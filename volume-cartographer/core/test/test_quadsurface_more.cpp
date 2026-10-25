@@ -1,5 +1,5 @@
 // More coverage for QuadSurface.cpp: gridNormal, center, ptrToGrid, loc_raw,
-// resample, unloadPoints/unloadCaches, computeZOrientationAngle, orientZUp,
+// resample, unloadCaches, computeZOrientationAngle, orientZUp,
 // surface_diff/union/intersection, contains/contains_any, overlap, lookupDepthIndex.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -248,12 +248,10 @@ TEST_CASE("resample (NEAREST) preserves sentinels by interpolation choice")
     CHECK(p->rows == 10);
 }
 
-TEST_CASE("unloadPoints / unloadCaches: noop when path is empty (no-unload allowed)")
+TEST_CASE("unloadCaches keeps the points")
 {
     auto pts = makePlanarGrid(4, 4);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    // canUnload() is false → these should be safe no-ops
-    qs.unloadPoints();
     qs.unloadCaches();
     CHECK(qs.rawPointsPtr() != nullptr);
 }

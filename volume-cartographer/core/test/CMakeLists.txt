@@ -342,8 +342,6 @@ vc_add_test(NAME test_point_collection_widget
 
 vc_add_test(NAME test_quadsurface_save_roundtrip)
 
-vc_add_test(NAME test_atomic_imwrite_multi)
-
 vc_add_test(NAME test_post_process)
 
 # Pin the on-disk wire format: chunks must remain Blosc1-readable because
@@ -980,8 +978,6 @@ vc_add_test(NAME test_quadsurface_io)
 vc_add_test(NAME test_quadsurface_pointto)
 
 vc_add_test(NAME test_quadsurface_snapshot)
-
-vc_add_test(NAME test_quadsurface_save_concurrency)
 
 vc_add_test(NAME test_quadsurface_cache_concurrency)
 

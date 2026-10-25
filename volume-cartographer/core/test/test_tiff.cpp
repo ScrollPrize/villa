@@ -1,5 +1,4 @@
-// Coverage for core/src/Tiff.cpp. atomicImwriteMulti has its own test elsewhere;
-// here we exercise voxelSizeToDpi, writeTiff (typed & untiled), TiffWriter
+// Coverage for core/src/Tiff.cpp: voxelSizeToDpi, writeTiff (typed & untiled), TiffWriter
 // tiled writes, type-conversion paths, isReadableTiff, and mergeTiffParts
 // no-input.
 

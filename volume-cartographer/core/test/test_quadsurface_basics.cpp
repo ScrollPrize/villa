@@ -140,7 +140,6 @@ TEST_CASE("QuadSurface ctor from Mat retains scale and is loaded")
     CHECK(qs.isLoaded());
     CHECK(qs.scale()[0] == doctest::Approx(1.5f));
     CHECK(qs.scale()[1] == doctest::Approx(2.0f));
-    CHECK(qs.canUnload() == false); // no path
 }
 
 TEST_CASE("size() returns scaled grid size")
@@ -459,9 +458,3 @@ TEST_CASE("invalidateCache / invalidateMask are no-throw")
     CHECK(true);
 }
 
-TEST_CASE("canUnload is false without a path")
-{
-    auto pts = makePlanarGrid(2, 2);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    CHECK_FALSE(qs.canUnload());
-}

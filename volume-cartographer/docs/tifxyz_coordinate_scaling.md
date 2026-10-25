@@ -22,9 +22,7 @@ scaled, physical area stays unchanged, and voxel size is divided by the factor.
 Historical `fit_config` remains unchanged; current voxel size is written at the
 top level, using the fit-config voxel size if no top-level value existed.
 The destination name comes from the output directory name; its UUID is newly
-generated. Derived outputs omit the old Open Data cache markers
-(`catalog-origin.json`, `vc_open_data_representation`). Other
-coordinate/provenance metadata is retained.
+generated. Other coordinate/provenance metadata is retained.
 
 If the input records `base_shape_zyx`, the actual target shape is required:
 rounding at lower pyramid levels cannot be inverted to recover exact dimensions.

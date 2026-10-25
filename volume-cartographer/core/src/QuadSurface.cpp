@@ -7,7 +7,6 @@
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/util/SurfaceIdentity.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
 
@@ -349,48 +348,19 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
                                  (path / "meta.json").string());
     }
 
-    auto readDimensions =
-        [](const utils::Json& json) -> std::optional<std::pair<uint32_t, uint32_t>> {
-        if (!json.contains("tiff_dimensions") ||
-            !json["tiff_dimensions"].is_array() ||
-            json["tiff_dimensions"].size() < 2) {
-            return std::nullopt;
-        }
-        const auto w = json["tiff_dimensions"][0].get_int();
-        const auto h = json["tiff_dimensions"][1].get_int();
-        if (w <= 0 || h <= 0) {
-            return std::nullopt;
-        }
-        return std::make_pair(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
-    };
-
     uint32_t width = 0;
     uint32_t height = 0;
     const auto xPath = path / "x.tif";
-    if (std::filesystem::exists(xPath)) {
-        TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
-        if (!tif) {
-            throw std::runtime_error("Failed to open TIFF: " + xPath.string());
-        }
-        const bool haveGeometry =
-            TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
-            TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
-        TIFFClose(tif);
-        if (!haveGeometry || width == 0 || height == 0) {
-            throw std::runtime_error("TIFF missing width/height: " + xPath.string());
-        }
-    } else {
-        // Metadata-only surfaces (open-data lazy placeholders) carry the grid
-        // size in meta.json; the TIFFs only exist after materialization.
-        std::optional<std::pair<uint32_t, uint32_t>> dims = readDimensions(metadata);
-        if (!dims) {
-            dims = readDimensions(diskMetadata());
-        }
-        if (!dims) {
-            throw std::runtime_error("Failed to open TIFF: " + xPath.string() + " and no dimensions metadata available");
-        }
-        width = dims->first;
-        height = dims->second;
+    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
+    }
+    const bool haveGeometry =
+        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
+        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+    TIFFClose(tif);
+    if (!haveGeometry || width == 0 || height == 0) {
+        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
     }
 
     LazySurfaceGeometry result;
@@ -1055,7 +1025,6 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     _scale = geometry.scale;
     _center = geometry.center;
     _bounds = geometry.bounds;
-    _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
 
@@ -1080,7 +1049,6 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
     _scale = geometry.scale;
     _center = geometry.center;
     _bounds = geometry.bounds;
-    _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
 
@@ -1121,7 +1089,6 @@ void QuadSurface::ensureLoaded()
         _bbox = loaded->_bbox;
     }
 
-    _maskTimestamp = readMaskTimestamp(path);
 
     // Mark as loaded (after all data is set)
     _needsLoad = false;
@@ -1389,33 +1356,6 @@ int QuadSurface::countValidQuads() const
     if (!_points) return 0;
     auto range = validQuads();
     return static_cast<int>(std::distance(range.begin(), range.end()));
-}
-
-void QuadSurface::unloadPoints()
-{
-    if (path.empty()) return;  // No disk backing — can't reload.
-    std::lock_guard<std::mutex> lock(_loadMutex);
-    if (_needsLoad) return;    // Already unloaded.
-    std::size_t mb = 0;
-    if (_points) {
-        mb = static_cast<std::size_t>(_points->rows) * _points->cols
-             * sizeof(cv::Vec3f) / (1024 * 1024);
-    }
-    _points.reset();
-    _channels.clear();
-    {
-        std::lock_guard<std::mutex> cacheLock(_cacheMutex);
-        _validMaskCache = cv::Mat_<uint8_t>();
-        _validMaskAllValid = false;
-        _normalCache = cv::Mat_<cv::Vec3f>();
-        _smoothDuCache.release();
-        _smoothDvCache.release();
-        _smoothDuvCache.release();
-    }
-    _needsLoad = true;
-    if (DebugLoggingEnabled()) {
-        std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
-    }
 }
 
 void QuadSurface::unloadCaches()
@@ -2228,10 +2168,7 @@ void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 
 void QuadSurface::saveAsNew(const std::filesystem::path &path_, bool force_overwrite)
 {
-    // A derived local surface is not the source's catalog representation.
-    // Keep coordinate/provenance fields, but use its directory as the UI key.
-    const auto uuid = vc::core::util::newDerivedSurfaceIdentity(meta);
-    saveWithUuid(path_, uuid, force_overwrite);
+    saveWithUuid(path_, vc::util::newUuid(), force_overwrite);
 }
 
 void QuadSurface::saveEdited(const std::filesystem::path &source,
@@ -2261,7 +2198,7 @@ void QuadSurface::saveOverwrite()
     const std::string uuid = objectUuidOrNew();
 
     // Snapshot the on-disk state before overwriting. saveSnapshot() writes
-    // a rotating backup at <backupRoot>/backups/<segname>/{0..N-1}/ so a
+    // a rotating backup at <parent>/backups/<segname>/{0..N-1}/ so a
     // destructive save (e.g. corrupted in-memory _points) is recoverable.
     // Failures (disk full, permissions) are logged but never block the
     // user's edit — the backup is best-effort.
@@ -2340,54 +2277,13 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     }
 }
 
-void QuadSurface::saveChannel(const std::string& name)
-{
-    if (path.empty()) {
-        throw std::runtime_error("QuadSurface::saveChannel() requires a valid path");
-    }
-    std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
-
-    auto it = _channels.find(name);
-    if (it == _channels.end() || it->second.empty()) {
-        return;
-    }
-
-    // Write only <name>.tif, no snapshot or x/y/z rewrite. tmp+rename so a
-    // crash mid-write can't tear the existing file. Unique tmp (pid+counter) so
-    // overlapping saves don't reuse a name; non-throwing rename so a lost race
-    // degrades to a logged warning instead of std::terminate.
-    static std::atomic<uint64_t> tmpCounter{0};
-    const std::string tmpStem = "." + name + ".tmp" + std::to_string(vc::memmap::pid())
-        + "_" + std::to_string(tmpCounter.fetch_add(1, std::memory_order_relaxed));
-    writeChannelFile(path, tmpStem, it->second);
-    const auto tmpPath = path / (tmpStem + ".tif");
-    try {
-        replaceFile(tmpPath, path / (name + ".tif"));
-    } catch (const std::filesystem::filesystem_error& error) {
-        Logger()->warn("saveChannel: rename {}.tif -> {}.tif failed: {}",
-                       tmpStem, name, error.code().message());
-        std::error_code rmEc;
-        std::filesystem::remove(tmpPath, rmEc);
-    }
-}
-
 // Minimum wall-clock gap between rotating snapshots of the same segment.
 // saveOverwrite()/autosave/growth all snapshot; without this, edit-cadence
 // saves would copy the whole segment dir into backups/ many times a second.
 static constexpr std::chrono::seconds kSnapshotThrottle{120};
 
-// App-configurable count of rotating snapshots kept per segment (see header).
-static std::atomic<int> g_backupCount{10};
-
-void QuadSurface::setBackupCount(int count)
-{
-    g_backupCount.store(std::max(0, count));
-}
-
-int QuadSurface::backupCount()
-{
-    return g_backupCount.load();
-}
+// Rotating snapshots kept per segment when the caller does not say.
+static constexpr int kDefaultBackupCount = 10;
 
 void QuadSurface::saveSnapshot(int maxBackups, bool force)
 {
@@ -2396,7 +2292,7 @@ void QuadSurface::saveSnapshot(int maxBackups, bool force)
     }
     std::lock_guard<std::recursive_mutex> dirLock(dirWriteMutex(path));
     if (maxBackups < 0) {
-        maxBackups = g_backupCount.load();
+        maxBackups = kDefaultBackupCount;
     }
     if (maxBackups <= 0) {
         return;  // backups disabled
@@ -2411,14 +2307,8 @@ void QuadSurface::saveSnapshot(int maxBackups, bool force)
         return;
     }
 
-    // Backups live in a "backups/" dir under backupRoot — VolumePkg sets this to
-    // the directory holding the volpkg.json, so backups are always a sibling of
-    // the project file regardless of where the segment dir actually lives. If no
-    // root was supplied (e.g. standalone CLI tools), fall back to the segment's
-    // own parent dir.
-    const std::filesystem::path root =
-        backupRoot.empty() ? path.parent_path() : backupRoot;
-    std::filesystem::path backupsDir = root / "backups" / path.filename();
+    // Backups live in a "backups/" dir beside the segment.
+    std::filesystem::path backupsDir = path.parent_path() / "backups" / path.filename();
 
     std::error_code ec;
     std::filesystem::create_directories(backupsDir, ec);
@@ -2697,59 +2587,6 @@ void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::st
     // Update the path to the final canonical location
     path = final_path;
     id = final_path.filename().string();
-}
-
-void QuadSurface::save_meta()
-{
-    if (meta.is_null())
-        throw std::runtime_error("can't save_meta() without metadata!");
-    if (path.empty())
-        throw std::runtime_error("no storage path for QuadSurface");
-
-    if (!meta.is_object()) {
-        throw std::runtime_error("can't save_meta() with non-object metadata!");
-    }
-
-    const std::string uuid = objectUuidOrNew();
-
-    {
-        // NB: deliberately no bbox recompute here, unlike save(). save_meta()
-        // rewrites meta.json only and leaves the x/y/z TIFFs untouched, so
-        // recomputing from the in-memory grid would describe geometry that
-        // was never persisted. For a surface with unsaved inward edits that
-        // would write an under-covering bbox, i.e. exactly the #1272 failure
-        // this change set exists to prevent. The bbox is refreshed where the
-        // geometry itself is written.
-        auto lo = utils::Json::array();
-        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
-        auto hi = utils::Json::array();
-        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
-        auto bb = utils::Json::array();
-        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
-        meta["bbox"] = std::move(bb);
-    }
-    meta["type"] = "seg";
-    meta["uuid"] = uuid;
-    meta["format"] = "tifxyz";
-    {
-        auto sc = utils::Json::array();
-        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
-        meta["scale"] = std::move(sc);
-    }
-
-    const auto tempMetaPath = path / "meta.json.tmp";
-    const auto metaPath = path / "meta.json";
-    {
-        std::ofstream o(tempMetaPath);
-        o << meta.dump(4) << std::endl;
-        if (!o) {
-            throw std::runtime_error("failed to write metadata: " + tempMetaPath.string());
-        }
-    }
-
-    // Rename to make replacement atomic. Windows requires the source handle to
-    // be closed and an explicit replace-existing operation.
-    replaceFile(tempMetaPath, metaPath);
 }
 
 Rect3D QuadSurface::bbox()
@@ -3530,55 +3367,6 @@ void QuadSurface::orientZUp()
     }
 }
 
-namespace {
-// Helper to flip all layers in a multi-layer TIFF file
-void flipMultiLayerTiff(const std::filesystem::path& tiffPath, int flipCode) {
-    if (!std::filesystem::exists(tiffPath)) {
-        return;
-    }
-
-    // Read all layers
-    std::vector<cv::Mat> layers;
-    if (!cv::imreadmulti(tiffPath.string(), layers, cv::IMREAD_UNCHANGED)) {
-        std::cerr << "Warning: Could not read multi-layer TIFF: " << tiffPath << std::endl;
-        return;
-    }
-
-    if (layers.empty()) {
-        return;
-    }
-
-    // Flip each layer
-    for (auto& layer : layers) {
-        cv::flip(layer, layer, flipCode);
-    }
-
-    // Write back all layers
-    if (!cv::imwritemulti(tiffPath.string(), layers)) {
-        std::cerr << "Warning: Could not write flipped multi-layer TIFF: " << tiffPath << std::endl;
-    }
-}
-
-// Helper to flip a single-layer TIFF file
-void flipSingleTiff(const std::filesystem::path& tiffPath, int flipCode) {
-    if (!std::filesystem::exists(tiffPath)) {
-        return;
-    }
-
-    cv::Mat img = cv::imread(tiffPath.string(), cv::IMREAD_UNCHANGED);
-    if (img.empty()) {
-        std::cerr << "Warning: Could not read TIFF: " << tiffPath << std::endl;
-        return;
-    }
-
-    cv::flip(img, img, flipCode);
-
-    if (!cv::imwrite(tiffPath.string(), img)) {
-        std::cerr << "Warning: Could not write flipped TIFF: " << tiffPath << std::endl;
-    }
-}
-} // anonymous namespace
-
 void QuadSurface::flipU()
 {
     ensureLoaded();
@@ -3595,13 +3383,6 @@ void QuadSurface::flipU()
         if (!channel.empty()) {
             cv::flip(channel, channel, flipCode);
         }
-    }
-
-    // Flip external TIFF files on disk
-    if (!path.empty()) {
-        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
-        flipSingleTiff(path / "generations.tif", flipCode);
-        flipSingleTiff(path / "approval.tif", flipCode);
     }
 
     // Invalidate derived geometry caches.
@@ -3626,34 +3407,8 @@ void QuadSurface::flipV()
         }
     }
 
-    // Flip external TIFF files on disk
-    if (!path.empty()) {
-        flipMultiLayerTiff(path / "multilayer_mask.tif", flipCode);
-        flipSingleTiff(path / "generations.tif", flipCode);
-        flipSingleTiff(path / "approval.tif", flipCode);
-    }
-
     // Invalidate derived geometry caches.
     invalidateCache();
-}
-
-std::optional<std::filesystem::file_time_type> QuadSurface::readMaskTimestamp(const std::filesystem::path& dir)
-{
-    const std::filesystem::path maskPath = dir / "mask.tif";
-    std::error_code ec;
-    if (!std::filesystem::exists(maskPath, ec) || ec) {
-        return std::nullopt;
-    }
-    auto ts = std::filesystem::last_write_time(maskPath, ec);
-    if (ec) {
-        return std::nullopt;
-    }
-    return ts;
-}
-
-void QuadSurface::refreshMaskTimestamp()
-{
-    _maskTimestamp = readMaskTimestamp(path);
 }
 
 // Surface overlap/containment tests

@@ -398,7 +398,6 @@ public:
     // silently convert to force_overwrite.
     void save(const std::filesystem::path&, const char*, bool = false) = delete;
     void save(const std::filesystem::path&, const std::string&, bool = false) = delete;
-    void save_meta();
     // meta["uuid"], or empty when the surface has no persistent identity yet.
     [[nodiscard]] std::string objectUuid() const;
     Rect3D bbox();
@@ -413,9 +412,6 @@ public:
     // require external synchronization.
     void unloadCaches();
 
-    // True iff this surface was loaded from disk and can be safely unloaded.
-    bool canUnload() const { return !path.empty(); }
-
     // Override disconnected component column ranges for an in-memory view.
     void setComponents(std::vector<std::pair<int, int>> components)
     {
@@ -425,10 +421,6 @@ public:
         _smoothDvCache.release();
         _smoothDuvCache.release();
     }
-
-    // Drop _points and all derived caches; ensureLoaded() will re-read from
-    // disk on next access. No-op for in-memory-only surfaces.
-    void unloadPoints();
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
@@ -506,20 +498,10 @@ public:
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
     void invalidateCache();
     void saveOverwrite();
-    // Write a single ancillary channel to path/<name>.tif in place, without
-    // snapshotting or rewriting x/y/z. No-op if the channel is absent/empty.
-    void saveChannel(const std::string& name);
-    // Rotating backup under <backupRoot>/backups/<seg>/ (backupRoot defaults to
-    // the segment's parent dir; VolumePkg sets it to the volpkg.json's dir).
-    // Throttled to at most one snapshot per segment every couple minutes; pass
-    // force=true to bypass. maxBackups < 0 means "use the configured default".
+    // Rotating backup under <parent>/backups/<seg>/. Throttled to at most one
+    // snapshot per segment every couple minutes; pass force=true to bypass.
+    // maxBackups < 0 means the default (10).
     void saveSnapshot(int maxBackups = -1, bool force = false);
-
-    // App-configurable number of rotating snapshots kept per segment. VC3D
-    // wires this to a user setting; defaults to 10 so non-GUI tools behave as
-    // before. Used by saveOverwrite() and saveSnapshot()'s default.
-    static void setBackupCount(int count);
-    static int backupCount();
     void invalidateMask();
     std::vector<std::string> channelNames() const;
     // Whether a registered channel holds data (a store channel loads on first use).
@@ -546,11 +528,6 @@ public:
     /** Flip the surface over the V axis (reverses columns/U direction) */
     void flipV();
 
-    // Mask timestamp caching
-    std::optional<std::filesystem::file_time_type> maskTimestamp() const { return _maskTimestamp; }
-    void refreshMaskTimestamp();
-    static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
-
     // DPI for TIFF output (0 = don't set). Set via setDpi() or voxelSizeToDpi().
     float dpi() const { return dpi_; }
     void setDpi(float d) { dpi_ = d; }
@@ -562,7 +539,6 @@ protected:
     cv::Rect _bounds;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
-    std::optional<std::filesystem::file_time_type> _maskTimestamp;
     // Column ranges of disconnected surface components (from meta.json "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
@@ -591,12 +567,9 @@ private:
 
     // Serializes all on-disk writes targeting a given segment directory, keyed by
     // the directory path so it works across separate QuadSurface objects pointing
-    // at the same dir (e.g. the autosave worker's snapshot vs. the live surface).
-    // Without it, a worker-thread saveOverwrite() directory swap can delete a tmp
-    // file out from under a main-thread saveChannel() rename -> uncaught
-    // filesystem_error -> std::terminate. Recursive so a public entry point
-    // (saveOverwrite) can hold it across nested saveSnapshot()/save() calls on
-    // the same thread without self-deadlock.
+    // at the same dir. Recursive so a public entry point (saveOverwrite) can hold
+    // it across nested saveSnapshot()/save() calls on the same thread without
+    // self-deadlock.
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
 

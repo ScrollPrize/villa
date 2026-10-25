@@ -182,7 +182,6 @@ int main(int argc, char* argv[])
     if (!in_place) {
         meta["uuid"] = vc::util::newUuid();
         meta["name"] = dst.filename().string();
-        meta.erase("vc_open_data_representation");
     }
     // Recompute rather than erase. Trimming drops rows/columns, so the input's
     // bbox is stale — but dropping the key outright makes the segment invisible
@@ -204,7 +203,6 @@ int main(int argc, char* argv[])
         const fs::path& p = entry.path();
         if (p.extension() == ".tif") continue;
         if (p.filename() == "meta.json") continue;
-        if (!in_place && p.filename() == "catalog-origin.json") continue;
         fs::copy_file(p, stage / p.filename(),
                       fs::copy_options::overwrite_existing, ec);
         if (ec) {

@@ -1,5 +1,4 @@
-// More QuadSurface coverage: save_meta, refreshMaskTimestamp and the
-// path-only save() overload.
+// More QuadSurface coverage: the path-only save() overload.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -72,56 +71,6 @@ TEST_CASE("save() with force_overwrite overwrites an existing dir")
     qs2.id = t.segId;
     qs2.save(t.segDir, /*force_overwrite=*/true);
     CHECK(fs::exists(t.segDir / "x.tif"));
-}
-
-TEST_CASE("save_meta updates meta.json without rewriting TIFFs")
-{
-    TmpSegDir t;
-    auto pts = grid();
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.id = t.segId;
-    qs.path = t.segDir;
-    qs.save(t.segDir);
-    // Mutate meta in-memory and persist.
-    qs.meta = utils::Json::object();
-    qs.meta["custom_field"] = "custom_value";
-    qs.save_meta();
-    // Reload and verify
-    QuadSurface reloaded(t.segDir);
-    CHECK(reloaded.meta.contains("custom_field"));
-    CHECK(reloaded.meta["custom_field"].get_string() == "custom_value");
-}
-
-TEST_CASE("readMaskTimestamp: returns nullopt when no mask file")
-{
-    TmpSegDir t;
-    fs::create_directories(t.segDir);
-    auto ts = QuadSurface::readMaskTimestamp(t.segDir);
-    CHECK_FALSE(ts.has_value());
-}
-
-TEST_CASE("readMaskTimestamp / refreshMaskTimestamp: writeValidMask leaves a timestamped mask.tif")
-{
-    TmpSegDir t;
-    auto pts = grid();
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.id = t.segId;
-    qs.path = t.segDir;
-    qs.save(t.segDir);
-    qs.writeValidMask(); // writes mask.tif inside segDir
-
-    // readMaskTimestamp (static) should now succeed if mask.tif exists.
-    auto ts = QuadSurface::readMaskTimestamp(t.segDir);
-    if (fs::exists(t.segDir / "mask.tif")) {
-        CHECK(ts.has_value());
-    }
-
-    // refreshMaskTimestamp is a void member; just exercise it.
-    qs.refreshMaskTimestamp();
-    auto memTs = qs.maskTimestamp();
-    if (fs::exists(t.segDir / "mask.tif")) {
-        CHECK(memTs.has_value());
-    }
 }
 
 TEST_CASE("save() on a path-less surface still writes when path passed explicitly")

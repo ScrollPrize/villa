@@ -1,5 +1,4 @@
-// Cover QuadSurface::save force_overwrite atomic-exchange and save_meta error
-// branches.
+// Cover QuadSurface::save force_overwrite atomic-exchange and identity rules.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -48,9 +47,6 @@ TEST_CASE("new patch UUID survives metadata and geometry saves")
     const std::string uuid = loaded.meta["uuid"].get_string();
     CHECK(vc::util::isUuid(uuid));
     CHECK(loaded.id == "named_patch");
-    loaded.id = "changed_display_name";
-    loaded.save_meta();
-    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
     loaded.ensureLoaded();
     loaded.saveOverwrite();
     CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
@@ -180,68 +176,6 @@ TEST_CASE("load rolls back an interrupted multi-file save generation")
     fs::remove_all(root);
 }
 
-TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
-{
-    auto root = tmpDir("savechannel");
-    auto segDir = root / "seg";
-
-    // Place the seg dir under a paths/ dir so it mimics <volpkg>/paths/<seg>.
-    // saveSnapshot() would write backups beside the seg dir (paths/backups/).
-    auto volpkg = root / "scroll.volpkg";
-    auto pathsDir = volpkg / "paths";
-    fs::create_directories(pathsDir);
-    segDir = pathsDir / "seg";
-
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta["uuid"] = "uuid-a";
-    qs.save(segDir.string(), /*force_overwrite=*/false);
-    REQUIRE(fs::exists(segDir / "x.tif"));
-
-    // Capture x.tif mtime so we can assert saveChannel leaves it untouched.
-    auto xMtimeBefore = fs::last_write_time(segDir / "x.tif");
-
-    cv::Mat_<cv::Vec3b> approval(8, 8, cv::Vec3b(0, 0, 0));
-    approval(2, 3) = cv::Vec3b(0, 255, 0);  // BGR
-    qs.setChannel("approval", approval);
-    qs.saveChannel("approval");
-
-    CHECK(fs::exists(segDir / "approval.tif"));
-
-    // Replacing an existing channel file needs an explicit replace operation
-    // on Windows; std::filesystem::rename alone leaves the first save in place.
-    approval(2, 3) = cv::Vec3b(255, 0, 0);
-    qs.setChannel("approval", approval);
-    qs.saveChannel("approval");
-
-    // No backups/ directory: saveChannel must not snapshot the segment.
-    CHECK_FALSE(fs::exists(pathsDir / "backups"));
-    CHECK_FALSE(fs::exists(volpkg / "backups"));
-    // x.tif untouched (not rewritten).
-    CHECK(fs::last_write_time(segDir / "x.tif") == xMtimeBefore);
-
-    QuadSurface reloaded(segDir);
-    cv::Mat got = reloaded.channel("approval", SURF_CHANNEL_NORESIZE);
-    REQUIRE(got.channels() == 3);
-    CHECK(got.at<cv::Vec3b>(2, 3) == cv::Vec3b(255, 0, 0));
-    CHECK(got.at<cv::Vec3b>(0, 0) == cv::Vec3b(0, 0, 0));
-
-    fs::remove_all(root);
-}
-
-TEST_CASE("saveChannel: absent or empty channel is a no-op")
-{
-    auto root = tmpDir("savechannel_noop");
-    auto segDir = root / "seg";
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta["uuid"] = "uuid-a";
-    qs.save(segDir.string(), /*force_overwrite=*/false);
-
-    qs.saveChannel("approval");  // never set
-    CHECK_FALSE(fs::exists(segDir / "approval.tif"));
-
-    fs::remove_all(root);
-}
-
 TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
 {
     auto root = tmpDir("noforce");
@@ -262,50 +196,6 @@ TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
     }
     CHECK(true);
     fs::remove_all(root);
-}
-
-TEST_CASE("save_meta: requires path")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta = utils::Json::object();
-    qs.meta["uuid"] = "x";
-    qs.meta["format"] = "tifxyz";
-    qs.meta["type"] = "seg";
-    CHECK_THROWS(qs.save_meta());
-}
-
-TEST_CASE("save_meta: requires object metadata (not null)")
-{
-    auto root = tmpDir("nullmeta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.meta = utils::Json{}; // null
-    CHECK_THROWS(qs.save_meta());
-    fs::remove_all(root);
-}
-
-TEST_CASE("save_meta: requires object (not array) metadata")
-{
-    auto root = tmpDir("arrmeta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.meta = utils::Json::array();
-    CHECK_THROWS(qs.save_meta());
-    fs::remove_all(root);
-}
-
-TEST_CASE("readMaskTimestamp: returns nullopt for an invalid dir")
-{
-    auto ts = QuadSurface::readMaskTimestamp("/__no__/__where__");
-    CHECK_FALSE(ts.has_value());
 }
 
 TEST_CASE("lookupDepthIndex: with 'd' channel as float matrix")
