@@ -21,7 +21,6 @@ import numpy as np
 
 REF_PREFIX = "vcobj:"
 INVALID = -1.0
-ATTACHMENT = "attachment"
 
 
 def surface_ref(surface_uuid: str, geometry_revision: str | None = None) -> str:
@@ -207,13 +206,11 @@ def attach_results(store: str | Path, surface_uuid: str, document: dict, *, role
 	geometry = dict(kind="point_collection", arrays=[
 		dict(name="points", dtype="<f8", shape=[len(records), 3], data=points.tobytes()),
 		dict(name="point_ids", dtype="<i8", shape=[len(records)], data=ids.tobytes())])
-	whole = {"whole_geometry": True}
 	with open_store(store, read_only=False, author=author) as db:
 		surface_revision = db.current_object_revision(surface_uuid)
 		with db.write(expected_revisions={collection_uuid: None,
 										  surface_uuid: surface_revision["uuid"] if surface_revision else None}) as tx:
 			tx.upsert_object(record)
 			tx.put_geometry(collection_uuid, geometry)
-			tx.add_edge(dict(a=collection_uuid, b=surface_uuid, kind=ATTACHMENT, a_anchor=whole, b_anchor=whole,
-							 meta=dict(role=role)))
+			tx.attach(collection_uuid, surface_uuid, role)
 	return collection_uuid
