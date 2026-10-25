@@ -4778,16 +4778,18 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         using namespace vc::objects;
         const auto connection = _state->objectStoreSession();
         const auto attachment = *connection->attachment();
-        RevisionSelection expected;
-        std::set<std::string> existing;
+        std::vector<std::string> existing;
         connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& object : db.objectsByKind(txn, "fiber")) {
-                existing.insert(object.uuid);
-                expected[object.uuid] = db.currentObjectRevision(txn, object.uuid)->uuid;
-            }
+            for (const auto& object : db.objectsByKind(txn, "fiber")) existing.push_back(object.uuid);
         });
-        auto batch = prepareGeometrySource("fiber", importPath,
-            std::vector<std::string>(existing.begin(), existing.end()));
+        auto batch = prepareGeometrySource("fiber", importPath, existing);
+        // Pin only the existing fibers the imported ones link to, so unrelated
+        // edits in the meantime do not fail the import.
+        RevisionSelection expected;
+        connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& uuid : fiberBatchEndpoints(batch))
+                if (const auto head = db.currentObjectRevision(txn, uuid)) expected[uuid] = head->uuid;
+        });
         for (const auto& source : batch) expected[source.object.uuid] = std::nullopt;
         const auto count = batch.size();
         connection->act(attachment, expected, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, std::move(batch)); });
