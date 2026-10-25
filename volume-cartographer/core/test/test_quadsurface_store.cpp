@@ -12,6 +12,8 @@
 
 #include <opencv2/core.hpp>
 #include <filesystem>
+#include <cstring>
+#include <cmath>
 
 namespace fs = std::filesystem;
 using namespace vc::objects;
@@ -153,6 +155,26 @@ TEST_CASE("QuadSurface round trip through the object store")
     CHECK((*grown->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1));
     CHECK((*grown->rawPointsPtr())(2, 2) == cv::Vec3f(1.5f, 1.f, 11.f));
     CHECK(grown->channel("generations", SURF_CHANNEL_NORESIZE).at<uint16_t>(0, 0) == 0);
+}
+
+TEST_CASE("A stored vertex without coordinates loads as missing")
+{
+    Store store;
+    const auto uuid = util::newUuid();
+    GeometryData data{"surface", 1, "source_xyz", R"({"scale":[1,1]})", {}};
+    const std::vector<float> xyz{1, 2, 3, 5, -1, 7, std::nanf(""), 1, 2};
+    GeometryArray points{"points", "<f4", {1, 3, 3}, std::vector<uint8_t>(xyz.size() * 4)};
+    std::memcpy(points.bytes.data(), xyz.data(), points.bytes.size());
+    data.arrays.push_back(points);
+    store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+        db.upsertObject(txn, record);
+        db.putGeometry(txn, uuid, data);
+    });
+    const auto loaded = store.load(uuid);
+    CHECK((*loaded->rawPointsPtr())(0, 0) == cv::Vec3f(1, 2, 3));
+    CHECK((*loaded->rawPointsPtr())(0, 1) == cv::Vec3f(-1, -1, -1));
+    CHECK((*loaded->rawPointsPtr())(0, 2) == cv::Vec3f(-1, -1, -1));
 }
 
 TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only stored units")
