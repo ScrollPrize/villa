@@ -71,6 +71,21 @@ int main() try {
         require(snapshot.pointCollection(points).viewTransformedAt("b").points("points",0,1).front()==std::array<double,3>{13,2,23},"point collections share transformed accessor");
         require(snapshot.umbilicus(umbilicus).viewTransformedAt("b").points("points",0,1).front()==std::array<double,3>{13,2,23},"umbilici share transformed accessor");
         require(snapshot.fiber(fiber).viewTransformedAt("b").points("control_points",0,2).back()==std::array<double,3>{16,0,20},"fibers share transformed accessor");
+        {
+            // A whole edited fiber back to canonical coordinates: shown points keep
+            // their exact stored values by ID; moved and inserted ones map back.
+            const auto fiberView=snapshot.fiber(fiber);const auto shown=fiberView.viewTransformedAt("b");
+            const auto ids=fiberView.controlPointIds(0,2);
+            vc::geometry::Fiber edited;
+            edited.controlPoints={shown.points("control_points",0,2)[1],{12,0,20},{14,1,21}};
+            edited.controlPointIds={ids[1],ids[0],ids[1]+100};
+            const auto canonical=shown.canonicalFiber(edited);
+            require(canonical.controlPoints[0]==std::array<double,3>{3,0,0},"unchanged control point keeps its canonical value");
+            require(canonical.controlPoints[1]==std::array<double,3>{1,0,0},"moved control point maps through the inverse");
+            const auto back=matrix.apply(canonical.controlPoints[2]);
+            require(std::abs(back[0]-14)<1e-12&&std::abs(back[1]-1)<1e-12&&std::abs(back[2]-21)<1e-12,"inserted control point maps back");
+            require(canonical.controlPointIds==edited.controlPointIds,"control point IDs are kept");
+        }
         require(snapshot.pointCollection(points).ids(0,1).front()==17,"stable point IDs remain canonical");
         require(snapshot.track(track).points(1,1).front()[0]==3,"requesting view never changes canonical geometry");
         bool unavailable=false;try{snapshot.track(track).viewTransformedAt("missing");}catch(const std::exception&){unavailable=true;}

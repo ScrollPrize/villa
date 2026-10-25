@@ -1,6 +1,7 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include <map>
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <limits>
@@ -338,6 +339,32 @@ geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired
     if(!geometry::validSurfacePoint(result))throw std::invalid_argument("surface coordinate cannot be represented in the canonical frame");
     return result;
 }
+}
+geometry::Fiber TransformedGeometryView::canonicalFiber(const geometry::Fiber& desired) const {
+    const auto* fiber=std::get_if<FiberView>(&source_);
+    if(!fiber)throw std::invalid_argument("not a fiber");
+    if(!desired.controlPointIds.empty()&&desired.controlPointIds.size()!=desired.controlPoints.size())
+        throw std::invalid_argument("fiber control point IDs do not match its control points");
+    const auto stored=fiber->load();
+    const auto inverse=mapping_.inverse();
+    auto canonical=[&](const geometry::Point& wanted,const geometry::Point* original) {
+        if(original&&mapping_.apply(*original)==wanted)return *original;
+        const auto p=inverse.apply(wanted);
+        for(double v:p)if(!std::isfinite(v))throw std::invalid_argument("fiber coordinate is not finite in the canonical frame");
+        return p;
+    };
+    std::map<geometry::PointId,size_t> byId;
+    for(size_t i=0;i<stored.controlPointIds.size();++i)byId.emplace(stored.controlPointIds[i],i);
+    auto result=desired;
+    for(size_t i=0;i<desired.controlPoints.size();++i) {
+        const geometry::Point* original=nullptr;
+        if(desired.controlPointIds.empty()) { if(i<stored.controlPoints.size())original=&stored.controlPoints[i]; }
+        else if(const auto found=byId.find(desired.controlPointIds[i]);found!=byId.end())original=&stored.controlPoints[found->second];
+        result.controlPoints[i]=canonical(desired.controlPoints[i],original);
+    }
+    for(size_t i=0;i<desired.linePoints.size();++i)
+        result.linePoints[i]=canonical(desired.linePoints[i],i<stored.linePoints.size()?&stored.linePoints[i]:nullptr);
+    return result;
 }
 geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
