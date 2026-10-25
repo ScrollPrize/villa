@@ -1501,7 +1501,6 @@ void SurfacePanelController::refreshProximityFilters()
     struct Answers { ProximityAnswer focus, pointSets; };
     vc3d::store::background<Answers>(this,
         [session = _catalog->session(), sources = _catalog->sources(), focus, pointSets, focusRadius]() {
-            // Each store is asked in the open volume's voxels (its source volume at the open level).
             auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
                 result.pointSets = sets;
@@ -1511,16 +1510,8 @@ void SurfacePanelController::refreshProximityFilters()
                     bool first = true;
                     for (const auto& point : points) {
                         std::set<std::string> near;
-                        for (const auto& source : sources) {
-                            vc::objects::SurfaceProximityQuery query;
-                            query.point = {point[0], point[1], point[2]};
-                            query.tolerance = tolerance;
-                            query.volume = source.volume;
-                            query.targetScale = source.scale;
-                            session->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                                for (const auto& hit : db.nearestSurfaces(txn, query)) near.insert(hit.objectUuid);
-                            });
-                        }
+                        for (const auto& hit : SurfaceCatalog::nearest(*session, sources, point, tolerance))
+                            near.insert(hit.objectUuid);
                         any.insert(near.begin(), near.end());
                         if (first) all = near;
                         else std::erase_if(all, [&](const std::string& uuid) { return !near.contains(uuid); });

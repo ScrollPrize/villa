@@ -1869,7 +1869,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         for (auto& [surface, segments] : editPatchIndex->computePlaneIntersections(*plane, planeRoi, {active}))
             for (const auto& segment : segments) intersections[active->id].push_back({segment.world[0], segment.world[1]});
     }
-    if (_surfaceCatalog && _surfaceCatalog->attachment() && _surfaceCatalog->volume()) {
+    if (_surfaceCatalog && _surfaceCatalog->volume()) {
         auto corner = [&](float x, float y) {
             const cv::Vec3f p = plane->coord({0, 0, 0}, {x, y, 0.0f});
             return vc::fibers::Point{p[0], p[1], p[2]};
@@ -1879,18 +1879,15 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                                                     corner(planeRoi.x, planeRoi.y + planeRoi.height), 1.0);
         if (region) {
             try {
-                _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
-                    vc::objects::RegionOptions options;
-                    options.kind = "surface";
-                    options.volume = _surfaceCatalog->volume()->id();
-                    for (const auto& run : db.geometryRegion(txn, vc3d::store::regionSlice(*region), options).runs) {
-                        if (active && run.objectUuid == active->id && intersections.contains(active->id)) continue;
-                        auto& out = intersections[run.objectUuid];
-                        for (size_t i = 1; i < run.points.size(); ++i)
-                            out.push_back({cv::Vec3f(run.points[i - 1][0], run.points[i - 1][1], run.points[i - 1][2]),
-                                           cv::Vec3f(run.points[i][0], run.points[i][1], run.points[i][2])});
-                    }
-                });
+                const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
+                                                              vc3d::store::regionSlice(*region), {});
+                for (const auto& run : crossings.runs) {
+                    if (active && run.objectUuid == active->id && intersections.contains(active->id)) continue;
+                    auto& out = intersections[run.objectUuid];
+                    for (size_t i = 1; i < run.points.size(); ++i)
+                        out.push_back({cv::Vec3f(run.points[i - 1][0], run.points[i - 1][1], run.points[i - 1][2]),
+                                       cv::Vec3f(run.points[i][0], run.points[i][1], run.points[i][2])});
+                }
             } catch (const std::exception& error) {
                 Logger()->warn("Relative winding surface query failed: {}", error.what());
             }

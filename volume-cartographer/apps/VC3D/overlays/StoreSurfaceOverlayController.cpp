@@ -129,25 +129,14 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
     const auto revision = _revision;
     vc3d::store::background<Listing>(this,
         [session = _catalog->session(), sources = _catalog->sources(), uuids = _surfaces, query, cancel]() {
+            vc::objects::RegionOptions options;
+            options.uuids = uuids;
+            options.processingByteBudget = kProcessingBudget;
+            auto crossings = SurfaceCatalog::region(*session, sources, vc3d::store::regionSlice(query), options,
+                                                    [&] { return cancel->load(); });
             Listing listing;
-            listing.complete = true;
-            for (const auto& source : sources) {
-                // In the open volume's voxels: the source volume at the open level.
-                const auto slice = vc3d::store::regionSlice(query);
-                session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
-                    vc::objects::RegionOptions options;
-                    options.kind = "surface";
-                    options.volume = source.volume;
-                    options.targetScale = source.scale;
-                    options.uuids = uuids;
-                    options.processingByteBudget = kProcessingBudget;
-                    auto result = db.geometryRegion(txn, slice, options,
-                                                    [&](const auto&) { return cancel->load() || cancelled.load(); });
-                    listing.complete = listing.complete && result.complete();
-                    for (auto& run : result.runs)
-                        listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
-                });
-            }
+            listing.complete = crossings.complete;
+            for (auto& run : crossings.runs) listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
             return listing;
         },
         [this, viewer, cancel, view, query, revision](vc3d::store::Outcome<Listing> result) {

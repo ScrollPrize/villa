@@ -295,11 +295,39 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
     return uuid;
 }
 
+SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<Source>& sources,
+                                                 const RegionSlice& slice, RegionOptions options,
+                                                 const std::function<bool()>& cancelled)
+{
+    Crossings crossings;
+    options.kind = "surface";
+    for (const auto& source : sources) {
+        // In the open volume's voxels: the source volume at the open level.
+        options.volume = source.volume;
+        options.targetScale = source.scale;
+        session.read(source.attachment, [&](const auto& db, const auto& txn, const auto& readCancelled) {
+            auto result = db.geometryRegion(txn, slice, options, [&](const auto&) {
+                return readCancelled.load() || (cancelled && cancelled());
+            });
+            crossings.complete = crossings.complete && result.complete();
+            for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
+        });
+    }
+    return crossings;
+}
+
 std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double, 3>& point, double tolerance,
                                                          const std::optional<std::vector<std::string>>& uuids) const
 {
+    return nearest(*session_, sources(), point, tolerance, uuids);
+}
+
+std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(ObjectStoreSession& session, const std::vector<Source>& sources,
+                                                         const std::array<double, 3>& point, double tolerance,
+                                                         const std::optional<std::vector<std::string>>& uuids)
+{
     std::vector<SurfaceProximityHit> hits;
-    for (const auto& source : sources()) {
+    for (const auto& source : sources) {
         // In the open volume's voxels: the source volume at the open level.
         SurfaceProximityQuery query;
         query.point = point;
@@ -307,7 +335,7 @@ std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double
         query.uuids = uuids;
         query.volume = source.volume;
         query.targetScale = source.scale;
-        session_->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
+        session.read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
             for (auto hit : db.nearestSurfaces(txn, query)) hits.push_back(std::move(hit));
         });
     }

@@ -6,6 +6,7 @@
 // viewed or edited. Surfaces are identified by their store UUID.
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/GeometryRegion.hpp>
 #include <nlohmann/json.hpp>
 #include <QObject>
 #include <QString>
@@ -106,10 +107,25 @@ public:
                        const vc::objects::AttachmentIdentity& attachment, const std::string& volume,
                        const std::string& uuid, double scale = 1);
 
+    // Where the surfaces of every source cross `slice` (open-volume voxels),
+    // with `options` (uuids, budgets) per source; complete when every source's
+    // read was. Synchronous: callers run it on a worker thread.
+    struct Crossings {
+        std::vector<vc::objects::VisibleRun> runs;
+        bool complete = true;
+    };
+    static Crossings region(vc::objects::ObjectStoreSession& session, const std::vector<Source>& sources,
+                            const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
+                            const std::function<bool()>& cancelled = {});
+
     // Surfaces (among `uuids`, all when nullopt) within `tolerance` voxels of a
     // volume point, nearest first. Synchronous.
     std::vector<vc::objects::SurfaceProximityHit> nearest(const std::array<double, 3>& point, double tolerance,
         const std::optional<std::vector<std::string>>& uuids = std::nullopt) const;
+    // The same over explicit sources, for worker threads.
+    static std::vector<vc::objects::SurfaceProximityHit> nearest(vc::objects::ObjectStoreSession& session,
+        const std::vector<Source>& sources, const std::array<double, 3>& point, double tolerance,
+        const std::optional<std::vector<std::string>>& uuids = std::nullopt);
 
     // Record edits: they commit at once and reach rows() through the commit events.
     void setTags(const std::string& uuid, const std::vector<std::string>& tags);
