@@ -165,6 +165,36 @@ int runObjectStoreControllerTests()
         require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
         collection.selectFiber(a.id, false, false);
         checkHubStatus(state, controller, collection, [&] { return catalog.size() == 2; });
+        {
+            const auto generation = controller._fiberDataGeneration;
+            const auto snapshots = controller._sideStripStoredSnapshotCache.size();
+            int catalogUpdates = 0, fiberUpdates = 0, selectionResets = 0;
+            QObject observer;
+            QObject::connect(&collection, &FiberCollectionController::catalogChanged, &observer,
+                [&](const auto&, bool) { ++catalogUpdates; });
+            QObject::connect(&collection, &FiberCollectionController::selectionChanged, &observer,
+                [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
+            QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
+            const auto connection = state.objectStoreSession();
+            const auto attachment = *connection->attachment();
+            const auto unrelated = vc::util::newUuid();
+            connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
+                ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
+                db.upsertObject(txn, record);
+            });
+            state.pollObjectStoreChanges();
+            // Old/foreign attachments must not invalidate this store's fibers.
+            StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,
+                {vc::util::newUuid(), attachment.generation}, 0, {}};
+            JournalEntry change; change.kind = "fiber"; foreign.changes.push_back(change);
+            state.objectStoreChanged(foreign);
+            QApplication::processEvents();
+            require(catalogUpdates == 0 && fiberUpdates == 0 && selectionResets == 0,
+                    "unrelated and foreign commits preserve catalog and selection");
+            require(controller._fiberDataGeneration == generation &&
+                    controller._sideStripStoredSnapshotCache.size() == snapshots,
+                    "unrelated and foreign commits preserve warm fiber snapshots");
+        }
         const auto transferPaths = controller.fiberTransportPaths({a.id});
         require(transferPaths.size() == 2, "transport includes both linked endpoints");
         auto readDocument = [](const auto& file) { std::ifstream input(file); return nlohmann::json::parse(input); };

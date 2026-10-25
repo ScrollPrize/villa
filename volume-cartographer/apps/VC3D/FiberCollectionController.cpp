@@ -1,4 +1,5 @@
 #include "FiberCollectionController.hpp"
+#include "ObjectStoreEvents.hpp"
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -347,6 +348,9 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
         // Sync/lease status is not a data change. Pulled edits arrive through
         // Committed events; status-only events must preserve warm views/selection.
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
+        if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
+            !state_->objectStoreSession()->current(event.attachment)) return;
+        if (!vc3d::store::touches(event, {"fiber", "fiber_branch"})) return;
         projectChanged(event.kind == vc::objects::StoreSessionEvent::Kind::Committed);
     });
     connect(state_, &CState::volumeChanged, this, [this]() { projectChanged(); });

@@ -3,6 +3,7 @@
 #include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include "ObjectStoreCoordinates.hpp"
+#include "ObjectStoreEvents.hpp"
 #include "ObjectStoreArtifacts.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include "LineAnnotationController.hpp"
@@ -2037,7 +2038,8 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 onVolumePackageChanged({});
                 return;
             }
-            if (!_state->objectStoreSession()->current(event.attachment)) return;
+            if (!_state->objectStoreSession()->current(event.attachment) ||
+                !vc3d::store::touches(event, {"fiber", "fiber_branch"})) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
             refreshChangedStoreFibers();
