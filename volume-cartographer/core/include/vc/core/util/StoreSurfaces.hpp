@@ -71,7 +71,7 @@ private:
     std::string tool_;
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     vc::objects::AttachmentIdentity attachment_;
-    std::optional<std::chrono::system_clock::time_point> lastWrite_;
+    bool wrote_ = false;
     // Object and geometry revisions of each loaded surface, the pins of updates.
     // Loads may run on several threads.
     std::mutex loadedMutex_;

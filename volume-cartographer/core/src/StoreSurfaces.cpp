@@ -6,7 +6,6 @@
 
 #include <cstdlib>
 #include <stdexcept>
-#include <thread>
 
 StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool)
     : tool_(tool), session_(std::make_shared<vc::objects::ObjectStoreSession>())
@@ -64,7 +63,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
     session_->act(attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
         create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());
     });
-    lastWrite_ = std::chrono::system_clock::now();
+    wrote_ = true;
     surface.id = uuid;
     return uuid;
 }
@@ -79,7 +78,7 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
         revision = write_quad_rect_to_store(db, txn, canonical, surface, cv::Rect(0, 0, points.cols, points.rows),
                                             geometryRevision, keep);
     });
-    lastWrite_ = std::chrono::system_clock::now();
+    wrote_ = true;
     return revision;
 }
 
@@ -91,7 +90,7 @@ std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& 
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
         revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
     });
-    lastWrite_ = std::chrono::system_clock::now();
+    wrote_ = true;
     return revision;
 }
 
@@ -109,18 +108,11 @@ StoreSurfaces::Loaded StoreSurfaces::writable(const std::string& uuid)
 void StoreSurfaces::finish(std::chrono::seconds timeout)
 {
     session_->finalize();
-    if (!lastWrite_ || !session_->hubStatus(attachment_)) return;
-    const auto written = std::chrono::duration_cast<std::chrono::microseconds>(lastWrite_->time_since_epoch()).count();
-    session_->syncHub(attachment_);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    for (;;) {
-        // Status describes the last completed sync; it must postdate the writes.
-        const auto status = session_->hubStatus(attachment_);
-        if (status && status->pending.empty() && status->syncedAtUs && *status->syncedAtUs > written) return;
-        if (std::chrono::steady_clock::now() > deadline)
-            throw std::runtime_error("writes did not reach the hub" + (status && !status->error.empty() ? ": " + status->error : std::string()));
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    if (!wrote_) return;
+    const auto status = session_->syncHubAndWait(attachment_, timeout);
+    if (status && (!status->error.empty() || !status->conflicts.empty()))
+        throw std::runtime_error("writes did not reach the hub: " +
+                                 (status->error.empty() ? std::string("unresolved hub conflicts") : status->error));
 }
 
 bool StoreOutputArgs::parse(const std::string& arg)
