@@ -14,6 +14,9 @@
 namespace {
 // Surfaces cross the slab's mid-plane; the depth only selects candidate tiles.
 constexpr double kHalfDepthVx = 1.0;
+// Each crossed surface tile decodes ~0.5 MB, so the store's default (64 MB) drew
+// about 6 surfaces crossing a 2000 vx view; this covers ~55 crossing 4000 vx.
+constexpr uint64_t kProcessingBudget = uint64_t(1) << 30;
 
 vc::fibers::Point point(const cv::Vec3f& p)
 {
@@ -136,6 +139,7 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
                     options.volume = source.volume;
                     options.targetScale = source.scale;
                     options.uuids = uuids;
+                    options.processingByteBudget = kProcessingBudget;
                     auto result = db.geometryRegion(txn, slice, options,
                                                     [&](const auto&) { return cancel->load() || cancelled.load(); });
                     listing.complete = listing.complete && result.complete();
@@ -176,11 +180,14 @@ void StoreSurfaceOverlayController::collectPrimitives(VolumeViewerBase* viewer, 
     v.dirty = false;
     v.displayed = current;
     v.displayedRect = visibleSceneRect(viewer);
-    if (!v.region.error.isEmpty()) {
+    const auto notice = !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
+                        : v.region.loaded && !v.region.complete ? tr("Partial surface view · zoom in")
+                                                                : QString{};
+    if (!notice.isEmpty()) {
         OverlayStyle info;
         info.penColor = QColor(255, 210, 100);
         info.z = vc3d::kIntersectionZ;
-        builder.addText(v.displayedRect.topLeft() + QPointF(8, 60), tr("Surfaces: %1").arg(v.region.error), QFont{}, info);
+        builder.addText(v.displayedRect.topLeft() + QPointF(8, 60), notice, QFont{}, info);
     }
     // The active surface is drawn by the viewer from its live (possibly edited) geometry.
     const auto active = _state->surface("segmentation");
