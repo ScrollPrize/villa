@@ -436,6 +436,12 @@ class ZarrDataset(Dataset):
             self._load_from_cache(cache_data)
             return
 
+        if getattr(self.mgr, 'bg_sampling_enabled', False):
+            raise ValueError(
+                'Background sampling needs a matching patch cache; run '
+                '`vesuvius.find_patches --config <config.yaml>` to regenerate it.'
+            )
+
         # No cache found - enumerate all patches without validation
         logger.warning(
             "No patch cache found. Enumerating all patches without validation. "
@@ -661,7 +667,9 @@ class ZarrDataset(Dataset):
 
     def _try_load_cache(self):
         """Attempt to load patch cache using current validation params."""
-        from vesuvius.models.preprocessing.patches import try_load_patch_cache
+        from vesuvius.models.preprocessing.patches.cache import (
+            background_cache_options, try_load_patch_cache,
+        )
 
         # Get valid_patch_value from target config, with dataset-level fallback
         valid_patch_value = None
@@ -688,6 +696,10 @@ class ZarrDataset(Dataset):
             unlabeled_fg_enabled=self.unlabeled_fg_enabled,
             unlabeled_fg_threshold=self.unlabeled_fg_threshold,
             unlabeled_fg_bbox_threshold=self.unlabeled_fg_bbox_threshold,
+            **background_cache_options(
+                bool(getattr(self.mgr, 'bg_sampling_enabled', False)),
+                self.targets.get(self.target_names[0]) or {},
+            ),
         )
 
     def _load_from_cache(self, cache_data) -> None:
@@ -719,9 +731,19 @@ class ZarrDataset(Dataset):
             ))
         self._n_unlabeled_fg = len(cache_data.unlabeled_fg_patches)
 
+        # Keep background after labeled/unlabeled FG; it belongs to training only.
+        background = cache_data.bg_patches if getattr(self.mgr, 'bg_sampling_enabled', False) else []
+        for entry in background:
+            vol_idx = volume_name_to_idx.get(entry.volume_name, entry.volume_idx)
+            self._patches.append(PatchInfo(
+                volume_index=vol_idx, volume_name=entry.volume_name,
+                position=entry.position, patch_size=self.patch_size,
+                is_unlabeled_fg=False,
+            ))
+
         logger.info(
-            "Loaded %d patches from cache (%d labeled, %d unlabeled)",
-            len(self._patches), self._n_labeled_fg, self._n_unlabeled_fg
+            "Loaded %d patches from cache (%d labeled, %d unlabeled, %d BG)",
+            len(self._patches), self._n_labeled_fg, self._n_unlabeled_fg, len(background)
         )
 
     def _iter_2d_positions(
