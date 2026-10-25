@@ -543,7 +543,7 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
     }
     const QJsonObject p = params.toObject();
 
-    // The overlay switches apply to every viewer, like the checkboxes.
+    // The overlay switches apply to every viewer, like the View menu items.
     vc3d::hud::Options options = mgr->hudOptions();
     if (p.contains("histogram")) options.histogram = p.value("histogram").toBool();
     if (p.contains("lineProfile")) options.lineProfile = p.value("lineProfile").toBool();

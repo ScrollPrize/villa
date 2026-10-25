@@ -309,7 +309,7 @@ async def vc3d_set_hud(
     clear_profile: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Turn the slice viewers' measurement overlays on or off, and measure
-    gray values along a line. Same as the View panel checkboxes; every
+    gray values along a line. Same as View > Measurement Overlays; every
     argument is optional and omitted ones are left unchanged.
 
     histogram: histogram of the gray values on screen, with the 1st/99th

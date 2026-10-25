@@ -8527,46 +8527,6 @@ void CWindow::CreateWidgets(void)
             }
         });
     }
-    // Measurement overlays, also off by default each session.
-    {
-        const auto applyHud = [this]() {
-            vc3d::hud::Options options;
-            options.histogram = ui.chkHudHistogram && ui.chkHudHistogram->isChecked();
-            options.lineProfile = ui.chkHudLineProfile && ui.chkHudLineProfile->isChecked();
-            options.grid = ui.chkHudGrid && ui.chkHudGrid->isChecked();
-            options.loupe = ui.chkHudLoupe && ui.chkHudLoupe->isChecked();
-            for (auto* manager : ViewerManager::allManagers()) {
-                if (manager) {
-                    const double step = manager->hudOptions().gridStep;
-                    options.gridStep = step;
-                    manager->setHudOptions(options);
-                }
-            }
-        };
-        for (QCheckBox* box : {ui.chkHudHistogram, ui.chkHudLineProfile, ui.chkHudGrid, ui.chkHudLoupe}) {
-            if (box) {
-                connect(box, &QCheckBox::toggled, this, applyHud);
-            }
-        }
-        // Keep the boxes in step when an agent or script changes the overlays.
-        if (_viewerManager) {
-            connect(_viewerManager.get(), &ViewerManager::hudOptionsChanged, this,
-                    [this](const vc3d::hud::Options& options) {
-                        const std::pair<QCheckBox*, bool> boxes[] = {
-                            {ui.chkHudHistogram, options.histogram},
-                            {ui.chkHudLineProfile, options.lineProfile},
-                            {ui.chkHudGrid, options.grid},
-                            {ui.chkHudLoupe, options.loupe},
-                        };
-                        for (const auto& [box, on] : boxes) {
-                            if (box && box->isChecked() != on) {
-                                QSignalBlocker blocker(box);
-                                box->setChecked(on);
-                            }
-                        }
-                    });
-        }
-    }
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }

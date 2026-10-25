@@ -319,8 +319,8 @@ dialog.
 - Viewer-manager settings remain meaningful with zero viewers. Per-viewer
   toggles are broadcast to every live base viewer and their persisted defaults
   are updated where applicable.
-- `viewer.set_hud` switches the measurement overlays for every viewer, like the
-  View panel checkboxes, which follow it. A `profileLine` is given in fractions
+- `viewer.set_hud` switches the measurement overlays for every viewer, like
+  View > Measurement Overlays, whose items follow it. A `profileLine` is given in fractions
   of the target viewer's viewport, turns profile mode on and is read from the
   rendered frame, so the values are display gray levels after the volume
   window. The grid draws only on plane views.

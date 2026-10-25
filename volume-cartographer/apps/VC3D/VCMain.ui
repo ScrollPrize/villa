@@ -1095,46 +1095,6 @@
        </property>
       </widget>
      </item>
-     <item row="12" column="0" colspan="4">
-      <widget class="QCheckBox" name="chkHudHistogram">
-       <property name="text">
-        <string>Show on-screen histogram</string>
-       </property>
-       <property name="toolTip">
-        <string>Histogram of the gray values in each slice view, with 1st and 99th percentiles and the share clipped to black or white</string>
-       </property>
-      </widget>
-     </item>
-     <item row="13" column="0" colspan="4">
-      <widget class="QCheckBox" name="chkHudLineProfile">
-       <property name="text">
-        <string>Line profile (drag in a slice view)</string>
-       </property>
-       <property name="toolTip">
-        <string>With this on, a left drag draws a line and plots the gray values along it; peaks mark bright crossings such as papyrus layers. A click clears it.</string>
-       </property>
-      </widget>
-     </item>
-     <item row="14" column="0" colspan="4">
-      <widget class="QCheckBox" name="chkHudGrid">
-       <property name="text">
-        <string>Show volume coordinate grid</string>
-       </property>
-       <property name="toolTip">
-        <string>Labeled lines at round volume coordinates on plane views, so positions can be read and shared</string>
-       </property>
-      </widget>
-     </item>
-     <item row="15" column="0" colspan="4">
-      <widget class="QCheckBox" name="chkHudLoupe">
-       <property name="text">
-        <string>Show magnifier loupe</string>
-       </property>
-       <property name="toolTip">
-        <string>Magnified view of the pixels under the cursor, with the value and volume position</string>
-       </property>
-      </widget>
-     </item>
     </layout>
    </widget>
    </widget>
