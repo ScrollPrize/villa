@@ -285,15 +285,11 @@ private:
 
     // Per-segment mesh operations live in AgentBridgeHandlers_surfaceops.cpp.
     // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /
-    // refine_alpha_comp (mirror render.tifxyz). In-process deferred:
-    // generate_mask / append_mask (shared handleSegmentMask helper).
+    // refine_alpha_comp (mirror render.tifxyz).
     QJsonObject handleSegmentCropBounds(const QJsonValue& params);
     QJsonObject handleSegmentRecalcArea(const QJsonValue& params);
     QJsonObject handleSegmentReoptimize(const QJsonValue& params);
     QJsonObject handleSegmentRefineAlphaComp(const QJsonValue& params);
-    QJsonObject handleSegmentGenerateMask(const QJsonValue& params);
-    QJsonObject handleSegmentAppendMask(const QJsonValue& params);
-    QJsonObject handleSegmentMask(const QJsonValue& params, bool append);
 
     // --- Open Data manifest acquisition ---
     // Serves the cached manifest synchronously when available and `refresh` is

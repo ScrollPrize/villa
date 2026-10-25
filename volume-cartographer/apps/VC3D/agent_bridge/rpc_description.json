@@ -965,7 +965,7 @@
           "energyType": "energy_type",
           "inpaintHoles": "inpaint_holes",
           "keepPercent": "keep_percent",
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "segmentId": "segment_id"
         },
         "tool": "vc3d_flatten_slim"
@@ -999,7 +999,7 @@
             "maximum": 100,
             "type": "number"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
           },
           "segmentId": {
@@ -1033,7 +1033,7 @@
           "wait"
         ],
         "paramRenames": {
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "overlapPasses": "overlap_passes",
           "segmentId": "segment_id",
           "trimMaxEdge": "trim_max_edge",
@@ -1047,7 +1047,7 @@
             "default": true,
             "type": "boolean"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
           },
           "overlapPasses": {
@@ -2226,33 +2226,6 @@
         "type": "object"
       }
     },
-    "segment.append_mask": {
-      "errors": [
-        -32602,
-        -32000,
-        -32001,
-        -32004,
-        -32005,
-        -32007
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_append_segment_mask"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "segment.crop_bounds": {
       "errors": [
         -32602,
@@ -2268,32 +2241,6 @@
           "segmentId": "segment_id"
         },
         "tool": "vc3d_crop_segment_bounds"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
-    "segment.generate_mask": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32005,
-        -32007
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_generate_segment_mask"
       },
       "params": {
         "properties": {
@@ -2352,8 +2299,9 @@
         "paramRenames": {
           "borderOff": "border_off",
           "genVertexColor": "gen_vertex_color",
+          "inPlace": "in_place",
           "ompThreads": "omp_threads",
-          "outputDir": "output_dir",
+          "outputName": "output_name",
           "readerScale": "reader_scale",
           "scaleGroup": "scale_group",
           "segmentId": "segment_id"
@@ -2376,6 +2324,10 @@
             "minimum": -2147483648,
             "type": "integer"
           },
+          "inPlace": {
+            "default": false,
+            "type": "boolean"
+          },
           "low": {
             "default": 26,
             "maximum": 2147483647,
@@ -2387,12 +2339,8 @@
             "minimum": -2147483648,
             "type": "integer"
           },
-          "outputDir": {
+          "outputName": {
             "type": "string"
-          },
-          "overwrite": {
-            "default": true,
-            "type": "boolean"
           },
           "radius": {
             "default": 3,
@@ -2598,7 +2546,7 @@
         ],
         "paramRenames": {
           "minAreaCm": "min_area_cm",
-          "outputDir": "output_dir",
+          "outputTag": "output_tag",
           "volumeId": "volume_id"
         },
         "tool": "vc3d_grow_patch_from_seed"
@@ -2616,7 +2564,8 @@
             "minimum": 0,
             "type": "number"
           },
-          "outputDir": {
+          "outputTag": {
+            "default": "paths",
             "type": "string"
           },
           "seed": {
@@ -3154,9 +3103,10 @@
         ],
         "paramRenames": {
           "ompThreads": "omp_threads",
-          "outputDir": "output_dir",
+          "outputTag": "output_tag",
           "paramOverrides": "param_overrides",
-          "segmentId": "segment_id"
+          "segmentId": "segment_id",
+          "sourceTag": "source_tag"
         },
         "tool": "vc3d_run_trace"
       },
@@ -3167,7 +3117,8 @@
             "minimum": -2147483648,
             "type": "integer"
           },
-          "outputDir": {
+          "outputTag": {
+            "default": "traces",
             "type": "string"
           },
           "paramOverrides": {
@@ -3178,6 +3129,10 @@
             ]
           },
           "segmentId": {
+            "type": "string"
+          },
+          "sourceTag": {
+            "default": "paths",
             "type": "string"
           }
         },

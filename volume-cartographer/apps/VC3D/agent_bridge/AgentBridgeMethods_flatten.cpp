@@ -58,7 +58,7 @@ void AgentBridgeServer::registerFlattenHandlers()
                 Params::optionalBoolean(
                     QStringLiteral("inpaintHoles"),
                     false),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputName")),
             },
             .errors = {
                 -32602, -32000, -32001, -32004, -32005, -32006, -32007,
@@ -106,7 +106,7 @@ void AgentBridgeServer::registerFlattenHandlers()
                     QStringLiteral("trimMaxEdge"),
                     100.0,
                     0.0),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputName")),
             },
             .errors = {
                 -32602, -32000, -32001, -32004, -32005, -32006, -32007,

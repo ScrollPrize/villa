@@ -252,18 +252,19 @@ async def vc3d_grow_patch_from_seed(
     volume_id: Optional[str] = None,
     iterations: int = 200,
     min_area_cm: float = 0.002,
-    output_dir: Optional[str] = None,
+    output_tag: str = "paths",
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Create a brand-new segment by growing a patch from a 3D seed point
-    (headless GrowPatch). Async: returns a jobId and outputDir.
+    (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the
+    finished job's output.
 
     seed: volume-space {"x","y","z"} seed point.
     volume_id: vpkg volume id; default is the current volume.
     iterations: 1..100000, default 200 ("generations" in the underlying tool).
     min_area_cm: minimum patch area in cm^2, >= 0.
-    output_dir: absolute path, or relative to the volpkg root.
+    output_tag: tag of the new surface (default "paths").
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
     """
@@ -275,7 +276,7 @@ async def vc3d_grow_patch_from_seed(
                 "volumeId": volume_id,
                 "iterations": iterations,
                 "minAreaCm": min_area_cm,
-                "outputDir": output_dir,
+                "outputTag": output_tag,
             }
         ),
     )
@@ -358,16 +359,18 @@ async def vc3d_run_trace(
     segment_id: str,
     param_overrides: Optional[dict[str, Any]] = None,
     omp_threads: Optional[int] = None,
-    output_dir: Optional[str] = None,
+    source_tag: str = "paths",
+    output_tag: str = "traces",
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
     """Run the patch-stitching tracer (vc_grow_seg_from_segments) on a segment,
     the headless twin of the "Run Trace" context-menu action. Asynchronous
     (a source:"tool" job -- poll vc3d_job_status). param_overrides is merged
-    over <volpkg>/trace_params.json. output_dir defaults to <volpkg>/traces.
-    Rejects remote volumes. Returns {"jobId", "kind": "tracer.run_trace",
-    "source": "tool", "outputDir"}.
+    over <volpkg>/trace_params.json. The trace grows along the surfaces tagged
+    source_tag; its surfaces are tagged output_tag and their UUIDs are the
+    finished job's output. Rejects remote volumes. Returns {"jobId", "kind":
+    "tracer.run_trace", "source": "tool"}.
 
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline."""
@@ -378,7 +381,8 @@ async def vc3d_run_trace(
                 "segmentId": segment_id,
                 "paramOverrides": param_overrides,
                 "ompThreads": omp_threads,
-                "outputDir": output_dir,
+                "sourceTag": source_tag,
+                "outputTag": output_tag,
             }
         ),
     )

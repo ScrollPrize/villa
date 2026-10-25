@@ -1,4 +1,4 @@
-"""Per-segment mesh operations (crop, area, reoptimize, refine, mask)."""
+"""Per-segment mesh operations (crop, area, reoptimize, refine)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,6 @@ from typing import Any, Optional
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
-
-# The bridge caps a mask render's deferred reply at 120s (AgentBridgeHandlers_
-# surfaceops.cpp beginDeferred(120000)); the client's default request timeout is
-# only 30s. Wait comfortably past the server cap so a slow-but-succeeding render
-# resolves client-side instead of failing while the bridge is still writing.
-MASK_RENDER_TIMEOUT_S = 130.0
 
 
 @mcp.tool()
@@ -96,11 +90,11 @@ async def vc3d_refine_segment_alpha_comp(
     border_off: float = 1.0,
     radius: int = 3,
     gen_vertex_color: bool = False,
-    overwrite: bool = True,
     reader_scale: float = 0.5,
     scale_group: str = "1",
     omp_threads: Optional[int] = None,
-    output_dir: Optional[str] = None,
+    output_name: Optional[str] = None,
+    in_place: bool = False,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -115,17 +109,17 @@ async def vc3d_refine_segment_alpha_comp(
     border_off: border offset (default 1.0).
     radius: neighborhood radius (default 3).
     gen_vertex_color: emit vertex colors (default false).
-    overwrite: overwrite an existing output (default true).
     reader_scale: reader downscale factor (default 0.5).
     scale_group: OME-Zarr scale group (default "1").
     omp_threads: OMP_NUM_THREADS override; omit for the runner default.
-    output_dir: absolute path, or relative to the volpkg root. Default is
-    <segment>_refined.
+    output_name: name of the refined surface. Default is <name>_refined.
+    in_place: refine the segment itself instead of creating a new surface
+    (default false).
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
 
     Returns {"jobId", "kind": "segment.refine_alpha_comp", "source": "tool",
-    "outputDir", "segmentId"}.
+    "segmentId"}; the refined surface's UUID is the finished job's output.
     """
     result = await _call(
         "segment.refine_alpha_comp",
@@ -141,46 +135,12 @@ async def vc3d_refine_segment_alpha_comp(
                 "borderOff": border_off,
                 "radius": radius,
                 "genVertexColor": gen_vertex_color,
-                "overwrite": overwrite,
                 "readerScale": reader_scale,
                 "scaleGroup": scale_group,
                 "ompThreads": omp_threads,
-                "outputDir": output_dir,
+                "outputName": output_name,
+                "inPlace": in_place,
             }
         ),
     )
     return await _wait_for_job(result["jobId"], wait, result, ctx)
-
-
-@mcp.tool()
-async def vc3d_generate_segment_mask(segment_id: str) -> dict[str, Any]:
-    """Render a segment's binary mask to <segment>/mask.tif, the headless twin of
-    the "Edit mask" context-menu action. The bridge holds the reply until the
-    render (a background worker) finishes, so this call resolves only on
-    completion (no separate job to poll).
-
-    segment_id: id of the segment to render a mask for.
-
-    Requires a loaded volume package. If mask.tif already exists it is NOT
-    regenerated (matching the GUI), returning {"generated": false,
-    "alreadyExists": true, "maskPath", "segmentId"}. On a fresh render returns
-    {"generated": true, "appended": false, "maskPath", "segmentId", "message"}.
-    """
-    return await _call("segment.generate_mask", {"segmentId": segment_id},
-                       timeout=MASK_RENDER_TIMEOUT_S)
-
-
-@mcp.tool()
-async def vc3d_append_segment_mask(segment_id: str) -> dict[str, Any]:
-    """Append a volume-image layer to a segment's mask.tif (creating it if
-    absent), the headless twin of the "Append mask" context-menu action. Requires
-    a current volume. The bridge holds the reply until the background render
-    finishes, so this call resolves only on completion (no separate job to poll).
-
-    segment_id: id of the segment whose mask to append to.
-
-    Returns {"generated": true, "appended": true, "maskPath", "segmentId",
-    "message"}.
-    """
-    return await _call("segment.append_mask", {"segmentId": segment_id},
-                       timeout=MASK_RENDER_TIMEOUT_S)

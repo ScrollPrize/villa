@@ -204,7 +204,8 @@ void AgentBridgeServer::registerSeedingHandlers()
                     QStringLiteral("paramOverrides"),
                     {})),
                 Params::optionalInteger(QStringLiteral("ompThreads")),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("sourceTag"), QStringLiteral("paths")),
+                Params::optionalString(QStringLiteral("outputTag"), QStringLiteral("traces")),
             },
             .errors = {
                 -32602, -32000, -32004, -32005, -32006, -32007, -32009,

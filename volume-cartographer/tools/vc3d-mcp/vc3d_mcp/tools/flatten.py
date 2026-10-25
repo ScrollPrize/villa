@@ -32,7 +32,8 @@ async def vc3d_render_tifxyz(
     TIFF stack.
     volume_id: vpkg volume id; default is the current volume.
     output_dir: absolute path, or relative to the volpkg root. Default is the
-    segment folder (output lands in <segment>/layers or <segment>/surface.zarr).
+    surface's artifact directory (output lands in <artifacts>/layers or
+    <artifacts>/surface.zarr).
     scale: pixels per level-g voxel, > 0 (default 1.0).
     group_idx: OME-Zarr group index, >= 0 (default 0).
     num_slices: number of slices to render along the surface normal, >= 1
@@ -72,7 +73,7 @@ async def vc3d_flatten_slim(
     energy_type: Literal["symmetric_dirichlet", "conformal"] = "symmetric_dirichlet",
     keep_percent: float = 100.0,
     inpaint_holes: bool = False,
-    output_dir: Optional[str] = None,
+    output_name: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -91,12 +92,12 @@ async def vc3d_flatten_slim(
     Default 100 = full-resolution SLIM (no decimation), the production-
     recommended path. Below 100 decimates then lifts UVs back to full res.
     inpaint_holes: fill holes before flattening (default false).
-    output_dir: absolute path, or relative to the volpkg root. Default is
-    <segment>_flatboi.
+    output_name: name of the new flattened surface. Default is <name>_flatboi.
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
 
-    Returns {"jobId", "kind": "flatten.slim", "source": "flatten", "outputDir"}.
+    Returns {"jobId", "kind": "flatten.slim", "source": "flatten", "outputName"};
+    the new surface's UUID is the finished job's output.
     """
     result = await _call(
         "flatten.slim",
@@ -108,7 +109,7 @@ async def vc3d_flatten_slim(
                 "energyType": energy_type,
                 "keepPercent": keep_percent,
                 "inpaintHoles": inpaint_holes,
-                "outputDir": output_dir,
+                "outputName": output_name,
             }
         ),
     )
@@ -133,8 +134,8 @@ async def vc3d_flatten_abf(
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
 
-    Returns {"jobId", "kind": "flatten.abf", "source": "flatten", "outputDir"}
-    -- output lands in <segment>_abf.
+    Returns {"jobId", "kind": "flatten.abf", "source": "flatten", "outputName"}
+    -- a new surface named <name>_abf, whose UUID is the finished job's output.
     """
     result = await _call(
         "flatten.abf",
@@ -158,7 +159,7 @@ async def vc3d_flatten_straighten(
     orthogonalize: bool = True,
     trim: bool = True,
     trim_max_edge: float = 100.0,
-    output_dir: Optional[str] = None,
+    output_name: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
@@ -175,13 +176,13 @@ async def vc3d_flatten_straighten(
     trim: run the trim stage (default true).
     trim_max_edge: max edge length for the trim stage (default 100); only used
     when trim is true.
-    output_dir: absolute path, or relative to the volpkg root. Default is
-    <segment>_straightened. vc_straighten refuses to overwrite an existing dir.
+    output_name: name of the new straightened surface. Default is
+    <name>_straightened.
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
 
     Returns {"jobId", "kind": "flatten.straighten", "source": "flatten",
-    "outputDir"}.
+    "outputName"}; the new surface's UUID is the finished job's output.
     """
     result = await _call(
         "flatten.straighten",
@@ -194,7 +195,7 @@ async def vc3d_flatten_straighten(
                 "orthogonalize": orthogonalize,
                 "trim": trim,
                 "trimMaxEdge": trim_max_edge,
-                "outputDir": output_dir,
+                "outputName": output_name,
             }
         ),
     )

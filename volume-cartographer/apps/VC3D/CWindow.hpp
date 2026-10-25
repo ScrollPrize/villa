@@ -151,11 +151,6 @@ public:
     bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                    QString* errorMessage = nullptr);
 
-    // Renders <segment>/mask.tif on a QtConcurrent worker. Presentation belongs
-    // to the caller; onFinished runs on the GUI thread.
-    bool startMaskRender(const QString& segmentId, bool append,
-                         std::function<void(bool, QString)> onFinished,
-                         QString* errorMessage = nullptr);
 
 signals:
     // Atlas search progress. phase is in [1, ATLAS_SEARCH_PHASE_COUNT] and
@@ -321,8 +316,6 @@ private:
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
 
 private slots:
-    void onEditMaskPressed(const QString& segmentId);
-    void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
     void onFocusBoundsEdited();
     void onFocusBoundsToggled(bool enabled);
@@ -499,7 +492,6 @@ private:
 
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
-    bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts

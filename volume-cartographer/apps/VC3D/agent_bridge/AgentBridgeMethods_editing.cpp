@@ -94,7 +94,7 @@ void AgentBridgeServer::registerEditingHandlers()
                     1,
                     100000),
                 nonNegativeNumber(QStringLiteral("minAreaCm"), 0.002),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputTag"), QStringLiteral("paths")),
             },
             .errors = {
                 -32602, -32000, -32001, -32004, -32005, -32006, -32007,
