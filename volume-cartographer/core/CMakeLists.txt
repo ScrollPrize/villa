@@ -35,6 +35,7 @@ add_library(vc_core
         src/QuadSurface.cpp
         src/QuadSurfaceStore.cpp
         src/StoreSurfaces.cpp
+        src/SurfaceMeshing.cpp
         src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp
