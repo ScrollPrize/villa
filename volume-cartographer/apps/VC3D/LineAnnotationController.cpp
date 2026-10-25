@@ -453,22 +453,6 @@ std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
         *state->vpkg(), state->currentVolumeId());
 }
 
-void copyCoordinateIdentityToJson(
-    nlohmann::json& target,
-    const std::optional<vc3d::opendata::CoordinateIdentity>& identity)
-{
-    if (!identity)
-        return;
-    target["vc_open_data_coordinate_space"] = identity->coordinateSpace;
-    target["vc_open_data_source_path"] = identity->sourcePath;
-    target["vc_open_data_source_coordinate_level"] =
-        identity->sourceCoordinateLevel;
-    target["vc_open_data_source_coordinate_scale_factor"] =
-        identity->sourceCoordinateScaleFactor;
-    target["vc_open_data_source_original_resolution"] =
-        identity->sourceOriginalResolution;
-}
-
 constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.
@@ -5108,8 +5092,9 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
                                                    basePin,
                                                    zeroWindingColumn,
                                                    std::move(mapping));
-    copyCoordinateIdentityToJson(
-        atlas.metadata.coordinateMetadata, coordinateIdentity);
+    if (coordinateIdentity)
+        atlas.metadata.coordinateMetadata.update(
+            nlohmann::json::parse(vc3d::opendata::coordinateIdentityJson(coordinateIdentity).dump()));
     atlas.save(atlasDir);
     if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
         (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
@@ -17279,8 +17264,6 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     FiberSaveSnapshot snapshot;
     snapshot.fiber = fiber;
     retainStoredFiberCoordinateBaseShape(snapshot.fiber);
-    if ((!snapshot.fiber.storePin || snapshot.fiber.storePin->objectRevision.empty()) && snapshot.fiber.coordinateIdentity.empty())
-        copyCoordinateIdentityToJson(snapshot.fiber.coordinateIdentity, coordinateIdentityForState(_state));
     if ((!fiber.storePin || fiber.storePin->objectRevision.empty()) && _state && _state->currentVolume()) {
         // A fiber created in an annotation pane is in the volume's voxels.
         for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == fiber.uuid) {
