@@ -214,6 +214,19 @@ int runObjectStoreControllerTests()
                     "a moved registered point maps back through the inverse");
             const auto reread = read(scaled);
             require(reread.width == 4 && cv::Vec3d(reread.controlPoints[1]) == cv::Vec3d{6,2,3}, "the saved fiber reads back in the volume");
+            // A record-only edit of a fiber read without its line (tag, rename)
+            // loads the line on save in the same frame and leaves it unchanged.
+            for (const auto& uuid : {scaled, registered}) {
+                const auto before = stored(uuid);
+                auto lazy = controller.readStoredFibers(std::vector<std::string>{uuid}).front();
+                require(!lazy.linePointsLoaded, "lines are loaded on demand");
+                lazy.tags.push_back("reviewed");
+                std::vector<Controller::FiberSaveSnapshot> tagEdit{controller.makeFiberSaveSnapshot(lazy)};
+                controller.commitFiberStoreAction(tagEdit);
+                const auto after = stored(uuid);
+                require(after.linePoints == before.linePoints && after.controlPoints == before.controlPoints,
+                        "a record-only edit keeps the stored geometry");
+            }
             state.detachObjectStore();
         }
         OpenOptions options; options.author = "vc3d-controller-test";

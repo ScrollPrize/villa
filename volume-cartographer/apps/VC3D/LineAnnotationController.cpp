@@ -386,6 +386,18 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// A fiber's sampled line in the frame its controls were read in: the open
+// volume's voxels through the store's view, else stored coordinates.
+std::vector<vc::geometry::Point> storedFiberLinePoints(
+    const vc::objects::FiberView& view, const std::optional<vc3d::line_annotation::FiberVolumeFrame>& frame)
+{
+    if (!frame) return view.linePoints(0, view.linePointCount());
+    const auto shown = view.viewTransformedAt(frame->volume);
+    if (shown.mapping() != frame->storedToVolume)
+        throw std::runtime_error("The fiber's volume registration changed; reopen it");
+    return shown.points("line_points", 0, view.linePointCount());
+}
+
 // Link predicates shared with the save/validation helpers and the
 // structural-edit planners (LineAnnotationFiberLinks.hpp).
 namespace {
@@ -17416,9 +17428,10 @@ void LineAnnotationController::ensureFiberLines(const StoredFiber& fiber) const
     const auto& pin = *fiber.storePin;
     std::vector<cv::Vec3d> points;
     _state->objectStoreSession()->read(pin.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto geometry = std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn, *pin.geometryRevision)));
-        points.reserve(geometry.linePoints.size());
-        for (const auto& point : geometry.linePoints) points.emplace_back(point[0],point[1],point[2]);
+        const auto view = vc::objects::GeometrySnapshot(db, txn).fiber(fiber.uuid, *pin.geometryRevision);
+        const auto line = storedFiberLinePoints(view, fiber.frame);
+        points.reserve(line.size());
+        for (const auto& point : line) points.emplace_back(point[0],point[1],point[2]);
     });
     fiber.linePoints = std::move(points);
     fiber.linePointsLoaded = true;
@@ -17457,14 +17470,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                         fiber.frame = vc3d::line_annotation::FiberVolumeFrame{volume->id(), *mapping};
                 vc::geometry::Fiber geometry;
                 geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
-                if (fiber.frame) {
-                    const auto shown = view.viewTransformedAt(volume->id());
-                    geometry.controlPoints = shown.points("control_points", 0, view.controlPointCount());
-                    if (withLines) geometry.linePoints = shown.points("line_points", 0, view.linePointCount());
-                } else {
-                    geometry.controlPoints = view.controlPoints(0, view.controlPointCount());
-                    if (withLines) geometry.linePoints = view.linePoints(0, view.linePointCount());
-                }
+                geometry.controlPoints = fiber.frame
+                    ? view.viewTransformedAt(volume->id()).points("control_points", 0, view.controlPointCount())
+                    : view.controlPoints(0, view.controlPointCount());
+                if (withLines) geometry.linePoints = storedFiberLinePoints(view, fiber.frame);
                 const auto source = metadata.value("source", nlohmann::json::object());
                 fiber.username = source.value("username", std::string{"anon"});
                 fiber.startedAt = source.value("started_at", std::string{});
