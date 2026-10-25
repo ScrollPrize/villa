@@ -366,6 +366,27 @@ geometry::Fiber TransformedGeometryView::canonicalFiber(const geometry::Fiber& d
         result.linePoints[i]=canonical(desired.linePoints[i],i<stored.linePoints.size()?&stored.linePoints[i]:nullptr);
     return result;
 }
+geometry::PointCollection TransformedGeometryView::canonicalPointCollection(const geometry::PointCollection& desired) const {
+    const auto* collection=std::get_if<PointCollectionView>(&source_);
+    if(!collection)throw std::invalid_argument("not a point collection");
+    if(desired.ids.size()!=desired.points.size())
+        throw std::invalid_argument("point collection IDs do not match its points");
+    const auto stored=collection->load();
+    const auto inverse=mapping_.inverse();
+    std::map<geometry::PointId,size_t> byId;
+    for(size_t i=0;i<stored.ids.size();++i)byId.emplace(stored.ids[i],i);
+    auto result=desired;
+    for(size_t i=0;i<desired.points.size();++i) {
+        const auto found=byId.find(desired.ids[i]);
+        if(found!=byId.end()&&mapping_.apply(stored.points[found->second])==desired.points[i]) {
+            result.points[i]=stored.points[found->second];
+            continue;
+        }
+        result.points[i]=inverse.apply(desired.points[i]);
+        for(double v:result.points[i])if(!std::isfinite(v))throw std::invalid_argument("point coordinate is not finite in the canonical frame");
+    }
+    return result;
+}
 geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");

@@ -112,6 +112,10 @@ public:
     // their displayed position is unchanged, matched by stable ID (by index
     // when desired has no IDs); line points match by index.
     geometry::Fiber canonicalFiber(const geometry::Fiber& desired) const;
+    // A whole edited point collection (points in the target volume) in
+    // canonical coordinates. Points keep their exact canonical values while
+    // their displayed position is unchanged, matched by stable ID.
+    geometry::PointCollection canonicalPointCollection(const geometry::PointCollection& desired) const;
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;

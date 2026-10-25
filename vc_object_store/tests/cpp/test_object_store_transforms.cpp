@@ -86,6 +86,18 @@ int main() try {
             require(std::abs(back[0]-14)<1e-12&&std::abs(back[1]-1)<1e-12&&std::abs(back[2]-21)<1e-12,"inserted control point maps back");
             require(canonical.controlPointIds==edited.controlPointIds,"control point IDs are kept");
         }
+        {
+            // The same for a point collection, matched by stable point ID.
+            const auto collectionView=snapshot.pointCollection(points);const auto shown=collectionView.viewTransformedAt("b");
+            vc::geometry::PointCollection edited;
+            edited.ids={collectionView.ids(0,1).front(),99};
+            edited.points={shown.points("points",0,1).front(),{14,1,21}};
+            const auto canonical=shown.canonicalPointCollection(edited);
+            require(canonical.points[0]==collectionView.points(0,1).front(),"unchanged point keeps its canonical value");
+            const auto back=matrix.apply(canonical.points[1]);
+            require(std::abs(back[0]-14)<1e-12&&std::abs(back[1]-1)<1e-12&&std::abs(back[2]-21)<1e-12,"new point maps back");
+            require(canonical.ids==edited.ids,"point IDs are kept");
+        }
         require(snapshot.pointCollection(points).ids(0,1).front()==17,"stable point IDs remain canonical");
         require(snapshot.track(track).points(1,1).front()[0]==3,"requesting view never changes canonical geometry");
         bool unavailable=false;try{snapshot.track(track).viewTransformedAt("missing");}catch(const std::exception&){unavailable=true;}
