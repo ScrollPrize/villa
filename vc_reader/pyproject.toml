@@ -16,8 +16,8 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
-# The catalog layer is stdlib-only. The reader is the compiled extension built
-# from src/cpp/ (see CMakeLists.txt) plus numpy.
+# Catalog parsing and registrations use the native C++ catalog extension.
+# Array reading additionally requires numpy.
 dependencies = []
 
 [project.optional-dependencies]

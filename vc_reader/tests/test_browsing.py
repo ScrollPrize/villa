@@ -190,7 +190,7 @@ class BrowsingTests(unittest.TestCase):
         self.assertEqual(label.volume.id, 'unpublished')
         self.assertIsNone(label.volume.record)
         self.assertEqual(label.mappable_volumes['a'].transform, Affine.scale(2))
-        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a'])
+        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a', 'b'])
 
     def test_cycles_and_malformed_overlay_relationships(self):
         c = catalog()

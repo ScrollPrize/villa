@@ -1431,3 +1431,18 @@ CUDA backends. Python and C++ use the same implementations. Configure with
 See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
 array/cache configuration, transform pipelines and replay, device-buffer
 ownership, streams, and a complete CPU/CUDA CT-normal example.
+
+### Native catalog
+
+`vc_reader::catalog` provides the same Open Data parser and volume-registration
+resolver used by Python. Include `<vc_reader/catalog.hpp>` to load a catalog,
+browse its samples, scans, volumes, segments and artifacts, or build a
+`RegistrationGraph`. `loadCatalog` accepts a cache file and refresh policy;
+its result reports cached fallback and a warning when refresh fails.
+
+The catalog target requires nlohmann_json, libcurl and zlib; it does not require
+Python, Qt, OpenCV, CUDA or the volume reader. Configure with
+`VC_READER_BUILD_READER=OFF` and `VC_READER_ENABLE_CUDA=OFF` for catalog-only use.
+Python requires the compiled `_catalog` extension but no NumPy or array backend
+for metadata browsing. Native regression tests are enabled by
+`VC_READER_BUILD_NATIVE_TESTS=ON`.

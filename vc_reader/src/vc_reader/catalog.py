@@ -1,10 +1,12 @@
 """Catalog metadata records and the scroll-centered browsing entry point.
 
 Records retain source relationships; contextual views share these records.
-Import and navigation require only the standard library.
+Parsing and registrations are shared with the native C++ catalog.
 """
 from __future__ import annotations
 import os
+import json
+from . import _catalog
 from dataclasses import dataclass
 from typing import Any, Mapping
 from . import _fetch
@@ -63,14 +65,15 @@ class Model:
 
 class Scan:
 
-    def __init__(self, sample: _SampleRecord, d: Mapping[str, Any]):
+    def __init__(self, sample: _SampleRecord, native):
+        d = native.raw
         self.sample = sample
         self.raw = d
-        self.id: str = d['id']
+        self.id: str = native.id
         self.long_id: str | None = d.get('long_id')
         self.creation: Mapping[str, Any] = d.get('creation') or {}
         p = d.get('properties') or {}
-        self.pixel_size_um = _num(p.get('pixel_size_um'))
+        self.pixel_size_um = native.pixel_size_um
         self.energy_kev = _num(p.get('energy_keV'))
         self.detector_distance_mm = _num(p.get('detector_distance_mm'))
         self.name: str | None = _scan_name(self.creation.get('metadata') or {})
@@ -84,20 +87,21 @@ class Scan:
 
 class _VolumeRecord:
 
-    def __init__(self, sample: _SampleRecord, d: Mapping[str, Any]):
+    def __init__(self, sample: _SampleRecord, native):
+        d = native.raw
         self.sample = sample
         self.raw = d
-        self.id: str = d['id']
+        self.id: str = native.id
         self.long_id: str | None = d.get('long_id')
         self.suffix: str | None = d.get('suffix')
-        self.scan_id: str | None = d.get('scan_id')
+        self.scan_id: str | None = native.scan_id or None
         self.creation: Mapping[str, Any] = d.get('creation') or {}
         p = self.properties = d.get('properties') or {}
-        self.pixel_size_um = _num(p.get('pixel_size_um'))
-        self.energy_kev = _num(p.get('energy_keV'))
-        self.detector_distance_mm = _num(p.get('detector_distance_mm'))
-        self.dtype: str | None = p.get('data_format')
-        shape = p.get('shape')
+        self.pixel_size_um = native.pixel_size_um
+        self.energy_kev = native.energy_kev
+        self.detector_distance_mm = native.detector_distance_mm
+        self.dtype: str | None = native.dtype or None
+        shape = native.shape_zyx
         self.shape_zyx: tuple[int, int, int] | None = tuple(shape) if shape else None
         lic = p.get('license')
         self.license = License(lic['name'], lic['url']) if lic else None
@@ -108,7 +112,7 @@ class _VolumeRecord:
         self.left_handed_coordinates: bool | None = p.get('left_handed_coordinates')
         self.z_direction_is_top_to_bottom: bool | None = p.get('z_direction_is_top_to_bottom')
         self.text_side: str | None = p.get('text_side')
-        self.artifacts = parse_artifacts(d.get('data'))
+        self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
 
     def __repr__(self) -> str:
         return f'_VolumeRecord({self.long_id or self.id!r})'
@@ -123,20 +127,21 @@ class _VolumeRecord:
 
 class _SegmentRecord:
 
-    def __init__(self, sample: _SampleRecord, d: Mapping[str, Any]):
+    def __init__(self, sample: _SampleRecord, native):
+        d = native.raw
         self.sample = sample
         self.raw = d
-        self.id: str = d['id']
+        self.id: str = native.id
         self.long_id: str | None = d.get('long_id')
         self.suffix: str | None = d.get('suffix') or None
-        self.original_volume_id: str = d['original_volume_id']
+        self.original_volume_id: str = native.original_volume_id
         self.creation: Mapping[str, Any] = d.get('creation') or {}
         p = self.properties = d.get('properties') or {}
-        self.width: int | None = p.get('width')
-        self.height: int | None = p.get('height')
+        self.width: int | None = native.width
+        self.height: int | None = native.height
         self.original_volume_downscale: int = int(p.get('original_volume_downscale') or 1)
         self.coverage: dict[str, VolumeCoverage] = {vid: VolumeCoverage.from_json(vid, c) for vid, c in (p.get('volume_coverage') or {}).items()}
-        self.artifacts = parse_artifacts(d.get('data'))
+        self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
 
     def __repr__(self) -> str:
         return f'_SegmentRecord({self.long_id or self.id!r})'
@@ -147,26 +152,22 @@ class _SegmentRecord:
 
 class _SampleRecord:
 
-    def __init__(self, catalog: Catalog, tree: Mapping[str, Any]):
+    def __init__(self, catalog: Catalog, native):
+        tree = native.raw
         self.catalog = catalog
         self.raw = tree
-        s = tree['sample']
-        self.id: str = s['id']
+        s = tree.get('sample') or tree
+        self.id: str = native.id
         self.description: str | None = s.get('description')
-        p = self.properties = s.get('properties') or {}
-        self.type: str | None = p.get('type')
+        p = self.properties = native.properties
+        self.type: str | None = native.type or None
         self.display_name: str | None = p.get('description')
         self.legacy_data_url: str | None = p.get('legacy_data_url')
         self.aliases: tuple[str, ...] = tuple((a for a, sid in COMMUNITY_ALIASES.items() if sid == self.id))
-        self.artifacts = parse_artifacts(s.get('data'))
-        self.scans: dict[str, Scan] = {k: Scan(self, v) for k, v in (tree.get('scans') or {}).items()}
-        self.volumes: dict[str, _VolumeRecord] = {k: _VolumeRecord(self, v) for k, v in (tree.get('volumes') or {}).items()}
-        self.segments: dict[str, _SegmentRecord] = {k: _SegmentRecord(self, v) for k, v in (tree.get('segments') or {}).items()}
-        self._transforms: dict[tuple[str, str], Affine] = {}
-        for group in p.get('volume_transforms') or ():
-            src = group['from_volume_id']
-            for t in group.get('transforms') or ():
-                self._transforms[src, t['to_volume_id']] = Affine.from_rows(t['matrix'], t.get('derivation_path'))
+        self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
+        self.scans: dict[str, Scan] = {v.id: Scan(self, v) for v in native.scans}
+        self.volumes: dict[str, _VolumeRecord] = {v.id: _VolumeRecord(self, v) for v in native.volumes}
+        self.segments: dict[str, _SegmentRecord] = {v.id: _SegmentRecord(self, v) for v in native.segments}
 
     def __repr__(self) -> str:
         return f'_SampleRecord({self.id!r}, volumes={len(self.volumes)}, segments={len(self.segments)})'
@@ -185,13 +186,8 @@ class _SampleRecord:
         voxel frame, so the identity is returned for that pair if no matrix is
         listed. None when the volumes are not registered to each other.
         """
-        a, b = (_volume_id(from_volume), _volume_id(to_volume))
-        if a == b:
-            return Affine.identity()
-        tf = self._transforms.get((a, b))
-        if tf is not None:
-            return tf
-        return Affine.identity() if self.same_frame(a, b) else None
+        result = self.catalog._native.transform(self.id, _volume_id(from_volume), _volume_id(to_volume))
+        return None if result is None else Affine.from_rows(result['matrix'], result['derivation_path'])
 
     def same_frame(self, a: _VolumeRecord | str, b: _VolumeRecord | str) -> bool:
         """True if ``a`` and ``b`` are the same volume or one supersedes the other."""
@@ -202,11 +198,15 @@ class _SampleRecord:
 class Catalog:
 
     def __init__(self, data: Mapping[str, Any], source: str | None=None):
+        self._native = data if isinstance(data, _catalog.Catalog) else _catalog.parse(json.dumps(data))
+        data = self._native.raw
+        if 'metadata' in data:
+            data = data['metadata']
         self.raw = data
         self.source = source
         self.schema_url: str | None = data.get('$schema')
-        self.models: dict[str, Model] = {k: Model(v) for k, v in (data.get('models') or {}).items()}
-        self._samples: dict[str, _SampleRecord] = {k: _SampleRecord(self, v) for k, v in (data.get('samples') or {}).items()}
+        self.models: dict[str, Model] = {v.id: Model(dict(v.raw, id=v.id)) for v in self._native.models}
+        self._samples: dict[str, _SampleRecord] = {v.id: _SampleRecord(self, v) for v in self._native.samples}
         self._names = SampleNameIndex()
         for s in self._samples.values():
             self._names.add(s.id, (s.display_name, *s.aliases))
@@ -218,15 +218,19 @@ class Catalog:
     def load(cls, source: str | os.PathLike[str]=_fetch.DEFAULT_METADATA_URL, *, cache_dir: str | os.PathLike[str] | None=None, use_cache: bool=True, max_age: float=3600.0, refresh: bool=False, timeout: float=60.0) -> Catalog:
         """Load from an http(s) URL (cached on disk) or a local file (plain or gzipped JSON)."""
         src = os.fspath(source)
-        if src.startswith(('http://', 'https://')):
-            data = _fetch.fetch_metadata(src, cache_dir=cache_dir, use_cache=use_cache, max_age=max_age, refresh=refresh, timeout=timeout)
-        else:
-            data = _fetch.read_metadata_file(src)
-        return cls(data, source=src)
+        import hashlib
+        cache = ''
+        if use_cache:
+            cache = os.fspath((_fetch.default_cache_dir() if cache_dir is None else __import__('pathlib').Path(cache_dir)) /
+                              ('metadata-' + hashlib.sha256(src.encode()).hexdigest()[:16] + '.json'))
+        return cls(_catalog.load(src, cache, refresh, max_age), source=src)
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> Catalog:
-        return cls(_fetch.read_metadata_file(path), source=os.fspath(path))
+        return cls(_catalog.load(os.fspath(path)), source=os.fspath(path))
+
+    def __reduce__(self):
+        return (Catalog, (self.raw, self.source))
 
     @property
     def _index(self):

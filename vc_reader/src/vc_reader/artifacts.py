@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Mapping
+from . import _catalog
 
 OPEN_DATA_S3_ROOT = "s3://vesuvius-challenge-open-data"
 OPEN_DATA_HTTPS_ROOT = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
@@ -75,17 +76,12 @@ def pyramid_sublevel(grid_level: int | None, volume_level: int) -> int | None:
 
 
 def join_url(root: str, path: str) -> str:
-    return root.rstrip("/") + "/" + path.lstrip("/")
+    return _catalog.join_url(root, path)
 
 
 def to_https(url: str) -> str | None:
-    """HTTPS form of ``url``, or None if no public HTTPS equivalent is known."""
-    if url.startswith(("https://", "http://")):
-        return url
-    for s3, https in HTTPS_REWRITES:
-        if url.startswith(s3):
-            return https + url[len(s3):]
-    return None
+    """Public HTTPS location resolved by the shared native catalog."""
+    return _catalog.to_https(url)
 
 
 def to_s3(url: str) -> str | None:
@@ -143,15 +139,16 @@ class Artifact:
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> Artifact:
-        return cls(
-            type=d.get("type") or "",
-            origins=tuple(Origin.from_json(o) for o in d.get("origins") or ()),
-            parameters=d.get("parameters") or {},
-            properties=d.get("properties") or {},
-            creation_info=d.get("creation_info"),
-            id=d.get("id"),
-            raw=d,
-        )
+        return cls.from_native(_catalog.parse_artifacts([d])[0])
+
+    @classmethod
+    def from_native(cls, native) -> Artifact:
+        d = native.raw
+        return cls(type=native.type,
+                   origins=tuple(Origin(o.path, tuple(AccessRoot(r.type, r.url, r.usage) for r in o.access_roots),
+                                        o.raw.get('copy_info')) for o in native.origins),
+                   parameters=native.parameters, properties=native.properties,
+                   creation_info=native.creation_info or None, id=d.get('id'), raw=d)
 
     def __repr__(self) -> str:
         params = ", ".join(f"{k}={v!r}" for k, v in self.parameters.items())
@@ -218,17 +215,13 @@ class Artifact:
         None to keep the location's own scheme. The open-data bucket is
         preferred over other channels; otherwise metadata order is kept.
         """
-        convert = {"https": to_https, "s3": to_s3, None: lambda u: u}.get(scheme)
-        if convert is None:
+        if scheme not in ('https', 's3', None):
             raise ValueError(f"unknown scheme {scheme!r}; use 'https', 's3' or None")
-        ranked = []
-        for i, o in enumerate(self.origins):
-            for r in o.access_roots:
-                url = convert(join_url(r.url, o.path))
-                if url is not None:
-                    open_data = r.url.rstrip("/") in (OPEN_DATA_S3_ROOT, OPEN_DATA_HTTPS_ROOT)
-                    ranked.append((not open_data, i, url))
-        return min(ranked)[2] if ranked else None
+        native = _catalog.parse_artifacts([self.raw or dict(type=self.type, origins=[
+            dict(path=o.path, access_roots=[dict(type=r.type, url=r.url, usage=r.usage) for r in o.access_roots])
+            for o in self.origins])])[0]
+        url = native.url if scheme == 'https' else native.source_path
+        return (to_s3(url) if scheme == 's3' else url) or None
 
     @property
     def usage(self) -> tuple[str, ...]:
@@ -237,4 +230,4 @@ class Artifact:
 
 
 def parse_artifacts(entries: Any) -> tuple[Artifact, ...]:
-    return tuple(Artifact.from_json(e) for e in entries or ())
+    return tuple(Artifact.from_native(a) for a in _catalog.parse_artifacts(entries or []))
