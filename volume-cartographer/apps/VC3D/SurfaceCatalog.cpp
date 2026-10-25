@@ -231,7 +231,7 @@ void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<voi
         auto record = *db.objectByUuid(txn, uuid);
         change(record);
         db.upsertObject(txn, record);
-        for (const auto& edge : db.edgesOf(txn, uuid, true)) db.keepRecordedRelationship(txn, edge.uuid);
+        db.keepRecordedRelationshipsOf(txn, uuid);
     });
 }
 
@@ -265,7 +265,7 @@ void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
     session_->editKeepingRelationships(*attachment_, pins, {}, [&](auto& db, auto& txn, const auto&) {
         for (const auto& [uuid, revision] : pins) {
             db.retireObject(txn, uuid);
-            for (const auto& edge : db.edgesOf(txn, uuid, true)) db.keepRecordedRelationship(txn, edge.uuid);
+            db.keepRecordedRelationshipsOf(txn, uuid);
         }
     });
 }
