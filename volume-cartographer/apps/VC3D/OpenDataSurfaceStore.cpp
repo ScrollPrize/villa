@@ -1,6 +1,5 @@
 #include "OpenDataSurfaceStore.hpp"
 
-#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
