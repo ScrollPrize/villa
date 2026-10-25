@@ -109,11 +109,18 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 uv run python -m vesuvius.ink_detection.inference.
 
 A 1320 × 2480 px, 31-layer segment takes about two minutes per model on an M5 Pro. Run both depth directions: ink should show in only one of them. Strokes that appear in both directions are almost always crack or tear edges. The rims of voids are the other common false positive, so mask them before you review.
 
-**Check the pipeline on known text first.** `ink_9um` holds out PHerc1667 segment `w018` from training. Rendered from the 2.4 µm volume at level 2 and run through the steps above, it should show rows of letters in the forward direction and noise in reverse. If it doesn't, check `--flip` and the mesh frame level before you scan new surfaces.
+**Check the pipeline on known text first.** The `ink_9um` labels include held-out validation regions on three segments:
+- `pherc0139-w016`;
+- `pherc0814-46527`;
+- `pherc1667-w029`.
+
+Render one of them with the steps above and compare the prediction with the published labels inside `<case>_validation_mask`. The mac-first-letters repo's `bench/` scripts do this end to end. Its `RESULTS.md` shows the streamed renders scoring within about 0.01 AUROC of the official surface volumes.
+
+A quicker visual check is PHerc1667 `w018`: it should show rows of letters in the forward direction and noise in reverse. It is part of the training labels, so it confirms orientation and scale, not generalisation. If either check fails, look at `--flip` and the mesh frame level before you scan new surfaces.
 
 ## 6. Spiral fitting
 
-`spiral-fitting` can run on MPS for short fits. On the PHerc0846A band we tested, MPS driver memory grew by about 0.35 GB per step. For long fits, set `FIT_SPIRAL_DEVICE=cpu`: a 1000-slice band ran at about 0.5 it/s with a 4.7 GB peak.
+`spiral-fitting` runs track-based fits on MPS with `FIT_SPIRAL_DEVICE=mps`. On a 1000-slice PHerc0846A band with 144k tracks, an M5 Pro reaches about 1.1 it/s (0.6 it/s while sharing the machine with other jobs). The same fit on CPU does 0.47 it/s. This needs the MPS fixes in ScrollPrize/villa PR "spiral-fitting: make weighted track sampling work on MPS". The fit holds about 4.5 GB between steps and peaks around 10 GB.
 
 You can build a band dataset from public data alone:
 - umbilicus: `vc_gen_umbilicus` on the normal grids;
