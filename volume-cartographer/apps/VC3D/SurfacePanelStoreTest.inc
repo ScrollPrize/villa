@@ -5,7 +5,9 @@
 #include <iostream>
 #include <vc_object_store/Uuid.hpp>
 // Built only with VC_TESTING. The surface panel over a real object store:
-// listing, filters, tags, activation and deletion through commit events.
+// listing, filters, tags, activation and deletion through commit events; a
+// read-only catalog store listed beside it at a pyramid level, fetched on
+// activation and copied into the user's store.
 int runSurfacePanelStoreTests()
 {
     using namespace vc::objects;
@@ -89,6 +91,48 @@ int runSurfacePanelStoreTests()
         require(panel.retireSurfaces({QString::fromStdString(approved)}, &error), "surfaces retire");
         pump([&] { return tree.topLevelItemCount() == 2; }, "retired surfaces leave the panel");
         require(visible() == std::vector<std::string>{plain}, "retired surfaces are not drawn");
+
+        // A catalog store of another (catalog) volume that the open volume shows at
+        // level 1: one surface with geometry, one still remote.
+        const auto catalogPath = fs::path(dir.path().toStdString()) / "catalog.vcobj";
+        std::string shown, remote;
+        {
+            auto db = ObjectStore::create(catalogPath, options);
+            const auto binding = nlohmann::json{{"coordinates", {{"volume_uuid", "catalog-volume"}, {"scale_factor", 1}}}}.dump();
+            shown = util::newUuid();
+            remote = util::newUuid();
+            auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
+            create_quad_in_store(db, txn, shown, grid, "shown", {}, binding);
+            ObjectRecord record;
+            record.uuid = remote; record.kind = "surface"; record.name = "remote"; record.meta = binding;
+            db.upsertObject(txn, record);
+            txn.commit();
+        }
+        std::vector<std::string> fetched;
+        catalog.setFetcher([&](const fs::path& store, const std::string& uuid) {
+            fetched.push_back(uuid);
+            auto db = ObjectStore::open(store, options);
+            auto txn = db.write({{uuid, db.currentObjectRevision(db.read(), uuid)->uuid}});
+            db.putGeometry(txn, uuid, quad_surface_geometry(grid));
+            txn.commit();
+        });
+        catalog.setCatalogSources({{state.catalogAttachment(catalogPath), "catalog-volume", 0.5}});
+        pump([&] { return tree.topLevelItemCount() == 4; }, "catalog surfaces are listed beside the user's");
+        require(catalog.row(shown)->catalog && !catalog.row(plain)->catalog, "rows know their store");
+        require(catalog.row(shown)->toVolume == 0.5, "catalog rows are scaled to the open volume's level");
+
+        require(panel.activateSurfaceById(shown, &error), "catalog surfaces open");
+        require((*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "in the open volume's voxels");
+        require(!panel.opened()->editable, "catalog surfaces are read-only");
+        require(panel.activateSurfaceById(remote, &error) && fetched == std::vector<std::string>{remote},
+                "a remote catalog surface is fetched when activated headlessly");
+
+        const auto copy = catalog.copy(shown, "editable");
+        catalog.readNow({copy});
+        require(catalog.row(copy) && !catalog.row(copy)->catalog && catalog.row(copy)->toVolume == 1.0,
+                "a copy of a catalog surface is the user's, in the open volume's voxels");
+        require(panel.activateSurfaceById(copy, &error) && panel.opened()->editable &&
+                (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "the copy opens editable");
         state.detachObjectStore();
         std::cerr << "surface panel store tests passed\n";
         return 0;
