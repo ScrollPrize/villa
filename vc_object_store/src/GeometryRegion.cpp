@@ -350,8 +350,9 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                 auto at = [&](double t) {
                     if (t <= 0) return a;
                     if (t >= 1) return b;
+                    // a and b are crossings of target-space vertices.
                     Point p; for (int k = 0; k < 3; ++k) p[k] = a[k] + t * (b[k] - a[k]);
-                    return options.toTarget?options.toTarget->apply(p):p;
+                    return p;
                 };
                 const uint64_t added = open && first <= 0 ? 24 : 48;
                 if (added > options.outputByteBudget - result.stats.outputBytes) request.stop(RegionStop::OutputBudget);

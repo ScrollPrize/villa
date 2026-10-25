@@ -45,6 +45,20 @@ int main() try {
         const auto halfRuns=db.geometryRegion(txn,slice,region);
         require(halfRuns.complete()&&halfRuns.runs.size()==1&&halfRuns.runs.front().points.front()==std::array<double,3>{5,0,10},
                 "regions at a target scale");
+        // A registered surface cut by x'=13 and clipped to y in [0.5,1.5]: both
+        // run ends are interpolated inside the mesh, already in target space.
+        RegionOptions surfaces;surfaces.volume="b";surfaces.kind="surface";
+        RegionSlice cut;cut.origin={13,1,21};cut.u={0,1,0};cut.v={0,0,1};cut.normal={1,0,0};cut.localBounds={-.5,-1,-1,.5,1,1};
+        auto clippedEnds=[&](double scale){
+            const auto found=db.geometryRegion(txn,cut,surfaces);
+            require(found.complete()&&found.runs.size()==1&&found.runs.front().points.size()>=2,"registered surface cut");
+            for(const auto& p:{found.runs.front().points.front(),found.runs.front().points.back()})
+                require(std::abs(p[0]-13*scale)<1e-9&&std::abs(p[2]-21*scale)<1e-9&&
+                        (std::abs(p[1]-.5*scale)<1e-9||std::abs(p[1]-1.5*scale)<1e-9),"clipped surface run ends are mapped once");
+        };
+        clippedEnds(1);
+        surfaces.targetScale=.5;cut.origin={6.5,.5,10.5};cut.localBounds={-.25,-.5,-.5,.25,.5,.5};
+        clippedEnds(.5);
     }
     std::string objectRevision,geometryRevision;
     std::vector<GeometryArrayEdit> changes;
