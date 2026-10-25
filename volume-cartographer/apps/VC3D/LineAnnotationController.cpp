@@ -1,5 +1,6 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include "ObjectStoreCoordinates.hpp"
@@ -17582,15 +17583,12 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             fiber.id = fiberIdForUuid(object.uuid);
             try {
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
-                const auto revision = db.geometryRevision(txn, *head.geometryRevision);
-                GeometryData data; data.kind = "fiber";
-                for (const auto& descriptor : revision->arrays) {
-                    GeometryArray array; array.name = descriptor.name; array.dtype = descriptor.dtype; array.shape = descriptor.shape;
-                    if (array.name == "line_points" && !withLines) array.shape[0] = 0;
-                    else array.bytes = db.readGeometryArray(txn, revision->uuid, array.name);
-                    data.arrays.push_back(std::move(array));
-                }
-                const auto geometry = std::get<vc::geometry::Fiber>(vc::geometry::decode(data));
+                // Controls always; the sampled line only when asked for.
+                const auto view = GeometrySnapshot(db, txn).fiber(object.uuid, *head.geometryRevision);
+                vc::geometry::Fiber geometry;
+                geometry.controlPoints = view.controlPoints(0, view.controlPointCount());
+                geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
+                if (withLines) geometry.linePoints = view.linePoints(0, view.linePointCount());
                 const auto metadata = nlohmann::json::parse(object.meta);
                 const auto source = metadata.value("source", nlohmann::json::object());
                 fiber.username = source.value("username", std::string{"anon"});

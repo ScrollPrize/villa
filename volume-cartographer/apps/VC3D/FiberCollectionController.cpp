@@ -1,5 +1,6 @@
 #include "FiberCollectionController.hpp"
 #include "ObjectStoreEvents.hpp"
+#include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -30,7 +31,6 @@
 #include <QtConcurrent/QtConcurrentRun>
 #include <nlohmann/json.hpp>
 #include <algorithm>
-#include <bit>
 #include <functional>
 #include <cmath>
 #include <limits>
@@ -65,18 +65,6 @@ bool inside(const Point& local, const Bounds& bounds)
         if (local[i] < bounds.lower[i] || local[i] > bounds.upper[i])
             return false;
     return true;
-}
-// Little-endian float64 XYZ rows, as the store returns them.
-Point xyzAt(const std::vector<uint8_t>& bytes, size_t row)
-{
-    Point p{};
-    for (size_t axis = 0; axis < 3; ++axis) {
-        uint64_t bits = 0;
-        for (size_t byte = 0; byte < 8; ++byte)
-            bits |= uint64_t(bytes[row * 24 + axis * 8 + byte]) << (8 * byte);
-        p[axis] = std::bit_cast<double>(bits);
-    }
-    return p;
 }
 // Consecutive groups are separated by the golden angle; saturation and value
 // bands keep unusually large sets distinct.
@@ -619,7 +607,7 @@ void FiberCollectionController::navigate(int index)
                 const auto geometry=db.geometryRevision(txn,*pin.geometryRevision);
                 const auto lines=std::find_if(geometry->arrays.begin(),geometry->arrays.end(),[](const auto& a){return a.name=="line_points";});
                 const auto name=lines!=geometry->arrays.end() && lines->shape[0]>0 ? "line_points" : "control_points";
-                point=xyzAt(db.readGeometryArray(txn,*pin.geometryRevision,name,int64_t(index)*24,24),0);
+                point=vc::objects::xyzFromBytes<double>(db.readGeometryArray(txn,*pin.geometryRevision,name,int64_t(index)*24,24)).front();
             });return point;
         },
         [this, rev, token, factor=*selectedToVolume_](const Outcome<Point>& result) {
@@ -720,12 +708,14 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 if (!revisions.empty()) {
                     const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
                     if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
-                    for (size_t i = 0; i < owners.size(); ++i)
-                        for (uint64_t row = controls.offsets[i]; row < controls.offsets[i + 1]; ++row) {
-                            auto position = xyzAt(controls.data, row);
+                    for (size_t i = 0; i < owners.size(); ++i) {
+                        const auto positions = vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i));
+                        for (size_t k = 0; k < positions.size(); ++k) {
+                            auto position = positions[k];
                             for (auto& coordinate : position) coordinate *= factors.at(owners[i]);
-                            result.controls.push_back({owners[i], int(row - controls.offsets[i]), position});
+                            result.controls.push_back({owners[i], int(k), position});
                         }
+                    }
                 }
                 if (!linked) return;
                 vc::objects::EdgeSelection edges;
@@ -1039,13 +1029,10 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                     chain.uuid = uuids[i];
                     auto& index = controlIndex[uuids[i]];
                     index.first = result.chains.size();
-                    for (uint64_t row = controls.offsets[i]; row < controls.offsets[i + 1]; ++row)
-                        chain.points.push_back(cvpoint(xyzAt(controls.data, row), factors[i]));
-                    for (uint64_t row = ids.offsets[i]; row < ids.offsets[i + 1]; ++row) {
-                        uint64_t bits = 0;
-                        for (size_t byte = 0; byte < 8; ++byte) bits |= uint64_t(ids.data[row * 8 + byte]) << (8 * byte);
-                        index.second[std::bit_cast<int64_t>(bits)] = size_t(row - ids.offsets[i]);
-                    }
+                    for (const auto& position : vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i)))
+                        chain.points.push_back(cvpoint(position, factors[i]));
+                    const auto controlIds = vc::objects::scalarsFromBytes<int64_t>(vc::objects::packedItem(ids, i));
+                    for (size_t k = 0; k < controlIds.size(); ++k) index.second[controlIds[k]] = k;
                     chain.linkMarks.assign(chain.points.size(), LinkMark{});
                     result.chains.push_back(std::move(chain));
                 }
