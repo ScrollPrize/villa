@@ -112,6 +112,10 @@ int main() try {
                     xyzFromBytes<double>(packedItem(packed, 0)) == std::vector<std::array<double, 3>>{{1,2,3}},
                     "packed items decode to their points");
             mustFail([&] { (void)packedItem(packed, 2); });
+            ObjectSelection umbilici; umbilici.uuids = {a, b};
+            const auto heads = db.currentRevisions(txn, umbilici);
+            require(heads.size() == 2 && *heads.at(a) == db.currentObjectRevision(txn, a)->uuid &&
+                    *heads.at(b) == db.currentObjectRevision(txn, b)->uuid, "current revisions pin a selection");
         });
     }
     // Auxiliary channels and non-finite payload bits belong to the generic

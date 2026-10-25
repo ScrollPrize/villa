@@ -510,6 +510,15 @@ RevisionSelection ObjectStore::revisionSelectionAt(const Txn& txn, int64_t publi
     return result;
 }
 
+RevisionSelection ObjectStore::currentRevisions(const Txn& txn, const ObjectSelection& selection) const
+{
+    const auto heads = revisionSelectionAt(txn, std::numeric_limits<int64_t>::max(), true);
+    RevisionSelection result;
+    for (const auto& object : selectObjects(txn, selection, std::vector<std::string>{}))
+        if (const auto head = heads.find(object.uuid); head != heads.end()) result.emplace(head->first, head->second);
+    return result;
+}
+
 std::vector<RelationshipRevision> ObjectStore::recordedRelationships(const Txn& txn, const std::string& uuid) const
 {
     const auto revision = objectRevision(txn, uuid);

@@ -382,6 +382,9 @@ public:
     // Latest live revisions at/before this time; actions are indivisible.
     // Empty before the first publication; excludes deletions.
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
+    // The current revisions of the selected objects (a pin for each), without a
+    // query per object.
+    RevisionSelection currentRevisions(const Txn&, const ObjectSelection&) const;
     std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
