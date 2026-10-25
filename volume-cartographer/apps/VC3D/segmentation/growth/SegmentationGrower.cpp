@@ -1231,8 +1231,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
                    kStatusLong);
         return false;
     }
-    std::filesystem::path storePath;
-    catalog->session()->read(*catalog->attachment(), [&](const auto& db, const auto&, const auto&) { storePath = db.path(); });
+    const auto storePath = catalog->session()->path(*catalog->attachment());
 
     utils::Json customParams = _context.widget->customParamsJson();
 

@@ -1795,11 +1795,7 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
     _storeSession = session;
     _storeAttachment = attachment;
     _storePath.clear();
-    if (session && _storeAttachment) {
-        session->read(*_storeAttachment, [this](const auto& db, const auto&, const auto&) {
-            _storePath = QString::fromStdString(db.path().string());
-        });
-    }
+    if (session && _storeAttachment) _storePath = QString::fromStdString(session->path(*_storeAttachment).string());
     // The internal service works on one store file; restart it on the next job.
     if (_process && !_isExternal && _serviceStorePath != _storePath) {
         stopService();

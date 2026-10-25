@@ -96,8 +96,7 @@ std::function<void()> SurfaceCatalog::fetchJob(const std::string& uuid) const
 {
     const auto* listed = row(uuid);
     if (!listed || !listed->catalog || !fetcher_) throw std::runtime_error("The surface has no geometry");
-    std::filesystem::path store;
-    session_->read(listed->source.attachment, [&](const auto& db, const auto&, const auto&) { store = db.path(); });
+    const auto store = session_->path(listed->source.attachment);
     return [fetcher = fetcher_, store, uuid]() { fetcher(store, uuid); };
 }
 

@@ -1449,9 +1449,7 @@ SegmentationCommandHandler::storeForTools(CommandLaunchError* error) const
     StoredSurface stored;
     stored.volumeUuid = QString::fromStdString(catalog->volume()->id());
     try {
-        catalog->session()->read(*catalog->attachment(), [&](const auto& db, const auto&, const auto&) {
-            stored.store = QString::fromStdString(db.path().string());
-        });
+        stored.store = QString::fromStdString(catalog->session()->path(*catalog->attachment()).string());
     } catch (const std::exception& e) {
         setErr(tr("Could not read the object store: %1").arg(e.what()));
         return std::nullopt;

@@ -1172,9 +1172,7 @@ std::optional<QStringList> SeedingWidget::batchStore(QString* error) const
         *error = tr("The object store is read-only.");
         return std::nullopt;
     }
-    std::filesystem::path store;
-    _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(),
-                                     [&](const auto& db, const auto&, const auto&) { store = db.path(); });
+    const auto store = _surfaceCatalog->session()->path(*_surfaceCatalog->attachment());
     return QStringList{QStringLiteral("--store"), QString::fromStdString(store.string()),
                        QStringLiteral("--volume-uuid"), QString::fromStdString(_surfaceCatalog->volume()->id()),
                        QStringLiteral("--tag"), QStringLiteral("paths")};
