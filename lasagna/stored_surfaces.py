@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import getpass
 import math
-import time
 import uuid as uuidlib
 from pathlib import Path
 
@@ -67,20 +66,13 @@ class StoreSession:
 	def sync(self, *, timeout_s: float = 120.0) -> None:
 		"""Pull the hub's changes and push this replica's; returns once a sync started now has finished. A store
 		without a hub, or a shared one, has nothing to sync."""
-		if self._session.hub_status(self._attachment) is None:
+		status = self._session.sync_hub_and_wait(self._attachment, timeout_s=timeout_s)
+		if status is None:
 			return
-		requested_us = time.time() * 1e6
-		self._session.sync_hub(self._attachment)
-		deadline = time.monotonic() + timeout_s
-		while True:
-			status = self._session.hub_status(self._attachment)
-			if status["conflicts"]:
-				raise RuntimeError(f"store {self.path} has hub conflicts to resolve")
-			if (status["synced_at_us"] or 0) > requested_us and not status["pending"]:
-				return
-			if time.monotonic() > deadline:
-				raise RuntimeError(f"store {self.path} did not sync with its hub: {status['error'] or 'timed out'}")
-			time.sleep(0.05)
+		if status["conflicts"]:
+			raise RuntimeError(f"store {self.path} has hub conflicts to resolve")
+		if status["error"]:
+			raise RuntimeError(f"store {self.path} did not sync with its hub: {status['error']}")
 
 	def close(self) -> None:
 		self._session.detach(self._attachment)
