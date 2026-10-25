@@ -27,6 +27,8 @@ public:
     void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {});
 
     vc::objects::PinnedObject pin() const;
+    // The pin the edit started from (the opened surface's).
+    const vc::objects::PinnedObject& origin() const { return _origin; }
     const std::string& uuid() const { return _uuid; }
 
 private:
@@ -34,5 +36,6 @@ private:
     std::string _uuid;
     mutable std::mutex _mutex;
     vc::objects::PinnedObject _pin;
+    const vc::objects::PinnedObject _origin;
     vc::objects::LeaseHold _lease;
 };

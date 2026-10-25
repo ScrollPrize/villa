@@ -6732,6 +6732,28 @@ void CWindow::CreateWidgets(void)
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
     connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
+    // Another replica, tool or service changed the open surface: reopen it, unless
+    // it is being edited (its edits continue from their own revisions).
+    connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
+        const auto active = _state->activeSurface().lock();
+        if (!active || std::find(uuids.begin(), uuids.end(), active->id) == uuids.end() || !_surfaceCatalog->attachment()) {
+            return;
+        }
+        auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
+        if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
+        std::optional<std::string> head;
+        _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
+        });
+        if (!head || (known && known->objectRevision == *head)) {
+            return;
+        }
+        if (_segmentationModule && _segmentationModule->editingEnabled()) {
+            showStatusBarMessage(tr("This surface changed in the object store while you edit it; your saves will be refused until you reopen it."), 15000);
+            return;
+        }
+        _surfacePanel->activateSurfaceById(active->id);
+    });
     if (_viewerManager) {
         _viewerManager->setSurfacePicker([this](const cv::Vec3f& point, float tolerance) -> std::optional<std::string> {
             const auto active = _state->surface("segmentation");

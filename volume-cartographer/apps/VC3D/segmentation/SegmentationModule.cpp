@@ -3033,10 +3033,11 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     if (!surface || surface->id.empty()) {
         return nullptr;
     }
-    if (_storeEdit && _storeEdit->uuid() == surface->id) {
+    const auto pin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
+    // Saves continue from the edit's own revisions until the surface is reopened.
+    if (_storeEdit && _storeEdit->uuid() == surface->id && (!pin || *pin == _storeEdit->origin())) {
         return _storeEdit;
     }
-    const auto pin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
     if (!pin || !_state) {
         return nullptr;
     }

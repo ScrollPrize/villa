@@ -6,7 +6,7 @@
 using namespace vc::objects;
 
 SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, PinnedObject pin)
-    : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(std::move(pin))
+    : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(pin), _origin(std::move(pin))
 {
     if (!_pin.geometryRevision) throw std::runtime_error("The surface has no geometry");
 }
