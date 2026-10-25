@@ -28,7 +28,7 @@ The Surface classes provide an abstraction for working with 2D surfaces embedded
 | Member | Type | Description |
 |--------|------|-------------|
 | `meta` | `nlohmann::json*` | Optional metadata associated with the surface |
-| `path` | `std::filesystem::path` | File path for surfaces loaded from disk |
+| `path` | `std::filesystem::path` | The tifxyz directory of a surface loaded from one (empty for stored surfaces) |
 | `id` | `std::string` | Unique identifier for the surface |
 
 ---
@@ -79,7 +79,30 @@ QuadSurface(cv::Mat_<cv::Vec3f>* points, const cv::Vec2f& scale);
 | `center()` | Returns the center point in internal coordinates |
 | `bbox()` | Computes and caches the 3D bounding box of all valid points |
 
-### Persistence
+### Object store
+
+Surfaces are `surface` objects of a `vc_object_store` database
+(`vc/core/util/QuadSurface.hpp`). VC3D reads and writes surfaces only this way.
+Callers own the transactions and revision pins.
+
+| Function | Description |
+|----------|-------------|
+| `load_quad_from_store(db, txn, uuid, geometryRevision, applyValidity, toVolume)` | Opens a geometry revision (default: current). Vertices whose `valid` is 0 load as `{-1, -1, -1}`; `valid` is the `mask` channel; record tags appear as `meta["tags"]` keys; `toVolume` scales into a volume's voxels |
+| `store_channel_loader(session, attachment, geometryRevision)` | Loads other channels on demand (pass to `setChannelLoader`) |
+| `create_quad_in_store(db, txn, uuid, surface, name, tags, metaJson)` | Creates a surface object from a `QuadSurface` |
+| `quad_surface_geometry(surface)` | The geometry for `putGeometry`: points, `valid` and the other channels |
+| `write_quad_rect_to_store(db, txn, uuid, surface, rect, expected)` | Publishes the changed vertices of a grid rectangle as one sparse edit |
+| `write_quad_channels_to_store(db, txn, uuid, surface, names, remove, expected)` | Replaces or removes channels |
+| `resize_store_surface(db, txn, uuid, gridInStored, expected)` | Grows or crops the stored grid |
+
+Command-line tools use `StoreSurfaces` (`vc/core/util/StoreSurfaces.hpp`) for
+their `--store` mode: `load`, `create` (with tool provenance), `update`,
+`updateChannels`, `artifactDirectory` and `finish` (waits for the hosted-store
+sync).
+
+### tifxyz files
+
+Command-line tools without `--store` still read and write tifxyz directories.
 
 | Method | Description |
 |--------|-------------|
@@ -92,12 +115,12 @@ QuadSurface(cv::Mat_<cv::Vec3f>* points, const cv::Vec2f& scale);
 
 ### Channels
 
-Surfaces can have additional data channels (e.g., masks, generation info) stored as TIFFs.
+Surfaces can have additional data channels (e.g., masks, generation info), stored as geometry arrays of a stored surface or as TIFFs of a tifxyz directory.
 
 | Method | Description |
 |--------|-------------|
 | `setChannel(name, mat)` | Sets a named channel |
-| `channel(name, flags)` | Retrieves a channel (loads from disk on demand) |
+| `channel(name, flags)` | Retrieves a channel (loaded on demand: from the store through the channel loader, or from the tifxyz directory) |
 | `channelNames()` | Returns list of available channel names |
 | `invalidateCache()` | Recomputes internal caches (bounds, center, bbox) |
 | `invalidateMask()` | Removes the mask channel from memory and disk |
@@ -147,12 +170,12 @@ auto it = std::find_if(surf->validPoints().begin(), surf->validPoints().end(),
 | Method | Description |
 |--------|-------------|
 | `validMask()` | Returns `cv::Mat_<uint8_t>` mask at native resolution (255=valid, 0=invalid) |
-| `writeValidMask(const cv::Mat& img)` | Writes mask to `path/mask.tif`. If `img` provided, writes multi-layer TIFF |
+| `writeValidMask(const cv::Mat& img)` | tifxyz only: writes the mask to `path/mask.tif`. If `img` provided, writes multi-layer TIFF |
 
-### Loading
+### Loading tifxyz
 
 ```cpp
-QuadSurface* load_quad_from_tifxyz(const std::string& path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path& path, int flags = 0);
 ```
 
 Loads a surface from a tifxyz directory containing:

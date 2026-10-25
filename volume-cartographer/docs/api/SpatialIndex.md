@@ -78,7 +78,7 @@ struct RayQuery {
 
 | Method | Description |
 |--------|-------------|
-| `rebuild(surfaces, bboxPadding)` | Build the index from a vector of `SurfacePtr` disk-backed tifxyz `QuadSurface` objects. Optional padding expands bounding boxes. |
+| `rebuild(surfaces, bboxPadding)` | Build the index from a vector of `SurfacePtr` `QuadSurface` objects (in VC3D: the active surface and workspace slots; other surfaces are drawn from the object store). Optional padding expands bounding boxes. |
 | `clear()` | Remove all surfaces from the index |
 | `empty()` | Returns `true` if the index contains no surfaces |
 | `patchCount()` | Returns the number of indexed patch boxes |

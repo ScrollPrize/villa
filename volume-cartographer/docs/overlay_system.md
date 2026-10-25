@@ -95,6 +95,18 @@ This replaces older manual `QGraphicsItem` creation.
 - Receives `PathPrimitive`s from drawing and seeding widgets.
 - Supports line-strip and point render modes plus eraser styling (dashed red path).
 
+### StoreSurfaceOverlayController
+
+- Draws the intersections of the surfaces the surface panel shows (other than
+  the active one) with the plane viewers.
+- Reads them from the object store as `geometryRegion` requests (`kind=surface`,
+  the visible UUIDs, the open volume) through `vc3d::store::RegionRequests`, in a
+  1-voxel half-depth slab around each plane; nothing is loaded into `CState`.
+  Surfaces of a read-only Open Data catalog store are requested in their catalog
+  volume's voxels and scaled to the open volume's pyramid level.
+- The active surface (and workspace slots) are drawn by the viewer's own
+  intersection path from `SurfacePatchIndex`.
+
 ### BBoxOverlayController
 
 - Renders persistent selection rectangles and active drag preview.

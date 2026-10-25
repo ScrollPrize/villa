@@ -22,9 +22,9 @@ scaled, physical area stays unchanged, and voxel size is divided by the factor.
 Historical `fit_config` remains unchanged; current voxel size is written at the
 top level, using the fit-config voxel size if no top-level value existed.
 The destination name comes from the output directory name; its UUID is newly
-generated, as with GUI Save As New. Derived outputs omit `catalog-origin.json`
-and `vc_open_data_representation` so they are editable local surfaces, not
-immutable catalog entries. Other coordinate/provenance metadata is retained.
+generated. Derived outputs omit the old Open Data cache markers
+(`catalog-origin.json`, `vc_open_data_representation`). Other
+coordinate/provenance metadata is retained.
 
 If the input records `base_shape_zyx`, the actual target shape is required:
 rounding at lower pyramid levels cannot be inverted to recover exact dimensions.
@@ -45,9 +45,12 @@ A killed process may leave a uniquely named `.scale-*.tmp` directory, which is n
 a completed output and is not reused by subsequent runs.
 
 In VC3D, enable **Scale Only**, then **Don't resample (scale only)** in the
-Transforms panel. The selected volume supplies the destination shape. GUI
-preview/save operates on the current in-memory surface, preserving edits; use
-the CLI for streamed processing of large files without loading a GUI surface.
+Transforms panel. The selected volume supplies the destination shape. Preview
+operates on the current in-memory surface, preserving edits; **Save Transformed**
+creates a new surface in the attached object store (catalog surfaces included)
+whose provenance names the source. Corrections stay linked to the source surface.
+Use the CLI for streamed processing of large tifxyz directories without loading a
+surface.
 
 Build and test:
 

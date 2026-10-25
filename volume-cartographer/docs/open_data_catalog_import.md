@@ -7,9 +7,10 @@ and Select all/Select none also work. Set the project name and destination
 `.volpkg.json`, then choose **Create and Open**. Existing files require confirmation;
 the currently open project cannot be overwritten through this action.
 
-Fibers live in an explicitly attached object store (`.vcobj`). Project creation
-does not create a fiber directory. Use File → Object Store → Attach Object Store, then the
-explicit fiber import command for current-format transfer JSON.
+Fibers and the user's own surfaces live in an explicitly attached object store
+(`.vcobj`). Project creation does not create one. Use File → Object Store →
+Attach Object Store..., then the explicit fiber import command for current-format
+transfer JSON.
 
 An empty selection creates an empty project. Open Sample still uses the existing
 full-sample workflow. The selective path never loads the cached full-sample project.
@@ -37,10 +38,8 @@ have full-text tooltips. Select all/none operates across all three tabs.
 Selecting a derived resource includes its channel volumes, using existing
 attachment/coordinate validation. It does not add raw scans, rebased scan views,
 or unrelated representations. Lasagna can resolve directly against a selected
-L0 scan without a rebased view. Segments include their catalog
-coordinate representations and available transformed views, as in ordinary catalog
-attachment, but project entries point to individual segment directories rather
-than cache-wide aggregate folders. Unselected cached segments remain untouched.
+L0 scan without a rebased view. Selected segments are imported as described
+under *Catalog surfaces*; unselected ones are not imported.
 
 Preparation runs on the existing asynchronous open worker. A detached package
 prevents preparation from replacing the active project's autosave. After successful
@@ -49,7 +48,42 @@ Canceling the selection dialog or failing to save leaves the active project open
 
 Implementation: `OpenDataCatalogWindow` owns the dialog; `MenuActionController`
 reuses the asynchronous open flow; `OpenDataSampleProject` handles fresh saving and
-resource filters; `OpenDataSegmentCache` provides individual-entry reconciliation.
+resource filters; `OpenDataSurfaceStore` imports segments.
+
+## Catalog surfaces
+
+Open Data segments are surfaces of one internal object store per sample,
+`<remote cache>/open_data/stores/<sample>.vcobj`, written only by the importer.
+Open Sample imports every segment of the sample; Create Project imports the
+selected ones. Each segment representation is one surface record with a
+deterministic UUID (a UUIDv5 of the representation id), so every machine names it
+the same way:
+
+- the authored tifxyz of the segment's source volume (native, in that volume's
+  downscaled voxels);
+- a published transformed tifxyz for another sample volume;
+- for the other volumes with a sample matrix from the source volume, a generated
+  representation: the source moved into that volume by the matrix.
+
+Records are bound to their catalog volume id at L0 (`scale_factor` is
+`1/downscale` for native representations; coordinates are not rewritten) and keep
+the catalog details in `meta.open_data` (sample and segment ids, lineage,
+representation, source URL, the generation recipe, ink detections). Re-importing
+updates the records; geometry already fetched or generated stays.
+
+A record starts without geometry. Activating it fetches the registered tifxyz
+into the store (or computes a generated one, fetching its source first); the
+catalog window's **Fetch Selected** and **Fetch All Surfaces** do the same ahead
+of time and show each segment as missing, remote or stored.
+
+While an Open Data volume is open (recognized by its volume tags), VC3D lists the
+sample's store read-only beside the user's store, scaled from L0 to the open
+volume's pyramid level. Catalog surfaces can be viewed, focused, drawn as
+overlays and copied; renaming, tagging, editing and the surface tools need a copy
+in the user's store (surface panel context menu,
+**Copy Surface > Copy Surface...**, or the bridge's
+`segments.create_editable_copy`). Ink detections stay the published PNG/JPEG
+images; the ink overlay downloads them into the surface's artifact directory.
 
 Main and overlay volume selectors put recognized volumes first and prefix their
 existing labels with `fiber -` (manifest presence group), `scan -` (catalog source

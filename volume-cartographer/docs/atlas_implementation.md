@@ -1,6 +1,6 @@
 # Atlas Implementation
 
-Atlas generation stores V4 metadata, an unchanged copy of the selected base mesh, typed links, and V3 fiber mappings under `<volpkg-root>/atlases/<atlas-name>/`. Atlas creation reads the selected `.lasagna.json` manifest, resolves its `init_shell_dir` relative to that manifest, and uses only `shell_*.tifxyz` directories from that init shell directory as base candidates. Saved fiber `linePoints` are projected onto the selected base mesh using Lasagna normals and adaptive base-surface ray projection.
+Atlas generation stores version 6 metadata, typed links, and V3 fiber mappings under `<volpkg-root>/atlases/<atlas-name>/`; the base mesh is a surface of the attached object store, pinned by the metadata. Atlas creation reads the selected `.lasagna.json` manifest, resolves its `init_shell_dir` relative to that manifest, and uses only `shell_*.tifxyz` directories from that init shell directory as base candidates. Saved fiber `linePoints` are projected onto the selected base mesh using Lasagna normals and adaptive base-surface ray projection.
 
 Atlas anchor U/V values are stored in base-mesh-relative grid coordinates. The metadata field `zero_winding_column` is not a coordinate transform; it only defines the origin for winding labels and display ranges:
 
@@ -8,7 +8,7 @@ Atlas anchor U/V values are stored in base-mesh-relative grid coordinates. The m
 
 ## Atlas Storage Model
 
-Atlas creation copies the selected `shell_*.tifxyz` base mesh as-is into the atlas directory. It does not rotate, reindex, or shift the saved base shell columns. The first and duplicate closing seam columns remain exactly as they were in the source shell, and ancillary surface channels are copied without column rotation.
+Atlas creation imports the selected `shell_*.tifxyz` base mesh as-is into the attached object store as a surface tagged `atlas_base`, and the metadata's `base.object` pins its object UUID, object revision and geometry revision. Loading an atlas opens exactly that geometry revision, so later edits of the surface do not move the atlas; an atlas of another store is rejected. The import does not rotate, reindex, or shift the base shell columns. The first and duplicate closing seam columns remain exactly as they were in the source shell, and ancillary surface channels are stored without column rotation. Atlases with older metadata (a copied base mesh directory) are rejected by normal loads.
 
 Fiber anchors store source geometry in `world` and mapped-shell coordinates in `atlasU`/`atlasV`. Projection hits keep their raw base mesh U/V values. Continuation mapping may unwrap `atlasU` across the seam for line continuity, but the modulo column position still refers to the original base mesh columns. Atlas layout never rewrites anchor coordinates or source fiber geometry.
 

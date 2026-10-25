@@ -187,7 +187,7 @@ translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
 Coordinate-bearing artifacts created by VC3D retain the selected source view
-in their JSON metadata (`meta.json`, point collections, fibers, and atlas
+in their JSON metadata (surface records, point collections, fibers, and atlas
 `metadata.json`). For example:
 
 ```json
@@ -223,9 +223,11 @@ Your folder structure should resemble this:
     │   │   └── meta.json - REQUIRED!
     │   └── 050_entire_scroll1_ome.zarr -- this is your surface prediction/
     │       └── meta.json - REQUIRED!
-    ├── paths 
     └── config.json - REQUIRED!
 ```
+
+Surfaces (segments) are not files of the volpkg: they live in an object store
+(`.vcobj`) that VC3D attaches with `File -> Object Store -> Attach Object Store...`.
 
 ### Working on remote volumes from the command line
 
@@ -329,9 +331,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   segment's `meta.json` keeps the selector in `target_volume`.
 
 ### Opening a volume package and navigating the UI
-First, click `File -> Open volpkg` and select the volpkg you wish to work with (select the folder ending in .volpkg)
+First, click `File -> Open Project...` and select the project you wish to work with, then attach its object store with `File -> Object Store -> Attach Object Store...`
 
-On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the `paths` surface list, which selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the surface list, which lists the surfaces of the attached object store (plus the read-only Open Data catalog surfaces of an Open Data volume) and selects the currently displayed segment. Selecting a `Surface ID` should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
 
 There are a number of widgets, each with their own purpose. From top to bottom, and left to right : 
 
@@ -341,11 +343,9 @@ _Main UI widget for interacting with the volume package and surface list_
 
 <img src="docs/imgs/volume-package-ui.png" style="height: 500px">
 
-- `Reload Surfaces` : checks for new segmentations in the currently selected directory (by default, this is {volpkg}/paths
 - `Filters` : Apply a single (or multiple) filters to show or hide specific surface ids from the current set
   - the most important one to remember here is `Current Segment Only`, which will hide the intersection overlays of all other segmentations in the volume viewers (this can greatly speed up ui interaction)
-- `Approved`, `Defective`, `Reviewed`, `Inspect`  : tags which can be applied to the surface meta.json, and filtered against
-- `Generate Surface Mask` and `Append Surface Mask` : Create a binary mask representing the valid surface, and optionally append the current selected volume to it as a multipage tif
+- `Approved`, `Defective`, `Reviewed`, `Inspect`  : tags of the surface's object store record, which can be filtered against
 
 **Location**
 

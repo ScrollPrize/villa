@@ -1,12 +1,12 @@
-Segmentation growth and editing is now supported within the segmentation widget. Starting from a seed patch (or some segmentation imported into vc3d), you can grow them using the tracing method used during regular patch growth, and influence the direction it grows or modify its underlying geoemetry right in vc3d.
+Segmentation growth and editing is now supported within the segmentation widget. Starting from a seed patch (or any surface in the attached object store), you can grow them using the tracing method used during regular patch growth, and influence the direction it grows or modify its underlying geoemetry right in vc3d.
 
 This is relatively untested, but (should) work. It's possible to easily create relatively large segmentations rather quickly -- i created this nearly 22cm segmentation in less than 5 minutes. ![grow_example.png](grow_example.png)
 
 **rotate and flip a surface**
 
-Select a segmentation, then open `Actions > Transforms > Rotate`. For an immutable Open Data catalog segment, VC3D first asks you to create or choose an editable copy and leaves the catalog cache unchanged. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation and flip preview remain available for surfaces with multipage `mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
+Select a segmentation, then open `Actions > Transforms > Rotate`. Open Data catalog surfaces are read-only: copy one into your object store first (surface panel context menu, `Copy Surface > Copy Surface...`) and rotate the copy. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to commit the transformed surface to the store as a new geometry revision. Rotation and flip preview remain available for surfaces with disconnected component ranges, but `Apply` is disabled because those cannot yet be transformed safely.
 
-The captures below were made with an earlier build using sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog. They demonstrate the transform output; current builds first create or select an editable copy for immutable catalog segments.
+The captures below were made with an earlier build using sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog. They demonstrate the transform output; current builds rotate an editable copy of a catalog surface.
 
 | Original | Preview: 37° + horizontal flip | Transformed result after Apply (earlier build) |
 | --- | --- | --- |
@@ -17,8 +17,7 @@ The captures below were made with an earlier build using sample `PHerc0800`, seg
   - to compute these, run `/path/to/build/bin/vc_compute_normal_grids` , use the help option to see the options (or just enter it without any arguments)
   - a store published under a URL can be streamed instead of copied: create the local directory you pass as the grid path and write `normal-grids-remote.json` into it, containing `{"url": "https://.../....normal-grids"}`; the loader then fetches each slice it needs on demand and caches it there. VC3D writes that file when you pick a remote store in its Open Data dialog; on the command line there is no flag for it, so write it by hand.
   - while tracing, the slices that were opened stay in a cache bounded by `VC_GRID_CACHE_BYTES` (default 2 GiB, and never fewer than the 512 slices kept before). The default holds a patch of about 1 cm² on PHerc1447's 8.64 µm store; larger patches and runs on many threads gain from a larger budget (at eight threads a 200-generation patch there stops gaining at about 8 GiB, `VC_GRID_CACHE_BYTES=8589934592`). The count is of each slice's whole mapped file plus what it has decoded from it (paths and bucket indices). On the stores measured the file is nearly all of it and is more than what is resident: about twice on PHerc1447, about nine times on PHercParis4's 2.4 µm store, whose slices run to about 5 MiB each and are read a small window at a time; a store like that wants more still, for example `VC_GRID_CACHE_BYTES=17179869184`. `VC_GRID_CACHE_BYTES=0` restores the older limit of 512 slices.
-- you must have the latest branch of volume-cartographer checked out (as this contains major changes that are required for this to work)
-- you must have an existing patch or sgementation, or create one using the seeding widget
+- you must have an existing surface in the attached object store (File > Object Store > Attach Object Store...), or create one using the seeding widget
 
 **methods**
 
@@ -30,8 +29,8 @@ these can be used together, or independently -- the mesh deformation at times cr
 
 **useage**
 
-1. open a volpkg 
-2. click on the segmentation you want to edit
+1. open a project and attach its object store
+2. click on the surface you want to edit in the surface panel (a catalog surface must be copied first)
 3. ensure `enable editing` is checked
 4. ensure the mode is set to `corrections`
 5. inspect the patch and see if there are any areas that have strayed from the correct path and require corrections
@@ -40,4 +39,4 @@ these can be used together, or independently -- the mesh deformation at times cr
    8. if you desire , you can deform the mesh by clicking near the segmentation line , the mesh should "pull" towards the clicked location
 9. once you've completed all your corrections, set the number of `steps` (aka generations) you would like to grow, the directions you'd like to grow in , and any z limits you may want to apply. 
 10. click the `grow` button , and the patch will grow for that number of generations. i'd stick with a small number of steps for now, likely somewhere between 5-20, as its easier to correct a small error than one that has gone on for some time
-11. repeat steps 9-10 until you feel like stopping
+11. repeat steps 9-10 until you feel like stopping. Edits, corrections and growth are committed to the surface in the store as you go; its revision history replaces backups.

@@ -1,9 +1,11 @@
 # Segmentation Editing Architecture (Gaussian Vertex Mode)
-*last update 10/25*
 ## Purpose and Scope
 
 The segmentation editor lets annotators reshape an existing `QuadSurface` by
 pulling its grid vertices with a Gaussian falloff. Editing operates directly on every valid vertex in the surface.
+The surface is an object in the attached object store; edits are committed to it
+as new geometry revisions. Surfaces of an Open Data catalog store are read-only:
+editing one first makes an editable copy in the user's store.
 
 Unless noted otherwise, paths are relative to `apps/VC3D`.
 
@@ -35,8 +37,13 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 5. **Persistence** – "Apply" simply bakes the current base grid into the
    original snapshot and clears the edit map (this also happens automatically
    after each committed drag). "Reset" discards active drags and copies the
-   original snapshot back onto the base surface. A session ends by clearing
-   overlay state and cached snapshots.
+   original snapshot back onto the base surface. Committing to the store is the
+   module's autosave: `segmentation/SurfaceStoreEdit` publishes the vertices of
+   the touched rectangle that changed as one sparse geometry edit (a different
+   grid size, after growth or a crop, publishes a whole new geometry) and
+   re-pins the surface from the commit's receipt. The store's revision history
+   replaces backups. A session ends by clearing overlay state and cached
+   snapshots.
 
 
 ## Component Overview
@@ -54,7 +61,9 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 
 1. **Begin** – `SegmentationModule::beginEditingSession` primes the edit manager
    with the base surface, updates overlay parameters, and republishes that same
-   surface through the shared collection so viewers refresh immediately.
+   surface through the shared collection so viewers refresh immediately. The
+   surface's `SurfaceStoreEdit` holds the object for editing (a lease in a
+   hosted store); a read-only store or a stale pin refuses the session.
 2. **Edit** – All vertex mutations occur directly on the base surface while the
    module keeps `_originalPoints` as the reset snapshot. The module
    continuously mirrors dirty state back to the widget so the UI can flag
@@ -64,7 +73,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    surface). `resetPreview` clears the edit map and copies `_originalPoints`
    back into the base surface.
 4. **End** – `SegmentationModule::endEditingSession` cancels any active drag,
-   clears overlay markers, and drops the cached snapshot state.
+   commits a pending autosave, releases the hold, clears overlay markers, and
+   drops the cached snapshot state.
 
 
 ## Gaussian Falloff Workflow

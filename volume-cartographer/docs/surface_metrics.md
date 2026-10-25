@@ -3,12 +3,15 @@ vc_calc_surface_metrics can calculate surface metrics from point collection grou
 
 # Workflow
 - annotate sets of relative windings (intra and inter winding), see below
-- take a patch or surface that should be evaluated
+- take a patch or surface that should be evaluated; the metric tools read tifxyz directories, so export a stored surface first:
+    ```shell
+    vc_object_export --db <objects.vcobj> --uuid <surface uuid> --output <tifxyz_path>
+    ```
 - calculate relative surface winding number using vc_tifxyz_winding (only required of inter winding metrics)
     ```shell
     vc_tifxyz_winding <tifxyz_path>
     ```
-    This will create files in the working directory (you need the winding.tif) it can just be run in the tifxyz_directory but will then overwrite existing winding information if any is already there
+    This will create files in the working directory (you need the winding.tif); running it in the exported tifxyz directory overwrites winding information already there
 - run vc_calc_surface_metrics on surface and winding to get metrics json
     ```shell
     vc_calc_surface_metrics --surface <tifxyz_path> winding <winding.tif> --collection <annnotated_gt.json> --output <metrics.json>
@@ -21,7 +24,7 @@ vc_calc_surface_metrics can calculate surface metrics from point collection grou
 ## Annotation
 
 ### Inter Winding
-Annotate points roughly along the surface normal. Annotation can be performed with the point collection tool (shift-click to add a new point to the selected collection), or the drawing tool. Multiple annotations should overlap by several windings if possible.
+Annotate points roughly along the surface normal. Annotation can be performed with the point collection tool (shift-click to add a new point to the selected collection), or the drawing tool. Save the collections as JSON (Point Collections → Save) to pass them to `--collection`. Multiple annotations should overlap by several windings if possible.
 
 ![inter winding annotation example](imgs/inter_winding_gt.jpg)
 
