@@ -100,6 +100,22 @@ GeometrySource decodeFiberJson(const std::string& text)
     p.source = std::move(root);
     return p;
 }
+std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>& batch)
+{
+    std::set<std::string> inBatch, targets;
+    for (const auto& entry : batch) inBatch.insert(entry.object.uuid);
+    for (const auto& entry : batch) {
+        if (entry.object.kind != "fiber") continue;
+        for (const auto* key : {"branches", "adjacent_branches"})
+            for (const auto& branch : entry.source.value(key, Json::array()))
+                targets.insert(util::canonicalUuid(branch.at("target_uuid").get<std::string>()));
+    }
+    std::vector<std::string> result;
+    for (const auto& target : targets)
+        if (!inBatch.contains(target)) result.push_back(target);
+    return result;
+}
+
 std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
                            const std::string& source)
 {

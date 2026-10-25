@@ -14,6 +14,18 @@ int main() try {
                                       Json{{"position",{5.25,2,3}}}})},
         {"line_points",{{1.25,2,3},{5.25,2,3}}}, {"hv_classification",{{"manual_tag","H"}}}};
     const auto doc = decodeFiberJson(root.dump());
+    {
+        // A batch links to the fibers it names outside itself; those are the pins a checked import needs.
+        const auto existing = util::newUuid();
+        auto linked = root; linked["uuid"] = util::newUuid();
+        linked["branches"] = Json::array({Json{{"target_uuid", existing}, {"control_point_index", 0},
+                                               {"branch_control_point_index", 0}}});
+        auto back = root; back["uuid"] = existing;
+        require(fiberBatchEndpoints({decodeFiberJson(linked.dump())}) == std::vector<std::string>{existing},
+                "a prepared fiber batch reports the existing fibers it links to");
+        require(fiberBatchEndpoints({decodeFiberJson(linked.dump()), decodeFiberJson(back.dump())}).empty(),
+                "links within the batch need no pins");
+    }
     for (const int version : {1, 2}) {
         auto legacy = root; legacy["version"] = version;
         mustFail([&] { decodeFiberJson(legacy.dump()); });
