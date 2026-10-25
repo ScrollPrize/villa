@@ -37,8 +37,10 @@ void writeAtomic(const std::filesystem::path& path, const std::string& value) {
         std::filesystem::rename(temp,path);
     }catch(...){std::error_code ec;std::filesystem::remove(temp,ec);throw;}
 }
-std::pair<std::string,HttpResponse> request(const std::string& url,const std::string& etag={}) {
-    HttpClient client(HttpOptions{});std::string body;
+std::pair<std::string,HttpResponse> request(const std::string& url,const std::string& etag={},double timeout=60) {
+    if(!std::isfinite(timeout)||timeout<=0||timeout>86400)throw std::invalid_argument("catalog timeout must be in (0, 86400] seconds");
+    HttpOptions options;options.request_timeout_ms=std::max(1L,long(timeout*1000));options.retries=0;
+    HttpClient client(options);std::string body;
     std::vector<std::pair<std::string,std::string>> headers;
     if(!etag.empty())headers.emplace_back("If-None-Match",etag);
     const auto response=client.get_stream(url,[&]{body.clear();},[&](const char* p,size_t n){
@@ -71,7 +73,7 @@ CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions
     }catch(const std::exception&){}
     if(cached&&!options.refresh&&now-info.value("checked_at",0.)<options.maxAgeSeconds)return {*cached,true,{}};
     try {
-        auto [body,response]=request(source,cached?info.value("etag",std::string{}):std::string{});
+        auto [body,response]=request(source,cached?info.value("etag",std::string{}):std::string{},options.timeoutSeconds);
         if(response.status==304&&!cached)throw std::runtime_error("catalog returned 304 without cached content");
         auto manifest=response.status==304?*cached:parseOpenDataManifest(body,source);
         if(!options.cacheFile.empty()) {

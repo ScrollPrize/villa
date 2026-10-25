@@ -223,7 +223,7 @@ class Catalog:
         if use_cache:
             cache = os.fspath((_fetch.default_cache_dir() if cache_dir is None else __import__('pathlib').Path(cache_dir)) /
                               ('metadata-' + hashlib.sha256(src.encode()).hexdigest()[:16] + '.json'))
-        return cls(_catalog.load(src, cache, refresh, max_age), source=src)
+        return cls(_catalog.load(src, cache, refresh, max_age, timeout), source=src)
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> Catalog:

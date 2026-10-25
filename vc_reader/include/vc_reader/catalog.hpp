@@ -214,6 +214,7 @@ struct CatalogLoadOptions {
     std::filesystem::path cacheFile;
     bool refresh = false;
     double maxAgeSeconds = 3600;
+    double timeoutSeconds = 60;
 };
 struct CatalogLoadResult {
     OpenDataManifest manifest;

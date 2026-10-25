@@ -104,7 +104,8 @@ std::optional<double> numberValue(const nlohmann::json& obj,
 std::optional<int> intValue(const nlohmann::json& obj,
                             std::initializer_list<std::string_view> keys)
 {
-    if (auto value = numberValue(obj, keys)) {
+    if (auto value = numberValue(obj, keys); value && std::isfinite(*value) &&
+        *value >= std::numeric_limits<int>::min() && *value <= std::numeric_limits<int>::max() && std::floor(*value)==*value) {
         return static_cast<int>(*value);
     }
     return std::nullopt;

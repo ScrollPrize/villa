@@ -254,3 +254,11 @@ class PublishedLabelMappingTests(unittest.TestCase):
             self.assertEqual(label.volume.id, summary['source_volume'])
             # Source ownership never moves the label into B's direct-label list.
             self.assertFalse(mapping.volume.labels)
+
+
+def test_native_artifact_parameter_parity():
+    from vc_reader.artifacts import Artifact
+    from vc_reader import _catalog
+    for level in [None, -1, 2.5, "2", 2, 5, 6, 10**40]:
+        raw = {"type": "surface-prediction-zarr", "parameters": {"level": level}}
+        assert Artifact.from_json(raw).level == _catalog.parse_artifacts([raw])[0].level

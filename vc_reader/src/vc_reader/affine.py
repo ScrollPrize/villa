@@ -1,9 +1,7 @@
 """3x4 affine transforms in the metadata's ``[x, y, z]`` convention.
 
-Pure Python so that the parsing layer has no dependencies. Matrices are kept
-exactly as they appear in ``metadata.json``; the only arithmetic done on them
-by vc_reader itself is composition with power-of-two pyramid-level scales,
-which is exact in floating point.
+Arithmetic uses the native catalog implementation shared with C++ clients.
+Matrices retain float64 coefficients from the published registrations.
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ class Affine:
         return tuple(_catalog.affine_apply(self.matrix, tuple(point)))
 
     def apply_many(self, points: Iterable[Sequence[float]]) -> list[Point]:
-        return [self.apply(p) for p in points]
+        return [tuple(p) for p in _catalog.affine_apply_many(self.matrix, list(points))]
 
     def __matmul__(self, other: Affine) -> Affine:
         if not isinstance(other, Affine):

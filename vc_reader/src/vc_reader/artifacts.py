@@ -136,6 +136,17 @@ class Artifact:
     creation_info: Mapping[str, Any] | None = field(default=None, repr=False)
     id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    _parsed: Mapping[str, Any] = field(default_factory=dict, repr=False)
+
+    def _native_values(self):
+        if not self._parsed:
+            native = _catalog.parse_artifacts([self.raw or dict(type=self.type,
+                parameters=dict(self.parameters), properties=dict(self.properties), origins=[
+                dict(path=o.path, access_roots=[dict(type=r.type, url=r.url, usage=r.usage) for r in o.access_roots])
+                for o in self.origins])])[0]
+            object.__setattr__(self, '_parsed', dict(level=native.level, target=native.target_volume_id,
+                model=native.model_id, url=native.url, source_path=native.source_path))
+        return self._parsed
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> Artifact:
@@ -148,7 +159,9 @@ class Artifact:
                    origins=tuple(Origin(o.path, tuple(AccessRoot(r.type, r.url, r.usage) for r in o.access_roots),
                                         o.raw.get('copy_info')) for o in native.origins),
                    parameters=native.parameters, properties=native.properties,
-                   creation_info=native.creation_info or None, id=d.get('id'), raw=d)
+                   creation_info=native.creation_info or None, id=d.get('id'), raw=d,
+                   _parsed=dict(level=native.level, target=native.target_volume_id, model=native.model_id,
+                                url=native.url, source_path=native.source_path))
 
     def __repr__(self) -> str:
         params = ", ".join(f"{k}={v!r}" for k, v in self.parameters.items())
@@ -168,11 +181,11 @@ class Artifact:
 
     @property
     def target_volume_id(self) -> str | None:
-        return self.parameters.get("target_volume")
+        return self._native_values()["target"]
 
     @property
     def model_id(self) -> str | None:
-        return self.parameters.get("model_id")
+        return self._native_values()["model"]
 
     @property
     def label_set(self) -> str | None:
@@ -186,8 +199,7 @@ class Artifact:
     @property
     def level(self) -> int | None:
         """``parameters.level``: the source pyramid level a volume prediction ran on."""
-        level = self.parameters.get("level")
-        return None if level is None else int(level)
+        return self._native_values()["level"]
 
     @property
     def grid_level(self) -> int | None:
@@ -217,10 +229,8 @@ class Artifact:
         """
         if scheme not in ('https', 's3', None):
             raise ValueError(f"unknown scheme {scheme!r}; use 'https', 's3' or None")
-        native = _catalog.parse_artifacts([self.raw or dict(type=self.type, origins=[
-            dict(path=o.path, access_roots=[dict(type=r.type, url=r.url, usage=r.usage) for r in o.access_roots])
-            for o in self.origins])])[0]
-        url = native.url if scheme == 'https' else native.source_path
+        values = self._native_values()
+        url = values['url'] if scheme == 'https' else values['source_path']
         return (to_s3(url) if scheme == 's3' else url) or None
 
     @property
