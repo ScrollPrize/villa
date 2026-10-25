@@ -277,6 +277,27 @@ int main(int argc, char** argv)
              "the full volume lists surfaces made at the level");
         require(*catalog.row(atLevel)->mapping == VolumeAffine::scale(2), "seen at the full volume's scale");
 
+        // Volume switches resolve through the same transforms, levels included.
+        {
+            using vc3d::opendata::CatalogVolume;
+            using vc3d::opendata::volumeToVolume;
+            const CatalogVolume l0{"sample", "scan", 0}, l2{"sample", "scan", 2};
+            const VolumeTransforms none;
+            const auto down = volumeToVolume(none, "scan", l0, "scan-l2", l2);
+            require(down && *down == VolumeAffine::scale(0.25), "a level quarters level-0 coordinates");
+            const auto same = volumeToVolume(none, "scan-l2", l2, "prediction-l2", l2);
+            require(same && *same == VolumeAffine::identity(), "two volumes showing one level share a frame");
+            VolumeTransforms registered;
+            registered.graph.add({"registration", "", "scan", "other", VolumeAffine::scale(3), "registration"});
+            const auto across = volumeToVolume(registered, "scan-l2", l2, "other", std::nullopt);
+            require(across && *across == VolumeAffine::scale(12), "registrations compose with levels");
+            std::optional<VolumeAffine> stored;
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                stored = volumeToVolume(db.volumeTransforms(txn), "vol1", std::nullopt, "vol1-level1", CatalogVolume{"s", "vol1", 1});
+            });
+            require(stored && *stored == VolumeAffine::scale(0.5), "a level the store registered is not related twice");
+        }
+
         catalog.setSource(std::nullopt, volume);
         require(catalog.rows().empty(), "no attachment lists nothing");
         session->detach(attachment);

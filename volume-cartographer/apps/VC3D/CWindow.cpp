@@ -7,6 +7,7 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataSurfaceStore.hpp"
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
@@ -213,7 +214,6 @@ constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
 constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
 constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
 constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
-constexpr std::string_view OPEN_DATA_VOLUME_ID_TAG_PREFIX = "vc-open-data-volume-id:";
 
 std::optional<vc3d::opendata::ResolvedOpenDataLasagna>
 resolvedLasagnaForState(const CState* state)
@@ -244,37 +244,6 @@ QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
     return QStringLiteral("%1 x %2 vx").arg(formatValue(size.width), formatValue(size.height));
 }
 
-QString openDataCatalogVolumeIdForLoadedVolume(const VolumePkg& pkg, const std::string& loadedVolumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-volume-id:";
-    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
-        if (tag.rfind(prefix, 0) == 0) {
-            return QString::fromStdString(tag.substr(prefix.size()));
-        }
-    }
-    return {};
-}
-
-std::optional<int> openDataCoordinateLevelForLoadedVolume(
-    const VolumePkg& pkg,
-    const std::string& loadedVolumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-source-coordinate-level:";
-    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
-        if (tag.rfind(prefix, 0) != 0)
-            continue;
-        const auto value = tag.substr(prefix.size());
-        try {
-            std::size_t consumed = 0;
-            const int level = std::stoi(value, &consumed);
-            if (consumed == value.size() && level >= 0 && level <= 5)
-                return level;
-        } catch (...) {
-        }
-    }
-    return std::nullopt;
-}
-
 std::string openDataCoordinateSpaceForLoadedVolume(
     const VolumePkg& pkg,
     const std::string& loadedVolumeId)
@@ -285,16 +254,6 @@ std::string openDataCoordinateSpaceForLoadedVolume(
             return tag.substr(prefix.size());
     }
     return {};
-}
-
-cv::Matx44d coordinateLevelScale(int level)
-{
-    const double scale = std::ldexp(1.0, level);
-    return cv::Matx44d(
-        scale, 0, 0, 0,
-        0, scale, 0, 0,
-        0, 0, scale, 0,
-        0, 0, 0, 1);
 }
 
 std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
@@ -3663,7 +3622,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     const auto navigationTransform =
         (hadVolume && newvol && previousVolumeId != targetVolumeId)
-            ? openDataVolumeTransformForSwitch(previousVolumeId, targetVolumeId)
+            ? volumeTransformForSwitch(previousVolumeId, targetVolumeId)
             : std::optional<cv::Matx44d>{};
 
     // Switch both independent states before revalidating the canonical overlay.
@@ -8488,74 +8447,25 @@ const vcr::catalog::OpenDataManifest* CWindow::cachedOpenDataManifest() const
     return nullptr;
 }
 
-std::string CWindow::openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const
+std::optional<cv::Matx44d> CWindow::volumeTransformForSwitch(const std::string& from, const std::string& to) const
 {
-    if (volumeId.empty() || !_state || !_state->vpkg()) {
-        return {};
+    // The store's resolution (catalog registrations, its own and its route
+    // choices); without a store, the cached catalog's registrations.
+    vc::objects::VolumeTransforms transforms;
+    if (const auto attachment = _state->objectStoreAttachment()) {
+        _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            transforms = db.volumeTransforms(txn);
+        });
+    } else if (const auto* manifest = cachedOpenDataManifest()) {
+        transforms.graph.addCatalog(*manifest);
     }
-
-    for (const auto& tag : _state->vpkg()->volumeTags(volumeId)) {
-        if (tag.rfind(OPEN_DATA_VOLUME_ID_TAG_PREFIX, 0) != 0) {
-            continue;
-        }
-        return tag.substr(OPEN_DATA_VOLUME_ID_TAG_PREFIX.size());
-    }
-
-    return {};
-}
-
-std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
-    const std::string& fromLoadedVolumeId,
-    const std::string& toLoadedVolumeId) const
-{
-    const std::string fromCatalogId = openDataVolumeIdForLoadedVolumeId(fromLoadedVolumeId);
-    const std::string toCatalogId = openDataVolumeIdForLoadedVolumeId(toLoadedVolumeId);
-    if (fromCatalogId.empty() || toCatalogId.empty()) {
-        return std::nullopt;
-    }
-
-    const auto& pkg = *_state->vpkg();
-    const auto fromLevel = openDataCoordinateLevelForLoadedVolume(pkg, fromLoadedVolumeId);
-    const auto toLevel = openDataCoordinateLevelForLoadedVolume(pkg, toLoadedVolumeId);
-    const auto fromSpace = openDataCoordinateSpaceForLoadedVolume(pkg, fromLoadedVolumeId);
-    const auto toSpace = openDataCoordinateSpaceForLoadedVolume(pkg, toLoadedVolumeId);
-    const bool explicitCoordinates = fromLevel && toLevel &&
-                                     !fromSpace.empty() && !toSpace.empty();
-    if (explicitCoordinates) {
-        if (fromSpace == toSpace)
-            return cv::Matx44d::eye();
-        if (fromCatalogId == toCatalogId) {
-            const double factor = std::ldexp(1.0, *fromLevel - *toLevel);
-            return cv::Matx44d(
-                factor, 0, 0, 0,
-                0, factor, 0, 0,
-                0, 0, factor, 0,
-                0, 0, 0, 1);
-        }
-    } else if (fromCatalogId == toCatalogId) {
-        // Preserve legacy/manual same-lineage behavior when explicit
-        // coordinate identity is unavailable.
-        return std::nullopt;
-    }
-
-    const auto* manifest = cachedOpenDataManifest();
-    if (!manifest) {
-        return std::nullopt;
-    }
-
-    for (const auto& sample : manifest->samples) {
-        if (auto nativeMatrix = vcr::catalog::findSampleVolumeTransform(
-                sample, fromCatalogId, toCatalogId)) {
-            auto matrix = std::optional(vc3d::opendata::cvMatrix(*nativeMatrix));
-            if (!explicitCoordinates)
-                return matrix;
-            const auto sourceScale = coordinateLevelScale(*fromLevel);
-            const auto targetScaleInv = coordinateLevelScale(-*toLevel);
-            return targetScaleInv * *matrix * sourceScale;
-        }
-    }
-
-    return std::nullopt;
+    // Open Data levels are related to their catalog volume (the store may not
+    // have registered one yet: no or read-only store, not opened since).
+    const auto shown = [&](const std::string& id) {
+        return _state->vpkg() ? vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(id)) : std::nullopt;
+    };
+    const auto mapping = vc3d::opendata::volumeToVolume(std::move(transforms), from, shown(from), to, shown(to));
+    return mapping ? std::optional(vc3d::opendata::cvMatrix(*mapping)) : std::nullopt;
 }
 
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)

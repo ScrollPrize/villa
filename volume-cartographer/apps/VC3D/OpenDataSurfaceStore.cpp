@@ -639,6 +639,21 @@ bool registerVolumeLevel(vc::objects::ObjectStoreSession& session, const vc::obj
     return true;
 }
 
+std::optional<vc::objects::VolumeAffine> volumeToVolume(vc::objects::VolumeTransforms transforms,
+                                                        const std::string& from, const std::optional<CatalogVolume>& fromShown,
+                                                        const std::string& to, const std::optional<CatalogVolume>& toShown)
+{
+    for (const auto& [id, shown] : {std::pair{from, fromShown}, std::pair{to, toShown}}) {
+        if (shown && shown->volumeId != id &&
+            transforms.resolve(shown->volumeId, id).status == vcr::catalog::TransformStatus::Unavailable)
+            transforms.graph.add({"level:" + id, "", shown->volumeId, id,
+                                  vc::objects::VolumeAffine::scale(std::ldexp(1.0, -shown->level)), "pyramid level"});
+    }
+    const auto resolution = transforms.resolve(from, to);
+    if (resolution.status != vcr::catalog::TransformStatus::Resolved) return std::nullopt;
+    return resolution.resolved().forward;
+}
+
 SurfaceImportResult importSampleSurfaces(const std::filesystem::path& remoteCacheRoot,
                                          const vcr::catalog::OpenDataSample& sample,
                                          const std::optional<std::vector<std::string>>& segmentIds)

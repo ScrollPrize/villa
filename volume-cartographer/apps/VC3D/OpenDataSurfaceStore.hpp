@@ -1,6 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 
 // Open Data segments as surfaces of one internal object store per sample
 // (<remote cache>/open_data/stores/<sample>.vcobj). Only this importer writes
@@ -67,6 +68,14 @@ struct CatalogVolume {
 // Returns whether a registration was written.
 bool registerVolumeLevel(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
                          const std::string& volume, const std::string& shown, int level);
+
+// The mapping from volume `from`'s voxels to `to`'s, resolved by `transforms`
+// (a store's, or a catalog's) with each volume that shows a catalog volume at
+// some level (`fromShown`, `toShown`) related to it unless already related.
+// nullopt when unrelated or ambiguous.
+std::optional<vc::objects::VolumeAffine> volumeToVolume(vc::objects::VolumeTransforms transforms,
+                                                        const std::string& from, const std::optional<CatalogVolume>& fromShown,
+                                                        const std::string& to, const std::optional<CatalogVolume>& toShown);
 
 struct SurfaceImportResult {
     int representations = 0;
