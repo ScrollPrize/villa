@@ -651,7 +651,7 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // Flush any pending approval mask saves and clear images BEFORE turning off editing
     // loadApprovalMaskImage(nullptr) does both:
     // 1. Saves pending changes to _approvalSaveSurface (the previous segment)
-    // 2. Clears the mask images so subsequent saveApprovalMaskToDisk() has nothing to save
+    // 2. Clears the mask images so subsequent saveApprovalMask() has nothing to save
     // This prevents the old mask from being incorrectly saved to the new segment
     if (_overlay) {
         _overlay->loadApprovalMaskImage(nullptr);
@@ -787,7 +787,7 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
 
         // Save changes to disk when exiting edit mode
         if (wasEditing) {
-            saveApprovalMaskToDisk();
+            saveApprovalMask();
         }
     }
 
@@ -849,7 +849,7 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
 
         // Save changes to disk when exiting edit mode
         if (wasEditing) {
-            saveApprovalMaskToDisk();
+            saveApprovalMask();
         }
     }
 
@@ -957,9 +957,9 @@ void SegmentationModule::performAutoApproval(const std::vector<std::pair<int, in
     qCDebug(lcSegModule) << "Auto-approved" << vertices.size() << "vertices with radius" << _autoApprovalRadius;
 }
 
-void SegmentationModule::saveApprovalMaskToDisk()
+void SegmentationModule::saveApprovalMask()
 {
-    qCInfo(lcSegModule) << "Saving approval mask to disk...";
+    qCInfo(lcSegModule) << "Saving approval mask...";
 
     QuadSurface* surface = nullptr;
     std::shared_ptr<Surface> surfaceHolder;  // Keep surface alive during this scope
@@ -972,7 +972,7 @@ void SegmentationModule::saveApprovalMaskToDisk()
 
     if (_overlay && surface) {
         // Compose the mask onto the surface channel and let the single autosave
-        // persist it (x/y/z + meta + all channels) on its next tick.
+        // publish it to the store (vertices and channels) on its next tick.
         _overlay->composeApprovalMaskToSurface(surface);
         markAutosaveNeeded();
         if (!surface->id.empty()) {
@@ -2821,8 +2821,8 @@ void SegmentationModule::performAutosave()
         return;
     }
 
-    // The single autosave persists the whole segment (x/y/z + meta + all
-    // channels incl. approval). Resolve the live surface from the edit session
+    // The single autosave publishes the surface's edits (vertices and
+    // channels incl. approval) to the store. Resolve the live surface from the edit session
     // if there is one, else from the active "segmentation" surface — approval
     // edits happen with editing disabled / no session and must still save.
     std::shared_ptr<QuadSurface> surfacePtr;

@@ -167,7 +167,7 @@ void CommandLineToolRunner::setTraceParams(QString volumePath, QString volumeUui
     _sourceTag = sourceTag;
     _outputTag = outputTag;
     _jsonParams = jsonParams;
-    _srcSegment = srcSurface;
+    _sourceSurfaceUuid = srcSurface;
 }
 
 void CommandLineToolRunner::setToObjParams(QString surfaceUuid, QString objName)
@@ -314,13 +314,13 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         return false;
     }
 
-    if (tool == Tool::GrowSegFromSegment && _srcSegment.isEmpty()) {
+    if (tool == Tool::GrowSegFromSegment && _sourceSurfaceUuid.isEmpty()) {
         warn(tr("Error"), tr("Source segment not specified."));
         return false;
     }
 
     if (tool == Tool::NeighborCopy) {
-        if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty()) {
+        if (_jsonParams.isEmpty() || _resumeSurfaceUuid.isEmpty()) {
             warn(tr("Error"), tr("Neighbor copy parameters incomplete."));
             return false;
         }
@@ -441,7 +441,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
                            : tr("Starting %1 for: %2")
                                  .arg(toolLabel)
-                                 .arg(_surfaceUuid.isEmpty() ? _srcSegment : _surfaceUuid);
+                                 .arg(_surfaceUuid.isEmpty() ? _sourceSurfaceUuid : _surfaceUuid);
     emit toolStarted(_currentTool, startMessage);
 
     _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
@@ -738,7 +738,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             args << "--volume" << _volumePath
                  << "--params" << _jsonParams
                  << "--store" << _storePath
-                 << "--src-surface" << _srcSegment
+                 << "--src-surface" << _sourceSurfaceUuid
                  << "--volume-uuid" << _volumeUuid
                  << "--source-tag" << _sourceTag
                  << "--tag" << _outputTag;
@@ -762,7 +762,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             args << "-v" << _volumePath
                  << "-p" << _jsonParams
                  << "--store" << _storePath
-                 << "--surface" << _resumeSurfacePath
+                 << "--surface" << _resumeSurfaceUuid
                  << "--volume-uuid" << _volumeUuid
                  << "--tag" << _outputTag;
             if (!_resumeOpt.isEmpty()) {
@@ -936,7 +936,7 @@ void CommandLineToolRunner::setNeighborCopyParams(const QString& volumePath,
 {
     setVolumePath(volumePath);
     _jsonParams = paramsJson;
-    _resumeSurfacePath = resumeSurface;
+    _resumeSurfaceUuid = resumeSurface;
     _volumeUuid = volumeUuid;
     _outputTag = outputTag;
     _resumeOpt = resumeOpt;

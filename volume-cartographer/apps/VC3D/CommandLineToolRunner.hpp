@@ -214,10 +214,10 @@ private:
     QString _sourceTag;
     QString _outputTag;
     QString _volumeUuid;
-    QString _srcSegment;
+    QString _sourceSurfaceUuid;
     QString _objPath;
     QString _jsonParams;
-    QString _resumeSurfacePath;
+    QString _resumeSurfaceUuid;
     QString _resumeOpt;
     
     float _scale;

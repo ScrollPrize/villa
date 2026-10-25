@@ -653,7 +653,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         nameLayout->addWidget(new QLabel(tr("Name:"), nameWidget));
         _outputNameEdit = new QLineEdit(nameWidget);
         _outputNameEdit->setPlaceholderText(tr("new_model"));
-        _outputNameEdit->setToolTip(tr("Output name prefix (auto-versioned, e.g. mysheet → mysheet_v001.tifxyz)"));
+        _outputNameEdit->setToolTip(tr("Output name prefix (auto-versioned, e.g. mysheet → mysheet_v001)"));
         nameLayout->addWidget(_outputNameEdit, 1);
         _newModelGroup->contentLayout()->addWidget(nameWidget);
     }

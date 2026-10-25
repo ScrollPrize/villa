@@ -376,11 +376,11 @@ void ApprovalMaskBrushTool::clear()
     _hasLastOverlaySample = false;
     _hasLastSearchCache = false;
 
-    // Reload approval mask from disk to discard pending changes
+    // Reload the approval mask from the surface to discard pending changes
     auto overlay = _module.overlay();
     if (overlay && _surface) {
         overlay->loadApprovalMaskImage(_surface);
-        qCDebug(lcApprovalMask) << "Reloaded approval mask from disk (discarded pending changes)";
+        qCDebug(lcApprovalMask) << "Reloaded approval mask (discarded pending changes)";
     }
 
     _module.refreshOverlay();

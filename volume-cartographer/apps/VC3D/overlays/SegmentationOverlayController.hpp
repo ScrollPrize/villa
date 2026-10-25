@@ -233,7 +233,7 @@ private:
     std::chrono::steady_clock::time_point _lastRefreshTime;
 
     // Approval mask images - separate saved and pending (RGB colors, ARGB32 format)
-    QImage _savedApprovalMaskImage;   // RGB colors from disk, with alpha for overlay
+    QImage _savedApprovalMaskImage;   // RGB colors as saved on the surface, with alpha for overlay
     QImage _pendingApprovalMaskImage; // RGB colors from pending strokes
 
     // Per-viewer cached scene-space rasterized images

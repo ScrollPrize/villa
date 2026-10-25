@@ -451,7 +451,7 @@ private:
     void performAutosave();
     void ensureAutosaveTimer();
     void updateAutosaveState();
-    void saveApprovalMaskToDisk();
+    void saveApprovalMask();
     void queueAutosaveVertexUpdates(const std::vector<SegmentationEditManager::VertexEdit>& edits);
 
     SegmentationWidget* _widget{nullptr};

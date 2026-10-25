@@ -25,9 +25,8 @@
 // ===========================================================================
 // Per-segment mesh operations. Sync dialog-free ops (crop, recalc_area) call a
 // SegmentationCommandHandler / SurfaceAreaCalculator entry directly; async ops
-// drive a headless start* launcher tracked as a job -- external-tool ones share
-// the source:"tool" slot like render.tifxyz; the in-process mask render resolves
-// via the deferred-response mechanism.
+// drive a headless start* launcher tracked as a job; external-tool ones share
+// the source:"tool" slot like render.tifxyz.
 // ===========================================================================
 
 

@@ -8817,7 +8817,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
             } catch (const std::exception& e) {
                 qWarning() << "Failed to activate surface"
                            << surfaceId
-                           << "while it may still be writing:"
+                           << ":"
                            << e.what();
                 _state->clearActiveSurface();
                 _state->setSurface("segmentation", nullptr, false, false);
@@ -8875,7 +8875,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
         } catch (const std::exception& e) {
             qWarning() << "Failed to apply surface orientation for"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
@@ -8942,7 +8942,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         } catch (const std::exception& e) {
             qWarning() << "Failed to activate surface"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
@@ -8985,7 +8985,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         } catch (const std::exception& e) {
             qWarning() << "Failed to apply surface orientation for"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
