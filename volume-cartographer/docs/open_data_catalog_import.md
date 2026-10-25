@@ -15,6 +15,12 @@ An empty selection creates an empty project. Open Sample still uses the existing
 full-sample workflow. The selective path never loads the cached full-sample project.
 Saved projects reopen through ordinary project loading and use the global cache.
 
+Native catalog source scans use the catalog volume ID (for example,
+`20260102150214`) when opened, including from existing saved projects. This lets
+object-store fibers bound to that ID match the streamed scan automatically.
+Predictions and rebased source views retain distinct IDs; sharing a catalog tag
+does not make their coordinate frames interchangeable.
+
 The initial JSON destination uses the same directory as File -> New Project
 (normally the per-user `.VC3D` directory). Volumes, Representations and Segments
 have separate checkbox tabs that share the catalog's model-to-display formatters,

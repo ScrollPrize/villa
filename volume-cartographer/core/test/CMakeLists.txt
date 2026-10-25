@@ -815,8 +815,9 @@ vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: opens the PHerc 0172 volume and reads small chunks.
-vc_add_test(NAME test_volume_live_s3)
+# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+vc_add_test(NAME test_volume_live_s3
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
