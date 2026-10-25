@@ -138,8 +138,9 @@ struct SelectedFiber {
     int64_t pointCount = 0;
 };
 struct RegionResult {
-    vc::fibers::RegionPage page;
-    std::vector<std::string> blockUuids;
+    // The store's runs, in volume voxels.
+    std::vector<vc::objects::VisibleRun> runs;
+    bool complete = true;
     struct Control {
         std::string uuid;
         int index = 0;
@@ -197,7 +198,12 @@ std::map<std::string, double> volumeFactors(const vc::objects::ObjectStore& db, 
 struct FiberCollectionController::View {
     vc3d::store::RegionRequests region;
     std::optional<Slice> displayed;
-    std::vector<vc::fibers::Block> blocks;
+    // Visible runs with the runtime ID of their fiber.
+    struct Run {
+        uint64_t fiber = 0;
+        vc::objects::VisibleRun run;
+    };
+    std::vector<Run> runs;
     struct Control {
         uint64_t fiber = 0;
         int index = 0;
@@ -318,7 +324,7 @@ void FiberCollectionController::clear()
     catalogCursor_.reset();
     for (auto& [v, s] : views_) {
         s->region.reset();
-        s->blocks.clear();
+        s->runs.clear();
         s->controls.clear();
         s->rings.clear();
         s->linkGroups.clear();
@@ -390,7 +396,7 @@ void FiberCollectionController::invalidate()
     for (auto& [v, s] : views_) {
         s->region.reset();
         s->displayed.reset();
-        s->blocks.clear();
+        s->runs.clear();
         s->controls.clear();
         s->rings.clear();
         s->linkGroups.clear();
@@ -689,17 +695,15 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 if (!selectedUuid.empty()) options.selected=selectedUuid;
                 options.family=family;
                 auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel->load() || cancelled.load(); });
-                result.page.complete = region.complete();
-                result.page.decodedBytes = region.stats.outputBytes;
+                result.complete = region.complete();
                 // Runs arrive in volume voxels, merged in UUID order with the selected fiber first.
                 std::map<std::string, std::optional<std::string>> drawn;
                 for (auto& run : region.runs) {
                     auto& sampledRevision = drawn[run.objectUuid];
                     // Control points are annotation markers only on fibers drawn from a sampled line.
                     if (run.arrayName == "line_points") sampledRevision = run.revisionUuid;
-                    result.blockUuids.push_back(run.objectUuid);
-                    result.page.blocks.push_back({0,0,run.firstSegment,run.family,std::move(run.points)});
                 }
+                result.runs = std::move(region.runs);
                 if (drawn.empty()) return;
                 const auto factors = volumeFactors(db, txn, drawn, volume);
                 std::vector<std::string> revisions, owners;
@@ -751,13 +755,11 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             if (found == views_.end()) return;
             auto& v = *found->second;
             using Finished = vc3d::store::RegionRequests::Finished;
-            const auto finished = v.region.finish(cancel, rev == revision_, s, query, result.value.page.complete, result.error);
+            const auto finished = v.region.finish(cancel, rev == revision_, s, query, result.value.complete, result.error);
             if (finished == Finished::Stale) return;
             v.dirty = true;
             if (finished == Finished::Install && result.error.isEmpty()) {
                 auto& region = result.value;
-                for (size_t i = 0; i < region.page.blocks.size(); ++i)
-                    region.page.blocks[i].fiberId = int64_t(annotations_->fiberIdForUuid(region.blockUuids[i]));
                 v.controls.clear();
                 for (const auto& control : region.controls)
                     v.controls.push_back({annotations_->fiberIdForUuid(control.uuid), control.index, control.position});
@@ -765,7 +767,8 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 for (const auto& [uuid, group] : region.linkGroups)
                     v.linkGroups[annotations_->fiberIdForUuid(uuid)] = annotations_->fiberIdForUuid(group);
                 v.rings = std::move(region.rings);
-                v.blocks = std::move(region.page.blocks);
+                v.runs.clear();
+                for (auto& run : region.runs) v.runs.push_back({annotations_->fiberIdForUuid(run.objectUuid), std::move(run)});
             }
             refreshViewer(viewer);
         });
@@ -838,18 +841,20 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     };
     std::unordered_map<int64_t, QColor> colors;
     std::unordered_set<int64_t> visibleIds;
-    for (const auto& b : v.blocks) {
+    for (const auto& entry : v.runs) {
+        const auto& b = entry.run;
+        const auto fiberId = int64_t(entry.fiber);
         // Hash the logical fiber ID, not its storage block or catalog row, so
         // every block of a fiber keeps its color across region/filter changes.
-        const auto colorIndex = ((uint64_t(b.fiberId) * 0x9e3779b97f4a7c15ULL) >> 32) % rainbowPaths.size();
-        const auto group = linkGroup(b.fiberId);
-        auto& path = b.fiberId == selected_ ? selected
+        const auto colorIndex = ((uint64_t(fiberId) * 0x9e3779b97f4a7c15ULL) >> 32) % rainbowPaths.size();
+        const auto group = linkGroup(fiberId);
+        auto& path = fiberId == selected_ ? selected
                      : group                ? linkedPaths[*group]
                      : useRainbow           ? rainbowPaths[colorIndex]
                      : b.family == "H"      ? horizontal
                      : b.family == "V"      ? vertical
                                             : other;
-        colors.emplace(b.fiberId, b.fiberId == selected_ ? QColor("#ffff66")
+        colors.emplace(fiberId, fiberId == selected_ ? QColor("#ffff66")
                                   : group                ? groupColor(*group)
                                   : useRainbow           ? QColor::fromHsvF(double(colorIndex) / rainbowPaths.size(), 0.7, 1.0)
                                   : b.family == "H"      ? QColor("#40a5ff")
@@ -882,8 +887,8 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
             if (!run.isEmpty() && run.back() != pa) flush();
             if (run.isEmpty()) run.push_back(pa);
             run.push_back(pb);
-            v.hits.push_back({pa, pb, b.fiberId});
-            visibleIds.insert(b.fiberId);
+            v.hits.push_back({pa, pb, fiberId});
+            visibleIds.insert(fiberId);
         }
         flush();
     }
