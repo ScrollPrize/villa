@@ -17,8 +17,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Slicing.hpp"
 
 namespace po = boost::program_options;
@@ -27,8 +25,7 @@ using Json = utils::Json;
 
 
 class SegmentRenderer {
-    std::shared_ptr<VolumePkg> vpkg_;
-    std::shared_ptr<Volume> volume_;
+    fs::path segments_dir_;
     struct SurfaceInfo {
         std::string id;
         std::shared_ptr<QuadSurface> surface;
@@ -112,25 +109,10 @@ class SegmentRenderer {
     }
 
 public:
-    SegmentRenderer(const fs::path& volpkg_path, const std::string& volume_id) {
-        if (fs::is_directory(volpkg_path)) {
-            throw std::runtime_error(
-                "directory inputs are no longer supported; convert with vc_volpkg_convert "
-                + volpkg_path.string() + " <out.volpkg.json>");
+    explicit SegmentRenderer(const fs::path& segments_dir) : segments_dir_(segments_dir) {
+        if (!fs::is_directory(segments_dir_)) {
+            throw std::runtime_error("Not a directory: " + segments_dir_.string());
         }
-        vpkg_ = VolumePkg::load(volpkg_path);
-
-        if (volume_id.empty()) {
-            throw std::runtime_error("You must provide a volume id");
-        }
-
-        if (!vpkg_->hasVolume(volume_id)) {
-            throw std::runtime_error("Volume not found: " + volume_id);
-        }
-        volume_ = vpkg_->volume(volume_id);
-        std::cout << "Using volume: " << volume_id << " (" << volume_->name() << ")" << std::endl;
-        auto [w, h, d] = volume_->shapeXyz();
-        std::cout << "Volume dimensions: " << w << "x" << h << "x" << d << std::endl;
     }
 
     ~SegmentRenderer() = default;
@@ -142,6 +124,20 @@ public:
     }
 
 private:
+    // A segment is the tifxyz directory <segments-dir>/<id>.
+    std::shared_ptr<QuadSurface> loadSurface(const std::string& id) {
+        const fs::path dir = segments_dir_ / id;
+        if (!fs::is_directory(dir)) {
+            return nullptr;
+        }
+        try {
+            return load_quad_from_tifxyz(dir);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load " << dir << ": " << e.what() << std::endl;
+            return nullptr;
+        }
+    }
+
     cv::Mat renderWithSpatialIndex(const std::string& target_segment_id,
                                     const fs::path& output_path,
                                     const std::string& source,
@@ -153,7 +149,7 @@ private:
         segment_color_map_.clear();
 
         // Load target segment
-        auto target_surf = vpkg_->loadSurface(target_segment_id);
+        auto target_surf = loadSurface(target_segment_id);
         if (!target_surf) {
             throw std::runtime_error("Failed to load target segment: " + target_segment_id);
         }
@@ -340,7 +336,7 @@ private:
         // Load all surfaces with color indices based on sorted order
         int color_idx = 0;
         for (const auto& surf_id : surface_ids) {
-            auto surf = vpkg_->loadSurface(surf_id);
+            auto surf = loadSurface(surf_id);
             if (surf) {
                 surfaces.push_back({surf_id, surf, color_idx});
                 segment_color_map_[surf_id] = color_idx;
@@ -372,7 +368,7 @@ private:
         std::vector<std::string> original_sequence = getSurfaceIds(target_id, target_surf, "sequence");
 
         for (const auto& seq_id : original_sequence) {
-            auto surf = vpkg_->loadSurface(seq_id);
+            auto surf = loadSurface(seq_id);
             if (surf && segment_color_map_.find(seq_id) != segment_color_map_.end()) {
                 surfaces.push_back({seq_id, surf, segment_color_map_[seq_id]});
             }
@@ -523,12 +519,10 @@ int main(int argc, char* argv[]) {
         po::options_description desc("Segment Renderer Options");
         desc.add_options()
             ("help,h", "Show help message")
-            ("volpkg-path,v", po::value<std::string>()->required(),
-                "Path to volume package JSON file (*.volpkg.json)")
-            ("volume-id", po::value<std::string>()->required(),
-                "ID of volume to use")
+            ("segments-dir,d", po::value<std::string>()->required(),
+                "Directory holding the tifxyz segments (one directory per segment ID)")
             ("segment-id,s", po::value<std::string>()->required(),
-                "ID of segment to render")
+                "ID (directory name) of segment to render")
             ("overlap-source", po::value<std::string>()->required(),
                 "Source for overlaps (contributing|sequence|approved_patches)")
             ("output,o", po::value<std::string>()->required(),
@@ -552,20 +546,20 @@ int main(int argc, char* argv[]) {
             std::cout << "  - Legend: Automatically generated as <output>_legend.png\n\n";
             std::cout << "Examples:\n";
             std::cout << "  # Basic rendering with auto-selected stride:\n";
-            std::cout << "  " << argv[0] << " --volpkg-path /path/to/vol.volpkg --volume-id vol123 \\\n";
+            std::cout << "  " << argv[0] << " --segments-dir /path/to/paths \\\n";
             std::cout << "                  --segment-id seg456 --overlap-source contributing \\\n";
             std::cout << "                  --output output.png\n\n";
 
             std::cout << "  # Full resolution rendering (stride=1):\n";
-            std::cout << "  " << argv[0] << " -v /path/to/vol.volpkg --volume-id vol123 -s seg456 \\\n";
+            std::cout << "  " << argv[0] << " -d /path/to/paths -s seg456 \\\n";
             std::cout << "                  --overlap-source approved_patches -o output.png --stride 1\n\n";
 
             std::cout << "  # Fast preview with stride=4:\n";
-            std::cout << "  " << argv[0] << " -v /path/to/vol.volpkg --volume-id vol123 -s seg456 \\\n";
+            std::cout << "  " << argv[0] << " -d /path/to/paths -s seg456 \\\n";
             std::cout << "                  --overlap-source contributing -o output.png --stride 4\n\n";
 
             std::cout << "  # Filter to specific surfaces:\n";
-            std::cout << "  " << argv[0] << " -v /path/to/vol.volpkg --volume-id vol123 -s seg456 \\\n";
+            std::cout << "  " << argv[0] << " -d /path/to/paths -s seg456 \\\n";
             std::cout << "                  --overlap-source contributing -o output.png \\\n";
             std::cout << "                  --filter \"surface1,surface2,surface3\"\n";
             return EXIT_SUCCESS;
@@ -573,8 +567,7 @@ int main(int argc, char* argv[]) {
 
         po::notify(vm);
 
-        fs::path volpkg_path = vm["volpkg-path"].as<std::string>();
-        std::string volume_id = vm["volume-id"].as<std::string>();
+        fs::path segments_dir = vm["segments-dir"].as<std::string>();
         std::string segment_id = vm["segment-id"].as<std::string>();
         std::string overlap_source = vm["overlap-source"].as<std::string>();
         fs::path output_path = vm["output"].as<std::string>();
@@ -596,7 +589,7 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
 
-        SegmentRenderer renderer(volpkg_path, volume_id);
+        SegmentRenderer renderer(segments_dir);
         renderer.render(segment_id, output_path, overlap_source, filter, stride);
 
         return EXIT_SUCCESS;

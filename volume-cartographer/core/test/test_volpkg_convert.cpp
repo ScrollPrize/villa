@@ -70,15 +70,13 @@ TEST_CASE("convertVolpkg: empty volpkg dir produces a minimal project.json")
     auto j = utils::Json::parse_file(r.output);
     CHECK(j.contains("name"));
     CHECK(j.contains("volumes"));
-    CHECK(j.contains("segments"));
     CHECK(j.contains("normal_grids"));
     CHECK(j["volumes"].is_array());
     CHECK(j["volumes"].size() == 0);
-    CHECK(j["segments"].size() == 0);
     fs::remove_all(d);
 }
 
-TEST_CASE("convertVolpkg: picks up volumes/, paths/, normal_grids/ subdirs")
+TEST_CASE("convertVolpkg: picks up volumes/ and normal_grids/; segment dirs are not project entries")
 {
     auto d = tmpDir("full_layout");
     fs::create_directories(d / "volumes");
@@ -89,22 +87,9 @@ TEST_CASE("convertVolpkg: picks up volumes/, paths/, normal_grids/ subdirs")
     REQUIRE(r.ok);
     auto j = utils::Json::parse_file(r.output);
     CHECK(j["volumes"].size() == 1);
-    CHECK(j["segments"].size() == 1);
     CHECK(j["normal_grids"].size() == 1);
-    CHECK(j.contains("output_segments"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("convertVolpkg: traces/ and export/ also count as segments")
-{
-    auto d = tmpDir("traces_export");
-    fs::create_directories(d / "traces");
-    fs::create_directories(d / "export");
-    auto outFile = d / "project.json";
-    auto r = vc::convertVolpkg(d.string(), outFile);
-    REQUIRE(r.ok);
-    auto j = utils::Json::parse_file(r.output);
-    CHECK(j["segments"].size() == 2);
+    CHECK_FALSE(j.contains("segments"));
+    CHECK_FALSE(j.contains("output_segments"));
     fs::remove_all(d);
 }
 

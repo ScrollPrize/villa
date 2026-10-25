@@ -32,7 +32,6 @@
 #include "overlays/FiberSliceOverlayController.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -7957,12 +7956,6 @@ LineAnnotationController::umbilicusStatus() const
         }
         return {true, std::move(text)};
     }
-    if (!resolved.ambiguous.empty()) {
-        // The candidate paths are what makes this error long; a count is enough
-        // for a status line and the full list still appears on rebuild.
-        return {false, tr("multiple umbilicus files found (%1)")
-                           .arg(resolved.ambiguous.size())};
-    }
     if (!pkg.umbilicusPath().empty()) {
         // The project named a file the resolver refused: that is worth spelling
         // out, since nothing in the package directory can fix it. The resolver
@@ -8123,8 +8116,8 @@ LineAnnotationController::umbilicusForSnapshot(
 {
     SnapshotUmbilicus result;
     // Which umbilicus a package uses is the shared resolver's call: the
-    // project's "umbilicus" field wins, otherwise the package root and the
-    // segment parents are searched and ambiguity is refused outright.
+    // project's "umbilicus" field wins, otherwise the project directory is
+    // searched.
     if (!_state || !_state->vpkg()) {
         return result;
     }
@@ -8132,10 +8125,6 @@ LineAnnotationController::umbilicusForSnapshot(
         vc::core::util::resolveScrollUmbilicus(*_state->vpkg());
     if (resolved.path.empty()) {
         result.message = QString::fromStdString(resolved.error);
-        for (const auto& candidate : resolved.ambiguous) {
-            result.message += QLatin1Char('\n');
-            result.message += QString::fromStdString(candidate.string());
-        }
         Logger()->warn("Fiber map: no usable umbilicus: {}", resolved.error);
         return result;
     }

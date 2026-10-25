@@ -120,20 +120,10 @@ vc::VolpkgConvertResult convertLocal(const fs::path& root, const fs::path& outFi
     }
 
     auto volumes = utils::Json::array();
-    auto segments = utils::Json::array();
     auto normalGrids = utils::Json::array();
 
     if (fs::is_directory(absRoot / "volumes")) {
         appendBareEntry(volumes, relPath(absRoot / "volumes", absOutDir));
-    }
-
-    std::optional<std::string> firstSegmentsLoc;
-    for (const auto& d : {"paths", "traces", "export"}) {
-        if (fs::is_directory(absRoot / d)) {
-            const auto loc = relPath(absRoot / d, absOutDir);
-            appendBareEntry(segments, loc);
-            if (!firstSegmentsLoc) firstSegmentsLoc = loc;
-        }
     }
 
     if (fs::is_directory(absRoot / "normal_grids")) {
@@ -149,9 +139,7 @@ vc::VolpkgConvertResult convertLocal(const fs::path& root, const fs::path& outFi
     }
 
     out["volumes"] = volumes;
-    out["segments"] = segments;
     out["normal_grids"] = normalGrids;
-    if (firstSegmentsLoc) out["output_segments"] = *firstSegmentsLoc;
 
     return writeOut(outFile, out, warning);
 }

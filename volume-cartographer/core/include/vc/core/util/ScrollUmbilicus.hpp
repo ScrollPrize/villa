@@ -17,9 +17,6 @@ namespace vc::core::util {
         std::filesystem::path path;
         // Contents of `path`, when it is non-empty.
         UmbilicusFileInfo info;
-        // The distinct candidates found when a directory search turned up more
-        // than one, in which case `path` is left empty.
-        std::vector<std::filesystem::path> ambiguous;
         // Human-readable reason why `path` is empty.
         std::string error;
     };
@@ -33,13 +30,9 @@ namespace vc::core::util {
     // reported as an unsupported-location error, distinct from the
     // does-not-exist error a missing local file gets.
     //
-    // Only an empty field proceeds to discovery: the package root, plus both
-    // the parent and the grandparent of every attached segments entry, are
-    // searched for umbilicus.json, then estimated_umbilicus.json. Searching
-    // grandparents covers the <volpkg>/paths/<segment> layout, whose
-    // <volpkg>/umbilicus.json a parent-only search misses. The result is only
-    // accepted when all roots agree on a single file; one file reachable
-    // through several roots is deduplicated and stays unambiguous.
+    // Only an empty field proceeds to discovery: the directory holding the
+    // project file is searched for umbilicus.json, then
+    // estimated_umbilicus.json.
     //
     // Frame metadata is reported as the file declares it, and unstamped files
     // are returned as such for callers to decide about — but a file whose
@@ -128,11 +121,10 @@ namespace vc::core::util {
     // alongside it invalidated derived views over files the resolver never looks
     // at. Both operations consume this, so they cannot disagree.
     //
-    // Discovery stops at the first existing name in each root, matching the
-    // search, so a shadowed lower-priority file is absent from the list; the
-    // absent higher-priority names are present, because one appearing does change
-    // the answer. Deduplicated by canonical path so a file reachable through two
-    // roots appears once.
+    // Discovery stops at the first existing name, matching the search, so a
+    // shadowed lower-priority file is absent from the list; the absent
+    // higher-priority names are present, because one appearing does change the
+    // answer.
     [[nodiscard]] std::vector<UmbilicusCandidate> scanUmbilicusCandidates(
         const VolumePkg& pkg);
 
