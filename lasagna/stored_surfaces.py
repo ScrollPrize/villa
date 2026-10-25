@@ -62,8 +62,8 @@ class StoreSession:
 	def store_uuid(self) -> str:
 		return self._attachment.store_uuid
 
-	def artifact_directory(self, object_uuid: str) -> Path:
-		return Path(self._session.artifact_directory(self._attachment, object_uuid))
+	def artifact_directory(self, object_uuid: str, *, create: bool = True) -> Path:
+		return Path(self._session.artifact_directory(self._attachment, object_uuid, create=create))
 
 	def sync(self, *, timeout_s: float = 120.0) -> None:
 		"""Pull the hub's changes and push this replica's; returns once a sync started now has finished. A store
