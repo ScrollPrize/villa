@@ -7564,7 +7564,6 @@ void CWindow::CreateWidgets(void)
     attachScrollAreaToDock(_transformsDock,
                            transformsPanel,
                            QStringLiteral("dockWidgetTransformsContent"));
-    _viewerControlsPanel->setTransformsPanel(transformsPanel);
 
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
             this, &CWindow::onZoomIn);
@@ -7581,7 +7580,7 @@ void CWindow::CreateWidgets(void)
     _surfaceAffineTransforms = std::make_unique<SurfaceAffineTransformController>(
         SurfaceAffineTransformController::Deps{
             .state = _state,
-            .viewerControlsPanel = _viewerControlsPanel.get(),
+            .transformsPanel = transformsPanel,
             .viewerManager = _viewerManager.get(),
             .segmentationModule = _segmentationModule.get(),
             .surfacePanel = _surfacePanel.get(),

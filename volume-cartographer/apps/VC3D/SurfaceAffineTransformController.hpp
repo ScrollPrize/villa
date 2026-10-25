@@ -17,7 +17,6 @@ class CState;
 class QuadSurface;
 class SegmentationModule;
 class SurfacePanelController;
-class ViewerControlsPanel;
 class ViewerManager;
 class ViewerTransformsPanel;
 class QWidget;
@@ -29,7 +28,7 @@ class SurfaceAffineTransformController : public QObject
 public:
     struct Deps {
         CState* state{nullptr};
-        ViewerControlsPanel* viewerControlsPanel{nullptr};
+        ViewerTransformsPanel* transformsPanel{nullptr};
         ViewerManager* viewerManager{nullptr};
         SegmentationModule* segmentationModule{nullptr};
         SurfacePanelController* surfacePanel{nullptr};
@@ -63,7 +62,7 @@ private:
     void onLoadAffineRequested();
 
     CState* _state{nullptr};
-    ViewerControlsPanel* _viewerControlsPanel{nullptr};
+    ViewerTransformsPanel* _transformsPanel{nullptr};
     ViewerManager* _viewerManager{nullptr};
     SegmentationModule* _segmentationModule{nullptr};
     SurfacePanelController* _surfacePanel{nullptr};

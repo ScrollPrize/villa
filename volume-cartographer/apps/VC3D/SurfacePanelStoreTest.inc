@@ -1,9 +1,13 @@
 #include <QApplication>
+#include <QPushButton>
+#include <QSpinBox>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QThread>
 #include <iostream>
 #include <vc_object_store/Uuid.hpp>
+#include "SurfaceAffineTransformController.hpp"
+#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
 // read-only catalog store listed beside it at a pyramid level, fetched on
@@ -133,6 +137,17 @@ int runSurfacePanelStoreTests()
                 "a copy of a catalog surface is the user's, in the open volume's voxels");
         require(panel.activateSurfaceById(copy, &error) && panel.opened()->editable &&
                 (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "the copy opens editable");
+
+        // A transform of a store surface can be saved (as a new surface).
+        state.setSurface("segmentation", activated.back());
+        ViewerTransformsPanel transforms;
+        SurfaceAffineTransformController transformController({&state, &transforms, nullptr, nullptr, &panel, nullptr, nullptr, {}});
+        transforms.findChild<QSpinBox*>()->setValue(2);
+        QPushButton* save = nullptr;
+        for (auto* button : transforms.findChildren<QPushButton*>())
+            if (button->text().contains("Save")) save = button;
+        transformController.refresh();
+        require(save && save->isEnabled(), "a transformed store surface can be saved");
         state.detachObjectStore();
         std::cerr << "surface panel store tests passed\n";
         return 0;

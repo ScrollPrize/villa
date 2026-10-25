@@ -7,7 +7,6 @@
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -102,7 +101,7 @@ vc::HttpAuth authForRemoteTransformSource(const QString& source)
 SurfaceAffineTransformController::SurfaceAffineTransformController(const Deps& deps, QObject* parent)
     : QObject(parent)
     , _state(deps.state)
-    , _viewerControlsPanel(deps.viewerControlsPanel)
+    , _transformsPanel(deps.transformsPanel)
     , _viewerManager(deps.viewerManager)
     , _segmentationModule(deps.segmentationModule)
     , _surfacePanel(deps.surfacePanel)
@@ -408,10 +407,6 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
     auto* transformPanel = transformsPanel();
     const int scale = transformPanel ? transformPanel->scaleValue() : 1;
     const bool scaleOnly = transformPanel && transformPanel->scaleOnlyChecked();
-    if (transformPanel && transformPanel->noResampleChecked() &&
-        !sourceSurface->path.empty() && std::filesystem::exists(sourceSurface->path / "corrections.json")) {
-        throw std::runtime_error("No-resample scaling does not yet transform corrections.json");
-    }
     std::optional<cv::Matx44d> matrix;
     if (!scaleOnly) {
         matrix = currentTransformMatrix(allowRemoteFetch);
@@ -430,8 +425,6 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
     if (!previewSurface) {
         return false;
     }
-
-    previewSurface->path.clear();
 
     if (transformPanel && transformPanel->noResampleChecked()) {
         const auto volume = _state->currentVolume();
@@ -457,7 +450,7 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
 
 ViewerTransformsPanel* SurfaceAffineTransformController::transformsPanel() const
 {
-    return _viewerControlsPanel ? _viewerControlsPanel->transformsPanel() : nullptr;
+    return _transformsPanel;
 }
 
 void SurfaceAffineTransformController::refresh()
@@ -496,7 +489,8 @@ void SurfaceAffineTransformController::refresh()
     const bool previewEnabled =
         sourceSurface && !editingEnabled &&
         (hasScaleOnlyTransform || (!scaleOnly && hasTransform));
-    const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
+    const auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+    const bool saveEnabled = previewEnabled && catalog && catalog->row(sourceSurface->id);
 
     const QString transformLocation = currentTransformSourceDescription();
 
