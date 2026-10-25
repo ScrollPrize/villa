@@ -31,7 +31,7 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from vesuvius.ink_detection.data.dataset import InkDataset
+from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.training.train import stage_training_request, training_dataset_config
 from vesuvius.ink_detection.volume_io import open_volume
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -62,17 +62,40 @@ def parse_args(argv: Sequence[str] | None = None):
     return parser.parse_args(argv)
 
 
-def chunk_keys_for_patches(patches, volume) -> set[str]:
-    """Level-0 chunk keys (as stored on disk) touched by the patches' bounding boxes."""
+def chunk_key_encoder(volume):
+    """Map chunk coordinates to the key the array stores them under, for Zarr 2 and Zarr 3."""
+    metadata = getattr(volume, "metadata", None)
+    if metadata is not None and hasattr(metadata, "encode_chunk_key"):  # Zarr 3 (v2 and v3 arrays)
+        return metadata.encode_chunk_key
+    separator = getattr(volume, "_dimension_separator", None) or "."  # Zarr 2
+    return lambda coords: separator.join(map(str, coords))
+
+
+def read_z_range(patch, config, depth: int) -> tuple[int, int]:
+    """Z range the trainer can read for this patch, including every flat_z_window_jitter offset."""
+    canonical, _ = flat_z_window_bbox(
+        patch.bbox, config=config, do_augmentations=False, is_validation=True
+    )
+    z0, z1 = min(patch.bbox[0], canonical[0]), max(patch.bbox[3], canonical[3])
+    jitter = config.jitter
+    if jitter.enabled and jitter.max_offset > 0 and not patch.is_validation:
+        z0 = min(z0, max(0, canonical[0] - jitter.max_offset))
+        z1 = max(z1, min(depth, canonical[3] + jitter.max_offset))
+    return z0, z1
+
+
+def chunk_keys_for_patches(patches, volume, config) -> set[str]:
+    """Level-0 chunk keys (as stored on disk) the patches can read, Z jitter included."""
     cz, cy, cx = volume.chunks
-    separator = getattr(volume.metadata, "dimension_separator", ".") or "."
+    encode = chunk_key_encoder(volume)
     keys = set()
     for patch in patches:
-        z0, y0, x0, z1, y1, x1 = patch.bbox
+        _, y0, x0, _, y1, x1 = patch.bbox
+        z0, z1 = read_z_range(patch, config, int(volume.shape[0]))
         for iz in range(z0 // cz, (z1 - 1) // cz + 1):
             for iy in range(y0 // cy, (y1 - 1) // cy + 1):
                 for ix in range(x0 // cx, (x1 - 1) // cx + 1):
-                    keys.add(separator.join(map(str, (iz, iy, ix))))
+                    keys.add(encode((iz, iy, ix)))
     return keys
 
 
@@ -106,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         patch_count += len(patches)
         volume = open_volume(segment.image_volume, 0)
         prefix = "" if prefix == "." else prefix + "/"
-        wanted_chunks |= {f"{prefix}0/{key}" for key in chunk_keys_for_patches(patches, volume)}
+        wanted_chunks |= {f"{prefix}0/{key}" for key in chunk_keys_for_patches(patches, volume, config)}
     if not wanted_chunks:
         raise SystemExit(f"no discovered segment lies under the plan destination {plan_root}")
 

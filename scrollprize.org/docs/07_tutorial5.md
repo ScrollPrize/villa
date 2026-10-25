@@ -186,8 +186,6 @@ cd villa/vesuvius
 uv sync --extra models
 ```
 
-If `uv sync --extra models` stops with `Could not find a package configuration file provided by "Ceres"`, it is building the C++ `volume-cartographer` bindings, which ink detection does not use (see [villa#1706](https://github.com/ScrollPrize/villa/pull/1706)). Skip them with `uv sync --extra models --no-install-package volume-cartographer`.
-
 `uv sync --extra models` creates a virtual environment and installs the exact locked dependencies (PyTorch, zarr, and friends). The `models` extra is the machine-learning stack; every command below passes it too. Verify that PyTorch sees your GPU:
 
 ```bash
@@ -260,11 +258,11 @@ The trainer discovers your segments, finds all training patches inside the super
 If your dataset includes segments with validation masks, the model is also evaluated on those held-out regions at each validation step, reporting balanced accuracy — how well it detects ink in areas it was never trained on. If training loss keeps dropping while validation accuracy stalls, the model is starting to overfit your labels. (The tutorial segment has no validation mask, so this first run reports training loss only.) You can stop training at any time with `ctrl+c` and use the most recently saved checkpoint.
 
 :::tip
-If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. On Windows and WSL2 you may never see an out-of-memory error: the NVIDIA driver moves the overflow into system RAM and training just gets 20–100× slower. If `nvidia-smi` shows the card full and each iteration takes seconds, treat that as running out of memory. [Measured settings for a 6 GB card](#small-gpu-or-small-disk) are below. For multi-GPU training, launch through Accelerate instead: `uv run --extra models accelerate launch --num_processes 2 --module vesuvius.ink_detection.training.train configs/ink_tutorial.json`.
+If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_size` to `[64, 128, 128]`. On Windows and WSL2 you may never see an out-of-memory error: the NVIDIA driver moves the overflow into system RAM and training just gets 20–100× slower. If `nvidia-smi` shows the card full and each iteration takes seconds, treat that as running out of memory. On an RTX 3080 (10 GB) under WSL2 the tutorial config (`[64, 256, 256]`, `batch_size` 2) ran at 9.5 s per iteration and `batch_size` 1 at 0.37 s. [Measured settings for a 6 GB card](#small-gpu-or-small-disk) are below. For multi-GPU training, launch through Accelerate instead: `uv run --extra models accelerate launch --num_processes 2 --module vesuvius.ink_detection.training.train configs/ink_tutorial.json`.
 :::
 
 :::tip
-To log metrics and previews to Weights & Biases, add `"wandb_project": "ink-detection"` and `"wandb_entity": "your-username"` to the config and run `uv run wandb login` once.
+To log metrics and previews to Weights & Biases, add `"wandb_project": "ink-detection"` and `"wandb_entity": "your-username"` to the config and run `uv run wandb login` once. The locked `wandb` (0.28) logs to `api.wandb.ai` by default. If your account is on W&B's Forge host, set `WANDB_BASE_URL=https://api.forge.coreweave.com` before logging in; otherwise `wandb.init` stops with `No API key configured` even though you are logged in.
 :::
 
 ### Inference
@@ -325,7 +323,7 @@ uv run --extra models python -m vesuvius.ink_detection.preprocessing.select_flat
 uvx --from huggingface_hub hf buckets sync --apply subset.jsonl
 ```
 
-For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 13 minutes here; step 3 runs patch discovery and took about 3.5 minutes. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3.
+For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) with `patch_size [64, 256, 256]`, and 2,862 chunks (2.42 GB) with `[64, 128, 128]`. Step 1 is many small files (12,625 files, 70 MB) and took 13 minutes here; step 3 runs patch discovery and took about 3.5 minutes. Selecting the chunks is config-specific: if you change `patch_size`, `patch_overlap`, `patch_min_labeled_coverage` or the labels, rerun step 3. With `flat_z_window_jitter` enabled, the selection also covers every Z offset the jitter can draw.
 
 **Settings that fit a 6 GB GPU.** Measured on an RTX 3060 Laptop GPU (6 GB), driver 616.92, WSL2, `torch 2.12.1+cu130`, on the tutorial segment with `mixed_precision: fp16` and `dataloader_workers: 4`. Steady-state time per iteration after 20 iterations; "spills" means the card was full and the driver moved memory into system RAM (see the tip above):
 
@@ -340,6 +338,8 @@ For the tutorial segment this keeps 3,534 of 101,304 level-0 chunks (2.95 GB) wi
 | `[64, 256, 256]` | 8 | — | full | out of memory at ~17 GB allocated |
 
 Inference needs far less: with the 9 µm checkpoint `hybrid_3d2d-seed42/step-075000.pth` on the w035 render (6,458 patches), `--batch-size 8` peaked at 0.6 GB, `32` at 1.5 GB and `128` at 4.9 GB, all finishing in about 1 min 40 s; most of that is startup, `torch.compile` and data loading, not the GPU.
+
+`torch.compile` builds small C helpers and needs the Python development headers (`python3.X-dev` on Debian/Ubuntu, matching your Python). Without them nothing fails: inference logs `fatal error: Python.h: No such file or directory` followed by `WARNING torch.compile backend failed during forward (...); continuing eagerly` and run uncompiled.
 
 ### Native 3D: training and inference
 
