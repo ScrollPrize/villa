@@ -70,18 +70,17 @@ int runFiberConstraintExtraction(int argc, char** argv)
         artifactFound=artifactFound || (artifact.at("kind")=="manifest" && artifact.at("path")==manifestName);
     if(!artifactFound)throw std::invalid_argument("Normal manifest is not the recorded provenance artifact");
     const auto queryStart=Clock::now();
-    // Fiber UUID -> (stored-to-volume scale, line point count), in UUID
-    // order: that order is the trace order and the database's source_index.
-    std::map<std::string,std::pair<double,int64_t>> members;
+    // Fiber UUID -> stored-to-volume scale, in UUID order: that order is the
+    // trace order and the database's source_index.
+    std::map<std::string,double> members;
     const auto addMembers=[&](const std::vector<vc::objects::ObjectRecord>& records) {
         for(const auto& record:records) {
-            if(!record.fiber || record.fiber->linePointCount<2) continue;
             const auto scale=vc::objects::geometryScaleToVolume(Json::parse(record.meta),volume);
             if(!scale) throw std::runtime_error("Fiber "+record.uuid+" is not bound to volume "+volume);
-            members.emplace(record.uuid,std::pair{*scale,record.fiber->linePointCount});
+            members.emplace(record.uuid,*scale);
         }
     };
-    const std::vector<std::string> memberFields{"meta","fiber"};
+    const std::vector<std::string> memberFields{"meta"};
     if(cfg.value("full_volume",false)) {
         vc::objects::ObjectSelection selection;
         selection.kind="fiber"; selection.volume=volume; selection.limit=8192;
@@ -114,22 +113,25 @@ int runFiberConstraintExtraction(int argc, char** argv)
         if(selection.uuids.empty() || selection.uuids.back()!=run.objectUuid) selection.uuids.push_back(run.objectUuid);
     if(!selection.uuids.empty()) addMembers(store.selectObjects(txn,selection,memberFields));
     }
-    std::vector<std::string> ids;
-    for(const auto& [uuid,member]:members) ids.push_back(uuid);
+    // Fibers with a sampled line of at least two points, by their current
+    // geometry (the record's ingest summary is not updated by edits).
+    std::vector<std::string> ids, revisions;
+    std::vector<double> scales;
+    for(const auto& [uuid,scale]:members) {
+        const auto head=store.currentGeometry(txn,uuid);
+        if(!head)throw std::runtime_error("Fiber "+uuid+" has no geometry");
+        const auto line=std::find_if(head->arrays.begin(),head->arrays.end(),[](const auto& a){return a.name=="line_points";});
+        if(line==head->arrays.end() || line->shape.empty() || line->shape[0]<2) continue;
+        ids.push_back(uuid);
+        revisions.push_back(head->uuid);
+        scales.push_back(scale);
+    }
     if (ids.empty()) throw std::runtime_error("No fibers intersect selection box");
     const double querySeconds=seconds(queryStart);
     const auto loadStart=Clock::now();
     std::vector<FiberletCropTraceLine> lines;
     cv::Vec3d lo{INFINITY,INFINITY,INFINITY}, hi{-INFINITY,-INFINITY,-INFINITY};
     double totalArc=0.; std::size_t totalPoints=0;
-    std::vector<std::string> revisions;
-    std::vector<std::pair<double,int64_t>> scaleAndCount;
-    for(const auto& [uuid,member]:members) {
-        const auto head=store.currentGeometry(txn,uuid);
-        if(!head)throw std::runtime_error("Fiber "+uuid+" has no geometry");
-        revisions.push_back(head->uuid);
-        scaleAndCount.push_back(member);
-    }
     constexpr std::size_t kLoadBatch=4096;
     for(std::size_t start=0;start<revisions.size();start+=kLoadBatch) {
         const std::vector<std::string> batch(revisions.begin()+static_cast<std::ptrdiff_t>(start),
@@ -138,7 +140,7 @@ int runFiberConstraintExtraction(int argc, char** argv)
         if(packed.dtype!="<f8")throw std::runtime_error("Fiber line points must be float64");
         for(std::size_t i=0;i<batch.size();++i) {
             FiberletCropTraceLine line;
-            const auto [scale,count]=scaleAndCount[start+i];
+            const double scale=scales[start+i];
             for(uint64_t row=packed.offsets[i];row<packed.offsets[i+1];++row) {
                 double p[3];
                 std::memcpy(p,packed.data.data()+row*sizeof(p),sizeof(p));
@@ -147,8 +149,6 @@ int runFiberConstraintExtraction(int argc, char** argv)
                 line.pointsBaseXYZ.emplace_back(p[0],p[1],p[2]);
                 for(int d=0;d<3;++d){lo[d]=std::min(lo[d],p[d]);hi[d]=std::max(hi[d],p[d]);}
             }
-            if(line.pointsBaseXYZ.size()!=static_cast<std::size_t>(count))
-                throw std::runtime_error("Fiber point-count mismatch");
             totalArc+=makePolylineArcGeometry(line.pointsBaseXYZ).length();
             totalPoints+=line.pointsBaseXYZ.size();
             lines.push_back(std::move(line));
