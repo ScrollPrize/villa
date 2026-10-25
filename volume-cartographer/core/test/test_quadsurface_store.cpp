@@ -203,6 +203,15 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         CHECK((*inVolume->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 4));
         CHECK_THROWS(surfaces.update(uuid, *inVolume));
         CHECK_THROWS(surfaces.load(uuid, true, std::string("other-volume")));
+        // A volume registered to "vol" (here shifted by 10 in x) reads through the store's mapping.
+        const auto registration = util::newUuid();
+        surfaces.session()->act(surfaces.attachment(), {{registration, std::nullopt}}, [&](auto& db, auto& txn) {
+            VolumeAffine shift; shift(0, 3) = 10;
+            db.registerVolumeTransform(txn, "vol", "registered", shift, "test registration", registration);
+        });
+        auto registered = surfaces.load(uuid, true, std::string("registered"));
+        CHECK((*registered->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
+        CHECK_THROWS(surfaces.update(uuid, *registered));
         auto inStore = surfaces.load(uuid);
         CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
         CHECK_NOTHROW(surfaces.update(uuid, *inStore));

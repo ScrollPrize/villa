@@ -1,7 +1,7 @@
 #include "vc/core/util/StoreSurfaces.hpp"
 
 #include <vc_object_store/Uuid.hpp>
-#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 
 #include <cstdlib>
 #include <stdexcept>
@@ -25,22 +25,21 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
 {
     std::unique_ptr<QuadSurface> surface;
     std::string objectRevision, revision;
-    double toVolume = 1;
+    bool storedUnits = true;
     session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
         if (volume) {
-            const auto object = db.objectByUuid(txn, uuid);
-            if (!object) throw std::runtime_error("surface not found: " + uuid);
-            const auto scale = vc::objects::geometryScaleToVolume(nlohmann::json::parse(object->meta), *volume);
-            if (!scale) throw std::runtime_error("surface " + uuid + " is not bound to volume " + *volume);
-            toVolume = *scale;
+            const auto view = vc::objects::GeometrySnapshot(db, txn).viewTransformedAt(uuid, *volume);
+            storedUnits = view.mapping() == vc::objects::VolumeAffine::identity();
+            surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, 1, &view);
+        } else {
+            surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
         }
-        surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, toVolume);
         revision = db.currentGeometry(txn, surface->id)->uuid;
         objectRevision = db.currentObjectRevision(txn, surface->id)->uuid;
     });
     {
         std::lock_guard lock(loadedMutex_);
-        loaded_[surface->id] = {objectRevision, revision, toVolume};
+        loaded_[surface->id] = {objectRevision, revision, storedUnits};
     }
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
     return surface;
@@ -72,7 +71,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, toVolume] = writable(canonical);
+    const auto [objectRevision, geometryRevision, storedUnits] = writable(canonical);
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto& keep) {
@@ -86,7 +85,7 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, toVolume] = writable(canonical);
+    const auto [objectRevision, geometryRevision, storedUnits] = writable(canonical);
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
         revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
@@ -100,9 +99,9 @@ StoreSurfaces::Loaded StoreSurfaces::writable(const std::string& uuid)
     std::lock_guard lock(loadedMutex_);
     const auto found = loaded_.find(uuid);
     if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    // Writing a rescaled grid back would rewrite every stored coordinate.
-    if (found->second.toVolume != 1)
-        throw std::runtime_error("surface " + uuid + " was loaded in a volume's voxels at a scale other than 1");
+    // Writing a mapped grid back would rewrite every stored coordinate.
+    if (!found->second.storedUnits)
+        throw std::runtime_error("surface " + uuid + " was loaded through a volume mapping other than the identity");
     return found->second;
 }
 

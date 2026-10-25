@@ -37,9 +37,10 @@ public:
     StoreSurfaces& operator=(const StoreSurfaces&) = delete;
 
     // The surface's current geometry; channels load on demand from that revision.
-    // With `volume`, in that volume's voxels (the surface must be bound to it);
-    // otherwise in stored units. Only a surface loaded in stored units, or at a
-    // volume scale of 1, can be written back.
+    // With `volume`, in that volume's voxels through the store's transformed view
+    // (bound to it, or registered to it); otherwise in stored units. Only a surface
+    // loaded in stored units, or whose mapping to the volume is the identity, can
+    // be written back.
     std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true,
                                       const std::optional<std::string>& volume = std::nullopt);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
@@ -74,7 +75,7 @@ private:
     std::mutex loadedMutex_;
     struct Loaded {
         std::string objectRevision, geometryRevision;
-        double toVolume = 1;
+        bool storedUnits = true;
     };
     std::map<std::string, Loaded> loaded_;
     // The pins of a surface this tool loaded in stored units; throws otherwise.
