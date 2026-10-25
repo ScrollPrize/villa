@@ -58,20 +58,15 @@ GeometryArray arrayFromMat(const std::string& name, const cv::Mat& mat)
     return array;
 }
 
-// The "mask" channel as per-vertex validity: a vertex is valid only if every
-// mask pixel it covers is 255 (masks may be a whole multiple of the grid).
+// The "mask" channel as per-vertex validity (the store's rule; masks may be a
+// whole multiple of the grid).
 GeometryArray validFromMask(const cv::Mat& mask, int rows, int cols)
 {
-    if (mask.channels() != 1 || mask.rows % rows || mask.cols % cols)
-        throw std::runtime_error("surface mask must be one channel and a whole multiple of the grid");
-    cv::Mat_<uint8_t> values;
-    mask.convertTo(values, CV_8U);
-    const int sy = mask.rows / rows, sx = mask.cols / cols;
-    std::vector<uint8_t> valid(size_t(rows) * size_t(cols), 255);
-    for (int r = 0; r < mask.rows; ++r)
-        for (int c = 0; c < mask.cols; ++c)
-            if (values(r, c) < 255) valid[size_t(r / sy) * size_t(cols) + size_t(c / sx)] = 0;
-    return {"valid", "|u1", {rows, cols}, std::move(valid)};
+    if (mask.channels() != 1) throw std::runtime_error("surface mask must be one channel");
+    cv::Mat_<double> values;
+    mask.convertTo(values, CV_64F);
+    return {"valid", "|u1", {rows, cols},
+            vc::geometry::validityFromMask({values.ptr<double>(), values.total()}, values.rows, values.cols, rows, cols)};
 }
 
 // QuadSurface keeps tifxyz semantics: a vertex at z <= 0 is missing, as
