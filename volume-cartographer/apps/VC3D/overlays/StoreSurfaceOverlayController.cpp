@@ -128,23 +128,19 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
             Listing listing;
             listing.complete = true;
             for (const auto& source : sources) {
-                // The slab in the bound volume's voxels; runs back in the open volume's.
-                auto slice = vc3d::store::regionSlice(query);
-                for (auto& value : slice.origin) value /= source.scale;
-                for (auto& value : slice.localBounds) value /= source.scale;
+                // In the open volume's voxels: the source volume at the open level.
+                const auto slice = vc3d::store::regionSlice(query);
                 session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
                     vc::objects::RegionOptions options;
                     options.kind = "surface";
                     options.volume = source.volume;
+                    options.targetScale = source.scale;
                     options.uuids = uuids;
                     auto result = db.geometryRegion(txn, slice, options,
                                                     [&](const auto&) { return cancel->load() || cancelled.load(); });
                     listing.complete = listing.complete && result.complete();
-                    for (auto& run : result.runs) {
-                        if (source.scale != 1)
-                            for (auto& point : run.points) for (auto& value : point) value *= source.scale;
+                    for (auto& run : result.runs)
                         listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
-                    }
                 });
             }
             return listing;

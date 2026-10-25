@@ -306,18 +306,15 @@ std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double
 {
     std::vector<SurfaceProximityHit> hits;
     for (const auto& source : sources()) {
-        // Queries are in the bound volume's voxels; hits come back in the open volume's.
+        // In the open volume's voxels: the source volume at the open level.
         SurfaceProximityQuery query;
-        query.point = {point[0] / source.scale, point[1] / source.scale, point[2] / source.scale};
-        query.tolerance = tolerance / source.scale;
+        query.point = point;
+        query.tolerance = tolerance;
         query.uuids = uuids;
         query.volume = source.volume;
+        query.targetScale = source.scale;
         session_->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (auto hit : db.nearestSurfaces(txn, query)) {
-                for (auto& value : hit.point) value *= source.scale;
-                hit.distance *= source.scale;
-                hits.push_back(std::move(hit));
-            }
+            for (auto hit : db.nearestSurfaces(txn, query)) hits.push_back(std::move(hit));
         });
     }
     std::stable_sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) { return a.distance < b.distance; });
