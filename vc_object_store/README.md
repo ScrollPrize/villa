@@ -57,8 +57,24 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
 edits, graph snapshots, spatial queries, and synchronization. Detector distances
-and scale options use working voxels. CT normals use uint8 Zarr data with complete
-109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
+and scale options use working voxels.
+
+Fiber- and track-patch linking widens each centerline into a strip that follows
+the sheet normal. The normal source is one of:
+
+- CT (`--ct`, `ct_volume`): structure-tensor normals from uint8 Zarr data with
+  complete 109³ support.
+- Lasagna normals (`--normal-x/--normal-y`, `normal_x_volume`/`normal_y_volume`):
+  paired uint8 nx/ny stores, read at `<store>/<ct_level>` and decoded as the
+  spiral fitter does: `(v - 128) / 127`, `nz = sqrt(1 - nx² - ny²)`, with
+  `nx = ny = 0` meaning no data. Nearest-voxel lookup; `ct_to_base_scale` is the
+  store's downsampling (the spiral's `lasagna_scale`).
+- Neither: no strip is built. Anchors compare the centerline points themselves
+  with each patch, by distance only (same sheet within `same_sheet`, adjacent
+  within `adjacent_low..adjacent_high`), under the same strip gate ratio/margin.
+
+Edges record the choice in `meta.normal_method` (`ct-…`, `lasagna-…` or
+`centerline`) and `meta.normal_source`. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
 adapter. Codec support follows vc_reader.
 

@@ -170,6 +170,12 @@ struct LinePatchParams : CoordinateParams {
     double workingToBaseScale = 1.0;
     double ctToBaseScale = 1.0;
     int ctLevel = 0;
+    // Sheet-normal source, at most one of: the detector's ctVolume argument
+    // (structure-tensor normals from uint8 CT), or both of these paired uint8
+    // lasagna nx/ny volumes (see LasagnaSheetNormalSampler). ctLevel and
+    // ctToBaseScale address whichever volume is selected. With neither, no
+    // normal strip is built and anchors test the centerline points themselves.
+    std::filesystem::path normalXVolume, normalYVolume;
     // Discovery: dense line point -> patch surface distance.
     double proximity = 1.5;
     std::size_t minContacts = 2;
@@ -206,8 +212,9 @@ struct FiberPatchParams : LinePatchParams {
     bool rebuildStrips = false;
 };
 
-// Stored fibers -> stored patches. CT supplies the normal field.
-// Only line points between projected endpoint controls participate. Anchors use
+// Stored fibers -> stored patches. CT (ctVolume) or lasagna normals
+// (normalX/YVolume) supply the strip normal field; with neither, the centerline
+// alone gates anchors. Only line points between projected endpoint controls participate. Anchors use
 // raw line indices and source XYZ. Failed inputs are excluded from stale removal.
 DetectorReport linkFibersToPatches(objects::ObjectStore& db,
     const std::filesystem::path& ctVolume, const FiberPatchParams& params = {},
@@ -234,7 +241,7 @@ struct TrackPatchParams : LinePatchParams {
     double trackScale = 1.0; // source track XYZ -> working XYZ
     std::vector<std::string> trackUuids; // optional existing graph-object subset
 };
-// Uses the same discovery, CT strip, contact gates and growth as fiber->patch.
+// Uses the same discovery, normal source, contact gates and growth as fiber->patch.
 // Reads stored tracks and patches; anchors use raw indices and source XYZ.
 DetectorReport linkTracksToPatches(objects::ObjectStore& db,
     const std::filesystem::path& ctVolume, const TrackPatchParams& params = {},

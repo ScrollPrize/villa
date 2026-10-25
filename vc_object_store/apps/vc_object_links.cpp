@@ -55,9 +55,11 @@ void usage()
         << "  --link-fiber-patches            link stored fibers to stored patches\n"
         << "  --strip-cache <dir>             optional disposable fiber-strip cache\n"
         << "  --rebuild-fiber-strips          refresh strip caches (e.g. after CT voxel edits)\n"
-        << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
-        << "  --ct-level <level>              CT pyramid level (default 0)\n"
-        << "  --ct-to-base-scale <factor>     selected CT voxel size in base units (default 1)\n"
+        << "  --ct <path>                     uint8 CT volume; structure-tensor strip normals\n"
+        << "  --normal-x <path> --normal-y <path>  uint8 lasagna nx/ny volumes for strip normals\n"
+        << "                                  (neither --ct nor these: centerline-only linking)\n"
+        << "  --ct-level <level>              CT or lasagna pyramid level/group (default 0)\n"
+        << "  --ct-to-base-scale <factor>     selected CT/lasagna voxel size in base units (default 1)\n"
         << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
         << "  --patch-scale <factor>           patch XYZ -> working XYZ (default 1)\n"
         << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
@@ -130,6 +132,8 @@ try {
         else if (arg == "--link-fiber-patches") linkFibers = true;
         else if (arg == "--rebuild-fiber-strips") fiberPatchParams.rebuildStrips = true;
         else if (arg == "--ct") ctVolume = next(arg.c_str());
+        else if (arg == "--normal-x") fiberPatchParams.normalXVolume = next(arg.c_str());
+        else if (arg == "--normal-y") fiberPatchParams.normalYVolume = next(arg.c_str());
         else if (arg == "--ct-level") fiberPatchParams.ctLevel = std::stoi(next(arg.c_str()));
         else if (arg == "--ct-to-base-scale") fiberPatchParams.ctToBaseScale = std::stod(next(arg.c_str()));
         else if (arg == "--fiber-scale") fiberPatchParams.fiberScale = std::stod(next(arg.c_str()));
@@ -151,8 +155,6 @@ try {
         return 2;
     }
 
-    if ((linkFibers || linkTrackPatches) && ctVolume.empty())
-        throw std::runtime_error("patch linking requires --ct");
     pclParams.patchScale = fiberPatchParams.patchScale;
 
     static_cast<vc::object_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;

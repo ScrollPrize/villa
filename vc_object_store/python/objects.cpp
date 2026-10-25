@@ -130,6 +130,8 @@ bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::stri
     else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
     else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
     else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
+    else if (key == "normal_x_volume") p.normalXVolume = nb::cast<std::string>(val);
+    else if (key == "normal_y_volume") p.normalYVolume = nb::cast<std::string>(val);
     else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
     else if (key == "proximity") p.proximity = nb::cast<double>(val);
     else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
@@ -665,7 +667,8 @@ NB_MODULE(_native, m)
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored tracks to stored patches; select with track_uuids and patch_uuids. "
-            "vc_reader supplies CT normals. Anchors retain raw indices and source XYZ.")
+            "Strip normals come from ct_volume, or from lasagna "
+            "normal_x_volume/normal_y_volume; with neither, the centerline alone gates anchors. Anchors retain raw indices and source XYZ.")
         .def(
             "link_fibers_to_patches",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
@@ -686,7 +689,8 @@ NB_MODULE(_native, m)
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored patches; select with fiber_uuids and patch_uuids. "
-            "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
+            "Strip normals come from ct_volume, or from lasagna "
+            "normal_x_volume/normal_y_volume; with neither, the centerline alone gates anchors. Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))

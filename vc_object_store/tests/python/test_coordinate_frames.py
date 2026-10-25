@@ -189,18 +189,23 @@ def test_fiber_frame_preflight_precedes_ct_open(db):
     assert db.journal_since() == before
 
 
+def u8_zarr(path, data):
+    """Uncompressed single-chunk uint8 Zarr v2 array, no Python Zarr dependency."""
+    path.mkdir(parents=True)
+    (path / ".zarray").write_text(json.dumps(dict(zarr_format=2, shape=data.shape, chunks=data.shape,
+        dtype="|u1", compressor=None, fill_value=0, order="C", filters=None)))
+    (path / "0.0.0").write_bytes(np.ascontiguousarray(data, dtype=np.uint8).tobytes())
+
+
 @pytest.mark.parametrize("kind", ["fiber", "track"])
 @pytest.mark.parametrize("ct_downsample", [1, 2])
 def test_mixed_lines_and_patch_with_ct(db, tmp_path, kind, ct_downsample):
-    # Uncompressed Zarr v2, no Python Zarr dependency. Full tensor support.
+    # Full tensor support.
     ct = tmp_path / "ct.zarr"
-    ct.mkdir()
     shape = (192, 192, 192)
-    (ct / ".zarray").write_text(json.dumps(dict(zarr_format=2, shape=shape, chunks=shape,
-        dtype="|u1", compressor=None, fill_value=0, order="C", filters=None)))
     z = np.arange(shape[0], dtype=float)
     intensity = (200 * np.exp(-((z - 96) / 3)**2)).astype(np.uint8)
-    (ct / "0.0.0").write_bytes(np.broadcast_to(intensity[:, None, None], shape).tobytes())
+    u8_zarr(ct, np.broadcast_to(intensity[:, None, None], shape))
     a, b = patch(db, 2, 65, (64, 64, 96)), patch(db, 0.5, 65, (64, 64, 96))
     def line(scale):
         if kind == "fiber":
@@ -234,6 +239,85 @@ def test_mixed_lines_and_patch_with_ct(db, tmp_path, kind, ct_downsample):
     assert len(db.edges_of(first)) == 2
     selected = next(e for e in db.edges_of(first) if a in (e["a"], e["b"]))
     assert selected["meta"]["coordinate_frame"] is None
+
+
+LINE_OPTIONS = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
+                    anchor_contact=10, contact_gap=10, strip_margin=0)
+
+
+def lasagna(tmp_path, nx, ny, group="2", downsample=2):
+    # Paired nx/ny stores read at <store>/<group>, as the spiral fitter reads them.
+    shape = (192 // downsample,) * 3
+    for name, value in (("nx", nx), ("ny", ny)):
+        u8_zarr(tmp_path / f"{name}.zarr" / group, np.full(shape, value, np.uint8))
+    return dict(normal_x_volume=str(tmp_path / "nx.zarr"), normal_y_volume=str(tmp_path / "ny.zarr"),
+                ct_level=int(group), ct_to_base_scale=downsample)
+
+
+def test_fiber_patch_lasagna_normals(db, tmp_path):
+    a = patch(db, 1, 65, (64, 64, 96))
+    uid = fiber(db, 1)
+    # 128/128 decodes to nx = ny = 0, so the sheet normal is +z, as for the patch.
+    report = db.link_fibers_to_patches(**LINE_OPTIONS, **lasagna(tmp_path, 128, 128))
+    assert report["edges_created"] == 1, report
+    edge = db.edges_of(uid)[0]
+    assert a in (edge["a"], edge["b"])
+    assert edge["meta"]["normal_method"] == "lasagna-nxny-u8-nearest-v1"
+    assert edge["meta"]["normal_source"] == {"normal_x": str(tmp_path / "nx.zarr"),
+                                             "normal_y": str(tmp_path / "ny.zarr")}
+    assert edge["meta"]["fiber_patch"]["patch_grid"] == [32, 32]
+
+
+def test_fiber_patch_lasagna_without_data_links_nothing(db, tmp_path):
+    patch(db, 1, 65, (64, 64, 96))
+    uid = fiber(db, 1)
+    report = db.link_fibers_to_patches(**LINE_OPTIONS, **lasagna(tmp_path, 0, 0))
+    assert report["edges_created"] == 0
+    assert any("no valid sheet normals" in problem for problem in report["problems"]), report
+    assert db.edges_of(uid) == []
+
+
+@pytest.mark.parametrize("kind", ["fiber", "track"])
+def test_line_patch_without_normals_uses_centerline(db, kind):
+    a = patch(db, 1, 65, (64, 64, 96))
+    if kind == "fiber":
+        uid = fiber(db, 1)
+    else:
+        uid = db.upsert_object({"kind": "track", "meta": {"coordinates": frame(1)},
+            "track": {"dataset_ref": "fixture", "external_key": "0", "family": "horizontal"}})
+        db.put_geometry(uid, Track([[x, 96, 96] for x in range(72, 121)]))
+    link = db.link_fibers_to_patches if kind == "fiber" else db.link_tracks_to_patches
+    report = link(**LINE_OPTIONS)
+    assert report["edges_created"] == 1, report
+    edge = db.edges_of(uid)[0]
+    assert a in (edge["a"], edge["b"])
+    assert edge["meta"]["normal_method"] == "centerline"
+    assert edge["meta"]["normal_source"] is None
+    assert edge["meta"][kind + "_patch"]["anchor"] is True
+    assert edge["meta"][kind + "_patch"]["strip_same"] == 1
+
+
+def test_centerline_gate_rejects_adjacent_sheet(db):
+    # The fiber touches the patch only where a short dip reaches it; elsewhere it
+    # runs one sheet away, so the centerline is mostly adjacent, not same-sheet.
+    patch(db, 1, 65, (64, 64, 96))
+    xyz = [[x, 96, 96 if 94 <= x <= 106 else 104] for x in range(72, 129)]
+    uid = db.upsert_object({"kind": "fiber", "meta": {"coordinates": frame(1)}})
+    db.put_geometry(uid, Fiber([xyz[0], xyz[-1]], xyz))
+    report = db.link_fibers_to_patches(**LINE_OPTIONS)
+    assert report["edges_created"] == 0, report
+
+
+def test_lasagna_normal_arguments_are_validated(db, tmp_path):
+    patch(db, 1, 65, (64, 64, 96))
+    fiber(db, 1)
+    before = db.journal_since()
+    options = lasagna(tmp_path, 128, 128)
+    with pytest.raises(ValueError, match="both normal_x and normal_y"):
+        db.link_fibers_to_patches(normal_x_volume=options["normal_x_volume"], volume_uuid=VOLUME)
+    with pytest.raises(ValueError, match="not both"):
+        db.link_fibers_to_patches("/missing-ct", **LINE_OPTIONS, **options)
+    assert db.journal_since() == before
 
 
 @pytest.mark.parametrize("value", [True, "1", float("nan"), float("inf"), -float("inf")])

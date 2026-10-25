@@ -28,24 +28,46 @@
 namespace vc::object_links::detail {
 namespace {
 
-// Profile CT queries, including cache hits, used by strip marching and patch-link gates.
+// Selects CT, lasagna or no normals. Profiles queries, including cache hits,
+// used by strip marching and patch-link gates.
 class SheetNormalSource {
 public:
-    SheetNormalSource(const std::filesystem::path& ctVolume, const LinePatchParams& params) {
-        ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel,
-            params.workingToBaseScale / params.ctToBaseScale);
+    SheetNormalSource(const std::filesystem::path& ctVolume, const LinePatchParams& params)
+        : ctVolume_(ctVolume), normalX_(params.normalXVolume), normalY_(params.normalYVolume),
+          level_(params.ctLevel) {
+        if (params.normalXVolume.empty() != params.normalYVolume.empty())
+            throw std::invalid_argument("graph links: lasagna normals need both normal_x and normal_y volumes");
+        if (!ctVolume.empty() && !params.normalXVolume.empty())
+            throw std::invalid_argument("graph links: choose CT or lasagna normals, not both");
+        const double scale = params.workingToBaseScale / params.ctToBaseScale;
+        if (!ctVolume.empty())
+            ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel, scale);
+        else if (!params.normalXVolume.empty())
+            lasagna_ = std::make_unique<vc::LasagnaSheetNormalSampler>(
+                params.normalXVolume, params.normalYVolume, params.ctLevel, scale);
     }
     ~SheetNormalSource() {
         if (profile_) printProfile("total");
     }
+    bool available() const { return ct_ || lasagna_; }
     const char* method() const {
-        return vc::CtSheetNormalSampler::method;
+        if (ct_) return vc::CtSheetNormalSampler::method;
+        if (lasagna_) return vc::LasagnaSheetNormalSampler::method;
+        return "centerline";
     }
+    nlohmann::json location() const {
+        if (ct_) return ctVolume_.string();
+        if (lasagna_) return {{"normal_x", normalX_.string()}, {"normal_y", normalY_.string()}};
+        return nullptr;
+    }
+    // Strip-cache identity for the selected volume(s); none without normals.
+    std::optional<nlohmann::json> identity() const;
     vc::CtSheetNormal sampleNormal(const cv::Vec3d& point, const std::atomic_bool* cancel) const {
         if (cancel && cancel->load()) throw std::runtime_error("graph links: line-patch linking cancelled");
+        if (!available()) throw std::logic_error("graph links: no sheet-normal source");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
-        result = ct_->sampleNormal(point, cancel);
+        result = ct_ ? ct_->sampleNormal(point, cancel) : lasagna_->sampleNormal(point, cancel);
         if (profile_) {
             seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
             ++queries_;
@@ -59,7 +81,10 @@ private:
         std::fprintf(stderr, "FIBER_PATCH_PROFILE %s queries %zu normal_seconds %.9f invalid %zu\n",
                      phase, queries_, seconds_, invalid_);
     }
+    std::filesystem::path ctVolume_, normalX_, normalY_;
+    int level_ = 0;
     std::unique_ptr<vc::CtSheetNormalSampler> ct_;
+    std::unique_ptr<vc::LasagnaSheetNormalSampler> lasagna_;
     bool profile_ = std::getenv("VC_FIBER_PATCH_PROFILE") != nullptr;
     mutable size_t queries_ = 0, invalid_ = 0;
     mutable double seconds_ = 0;
@@ -122,7 +147,7 @@ std::vector<cv::Vec3d> gaussianAlong(const std::vector<cv::Vec3d>& values, doubl
 
 // The reduced fast strip: centerline resampled every stripSpacing,
 // marched stripRowsEachSide rows out along the in-sheet cross direction
-// while following normals estimated directly from CT intensities.
+// while following the selected sheet normals (CT structure tensor or lasagna).
 std::shared_ptr<PatchGrid> buildStrip(const LineData& fiber, const SheetNormalSource& sampler,
                                         const LinePatchParams& params, const std::atomic_bool* cancel)
 {
@@ -293,10 +318,10 @@ std::shared_ptr<PatchGrid> buildStrip(const LineData& fiber, const SheetNormalSo
 // Cache source identity without traversing a potentially enormous chunk tree.
 // Volume chunks are treated as immutable; rebuildStrips explicitly refreshes
 // entries after in-place voxel edits. Read metadata once per detector run.
-nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LinePatchParams& p)
+nlohmann::json volumeIdentity(const std::filesystem::path& volume, int level)
 {
     namespace fs = std::filesystem;
-    const auto location = ct.string();
+    const auto location = volume.string();
     nlohmann::json identity{{"location", location}};
     if (location.find("://") != std::string::npos) return identity;
     std::error_code ec;
@@ -313,11 +338,19 @@ nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LineP
     };
     if (fs::is_regular_file(path)) metadata(path);
     else {
-        for (const auto& dir : {path, path / std::to_string(p.ctLevel)})
+        for (const auto& dir : {path, path / std::to_string(level)})
             for (const char* name : {".zarray", ".zattrs", ".zgroup", ".zmetadata", "zarr.json", "meta.json"})
                 metadata(dir / name);
     }
     return identity;
+}
+
+std::optional<nlohmann::json> SheetNormalSource::identity() const
+{
+    if (ct_) return volumeIdentity(ctVolume_, level_);
+    if (lasagna_) return nlohmann::json{{"normal_x", volumeIdentity(normalX_, level_)},
+                                        {"normal_y", volumeIdentity(normalY_, level_)}};
+    return std::nullopt;
 }
 
 nlohmann::json stripCacheKey(const LineData& fiber, const LinePatchParams& p,
@@ -563,6 +596,26 @@ std::pair<double, double> stripAgreement(const Surface& strip, const Surface& pa
     return {same / weight, adjacent / weight};
 }
 
+// Without a normal field there is no strip: measure the eligible centerline
+// points themselves against the patch, by distance alone. Points farther than
+// adjacentHigh from the patch bounds cannot be on either sheet; skip them.
+std::pair<double, double> lineAgreement(const LineData& line, const Surface& patch,
+                                        const LinePatchParams& p, const std::atomic_bool* cancel)
+{
+    size_t selected = 0, same = 0, adjacent = 0;
+    for (size_t i = line.firstLine; i <= line.lastLine; ++i) {
+        if (((i - line.firstLine) & 1023) == 0) checkCancelled(cancel);
+        if (!patch.inBox(line.line[i], p.adjacentHigh)) continue;
+        ++selected;
+        const auto hit = patch.nearest(line.line[i], cv::Vec3d{0, 0, 0}, p.adjacentHigh);
+        if (!hit) continue;
+        if (hit->distance <= p.sameSheet) ++same;
+        else if (hit->distance >= p.adjacentLow) ++adjacent;
+    }
+    if (selected < 5) return {0, 0};
+    return {double(same) / selected, double(adjacent) / selected};
+}
+
 struct Relation {
     std::vector<double> distance, normalDot;
     explicit Relation(size_t n) : distance(n, std::numeric_limits<double>::infinity()), normalDot(n, 0) {}
@@ -598,9 +651,12 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
               const std::optional<nlohmann::json>& source, DetectorReport& report, const std::atomic_bool* cancel)
 {
     if (proposals.empty()) return;
-    const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
-    objects::util::reportProgress(p.progress, "indexing normal strip");
-    const Surface strip(stripGeometry);
+    std::optional<Surface> strip;
+    if (sampler.available()) {
+        const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
+        objects::util::reportProgress(p.progress, "indexing normal strip");
+        strip.emplace(stripGeometry);
+    }
     std::vector<size_t> fresh;
     std::vector<std::unique_ptr<Relation>> relations(proposals.size());
     for (size_t i = 0; i < proposals.size(); ++i) {
@@ -609,7 +665,8 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
         const auto& patch = *patches[c.patch].surface;
         c.contact = contactLength(fiber, c.contacts, p.contactGap);
         if (c.contact >= p.anchorContact) {
-            std::tie(c.stripSame, c.stripAdjacent) = stripAgreement(strip, patch, p, cancel);
+            std::tie(c.stripSame, c.stripAdjacent) = strip ? stripAgreement(*strip, patch, p, cancel)
+                                                           : lineAgreement(fiber, patch, p, cancel);
             c.anchor = c.stripSame > 0 && c.stripSame > p.stripGateRatio * c.stripAdjacent + p.stripGateMargin;
         }
         if (c.anchor) {
@@ -712,9 +769,9 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
         objects::util::reportProgress(params.progress, "opening normal source");
         const SheetNormalSource sampler(ctVolume, params);
         std::optional<nlohmann::json> stripSource;
-        if (!tracks) {
+        if (!tracks && sampler.available()) {
             try {
-                stripSource = normalSourceIdentity(ctVolume, params);
+                stripSource = sampler.identity();
             } catch (const std::exception& e) {
                 report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
@@ -859,7 +916,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 }
                 c.score = p.anchor ? p.stripSame : p.linkedSame;
                 auto metadata = nlohmann::json{{tracks ? "track_patch" : "fiber_patch", evidence}, {"settings", settings},
-                    {"normal_source", ctVolume.string()},
+                    {"normal_source", sampler.location()},
                     {"normal_method", sampler.method()},
                     {"pred_dt_snap", false},
                     {"anchor_index_space", "line_points"}, {"anchor_position_space", "source"}, {"measurement_space", "working_voxels"}};
