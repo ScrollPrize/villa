@@ -147,15 +147,6 @@ std::shared_ptr<QuadSurface> SurfaceAffineTransformController::currentTransformS
         return active;
     }
 
-    if (_state->vpkg()) {
-        const std::string activeId = _state->activeSurfaceId();
-        if (!activeId.empty()) {
-            if (auto surface = _state->vpkg()->getSurface(activeId)) {
-                return surface;
-            }
-        }
-    }
-
     auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
     if (segmentationSurface && segmentationSurface != _transformPreviewSurface) {
         return segmentationSurface;

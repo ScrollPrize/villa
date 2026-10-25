@@ -6851,10 +6851,19 @@ void CWindow::CreateWidgets(void)
             });
     connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
             this, [this](const QString& segmentId) {
-                if (!_state || !_state->vpkg()) return;
-                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId.toStdString()));
-                if (!surf) {
-                    surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                if (!_state) return;
+                const std::string id = segmentId.toStdString();
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(id));
+                if (const auto& opened = _surfacePanel->opened(); !surf && opened && opened->surface->id == id) {
+                    surf = opened->surface;
+                }
+                if (!surf && _surfaceCatalog) {
+                    try {
+                        surf = _surfaceCatalog->open(id).surface;
+                    } catch (const std::exception& error) {
+                        showStatusBarMessage(tr("Cannot focus %1: %2").arg(segmentId, QString::fromUtf8(error.what())), 5000);
+                        return;
+                    }
                 }
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;

@@ -1217,31 +1217,15 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     const int totalPoints = static_cast<int>(allPoints.size());
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
 
-    // Get paths
-    std::filesystem::path pathsDir;
-    std::filesystem::path seedJsonPath;
-
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        seedJsonPath = pathsDir.parent_path() / "seed.json";
-    } else {
-        if (!fVpkg->hasVolumes()) {
-            setError(tr("No volumes in volume package."));
-            return false;
-        }
-
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        seedJsonPath = vpkgPath / "seed.json";
-
-        if (!std::filesystem::exists(pathsDir)) {
-            setError(tr("Segmentation paths directory not found in volume package."));
-            return false;
-        }
+    // New surfaces go to the object store; seed.json lives in the project directory.
+    QString storeError;
+    const auto store = batchStore(&storeError);
+    if (!store) {
+        setError(storeError);
+        return false;
     }
+    const std::filesystem::path projectDir(fVpkg->getVolpkgDirectory());
+    const std::filesystem::path seedJsonPath = projectDir / "seed.json";
 
     if (!std::filesystem::exists(seedJsonPath)) {
         setError(tr("seed.json not found in volume package."));
@@ -1268,9 +1252,9 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
     _batchProcessTail.clear();
-    _batchPathsDir = pathsDir;
+    _batchStore = *store;
     _batchConfigJson = seedJsonPath;
-    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
+    _batchWorkingDir = QString::fromStdString(projectDir.string());
 
     // Update UI
     infoLabel->setText(tr("Running segmentation jobs..."));
@@ -1295,6 +1279,31 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     return true;
 }
 
+void SeedingWidget::setSurfaceCatalog(SurfaceCatalog* catalog)
+{
+    _surfaceCatalog = catalog;
+    // Expansion needs stored surfaces to grow from.
+    if (_surfaceCatalog) connect(_surfaceCatalog, &SurfaceCatalog::rowsChanged, this, &SeedingWidget::updateButtonStates);
+}
+
+std::optional<QStringList> SeedingWidget::batchStore(QString* error) const
+{
+    if (!_surfaceCatalog || !_surfaceCatalog->attachment() || !_surfaceCatalog->volume()) {
+        *error = tr("Attach an object store and open a volume first.");
+        return std::nullopt;
+    }
+    if (!_surfaceCatalog->session()->writable(*_surfaceCatalog->attachment())) {
+        *error = tr("The object store is read-only.");
+        return std::nullopt;
+    }
+    std::filesystem::path store;
+    _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(),
+                                     [&](const auto& db, const auto&, const auto&) { store = db.path(); });
+    return QStringList{QStringLiteral("--store"), QString::fromStdString(store.string()),
+                       QStringLiteral("--volume-uuid"), QString::fromStdString(_surfaceCatalog->volume()->id()),
+                       QStringLiteral("--tag"), QStringLiteral("paths")};
+}
+
 void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
 {
     if (pointIndex >= _batch.total() || !jobsRunning) {
@@ -1313,9 +1322,10 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
     process->setProcessEnvironment(env);
 
     const QStringList toolArgs = QStringList()
-                  << _batchVolumePath
-                  << QString::fromStdString(_batchPathsDir.string())
-                  << QString::fromStdString(_batchConfigJson.string())
+                  << QStringLiteral("-v") << _batchVolumePath
+                  << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
+                  << _batchStore
+                  << QStringLiteral("--seed")
                   << QString::number(point.p[0])
                   << QString::number(point.p[1])
                   << QString::number(point.p[2]);
@@ -2178,15 +2188,14 @@ void SeedingWidget::updateInfoLabel()
 void SeedingWidget::updateButtonStates()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto fVpkg = _state ? _state->vpkg() : nullptr;
 
     // Enable segmentation if we have any points (analysis results OR user points)
     bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty() || !_point_collection->getPoints("seeding_seeds").empty();
     runSegmentationButton->setEnabled(hasAnyPoints && currentVolume != nullptr);
 
-    // Enable expansion if we have a volume AND at least one segmentation
-    bool hasSegmentations = fVpkg && fVpkg->hasSegmentations();
-    expandSeedsButton->setEnabled(currentVolume != nullptr && hasSegmentations);
+    // Enable expansion if we have a volume AND at least one stored surface
+    const bool hasSurfaces = _surfaceCatalog && !_surfaceCatalog->rows().empty();
+    expandSeedsButton->setEnabled(currentVolume != nullptr && hasSurfaces);
 
     // Enable reset if we have any points or paths
     bool hasAnyData = hasAnyPoints || !paths.empty();
@@ -2272,31 +2281,16 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     const int expansionIterations = expansionIterationsSpinBox->value();
     const int ompThreads = ompThreadsSpinBox ? ompThreadsSpinBox->value() : 0;
 
-    // Get paths
-    std::filesystem::path pathsDir;
-    std::filesystem::path expandJsonPath;
-
-    if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
-        auto segID = fVpkg->segmentationIDs()[0];
-        auto seg = fVpkg->segmentation(segID);
-        pathsDir = seg->path().parent_path();
-        expandJsonPath = pathsDir.parent_path() / "expand.json";
-    } else {
-        if (!fVpkg->hasVolumes()) {
-            setError(tr("No volumes in volume package."));
-            return false;
-        }
-
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        expandJsonPath = vpkgPath / "expand.json";
-
-        if (!std::filesystem::exists(pathsDir)) {
-            setError(tr("Segmentation paths directory not found in volume package."));
-            return false;
-        }
+    // Expansion grows from the volume's stored surfaces into new ones;
+    // expand.json lives in the project directory.
+    QString storeError;
+    const auto store = batchStore(&storeError);
+    if (!store) {
+        setError(storeError);
+        return false;
     }
+    const std::filesystem::path projectDir(fVpkg->getVolpkgDirectory());
+    const std::filesystem::path expandJsonPath = projectDir / "expand.json";
 
     if (!std::filesystem::exists(expandJsonPath)) {
         setError(tr("expand.json not found in volume package."));
@@ -2317,9 +2311,9 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
     _batchProcessTail.clear();
-    _batchPathsDir = pathsDir;
+    _batchStore = *store;
     _batchConfigJson = expandJsonPath;
-    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
+    _batchWorkingDir = QString::fromStdString(projectDir.string());
 
     // Update UI
     infoLabel->setText(tr("Running expansion jobs..."));
@@ -2362,9 +2356,9 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
     process->setProcessEnvironment(env);
 
     const QStringList toolArgs = QStringList()
-                  << _batchVolumePath
-                  << QString::fromStdString(_batchPathsDir.string())
-                  << QString::fromStdString(_batchConfigJson.string());
+                  << QStringLiteral("-v") << _batchVolumePath
+                  << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
+                  << _batchStore;
 
     std::cout << "Starting expansion job " << iterationIndex << ": "
               << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()

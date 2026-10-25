@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QWidget>
+#include <optional>
 #include <QComboBox>
 #include <QSpinBox>
 #include <QDoubleSpinBox>
@@ -52,7 +53,7 @@ public:
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
     // Relative-winding paths cross the store surfaces of the current volume.
-    void setSurfaceCatalog(SurfaceCatalog* catalog) { _surfaceCatalog = catalog; }
+    void setSurfaceCatalog(SurfaceCatalog* catalog);
 
     // Dialog-free operation entry points.
     bool previewRaysHeadless(QString* errorMessage = nullptr);
@@ -197,6 +198,9 @@ private:
     // Data
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
+    // Store-mode arguments for vc_grow_seg_from_seed: new surfaces go to the
+    // attached store, bound to the current volume and tagged "paths".
+    std::optional<QStringList> batchStore(QString* error) const;
     SurfaceCatalog* _surfaceCatalog{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
     int currentZSlice;
@@ -230,7 +234,7 @@ private:
     // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
     // not filesystem::path, since a remote locator is a URL.
     QString _batchVolumePath;
-    std::filesystem::path _batchPathsDir;
+    QStringList _batchStore;  // the tool's --store/--volume-uuid/--tag arguments
     std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)
     QString _batchWorkingDir;
 

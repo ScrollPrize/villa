@@ -385,12 +385,6 @@ auto main(int argc, char* argv[]) -> int
         QString::number(CHUNK_CACHE_SIZE_GB));
     parser.addOption(cacheSizeOption);
 
-    QCommandLineOption loadFirstOption(
-        "load-first",
-        "Load the named segmentation folder first instead of loading all segmentation folders.",
-        "folder");
-    parser.addOption(loadFirstOption);
-
     QCommandLineOption volumePackageOption(
         "volpkg",
         "Open a volume package at startup.",
@@ -557,13 +551,6 @@ auto main(int argc, char* argv[]) -> int
                       << " GB is very large. Ensure sufficient system memory." << std::endl;
         }
         cacheSizeGB = static_cast<size_t>(parsed);
-    }
-
-    if (parser.isSet(loadFirstOption)) {
-        const QString loadFirstDir = parser.value(loadFirstOption).trimmed();
-        if (!loadFirstDir.isEmpty()) {
-            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
-        }
     }
 
     int rc = 0;

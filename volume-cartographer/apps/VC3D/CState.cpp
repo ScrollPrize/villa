@@ -453,12 +453,7 @@ void CState::closeAll()
     clearActiveSurface();
 
     setSurface("segmentation", nullptr, true);
-    if (_vpkg) {
-        for (const auto& id : _vpkg->getLoadedSurfaceIDs()) {
-            setSurface(id, nullptr, true);
-        }
-        _vpkg->unloadAllSurfaces();
-    } else {
+    if (!_vpkg) {
         auto names = surfaceNames();
         for (const auto& name : names) {
             if (name != "segmentation") {

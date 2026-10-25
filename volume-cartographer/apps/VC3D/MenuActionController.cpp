@@ -138,8 +138,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachVolumeAct = new QAction(QObject::tr("Attach &Volume..."), this);
     connect(_attachVolumeAct, &QAction::triggered, this, &MenuActionController::attachVolume);
 
-    _attachSegmentsAct = new QAction(QObject::tr("Attach Se&gments..."), this);
-    connect(_attachSegmentsAct, &QAction::triggered, this, &MenuActionController::attachSegments);
 
     _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
     connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
@@ -227,7 +225,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_saveProjectAsAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
-    _fileMenu->addAction(_attachSegmentsAct);
     _objectStoreMenu = new QMenu(QObject::tr("Object &Store"), _fileMenu);
     _fileMenu->addMenu(_objectStoreMenu);
     _objectStoreMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
@@ -1377,14 +1374,8 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
-    CState* state = _window->_state;
-    auto* dialog = new SettingsDialog(
-        state ? state->vpkg() : nullptr,
-        _window);
+    auto* dialog = new SettingsDialog(_window);
     dialog->exec();
-    if (dialog->outputSegmentsChanged()) {
-        _window->refreshCurrentVolumePackageUi();
-    }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
@@ -1789,33 +1780,6 @@ void MenuActionController::attachVolume()
     _window->refreshCurrentVolumePackageUi();
 }
 
-void MenuActionController::attachSegments()
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
-        return;
-    }
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto loc = promptLocation(QObject::tr("Attach Segments"),
-                              QObject::tr("Pick a segment or a folder of segments (local or s3://, https://)."),
-                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-                              {}, false, true);
-    if (loc.isEmpty()) return;
-    const auto err = vc::project::validateLocation(vc::project::Category::Segments, loc.toStdString());
-    if (!err.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("Not a valid segments location:\n\n%1").arg(QString::fromStdString(err)));
-        return;
-    }
-    auto pkg = _window->_state->vpkg();
-    if (!pkg->addSegmentsEntry(loc.toStdString())) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add segments (already attached?)"));
-        return;
-    }
-    if (!pkg->hasOutputSegments()) pkg->setOutputSegments(loc.toStdString());
-    _window->refreshCurrentVolumePackageUi();
-}
-
 void MenuActionController::attachNormalGrid()
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
@@ -2122,10 +2086,6 @@ void MenuActionController::detachEntry()
         items << QObject::tr("[volume] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
     }
-    for (const auto& e : pkg->segmentEntries()) {
-        items << QObject::tr("[segments] %1").arg(QString::fromStdString(e.location));
-        locations << QString::fromStdString(e.location);
-    }
     for (const auto& e : pkg->normalGridEntries()) {
         items << QObject::tr("[normal_grid] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
@@ -2158,35 +2118,6 @@ void MenuActionController::detachEntry()
             QObject::tr("Could not remove entry (not found)."));
         return;
     }
-    _window->refreshCurrentVolumePackageUi();
-}
-
-void MenuActionController::setOutputSegments()
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
-        return;
-    }
-    auto pkg = _window->_state->vpkg();
-    QStringList items;
-    for (const auto& e : pkg->segmentEntries()) items << QString::fromStdString(e.location);
-    if (items.isEmpty()) {
-        QMessageBox::information(_window, QObject::tr("No segments"),
-                                 QObject::tr("Attach a segments source first."));
-        return;
-    }
-    bool ok = false;
-    int currentIdx = 0;
-    if (pkg->hasOutputSegments()) {
-        const auto cur = QString::fromStdString(pkg->outputSegmentsPath().string());
-        for (int i = 0; i < items.size(); ++i) {
-            if (items[i] == cur) { currentIdx = i; break; }
-        }
-    }
-    QString chosen = QInputDialog::getItem(_window, QObject::tr("Set Output Segments"),
-        QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
-    if (!ok || chosen.isEmpty()) return;
-    pkg->setOutputSegments(chosen.toStdString());
     _window->refreshCurrentVolumePackageUi();
 }
 

@@ -287,8 +287,6 @@ set(srcs
     viewer_controls/panels/ViewerTransformsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp
     viewer_controls/panels/ViewerViewExtrasPanel.hpp
-    SegmentRenderThread.cpp
-    SegmentRenderThread.hpp
     elements/ProgressUtil.cpp
     elements/ProgressUtil.hpp
     CommandLineToolRunner.cpp
