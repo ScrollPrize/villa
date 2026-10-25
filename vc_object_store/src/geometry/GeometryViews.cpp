@@ -164,6 +164,10 @@ geometry::PointCollection PointCollectionView::load() const { return std::get<ge
 int64_t FiberView::controlPointCount() const { return state_->array("control_points").shape[0]; }
 int64_t FiberView::linePointCount() const { return state_->array("line_points").shape[0]; }
 std::vector<geometry::Point> FiberView::controlPoints(int64_t start, int64_t count) const { return objects::points<double>(*state_, "control_points", start, count); }
+std::vector<geometry::PointId> FiberView::controlPointIds(int64_t start, int64_t count) const
+{
+    return scalarsFromBytes<int64_t>(state_->range("control_point_ids", start, count));
+}
 std::vector<geometry::Point> FiberView::linePoints(int64_t start, int64_t count) const { return objects::points<double>(*state_, "line_points", start, count); }
 geometry::Fiber FiberView::load() const { return std::get<geometry::Fiber>(loadGeometry()); }
 int64_t TrackView::size() const { return state_->array("points").shape[0]; }

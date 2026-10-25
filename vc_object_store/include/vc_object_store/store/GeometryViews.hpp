@@ -35,6 +35,7 @@ public:
     int64_t controlPointCount() const;
     int64_t linePointCount() const;
     std::vector<geometry::Point> controlPoints(int64_t start, int64_t count) const;
+    std::vector<geometry::PointId> controlPointIds(int64_t start, int64_t count) const;
     std::vector<geometry::Point> linePoints(int64_t start, int64_t count) const;
     geometry::Fiber load() const;
 private:

@@ -78,6 +78,7 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_prop_ro("control_point_count", &vo::FiberView::controlPointCount)
         .def_prop_ro("line_point_count", &vo::FiberView::linePointCount)
         .def("control_points", &vo::FiberView::controlPoints, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
+        .def("control_point_ids", &vo::FiberView::controlPointIds, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
         .def("line_points", &vo::FiberView::linePoints, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
         .def("load", &vo::FiberView::load, nb::call_guard<nb::gil_scoped_release>());
     nb::class_<vo::TrackView, vo::GeometryView>(m, "TrackView")

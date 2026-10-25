@@ -73,6 +73,11 @@ int main() try {
                 Json::array({Json{{"note","second"}},Json::object(),Json{{"note","first"}}}),"annotations follow stable IDs through splice");
             // Typed views over the session's own transaction, at a pinned or the current revision.
             GeometrySnapshot inSession(db, txn);
+            if (std::string(kind) == "fiber") {
+                const auto fiber = inSession.fiber(uuid);
+                require(fiber.controlPointIds(0, fiber.controlPointCount()) == std::vector<int64_t>{20, 30, 10},
+                        "fiber views read stable control point IDs");
+            }
             const auto encoded = [&](const std::optional<std::string>& revision) {
                 return std::visit([](const auto& view) { return vc::geometry::encode(view.load()); },
                                   inSession.geometry(uuid, revision));
