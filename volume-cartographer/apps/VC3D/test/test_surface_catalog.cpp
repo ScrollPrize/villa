@@ -139,6 +139,12 @@ int main(int argc, char** argv)
             vc3d::corrections::write(*session, attachment, half, saved, *volume);
             auto stored = vc3d::corrections::read(*session, attachment, half);
             require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                const auto uuid = db.neighbours(txn, half, std::string(vc::objects::kAttachmentEdgeKind)).at(0);
+                require(nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta)["role"] == "corrections" &&
+                            db.neighbours(txn, half).empty(),
+                        "corrections are attached data, not graph links");
+            });
             PointCollections reloaded;
             require(reloaded.replaceAnchoredCollections(stored), "stored corrections load");
             const auto& collection = reloaded.getAllCollections().at(fix);

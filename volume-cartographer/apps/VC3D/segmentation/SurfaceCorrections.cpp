@@ -12,7 +12,8 @@ using namespace vc::objects;
 using Json = nlohmann::json;
 
 namespace {
-constexpr const char* kEdgeKind = "point-surface";
+// Corrections are data attached to the surface, never graph links.
+constexpr const char* kEdgeKind = kAttachmentEdgeKind;
 constexpr const char* kRole = "corrections";
 
 // The correction relationships of a surface, by collection UUID.
@@ -121,6 +122,7 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                 record.uuid = uuid;
                 record.kind = "point_collection";
                 for (const auto* key : {"coordinates", "coordinate_binding"}) meta[key] = binding.at(key);
+                meta["role"] = kRole;
             }
             record.name = collection.value("name", std::string{});
             const auto head = current ? db.currentGeometry(txn, uuid) : std::nullopt;
@@ -250,6 +252,7 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
                                    {"creation_time", point.creationTime}});
     }
     auto meta = vc3d::coordinateBindingForVolume(volume, 1);
+    meta["role"] = "growth_annotation";
     meta["source"] = {{"growth_annotation", {{"surface", annotation.surfaceUuid},
                                              {"before_geometry", annotation.beforeGeometry},
                                              {"after_geometry", annotation.afterGeometry},

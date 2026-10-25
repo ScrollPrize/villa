@@ -1,7 +1,8 @@
 #pragma once
 // A surface's correction point collections (VC point collections anchored on
-// the surface) in the object store: point_collection objects linked to the
-// surface by "point-surface" relationships whose meta role is "corrections".
+// the surface) in the object store: point_collection objects with record meta
+// role "corrections", attached to the surface by "attachment" relationships
+// with the same role (data on the surface, never graph links).
 #include "utils/Json.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <cstdint>
@@ -41,8 +42,8 @@ struct GrowthAnnotation {
     std::vector<Point> points;
 };
 
-// Store it as a point_collection linked to the surface ("point-surface",
-// role "growth_annotation"). Returns the new object's UUID.
+// Store it as a point_collection attached to the surface (role
+// "growth_annotation"). Returns the new object's UUID.
 std::string writeGrowthAnnotation(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
                                   const GrowthAnnotation& annotation, const Volume& volume);
 
