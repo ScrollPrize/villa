@@ -5,7 +5,7 @@
 #include "internal/RecordSql.hpp"
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/ArrayLayout.hpp"

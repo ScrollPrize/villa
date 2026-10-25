@@ -4,6 +4,8 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
+#include <tuple>
 #include <nlohmann/json.hpp>
 #include <iostream>
 using namespace vc::objects;
@@ -86,6 +88,26 @@ int main() try {
         mustFail([&] { session.act(attachment,pins,[&](auto& db,auto& txn) {
             updateGeometryArrays(db,txn,uuid,target,initialGeometry);
         }); });
+    }
+    {
+        // Packed reads decode per item with the public byte helpers.
+        const auto a = util::newUuid(), b = util::newUuid();
+        std::string ra, rb;
+        session.act(attachment, {{a,{}},{b,{}}}, [&](auto& db, auto& txn) {
+            for (const auto& [uuid, revision, points] : {std::tuple{a, &ra, std::vector<vc::geometry::Point>{{1,2,3}}},
+                                                       std::tuple{b, &rb, std::vector<vc::geometry::Point>{{4,5,6},{7,8,9}}}}) {
+                ObjectRecord object; object.uuid = uuid; object.kind = "umbilicus";
+                db.upsertObject(txn, object);
+                *revision = db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{points}));
+            }
+        });
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            const auto packed = db.readGeometryArrays(txn, {ra, rb}, "points");
+            require(xyzFromBytes<double>(packedItem(packed, 1)) == std::vector<std::array<double, 3>>{{4,5,6},{7,8,9}} &&
+                    xyzFromBytes<double>(packedItem(packed, 0)) == std::vector<std::array<double, 3>>{{1,2,3}},
+                    "packed items decode to their points");
+            mustFail([&] { (void)packedItem(packed, 2); });
+        });
     }
     // Auxiliary channels and non-finite payload bits belong to the generic
     // store schema even when owned, typed geometry cannot represent them.

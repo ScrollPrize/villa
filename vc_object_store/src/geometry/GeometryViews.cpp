@@ -1,5 +1,5 @@
 #include "vc_object_store/store/GeometryViews.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>

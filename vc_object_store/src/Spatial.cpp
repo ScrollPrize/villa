@@ -2,7 +2,7 @@
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 #include "geometry/GeometryReader.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <bit>
 #include <tuple>
 

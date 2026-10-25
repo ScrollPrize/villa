@@ -1,5 +1,5 @@
 #include "geometry/GeometryReader.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "internal/CoordinateFilter.hpp"
 #include "internal/Database.hpp"

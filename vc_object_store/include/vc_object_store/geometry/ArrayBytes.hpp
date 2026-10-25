@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/Geometry.hpp"
+#include "vc_object_store/objects/ObjectStore.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -64,3 +65,30 @@ template<class T> GeometryArray xyzArray(std::string name, std::string dtype,
     return result;
 }
 } // namespace vc::objects::detail
+
+namespace vc::objects {
+// Values of stored array bytes (little-endian, the stored dtype: uint8_t |u1,
+// int32_t <i4, int64_t <i8, float <f4, double <f8), e.g. from readGeometryArray,
+// readGeometryRanges or one item of a PackedGeometryArray.
+template<class T> std::vector<T> scalarsFromBytes(std::span<const uint8_t> bytes)
+{
+    if (bytes.size() % sizeof(T)) throw std::runtime_error("invalid scalar array size");
+    std::vector<T> result(bytes.size() / sizeof(T));
+    detail::copyScalars<T>(bytes, result);
+    return result;
+}
+template<class T> std::vector<std::array<T, 3>> xyzFromBytes(std::span<const uint8_t> bytes)
+{
+    return detail::xyzValues<T>(bytes);
+}
+// The bytes of item `item` of a packed array: rows offsets[item] to offsets[item + 1].
+inline std::span<const uint8_t> packedItem(const PackedGeometryArray& packed, size_t item)
+{
+    if (item + 1 >= packed.offsets.size()) throw std::out_of_range("packed array item out of range");
+    size_t rowBytes = size_t(std::stoi(packed.dtype.substr(2)));
+    for (size_t axis = 1; axis < packed.shape.size(); ++axis) rowBytes *= size_t(packed.shape[axis]);
+    const auto begin = packed.offsets[item] * rowBytes, end = packed.offsets[item + 1] * rowBytes;
+    if (end > packed.data.size()) throw std::out_of_range("packed array offsets exceed its data");
+    return std::span<const uint8_t>(packed.data).subspan(begin, end - begin);
+}
+} // namespace vc::objects

@@ -1,6 +1,6 @@
 #include "geometry/SequenceMetadata.hpp"
 #include "geometry/SequenceIdentity.hpp"
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 
 namespace vc::objects::detail {
 namespace {
