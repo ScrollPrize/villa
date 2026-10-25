@@ -73,7 +73,7 @@ add_library(vc_core
 target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
 
 target_link_libraries(vc_core
-    PUBLIC vc_object_store::vc_objects
+    PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats
         PUBLIC
         opencv_core
         opencv_imgproc

@@ -49,138 +49,11 @@ void fillTileBuffer(std::vector<uint8_t>& buf, int cvType, float padValue) {
     }
 }
 
-// Convert image to target type with value scaling
-cv::Mat convertWithScaling(const cv::Mat& img, int targetType) {
-    if (img.type() == targetType)
-        return img;
-
-    cv::Mat result;
-    const int srcType = img.type();
-
-    // Scaling factors for full-range conversion
-    if (srcType == CV_8UC1 && targetType == CV_16UC1) {
-        img.convertTo(result, CV_16UC1, 257.0);  // 255 * 257 = 65535
-    } else if (srcType == CV_8UC1 && targetType == CV_32FC1) {
-        img.convertTo(result, CV_32FC1, 1.0 / 255.0);
-    } else if (srcType == CV_16UC1 && targetType == CV_8UC1) {
-        img.convertTo(result, CV_8UC1, 1.0 / 257.0);
-    } else if (srcType == CV_16UC1 && targetType == CV_32FC1) {
-        img.convertTo(result, CV_32FC1, 1.0 / 65535.0);
-    } else if (srcType == CV_32FC1 && targetType == CV_8UC1) {
-        img.convertTo(result, CV_8UC1, 255.0);
-    } else if (srcType == CV_32FC1 && targetType == CV_16UC1) {
-        img.convertTo(result, CV_16UC1, 65535.0);
-    } else {
-        throw std::runtime_error("Unsupported type conversion");
-    }
-
-    return result;
-}
-
 } // anonymous namespace
 
 // ============================================================================
 // writeTiff implementation
 // ============================================================================
-
-void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvType, uint32_t tileW, uint32_t tileH, float padValue, uint16_t compression, float dpi)
-{
-    if (img.empty())
-        throw std::runtime_error("Empty image for " + outPath.string());
-    if (img.channels() != 1)
-        throw std::runtime_error("Expected single-channel image for " + outPath.string());
-
-    // Determine output type and convert if necessary
-    const int outType = (cvType < 0) ? img.type() : cvType;
-    const cv::Mat outImg = convertWithScaling(img, outType);
-
-    const auto params = getTiffParams(outType);
-
-    const uint32_t W = static_cast<uint32_t>(outImg.cols);
-    const uint32_t H = static_cast<uint32_t>(outImg.rows);
-    const std::uint64_t pixelBytes =
-        static_cast<std::uint64_t>(W) * H * params.elemSize;
-    const char* mode = pixelBytes > 0xffff0000ULL ? "w8" : "w";
-
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), mode);
-    if (!tf)
-        throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
-
-    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH,      W);
-    TIFFSetField(tf, TIFFTAG_IMAGELENGTH,     H);
-    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
-    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE,   params.bits);
-    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT,    params.sampleFormat);
-    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_MINISBLACK);
-    TIFFSetField(tf, TIFFTAG_COMPRESSION,     compression);
-    if (compression == COMPRESSION_LZW || compression == COMPRESSION_DEFLATE ||
-        compression == COMPRESSION_ADOBE_DEFLATE)
-        TIFFSetField(tf, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
-    if (dpi > 0.f) {
-        TIFFSetField(tf, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
-        TIFFSetField(tf, TIFFTAG_XRESOLUTION, dpi);
-        TIFFSetField(tf, TIFFTAG_YRESOLUTION, dpi);
-    }
-
-    if (tileW == 0 || tileH == 0) {
-        TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, H);
-        // The predictor encodes the scanline buffer in place; never hand it the caller's image.
-        std::vector<uint8_t> row(static_cast<size_t>(W) * outImg.elemSize());
-        for (uint32_t y = 0; y < H; ++y) {
-            std::memcpy(row.data(), outImg.ptr<uint8_t>(static_cast<int>(y)), row.size());
-            if (TIFFWriteScanline(tf, row.data(), y, 0) < 0) {
-                TIFFClose(tf);
-                throw std::runtime_error("TIFFWriteScanline failed at row " +
-                                        std::to_string(y) + " in " + outPath.string());
-            }
-        }
-
-        if (!TIFFWriteDirectory(tf)) {
-            TIFFClose(tf);
-            throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
-        }
-        TIFFClose(tf);
-        return;
-    }
-
-    TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
-    TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
-
-    const size_t tileBytes = static_cast<size_t>(tileW) * tileH * params.elemSize;
-    std::vector<uint8_t> tileBuf(tileBytes);
-
-    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
-        const uint32_t dy = std::min(tileH, H - y0);
-        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
-            const uint32_t dx = std::min(tileW, W - x0);
-
-            // Fill with padding
-            fillTileBuffer(tileBuf, outType, padValue);
-
-            // Copy actual data
-            for (uint32_t ty = 0; ty < dy; ++ty) {
-                const uint8_t* src = outImg.ptr<uint8_t>(static_cast<int>(y0 + ty)) + x0 * params.elemSize;
-                std::memcpy(tileBuf.data() + ty * tileW * params.elemSize,
-                           src,
-                           dx * params.elemSize);
-            }
-
-            const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
-            if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBytes)) < 0) {
-                TIFFClose(tf);
-                throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
-                                        std::to_string(x0) + "," + std::to_string(y0) +
-                                        ") in " + outPath.string());
-            }
-        }
-    }
-
-    if (!TIFFWriteDirectory(tf)) {
-        TIFFClose(tf);
-        throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
-    }
-    TIFFClose(tf);
-}
 
 // ============================================================================
 // TiffWriter implementation
@@ -331,24 +204,6 @@ bool decodesCompletely(TIFF* tf)
 }
 
 } // namespace
-
-bool isReadableTiff(const std::filesystem::path& path)
-{
-    // TIFFOpen("r") reads the first directory and fails without one, which
-    // is what a writer killed before close() leaves behind. That alone does
-    // not prove the tile data is intact, so every tile is decoded as well.
-    // A torn file makes libtiff complain through its global handlers, so
-    // mute them for the probe and hand back a plain yes/no.
-    TIFFErrorHandler prevError = TIFFSetErrorHandler(nullptr);
-    TIFFErrorHandler prevWarning = TIFFSetWarningHandler(nullptr);
-    TIFF* tf = TIFFOpen(path.string().c_str(), "r");
-    const bool ok = tf && decodesCompletely(tf);
-    if (tf)
-        TIFFClose(tf);
-    TIFFSetErrorHandler(prevError);
-    TIFFSetWarningHandler(prevWarning);
-    return ok;
-}
 
 // ============================================================================
 // mergeTiffParts implementation

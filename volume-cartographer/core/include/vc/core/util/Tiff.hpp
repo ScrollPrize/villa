@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdint>
 #include <tiffio.h>
+#include <vc_object_store/Tiff.hpp>
 
 // Convert voxel size in micrometers to DPI (dots per inch)
 // Returns 0 if voxelSize is <= 0
@@ -14,22 +15,8 @@ inline float voxelSizeToDpi(double voxelSizeUm)
     return voxelSizeUm > 0 ? static_cast<float>(25400.0 / voxelSizeUm) : 0.f;
 }
 
-// Write single-channel image (8U, 16U, 32F) as TIFF.
-// cvType: output type (-1 = same as input). If different, values are scaled:
-//         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
-// tileW/tileH: tile dimensions. If either is 0, write one untiled strip.
-// compression: libtiff compression constant (e.g. COMPRESSION_LZW, COMPRESSION_PACKBITS)
-// padValue: value for padding partial tiles (default -1.0f, used for float; int types use 0)
-// dpi: resolution in dots per inch (0 = don't set). Use voxelSizeToDpi() to convert from µm.
-void writeTiff(
-    const std::filesystem::path& outPath,
-    const cv::Mat& img,
-    int cvType = -1,
-    uint32_t tileW = 1024,
-    uint32_t tileH = 1024,
-    float padValue = -1.0f,
-    uint16_t compression = COMPRESSION_LZW,
-    float dpi = 0.f);
+// writeTiff, isReadableTiff and readTiffSamples/writeTiffSamples are the
+// object store's (vc_object_store/Tiff.hpp).
 
 // Class for incremental tiled TIFF writing
 // Useful for writing tiles in parallel or from streaming data
@@ -89,18 +76,6 @@ private:
     std::vector<uint8_t> _tileBuf;  // Reusable tile buffer
     std::filesystem::path _path;     // For error messages
 };
-
-// True if `path` opens as a TIFF whose first directory is present and whose
-// every tile (or strip) decodes to its full size. TiffWriter (like libtiff
-// in general) writes the directory in close(), so a file left behind by a
-// writer that was killed mid-way has a header and tile data but no
-// directory: exists() says "done", this says "torn". Decoding the payload
-// additionally rejects a file whose directory survived but whose tile data
-// is truncated or does not decompress; it reads the whole file, so this
-// costs about as much as one pass over the output. Pixel values are not
-// checked against anything. libtiff diagnostics are suppressed while
-// probing; the caller decides what to report.
-bool isReadableTiff(const std::filesystem::path& path);
 
 // Any-channel images that OpenCV's TIFF codec cannot write or read (e.g. two
 // float components): one uncompressed page with interleaved samples. Depths
