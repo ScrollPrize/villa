@@ -602,6 +602,11 @@ void ObjectStore::retainRelationship(WriteTxn& txn, const std::string& uuid)
     savepoint.release();
 }
 
+void ObjectStore::keepRecordedRelationshipsOf(WriteTxn& txn, const std::string& objectUuid)
+{
+    for (const auto& edge : edgesOf(txn, objectUuid, true)) keepRecordedRelationship(txn, edge.uuid);
+}
+
 void ObjectStore::keepRecordedRelationship(WriteTxn& txn, const std::string& uuid)
 {
     DependencyScope dependencies;

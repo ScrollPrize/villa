@@ -221,7 +221,10 @@ def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
     for action in ('retire_object', 'restore_object'):
         with db.write(expected_revisions=heads(db, a, b)) as tx:
             getattr(tx, action)(a)
-            tx.keep_recorded_relationship(edge)
+            if action == 'retire_object':
+                tx.keep_recorded_relationship(edge)
+            else:
+                tx.keep_recorded_relationships_of(a)  # every relationship of a, as recorded
         assert db.current_geometry(a)['uuid'] == second
         assert db.component(b, applicable_only=True) == [b]
     assert not db.object(a)['retired']

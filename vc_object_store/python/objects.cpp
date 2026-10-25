@@ -860,6 +860,7 @@ NB_MODULE(_native, m)
              nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
         .def("retain_relationship", writeMethod<&vo::ObjectStore::retainRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
         .def("keep_recorded_relationship", writeMethod<&vo::ObjectStore::keepRecordedRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
+        .def("keep_recorded_relationships_of", writeMethod<&vo::ObjectStore::keepRecordedRelationshipsOf, PyObjectWriteTxn>(), nb::arg("object_uuid"))
         .def("update_edge", [](PyObjectWriteTxn& self, const nb::dict& record) {
             self.owner->require().updateEdge(self.require(), edgeFromPy(record));
         })

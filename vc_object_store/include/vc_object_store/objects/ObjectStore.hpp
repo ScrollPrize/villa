@@ -392,6 +392,9 @@ public:
     // Keep historical pins after an endpoint edit without asserting that the
     // relationship applies to the edited endpoint. Current queries may be stale.
     void keepRecordedRelationship(WriteTxn&, const std::string& edgeUuid);
+    // keepRecordedRelationship for every relationship of the object, retired
+    // ones included (e.g. after a record-only edit of it).
+    void keepRecordedRelationshipsOf(WriteTxn&, const std::string& objectUuid);
     const std::filesystem::path& path() const;
     std::string hostname() const;
     std::string author() const;
