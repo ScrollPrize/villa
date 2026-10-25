@@ -59,7 +59,8 @@ public:
     geometry::SurfacePoint vertex(int64_t row, int64_t column) const;
     bool valid(int64_t row, int64_t column) const;
     // Returns an owned, row-major rectangle of points and validity with the same
-    // scale; other channels are read with readGeometryRectangle.
+    // scale; vertices without coordinates (validSurfacePoint) read as the
+    // (-1,-1,-1) sentinel. Other channels are read with readGeometryRectangle.
     geometry::Surface readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const;
     geometry::Surface load() const;
 private:

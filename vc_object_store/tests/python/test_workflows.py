@@ -691,3 +691,15 @@ def test_numpy_constructors_for_polylines(db):
         view = snapshot.fiber(uid)
         assert view.control_point_ids(0, 2) == [0, 1] and view.line_points_array().tolist()[1] == [1, 0, 0]
     assert Umbilicus.from_arrays(np.array([[1, 2, 3]], '<f8')).points == [[1, 2, 3]]
+
+
+def test_surface_views_read_vertices_without_coordinates_as_the_sentinel(db):
+    # The generic schema keeps exact bits; the typed tile read applies the store's rule.
+    points = np.array([[[1, 2, 3], [5, -1, 7], [np.nan, 1, 2]]], dtype='<f4')
+    uid = db.upsert_object(dict(kind='surface'))
+    revision = db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[array('points', points)]))
+    assert np.isnan(np.frombuffer(db.read_geometry_array(revision, 'points'), '<f4')[6])
+    with db.geometry_snapshot() as snapshot:
+        read, valid = snapshot.surface(uid).read_arrays()
+    assert read[0, 1].tolist() == [-1, -1, -1] and read[0, 2].tolist() == [-1, -1, -1]
+    assert valid.tolist() == [[True, False, False]]

@@ -193,6 +193,10 @@ geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t row
     const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
         state_->revision.uuid, "points", row, column, rows, columns);
     geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
+    // Vertices without coordinates read as the sentinel; exact stored bits stay
+    // available through readGeometryRectangle.
+    for (auto& p : result.points)
+        if (!geometry::validSurfacePoint(p)) p = {-1, -1, -1};
     const auto& arrays = state_->revision.arrays;
     if (std::any_of(arrays.begin(), arrays.end(), [](const auto& a) { return a.name == detail::surfaceValidChannel; }))
         result.validity = state_->read->db->readGeometryRectangle(*state_->read->txn,
