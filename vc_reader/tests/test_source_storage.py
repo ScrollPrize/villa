@@ -707,6 +707,23 @@ class RemoteTests(RemoteFixtureCase):
             old.read((0, 0), (5, 7))
         old.close()
 
+    def test_remote_demand_reads_go_through_the_prefetch_scheduler(self):
+        data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
+        path = self.root/'prefetch.zarr'
+        path.mkdir()
+        (path/'.zarray').write_text(json.dumps(dict(zarr_format=2, shape=data.shape, chunks=[2, 2, 2],
+            dtype=data.dtype.str, compressor=None, filters=None, fill_value=0, order='C')))
+        chunks = {'.'.join(map(str, index)): index for index in np.ndindex(2, 2, 2)}
+        for key, (z, y, x) in chunks.items():
+            (path/key).write_bytes(data[2*z:2*z+2, 2*y:2*y+2, 2*x:2*x+2].tobytes())
+        with ZarrReader.open(self.url+'/prefetch.zarr', cache_dir=self.cache) as reader:
+            # A window makes the scheduler the reader's fetcher, so cache misses become demand jobs.
+            with reader.prefetch_window():
+                np.testing.assert_array_equal(reader[:], data)
+            stats = reader.prefetch_stats()
+        self.assertEqual((stats['completed'], stats['errors']), (len(chunks), 0))
+        self.assertEqual({key: self.counts.get('/prefetch.zarr/'+key) for key in chunks}, dict.fromkeys(chunks, 1))
+
     def test_remote_process_population_temporary_limit_and_shared_chunk_budget(self):
         source = Source('workers', Storage(self.url+'/image.png', 'png'))
         with source.open(cache_dir=self.cache) as reader:

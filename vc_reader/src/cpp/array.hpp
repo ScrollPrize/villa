@@ -246,7 +246,9 @@ public:
 
     void set_fetcher(std::function<ChunkHandle(const Index&)> fetcher)
     {
-        fetcher_.store(std::make_shared<const Fetcher>(std::move(fetcher)));
+        auto next = std::make_shared<const Fetcher>(std::move(fetcher));
+        std::lock_guard lock(fetcher_mutex_);
+        fetcher_.swap(next);  // the replaced fetcher is released after the lock
     }
 
     // The scheduler calls this directly, bypassing its own demand callback.
@@ -1311,6 +1313,12 @@ private:
         return ChunkPtr(std::move(chunk));
     }
 
+    auto current_fetcher()
+    {
+        std::lock_guard lock(fetcher_mutex_);
+        return fetcher_;
+    }
+
     void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output,
                  bool stream = false)
     {
@@ -1353,7 +1361,7 @@ private:
                 return;
             }
         }
-        if (auto fetcher = fetcher_.load()) {
+        if (auto fetcher = current_fetcher()) {
             ChunkPtr chunk = (*fetcher)(w.idx).value;
             if (chunk && chunk->size() != chunk_bytes_)
                 throw std::runtime_error("prefetch coordinator returned an invalid chunk size");
@@ -1512,7 +1520,9 @@ private:
     std::unique_ptr<ZarrStorage> source_;
     std::mutex inflight_mutex_;
     using Fetcher = std::function<ChunkHandle(const Index&)>;
-    std::atomic<std::shared_ptr<const Fetcher>> fetcher_;
+    // libc++ has no std::atomic<std::shared_ptr>; a mutex works with every standard library.
+    std::mutex fetcher_mutex_;
+    std::shared_ptr<const Fetcher> fetcher_;
     std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
     std::mutex error_mutex_;
