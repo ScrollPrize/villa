@@ -1933,7 +1933,7 @@ LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnot
     markers.reserve(branches.size());
     for (const auto& branch : branches) {
         // A peer outside the volume has its position in another frame.
-        if (!fiberBoundToVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr)) continue;
+        if (!branch.branchInVolume) continue;
         if (!finitePoint(branch.controlPointPosition) ||
             !finitePoint(branch.branchControlPointPosition) ||
             !finiteDirection(branch.controlPointDirection) ||
@@ -15225,7 +15225,7 @@ LineAnnotationController::generatedBranchLinePointsForSession(
         if (branch.branchFiberId == 0 || !seenFiberIds.insert(branch.branchFiberId).second) {
             continue;
         }
-        if (!fiberBoundToVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr)) continue;
+        if (!branch.branchInVolume) continue;
         std::vector<cv::Vec3d> linePoints = linePointsForFiber(branch.branchFiberId);
         if (linePoints.size() >= 2) {
             branches.push_back(generatedLinePoints(linePoints));
@@ -15619,7 +15619,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         }
         vc::atlas::FiberSideStripLineQuery query;
         query.fiberId = branch.branchFiberId;
-        if (!fiberBoundToVolume(branch.branchFiberId, _state->currentVolume())) continue;
+        if (!branch.branchInVolume) continue;
         query.point = branch.branchControlPointPosition;
         query.direction = normalizedOrZero(branch.branchControlPointDirection);
         query.connectorStart = branch.controlPointPosition;
@@ -17537,6 +17537,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     };
                     branch.controlPointDirection = direction(local, own);
                     branch.branchControlPointDirection = direction(target, other);
+                    branch.branchInVolume = target.frame.has_value();
                     const auto meta = nlohmann::json::parse(edge.meta);
                     branch.pending = edge.approvalState != "approved";
                     branch.adjacent = meta.value("adjacent", false);

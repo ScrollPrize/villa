@@ -61,6 +61,9 @@ struct FiberBranchRef {
     // merged or written; approving the link clears it with `pending`.
     // Mirrored on both reciprocal refs like `pending` (JSON key "auto").
     bool autoLink = false;
+    // The peer was read in the open volume, so its position and direction
+    // are in the volume's voxels. Links are only made to such fibers.
+    bool branchInVolume = true;
 };
 
 // A fiber read in an open volume: positions, vectors and widths are in that
