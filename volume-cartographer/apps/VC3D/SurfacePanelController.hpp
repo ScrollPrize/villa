@@ -166,7 +166,8 @@ private:
     void setItemRow(SurfaceTreeWidgetItem* item, const SurfaceCatalog::Row& row);
     SurfaceTreeWidgetItem* itemFor(const std::string& id) const;
     // Open the selected surface and announce it.
-    void activate(const std::string& id, bool preserveEditing);
+    // Opens the surface (unless `opened` already holds it) and announces it.
+    void activate(const std::string& id, bool preserveEditing, std::optional<SurfaceCatalog::Opened> opened = std::nullopt);
     void fetchThenActivate(const std::string& id, bool preserveEditing);
 
     void connectFilterSignals();

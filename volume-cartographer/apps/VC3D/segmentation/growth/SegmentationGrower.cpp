@@ -452,10 +452,8 @@ std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTra
     std::vector<std::shared_ptr<QuadSurface>> surfaces;
     for (const auto& entry : source.surfaces) {
         try {
-            source.session->read(entry.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto view=vc::objects::GeometrySnapshot(db,txn).viewTransformedAt(entry.uuid,entry.targetVolume,entry.targetScale);
-                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, &view));
-            });
+            surfaces.push_back(SurfaceCatalog::open(source.session, entry.attachment, entry.targetVolume,
+                                                    entry.uuid, entry.targetScale).surface);
         } catch (const std::exception& ex) {
             // e.g. a catalog surface whose geometry was never fetched.
             qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface" << QString::fromStdString(entry.uuid) << ex.what();

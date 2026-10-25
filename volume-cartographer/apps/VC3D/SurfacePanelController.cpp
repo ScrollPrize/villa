@@ -254,13 +254,14 @@ void SurfacePanelController::syncTree()
     }
 }
 
-void SurfacePanelController::activate(const std::string& id, bool preserveEditing)
+void SurfacePanelController::activate(const std::string& id, bool preserveEditing,
+                                      std::optional<SurfaceCatalog::Opened> opened)
 {
     const QString idQString = QString::fromStdString(id);
     std::shared_ptr<QuadSurface> surface;
     _opened.reset();
     try {
-        _opened = _catalog->open(id);
+        _opened = opened ? std::move(opened) : std::optional(_catalog->open(id));
         surface = _opened->surface;
     } catch (const SurfaceCatalog::NoGeometry&) {
         const auto* row = _catalog->row(id);
@@ -873,14 +874,15 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
     if (!_catalog || !_catalog->row(surfaceId)) {
         return fail(tr("unknown surface: %1").arg(idQString));
     }
+    std::optional<SurfaceCatalog::Opened> opened;
     try {
         try {
-            (void)_catalog->open(surfaceId);
+            opened = _catalog->open(surfaceId);
         } catch (const SurfaceCatalog::NoGeometry&) {
             if (!_catalog->row(surfaceId)->catalog) throw;
             // Headless callers wait for a catalog surface to be fetched.
             _catalog->fetchJob(surfaceId)();
-            (void)_catalog->open(surfaceId);
+            opened = _catalog->open(surfaceId);
         }
     } catch (const std::exception& error) {
         return fail(tr("surface %1 could not be opened: %2").arg(idQString, QString::fromUtf8(error.what())));
@@ -889,7 +891,7 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
     if (!selectSurfaceById(surfaceId)) {
         return fail(tr("surface %1 could not be selected").arg(idQString));
     }
-    activate(surfaceId, false);
+    activate(surfaceId, false, std::move(opened));
     return _opened.has_value();
 }
 
