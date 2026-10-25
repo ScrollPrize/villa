@@ -2016,7 +2016,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 return;
             }
             if (event.attachment != _state->objectStoreAttachment() ||
-                !vc3d::store::touches(event, {"fiber", "fiber_branch"})) return;
+                !vc3d::store::touches(event, {"fiber", "fiber_branch", vc::objects::kAttachmentEdgeKind})) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
             refreshChangedStoreFibers();
