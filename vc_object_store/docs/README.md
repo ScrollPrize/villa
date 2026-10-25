@@ -96,7 +96,8 @@ their historical pins). `copyObject(from, to, uuid)` copies an
 object's current record and geometry from one attachment into another as a new
 object (new UUID, `meta.copied_from` naming the source store, object and
 revisions; point annotations kept); relationships, history and approval stay
-behind. `artifactDirectory(attachment, uuid)` returns (and creates)
+behind. `artifactDirectory(attachment, uuid)` returns (and creates; pass
+`create = false` to look for a file without creating it)
 `<store>.artifacts/<object uuid>/` for an object's non-geometry files such as
 fitted models or mesh exports; a hosted replica uses the directory beside its hub
 so replicas and services share it (an `sftp://` hub has none). `finalize()` waits

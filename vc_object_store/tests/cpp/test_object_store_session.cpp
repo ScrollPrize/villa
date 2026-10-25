@@ -248,7 +248,10 @@ int main() try
         require(sourceAnnotations == targetAnnotations, "copies keep point annotations");
     }
     session.takeEvents();
+    const auto looked = session.artifactDirectory(replacement, surface, false);
+    require(!std::filesystem::exists(looked), "looking for artifacts creates nothing");
     const auto artifacts = session.artifactDirectory(replacement, surface);
+    require(artifacts == looked, "looking and creating name the same directory");
     require(artifacts == std::filesystem::path(replacementPath.string() + ".artifacts") / surface &&
             std::filesystem::is_directory(artifacts), "artifacts live beside the store, one directory per object");
     session.detach(catalog);

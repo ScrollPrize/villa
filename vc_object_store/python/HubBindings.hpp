@@ -83,7 +83,8 @@ inline void bindObjectStoreSession(nb::module_& m)
         }, nb::arg("attachment"))
         .def("sync_hub", &vo::ObjectStoreSession::syncHub, nb::arg("attachment"))
         .def("resolve_hub_conflicts", &vo::ObjectStoreSession::resolveHubConflicts, nb::arg("attachment"), nb::arg("keep"))
-        .def("artifact_directory", &vo::ObjectStoreSession::artifactDirectory, nb::arg("attachment"), nb::arg("object_uuid"))
+        .def("artifact_directory", &vo::ObjectStoreSession::artifactDirectory, nb::arg("attachment"), nb::arg("object_uuid"),
+             nb::arg("create") = true)
         .def("copy_object", &vo::ObjectStoreSession::copyObject, nb::arg("source"), nb::arg("destination"),
              nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("finalize", &vo::ObjectStoreSession::finalize, nb::call_guard<nb::gil_scoped_release>())

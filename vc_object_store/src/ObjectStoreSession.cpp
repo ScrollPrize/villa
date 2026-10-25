@@ -218,7 +218,8 @@ std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const
     return copy->record.uuid;
 }
 
-std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIdentity& identity, const std::string& objectUuid)
+std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIdentity& identity, const std::string& objectUuid,
+                                                           bool create)
 {
     const auto object = util::canonicalUuid(objectUuid);
     std::filesystem::path base;
@@ -231,7 +232,7 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
     if (sftp::isSftpUrl(base.string()))
         throw std::runtime_error("an sftp:// hub has no shared artifact directory; mount the share instead");
     auto directory = std::filesystem::path(base.string() + ".artifacts") / object;
-    std::filesystem::create_directories(directory);
+    if (create) std::filesystem::create_directories(directory);
     return directory;
 }
 
