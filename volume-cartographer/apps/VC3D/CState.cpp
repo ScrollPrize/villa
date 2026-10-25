@@ -4,7 +4,6 @@
 #include "VCSettings.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <cmath>
 #include <exception>
 #include <thread>
@@ -13,6 +12,7 @@
 #include <QTimer>
 
 #include "vc/core/types/VolumePkg.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -371,11 +371,9 @@ CState::StoredUmbilicus CState::storedUmbilicus() const
             result.error = "umbilicus " + record.name + " has no geometry";
             return;
         }
-        const auto bytes = db.readGeometryArray(txn, geometry->uuid, "points");
-        std::vector<double> xyz(bytes.size() / sizeof(double));
-        std::memcpy(xyz.data(), bytes.data(), xyz.size() * sizeof(double));
-        for (std::size_t p = 0; p + 2 < xyz.size(); p += 3)
-            result.points.emplace_back(float(xyz[p] * *scale), float(xyz[p + 1] * *scale), float(xyz[p + 2] * *scale));
+        const auto stored = std::get<vc::geometry::Umbilicus>(vc::geometry::decode(db.readGeometryData(txn, geometry->uuid)));
+        for (const auto& p : stored.points)
+            result.points.emplace_back(float(p[0] * *scale), float(p[1] * *scale), float(p[2] * *scale));
         result.uuid = record.uuid;
         result.name = record.name;
         result.token = record.uuid + "@" + db.currentObjectRevision(txn, record.uuid)->uuid;
