@@ -7,6 +7,7 @@
 #include <iostream>
 #include <vc_object_store/Uuid.hpp>
 #include "SurfaceAffineTransformController.hpp"
+#include "segmentation/growth/SegmentationGrower.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
@@ -130,6 +131,17 @@ int runSurfacePanelStoreTests()
         require(!panel.opened()->editable, "catalog surfaces are read-only");
         require(panel.activateSurfaceById(remote, &error) && fetched == std::vector<std::string>{remote},
                 "a remote catalog surface is fetched when activated headlessly");
+
+        // The Patch Tracer reads each source surface from the store it is in.
+        PatchTracerSource tracerSource{state.objectStoreSession(), {}, {}};
+        for (const auto& [uuid, row] : catalog.rows())
+            if (row.toVolume) tracerSource.surfaces.push_back({row.source.attachment, uuid, *row.toVolume});
+        const auto tracerSurfaces = loadPatchTracerSurfaces(tracerSource);
+        require(tracerSource.surfaces.size() == 3 && tracerSurfaces.size() == 3 &&
+                std::any_of(tracerSurfaces.begin(), tracerSurfaces.end(), [](const auto& surface) {
+                    return (*surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1);
+                }),
+                "Patch Tracer sources load from their own stores, catalog ones scaled to the volume");
 
         const auto copy = catalog.copy(shown, "editable");
         catalog.readNow({copy});

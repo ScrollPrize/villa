@@ -457,33 +457,29 @@ struct CopyDisplacementJob
     utils::Json customParams;
 };
 
-// The Patch Tracer's source surfaces, read from the store in the volume's voxels.
-struct PatchTracerSource {
-    std::shared_ptr<vc::objects::ObjectStoreSession> session;
-    vc::objects::AttachmentIdentity attachment;
-    // UUID and volume voxels per stored unit of each source surface.
-    std::vector<std::pair<std::string, double>> surfaces;
-    // Identifies the source's content: tag, surfaces and their change stamps.
-    QString key;
-};
+} // namespace
 
 std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTracerSource& source)
 {
     std::vector<std::shared_ptr<QuadSurface>> surfaces;
-    source.session->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        for (const auto& [uuid, toVolume] : source.surfaces) {
-            try {
-                surfaces.emplace_back(load_quad_from_store(db, txn, uuid, std::nullopt, true, toVolume));
-            } catch (const std::exception& ex) {
-                qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface" << QString::fromStdString(uuid) << ex.what();
-            }
+    for (const auto& entry : source.surfaces) {
+        try {
+            source.session->read(entry.attachment, [&](const auto& db, const auto& txn, const auto&) {
+                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, entry.toVolume));
+            });
+        } catch (const std::exception& ex) {
+            // e.g. a catalog surface whose geometry was never fetched.
+            qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface" << QString::fromStdString(entry.uuid) << ex.what();
         }
-    });
+    }
     if (surfaces.empty()) {
         throw std::runtime_error("Patch Tracer source tag has no loadable surfaces in this volume");
     }
     return surfaces;
 }
+
+namespace
+{
 
 std::shared_ptr<SurfacePatchIndex> buildPatchTracerIndex(const std::vector<std::shared_ptr<QuadSurface>>& surfaces,
                                                          QuadSurface* seedSurface)
@@ -726,13 +722,13 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             showStatus(tr("Patch Tracer needs an attached object store."), kStatusLong);
             return false;
         }
-        PatchTracerSource source{catalog->session(), *catalog->attachment(), {}, sourceTag};
+        PatchTracerSource source{catalog->session(), {}, sourceTag};
         for (const auto& [uuid, row] : catalog->rows()) {
             if (!row.toVolume || uuid == segmentationSurface->id ||
                 std::find(row.record.tags.begin(), row.record.tags.end(), sourceTag.toStdString()) == row.record.tags.end()) {
                 continue;
             }
-            source.surfaces.emplace_back(uuid, *row.toVolume);
+            source.surfaces.push_back({row.source.attachment, uuid, *row.toVolume});
             source.key += QStringLiteral("|%1@%2").arg(QString::fromStdString(uuid), QString::fromStdString(row.record.changedAt));
         }
 
