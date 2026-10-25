@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <QColor>
@@ -139,7 +140,12 @@ public:
     { _editingDestinationResolver = std::move(resolver); }
     // The store pin a surface was opened at (nothing for surfaces not opened
     // from the object store); edits of the active surface commit to it.
-    using StorePinResolver = std::function<std::optional<vc::objects::PinnedObject>(const QuadSurface*)>;
+    // The store object an opened surface's edits commit to, and the view it was read through.
+    struct StoreOrigin {
+        vc::objects::PinnedObject pin;
+        vc3d::VolumeView view;
+    };
+    using StorePinResolver = std::function<std::optional<StoreOrigin>(const QuadSurface*)>;
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
     // Synchronously publish the loaded `channels` of `surface` (approval flushes at boundaries).
     bool saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels);

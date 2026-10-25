@@ -174,7 +174,7 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
     if (!meta.is_object()) meta = nlohmann::json::object();
     // Identity, geometry and file layout belong to the object and its geometry.
     // Status tags belong to the record and are not inherited from a source.
-    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "provenance", "tags", "vc3d_view"})
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "provenance", "tags"})
         meta.erase(key);
     vc::objects::eraseSourceGeometryCoordinates(meta);
     meta.update(nlohmann::json::parse(metaJson));

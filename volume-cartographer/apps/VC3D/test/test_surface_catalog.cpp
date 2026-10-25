@@ -90,10 +90,10 @@ int main(int argc, char** argv)
         require(opened.editable && opened.surface->id == native && opened.pin.geometryRevision, "native surfaces open editable and pinned");
         require((*opened.surface->rawPointsPtr())(2, 1) == cv::Vec3f(1, 2, 1), "native points are stored points");
         const auto scaled = catalog.open(half);
-        require(scaled.editable && scaled.toVolume == 2.0, "store views of scaled surfaces support inverse edits");
+        require(scaled.editable && scaled.view.mapping == VolumeAffine::scale(2.0), "store views of scaled surfaces support inverse edits");
         require((*scaled.surface->rawPointsPtr())(2, 1) == cv::Vec3f(2, 4, 2), "scaled points are in volume voxels");
         {
-            SurfaceStoreEdit edit(session,scaled.pin,scaled.surface->meta.at("vc3d_view").dump());
+            SurfaceStoreEdit edit(session,scaled.pin,scaled.view);
             cv::Mat_<cv::Vec3f> grown(4,3,cv::Vec3f(-1,-1,-1));
             scaled.surface->rawPointsPtr()->copyTo(grown(cv::Rect(0,0,3,3)));
             grown(3,1)={2,6,2};
@@ -217,7 +217,7 @@ int main(int argc, char** argv)
         pump([&]{return catalog.row(other)&&catalog.row(other)->mapping.has_value();},"registration commits refresh compatible surfaces");
         auto registered=catalog.open(other);
         require((*registered.surface->rawPointsPtr())(2,1)==cv::Vec3f(13,2,21),"surface uses the store's affine view");
-        SurfaceStoreEdit registeredEdit(session,registered.pin);
+        SurfaceStoreEdit registeredEdit(session,registered.pin,registered.view);
         (*registered.surface->rawPointsPtr())(2,1)={15,2,21};
         registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));
         session->read(attachment,[&](const auto& db,const auto& txn,const auto&) {

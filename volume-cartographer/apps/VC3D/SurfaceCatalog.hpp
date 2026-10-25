@@ -4,6 +4,7 @@
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
 // viewed or edited. Surfaces are identified by their store UUID.
+#include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <nlohmann/json.hpp>
 #include <QObject>
@@ -59,10 +60,9 @@ public:
     struct Opened {
         std::shared_ptr<QuadSurface> surface;
         vc::objects::PinnedObject pin;
-        double toVolume = 1;
-        vc::objects::VolumeAffine mapping;
-        // Writable attachment and stored at the volume's scale: an edit can
-        // publish the vertices it changed without rescaling the others.
+        // The view it was read through; edits map back through it.
+        vc3d::VolumeView view;
+        // The attachment is writable.
         bool editable = false;
     };
 

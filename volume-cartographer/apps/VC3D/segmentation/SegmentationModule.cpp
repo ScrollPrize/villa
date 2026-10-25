@@ -3033,17 +3033,16 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     if (!surface || surface->id.empty()) {
         return nullptr;
     }
-    const auto pin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
+    const auto origin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
     // Saves continue from the edit's own revisions until the surface is reopened.
-    if (_storeEdit && _storeEdit->uuid() == surface->id && (!pin || *pin == _storeEdit->origin())) {
+    if (_storeEdit && _storeEdit->uuid() == surface->id && (!origin || origin->pin == _storeEdit->origin())) {
         return _storeEdit;
     }
-    if (!pin || !_state) {
+    if (!origin || !_state) {
         return nullptr;
     }
     try {
-        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), *pin,
-            surface->meta.contains("vc3d_view") ? std::optional(surface->meta.at("vc3d_view").dump()) : std::nullopt);
+        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), origin->pin, origin->view);
     } catch (const std::exception& error) {
         emit statusMessageRequested(tr("Cannot edit surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
         return nullptr;

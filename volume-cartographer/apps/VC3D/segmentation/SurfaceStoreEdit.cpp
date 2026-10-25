@@ -7,9 +7,9 @@
 using namespace vc::objects;
 
 SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, PinnedObject pin,
-                                 std::optional<std::string> viewBinding)
+                                 std::optional<vc3d::VolumeView> view)
     : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(pin), _origin(std::move(pin)),
-      _viewBinding(std::move(viewBinding))
+      _view(std::move(view))
 {
     if (!_pin.geometryRevision) throw std::runtime_error("The surface has no geometry");
 }
@@ -40,17 +40,13 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
     std::lock_guard lock(_mutex);
     std::string geometry = *_pin.geometryRevision;
     const auto& points = *surface.rawPointsPtr();
-    const auto binding = _viewBinding ? _viewBinding : surface.meta.contains("vc3d_view")
-        ? std::optional(surface.meta.at("vc3d_view").dump()) : std::nullopt;
     const auto receipt = _session->editKeepingRelationships(_pin.attachment, {{_uuid, _pin.objectRevision}}, {},
         [&](auto& db, auto& txn, const auto& keep) {
             std::optional<TransformedGeometryView> transformed;
-            if(binding) {
-                const auto view=nlohmann::json::parse(*binding);
-                transformed=GeometrySnapshot(db,txn).viewTransformedAt(_uuid,view.at("target"),view.at("scale"));
-                if(transformed->mapping()!=VolumeAffine::fromJson(view.at("matrix")))
+            if (_view) {
+                transformed = GeometrySnapshot(db, txn).viewTransformedAt(_uuid, _view->volume, _view->scale);
+                if (transformed->mapping() != _view->mapping)
                     throw std::runtime_error("Volume registration changed; reopen the surface before saving");
-
             }
             const auto revision = db.geometryRevision(txn, geometry);
             if (!revision) throw std::runtime_error("surface geometry revision not found: " + geometry);
@@ -83,5 +79,4 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         });
     _pin.objectRevision = *receipt.at(_uuid);
     _pin.geometryRevision = geometry;
-    _viewBinding = binding;
 }

@@ -2,6 +2,7 @@
 // Where edits of an opened surface go: its object in the store, pinned at the
 // revisions the edit starts from and re-pinned from each commit's receipt.
 // Relationships are kept as recorded. Saves may run on worker threads.
+#include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <opencv2/core/types.hpp>
 #include <memory>
@@ -14,8 +15,10 @@ class QuadSurface;
 class SurfaceStoreEdit
 {
 public:
+    // Edits of a surface read through `view` map back to its stored frame;
+    // without one the surface holds stored coordinates.
     SurfaceStoreEdit(std::shared_ptr<vc::objects::ObjectStoreSession> session, vc::objects::PinnedObject pin,
-                     std::optional<std::string> viewBinding = std::nullopt);
+                     std::optional<vc3d::VolumeView> view = std::nullopt);
 
     // An editing session holds the object (vc3d::store::holdForEditing) until
     // release(); throws when the store is read-only or the pin is stale.
@@ -39,5 +42,5 @@ private:
     vc::objects::PinnedObject _pin;
     const vc::objects::PinnedObject _origin;
     vc::objects::LeaseHold _lease;
-    std::optional<std::string> _viewBinding;
+    const std::optional<vc3d::VolumeView> _view;
 };

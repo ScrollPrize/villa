@@ -6880,10 +6880,11 @@ void CWindow::CreateWidgets(void)
         return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
     });
     // Edits of the active surface commit to the store object it was opened from.
-    _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<vc::objects::PinnedObject> {
+    _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {
         const auto& opened = _surfacePanel ? _surfacePanel->opened() : std::nullopt;
         // By id: transforms and edit previews publish copies of the opened surface.
-        if (opened && surface && opened->surface->id == surface->id && opened->editable) return opened->pin;
+        if (opened && surface && opened->surface->id == surface->id && opened->editable)
+            return SegmentationModule::StoreOrigin{opened->pin, opened->view};
         return std::nullopt;
     });
 

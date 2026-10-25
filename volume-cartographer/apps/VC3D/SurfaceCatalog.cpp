@@ -208,10 +208,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const auto view=GeometrySnapshot(db,txn).viewTransformedAt(uuid,volume,scale);
         opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,1,&view);
-        opened.mapping=view.mapping();
-        opened.toVolume=geometryScaleToVolume(nlohmann::json::parse(revision->record.meta),volume).value_or(1.)*scale;
-        opened.surface->meta["vc3d_view"]=utils::Json::parse(nlohmann::json{
-            {"target",volume},{"scale",scale},{"matrix",view.mapping().json()}}.dump());
+        opened.view = {volume, scale, view.mapping()};
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
     });
     opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
