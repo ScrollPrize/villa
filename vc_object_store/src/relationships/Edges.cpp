@@ -1,6 +1,7 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
 #include "internal/History.hpp"
+#include <nlohmann/json.hpp>
 
 namespace vc::objects {
 using namespace detail;
@@ -170,6 +171,32 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
     }
     auto rows = edgeSelectionQuery(db, selection, columns);
     return readEdgeRows(db, *rows, fields);
+}
+
+std::string ObjectStore::attach(WriteTxn& txn, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role)
+{
+    EdgeRecord edge;
+    edge.kind = kAttachmentEdgeKind;
+    edge.aUuid = dataUuid;
+    edge.bUuid = ownerUuid;
+    edge.aAnchor.wholeGeometry = true;
+    edge.bAnchor.wholeGeometry = true;
+    edge.meta = nlohmann::json{{"role", role}}.dump();
+    return addEdge(txn, edge);
+}
+
+std::vector<EdgeRecord> ObjectStore::attachments(const Txn& txn, const std::string& ownerUuid,
+                                                 const std::optional<std::string>& role) const
+{
+    EdgeSelection selection;
+    selection.kind = kAttachmentEdgeKind;
+    selection.endpointUuids = std::vector<std::string>{ownerUuid};
+    auto edges = selectEdges(txn, selection);
+    if (role)
+        std::erase_if(edges, [&](const EdgeRecord& edge) {
+            return nlohmann::json::parse(edge.meta).value("role", std::string{}) != *role;
+        });
+    return edges;
 }
 
 } // namespace vc::objects

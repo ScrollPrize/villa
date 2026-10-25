@@ -539,6 +539,13 @@ public:
     // Projection always includes uuid/kind/a/b; empty fields means identities.
     std::vector<EdgeRecord> selectEdges(const Txn&, const EdgeSelection& = {},
         const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
+    // Attach object `data` to `owner` in `role` (kAttachmentEdgeKind, whole
+    // geometry at both ends, the role in the edge meta). Returns the edge UUID.
+    std::string attach(WriteTxn&, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
+    // The attachment relationships of `owner`, in `role` when given, in UUID
+    // order; the attached object is the endpoint other than `owner`.
+    std::vector<EdgeRecord> attachments(const Txn&, const std::string& ownerUuid,
+                                        const std::optional<std::string>& role = std::nullopt) const;
     // Both endpoints must belong to the selected objects. Reads topology,
     // generations and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},

@@ -621,3 +621,16 @@ def test_surface_vertices_are_missing_only_as_the_minus_one_sentinel(db, tmp_pat
         assert snapshot.surface(uid).valid(0, 0)
     with pytest.raises((RuntimeError, ValueError)):
         db.export_geometry(uid, tmp_path / 'out')  # tifxyz readers drop z <= 0
+
+
+def test_attachments_by_role(db):
+    owner, _ = put(db, Surface(1, 1, [1, 1], [[1, 2, 3]]), 'surface')
+    results, _ = put(db, PointCollection([1], [[1, 2, 3]]), 'point_collection')
+    corrections, _ = put(db, PointCollection([1], [[4, 5, 6]]), 'point_collection')
+    with db.write(expected_revisions=heads(db, owner, results, corrections)) as tx:
+        tx.attach(results, owner, 'fit_results')
+        tx.attach(corrections, owner, 'corrections')
+    other = lambda edge: edge['b'] if edge['a'] == owner else edge['a']
+    assert [other(e) for e in db.attachments(owner, role='corrections')] == [corrections]
+    assert sorted(other(e) for e in db.attachments(owner)) == sorted([results, corrections])
+    assert db.attachments(owner, role='missing') == []

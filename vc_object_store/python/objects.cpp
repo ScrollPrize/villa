@@ -170,6 +170,13 @@ void bindMutations(nb::class_<T>& cls)
                 return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.addEdge(t, edgeFromPy(rec)); });
             },
             nb::arg("record"), "Create an edge from a dict (keys: a, b, kind, anchors, tags, meta); returns uuid.")
+        .def(
+            "attach",
+            [](T& self, const std::string& data, const std::string& owner, const std::string& role) {
+                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.attach(t, data, owner, role); });
+            },
+            nb::arg("data_uuid"), nb::arg("owner_uuid"), nb::arg("role"),
+            "Attach object data to owner in role (an attachment relationship); returns the edge uuid.")
         .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge, T>(),
              nb::arg("uuid"))
         .def("set_approval", writeMethod<&vo::ObjectStore::setApproval, T>(),
@@ -452,6 +459,12 @@ NB_MODULE(_native, m)
              nb::arg("dataset_root") = std::nullopt,
              "Find a surface/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
+        .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
+            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
+            nb::list out; for (const auto& record : records) out.append(edgeToPy(record));
+            return out;
+        }, nb::arg("owner_uuid"), nb::arg("role") = std::nullopt,
+           "Attachment relationships of owner (in role when given); the attached object is the other endpoint.")
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
             bool both, const std::optional<std::string>& tag, const std::optional<int64_t>& limit,
