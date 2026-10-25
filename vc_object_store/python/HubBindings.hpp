@@ -27,6 +27,15 @@ nb::list hubConflicts(const std::vector<vo::HubConflict>& conflicts)
     return result;
 }
 
+nb::object sessionHubStatus(const std::optional<vo::HubSessionStatus>& status)
+{
+    if (!status) return nb::none();
+    nb::dict result; result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
+    result["error"] = status->error; result["synced_at_us"] = status->syncedAtUs;
+    result["leases"] = hubLeases(status->leases);
+    return result;
+}
+
 nb::dict hubReport(const vo::HubSyncReport& report)
 {
     nb::dict result; result["pulled"] = report.pulled; result["pushed"] = report.pushed;
@@ -73,15 +82,19 @@ inline void bindObjectStoreSession(nb::module_& m)
         .def("hold_leases", &vo::ObjectStoreSession::holdLeases, nb::arg("attachment"), nb::arg("uuids"),
              nb::call_guard<nb::gil_scoped_release>(),
              "Lease objects before editing them; renewed in the background until released.")
-        .def("hub_status", [](const vo::ObjectStoreSession& self, const vo::AttachmentIdentity& attachment) -> nb::object {
-            const auto status = self.hubStatus(attachment);
-            if (!status) return nb::none();
-            nb::dict result; result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
-            result["error"] = status->error; result["synced_at_us"] = status->syncedAtUs;
-            result["leases"] = hubLeases(status->leases);
-            return result;
+        .def("hub_status", [](const vo::ObjectStoreSession& self, const vo::AttachmentIdentity& attachment) {
+            return sessionHubStatus(self.hubStatus(attachment));
         }, nb::arg("attachment"))
         .def("sync_hub", &vo::ObjectStoreSession::syncHub, nb::arg("attachment"))
+        .def("sync_hub_and_wait", [](vo::ObjectStoreSession& self, const vo::AttachmentIdentity& attachment, double timeoutS) {
+            std::optional<vo::HubSessionStatus> status;
+            {
+                nb::gil_scoped_release release;
+                status = self.syncHubAndWait(attachment, std::chrono::milliseconds(int64_t(timeoutS * 1000)));
+            }
+            return sessionHubStatus(status);
+        }, nb::arg("attachment"), nb::arg("timeout_s") = 120.0,
+           "Sync now and return that sync's hub_status() once it finished (None without a hub); check error and conflicts.")
         .def("resolve_hub_conflicts", &vo::ObjectStoreSession::resolveHubConflicts, nb::arg("attachment"), nb::arg("keep"))
         .def("path", &vo::ObjectStoreSession::path, nb::arg("attachment"), "The attachment's store file (a hosted store's local replica).")
         .def("artifact_directory", &vo::ObjectStoreSession::artifactDirectory, nb::arg("attachment"), nb::arg("object_uuid"),

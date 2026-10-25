@@ -536,7 +536,6 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
 
 
 def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
-    import time
     import vc_object_store as vos
     hub = tmp_path / 'share' / 'hub.vcobj'
     hub.parent.mkdir()
@@ -557,13 +556,8 @@ def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
         with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as db:
             revision = db.current_geometry(surface)['uuid']
             db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(), revision)
-        edited_at = time.time() * 1e6
-        session.sync_hub(attachment)
-        deadline = time.time() + 20
-        # Status describes the worker's last sync; wait for one after the edit.
-        while (status := session.hub_status(attachment))['pending'] or (status['synced_at_us'] or 0) <= edited_at:
-            assert time.time() < deadline, 'the session pushes the service edit'
-            time.sleep(0.05)
+        status = session.sync_hub_and_wait(attachment, timeout_s=20)
+        assert not status['pending'] and not status['error'] and not status['conflicts']
     kinds = [event['kind'] for event in session.take_events()]
     assert kinds[0] == 'attached' and 'committed' in kinds
     session.detach(attachment)

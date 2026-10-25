@@ -150,6 +150,11 @@ public:
     std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
     // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.
     void syncHub(const AttachmentIdentity&);
+    // Sync now and block until that sync has finished: everything committed
+    // before the call is pushed and the hub's changes are pulled, unless the
+    // returned status reports an error or conflicts. nullopt when the attachment
+    // is not a writable hosted replica. Throws when no sync finishes in time.
+    std::optional<HubSessionStatus> syncHubAndWait(const AttachmentIdentity&, std::chrono::milliseconds timeout);
     void resolveHubConflicts(const AttachmentIdentity&, const std::string& keep);
 
 private:

@@ -355,6 +355,19 @@ void ObjectStoreSession::syncHub(const AttachmentIdentity& identity)
         if (attachment->identity == identity && attachment->hub) attachment->hub->requestSync(false);
 }
 
+std::optional<HubSessionStatus> ObjectStoreSession::syncHubAndWait(const AttachmentIdentity& identity,
+                                                                   std::chrono::milliseconds timeout)
+{
+    // Admission keeps the worker alive: detaching waits for the sync.
+    auto attachment = acquire(identity, false);
+    std::optional<HubSessionStatus> status;
+    try {
+        if (attachment->hub) status = attachment->hub->syncAndWait(timeout);
+    } catch (...) { release(*attachment, false); throw; }
+    release(*attachment, false);
+    return status;
+}
+
 void ObjectStoreSession::resolveHubConflicts(const AttachmentIdentity& identity, const std::string& keep)
 {
     std::lock_guard lock(mutex_);

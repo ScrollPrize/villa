@@ -328,7 +328,11 @@ int main() try
                 expected[b] = store.currentObjectRevision(txn, b)->uuid;
             });
             session.act(attachment, expected, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"session\""); });
-            eventually([&] { hubPull(bob); return meta(bob, b) == meta(alice, b); }, "action pushed in the background");
+            // A waited sync pushes everything committed before it.
+            const auto synced = session.syncHubAndWait(attachment, std::chrono::seconds(20));
+            require(synced && synced->pending.empty() && synced->error.empty(), "waited sync pushed the action");
+            hubPull(bob);
+            require(meta(bob, b) == meta(alice, b), "action reached the hub");
             mustFail([&] { acquireLeases(bob, {b}); });  // still held by the session
         }
         eventually([&] {
