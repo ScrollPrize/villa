@@ -1,5 +1,5 @@
-// Cover QuadSurface::save force_overwrite atomic-exchange, save_meta error
-// branches, and readOverlappingJson legacy-directory rejection.
+// Cover QuadSurface::save force_overwrite atomic-exchange and save_meta error
+// branches.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -365,39 +365,6 @@ TEST_CASE("save_meta: requires object (not array) metadata")
     qs.meta = utils::Json::array();
     CHECK_THROWS(qs.save_meta());
     fs::remove_all(root);
-}
-
-TEST_CASE("readOverlappingJson: legacy 'overlapping' directory triggers error")
-{
-    auto root = tmpDir("legacy_overlap");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    // Drop a sentinel 'overlapping' subdir.
-    fs::create_directories(segDir / "overlapping");
-
-    QuadSurface qs(segDir);
-    qs.path = segDir;
-    CHECK_THROWS(qs.readOverlappingJson());
-    fs::remove_all(root);
-}
-
-TEST_CASE("readOverlappingJson: empty path is a no-op")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    // path is empty by default — should silently return.
-    qs.readOverlappingJson();
-    CHECK(true);
-}
-
-TEST_CASE("writeOverlappingJson: empty path is a no-op")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.setOverlappingIds({"a", "b"});
-    qs.writeOverlappingJson(); // no-throw
-    CHECK(true);
 }
 
 TEST_CASE("readMaskTimestamp: returns nullopt for an invalid dir")

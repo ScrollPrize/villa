@@ -485,7 +485,6 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     clone->meta = source->meta.is_null() ? utils::Json::object() : source->meta;
     clone->id = source->id;
     clone->path = source->path;
-    clone->setOverlappingIds(source->overlappingIds());
 
     for (const auto& channelName : source->channelNames()) {
         clone->setChannel(channelName, source->channel(channelName, SURF_CHANNEL_NORESIZE).clone());

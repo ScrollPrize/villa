@@ -65,9 +65,6 @@ target_link_libraries(vc_objrefine vc_core)
 add_executable(vc_grow_seg_from_seed src/vc_grow_seg_from_seed.cpp)
 target_link_libraries(vc_grow_seg_from_seed vc_core vc_tracer Boost::program_options)
 
-add_executable(vc_seg_add_overlap src/vc_seg_add_overlap.cpp)
-target_link_libraries(vc_seg_add_overlap vc_core)
-
 add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
 
@@ -242,7 +239,7 @@ target_link_libraries(vc_zarr_download_region vc_core Boost::program_options)
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
     vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-    vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj
+    vc_grow_seg_from_segments vc_tifxyz2obj
     vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
     vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
     vc_straighten vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
@@ -279,7 +276,7 @@ add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
 if(VC_USE_PCH)
     foreach(_app
         vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
-        vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj
+        vc_grow_seg_from_segments vc_tifxyz2obj
         vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
         vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross

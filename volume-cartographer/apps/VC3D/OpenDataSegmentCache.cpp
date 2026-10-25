@@ -1222,8 +1222,6 @@ OpenDataSegmentMaterializationResult materializeOne(
             writeCachedTifxyzBand(url, "y.tif", tempDir / "y.tif");
             writeCachedTifxyzBand(url, "z.tif", tempDir / "z.tif");
             (void)cacheOptionalFile(url, "mask.tif", tempDir / "mask.tif");
-            (void)cacheOptionalFile(url, "overlapping.json",
-                                    tempDir / "overlapping.json");
             if (const auto inkIt = recipe.find("ink_detections");
                 inkIt != recipe.end() && inkIt->is_array()) {
                 for (const auto& item : *inkIt) {

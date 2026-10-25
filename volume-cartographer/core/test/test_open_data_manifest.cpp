@@ -1496,7 +1496,6 @@ TEST_CASE("OpenDataSampleProject attaches cached tifxyz segments")
     copyFixtureFile(fixtureSegment / "y.tif", segmentDir / "y.tif");
     copyFixtureFile(fixtureSegment / "z.tif", segmentDir / "z.tif");
     writeFile(segmentDir / "mask.tif", "optional");
-    writeFile(segmentDir / "overlapping.json", "{}");
     writeFile(segmentDir / "catalog-origin.json",
               nlohmann::json{
                   {"sample_id", sample.id},

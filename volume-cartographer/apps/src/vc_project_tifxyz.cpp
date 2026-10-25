@@ -350,24 +350,6 @@ std::vector<float> neighbor_distances(const cv::Mat_<float>& dist,
     return values;
 }
 
-bool surfaces_overlap(const SurfacePatchIndex::SurfacePtr& a,
-                      const SurfacePatchIndex::SurfacePtr& b)
-{
-    if (!a || !b) {
-        return false;
-    }
-    if (a == b || a.get() == b.get()) {
-        return true;
-    }
-    if (!a->id.empty() && b->overlappingIds().count(a->id) != 0) {
-        return true;
-    }
-    if (!b->id.empty() && a->overlappingIds().count(b->id) != 0) {
-        return true;
-    }
-    return false;
-}
-
 bool same_surface(const SurfacePatchIndex::SurfacePtr& a,
                   const SurfacePatchIndex::SurfacePtr& b)
 {
@@ -565,7 +547,7 @@ float local_patch_score(const std::vector<RayHit>& chosenHits,
             if (!neighbor.surface) {
                 continue;
             }
-            score += surfaces_overlap(candidateSurface, neighbor.surface)
+            score += same_surface(candidateSurface, neighbor.surface)
                 ? -compatibleBonus
                 : incompatiblePenalty;
         }

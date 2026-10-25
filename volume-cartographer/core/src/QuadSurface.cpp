@@ -3637,57 +3637,6 @@ void QuadSurface::flipV()
     invalidateCache();
 }
 
-// Overlapping JSON file utilities
-void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
-    auto overlap_json = utils::Json::object();
-    auto arr = utils::Json::array();
-    for (const auto& n : overlapping_names)
-        arr.push_back(n);
-    overlap_json["overlapping"] = std::move(arr);
-
-    std::ofstream o(seg_path / "overlapping.json");
-    o << overlap_json.dump(4) << std::endl;
-}
-
-std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path) {
-    std::set<std::string> overlapping;
-    std::filesystem::path json_path = seg_path / "overlapping.json";
-
-    if (std::filesystem::exists(json_path)) {
-        auto overlap_json = utils::Json::parse_file(json_path);
-
-        if (overlap_json.contains("overlapping")) {
-            for (const auto& name : overlap_json["overlapping"]) {
-                overlapping.insert(name.get_string());
-            }
-        }
-    }
-
-    return overlapping;
-}
-
-void QuadSurface::readOverlappingJson()
-{
-    if (path.empty()) {
-        return;
-    }
-    if (std::filesystem::exists(path / "overlapping")) {
-        throw std::runtime_error(
-            "Found overlapping directory at: " + (path / "overlapping").string() +
-            "\nPlease run overlapping_to_json.py on " + path.parent_path().string() + " to convert it to JSON format"
-        );
-    }
-    _overlappingIds = read_overlapping_json(path);
-}
-
-void QuadSurface::writeOverlappingJson() const
-{
-    if (path.empty()) {
-        return;
-    }
-    write_overlapping_json(path, _overlappingIds);
-}
-
 std::optional<std::filesystem::file_time_type> QuadSurface::readMaskTimestamp(const std::filesystem::path& dir)
 {
     const std::filesystem::path maskPath = dir / "mask.tif";
@@ -3708,26 +3657,6 @@ void QuadSurface::refreshMaskTimestamp()
 }
 
 // Surface overlap/containment tests
-bool overlap(QuadSurface& a, QuadSurface& b, int max_iters)
-{
-    if (!intersect(a.bbox(), b.bbox()))
-        return false;
-
-    cv::Mat_<cv::Vec3f> points = a.rawPoints();
-    for(int r=0; r<std::max(10, max_iters/10); r++) {
-        cv::Vec2f p = {static_cast<float>(rand() % points.cols), static_cast<float>(rand() % points.rows)};
-        cv::Vec3f loc = points(p[1], p[0]);
-        if (loc[0] == -1)
-            continue;
-
-        cv::Vec3f ptr(0, 0, 0);
-        if (b.pointTo(ptr, loc, 2.0, max_iters) <= 2.0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters)
 {
     if (!intersect(a.bbox(), {loc,loc}))

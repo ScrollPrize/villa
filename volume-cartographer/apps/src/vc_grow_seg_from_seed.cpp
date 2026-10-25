@@ -272,7 +272,6 @@ static int run_main(int argc, char *argv[])
     cv::Vec3d origin;
     Json params;
     PointCollections corrections;
-    bool skip_overlap_check = false;
     std::string segment_name;
     std::optional<unsigned int> rng_seed;
     // Store mode: surfaces come from and go to an object store instead of tifxyz directories.
@@ -304,7 +303,6 @@ static int run_main(int argc, char *argv[])
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
             ("rewind-gen", po::value<int>(), "Generation to rewind to")
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
-            ("skip-overlap-check", "Do not perform overlap check with other surfaces after tracing")
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
             ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
@@ -381,10 +379,6 @@ static int run_main(int argc, char *argv[])
 
         if (vm.count("inpaint")) {
             params["inpaint"] = true;
-        }
-
-        if (vm.count("skip-overlap-check")) {
-            skip_overlap_check = true;
         }
 
         if (vm.count("resume-opt")) {
@@ -574,7 +568,6 @@ static int run_main(int argc, char *argv[])
                     continue;
 
                 QuadSurface *sm = new QuadSurface(entry.path(), meta);
-                sm->readOverlappingJson();
 
                 surfs[name] = sm;
                 surfs_v.push_back(sm);
@@ -1672,66 +1665,6 @@ static int run_main(int argc, char *argv[])
     std::cout << "saving " << seg_dir.string() << std::endl;
     surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
-
-    if (mode == "expansion" && !skip_overlap_check) {
-        // Read existing overlapping data
-        std::set<std::string> current_overlapping = read_overlapping_json(surf->path);
-
-        // Add the source segment
-        current_overlapping.insert(src->id);
-
-        // Update source's overlapping data
-        std::set<std::string> src_overlapping = read_overlapping_json(src->path);
-        src_overlapping.insert(surf->id);
-        write_overlapping_json(src->path, src_overlapping);
-
-        // Check overlaps with existing surfaces
-        for(auto &s : surfs_v)
-            if (overlap(*surf, *s, search_effort)) {
-                current_overlapping.insert(s->id);
-
-                std::set<std::string> s_overlapping = read_overlapping_json(s->path);
-                s_overlapping.insert(surf->id);
-                write_overlapping_json(s->path, s_overlapping);
-            }
-
-        // Check for additional surfaces in target directory
-        for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename().string()))
-            {
-                std::string name = entry.path().filename().string();
-                if (name.compare(0, name_prefix.size(), name_prefix))
-                    continue;
-
-                if (name == surf->id)
-                    continue;
-
-                std::filesystem::path meta_fn = entry.path() / "meta.json";
-                if (!std::filesystem::exists(meta_fn))
-                    continue;
-
-                auto meta = utils::Json::parse_file(meta_fn);
-
-                if (!meta.count("bbox"))
-                    continue;
-
-                if (meta.value("format", std::string{"NONE"}) != "tifxyz")
-                    continue;
-
-                QuadSurface other = QuadSurface(entry.path(), meta);
-
-                if (overlap(*surf, other, search_effort)) {
-                    current_overlapping.insert(other.id);
-
-                    std::set<std::string> other_overlapping = read_overlapping_json(other.path);
-                    other_overlapping.insert(surf->id);
-                    write_overlapping_json(other.path, other_overlapping);
-                }
-            }
-
-        // Write final overlapping data for current
-        write_overlapping_json(surf->path, current_overlapping);
-    }
 
     delete surf;
     for (auto sm : surfs_v) {

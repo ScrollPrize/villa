@@ -400,10 +400,7 @@ private:
                                            const std::string& source) {
         std::vector<std::string> ids;
 
-        if (source == "overlapping") {
-            auto overlapping_ids = target_surf->overlappingIds();
-            ids.assign(overlapping_ids.begin(), overlapping_ids.end());
-        } else if (source == "contributing" || source == "approved_patches" || source == "sequence") {
+        if (source == "contributing" || source == "approved_patches" || source == "sequence") {
             fs::path meta_path = target_surf->path / "meta.json";
             if (fs::exists(meta_path)) {
                 Json meta_json = Json::parse_file(meta_path);
@@ -533,7 +530,7 @@ int main(int argc, char* argv[]) {
             ("segment-id,s", po::value<std::string>()->required(),
                 "ID of segment to render")
             ("overlap-source", po::value<std::string>()->required(),
-                "Source for overlaps (overlapping|contributing|sequence|approved_patches)")
+                "Source for overlaps (contributing|sequence|approved_patches)")
             ("output,o", po::value<std::string>()->required(),
                 "Output PNG file path")
             ("stride", po::value<int>()->default_value(0),
@@ -556,7 +553,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Examples:\n";
             std::cout << "  # Basic rendering with auto-selected stride:\n";
             std::cout << "  " << argv[0] << " --volpkg-path /path/to/vol.volpkg --volume-id vol123 \\\n";
-            std::cout << "                  --segment-id seg456 --overlap-source overlapping \\\n";
+            std::cout << "                  --segment-id seg456 --overlap-source contributing \\\n";
             std::cout << "                  --output output.png\n\n";
 
             std::cout << "  # Full resolution rendering (stride=1):\n";
@@ -585,12 +582,12 @@ int main(int argc, char* argv[]) {
         std::string filter = vm["filter"].as<std::string>();
 
         std::set<std::string> valid_sources = {
-            "overlapping", "contributing", "sequence", "approved_patches"
+            "contributing", "sequence", "approved_patches"
         };
 
         if (valid_sources.find(overlap_source) == valid_sources.end()) {
             std::cerr << "Error: Invalid overlap source '" << overlap_source << "'\n";
-            std::cerr << "Must be one of: overlapping, contributing, sequence, approved_patches\n";
+            std::cerr << "Must be one of: contributing, sequence, approved_patches\n";
             return EXIT_FAILURE;
         }
 

@@ -1,6 +1,5 @@
-// More QuadSurface coverage: writeOverlappingJson / readOverlappingJson,
-// save_meta, refreshMaskTimestamp, the path-only save() overload, plus the
-// free helpers write_overlapping_json / read_overlapping_json.
+// More QuadSurface coverage: save_meta, refreshMaskTimestamp and the
+// path-only save() overload.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -91,42 +90,6 @@ TEST_CASE("save_meta updates meta.json without rewriting TIFFs")
     QuadSurface reloaded(t.segDir);
     CHECK(reloaded.meta.contains("custom_field"));
     CHECK(reloaded.meta["custom_field"].get_string() == "custom_value");
-}
-
-TEST_CASE("writeOverlappingJson / readOverlappingJson round-trip")
-{
-    TmpSegDir t;
-    auto pts = grid();
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.id = t.segId;
-    qs.path = t.segDir;
-    qs.save(t.segDir);
-
-    qs.setOverlappingIds({"a", "b", "c"});
-    qs.writeOverlappingJson();
-    CHECK(fs::exists(t.segDir / "overlapping.json"));
-
-    QuadSurface qs2(t.segDir);
-    qs2.readOverlappingJson();
-    CHECK(qs2.overlappingIds() == std::set<std::string>{"a", "b", "c"});
-}
-
-TEST_CASE("write_overlapping_json (free helper) writes a parseable file")
-{
-    TmpSegDir t;
-    fs::create_directories(t.segDir);
-    write_overlapping_json(t.segDir, std::set<std::string>{"x", "y"});
-    CHECK(fs::exists(t.segDir / "overlapping.json"));
-    auto names = read_overlapping_json(t.segDir);
-    CHECK(names == std::set<std::string>{"x", "y"});
-}
-
-TEST_CASE("read_overlapping_json: missing file returns empty set")
-{
-    TmpSegDir t;
-    fs::create_directories(t.segDir);
-    auto names = read_overlapping_json(t.segDir);
-    CHECK(names.empty());
 }
 
 TEST_CASE("readMaskTimestamp: returns nullopt when no mask file")

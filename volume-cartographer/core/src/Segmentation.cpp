@@ -179,7 +179,6 @@ std::shared_ptr<QuadSurface> Segmentation::loadSurface()
         surface_->id = id();
 
         // Load overlapping info (separate JSON, no TIFF I/O)
-        surface_->readOverlappingJson();
 
         return surface_;
     } catch (const std::exception& e) {

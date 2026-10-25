@@ -317,25 +317,6 @@ TEST_CASE("contains_any: list with one far point returns false")
     CHECK_FALSE(contains_any(qs, far));
 }
 
-TEST_CASE("overlap: disjoint bboxes return false fast")
-{
-    auto pa = makePlanarGrid(8, 8);
-    auto pb = makeOffsetGrid(8, 8, cv::Vec3f(1000, 1000, 1000));
-    QuadSurface a(pa, cv::Vec2f(1.f, 1.f));
-    QuadSurface b(pb, cv::Vec2f(1.f, 1.f));
-    CHECK_FALSE(overlap(a, b, 50));
-}
-
-TEST_CASE("overlap: identical surfaces should overlap")
-{
-    auto pa = makePlanarGrid(20, 20);
-    QuadSurface a(pa, cv::Vec2f(1.f, 1.f));
-    QuadSurface b(pa, cv::Vec2f(1.f, 1.f));
-    // pointTo might converge on the same surface; we just exercise the path.
-    (void)overlap(a, b, 200);
-    CHECK(true);
-}
-
 TEST_CASE("surface_diff with disjoint surfaces returns a non-null result")
 {
     auto pa = makePlanarGrid(8, 8);

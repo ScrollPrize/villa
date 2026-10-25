@@ -149,8 +149,7 @@ static void saveGrid(const Grid& g, const fs::path& outdir, const fs::path& srcd
     // Recompute rather than erase: straightening moves every point, so the
     // input's bbox is stale, but dropping the key entirely makes the output
     // invisible to any tool gating on meta.contains("bbox") — e.g. three
-    // checks in vc_grow_seg_from_seed.cpp, and vc_seg_add_overlap.cpp's own
-    // directory discovery (is_tifxyz_dir requires it). See villa#1321.
+    // checks in vc_grow_seg_from_seed.cpp. See villa#1321.
     Rect3D bb;
     if (bbox_of_valid_points(P, bb)) {
         meta["bbox"] = bbox_to_json(bb);
