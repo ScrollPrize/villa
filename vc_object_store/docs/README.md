@@ -31,6 +31,25 @@ Always inspect `problems`.
 `ingest_registered_geometry` loads placeholders only if they have no geometry
 history, preserving unrelated metadata. Use store edits for subsequent changes.
 
+Files written before objects carried UUIDs (VC3D tifxyz patches, whose `uuid` is
+their directory name; PCL collections; version-3 fibers) are rejected unless a
+UUID namespace is supplied: `vc_object_ingest --derive-uuids NAMESPACE` or
+`ingest_geometry_source(..., uuid_namespace=NAMESPACE)`. Each such source then
+gets `uuid5(NAMESPACE, "<kind>:<key>")`, matching Python's `uuid.uuid5`:
+
+| Kind | Key |
+| --- | --- |
+| `patch` | `meta.json` `uuid` string, else the directory name |
+| `fiber` | file stem; version-3 `branch_file` targets resolve the same way |
+| `point_collection` | `<document stem>:<collection id>` |
+
+The object records `meta.source.uuid_derivation = {namespace, name}`. Canonical
+source UUIDs are kept, and tracks keep their `(dataset_ref, external_key)`
+identity. Use one namespace per dataset; the same files then always map to the
+same identities, so a repeated import fails as an existing identity rather than
+duplicating objects. Keys do not depend on absolute paths, but renaming a file or
+directory changes its identity.
+
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
 aliases and moved files are different namespaces. Import only new collections

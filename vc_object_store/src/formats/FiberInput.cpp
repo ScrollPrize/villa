@@ -7,9 +7,17 @@
 #include <tuple>
 namespace vc::objects::formats {
 namespace {
-Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& path)
+// A fiber file's key is its stem, which is also how version-3 branches name their targets.
+nlohmann::json fiberIdentity(nlohmann::json root, const std::filesystem::path& path,
+    const std::optional<std::string>& uuidNamespace)
 {
-    auto result = decodeFiberJson(root.dump());
+    deriveSourceUuid(root, "fiber", path.stem().string(), uuidNamespace);
+    return root;
+}
+Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& path,
+    const std::optional<std::string>& uuidNamespace = std::nullopt)
+{
+    auto result = decodeFiberJson(fiberIdentity(root, path, uuidNamespace).dump());
     if (result.object.name.empty()) result.object.name = path.stem().string();
     result.object.storageKind = "file";
     result.object.storageRef = std::filesystem::absolute(path).lexically_normal().string();
@@ -18,7 +26,8 @@ Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& 
 }
 Prepared fiber(const std::filesystem::path& path) { return fiberDocument(readJson(path), path); }
 
-std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available)
+std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available,
+    const std::optional<std::string>& uuidNamespace)
 {
     namespace fs = std::filesystem;
     using Json = nlohmann::json;
@@ -26,7 +35,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
     for (const auto& uuid : available) existing.insert(util::canonicalUuid(uuid));
     std::vector<Prepared> batch;
     const auto add = [&](const Json& document, const fs::path& source) {
-        auto decoded = fiberDocument(document, source);
+        auto decoded = fiberDocument(document, source, uuidNamespace);
         if (!incoming.insert(decoded.object.uuid).second) throw std::runtime_error("duplicate fiber UUID in import");
         batch.push_back(std::move(decoded));
     };
@@ -77,7 +86,8 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 if (version3) {
                     const auto peer = peerPath();
                     if (!fileUuids.contains(peer))
-                        fileUuids[peer] = util::canonicalUuid(readJson(peer).at("uuid").get<std::string>());
+                        fileUuids[peer] = util::canonicalUuid(
+                            fiberIdentity(readJson(peer), peer, uuidNamespace).at("uuid").get<std::string>());
                     branch["target_uuid"] = fileUuids.at(peer);
                 }
                 const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
@@ -95,7 +105,7 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                 kept.push_back(branch);
                 if (existing.contains(target) || incoming.contains(target)) continue;
                 const auto peer = readJson(peerPath());
-                if (util::canonicalUuid(peer.at("uuid").get<std::string>()) != target)
+                if (util::canonicalUuid(fiberIdentity(peer, peerPath(), uuidNamespace).at("uuid").get<std::string>()) != target)
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }

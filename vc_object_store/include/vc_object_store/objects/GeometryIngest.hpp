@@ -15,8 +15,14 @@ struct GeometrySource {
 // before opening a write transaction. Linked documents are loaded recursively;
 // available UUIDs are existing endpoints whose stored contents remain authoritative.
 // Explicit roots and duplicate identities are never silently skipped.
+// uuidNamespace (a UUID) admits sources without canonical UUIDs: a tifxyz patch keyed
+// by its meta.json "uuid" or directory name, a PCL collection by "<document stem>:<id>",
+// a fiber file by its stem (as version-3 branches name targets). Each gets
+// uuid5(namespace, "<kind>:<key>"), so reingesting the same files yields the same
+// identities. Canonical source UUIDs are kept.
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
-    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {});
+    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {},
+    const std::optional<std::string>& uuidNamespace = std::nullopt);
 
 // Create new identities atomically in the caller's transaction. Re-import and
 // retired identities are rejected. Checked callers must pin every relationship
@@ -49,8 +55,9 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
 // batch are errors. Use ingestRegisteredGeometry for an initial placeholder load.
 // coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind.
 // It fills unknown declarations and rejects source conflicts; XYZ is unchanged.
+// uuidNamespace is as for prepareGeometrySource; tracks keep (dataset_ref, external_key).
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
-    const std::string& coordinateContext = "{}");
+    const std::string& coordinateContext = "{}", const std::optional<std::string>& uuidNamespace = std::nullopt);
 
 } // namespace vc::objects

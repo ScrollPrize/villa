@@ -9,7 +9,7 @@
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
-Prepared patch(const fs::path& source)
+Prepared patch(const fs::path& source, const std::optional<std::string>& uuidNamespace)
 {
     auto fingerprint = [&]() {
         std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
@@ -19,7 +19,11 @@ Prepared patch(const fs::path& source)
         return result;
     };
     const auto before = fingerprint();
-    const auto root = readJson(source / "meta.json");
+    auto root = readJson(source / "meta.json");
+    // VC3D names a tifxyz by its directory and stores that name as "uuid".
+    const auto named = root.contains("uuid") && root.at("uuid").is_string() ? root.at("uuid").get<std::string>() : std::string{};
+    const auto directory = source.filename().empty() ? source.parent_path() : source;
+    deriveSourceUuid(root, "patch", named.empty() ? directory.filename().string() : named, uuidNamespace);
     Prepared p;
     p.object = sourceObject(root, "patch", source); p.geometry.kind = "patch";
     detail::validatePatchFiles(source);

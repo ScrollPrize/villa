@@ -409,12 +409,13 @@ NB_MODULE(_native, m)
         }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{},
            nb::arg("coordinate_context") = nb::dict())
         .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
-                                         const nb::dict& context) {
+                                         const nb::dict& context, const std::optional<std::string>& uuidNamespace) {
             const auto declarations = jsonDumps(context);
             return geometryReportToPy(self.withStore<true>([&](auto& db) {
-                return vo::ingestGeometrySource(db, kind, source, {}, declarations);
+                return vo::ingestGeometrySource(db, kind, source, {}, declarations, uuidNamespace);
             }));
-        }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
+        }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict(),
+           nb::arg("uuid_namespace") = std::nullopt)
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<std::string>& revision, bool overwrite) {
