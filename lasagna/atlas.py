@@ -315,6 +315,8 @@ def build_atlas_init(
 	device: torch.device,
 	mesh_step: int,
 	winding_step: int,
+	store: str | None = None,
+	volume: str | None = None,
 ) -> AtlasInit:
 	if atlas_obj.get("type") != "lasagna_atlas" or int(atlas_obj.get("version", 0)) != 1:
 		raise ValueError("atlas config must be type=lasagna_atlas version=1")
@@ -326,7 +328,7 @@ def build_atlas_init(
 		metadata = {}
 	zero_col = int(metadata.get("zero_winding_column", 0))
 
-	base_xyz, base_valid, _base_meta = load_tifxyz(str(base["path"]), device=device)
+	base_xyz, base_valid, _base_meta = load_tifxyz(str(base["path"]), device=device, store=store, volume=volume)
 	period_columns = _validate_wrapped_base(base_xyz, base_valid)
 	if int(metadata.get("period_columns", period_columns)) != period_columns:
 		raise ValueError(

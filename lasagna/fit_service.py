@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+import stored_surfaces
 import volume_scale
 
 
@@ -57,6 +58,7 @@ _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 _sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 _capture_jobs: bool = False  # Set via --capture-jobs
 _capture_dir: Path | None = None  # Set via --capture-dir
+_store: stored_surfaces.StoreSession | None = None  # Set via --store
 _API_VERSION = "2"
 _API_VERSION_HEADER = "X-Fit-Service-API-Version"
 _VC3D_SOURCE_HEADER = "X-VC3D-Source"
@@ -657,6 +659,45 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
         raise
 
 
+def _is_surface_ref(ref: Any) -> bool:
+    """A stored surface: {"type": "surface", "uuid": ..., "revision": optional geometry revision}."""
+    return isinstance(ref, dict) and ref.get("type") == "surface"
+
+
+def _require_store() -> stored_surfaces.StoreSession:
+    if _store is None:
+        raise ValueError("stored surface references need a service started with --store")
+    return _store
+
+
+def _stored_surface_path(ref: dict[str, Any]) -> str:
+    """The fit's reference to a stored surface (read from the service store)."""
+    _require_store()
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), ref.get("revision") or None)
+
+
+def _stored_model_path(ref: dict[str, Any]) -> Path:
+    """The model checkpoint a fit left in a stored surface's artifact directory."""
+    path = _require_store().artifact_directory(str(ref.get("uuid") or "")) / "model.pt"
+    if not path.is_file():
+        raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
+    return path
+
+
+def _request_store_volume(body: dict[str, Any]) -> str | None:
+    """The volume a store-mode request works in (one naming this service's store), else None."""
+    store_uuid = body.get("store_uuid")
+    if not store_uuid:
+        return None
+    store = _require_store()
+    if str(store_uuid) != store.store_uuid:
+        raise ValueError(f"request names store {store_uuid}; this service writes to {store.store_uuid}")
+    volume = str(body.get("volume_uuid") or "")
+    if not volume:
+        raise ValueError("a store request needs volume_uuid")
+    return volume
+
+
 def _resolve_object_ref(ref_raw: Any) -> Path:
     ref = _validate_object_ref(ref_raw)
     if not _object_present(ref):
@@ -679,7 +720,8 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = str(_resolve_object_ref(base["ref"]))
+    base["path"] = (_stored_surface_path(base["ref"]) if _is_surface_ref(base["ref"])
+                    else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
     if not isinstance(objects, dict):
@@ -970,7 +1012,9 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(surface_raw, dict):
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
-            if all(k in surface for k in ("type", "name", "hash")):
+            if _is_surface_ref(surface):
+                surface["path"] = _stored_surface_path(surface)
+            elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
         resolved_cfg["external_surfaces"] = external_surfaces
@@ -978,7 +1022,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
-        resolved_model_path = str(_resolve_object_ref(model_ref))
+        resolved_model_path = str(
+            _stored_model_path(model_ref) if _is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
         model_object_refs = _checkpoint_object_refs(resolved_model_path)
 
@@ -1293,6 +1338,7 @@ class _JobState:
         self._error: str | None = None
         self._cancel = False
         self._output_dir: str | None = None
+        self._output_surfaces: list[str] = []
         self._results_tmp: str | None = None  # temp dir to clean up after download
         self._tmp_dirs: list[str] = []
         self._events: list[dict[str, Any]] = []
@@ -1322,6 +1368,7 @@ class _JobState:
                 "stage_name": self._stage_name,
                 "error": self._error,
                 "output_dir": self._output_dir,
+                "output_surfaces": list(self._output_surfaces),
                 "submitted_at": self.submitted_at,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
@@ -1363,10 +1410,12 @@ class _JobState:
             self._overall_progress = overall_progress
             self._stage_name = stage_name
 
-    def set_finished(self, output_dir: str, results_tmp: str | None = None) -> None:
+    def set_finished(self, output_dir: str | None, results_tmp: str | None = None,
+                     output_surfaces: list[str] | None = None) -> None:
         with self._lock:
             self._state = "finished"
             self._output_dir = output_dir
+            self._output_surfaces = list(output_surfaces or [])
             self._results_tmp = results_tmp
             self.finished_at = time.time()
 
@@ -1568,6 +1617,7 @@ class _JobQueue:
                     "stage_name": "",
                     "error": None,
                     "output_dir": None,
+                    "output_surfaces": [],
                 }
             snap = job.snapshot(self.queue_position(job.job_id))
             if snap["state"] in {"upload", "waiting"}:
@@ -1770,7 +1820,11 @@ def _run_laplace_rank_job(job: _JobState, body: dict[str, Any]) -> None:
 def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     """Run fit.py then fit2tifxyz.py based on the request body.
 
-    Supports two modes:
+    Supports three modes:
+      - Store (VC3D): the request names the service store (store_uuid) and a
+        volume_uuid; inputs are stored-surface refs, results are new surfaces
+        in the store (their model checkpoints in artifact directories), and
+        the job reports their UUIDs as output_surfaces.
       - Local (internal): model_input and output_dir are local paths.
       - Remote (external): model_data contains base64-encoded model bytes,
         output goes to a temp dir, caller downloads results via GET /results.
@@ -1784,6 +1838,10 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     )
 
     try:
+        store_volume = _request_store_volume(body)
+        if store_volume is not None:
+            job.set_running("loading", 0, 0, 0.0, stage_name="Syncing the object store")
+            _require_store().sync()
         body = _body_with_resolved_job_spec(body)
     except Exception as exc:
         job.set_error(str(exc))
@@ -1828,7 +1886,10 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
         # If no output_dir, create a temp dir for results (external mode)
         results_tmp = None
-        if not output_dir:
+        if store_volume is not None:
+            if output_dir or body.get("export_flatten_map", False):
+                raise ValueError("store requests export surfaces to the store, not to files")
+        elif not output_dir:
             results_tmp = tempfile.mkdtemp(prefix="fit_results_")
             job.add_tmp_dir(results_tmp)
             output_dir = results_tmp
@@ -1887,6 +1948,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
+        if store_volume is not None:
+            args_section["store"] = _require_store().path
+            args_section["volume-uuid"] = store_volume
         if not omit_model_output:
             args_section["model-output"] = str(model_output)
         # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
@@ -1985,7 +2049,11 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 "exporting", 0, 0, 0.0,
                 stage_name="Exporting flattened preview surface")
             import fit2tifxyz
-            export_argv = ["--input", str(model_output), "--output", str(output_dir)]
+            export_argv = ["--input", str(model_output)]
+            if store_volume is not None:
+                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume])
+            else:
+                export_argv.extend(["--output", str(output_dir)])
             if body.get("single_segment"):
                 export_argv.append("--single-segment")
             output_name = body.get("output_name")
@@ -2014,30 +2082,41 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     str(int(request_volume_shape_zyx[2])),
                 ])
             _check_cancel()
+            output_surfaces: list[str] = []
             fit2tifxyz.main(export_argv, cancel_fn=_check_cancel,
-                            state=fit_state_sink.get("flatten_state"))
+                            state=fit_state_sink.get("flatten_state"),
+                            store_session=_store if store_volume is not None else None,
+                            created_surfaces=output_surfaces)
             fit_state_sink.clear()
             job.set_running(
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")
-            _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
-            _check_cancel()
-            save_s = time.perf_counter() - save_t0
-            try:
-                saved_bytes = _dir_size_bytes(Path(output_dir))
-            except OSError:
-                saved_bytes = 0
-            print(
-                f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
-                f"in {save_s:.3f}s",
-                flush=True,
-            )
+            if store_volume is not None:
+                _require_store().sync()
+                print(f"[fit-service] results stored: surfaces {output_surfaces} "
+                      f"in {time.perf_counter() - save_t0:.3f}s", flush=True)
+            else:
+                _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
+                _check_cancel()
+                save_s = time.perf_counter() - save_t0
+                try:
+                    saved_bytes = _dir_size_bytes(Path(output_dir))
+                except OSError:
+                    saved_bytes = 0
+                print(
+                    f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
+                    f"in {save_s:.3f}s",
+                    flush=True,
+                )
 
         # Clean up intermediate files (but keep results_tmp for download)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        job.set_finished(str(output_dir), results_tmp=results_tmp)
-        print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
+        if store_volume is not None:
+            job.set_finished(None, output_surfaces=output_surfaces)
+        else:
+            job.set_finished(str(output_dir), results_tmp=results_tmp)
+        print(f"[fit-service] optimization finished, output: {output_dir or output_surfaces}", flush=True)
 
     except KeyboardInterrupt:
         job.set_cancelled()
@@ -2121,7 +2200,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = "/" + "/".join(parts)
 
         if path == "/health":
-            self._send_json({"status": "ok"})
+            self._send_json({"status": "ok", "store_uuid": _store.store_uuid if _store is not None else None})
         elif path == "/status":
             self._send_json(_jobs.legacy_status())
         elif path == "/datasets":
@@ -2365,7 +2444,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
 
-            if model_data:
+            if _is_surface_ref(body.get("model")):
+                model_input = str(_stored_model_path(body["model"]))
+            elif model_data:
                 model_bytes = base64.b64decode(model_data)
                 tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
                 tmp.write(model_bytes)
@@ -2448,7 +2529,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global _data_dir, _object_store_dir, _gpu_pause_enabled, _sparse_prefetch_backend
-    global _capture_jobs, _capture_dir
+    global _capture_jobs, _capture_dir, _store
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
@@ -2469,7 +2550,14 @@ def main() -> None:
                    help="Capture queued job requests, events, and final results")
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
+    p.add_argument("--store", default=None,
+                   help="VC object store (a hub replica or local store) VC3D jobs read surfaces from and write to")
+    p.add_argument("--shared-store", action="store_true", default=False,
+                   help="--store is the store file of the VC3D that started this service; its session syncs it")
     args = p.parse_args()
+    if args.store:
+        _store = stored_surfaces.StoreSession(args.store, shared=args.shared_store)
+        atexit.register(_store.close)
 
     if args.data_dir:
         _data_dir = str(Path(args.data_dir).resolve())
