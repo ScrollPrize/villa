@@ -1,5 +1,6 @@
 #include "FiberConstraintExtraction.hpp"
 #include "FiberConstraintGeometry.hpp"
+#include <vc_object_store/geometry/ArrayBytes.hpp>
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/core/util/AtomicFile.hpp"
@@ -71,14 +72,15 @@ int runFiberConstraintExtraction(int argc, char** argv)
         artifactFound=artifactFound || (artifact.at("kind")=="manifest" && artifact.at("path")==manifestName);
     if(!artifactFound)throw std::invalid_argument("Normal manifest is not the recorded provenance artifact");
     const auto queryStart=Clock::now();
-    // Fiber UUID -> stored-to-volume scale, in UUID order: that order is the
-    // trace order and the database's source_index.
-    std::map<std::string,double> members;
+    // Fiber UUID -> stored-to-volume mapping (bound or registered), in UUID
+    // order: that order is the trace order and the database's source_index.
+    std::map<std::string,vc::objects::VolumeAffine> members;
+    const auto transforms=store.volumeTransforms(txn);
     const auto addMembers=[&](const std::vector<vc::objects::ObjectRecord>& records) {
         for(const auto& record:records) {
-            const auto scale=vc::objects::geometryScaleToVolume(Json::parse(record.meta),volume);
-            if(!scale) throw std::runtime_error("Fiber "+record.uuid+" is not bound to volume "+volume);
-            members.emplace(record.uuid,*scale);
+            const auto mapping=transforms.toVolume(Json::parse(record.meta),volume);
+            if(!mapping) throw std::runtime_error("Fiber "+record.uuid+" has no mapping to volume "+volume);
+            members.emplace(record.uuid,*mapping);
         }
     };
     const std::vector<std::string> memberFields{"meta"};
@@ -117,11 +119,11 @@ int runFiberConstraintExtraction(int argc, char** argv)
     // Fibers with a sampled line of at least two points, by their current
     // geometry (the record's ingest summary is not updated by edits).
     std::vector<std::string> ids, revisions;
-    std::vector<double> scales;
+    std::vector<vc::objects::VolumeAffine> mappings;
     for(const auto& selected:selectFiberConstraintGeometry(store,txn,members)) {
         ids.push_back(selected.uuid);
         revisions.push_back(selected.revision);
-        scales.push_back(selected.scale);
+        mappings.push_back(selected.mapping);
     }
     if (ids.empty()) throw std::runtime_error("No fibers intersect selection box");
     const double querySeconds=seconds(queryStart);
@@ -137,12 +139,10 @@ int runFiberConstraintExtraction(int argc, char** argv)
         if(packed.dtype!="<f8")throw std::runtime_error("Fiber line points must be float64");
         for(std::size_t i=0;i<batch.size();++i) {
             FiberletCropTraceLine line;
-            const double scale=scales[start+i];
-            for(uint64_t row=packed.offsets[i];row<packed.offsets[i+1];++row) {
-                double p[3];
-                std::memcpy(p,packed.data.data()+row*sizeof(p),sizeof(p));
-                // Stored coordinates are never rescaled; volume voxels = stored * scale.
-                if(scale!=1.) for(double& v:p) v*=scale;
+            const auto& mapping=mappings[start+i];
+            // Stored coordinates are never rewritten; volume voxels = mapping(stored).
+            for(const auto& stored:vc::objects::xyzFromBytes<double>(vc::objects::packedItem(packed,i))) {
+                const auto p=mapping.apply(stored);
                 line.pointsBaseXYZ.emplace_back(p[0],p[1],p[2]);
                 for(int d=0;d<3;++d){lo[d]=std::min(lo[d],p[d]);hi[d]=std::max(hi[d],p[d]);}
             }

@@ -26,7 +26,7 @@ TEST_CASE("constraint inputs use edited geometry rather than ingest counts")
     std::string initial;
     { auto txn = store.write(); ingestGeometryBatch(store, txn, {source});
       initial = store.currentGeometry(txn, uuid)->uuid; txn.commit(); }
-    const std::map<std::string, double> members{{uuid, 0.25}};
+    const std::map<std::string, VolumeAffine> members{{uuid, VolumeAffine::scale(0.25)}};
     { auto txn = store.read(); CHECK(selectFiberConstraintGeometry(store, txn, members).empty()); }
     std::string current = initial;
     for (const size_t count : {3u, 2u, 1u, 0u}) {
@@ -44,7 +44,7 @@ TEST_CASE("constraint inputs use edited geometry rather than ingest counts")
         REQUIRE(selected.size() == 1);
         CHECK(selected[0].uuid == uuid);
         CHECK(selected[0].revision == current);
-        CHECK(selected[0].scale == 0.25);
+        CHECK(selected[0].mapping == VolumeAffine::scale(0.25));
         const auto packed = store.readGeometryArrays(txn, {selected[0].revision}, "line_points");
         CHECK(packed.offsets.back() == count);
     }
@@ -84,7 +84,7 @@ TEST_CASE("constraint selection on an optional native fiber collection")
           txn.commit(); }
         auto txn = store.read();
         REQUIRE(store.objectByUuid(txn, sample->object.uuid)->fiber->linePointCount == originalCount);
-        const auto selected = selectFiberConstraintGeometry(store, txn, {{sample->object.uuid, 1.0}});
+        const auto selected = selectFiberConstraintGeometry(store, txn, {{sample->object.uuid, VolumeAffine::identity()}});
         if (count < 2) { CHECK(selected.empty()); continue; }
         REQUIRE(selected.size() == 1);
         const auto packed = store.readGeometryArrays(txn, {selected[0].revision}, "line_points");
