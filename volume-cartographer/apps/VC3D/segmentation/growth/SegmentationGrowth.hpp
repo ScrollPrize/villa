@@ -192,7 +192,8 @@ struct TracerGrowthResult {
     QuadSurface* surface{nullptr};
     QString error;
     QString statusMessage;
-    std::vector<std::filesystem::path> temporarySurfacePaths;
+    // UUIDs of the surfaces a displacement copy created (front, back).
+    std::vector<std::string> createdSurfaces;
     QString patchTracerCacheSourceKey;
     std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
     std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;

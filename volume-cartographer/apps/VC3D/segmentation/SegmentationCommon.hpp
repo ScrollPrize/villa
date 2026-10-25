@@ -4,15 +4,10 @@
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegWidget)
 
+// Values are persisted in settings (1 was the removed dense displacement model).
 enum class NeuralTracerModelType {
     Heatmap = 0,
-    DenseDisplacement = 1,
     DisplacementCopy = 2,
-};
-
-enum class NeuralTracerOutputMode {
-    OverwriteCurrentSegment = 0,
-    CreateNewSegment = 1,
 };
 
 enum class DenseTtaMode {

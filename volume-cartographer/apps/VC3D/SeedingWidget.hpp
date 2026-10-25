@@ -68,10 +68,9 @@ public:
     // Synchronous path-intensity analysis in Draw mode.
     bool runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed = nullptr,
                                  int* peaksFound = nullptr);
-    // Cancels the active run/expand or neural-trace batch. Each child is asked
-    // to terminate, then killed if it does not exit within one second.
+    // Cancels the active run/expand batch. Each child is asked to terminate,
+    // then killed if it does not exit within one second.
     void cancelSeedingBatchHeadless();
-    // A neural trace shares jobsRunning but is not a seeding batch.
     [[nodiscard]] bool seedingBatchActive() const { return jobsRunning && !_batch.kind().isEmpty(); }
     [[nodiscard]] int seedingBatchTotal() const { return _batch.total(); }
 
@@ -111,8 +110,6 @@ private slots:
     void onExpandSeedsClicked();
     void onResetPointsClicked();
     void onCancelClicked();
-    void onNeuralTraceClicked();
-    void onNeuralCheckpointBrowseClicked();
     
 private:
     // Mode enum
@@ -127,8 +124,6 @@ private:
     void findPeaksAlongRay(const cv::Vec2f& rayDir, const cv::Vec3f& startPoint);
     void runSegmentation();
     QString findExecutablePath();
-    QString findNeuralTracePyPath();
-    QString findPythonExecutable();
     void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();
@@ -243,18 +238,4 @@ private:
     std::vector<cv::Vec3f> _castRaysPeaks;  // Collected by background thread
     bool _castRaysWasPointMode{true};  // Track which mode triggered the cast
 
-    // Neural trace UI and state
-    QLineEdit* _neuralCheckpointEdit{nullptr};
-    QToolButton* _neuralCheckpointBrowse{nullptr};
-    QLineEdit* _neuralPythonEdit{nullptr};
-    QToolButton* _neuralPythonBrowse{nullptr};
-    QComboBox* _comboNeuralVolumeScale{nullptr};
-    QSpinBox* _spinNeuralMaxSize{nullptr};
-    QSpinBox* _spinNeuralStepsPerCrop{nullptr};
-    QPushButton* _btnNeuralTrace{nullptr};
-    QString _neuralCheckpointPath;
-    QString _neuralPythonPath;
-    int _neuralVolumeScale{0};
-    int _neuralMaxSize{60};
-    int _neuralStepsPerCrop{1};
 };

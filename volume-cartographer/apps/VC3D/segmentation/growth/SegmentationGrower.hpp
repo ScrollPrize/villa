@@ -91,8 +91,6 @@ private:
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};
-        bool denseDisplacement{false};
-        bool denseCreateNewSegment{false};
         bool copyDisplacement{false};
         bool manualAddPreview{false};
         std::optional<cv::Rect> correctionsAffectedBounds;
