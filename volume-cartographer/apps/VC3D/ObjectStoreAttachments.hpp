@@ -16,11 +16,7 @@ inline std::optional<nlohmann::json> attachedDocument(vc::objects::ObjectStoreSe
 {
     std::optional<nlohmann::json> document;
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::EdgeSelection selection;
-        selection.kind = vc::objects::kAttachmentEdgeKind;
-        selection.endpointUuids = std::vector<std::string>{objectUuid};
-        for (const auto& edge : db.selectEdges(txn, selection)) {
-            if (nlohmann::json::parse(edge.meta).value("role", "") != role) continue;
+        for (const auto& edge : db.attachments(txn, objectUuid, role)) {
             const auto uuid = edge.aUuid == objectUuid ? edge.bUuid : edge.aUuid;
             const auto object = db.objectByUuid(txn, uuid);
             const auto head = object && !object->retired ? db.currentGeometry(txn, uuid) : std::nullopt;

@@ -13,18 +13,13 @@ using Json = nlohmann::json;
 
 namespace {
 // Corrections are data attached to the surface, never graph links.
-constexpr const char* kEdgeKind = kAttachmentEdgeKind;
 constexpr const char* kRole = "corrections";
 
 // The correction relationships of a surface, by collection UUID.
 std::map<std::string, EdgeRecord> correctionEdges(const ObjectStore& db, const Txn& txn, const std::string& surfaceUuid)
 {
     std::map<std::string, EdgeRecord> edges;
-    EdgeSelection selection;
-    selection.kind = kEdgeKind;
-    selection.endpointUuids = std::vector<std::string>{surfaceUuid};
-    for (auto& edge : db.selectEdges(txn, selection)) {
-        if (Json::parse(edge.meta).value("role", "") != kRole) continue;
+    for (auto& edge : db.attachments(txn, surfaceUuid, std::string(kRole))) {
         const auto collection = edge.aUuid == surfaceUuid ? edge.bUuid : edge.aUuid;
         edges.emplace(collection, std::move(edge));
     }
@@ -219,16 +214,7 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                     }
                 }
             }
-            if (!linked.contains(uuid)) {
-                EdgeRecord edge;
-                edge.kind = kEdgeKind;
-                edge.aUuid = uuid;
-                edge.bUuid = surfaceUuid;
-                edge.aAnchor.wholeGeometry = true;
-                edge.bAnchor.wholeGeometry = true;
-                edge.meta = Json{{"role", kRole}}.dump();
-                db.addEdge(txn, edge);
-            }
+            if (!linked.contains(uuid)) db.attach(txn, uuid, surfaceUuid, kRole);
         }
         for (const auto& [uuid, edge] : linked) {
             if (desired.contains(uuid)) continue;
@@ -275,14 +261,7 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
         record.meta = meta.dump();
         db.upsertObject(txn, record);
         db.putGeometry(txn, uuid, vc::geometry::encode(geometry));
-        EdgeRecord edge;
-        edge.kind = kEdgeKind;
-        edge.aUuid = uuid;
-        edge.bUuid = annotation.surfaceUuid;
-        edge.aAnchor.wholeGeometry = true;
-        edge.bAnchor.wholeGeometry = true;
-        edge.meta = Json{{"role", "growth_annotation"}}.dump();
-        db.addEdge(txn, edge);
+        db.attach(txn, uuid, annotation.surfaceUuid, "growth_annotation");
     });
     return uuid;
 }
