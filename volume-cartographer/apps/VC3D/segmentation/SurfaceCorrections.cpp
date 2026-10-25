@@ -3,10 +3,10 @@
 #include "ObjectStoreCoordinates.hpp"
 #include "vc/core/types/Volume.hpp"
 
+#include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <nlohmann/json.hpp>
-#include <cstring>
 
 using namespace vc::objects;
 using Json = nlohmann::json;
@@ -139,79 +139,23 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                     // Only the record changed: the correction relationship still applies.
                     for (const auto& edge : db.edgesOf(txn, uuid)) db.retainRelationship(txn, edge.uuid);
                 } else {
-                    // The new sequence keeps the points that stay (referenced from the previous
-                    // revision, so they keep their identity), adds new ones, then moves the kept
-                    // points that moved. The correction relationship applies to it as before.
-                    std::map<int64_t, int64_t> previousRow;
-                    for (size_t i = 0; i < previous.ids.size(); ++i) previousRow[previous.ids[i]] = int64_t(i);
-                    GeometrySequenceEdit sequence;
-                    sequence.array = "points";
-                    sequence.eraseCount = int64_t(previous.ids.size());
-                    sequence.transformedAnnotations = stored.annotations.dump();
-                    std::vector<std::pair<int64_t, std::array<double, 3>>> moved;
-                    for (size_t i = 0; i < stored.points.ids.size(); ++i) {
-                        const auto id = stored.points.ids[i];
-                        const auto& xyz = stored.points.points[i];
-                        const auto found = previousRow.find(id);
-                        auto& last = sequence.parts;
-                        if (found != previousRow.end()) {
-                            if (previous.points[size_t(found->second)] != xyz) moved.emplace_back(int64_t(i), xyz);
-                            if (!last.empty() && last.back().revision && last.back().start + last.back().count == found->second) {
-                                ++last.back().count;
-                                continue;
-                            }
-                            GeometrySequencePart part;
-                            part.revision = head->uuid;
-                            part.start = found->second;
-                            part.count = 1;
-                            last.push_back(std::move(part));
-                            continue;
-                        }
-                        if (last.empty() || last.back().revision) last.emplace_back();
-                        auto& part = last.back();
-                        ++part.count;
-                        part.ids.push_back(id);
-                        const auto offset = part.bytes.size();
-                        part.bytes.resize(offset + sizeof xyz);
-                        std::memcpy(part.bytes.data() + offset, xyz.data(), sizeof xyz);
-                    }
-                    for (auto& part : sequence.parts)
-                        if (!part.revision) {
-                            auto annotations = Json::array();
-                            for (const auto id : part.ids)
-                                annotations.push_back(stored.annotations[std::find(stored.points.ids.begin(), stored.points.ids.end(), id) -
-                                                                         stored.points.ids.begin()]);
-                            part.annotations = annotations.dump();
-                        }
-                    auto retain = [&](const std::string& geometry, const std::vector<EdgeRecord>& edges) {
+                    // Points that stay keep their identity (stable IDs); the correction
+                    // relationship applies to the edited geometry as before.
+                    auto retain = [&](const std::vector<EdgeRecord>& edges) {
                         std::vector<GeometryEdgeEdit> decisions;
                         for (const auto& edge : edges) {
                             GeometryEdgeEdit decision;
                             decision.edgeUuid = edge.uuid;
                             decision.expectedGeneration = edge.generation;
                             decision.action = "retain";
-                            decision.aRevision = edge.aUuid == uuid ? std::optional(geometry) : std::nullopt;
-                            decision.bRevision = edge.bUuid == uuid ? std::optional(geometry) : std::nullopt;
-                            if (!decision.aRevision) if (const auto r = db.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
-                            if (!decision.bRevision) if (const auto r = db.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
+                            if (const auto r = db.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
+                            if (const auto r = db.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
                             decisions.push_back(std::move(decision));
                         }
                         return decisions;
                     };
-                    // Only moved points: their coordinates change in place.
-                    const bool sameSequence = previous.ids == stored.points.ids && previousAnnotations == stored.annotations;
-                    auto geometry = sameSequence ? head->uuid
-                        : db.editGeometrySequence(txn, uuid, sequence, head->uuid, retain(head->uuid, db.edgesOf(txn, uuid)));
-                    if (!moved.empty()) {
-                        std::vector<GeometryArrayEdit> edits;
-                        for (const auto& [row, xyz] : moved) {
-                            std::vector<uint8_t> bytes(sizeof xyz);
-                            std::memcpy(bytes.data(), xyz.data(), sizeof xyz);
-                            edits.push_back({"points", row * 3, std::move(bytes)});
-                        }
-                        db.editGeometry(txn, uuid, edits, geometry,
-                                        retain(geometry, db.affectedGeometryEditEdges(txn, uuid, edits, geometry)));
-                    }
+                    updateGeometryArrays(db, txn, uuid, vc::geometry::encode(stored.points), head->uuid,
+                                         {{"points", stored.annotations.dump()}}, retain);
                 }
             }
             if (!linked.contains(uuid)) db.attach(txn, uuid, surfaceUuid, kRole);
