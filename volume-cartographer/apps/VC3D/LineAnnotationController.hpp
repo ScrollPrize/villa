@@ -1498,12 +1498,6 @@ private:
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
     // The stored umbilicus token as of the cached load.
     QString _scrollUmbilicusToken;
-    // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
-    // key because the cached value is not the file's contents: its points are
-    // already multiplied by a frame-dependent factor and its per-slice centres
-    // sized to that frame's extent. Keyed on the project directory alone, a
-    // volume switch handed the orientation vote geometry from the previous frame.
-    vc3d::annotation::AnnotationFrame _scrollUmbilicusFrame;
     // The volume the cached umbilicus was read for. Deliberately conservative:
     // the volume-centre fallback and the legacy reading depend on the volume's
     // raw shape and its registration transform, not only on the annotation

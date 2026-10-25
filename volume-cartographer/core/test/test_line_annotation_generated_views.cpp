@@ -5466,8 +5466,6 @@ vc3d::annotation::UmbilicusCacheInputs cacheInputs()
     vc3d::annotation::UmbilicusCacheInputs inputs;
     inputs.volumeId = "vol-a";
     inputs.dependencyToken = "umbilicus-uuid@revision-1";
-    inputs.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
     return inputs;
 }
 
@@ -5484,8 +5482,8 @@ TEST_CASE("umbilicus cache: reused only while every input it was built from hold
     // Identical inputs reuse.
     CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
 
-    // A volume switch whose annotation frame is byte-identical must still
-    // reload, because the volume-centre fallback belongs to the volume.
+    // A volume switch reloads: the points are read in the volume's voxels and
+    // the volume-centre fallback belongs to the volume.
     auto otherVolume = cached;
     otherVolume.volumeId = "vol-b";
     CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
@@ -5494,18 +5492,6 @@ TEST_CASE("umbilicus cache: reused only while every input it was built from hold
     auto edited = cached;
     edited.dependencyToken = "umbilicus-uuid@revision-2";
     CHECK(umbilicusReloadNeeded(true, cached, edited));
-
-    // A frame change rescales the cached points, so it cannot be reused...
-    auto otherFrame = cached;
-    otherFrame.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 2000.0});
-    CHECK(umbilicusReloadNeeded(true, cached, otherFrame));
-
-    // ...but an imprecisely round-tripped voxel size is the same frame.
-    auto rounded = cached;
-    rounded.frame = vc3d::annotation::deriveAnnotationFrame(
-        2.4 + 1e-12, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
-    CHECK_FALSE(umbilicusReloadNeeded(true, cached, rounded));
 }
 
 TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the change")
@@ -5598,36 +5584,6 @@ TEST_CASE("controlled span keeps only the line between the outer control points"
         CHECK(span[1] == c);
         CHECK(span[2] == a);
     }
-}
-
-TEST_CASE("Winding queries use the center frame at every volume level")
-{
-    using namespace vc3d::line_annotation;
-    std::vector<cv::Vec3f> basePoints;
-    // Off-origin, z-dependent center exposes both XY and Z frame mismatches.
-    const auto towardCenter = [](const cv::Vec3f& p) -> cv::Vec3f {
-        return {1000.0f + p[2] - p[0], 2000.0f - p[2] - p[1], 0};
-    };
-    for (int i = 0; i < 40; ++i) {
-        const float z = 100.0f + i * 4.0f;
-        const float angle = i * 0.3f;
-        basePoints.push_back({1000.0f + z + 100.0f * std::cos(angle),
-                              2000.0f - z + 100.0f * std::sin(angle), z});
-    }
-    const auto expected = unwrappedGeneratedWindingAngles(basePoints, towardCenter);
-    auto viewerPoints = basePoints;
-    for (auto& point : viewerPoints) {
-        point *= 0.25f;
-    }
-    const auto actual = unwrappedGeneratedWindingAngles(viewerPoints, towardCenter, 4.0f);
-    REQUIRE(actual.size() == expected.size());
-    for (size_t i = 0; i < actual.size(); ++i) {
-        CHECK(actual[i] == doctest::Approx(expected[i]));
-    }
-    CHECK(generatedLineIndexRangeWithinWinding(actual, actual.size(), 20.0,
-                                               kGeneratedSideCutHalfWrapAngle) ==
-          generatedLineIndexRangeWithinWinding(expected, expected.size(), 20.0,
-                                               kGeneratedSideCutHalfWrapAngle));
 }
 
 TEST_CASE("control point tags round trip and travel with the point")

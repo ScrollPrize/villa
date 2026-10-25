@@ -13590,7 +13590,6 @@ void LineAnnotationController::invalidateScrollUmbilicus()
 {
     _scrollUmbilicusLoadAttempted = false;
     _scrollUmbilicusToken.clear();
-    _scrollUmbilicusFrame = {};
     _scrollUmbilicusVolumeId.clear();
     _scrollUmbilicus.reset();
     _umbilicusNotice.clear();
@@ -13739,65 +13738,40 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
 const std::optional<vc::core::util::Umbilicus>&
 LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
-    // The frame is part of the key: the cached points are scaled into it and the
-    // per-slice centres sized to its extent. The volume is too, conservatively:
-    // the volume-centre fallback reads its shape.
-    const auto currentAnnotationFrame = annotationFrame();
+    // Keyed by the volume (points in its voxels, centres sized to it) and the
+    // stored umbilicus revision.
     const std::string currentVolumeId =
         _state ? _state->currentVolumeId() : std::string{};
     const QString currentUmbilicusToken = umbilicusFingerprint();
     const vc3d::annotation::UmbilicusCacheInputs cachedInputs{
         _scrollUmbilicusVolumeId,
-        _scrollUmbilicusToken.toStdString(),
-        _scrollUmbilicusFrame};
+        _scrollUmbilicusToken.toStdString()};
     const vc3d::annotation::UmbilicusCacheInputs currentInputs{
         currentVolumeId,
-        currentUmbilicusToken.toStdString(),
-        currentAnnotationFrame};
+        currentUmbilicusToken.toStdString()};
     if (vc3d::annotation::umbilicusReloadNeeded(
             _scrollUmbilicusLoadAttempted, cachedInputs, currentInputs)) {
         _scrollUmbilicusLoadAttempted = true;
         _scrollUmbilicusToken = currentUmbilicusToken;
-        _scrollUmbilicusFrame = currentAnnotationFrame;
         _scrollUmbilicusVolumeId = currentVolumeId;
         // Cleared before the attempt: whatever is set below describes this
         // attempt, and success has to be able to retract an earlier complaint.
         _scrollUmbilicus.reset();
         _umbilicusNotice.clear();
         try {
+            // Line points and the stored umbilicus are both in the volume's voxels.
             auto umbilicus = _state ? _state->storedUmbilicus() : CState::StoredUmbilicus{};
-            // Line points live in the annotation frame, so the stored points (volume
-            // voxels) are scaled into it and the per-slice centres built at its extent.
-            const auto& frame = currentAnnotationFrame;
-            const auto asSliceCount = [](double extent) -> int {
-                if (!std::isfinite(extent) || extent < 1.0 ||
-                    extent > static_cast<double>(std::numeric_limits<int>::max())) {
-                    return 0;
-                }
-                return static_cast<int>(std::llround(extent));
-            };
-            const cv::Vec3i annotationShape{asSliceCount(frame.extentXyz[2]),
-                                            asSliceCount(frame.extentXyz[1]),
-                                            asSliceCount(frame.extentXyz[0])};
+            const auto volume = _state ? _state->currentVolume() : nullptr;
             if (!umbilicus.error.empty()) {
                 if (_state && _state->objectStoreAttachment()) {
                     Logger()->warn("Line annotation: no usable umbilicus: {}", umbilicus.error);
                     _umbilicusNotice = tr("no usable umbilicus: %1")
                                            .arg(QString::fromStdString(umbilicus.error));
                 }
-            } else if (!vc3d::annotation::hasCoordinateFrame(frame) ||
-                       annotationShape[0] <= 0 || annotationShape[1] <= 0 ||
-                       annotationShape[2] <= 0) {
-                // Left unset, so orientation falls back to the volume centre.
-                _umbilicusNotice = tr("umbilicus %1 unusable: the annotation frame "
-                                      "extent is not a usable grid")
-                                       .arg(QString::fromStdString(umbilicus.name));
-            } else {
-                for (auto& point : umbilicus.points) {
-                    point *= static_cast<float>(frame.factor);
-                }
+            } else if (volume) {
+                const auto shape = volume->shape();
                 _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
-                    std::move(umbilicus.points), annotationShape);
+                    std::move(umbilicus.points), cv::Vec3i{shape[0], shape[1], shape[2]});
             }
         } catch (...) {
             _scrollUmbilicus.reset();
@@ -14113,14 +14087,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         // umbilicus, else the volume center; with neither the angles stay NaN
         // and the side cut shows the whole line as before.
         constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
-        // The umbilicus is indexed in annotation coordinates, including z.
-        const float volumeToAnnotationScale =
-            static_cast<float>(annotationFrame().factor);
         cv::Vec2f volumeCenterXY{kNanF, kNanF};
         try {
             if (const auto volume = _state->currentVolume()) {
-                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f * volumeToAnnotationScale,
-                                  static_cast<float>(volume->sliceHeight()) * 0.5f * volumeToAnnotationScale};
+                volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f,
+                                  static_cast<float>(volume->sliceHeight()) * 0.5f};
             }
         } catch (...) {
         }
@@ -14140,8 +14111,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                                 0.0f};
                     }
                     return {kNanF, kNanF, kNanF};
-                },
-                volumeToAnnotationScale);
+                });
     }
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);

@@ -8141,9 +8141,10 @@ void CWindow::updateFiberLengthUnits()
     if (_destroyingWindow) {
         return;
     }
+    // Fiber lengths are in the open volume's voxels.
     std::optional<double> voxelSizeUm;
-    if (_lineAnnotationController) {
-        voxelSizeUm = _lineAnnotationController->annotationFrame().voxelSizeUm;
+    if (const auto volume = _state ? _state->currentVolume() : nullptr; volume && volume->voxelSize() > 0) {
+        voxelSizeUm = volume->voxelSize();
     }
     if (_fiberWidget) {
         _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
@@ -8171,10 +8172,10 @@ void CWindow::updateLineAnnotationLengthLabel()
         _lineAnnotationLengthLabel->hide();
         return;
     }
-    // The same frame the Fibers dock converts with, read from the controller
-    // rather than cached here so the two can never disagree.
+    // Fiber lengths are in the open volume's voxels, as in the Fibers dock.
+    const auto volume = _state->currentVolume();
     const std::optional<double> voxelSizeUm =
-        _lineAnnotationController->annotationFrame().voxelSizeUm;
+        volume && volume->voxelSize() > 0 ? std::optional(volume->voxelSize()) : std::nullopt;
     _lineAnnotationLengthLabel->setText(
         tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(summary->annotatedLengthVx, voxelSizeUm)));
     _lineAnnotationLengthLabel->show();

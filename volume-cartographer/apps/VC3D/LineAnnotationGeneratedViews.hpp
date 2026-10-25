@@ -597,12 +597,9 @@ inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
 // the point to the center at that point's z (non-finite when unknown). A point
 // without a usable direction gets NaN and does not break the chain: the next
 // finite angle continues from the last finite one. No towardCenter: all NaN.
-// pointToCenterFrameScale maps all three query coordinates into the center
-// provider's grid (including z for a center that varies along the scroll).
 inline std::vector<double> unwrappedGeneratedWindingAngles(
     const std::vector<cv::Vec3f>& linePoints,
-    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter,
-    float pointToCenterFrameScale = 1.0f)
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
 {
     constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
     std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
@@ -615,7 +612,7 @@ inline std::vector<double> unwrappedGeneratedWindingAngles(
         if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
             continue;
         }
-        const cv::Vec3f toCenter = towardCenter(point * pointToCenterFrameScale);
+        const cv::Vec3f toCenter = towardCenter(point);
         if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
             continue;
         }

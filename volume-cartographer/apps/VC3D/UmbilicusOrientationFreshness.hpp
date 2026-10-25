@@ -2,22 +2,17 @@
 
 #include <string>
 
-#include "AnnotationFrame.hpp"
-
 namespace vc3d::annotation {
 
-// The inputs the cached, already-scaled scroll umbilicus was built from: the
-// cached points are multiplied by a frame-dependent factor and its per-slice
-// centres sized to that frame's extent, and the volume-centre fallback depends
-// on the volume itself.
+// The inputs the cached scroll umbilicus was built from: it is read in the
+// volume's voxels and its per-slice centres sized to the volume, and the
+// volume-centre fallback depends on the volume itself.
 struct UmbilicusCacheInputs {
     // The active volume, deliberately conservative: any volume switch reloads
     // rather than proving the previous geometry equivalent.
     std::string volumeId;
     // The stored umbilicus (uuid@revision), or why there is none.
     std::string dependencyToken;
-    // The frame the cached points were scaled into.
-    AnnotationFrame frame;
 };
 
 // Whether a cached umbilicus may be reused for `current`, or must be
@@ -33,10 +28,7 @@ inline bool umbilicusReloadNeeded(bool cachedLoadAttempted,
     if (cached.volumeId != current.volumeId) {
         return true;
     }
-    if (cached.dependencyToken != current.dependencyToken) {
-        return true;
-    }
-    return !sameAnnotationFrame(cached.frame, current.frame);
+    return cached.dependencyToken != current.dependencyToken;
 }
 
 // One pane, as the stale-view refresh sees it.
