@@ -127,8 +127,19 @@ public:
         const std::vector<Source>& sources, const std::array<double, 3>& point, double tolerance,
         const std::optional<std::vector<std::string>>& uuids = std::nullopt);
 
+    // Where tools launched for the open volume read and write: the user's store
+    // file (a hosted replica's local file) and the volume's id. Throws without a
+    // writable attachment and an open volume.
+    struct ToolStore {
+        std::filesystem::path store;
+        std::string volume;
+    };
+    ToolStore toolStore() const;
+
     // Record edits: they commit at once and reach rows() through the commit events.
     void setTags(const std::string& uuid, const std::vector<std::string>& tags);
+    // Bind the surface to the open volume: `storedUnitsPerVoxel` stored units per voxel.
+    void bind(const std::string& uuid, double storedUnitsPerVoxel);
     void rename(const std::string& uuid, const std::string& name);
     void updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change);
     void retire(const std::vector<std::string>& uuids);
@@ -156,6 +167,8 @@ private:
     // The sources changed: drop the rows and pending reads, list again.
     void restart();
     void editRecord(const std::string& uuid, const std::function<void(vc::objects::ObjectRecord&)>& change);
+    // The surface's current object revision in the user's store; throws when it is gone.
+    std::string head(const std::string& uuid) const;
 
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;

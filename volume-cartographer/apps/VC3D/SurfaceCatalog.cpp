@@ -1,5 +1,6 @@
 #include "SurfaceCatalog.hpp"
 #include "ObjectStoreCoordinates.hpp"
+#include "ObjectStoreEvents.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -127,7 +128,11 @@ void SurfaceCatalog::handle(const StoreSessionEvent& event)
     if (event.kind != StoreSessionEvent::Kind::Committed ||
         std::none_of(listed.begin(), listed.end(), [&](const Source& source) { return source.attachment == event.attachment; }))
         return;
-    if(std::any_of(event.changes.begin(),event.changes.end(),[](const auto& c){return c.kind=="volume_transform"||c.kind=="volume_transform_choice";})){read(std::nullopt);return;}
+    // A registration can bring any surface into (or out of) the volume.
+    if (vc3d::store::touches(event, {"volume_transform", "volume_transform_choice"})) {
+        read(std::nullopt);
+        return;
+    }
     std::vector<std::string> changed;
     for (const auto& change : event.changes)
         if (change.kind == "surface") changed.push_back(change.recordUuid);
@@ -213,14 +218,33 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     return opened;
 }
 
-void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<void(ObjectRecord&)>& change)
+std::string SurfaceCatalog::head(const std::string& uuid) const
 {
     if (!attachment_) throw std::runtime_error("Attach an object store first");
     std::optional<std::string> revision;
     session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
-        if (const auto head = db.currentObjectRevision(txn, uuid)) revision = head->uuid;
+        if (const auto current = db.currentObjectRevision(txn, uuid)) revision = current->uuid;
     });
     if (!revision) throw std::runtime_error("The surface is no longer in the object store");
+    return *revision;
+}
+
+SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
+{
+    if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
+    if (!session_->writable(*attachment_)) throw std::runtime_error("The object store is read-only.");
+    return {session_->path(*attachment_), volume_->id()};
+}
+
+void SurfaceCatalog::bind(const std::string& uuid, double storedUnitsPerVoxel)
+{
+    if (!volume_) throw std::runtime_error("Open a volume first");
+    vc3d::bindCoordinates(*session_, *attachment_, uuid, head(uuid), *volume_, storedUnitsPerVoxel);
+}
+
+void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<void(ObjectRecord&)>& change)
+{
+    const auto revision = head(uuid);
     session_->editKeepingRelationships(*attachment_, {{uuid, revision}}, {}, [&](auto& db, auto& txn, const auto&) {
         auto record = *db.objectByUuid(txn, uuid);
         change(record);
@@ -254,7 +278,7 @@ void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
     RevisionSelection pins;
     session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
         for (const auto& uuid : uuids)
-            if (const auto head = db.currentObjectRevision(txn, uuid)) pins[uuid] = head->uuid;
+            if (const auto current = db.currentObjectRevision(txn, uuid)) pins[uuid] = current->uuid;
     });
     session_->editKeepingRelationships(*attachment_, pins, {}, [&](auto& db, auto& txn, const auto&) {
         for (const auto& [uuid, revision] : pins) {

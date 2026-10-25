@@ -1438,23 +1438,20 @@ SegmentationCommandHandler::storeForTools(CommandLaunchError* error) const
 {
     const CommandLaunchErrorSetter setErr{error};
     auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
-    if (!catalog || !catalog->attachment() || !catalog->volume()) {
+    if (!catalog) {
         setErr(tr("Attach an object store and open a volume first."), CommandLaunchError::InvalidState);
         return std::nullopt;
     }
-    if (!catalog->session()->writable(*catalog->attachment())) {
-        setErr(tr("The object store is read-only."), CommandLaunchError::InvalidState);
-        return std::nullopt;
-    }
-    StoredSurface stored;
-    stored.volumeUuid = QString::fromStdString(catalog->volume()->id());
     try {
-        stored.store = QString::fromStdString(catalog->session()->path(*catalog->attachment()).string());
+        const auto tools = catalog->toolStore();
+        StoredSurface stored;
+        stored.volumeUuid = QString::fromStdString(tools.volume);
+        stored.store = QString::fromStdString(tools.store.string());
+        return stored;
     } catch (const std::exception& e) {
-        setErr(tr("Could not read the object store: %1").arg(e.what()));
+        setErr(QString::fromUtf8(e.what()), CommandLaunchError::InvalidState);
         return std::nullopt;
     }
-    return stored;
 }
 
 std::optional<SegmentationCommandHandler::StoredSurface>

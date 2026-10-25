@@ -651,11 +651,7 @@ void SurfacePanelController::bindSurface(const std::string& id)
         return;
     }
     try {
-        std::string revision;
-        _catalog->session()->read(*_catalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
-            if (const auto head = db.currentObjectRevision(txn, id)) revision = head->uuid;
-        });
-        vc3d::bindCoordinates(*_catalog->session(), *_catalog->attachment(), id, revision, *volume, scale);
+        _catalog->bind(id, scale);
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
     }
