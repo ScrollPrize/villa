@@ -120,6 +120,14 @@ struct ObjectRevision {
     ObjectRecord record;
 };
 
+// Edge kind tying a data object to the object it describes (e.g. fit results
+// attached to a surface). Attachments are not graph links: traversal
+// (componentOf, reachableWithin, connectedTo), neighbours() and graph read views
+// skip them unless the attachment kind is requested explicitly. Edge listings
+// and exports include them. Point collections attached this way carry a record
+// meta "role" and are never linked to surfaces by the point-collection linker.
+inline constexpr const char* kAttachmentEdgeKind = "attachment";
+
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
 // Pins are immutable objectRevision() UUIDs, never moving heads.
 struct RelationshipRevision {
@@ -211,6 +219,8 @@ struct EdgeSelection {
     std::optional<bool> adjacent;
     // Shared membership/dependencies against latest heads. Requires a ReadTxn.
     bool applicableOnly = false;
+    // false skips attachment edges (graph read views do unless kind asks for them).
+    bool attachments = true;
 };
 
 // Snapshot topology in selection order. Every edge, including self/parallel edges,

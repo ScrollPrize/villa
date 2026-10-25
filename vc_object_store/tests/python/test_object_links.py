@@ -113,3 +113,39 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     edits = [dict(array="points", element_offset=0, data=geometry["arrays"][0]["data"])]
     db.edit_geometry(collection, edits, db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(collection, edits, db.current_geometry(collection)["uuid"])])
     assert db.link_point_collections_to_surfaces(collection_uuids=[collection], surface_uuids=[surface], point_scale=0.5)["stale_removed"] == 0
+
+
+def test_attached_collections_are_not_graph_links(db):
+    """Data attached to a surface (e.g. fit results) never becomes a graph link."""
+    surface, _ = plane(db)
+    other, _ = plane(db, offset=1, name="other")
+    results, _ = put(db, "point_collection", [
+        array("points", [[10, 10, 20], [20, 20, 20]], "<f8"),
+        array("point_ids", [1, 2], "<i8"),
+    ], meta={"role": "fit_results"})
+    whole = {"whole_geometry": True}
+    attachment = db.add_edge(dict(a=results, b=surface, kind="attachment", a_anchor=whole, b_anchor=whole,
+                                  meta={"role": "fit_results"}))
+
+    # The linker leaves role-carrying collections alone, and refuses them by name.
+    report = db.link_point_collections_to_surfaces()
+    assert report["edges_created"] == 0
+    assert [e["uuid"] for e in db.edges_of(results)] == [attachment]
+    with pytest.raises((ValueError, RuntimeError), match="role"):
+        db.link_point_collections_to_surfaces(collection_uuids=[results])
+
+    # Traversal and graph reads skip attachments unless asked for by kind.
+    link = db.add_edge(dict(a=surface, b=other, kind="surface-overlap", a_anchor=whole, b_anchor=whole))
+    assert results not in db.neighbours(surface)
+    assert db.neighbours(surface, edge_kind="attachment") == [results]
+    assert set(db.component(surface)) == {surface, other}
+    assert set(db.reachable_within(surface, 3)) == {surface, other}
+    assert results in db.component(surface, edge_kinds=["attachment"])
+    assert [o["uuid"] for o in db.select_objects(connected_to=results)] == [results]
+    with db.graph_read(approval_states=[]) as graph:
+        assert graph.edge_uuids == [link]
+    with db.graph_read(approval_states=[], edge_kind="attachment") as graph:
+        assert graph.edge_uuids == [attachment]
+    # Listings still show the attachment.
+    assert attachment in [e["uuid"] for e in db.edges_of(surface)]
+    assert attachment in [e["uuid"] for e in db.select_edges()]

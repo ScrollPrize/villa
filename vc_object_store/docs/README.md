@@ -178,6 +178,14 @@ endpoints in checked writes. Metadata/lifecycle decisions must match final state
 at commit. Unrelated metadata/point edits leave relationships applicable; physical
 or domain-specific validity remains the caller's responsibility.
 
+**Attachments are not graph links.** Edge kind `attachment` ties a data object
+to the object it describes (VC3D growth corrections, Lasagna fit results on a
+surface). `neighbours`, `component`, `reachable_within`, `connected_to` and
+`graph_read` skip attachments unless the `attachment` kind is requested;
+`edges_of`, `select_edges` and exports list them. Such point collections carry
+a record meta `role`; `link_point_collections_to_surfaces` never links them and
+rejects them when named.
+
 **Same-winding queries must pass `adjacent=False`.** On `select_edges`,
 `neighbours`, `component`, `reachable_within` and `graph_read`, it selects ordinary
 `fiber_branch` edges, including branches without the flag. `True` selects

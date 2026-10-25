@@ -49,6 +49,15 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
     std::vector<Collection> result;
     for (const auto& object : inputs.select("point_collection", params.collectionUuids)) {
         checkCancelled(cancel);
+        // A collection with a role is data attached to an object (e.g. fit
+        // results), never a source of surface links.
+        if (const auto meta = Json::parse(object.meta.empty() ? std::string("{}") : object.meta);
+            meta.is_object() && meta.contains("role")) {
+            if (!params.collectionUuids.empty())
+                throw std::invalid_argument("point collection " + object.uuid + " has role " +
+                                            meta.at("role").dump() + " and is not linked to surfaces");
+            continue;
+        }
         const auto geometry = inputs.load(object);
         const auto xyz = geometry.values<double>("points");
         const auto ids = geometry.values<int64_t>("point_ids");

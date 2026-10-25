@@ -111,6 +111,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
         return "?" + std::to_string(parameters.size());
     };
     if (selection.kind) sql += " AND kind=" + parameter(*selection.kind);
+    if (!selection.attachments) sql += " AND kind<>" + parameter(kAttachmentEdgeKind);
     if (selection.approvalStates.size() == 1)
         sql += " AND approval_state=" + parameter(selection.approvalStates.front());
     else if (!selection.approvalStates.empty())
