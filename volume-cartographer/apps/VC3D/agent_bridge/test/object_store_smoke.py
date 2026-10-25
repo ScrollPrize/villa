@@ -25,10 +25,12 @@ from vc3d_process import VC3DProcess
 from vc_object_store import ObjectStore
 
 
-def add_surface(store, name, volume):
-    """A 3x3 surface inside the 16^3 smoke volume, bound to `volume`; returns its UUID."""
-    rows, cols = np.mgrid[:3, :3]
-    points = np.stack([cols * 2.0 + 4, rows * 2.0 + 4, np.full((3, 3), 8.0)], axis=-1).astype('<f4')
+def add_surface(store, name, volume, invalid_rows=0):
+    """A 3x3 surface inside the 16^3 smoke volume, bound to `volume`, followed by
+    `invalid_rows` rows of invalid points; returns its UUID."""
+    rows, cols = np.mgrid[:3 + invalid_rows, :3]
+    points = np.stack([cols * 2.0 + 4, rows * 2.0 + 4, np.full(rows.shape, 8.0)], axis=-1).astype('<f4')
+    points[3:] = -1
     uuid = store.upsert_object(dict(kind='surface', name=name,
                                     meta=dict(coordinates=dict(volume_uuid=volume, scale_factor=1))))
     store.put_geometry(uuid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
@@ -66,7 +68,7 @@ def main():
             'vc-open-data-sample-id:smp', 'vc-open-data-volume-id:catvol',
             'vc-open-data-coordinate-space:smp/catvol@L0'])])))
         with ObjectStore.open(str(database), author='bridge-fixture') as store:
-            user_surface = add_surface(store, 'smoke surface', 'vol1')
+            user_surface = add_surface(store, 'smoke surface', 'vol1', invalid_rows=2)
         catalog_store = root / 'remote-cache' / 'open_data' / 'stores' / 'smp.vcobj'
         catalog_store.parent.mkdir(parents=True)
         with ObjectStore.create(str(catalog_store), author='vc3d-open-data') as store:
@@ -193,6 +195,13 @@ def surfaces(client, database, user_surface, catalog_surface):
         assert time.monotonic() < deadline, review
         time.sleep(.1)
     assert review['segments'][0]['reviewState'] == 'approved', review
+    with ObjectStore.open(str(database), read_only=True) as store:
+        before = store.current_geometry(user_surface)
+    client.call('segment.crop_bounds', {'segmentId': user_surface}, timeout=120)
+    with ObjectStore.open(str(database), read_only=True) as store:
+        after = store.current_geometry(user_surface)
+    assert after['parent_uuid'] == before['uuid'], (before, after)
+    assert [array['shape'] for array in after['arrays'] if array['name'] == 'points'] == [[3, 3, 3]], after
 
     client.call('segments.activate', {'segmentId': catalog_surface}, timeout=120)
     error = expect_error(client, 'segments.rename', {'segmentId': catalog_surface, 'newName': 'x'}, -32009)
@@ -214,7 +223,7 @@ def surfaces(client, database, user_surface, catalog_surface):
     enabled, _ = client.call('segmentation.enable_editing', {'enabled': True}, timeout=120)
     assert enabled['enabled'], enabled
     client.call('segmentation.enable_editing', {'enabled': False}, timeout=120)
-    print('Surfaces: list, activate, tags, rename and review edit the store; a catalog surface '
+    print('Surfaces: list, activate, tags, rename, review and crop edit the store; a catalog surface '
           'is read-only and its editable copy edits', flush=True)
 
 
