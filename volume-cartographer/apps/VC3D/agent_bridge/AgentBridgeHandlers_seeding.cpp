@@ -83,11 +83,6 @@ QJsonObject pushPullConfigToJson(const AlphaPushPullConfig& c)
 
 QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
@@ -98,40 +93,18 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
     const QString tagStr = p.value("tag").toString();
     const bool enabled = p.value("enabled").toBool();
 
-    // Keep this mapping aligned with SurfacePanelController::Tag.
-    SurfacePanelController::Tag tag;
-    if (tagStr == QLatin1String("approved"))
-        tag = SurfacePanelController::Tag::Approved;
-    else if (tagStr == QLatin1String("defective"))
-        tag = SurfacePanelController::Tag::Defective;
-    else if (tagStr == QLatin1String("reviewed"))
-        tag = SurfacePanelController::Tag::Reviewed;
-    else if (tagStr == QLatin1String("inspect"))
-        tag = SurfacePanelController::Tag::Inspect;
-    else
-        tag = SurfacePanelController::Tag::Inspect;
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
+    // Review tags are record tags of the surface in the user's store.
+    const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    auto tags = row.record.tags;
+    const std::string tag = tagStr.toStdString();
+    const auto found = std::find(tags.begin(), tags.end(), tag);
+    if (enabled && found == tags.end()) tags.push_back(tag);
+    if (!enabled && found != tags.end()) tags.erase(found);
+    try {
+        _window->_surfaceCatalog->setTags(row.record.uuid, tags);
+    } catch (const std::exception& error) {
         QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Select first, leaving segmentId active so the tag checkboxes are enabled,
-    // then set the tag. selectSurfaceById returns false for an unknown or
-    // unloaded id.
-    const std::string segmentId = segmentIdQ.toStdString();
-    if (!panel->selectSurfaceById(segmentId)) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
-    if (!panel->setTagChecked(tag, enabled)) {
-        // Selection succeeded but the tag checkbox is unavailable/disabled.
-        QJsonObject data;
-        data["detail"] = "tag checkbox is not available for this segment";
+        data["detail"] = QString::fromUtf8(error.what());
         throw AgentBridgeError{-32010, "Tag could not be set", data};
     }
 

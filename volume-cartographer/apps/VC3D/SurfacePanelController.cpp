@@ -862,7 +862,14 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
         return fail(tr("unknown surface: %1").arg(idQString));
     }
     try {
-        (void)_catalog->open(surfaceId);
+        try {
+            (void)_catalog->open(surfaceId);
+        } catch (const SurfaceCatalog::NoGeometry&) {
+            if (!_catalog->row(surfaceId)->catalog) throw;
+            // Headless callers wait for a catalog surface to be fetched.
+            _catalog->fetchJob(surfaceId)();
+            (void)_catalog->open(surfaceId);
+        }
     } catch (const std::exception& error) {
         return fail(tr("surface %1 could not be opened: %2").arg(idQString, QString::fromUtf8(error.what())));
     }

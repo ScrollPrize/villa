@@ -61,6 +61,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     if (!state) {
         // Degenerate case: report an empty snapshot rather than erroring.
         result["vpkg"] = QJsonValue::Null;
+        result["objectStore"] = QJsonValue::Null;
         result["volume"] = QJsonValue::Null;
         result["activeSurface"] = QJsonValue::Null;
         result["segmentationGrowthVolumeId"] = QString();
@@ -85,6 +86,17 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["vpkg"] = vpkg;
     } else {
         result["vpkg"] = QJsonValue::Null;
+    }
+
+    // The user's object store: where surfaces are listed from and saved to.
+    if (const auto attachment = state->objectStoreAttachment()) {
+        QJsonObject store;
+        store["storeUuid"] = QString::fromStdString(attachment->storeUuid);
+        store["writable"] = state->objectStoreSession()->writable(*attachment);
+        store["hosted"] = state->objectStoreSession()->hubStatus(*attachment).has_value();
+        result["objectStore"] = store;
+    } else {
+        result["objectStore"] = QJsonValue::Null;
     }
 
     // volume
@@ -231,200 +243,17 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 }
 
 
-QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
+QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& /*params*/)
 {
-    namespace fs = std::filesystem;
-
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const QString location = p.value("location").toString();
-    if (location.trimmed().isEmpty()) {
-        throw AgentBridgeError{
-            -32602,
-            "location must not be blank",
-            QJsonObject{{"param", "location"}},
-        };
-    }
-
-    const std::string input = location.toStdString();
-    if (vc::project::isLocationRemote(input)) {
-        throw AgentBridgeError{
-            -32007,
-            "Invalid segments location",
-            QJsonObject{
-                {"kind", "segment"},
-                {"detail", "remote segment locations are not supported"},
-            },
-        };
-    }
-
-    fs::path localPath =
-        vc::project::resolveLocalPath(input).lexically_normal();
-    while (localPath.has_relative_path() && localPath.filename().empty())
-        localPath = localPath.parent_path();
-    if (!localPath.is_absolute()) {
-        throw AgentBridgeError{
-            -32602,
-            "segment path must be absolute",
-            QJsonObject{{"param", "location"}},
-        };
-    }
-    const std::string normalizedLocation = localPath.string();
-
-    const std::string validationError = vc::project::validateLocation(
-        vc::project::Category::Segments, normalizedLocation);
-    if (!validationError.empty()) {
-        throw AgentBridgeError{
-            -32007,
-            "Invalid segments location",
-            QJsonObject{
-                {"kind", "segment"},
-                {"detail", QString::fromStdString(validationError)},
-            },
-        };
-    }
-
-    const bool select = p.value("select").toBool(true);
-    auto sourceIsSelected = [&](const std::string& persistedLocation) {
-        const fs::path selected =
-            vpkg->outputSegmentsPath().lexically_normal();
-        const fs::path source = vc::project::resolveLocalPath(
-            persistedLocation, vpkg->path().parent_path()).lexically_normal();
-        if (selected.empty())
-            return false;
-        std::error_code ec;
-        if (fs::equivalent(selected, source, ec))
-            return true;
-        return selected == source;
-    };
-    auto resultFor = [&](bool attached, const std::string& persistedLocation) {
-        return QJsonObject{
-            {"attached", attached},
-            {"alreadyAttached", !attached},
-            {"location", QString::fromStdString(persistedLocation)},
-            {"projectPath", QString::fromStdString(vpkg->path().string())},
-            {"selected", sourceIsSelected(persistedLocation)},
-        };
-    };
-
-    const auto existing =
-        vpkg->matchingSegmentsEntry(normalizedLocation);
-    const std::string persistedLocation =
-        existing ? existing->location : normalizedLocation;
-    const std::string sourceName = localPath.filename().string();
-    if (!existing) {
-        if (const auto conflict =
-                vpkg->matchingSegmentsEntryByDirectoryName(sourceName)) {
-            throw AgentBridgeError{
-                -32010,
-                "A segment source with the same directory name is already attached",
-                QJsonObject{
-                    {"sourceName", QString::fromStdString(sourceName)},
-                    {"existingLocation",
-                     QString::fromStdString(conflict->location)},
-                },
-            };
-        }
-    }
-
-    const bool selectionChanged =
-        select && !sourceIsSelected(persistedLocation);
-    const bool reloadSurfaces = !existing || selectionChanged;
-    if (reloadSurfaces && _window->_segmentationWidget &&
-        _window->_segmentationWidget->isEditingEnabled()) {
-        throw AgentBridgeError{
-            -32004,
-            "Cannot attach segments while editing",
-            QJsonObject{
-                {"detail",
-                 "disable segmentation editing before changing segment sources"},
-            },
-        };
-    }
-
-    std::vector<std::string> tags;
-    const QJsonArray tagValues = p.value("tags").toArray();
-    tags.reserve(tagValues.size());
-    for (const QJsonValue& tag : tagValues)
-        tags.push_back(tag.toString().toStdString());
-
-    VolumePkg::AttachSegmentsResult attachResult;
-    try {
-        attachResult = vpkg->attachSegmentsEntry(
-            normalizedLocation, std::move(tags), select);
-    } catch (const std::exception& error) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not attach segments",
-            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
-        };
-    }
-    if (reloadSurfaces) {
-        try {
-            _window->refreshCurrentVolumePackageUi();
-        } catch (const std::exception& error) {
-            Logger()->warn(
-                "Segment attachment committed, but the VC3D UI could not "
-                "refresh: {}",
-                error.what());
-        } catch (...) {
-            Logger()->warn(
-                "Segment attachment committed, but the VC3D UI could not "
-                "refresh");
-        }
-    }
-
-    const bool attached =
-        attachResult == VolumePkg::AttachSegmentsResult::Attached;
-    return resultFor(attached, persistedLocation);
-}
-
-
-QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const bool onlyLoaded = p.value("onlyLoaded").toBool(false);
-
-    // Loaded surface names live in CState; the on-disk segment ids come from the
-    // package. A segment is "loaded" when its id appears among CState surfaces.
-    const std::vector<std::string> loadedNames = state->surfaceNames();
-    const std::unordered_set<std::string> loadedSet(loadedNames.begin(), loadedNames.end());
-    const std::string activeId = state->activeSurfaceId();
-
+    auto& catalog = requireSurfaceCatalog(_window->_surfaceCatalog.get());
+    const std::string activeId = _window->_state ? _window->_state->activeSurfaceId() : std::string{};
     QJsonArray segments;
-    for (const std::string& id : vpkg->segmentationIDs()) {
-        const bool loaded = loadedSet.count(id) > 0;
-        if (onlyLoaded && !loaded)
-            continue;
-
-        QJsonObject seg;
-        seg["id"] = QString::fromStdString(id);
-
-        QString path;
-        try {
-            if (auto s = vpkg->segmentation(id))
-                path = QString::fromStdString(s->path().string());
-        } catch (...) {
-            // Metadata resolution may fail for a partially written segment; the
-            // id is still reportable without a path.
-        }
-        seg["path"] = path;
-        seg["loaded"] = loaded;
-        seg["active"] = (id == activeId);
-        segments.push_back(seg);
-    }
-
+    for (const auto& [uuid, row] : catalog.rows())
+        segments.push_back(surfaceRowJson(row, activeId));
     QJsonObject result;
     result["segments"] = segments;
+    // A listing is still being read: what is here may be partial.
+    result["loading"] = catalog.loading();
     return result;
 }
 
@@ -432,9 +261,9 @@ QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
 {
     CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state)
+        throw AgentBridgeError{-32000, "No state", {}};
+    (void)requireSurfaceCatalog(_window->_surfaceCatalog.get());
 
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
@@ -451,19 +280,6 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         data["detail"] = "surface panel is not available";
         throw AgentBridgeError{-32010, "Surface panel unavailable", data};
     }
-
-    // Resolve the path for the result's segment entry. Prefer the
-    // loaded CState surface (covers multi-folder display ids), fall back to the vpkg.
-    auto resolveSegPath = [&]() -> QString {
-        if (auto surf = state->surface(segmentId))
-            return QString::fromStdString(surf->path.string());
-        try {
-            if (auto s = vpkg->segmentation(segmentId))
-                return QString::fromStdString(s->path().string());
-        } catch (...) {
-        }
-        return QString();
-    };
 
     const std::string prevActive = state->activeSurfaceId();
     const QJsonValue previousSegmentId = prevActive.empty()
@@ -484,7 +300,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
                 data["detail"] = err;
                 throw AgentBridgeError{-32004, "Surface selection is locked", data};
             }
-            if (err.startsWith(QLatin1String("unknown segment"))) {
+            if (err.startsWith(QLatin1String("unknown surface"))) {
                 QJsonObject data;
                 data["kind"] = "segment";
                 data["id"] = segmentIdQ;
@@ -507,11 +323,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         }
     }
 
-    QJsonObject segment;
-    segment["id"] = segmentIdQ;
-    segment["path"] = resolveSegPath();
-    segment["loaded"] = true;
-    segment["active"] = true;
+    const QJsonObject segment = surfaceRowJson(*_window->_surfaceCatalog->row(segmentId), segmentId);
 
     QJsonObject result;
     result["activated"] = true;
@@ -561,6 +373,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
     } catch (const std::exception& error) {
         throw AgentBridgeError{-32000, QStringLiteral("Copy failed: %1").arg(QString::fromUtf8(error.what()))};
     }
+    catalog->readNow({copied});
     panel->activateSurfaceById(copied);
     return QJsonObject{
         {"created", true},
@@ -998,21 +811,6 @@ QJsonObject AgentBridgeServer::handleVolumeList(const QJsonValue&)
 }
 
 
-// The surface catalog row of `segmentId`, or -32007.
-static const SurfaceCatalog::Row& catalogRow(SurfaceCatalog* catalog, const QString& segmentIdQ)
-{
-    if (!catalog || !catalog->attachment())
-        throw AgentBridgeError{-32000, "No object store attached", {}};
-    const auto* row = catalog->row(segmentIdQ.toStdString());
-    if (!row) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
-    }
-    return *row;
-}
-
 QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
@@ -1032,7 +830,7 @@ QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
         data["detail"] = "cannot delete while editing";
         throw AgentBridgeError{-32004, "cannot delete while editing", data};
     }
-    (void)catalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    (void)writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
 
     SurfacePanelController* panel = _window->_surfacePanel.get();
     QString err;
@@ -1060,7 +858,7 @@ QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
         data["param"] = "newName";
         throw AgentBridgeError{-32602, "newName is required", data};
     }
-    const auto& row = catalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
     if (row.record.name == newName.toStdString()) {
         QJsonObject data;
         data["param"] = "newName";

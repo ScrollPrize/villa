@@ -19,6 +19,10 @@
 
 #include "agent_bridge/AgentBridgeError.hpp"       // AgentBridgeError
 #include "segmentation/tools/ManualAddTool.hpp"   // ManualAddTool enums
+#include "SurfaceCatalog.hpp"
+
+#include <QJsonArray>
+#include <nlohmann/json.hpp>
 
 inline QJsonObject vec3ToJson(const cv::Vec3f& v)
 {
@@ -126,4 +130,58 @@ inline QString interpolationModeToString(ManualAddTool::InterpolationMode mode)
     case ManualAddTool::InterpolationMode::TracerRestrictedToFill: return QStringLiteral("tracer_restricted_to_fill");
     }
     return QStringLiteral("thin_plate_spline");
+}
+
+// ---------------------------------------------------------------------------
+// Surfaces: the surface catalog's rows (the user's store and read-only
+// catalog stores of the open volume). Segment ids are store UUIDs.
+// ---------------------------------------------------------------------------
+
+// The listing, or -32000 without an attached store and open volume.
+inline SurfaceCatalog& requireSurfaceCatalog(SurfaceCatalog* catalog)
+{
+    if (!catalog || catalog->sources().empty())
+        throw AgentBridgeError{-32000, "No object store attached or no volume open", {}};
+    return *catalog;
+}
+
+// The row of `segmentId`, or -32007.
+inline const SurfaceCatalog::Row& catalogRow(SurfaceCatalog* catalog, const QString& segmentIdQ)
+{
+    const auto* row = requireSurfaceCatalog(catalog).row(segmentIdQ.toStdString());
+    if (!row) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = segmentIdQ;
+        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+    }
+    return *row;
+}
+
+// The row of a surface this session may change (in the user's store), or -32009.
+inline const SurfaceCatalog::Row& writableCatalogRow(SurfaceCatalog* catalog, const QString& segmentIdQ)
+{
+    const auto& row = catalogRow(catalog, segmentIdQ);
+    if (row.catalog) {
+        QJsonObject data;
+        data["id"] = segmentIdQ;
+        data["action"] = "segments.create_editable_copy";
+        data["detail"] = "catalog surfaces are read-only; make an editable copy first";
+        throw AgentBridgeError{-32009, "Cannot change a read-only catalog surface", data};
+    }
+    return row;
+}
+
+inline QJsonObject surfaceRowJson(const SurfaceCatalog::Row& row, const std::string& activeId)
+{
+    QJsonArray tags;
+    for (const auto& tag : row.record.tags) tags.append(QString::fromStdString(tag));
+    QJsonObject o;
+    o["id"] = QString::fromStdString(row.record.uuid);
+    o["name"] = QString::fromStdString(row.record.name);
+    o["tags"] = tags;
+    o["catalog"] = row.catalog;
+    o["bound"] = row.toVolume.has_value();
+    o["active"] = row.record.uuid == activeId;
+    return o;
 }

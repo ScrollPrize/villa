@@ -76,6 +76,9 @@ public:
     void setFetcher(Fetcher fetcher) { fetcher_ = std::move(fetcher); }
     // The work that fetches a catalog row's geometry; run it on a worker thread.
     std::function<void()> fetchJob(const std::string& uuid) const;
+    // Read these surfaces' rows now (synchronously), e.g. one just created,
+    // rather than waiting for the commit event.
+    void readNow(const std::vector<std::string>& uuids);
     // Session events (CState::objectStoreChanged); other attachments are ignored.
     void handle(const vc::objects::StoreSessionEvent& event);
 

@@ -131,7 +131,6 @@ private:
     QJsonObject handlePing(const QJsonValue& params);
     QJsonObject handleRpcDescribe(const QJsonValue& params);
     QJsonObject handleStateGet(const QJsonValue& params);
-    QJsonObject handleSegmentsAttach(const QJsonValue& params);
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
     QJsonObject handleSegmentsCreateEditableCopy(const QJsonValue& params);

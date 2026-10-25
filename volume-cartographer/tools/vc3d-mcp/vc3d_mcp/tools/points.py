@@ -286,17 +286,3 @@ async def vc3d_save_points_json(path: str) -> dict[str, Any]:
 async def vc3d_load_points_json(path: str) -> dict[str, Any]:
     """Load point collections from a JSON file. Returns {loaded: bool}."""
     return await _call("points.load_json", {"path": path})
-
-
-@mcp.tool()
-async def vc3d_save_points_segment_path(segment_path: str) -> dict[str, Any]:
-    """Save 2D-anchored correction points into a segment directory. Returns
-    {saved: bool}."""
-    return await _call("points.save_segment_path", {"segmentPath": segment_path})
-
-
-@mcp.tool()
-async def vc3d_load_points_segment_path(segment_path: str) -> dict[str, Any]:
-    """Load 2D-anchored correction points from a segment directory. Returns
-    {loaded: bool}."""
-    return await _call("points.load_segment_path", {"segmentPath": segment_path})

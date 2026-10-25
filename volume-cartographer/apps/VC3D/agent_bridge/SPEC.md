@@ -286,24 +286,24 @@ dialog.
 
 ### Segments and review state
 
-- `segments.attach` adds one absolute local tifxyz path to the open package.
-  The path may identify a segment or a directory of segments. Attachment uses
-  the same validation, persistence, and UI refresh as the GUI and is
-  idempotent by normalized location. It selects the attached segment source by
-  default; `select: false` preserves the current source. A source whose
-  directory name is already used case-insensitively by another attachment is
-  rejected because the VC3D source picker identifies entries by that name.
-- `segments.list` reports package segments, whether they are loaded, and the
-  active segment.
-- `segments.fetch` materializes an Open Data placeholder. Already-materialized
-  segments return synchronously; downloads return a `catalog` job.
+Segments are surfaces in the object stores the surface panel lists: the user's
+store (attached with `--object-store`) and, for an open Open Data volume, its
+sample's read-only catalog store. A segment id is the surface's store UUID.
+Methods on segments need an attached store and an open volume (-32000).
+
+- `segments.list` reports the listed surfaces: `id`, `name`, record `tags`,
+  `catalog` (read-only catalog store), `bound` (bound to the open volume) and
+  `active`; `loading` is true while a listing is still being read.
 - `segments.activate` validates before changing selection. Activating the
-  current segment is a no-op success. Placeholder materialization remains an
-  explicit fetch operation.
-- Delete and rename use dialog-free controller cores and preserve editing and
-  active-selection invariants.
-- `segments.review` derives review status and optional geometric/tag filters
-  without changing the current selection.
+  current segment is a no-op success. A catalog surface whose geometry is still
+  remote is fetched first (the call blocks while it downloads).
+- `segments.create_editable_copy` copies a catalog surface into the user's
+  store in the open volume's voxels (optional `name`), and activates the copy.
+- Delete (retire), rename and `tags.set` change the user's store and fail with
+  -32009 on catalog surfaces, as does enabling editing on one; the error's
+  `action` is `segments.create_editable_copy`.
+- `segments.review` derives review status from the record tags, with optional
+  tag filters, without changing the current selection.
 
 ### Canvas and viewers
 
@@ -412,7 +412,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_activate_segment` | `segments.activate` | Make a segment the active editing target (the programmatic equivalent of clicking it in the segment list). Required before `vc3d_enable_editing` / `vc3d_grow_segment` and after any segment switch. |
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
-| `vc3d_attach_segments` | `segments.attach` | Attach a local tifxyz segment, or a folder containing tifxyz segments, to the open volume package. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_atlas_open_result` | `atlas.open_result` |
 | `vc3d_atlas_open` | `atlas.open` |
@@ -431,14 +430,13 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_editable_segment_copy` | `segments.create_editable_copy` | Copy a fetched immutable Open Data catalog segment into the project's editable storage, attach it, and activate it. Idempotently reuses an existing copy. |
+| `vc3d_create_editable_segment_copy` | `segments.create_editable_copy` | Copy a read-only catalog (Open Data) surface into your object store as an editable surface and activate it. |
 | `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
-| `vc3d_delete_segment` | `segments.delete` | Delete a segment from disk. **Irreversible** — requires `confirm=true`. Fails while segmentation editing is enabled; deleting the active segment is allowed. |
+| `vc3d_delete_segment` | `segments.delete` | Retire a surface in your object store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on catalog surfaces. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
-| `vc3d_fetch_segment` | `segments.fetch` | Download ("materialize") an open-data placeholder segment so it can be activated/edited. Sync if already materialized; else a `"catalog"` job (`wait` defaults true). |
 | `vc3d_fiber_create_atlas` | `fiber.create_atlas` |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
@@ -470,10 +468,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_catalog_samples` | `catalog.list_samples` | List samples available to open from the Open Data catalog; use this for discovery when no volume package is loaded. |
 | `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package and the active workspace's selection. |
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
-| `vc3d_list_segments` | `segments.list` | List segments in the open volume package with loaded/active flags. |
+| `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and read-only catalog stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
 | `vc3d_load_points_json` | `points.load_json` |
-| `vc3d_load_points_segment_path` | `points.load_segment_path` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
@@ -490,7 +487,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
 | `vc3d_remove_point` | `points.remove_point` |
 | `vc3d_rename_point_collection` | `points.rename_collection` |
-| `vc3d_rename_segment` | `segments.rename` | Rename a segment (id + folder). `new_name` must match `^[a-zA-Z0-9_-]+$`, differ from the current name, and not collide. Fails while editing is enabled. |
+| `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails on catalog surfaces. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
 | `vc3d_reset_windings` | `points.reset_windings` |
@@ -498,7 +495,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_run_trace` | `tracer.run_trace` |
 | `vc3d_save_points_json` | `points.save_json` |
-| `vc3d_save_points_segment_path` | `points.save_segment_path` |
 | `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |

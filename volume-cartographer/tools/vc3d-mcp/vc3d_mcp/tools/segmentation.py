@@ -6,8 +6,7 @@ from typing import Any, Literal, Optional, TypedDict
 
 from mcp.server.fastmcp import Context
 
-from ..core import mcp, _call, _wait_for_job, _strip_none, _is_placeholder_error
-from ..bridge_client import BridgeError
+from ..core import mcp, _call, _wait_for_job, _strip_none
 
 
 class Point3D(TypedDict):
@@ -17,172 +16,82 @@ class Point3D(TypedDict):
 
 
 @mcp.tool()
-async def vc3d_attach_segments(
-    location: str,
-    tags: Optional[list[str]] = None,
-    select: bool = True,
+async def vc3d_list_segments() -> dict[str, Any]:
+    """List the surfaces of the open volume: your object store's and, for an
+    Open Data volume, the read-only catalog surfaces of its sample.
+
+    Each entry has "id" (the surface's store UUID, used by every other segment
+    tool), "name", record "tags", "catalog" (read-only catalog surface),
+    "bound" (bound to the open volume) and "active". "loading" is true while the
+    listing is still being read; retry for the complete list."""
+    return await _call("segments.list", {})
+
+
+@mcp.tool()
+async def vc3d_activate_segment(segment_id: str) -> dict[str, Any]:
+    """Make a surface the active editing target (the programmatic equivalent of
+    clicking it in the surface list). Required before vc3d_enable_editing /
+    vc3d_grow_segment and after any segment switch.
+
+    segment_id: a surface UUID as returned by vc3d_list_segments. A catalog
+    surface whose geometry is still remote is downloaded first (the call blocks
+    meanwhile)."""
+    return await _call("segments.activate", {"segmentId": segment_id})
+
+
+@mcp.tool()
+async def vc3d_create_editable_segment_copy(
+    segment_id: str, name: Optional[str] = None
 ) -> dict[str, Any]:
-    """Attach a local tifxyz segment, or a folder containing tifxyz segments,
-    to the open volume package.
+    """Copy a read-only catalog (Open Data) surface into your object store as an
+    editable surface, in the open volume's voxels, and activate the copy.
 
-    location must be an absolute path on the filesystem where VC3D runs. In a
-    containerized setup, use a path mounted into the VC3D container rather than
-    a host-only path. The directory may be one tifxyz segment with meta.json,
-    or a parent whose immediate subdirectories are tifxyz segments. Its
-    directory name must be unique, case-insensitively, among the project's
-    segment sources because the VC3D source picker identifies them by that
-    name.
+    Catalog surfaces cannot be edited, renamed, tagged or deleted. Call this when
+    vc3d_enable_editing, vc3d_rename_segment, vc3d_set_segment_tag or
+    vc3d_delete_segment report error -32009 with
+    action="segments.create_editable_copy".
 
-    tags are stored on a newly attached project entry. select defaults to true,
-    making this source the current segment directory so vc3d_list_segments can
-    discover its ids; pass select=false to register it without switching away
-    from the current source. Retrying the same location is an idempotent success
-    and keeps the existing entry and tags.
-    """
+    segment_id: a catalog surface UUID returned by vc3d_list_segments.
+    name: the copy's name (default: the catalog name + "_editable").
+
+    Returns {"created", "segmentId" (the copy's UUID), "sourceId", "name",
+    "activated"}. Errors: -32004 (editing is enabled), -32007 (unknown
+    surface), -32602 (already in your store), -32000 (copy failure)."""
     return await _call(
-        "segments.attach",
-        _strip_none({"location": location, "tags": tags, "select": select}),
+        "segments.create_editable_copy", _strip_none({"segmentId": segment_id, "name": name})
     )
 
 
 @mcp.tool()
-async def vc3d_list_segments(only_loaded: bool = False) -> dict[str, Any]:
-    """List segments in the open volume package with loaded/active flags."""
-    return await _call("segments.list", {"onlyLoaded": only_loaded})
-
-
-async def _fetch_segment_impl(
-    segment_id: str, wait: bool, ctx: Optional[Context] = None
-) -> dict[str, Any]:
-    """Fetch implementation shared by the vc3d_fetch_segment tool and the
-    auto-fetch path in vc3d_activate_segment. A plain (non-tool) coroutine so
-    the latter can forward progress through _wait_for_job without calling a
-    decorated tool."""
-    result = await _call("segments.fetch", {"segmentId": segment_id})
-    job_id = result.get("jobId") if isinstance(result, dict) else None
-    if not job_id:
-        return result  # synchronous: already materialized, nothing to wait on
-    return await _wait_for_job(job_id, wait, result, ctx)
-
-
-@mcp.tool()
-async def vc3d_fetch_segment(
-    segment_id: str, wait: bool = True, ctx: Optional[Context] = None
-) -> dict[str, Any]:
-    """Download ("materialize") an open-data placeholder segment so it can be
-    activated and edited.
-
-    Segments attached from the Open Data catalog are lazy placeholders that hold
-    only metadata until fetched -- vc3d_activate_segment on one fails with
-    "open-data placeholder; fetch it first". This runs the fetch, the
-    programmatic equivalent of the GUI's fetch-on-click.
-
-    If the segment is already materialized, returns immediately with
-    alreadyMaterialized=true. Otherwise the fetch runs as a "catalog"-source job:
-    wait defaults to true (block until the download finishes and the segment is
-    activatable); pass wait=false to get the jobId back immediately and poll
-    vc3d_job_status yourself.
-
-    segment_id: a segment id as returned by vc3d_list_segments.
-    """
-    return await _fetch_segment_impl(segment_id, wait, ctx)
-
-
-@mcp.tool()
-async def vc3d_activate_segment(
-    segment_id: str, auto_fetch: bool = True, ctx: Optional[Context] = None
-) -> dict[str, Any]:
-    """Make a segment the active editing target (the programmatic equivalent of
-    clicking it in the segment list). Required before vc3d_enable_editing /
-    vc3d_grow_segment and after any segment switch.
-
-    segment_id: a segment id as returned by vc3d_list_segments (including
-    folder-qualified display ids like "paths/foo").
-    auto_fetch: if true (default), when segment_id is an unfetched open-data
-    placeholder, transparently fetch it first (blocking, via vc3d_fetch_segment)
-    and then activate -- mirroring a GUI double-click, which fetches on click.
-    The result then carries fetched=true. Set auto_fetch=false to instead get
-    the raw "open-data placeholder; fetch it first" error without downloading.
-    """
-    try:
-        return await _call("segments.activate", {"segmentId": segment_id})
-    except BridgeError as exc:
-        if not (auto_fetch and _is_placeholder_error(exc)):
-            raise
-
-    # Placeholder + auto_fetch: fetch (blocking) then retry activation once.
-    fetch = await _fetch_segment_impl(segment_id, wait=True, ctx=ctx)
-    if fetch.get("waitTimedOut"):
-        return {"activated": False, "fetched": False, "fetch": fetch,
-                "detail": "segment fetch did not finish within the wait cap"}
-    state = fetch.get("state")
-    if state is not None and state != "succeeded":
-        return {"activated": False, "fetched": False, "fetch": fetch,
-                "detail": f"segment fetch did not succeed (state={state})"}
-
-    result = await _call("segments.activate", {"segmentId": segment_id})
-    result["fetched"] = True
-    return result
-
-
-@mcp.tool()
-async def vc3d_create_editable_segment_copy(segment_id: str) -> dict[str, Any]:
-    """Copy a fetched, immutable Open Data catalog segment into the project's
-    editable segment directory, attach it to the project, and activate it.
-
-    Open Data catalog files are shared cache objects and cannot safely be
-    edited or renamed in place. Call this after vc3d_fetch_segment when
-    vc3d_enable_editing or vc3d_rename_segment reports error -32009 with
-    action="segments.create_editable_copy". Retrying is idempotent: an existing
-    editable copy is reused and activated instead of copied again.
-
-    segment_id: a fetched catalog segment id returned by vc3d_list_segments.
-
-    Returns the source and editable paths plus created/alreadyExisted and
-    activated flags. Errors: -32004 (editing is enabled), -32007 (unknown
-    segment), -32009 (not a fetched catalog segment), -32005/-32010 (copy,
-    persistence, or activation failure).
-    """
-    return await _call("segments.create_editable_copy", {"segmentId": segment_id})
-
-
-@mcp.tool()
 async def vc3d_delete_segment(segment_id: str, confirm: bool = False) -> dict[str, Any]:
-    """Permanently delete a segment from the open volume package, removing it
-    from the surface panel AND deleting its files on disk.
+    """Retire a surface in your object store: it leaves the surface list (the
+    store's history keeps it).
 
-    IRREVERSIBLE: this deletes the segment's on-disk data. You MUST pass
-    confirm=True to actually delete; the default confirm=False is rejected
-    -32602 ({param:"confirm"}) as a safety guard. Deleting the active segment is
-    allowed (the active slot is cleared first), but deletion is refused while
+    You MUST pass confirm=True; the default confirm=False is rejected -32602
+    ({param:"confirm"}) as a safety guard. Deleting the active surface is allowed
+    (the active slot is cleared first), but deletion is refused while
     segmentation editing mode is enabled -- turn it off with
-    vc3d_enable_editing(False) first.
+    vc3d_enable_editing(False) first -- and for read-only catalog surfaces.
 
-    segment_id: a segment id as returned by vc3d_list_segments.
-    confirm: must be True to proceed (guards against accidental data loss).
+    segment_id: a surface UUID as returned by vc3d_list_segments.
+    confirm: must be True to proceed.
 
     Returns {"deleted": [segmentId]}. Errors: -32602 (confirm not True),
-    -32007 (unknown segment), -32004/-32010 (cannot delete while editing)."""
+    -32007 (unknown surface), -32009 (catalog surface), -32004/-32010 (cannot
+    delete while editing)."""
     return await _call("segments.delete", {"segmentId": segment_id, "confirm": confirm})
 
 
 @mcp.tool()
 async def vc3d_rename_segment(segment_id: str, new_name: str) -> dict[str, Any]:
-    """Rename a segment (its id and on-disk directory), the headless twin of the
-    surface panel's rename action.
+    """Rename a surface in your object store, the headless twin of the surface
+    panel's rename action. The UUID (its identity) stays.
 
-    new_name must match ^[a-zA-Z0-9_-]+$ (letters, digits, underscore, hyphen)
-    and must not collide with an existing segment. Renaming is refused while
-    segmentation editing mode is enabled -- turn it off with
-    vc3d_enable_editing(False) first. On any failure the on-disk state is rolled
-    back so the segment is left intact.
+    segment_id: a surface UUID as returned by vc3d_list_segments.
+    new_name: the new name; it must differ from the current one.
 
-    segment_id: a segment id as returned by vc3d_list_segments.
-    new_name: the desired new id/name.
-
-    Returns {"oldId", "newId"}. Errors: -32602 (invalid new_name), -32007
-    (unknown segment), -32010 (target name already exists / cannot rename while
-    editing)."""
+    Returns {"id", "name"}. Errors: -32602 (blank or unchanged new_name), -32007
+    (unknown surface), -32009 (catalog surface), -32010 (store refused the edit)."""
     return await _call("segments.rename", {"segmentId": segment_id, "newName": new_name})
 
 
@@ -289,10 +198,10 @@ async def vc3d_set_segment_tag(
     tag: Literal["approved", "defective", "reviewed", "inspect"],
     enabled: bool,
 ) -> dict[str, Any]:
-    """Set (or clear) a review tag on a segment. tag is one of
+    """Set (or clear) a review tag on a surface: a record tag of the surface in
+    your object store (catalog surfaces are read-only, -32009). tag is one of
     "approved" | "defective" | "reviewed" | "inspect" (there is no "revisit"
-    tag). As a documented side effect this selects segment_id in the surface
-    panel. Returns {"segmentId", "tag", "enabled"}."""
+    tag). Returns {"segmentId", "tag", "enabled"}."""
     return await _call(
         "tags.set", {"segmentId": segment_id, "tag": tag, "enabled": enabled}
     )

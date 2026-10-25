@@ -18,6 +18,40 @@ struct Listing {
     // The surfaces read: those missing from rows left the listing.
     std::optional<std::vector<std::string>> requested;
 };
+
+// The rows of `requested` (all when nullopt) in each listed source.
+Listing list(ObjectStoreSession& session, const std::vector<SurfaceCatalog::Source>& listed,
+             const std::optional<AttachmentIdentity>& user, const std::optional<std::vector<std::string>>& requested,
+             const std::atomic_bool& cancel)
+{
+    Listing listing;
+    listing.requested = requested;
+    for (const auto& source : listed) {
+        const bool catalog = source.attachment != user;
+        session.read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
+            ObjectSelection selection;
+            selection.kind = "surface";
+            selection.volume = source.volume;
+            // Catalog stores list only what they hold for this volume.
+            selection.includeUnbound = !catalog;
+            if (requested) {
+                if (requested->empty()) return;
+                selection.uuids = *requested;
+            }
+            for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
+                if (cancel.load() || cancelled.load()) return;
+                SurfaceCatalog::Row row;
+                row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), source.volume);
+                if (row.toVolume) *row.toVolume *= source.scale;
+                row.record = std::move(record);
+                row.source = source;
+                row.catalog = catalog;
+                listing.rows.push_back(std::move(row));
+            }
+        });
+    }
+    return listing;
+}
 }
 
 SurfaceCatalog::SurfaceCatalog(std::shared_ptr<ObjectStoreSession> session, QObject* parent)
@@ -43,6 +77,15 @@ void SurfaceCatalog::setCatalogSources(std::vector<Source> sources)
     if (catalogSources_ == sources) return;
     catalogSources_ = std::move(sources);
     restart();
+}
+
+void SurfaceCatalog::readNow(const std::vector<std::string>& uuids)
+{
+    const std::atomic_bool notCancelled{false};
+    auto listing = list(*session_, sources(), attachment_, uuids, notCancelled);
+    for (const auto& uuid : uuids) rows_.erase(uuid);
+    for (auto& row : listing.rows) rows_[row.record.uuid] = std::move(row);
+    emit rowsChanged();
 }
 
 std::function<void()> SurfaceCatalog::fetchJob(const std::string& uuid) const
@@ -124,33 +167,7 @@ void SurfaceCatalog::schedule()
     cancelled_ = std::make_shared<std::atomic_bool>(false);
     vc3d::store::background<Listing>(this,
         [session = session_, listed, user = attachment_, requested, cancel = cancelled_]() {
-            Listing listing;
-            listing.requested = requested;
-            for (const auto& source : listed) {
-                const bool catalog = source.attachment != user;
-                session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
-                    ObjectSelection selection;
-                    selection.kind = "surface";
-                    selection.volume = source.volume;
-                    // Catalog stores list only what they hold for this volume.
-                    selection.includeUnbound = !catalog;
-                    if (requested) {
-                        if (requested->empty()) return;
-                        selection.uuids = *requested;
-                    }
-                    for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
-                        if (cancel->load() || cancelled.load()) return;
-                        SurfaceCatalog::Row row;
-                        row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), source.volume);
-                        if (row.toVolume) *row.toVolume *= source.scale;
-                        row.record = std::move(record);
-                        row.source = source;
-                        row.catalog = catalog;
-                        listing.rows.push_back(std::move(row));
-                    }
-                });
-            }
-            return listing;
+            return list(*session, listed, user, requested, *cancel);
         },
         [this, generation = generation_, requested](vc3d::store::Outcome<Listing> result) {
             if (generation != generation_) return;

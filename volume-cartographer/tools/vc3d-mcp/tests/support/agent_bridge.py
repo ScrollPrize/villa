@@ -32,10 +32,6 @@ class FakeAgentBridgeServer:
         self._job_kinds: dict[str, str] = {}
         # job_id -> live record answered by job.status (state grows to terminal).
         self._jobs: dict[str, dict] = {}
-        # Segments that have been materialized (fetched). "seg-ph" starts as an
-        # unfetched open-data placeholder; fetching it adds it here so a
-        # subsequent segments.activate succeeds -- the fetch+retry compose.
-        self._fetched: set[str] = set()
         # Per-plane rotation state for viewer.rotate (mirrors the C++ controller's
         # _segXZRotationDeg / _segYZRotationDeg members).
         self._rotation: dict[str, float] = {}
@@ -202,63 +198,20 @@ class FakeAgentBridgeServer:
             self._start_job(job_id)
         elif method == "segments.activate":
             seg = params.get("segmentId")
-            if seg == "seg-ready" or seg in self._fetched:
+            if seg == "seg-ready":
                 await self._reply(
                     writer, req_id,
                     result={"activated": True,
-                            "segment": {"id": seg, "loaded": True, "active": True},
+                            "segment": {"id": seg, "name": seg, "tags": [], "catalog": False,
+                                        "bound": True, "active": True},
                             "previousSegmentId": None, "alreadyActive": False},
                 )
-            elif seg == "seg-ph":
-                await self._reply(
-                    writer, req_id,
-                    error={"code": -32005, "message": "Segment could not be activated",
-                           "data": {"detail": f"segment {seg} is an open-data "
-                                              "placeholder; fetch it first"}},
-                )
             else:
                 await self._reply(
                     writer, req_id,
                     error={"code": -32007, "message": "Segment not found",
                            "data": {"kind": "segment", "id": seg}},
                 )
-        elif method == "segments.fetch":
-            seg = params.get("segmentId")
-            if seg == "seg-ready" or seg in self._fetched:
-                await self._reply(
-                    writer, req_id,
-                    result={"fetched": True, "alreadyMaterialized": True,
-                            "segment": {"id": seg, "placeholder": False}},
-                )
-            elif seg == "seg-ph":
-                job_id = "job-3"
-                self._job_kinds[job_id] = "segments.fetch"
-                self._fetched.add(seg)  # materialized once the fetch is requested
-                await self._reply(
-                    writer, req_id,
-                    result={"jobId": job_id, "source": "catalog", "fetched": False,
-                            "alreadyMaterialized": False,
-                            "segment": {"id": seg, "placeholder": True}},
-                )
-                self._start_job(job_id)
-            else:
-                await self._reply(
-                    writer, req_id,
-                    error={"code": -32007, "message": "Segment not found",
-                           "data": {"kind": "segment", "id": seg}},
-                )
-        elif method == "segments.attach":
-            await self._reply(
-                writer,
-                req_id,
-                result={
-                    "attached": True,
-                    "alreadyAttached": False,
-                    "location": params.get("location"),
-                    "projectPath": "/tmp/project.volpkg.json",
-                    "selected": params.get("select", True),
-                },
-            )
         elif method == "viewer.rotate":
             plane = params.get("plane")
             norm = {"xz": "seg xz", "yz": "seg yz",
@@ -438,8 +391,7 @@ class FakeAgentBridgeServer:
                            "data": {"param": "confirm",
                                     "reason": "destructive; pass confirm=true"}},
                 )
-            elif seg in ("seg-ready", "seg-ph") or seg in self._fetched:
-                self._fetched.discard(seg)
+            elif seg == "seg-ready":
                 await self._reply(writer, req_id, result={"deleted": [seg]})
             else:
                 await self._reply(
@@ -451,7 +403,7 @@ class FakeAgentBridgeServer:
             seg = params.get("segmentId")
             new_name = params.get("newName")
             await self._reply(
-                writer, req_id, result={"oldId": seg, "newId": new_name},
+                writer, req_id, result={"id": seg, "name": new_name},
             )
         elif method == "segments.create_editable_copy":
             seg = params.get("segmentId")
@@ -460,10 +412,9 @@ class FakeAgentBridgeServer:
                 req_id,
                 result={
                     "created": True,
-                    "alreadyExisted": False,
-                    "segmentId": seg,
-                    "sourcePath": f"/catalog/{seg}",
-                    "path": f"/project/paths/{seg}",
+                    "segmentId": f"{seg}-copy",
+                    "sourceId": seg,
+                    "name": params.get("name", f"{seg}_editable"),
                     "activated": True,
                 },
             )

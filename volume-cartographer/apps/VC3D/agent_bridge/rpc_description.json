@@ -2827,9 +2827,6 @@
         -32005
       ],
       "mcp": {
-        "extraParams": [
-          "auto_fetch"
-        ],
         "paramRenames": {
           "segmentId": "segment_id"
         },
@@ -2843,40 +2840,6 @@
         },
         "required": [
           "segmentId"
-        ],
-        "type": "object"
-      }
-    },
-    "segments.attach": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32007,
-        -32005,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_attach_segments"
-      },
-      "params": {
-        "properties": {
-          "location": {
-            "type": "string"
-          },
-          "select": {
-            "default": true,
-            "type": "boolean"
-          },
-          "tags": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "location"
         ],
         "type": "object"
       }
@@ -2899,6 +2862,9 @@
       },
       "params": {
         "properties": {
+          "name": {
+            "type": "string"
+          },
           "segmentId": {
             "type": "string"
           }
@@ -2945,18 +2911,10 @@
         -32000
       ],
       "mcp": {
-        "paramRenames": {
-          "onlyLoaded": "only_loaded"
-        },
         "tool": "vc3d_list_segments"
       },
       "params": {
-        "properties": {
-          "onlyLoaded": {
-            "default": false,
-            "type": "boolean"
-          }
-        },
+        "properties": {},
         "type": "object"
       }
     },
@@ -2997,9 +2955,6 @@
         -32000
       ],
       "mcp": {
-        "paramRenames": {
-          "onlyLoaded": "only_loaded"
-        },
         "tool": "vc3d_review_segments"
       },
       "params": {
@@ -3029,10 +2984,6 @@
               }
             },
             "type": "object"
-          },
-          "onlyLoaded": {
-            "default": false,
-            "type": "boolean"
           }
         },
         "type": "object"

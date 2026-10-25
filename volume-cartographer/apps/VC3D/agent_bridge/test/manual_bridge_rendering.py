@@ -308,22 +308,21 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         return
 
     # --- Real, bounded, in-process ABF++ flatten of a pre-existing segment. It
-    # runs on a QtConcurrent worker (no subprocess), needs no external tool and
-    # no current volume, and writes <segment>_abf into the volpkg. A high
-    # downsampleFactor + low iterations keeps it bounded. Proves the full
-    # launch->job->flattenJobFinished->disk path with dialogs suppressed. ---
-    out_dir = None
+    # runs on a QtConcurrent worker (no subprocess), needs no external tool,
+    # and creates a new surface in the object store. A high downsampleFactor +
+    # low iterations keeps it bounded. Proves the full
+    # launch->job->flattenJobFinished->store path with dialogs suppressed. ---
+    created = None
     job_id = None
     started_at = time.monotonic()
     r = call_checked("flatten.abf (started)", "flatten.abf",
                      {"segmentId": target, "iterations": 3, "downsampleFactor": 4})
     if r is not None:
         job_id = r.get("jobId")
-        out_dir = r.get("outputDir")
-        rec.step("flatten.abf result shape {jobId,kind,source,outputDir}",
+        rec.step("flatten.abf result shape {jobId,kind,source,outputName}",
                  job_id is not None and r.get("kind") == "flatten.abf"
                  and r.get("source") == "flatten"
-                 and isinstance(r.get("outputDir"), str) and bool(r.get("outputDir")),
+                 and isinstance(r.get("outputName"), str) and bool(r.get("outputName")),
                  json.dumps(r))
 
     if job_id:
@@ -358,22 +357,19 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         rec.step("flatten.abf (completed within timeout)",
                  last_state in ("succeeded", "failed"),
                  f"final_state={last_state} elapsed={elapsed:.1f}s")
-        if last_state == "succeeded" and out_dir:
-            out_path = Path(out_dir)
-            meta = out_path / "meta.json"
-            rec.step("flatten.abf produced a real tifxyz surface on disk",
-                     out_path.is_dir() and meta.is_file(),
-                     f"outputDir={out_dir} exists={out_path.is_dir()} "
-                     f"meta.json={meta.is_file()}")
+        if last_state == "succeeded":
+            # The finished job names the new surface by its store UUID.
+            created = (st or {}).get("outputPath")
+            listed = call_checked("segments.list after flatten.abf", "segments.list") or {}
+            ids = [segment.get("id") for segment in listed.get("segments", [])]
+            rec.step("flatten.abf created a surface in the object store",
+                     bool(created) and created in ids,
+                     f"outputPath={created} listed={created in ids}")
         elif last_state == "failed":
             rec.step("flatten.abf real flatten outcome", False,
                      f"job failed: {st.get('message') if st else '?'}")
 
-    # Clean up the produced surface so the fixture tree is left untouched. Only
-    # remove a path we know we created (endswith _abf, inside the volpkg).
-    if out_dir and out_dir.endswith("_abf") and Path(out_dir).is_dir():
-        try:
-            import shutil
-            shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            pass
+    # Retire the surface this check created so the store's listing is left as it was.
+    if created:
+        call_checked("segments.delete flatten.abf output", "segments.delete",
+                     {"segmentId": created, "confirm": True})
