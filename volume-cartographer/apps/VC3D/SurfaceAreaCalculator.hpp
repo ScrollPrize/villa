@@ -15,8 +15,9 @@ struct AreaResult {
 
 namespace SurfaceAreaCalculator {
 
-// Area of each surface's valid quads in the current volume's voxels, recorded
-// in its record meta (area_vx2, and area_cm2 when the voxel size is known).
+// Area of each surface's valid quads, recorded in its record meta: area_vx2 in
+// voxels of the volume the surface is bound to, and area_cm2 (from the current
+// volume's voxel size, when known).
 std::vector<AreaResult> calculateAreas(SurfaceCatalog& catalog, const std::vector<std::string>& ids);
 
 } // namespace SurfaceAreaCalculator

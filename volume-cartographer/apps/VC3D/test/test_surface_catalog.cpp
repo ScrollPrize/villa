@@ -2,6 +2,8 @@
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
 #include "SurfaceCatalog.hpp"
+#include "SurfaceAreaCalculator.hpp"
+#include "vc/core/util/SurfaceArea.hpp"
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
 #include "vc/core/PointCollections.hpp"
@@ -216,6 +218,15 @@ int main(int argc, char** argv)
             db.registerVolumeTransform(txn,"vol2","vol1",affine,"registered scan",registration);
         });
         pump([&]{return catalog.row(other)&&catalog.row(other)->mapping.has_value();},"registration commits refresh compatible surfaces");
+        {
+            // Area: area_vx2 in the bound volume's voxels (vol2: the 2x2 unit grid),
+            // area_cm2 physical from the open volume, where the shear doubles x.
+            const auto areas=SurfaceAreaCalculator::calculateAreas(catalog,{other});
+            require(areas.size()==1&&areas.front().success&&areas.front().areaVx2==4.0,
+                    "area_vx2 is measured in the bound volume's voxels");
+            require(std::abs(vc::surface::computeSurfaceAreaVox2(*catalog.open(other).surface)-8.0)<1e-9,
+                    "the open volume sees the sheared area");
+        }
         auto registered=catalog.open(other);
         require((*registered.surface->rawPointsPtr())(2,1)==cv::Vec3f(13,2,21),"surface uses the store's affine view");
         SurfaceStoreEdit registeredEdit(session,registered.pin,registered.view);
