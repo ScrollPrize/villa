@@ -9,6 +9,7 @@ Which card to rent for surface prediction, training and lasagna, what it cost us
 | Surface prediction (`vesuvius.predict`, m7) | RTX PRO 6000 for the lowest cost; H200 for the shortest single run | Both measured on the same box: RTX PRO 6000 26,936 patches per USD, H200 18,997, H200 1.28x faster per patch |
 | nnU-Net training | H200 | 1.55 to 1.60x faster than an RTX PRO 6000 at batch 4 to 8, for 1.13 to 1.18x the cost per sample |
 | lasagna `predict3d` | RTX PRO 6000 | 33 to 69 M read voxels per second across ten jobs, about 2.5 to 5 min per 10 G voxels |
+| lasagna on a card you already have | Any 8 GB GPU | 5.6 GB peak at the default tile, 2.3 GB at `--tile-size 128`; slow (about 2 M voxels per second on an L4), see [lasagna on a small card](#lasagna-on-a-small-card) |
 | B300 | Only for compute-bound training | On m7 surface prediction a B300 was 38% busy and no faster than an H200 (0.0391 vs 0.0379 s per patch) at a higher price |
 | One model trained across several GPUs | H200 or B300 | They have NVLink; the RTX PRO 6000 is PCIe only (NVIDIA spec pages) |
 | Small checks, embeddings | L4 | 6 to 8x slower than the cards above on m7, but the cheapest per hour |
@@ -47,6 +48,24 @@ The m7 nnU-Net (published plans, `3d_fullres`, 192^3 patch, fresh weights), fp16
 | 8 | 0.783 | 1.253 | 1.60x | 70.1 / 87.6 |
 
 At batch 8 the RTX PRO 6000 logged an allocator out-of-memory warning and still finished; it is close to the card's limit there. Training is where a faster card pays: the H200's lead grows with batch size, while on inference it was only 1.28x.
+
+## lasagna on a small card
+
+lasagna `predict3d` does not need a big card. On an L4 its peak GPU memory was 5.6 GB at the default tile size (192) and 2.3 GB at `--tile-size 128`, so any 8 GB card runs it. What it costs on a small card is time: about 2 M requested voxels per second at the default, so roughly 10 minutes per cm³ of a 9.4 µm scan (arithmetic, before the margin effect below).
+
+![Wall time and peak GPU memory of lasagna predict3d on one L4 at tile sizes 128, 192 and 256](images/gpu_guide_lasagna_small.png)
+
+| `predict3d` on one L4, 537 M voxel box | Wall time | M voxels per second | Peak GPU memory | Peak host memory |
+| --- | ---: | ---: | ---: | ---: |
+| `--tile-size 128` | 445 s | 1.21 | 2.3 GB | 4.0 GB |
+| default (tile 192) | 273 s | 1.97 | 5.6 GB | 5.0 GB |
+| `--tile-size 256` | 204 s | 2.63 | about 10 GB (network alone) | not recorded |
+
+Tile 256 is 1.35x faster but does not write the same field: against the default run only half of the cos voxels were within 1 of 255 (mean difference 3.3). Tile 128 we did not compare. If you need the published field, keep the default tile and accept the time.
+
+Where the time goes: the GPU was 92 to 100% busy for 93% of the run, so a faster CPU or disk will not help. Most of the GPU work is repeated. With the default `--overlap 64` the tile stride is 128, so every voxel goes through the network about 3.4 times, and on a small box the tiles around its edge add about 2.3x more. Run whole scans or large boxes in one go rather than many small ones.
+
+On a Mac (M1 Pro, 16 GB, MPS, fp16) the lasagna network alone took 0.83 s per 128³ tile and 3.03 s per 192³ tile. On that Mac's CPU a 192³ tile was killed by macOS for memory, so use MPS or `--tile-size 128`.
 
 ## Mistakes that cost us the most GPU time
 
@@ -113,4 +132,5 @@ From NVIDIA's [RTX PRO 6000 Blackwell Server Edition](https://www.nvidia.com/en-
 - Surface prediction: one run per card and batch size on the box above. Seconds per patch is the full 512-patch run minus a 16-patch start-up run, over the 496 patches between them. Modal runs on 12 Oct 2026 (16 cores, 64 GiB); HF runs on 23 Oct 2026. Torch 2.14.1 with CUDA 13.2 on all cards. Different days and machines, so treat small gaps (under about 5%) as ties.
 - Training: steps timed after warm-up on HF Jobs, 23 Oct 2026, the same torch build.
 - lasagna: villa `lasagna/` at `db3dbea2`, `scrollprize/lasagna` `model_current.pt`, tile 192, ten HF RTX PRO 6000 jobs on ten different scans, 23 Oct 2026, read-box voxels over `predict3d` seconds; set-up was 140 to 165 s per job.
+- lasagna on a small card: villa `lasagna/` at `db3dbea2` (before #2283 changed `predict3d`'s GPU handling; not re-measured on current main), `scrollprize/lasagna`, HF Jobs L4 (8 vCPU), 25 Oct 2026, one box of PHerc0139 (z 9600, y 2816, x 2816, 512 x 1024 x 1024) with the CT copied to local disk first. Tile 128 and 192 in one job, tile 256 in a second job on the same box; peak GPU memory as nvidia-smi reports it. Utilization from nvidia-smi sampled during a separate profiled run. The Mac numbers are the network alone on random input, not a full `predict3d` run.
 - Not measured: the B300 against the H200 on the same training step; a whole training run on HF; packed multi-GPU machines (the split chart uses separate jobs); `--chunk_cache_mb` against a local copy.
