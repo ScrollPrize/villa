@@ -23,15 +23,13 @@ DEFAULT_VC3D_BIN = REPO_ROOT / "build-macos" / "bin" / "VC3D"
 #   {
 #     "name": "s1_2um_ds2",
 #     "volumes": ["volume-cartographer/test-data/s1_ds2.volpkg/volumes"],
-#     "segments": ["volume-cartographer/test-data/s1_ds2.volpkg/traces"],
-#     "output_segments": "volume-cartographer/test-data/s1_ds2.volpkg/traces",
 #     "normal_grids": ["volume-cartographer/test-data/s1_ds2.volpkg/normalgrids_2um_ds2"],
 #     "lasagna_datasets": [],
 #     "version": 1
 #   }
 # (paths are relative to the monorepo root, i.e. REPO_ROOT.parent). S3_VOLPKG_JSON
-# follows the same schema but points "volumes" at an s3:// URI and "segments" at
-# test-data/PHercParis4_neural_tracing.volpkg/segments/... dirs.
+# follows the same schema but points "volumes" at an s3:// URI. Surfaces come
+# from the object store attached with --object-store, not the project file.
 LOCAL_VOLPKG_JSON = Path(
     os.environ.get("VC3D_TEST_LOCAL_VOLPKG", str(REPO_ROOT.parent / "test.volpkg.json"))
 )

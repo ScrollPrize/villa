@@ -498,7 +498,7 @@ def check_project_create(
                 "location": str(volume),
                 "tags": ["source:smoke"],
             }
-            and document.get("segments") == []
+            and "segments" not in document
             and document.get("normal_grids") == []
             and document.get("lasagna_datasets") == []
             and after.get("vpkg") == before.get("vpkg")
