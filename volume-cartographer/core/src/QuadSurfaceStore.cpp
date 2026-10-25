@@ -190,21 +190,18 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
 
 vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
 {
-    auto* points = surface.rawPointsPtr();
-    vc::objects::GeometryData data;
-    data.kind = "surface";
-    data.attributes = nlohmann::json{{"scale", {surface._scale[0], surface._scale[1]}}}.dump();
-    cv::Mat_<cv::Vec3f> stored = points->clone();
-    for (auto& p : stored) if (!usable(p)) p = kInvalid;
-    GeometryArray xyz{"points", "<f4", {stored.rows, stored.cols, 3}, {}};
-    xyz.bytes.assign(stored.datastart, stored.dataend);
-    data.arrays.push_back(std::move(xyz));
+    const auto& points = *surface.rawPointsPtr();
+    vc::geometry::Surface geometry{points.rows, points.cols, {surface._scale[0], surface._scale[1]}, {}};
+    geometry.points.reserve(points.total());
+    for (const auto& p : points)
+        geometry.points.push_back(usable(p) ? vc::geometry::SurfacePoint{p[0], p[1], p[2]} : vc::geometry::SurfacePoint{-1, -1, -1});
     for (const auto& name : surface.channelNames()) {
         const auto channel = surface.channel(name, SURF_CHANNEL_NORESIZE);
         if (channel.empty()) continue;
-        data.arrays.push_back(name == "mask" ? validFromMask(channel, stored.rows, stored.cols) : arrayFromMat(name, channel));
+        if (name == "mask") geometry.validity = validFromMask(channel, points.rows, points.cols).bytes;
+        else geometry.channels.push_back(arrayFromMat(name, channel));
     }
-    return data;
+    return vc::geometry::encode(geometry);
 }
 
 std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
