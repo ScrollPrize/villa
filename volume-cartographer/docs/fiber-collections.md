@@ -165,3 +165,9 @@ VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
 Use fresh settings for the default-limit assertion. The check prints attachment,
 first-page and selected-fiber timings and verifies UI heartbeats, deferred line
 geometry, bounded catalog pages, and clearing runtime identities on detach.
+It also dispatches 20 status-only hub events against the loaded catalog and
+reports mean, median and p95 time until the catalog is ready, plus catalog,
+fiber-refresh and selection-reset counts. These events must preserve selection
+and warm fiber snapshots without reloading geometry. Use a local replica when
+testing a hosted store. This measures notification handling, not rendering FPS;
+the regular smoke test separately checks that actual commits refresh the views.

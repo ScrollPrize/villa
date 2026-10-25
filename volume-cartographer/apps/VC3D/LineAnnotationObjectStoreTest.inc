@@ -12,6 +12,43 @@ int runObjectStoreControllerTests()
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::util::newUuid()+".vcobj");
+    auto checkHubStatus = [&](CState& state, Controller& controller,
+                              FiberCollectionController& collection,
+                              const std::function<bool()>& catalogReady) {
+        const auto generation = controller._fiberDataGeneration;
+        const auto snapshots = controller._sideStripStoredSnapshotCache.size();
+        int catalogUpdates = 0, fiberUpdates = 0, selectionResets = 0;
+        QObject observer;
+        QObject::connect(&collection, &FiberCollectionController::catalogChanged, &observer,
+            [&](const auto&, bool) { ++catalogUpdates; });
+        QObject::connect(&collection, &FiberCollectionController::selectionChanged, &observer,
+            [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
+        QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
+        std::vector<double> elapsedMs;
+        for (int i = 0; i < 20; ++i) {
+            QElapsedTimer timer; timer.start();
+            state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
+                *state.objectStoreSession()->attachment(), 0, {}});
+            QApplication::processEvents();
+            while (!catalogReady() && timer.elapsed() < 10000) {
+                QApplication::processEvents(); QThread::msleep(1);
+            }
+            require(catalogReady(), "hub status test catalog settles");
+            elapsedMs.push_back(timer.nsecsElapsed() / 1.e6);
+        }
+        std::sort(elapsedMs.begin(), elapsedMs.end());
+        double total = 0;
+        for (const auto ms : elapsedMs) total += ms;
+        std::cout << "hub status events=20 mean_ms=" << total / elapsedMs.size()
+                  << " median_ms=" << (elapsedMs[9] + elapsedMs[10]) / 2
+                  << " p95_ms=" << elapsedMs[18] << " catalog_updates=" << catalogUpdates
+                  << " fiber_updates=" << fiberUpdates << " selection_resets=" << selectionResets << std::endl;
+        require(catalogUpdates == 0 && fiberUpdates == 0 && selectionResets == 0,
+                "hub status does not reload the catalog, redraw fibers or clear selection");
+        require(controller._fiberDataGeneration == generation &&
+                controller._sideStripStoredSnapshotCache.size() == snapshots,
+                "hub status preserves fiber generation and warm snapshots");
+    };
     try {
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
@@ -42,6 +79,9 @@ int runObjectStoreControllerTests()
             require(selected->linePointsLoaded, "selected line decodes on demand");
             std::cout << "read-only attach_ms=" << attachedMs << " first_page_ms=" << pageMs
                       << " selected_ms=" << timer.elapsed()-pageMs << " heartbeats=" << heartbeats << std::endl;
+            require(!controller.fiberSnapshotsForSideStripQuery({*selected}).empty(), "warm real fiber snapshot");
+            collection.selectFiber(id, false, false);
+            checkHubStatus(state, controller, collection, [&] { return !page.empty(); });
             state.detachObjectStore();
             require(controller.fiberUuidForId(id).empty() && !controller.readStoredFiber(id), "detach clears runtime identities");
             return 0;
@@ -122,6 +162,9 @@ int runObjectStoreControllerTests()
             require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.toVolume.has_value(); }),
                     "fibers without a binding list without a volume length");
         }
+        require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
+        collection.selectFiber(a.id, false, false);
+        checkHubStatus(state, controller, collection, [&] { return catalog.size() == 2; });
         const auto transferPaths = controller.fiberTransportPaths({a.id});
         require(transferPaths.size() == 2, "transport includes both linked endpoints");
         auto readDocument = [](const auto& file) { std::ifstream input(file); return nlohmann::json::parse(input); };
@@ -158,7 +201,18 @@ int runObjectStoreControllerTests()
             // Approval clears the mark on the shared edge.
             auto approved = a;
             approved.branches[0].pending = false;
+            const auto generation = controller._fiberDataGeneration;
             controller.commitFibers({&approved});
+            state.pollObjectStoreChanges();
+            require(controller._fiberDataGeneration > generation && controller._sideStripStoredSnapshotCache.empty(),
+                    "real commits still invalidate fiber geometry snapshots after hub status events");
+            QElapsedTimer timer; timer.start();
+            const auto approvedCatalog = [&] {
+                return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
+                    [](const auto& row) { return row.pendingLinks == 0; });
+            };
+            while (!approvedCatalog() && timer.elapsed() < 10000) { QApplication::processEvents(); QThread::msleep(1); }
+            require(approvedCatalog(), "real commits still refresh catalog link state");
             const auto again = resolve(a.uuid);
             require(!again.branches[0].pending && !again.branches[0].autoLink, "approval clears the automatic mark");
             auto pending = again;

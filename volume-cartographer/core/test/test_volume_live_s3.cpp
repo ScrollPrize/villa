@@ -8,10 +8,12 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStore.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <string>
@@ -83,12 +85,46 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     const auto volume = project->volume("20260102150214");
     REQUIRE(volume);
     CHECK(volume->shape() == untagged->shape());
+    // Changing the annotation identity must reuse the pre-existing URL cache,
+    // including the process cache shared with manually opened remote volumes.
+    CHECK(untagged->remotePersistentCachePath() == untagged->remoteCacheRoot() / untagged->id());
+    CHECK(volume->remotePersistentCachePath() == untagged->remotePersistentCachePath());
+    const auto originalCache = untagged->sharedChunkCache();
+    const auto catalogCache = volume->sharedChunkCache();
+    CHECK(catalogCache->sourceId() == originalCache->sourceId());
+    // Populate the original disk cache, evict decoded RAM, and read through
+    // the catalog volume. The bytes must survive without a remote chunk fetch.
+    const int level = untagged->presentScaleLevels().back();
+    const auto shape = untagged->levelShape(level);
+    const auto chunk = untagged->chunkShape(level);
+    const std::array<int, 3> key{shape[0] / 2 / chunk[0], shape[1] / 2 / chunk[1], shape[2] / 2 / chunk[2]};
+    const auto before = originalCache->getChunkBlocking(level, key[0], key[1], key[2]);
+    REQUIRE(before.status != vc::render::ChunkStatus::Error);
+    originalCache->waitForPendingChunks();
+    originalCache->invalidate();
+    const auto fetches = std::make_shared<std::atomic_int>(0);
+    const auto listener = catalogCache->addRemoteFetchActivityListener(
+        [fetches](const auto&, bool active) { if (active) ++*fetches; });
+    const auto after = catalogCache->getChunkBlocking(level, key[0], key[1], key[2]);
+    catalogCache->removeRemoteFetchActivityListener(listener);
+    CHECK(fetches->load() == 0);
+    CHECK(after.status == before.status);
+    if (before.bytes) {
+        REQUIRE(after.bytes);
+        CHECK(*after.bytes == *before.bytes);
+    }
+    MESSAGE("Catalog cache reuse: " << (after.bytes ? after.bytes->size() : 0)
+            << " decoded bytes, " << fetches->load() << " remote chunk fetches");
     CHECK(vc3d::geometryScaleForVolume(fiber, *volume) == 1.0);
     CHECK(vc3d::coordinateBindingForVolume(*volume, 1).at("coordinates") == fiber.at("coordinates"));
     REQUIRE(project->volumeIDs().size() == 2);
     for (const auto& id : project->volumeIDs()) {
-        if (id != volume->id())
-            CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *project->volume(id)).has_value());
+        if (id != volume->id()) {
+            const auto rebased = project->volume(id);
+            CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *rebased).has_value());
+            CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
+            CHECK(rebased->remotePersistentCachePath() == rebased->remoteCacheRoot() / rebased->id());
+        }
     }
 
     // Optional read-only validation against a local replica of the PHerc0139 hub.
@@ -120,6 +156,7 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
     CHECK(v->isRemote());
     CHECK_FALSE(v->remoteUrl().empty());
     CHECK_FALSE(v->id().empty());
+    CHECK(v->remotePersistentCachePath() == v->remoteCacheRoot() / v->id());
 }
 
 TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")

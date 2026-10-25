@@ -2030,6 +2030,9 @@ LineAnnotationController::LineAnnotationController(CState* state,
     _lineSolvePool.setThreadPriority(QThread::LowPriority);
     if (_state) {
         connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+            // Hub status alone changes no fiber revisions or geometry. Actual
+            // pulled edits are observed separately as Committed events.
+            if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
             if (event.kind == vc::objects::StoreSessionEvent::Kind::Attachment) {
                 onVolumePackageChanged({});
                 return;
