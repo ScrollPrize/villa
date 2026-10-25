@@ -216,6 +216,29 @@ optimization does not alter priority selection or numerical processing.
 
 ### Measured baseline (2026-10-25)
 
+Follow-up end-to-end GPU tracing with decoder commit `b3fd49f8c` used the same
+512 chunks, 176 nonempty, 1,028 paths, 10 GiB cache, refinement off and conflict
+filtering on. All outputs matched exactly. Under one nonexclusive grant of
+168 CPU cores and six GPUs (3 GiB/device), three repetitions gave:
+
+| Preparation workers | Frozen reader mean (s) | Fast decoder mean (s) |
+|---:|---:|---:|
+| 16 | 3.652 | 3.407 |
+| 64 | 3.265 | 3.185 |
+| 168 | 3.445 | 3.494 |
+
+The best new rate is 160.75 chunks/s, only 2.5% above its matched old control;
+timing ranges overlap. Isolated decoder gains therefore do not demonstrate a
+large end-to-end tracing speedup. At64 workers, GPU kernels sum to0.917s across
+six devices and average process CPU use is22.21 cores. Stage times include
+concurrent waits; these short runs include CUDA initialization and tails and do
+not uniquely identify the remaining bottleneck or establish full-volume speed.
+Source files were page-cache warm, decoded caches and output geometry fresh.
+Full distributions, commands, grants and stage profiles are in
+`/ephemeral/hendrik/fiber3d_train2/evaluations/trace_fast_decoder_20261025_v1/REPORT.md`.
+
+Earlier scheduler comparison:
+
 Retain the current resident-hit fast path and single-completion wakeup as the
 implementation baseline; `Direct` remains the default and `Queued` is opt-in.
 For the same 512 Paris4 cores, 10 GiB shared cache and six GPUs:

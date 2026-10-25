@@ -1,5 +1,13 @@
 # Reusable fiber test and experiment runner
 
+`trace-fast-decoder` rebuilds the current native tracing targets on ephemeral
+storage and compares full GPU chunk construction/filtering/publication against
+the frozen prior reader. It reuses the local 512-chunk Paris4 fixture, three
+repeats and a single manager grant, checking exact geometry/seeds/stops/flags.
+`trace-fast-decoder-report` regenerates the report without rerunning tracing.
+Like other local benchmark suites, these require the uncommitted local harness
+and fixture; they are not standalone tests on a fresh clone.
+
 `reader-multichannel` runs paired1/7-channel public ROI workloads,16/64callers,
 10GiB/512MiB cache budgets, independent exact oracle, and matched memcpy/decode
 controls. `reader-multichannel-report` generates output-byte throughput and

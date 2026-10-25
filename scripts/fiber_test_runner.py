@@ -8,6 +8,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "local/fiber_tests.json"
 SUITES = {
+    "trace-fast-decoder": ("local/test_trace_fast_decoder.py",),
+    "trace-fast-decoder-report": ("local/test_trace_fast_decoder.py::test_report",),
     "reader-multichannel": ("local/test_reader_multichannel.py",),
     "reader-multichannel-report": ("local/test_reader_multichannel_report.py",),
     "reader-layout": ("local/test_reader_layout.py",),
