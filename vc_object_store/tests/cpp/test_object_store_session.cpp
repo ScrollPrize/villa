@@ -5,6 +5,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <sqlite3.h>
 
 using namespace vc::objects;
 
@@ -12,6 +13,26 @@ int main() try
 {
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
+    // Both pre-backport formats are rejected before the new journal is queried.
+    for (const int version : {14, 15}) {
+        const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
+        { auto db = ObjectStore::create(oldPath, options); }
+        sqlite3* raw = nullptr;
+        require(sqlite3_open(oldPath.c_str(), &raw) == SQLITE_OK, "open schema fixture");
+        const auto sql = "PRAGMA user_version=" + std::to_string(version);
+        const int rc = sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr);
+        sqlite3_close(raw);
+        require(rc == SQLITE_OK, "set old schema version");
+        for (const bool readOnly : {false, true}) {
+            auto oldOptions = options; oldOptions.readOnly = readOnly;
+            bool rejected = false;
+            try { auto db = ObjectStore::open(oldPath, oldOptions); }
+            catch (const std::runtime_error& error) {
+                rejected = std::string(error.what()).find("unsupported database schema") != std::string::npos;
+            }
+            require(rejected, "old formats are explicitly rejected in read-only and writable mode");
+        }
+    }
     const auto path = directory.path / "mixed.vcobj";
     auto external = ObjectStore::create(path, options);
     std::string a, b;

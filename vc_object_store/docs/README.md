@@ -514,8 +514,9 @@ spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 Volume targets never parse every object's metadata. The `objects` table carries
 `coordinate_volume` and `coordinate_scale`, virtual generated columns equal to
 `json_extract` of `meta.coordinates`, indexed as `objects_coordinates(kind,
-coordinate_volume, coordinate_scale)` (schema version 14; earlier stores are
-rejected and must be rebuilt). A target finds its frames with one index seek per
+coordinate_volume, coordinate_scale)` (schema version 16; earlier stores are
+rejected and must be rebuilt). Version 16 also records object/edge kinds in the
+journal, including deletions, for selective cache invalidation. A target finds its frames with one index seek per
 distinct scale, and the unbound tail reads only the index ranges outside the
 volume's binding. `unboundObjectCount(txn, kind, volume)` counts that tail the
 same way. SQLite never answers a generated column from an index alone, so an

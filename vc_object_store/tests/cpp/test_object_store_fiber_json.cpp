@@ -20,6 +20,7 @@ int main() try {
         auto linked = root; linked["uuid"] = util::newUuid();
         linked["branches"] = Json::array({Json{{"target_uuid", existing}, {"control_point_index", 0},
                                                {"branch_control_point_index", 0}}});
+        linked["adjacent_branches"] = linked["branches"];
         auto back = root; back["uuid"] = existing;
         require(fiberBatchEndpoints({decodeFiberJson(linked.dump())}) == std::vector<std::string>{existing},
                 "a prepared fiber batch reports the existing fibers it links to");
@@ -81,6 +82,38 @@ int main() try {
         mustFail([&] {fiberRevisionJson(db,txn,*receipt.at(uuid),1);});
     });
     mustFail([&] { session.act(attachment,receipt,[](auto&,auto&) {}); });
+    {
+        // Only linked endpoints participate in checked import concurrency.
+        const auto unrelated = util::newUuid();
+        session.act(attachment, {{unrelated, {}}}, [&](auto& db, auto& txn) {
+            auto record = doc.object; record.uuid = unrelated;
+            db.upsertObject(txn, record); db.putGeometry(txn, unrelated, doc.geometry);
+        });
+        auto linked = root; const auto imported = util::newUuid(); linked["uuid"] = imported;
+        linked["branches"] = Json::array({Json{{"target_uuid", uuid}, {"control_point_index", 0},
+                                               {"branch_control_point_index", 0}}});
+        auto batch = std::vector<GeometrySource>{decodeFiberJson(linked.dump())};
+        RevisionSelection pins{{imported, {}}};
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& target : fiberBatchEndpoints(batch))
+                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+        });
+        { auto txn = external.write(); external.setMeta(txn, unrelated, "concurrent", "true"); txn.commit(); }
+        session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
+        // Reusing the new identity still fails even though unrelated fibers are not pinned.
+        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        const auto rejected = util::newUuid(); linked["uuid"] = rejected;
+        batch = {decodeFiberJson(linked.dump())}; pins = {{rejected, {}}};
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& target : fiberBatchEndpoints(batch))
+                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+        });
+        { auto txn = external.write(); external.setMeta(txn, uuid, "concurrent", "true"); txn.commit(); }
+        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            require(!db.objectByUuid(txn, rejected), "a changed linked endpoint rejects the entire import");
+        });
+    }
     const auto a = util::newUuid(), b = util::newUuid(), isolated = util::newUuid();
     std::string ordinary, adjacent;
     const auto networkPins = session.act(attachment, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
