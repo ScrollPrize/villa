@@ -138,10 +138,8 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string selectedFiberInferenceDatasetLocation;
     std::string selectedFiberManifestIdentity;
     fs::path selectedFiberInferenceManifestPath;
-    // Stored fibers use the fiber manifest's base grid. Generated viewer
-    // surfaces use the active volume grid and apply this adapter at the UI
-    // boundary; optimizer/session geometry stays in canonical base voxels.
-    double fiberBaseToVolumeScale = 1.0;
+    // Session geometry is in the open volume's voxels: stored fibers are read
+    // through the store's mapping into it (StoredFiber::frame).
     std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
@@ -1433,8 +1431,7 @@ void remapCollapsedBranchControlPointIndices(
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::PredSnapMarker>
 generatedPredSnapMarkers(const std::vector<vc3d::line_annotation::LineControlPoint>& controls,
-                         const vc::atlas::AtlasPredSnapSet& predSnapSet,
-                         double fiberBaseToVolumeScale)
+                         const vc::atlas::AtlasPredSnapSet& predSnapSet)
 {
     std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
     snapsByControl.reserve(predSnapSet.points.size());
@@ -1461,8 +1458,6 @@ generatedPredSnapMarkers(const std::vector<vc3d::line_annotation::LineControlPoi
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
         marker.manual = it->second->source == vc::atlas::AtlasPredSnapSource::Manual;
-        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
-            marker, fiberBaseToVolumeScale);
         markers.push_back(marker);
     }
     return markers;
@@ -1476,29 +1471,6 @@ std::vector<cv::Vec3f> generatedLinePoints(const std::vector<cv::Vec3d>& points)
         converted.push_back(toVec3f(point));
     }
     return converted;
-}
-
-vc::lasagna::LineModel lineModelForVolumeDisplay(
-    const vc::lasagna::LineModel& baseLine,
-    double baseToVolumeScale)
-{
-    if (!(baseToVolumeScale > 0.0) || !std::isfinite(baseToVolumeScale)) {
-        throw std::runtime_error(
-            "fiber base-to-volume display scale must be positive and finite");
-    }
-    vc::lasagna::LineModel displayLine = baseLine;
-    if (approximatelyEqual(baseToVolumeScale, 1.0)) {
-        return displayLine;
-    }
-    for (auto& point : displayLine.points) {
-        point.position *= baseToVolumeScale;
-    }
-    for (auto& segment : displayLine.segmentSamples) {
-        for (auto& sample : segment.samples) {
-            sample.position *= baseToVolumeScale;
-        }
-    }
-    return displayLine;
 }
 
 nlohmann::json pointToJson(const cv::Vec3d& point)
@@ -1959,14 +1931,13 @@ void applyFocusBoundsToOptimizationTask(
 } // namespace
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker>
-LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches,
-                           double fiberBaseToVolumeScale) const
+LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches) const
 {
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> markers;
     markers.reserve(branches.size());
     for (const auto& branch : branches) {
-        const auto linkedScale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr);
-        if (!linkedScale) continue;
+        // A peer outside the volume has its position in another frame.
+        if (!fiberBoundToVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr)) continue;
         if (!finitePoint(branch.controlPointPosition) ||
             !finitePoint(branch.branchControlPointPosition) ||
             !finiteDirection(branch.controlPointDirection) ||
@@ -1982,8 +1953,6 @@ LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnot
             toVec3f(normalizedOrZero(branch.branchControlPointDirection));
         marker.planePoint = marker.linkedControlPoint;
         marker.estimated = false;
-        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
-            marker, fiberBaseToVolumeScale, *linkedScale);
         markers.push_back(marker);
     }
     return markers;
@@ -2531,7 +2500,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             [this, surfaceName](uint64_t fiberId, cv::Vec3f volumePoint) {
                 handleGeneratedOpenNearbyAnnotation(
                     fiberId,
-                    fiberBasePointFromViewer(surfaceName, volumePoint));
+                    volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedSideStripIntersectionQueryRequested,
@@ -2753,8 +2722,8 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             [this, surfaceName](cv::Vec3f point, double position,
                                 cv::Vec3f anchor, cv::Vec3f direction) {
         handleGeneratedControlPoint(surfaceName,
-            fiberBasePointFromViewer(surfaceName, point), position,
-            fiberBasePointFromViewer(surfaceName, anchor), std::nullopt,
+            point, position,
+            anchor, std::nullopt,
             vc::fiber_tracer::displayUnit(cv::Vec3d(direction)));
     });
     connect(dialog, &LineAnnotationDialog::controlDirectionChanged, this,
@@ -2789,7 +2758,7 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, cv::Vec3f volumePoint, QPointF) {
                 handleLineSeed(name,
-                               fiberBasePointFromViewer(name, volumePoint),
+                               volumePoint,
                                InitialDirectionMode::ZInOut);
             });
     connect(dialog,
@@ -2819,8 +2788,8 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, cv::Vec3f point, double position,
                    cv::Vec3f anchor, cv::Vec3f normal, bool edge) {
-                handleGeneratedControlPoint(name, fiberBasePointFromViewer(name, point),
-                    position, fiberBasePointFromViewer(name, anchor),
+                handleGeneratedControlPoint(name, point,
+                    position, anchor,
                     edge ? std::optional<cv::Vec3d>(toVec3d(normal)) : std::nullopt);
             });
     connect(dialog,
@@ -2832,23 +2801,23 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
                    cv::Vec3f lineAnchor) {
                 handleGeneratedControlPoint(
                     name,
-                    fiberBasePointFromViewer(name, volumePoint),
+                    volumePoint,
                     linePosition,
-                    fiberBasePointFromViewer(name, lineAnchor));
+                    lineAnchor);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointDeleteRequested,
             this,
             [this](const std::string& name, double linePosition, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointDelete(
-                    name, linePosition, fiberBasePointFromViewer(name, volumePoint));
+                    name, linePosition, volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedNewLineAnnotationLinkedToCandidateRequested,
             this,
             [this](const std::string& name, cv::Vec3f volumePoint, cv::Vec3f linkDirection) {
                 handleGeneratedNewLineAnnotationLinkedToCandidate(name,
-                                                                  fiberBasePointFromViewer(name, volumePoint),
+                                                                  volumePoint,
                                                                   linkDirection);
             });
     connect(dialog,
@@ -2856,14 +2825,14 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointLinkCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                    name, controlPointIndex, volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointAdjacentLinkCandidateRequested,
             this,
             [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointLinkCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint),
+                    name, controlPointIndex, volumePoint,
                     /*adjacent=*/true);
             });
     connect(dialog,
@@ -2871,14 +2840,14 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointLinkWithCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                    name, controlPointIndex, volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointMergeWithCandidateRequested,
             this,
             [this](const std::string& name, size_t controlPointIndex, cv::Vec3f volumePoint) {
                 handleGeneratedControlPointMergeWithCandidate(
-                    name, controlPointIndex, fiberBasePointFromViewer(name, volumePoint));
+                    name, controlPointIndex, volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedSpanSplitRequested,
@@ -2937,7 +2906,7 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, cv::Vec3f volumePoint) {
                 handleGeneratedPredSnapPoint(
-                    name, fiberBasePointFromViewer(name, volumePoint));
+                    name, volumePoint);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedSegmentInterpolationGoalRequested,
@@ -3131,7 +3100,7 @@ std::optional<std::vector<cv::Vec3d>> LineAnnotationController::fiberMapLinePoin
     // drawn point to a position on the stored line (positions are indices,
     // shared by every frame of one line).
     const auto fiber = readStoredFiber(fiberId, true);
-    if (!fiber || !fiber->editorError.empty() || !storedFiberScale(*fiber)) {
+    if (!fiber || !fiber->editorError.empty() || !fiberInVolume(*fiber)) {
         return std::nullopt;
     }
     auto points = fiberInVolumeCoordinates(*fiber).linePoints;
@@ -3383,13 +3352,10 @@ std::optional<QString> LineAnnotationController::linkStoredControlPoints(StoredF
     // The two fibers may be stored in different frames: the fallback
     // direction (used only where a line gives no tangent) is taken in the
     // volume's.
-    const auto localScale = storedFiberScale(local);
-    const auto farScale = storedFiberScale(far);
-    if (!localScale || !farScale) {
+    if (!fiberInVolume(local) || !fiberInVolume(far)) {
         return tr("Bind both fibers to the active volume before linking.");
     }
-    const cv::Vec3d fallbackDirection =
-        normalizedOrZero(farPoint * (*farScale / *localScale) - localPoint);
+    const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
     const cv::Vec3d localDirection =
         endpointTangentFromLinePoints(local.linePoints, localPoint, fallbackDirection);
     const cv::Vec3d farDirection =
@@ -3757,7 +3723,6 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
         const FiberMapAutoLinkEndpoint* endpoint = nullptr;
         std::optional<StoredFiber> fiber;
         QString name;
-        double scale = 1.0;
         double windowVx = 0.0;
         double reuseVx = 0.0;
         al::ControlChoice choice;
@@ -3792,12 +3757,10 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
     }
     for (Side& side : sides) {
         side.name = fiberDisplayNameFromFileName(side.fiber->fileName);
-        const auto scale = storedFiberScale(*side.fiber);
-        if (!scale) {
+        if (!fiberInVolume(*side.fiber)) {
             return refuse(tr("%1 is not bound to the active volume.").arg(side.name));
         }
-        side.scale = *scale;
-        const double baseVoxelSizeUm = volume->voxelSize() * side.scale;
+        const double baseVoxelSizeUm = volume->voxelSize();
         if (!(baseVoxelSizeUm > 0.0) || !std::isfinite(baseVoxelSizeUm)) {
             return refuse(tr("The active volume has no usable voxel size."));
         }
@@ -3849,7 +3812,6 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
         side.session = makeIntersectionLineSession(
             *side.fiber, side.choice.linePosition, cv::Vec3d{0.0, 0.0, 1.0},
             "fiber_auto_link_" + side.fiber->uuid, nullptr);
-        side.session->fiberBaseToVolumeScale = side.scale;
         side.session->suppressErrorDialogs = false;
         if (!ensureSessionSolveBackends(*side.session, [&]() { return check(true); })) {
             return refuse(tr("Could not prepare the solve for %1.").arg(side.name));
@@ -4007,7 +3969,7 @@ void LineAnnotationController::handleGeneratedLinkNearbyFiber(const std::string&
     }
     // The identity verified, the X's point is converted into the session's
     // canonical base voxels (the scale is part of that identity).
-    const cv::Vec3f pointB = fiberBasePointFromViewer(surfaceName, viewerPoint);
+    const cv::Vec3f pointB = viewerPoint;
     if (!finitePoint(pointB)) {
         showError(tr("The marker has no finite position."));
         return;
@@ -4169,13 +4131,11 @@ void LineAnnotationController::runDialogAutoLink(const DialogAutoLinkCapture& c)
         return refuse(changedMessage);
     }
     FiberMapAutoLinkParams params;
-    const auto scaleB = storedFiberScale(*fiberB);
-    if (!scaleB) {
+    if (!fiberInVolume(*fiberB)) {
         return refuse(tr("%1 is not bound to the active volume.").arg(nameB));
     }
-    const double voxelA = c.volume->voxelSize() * sessionA.fiberBaseToVolumeScale;
-    const double voxelB = c.volume->voxelSize() * *scaleB;
-    if (!(voxelA > 0.0) || !std::isfinite(voxelA) || !(voxelB > 0.0) || !std::isfinite(voxelB)) {
+    const double voxel = c.volume->voxelSize();
+    if (!(voxel > 0.0) || !std::isfinite(voxel)) {
         return refuse(tr("The active volume has no usable voxel size."));
     }
     const std::vector<cv::Vec3d> lineA = linePointPositions(sessionA.optimizedLine);
@@ -4188,13 +4148,13 @@ void LineAnnotationController::runDialogAutoLink(const DialogAutoLinkCapture& c)
     choiceSides[0].source = choiceSourceFromSession(sessionA, &lineA);
     choiceSides[0].anchorPosition =
         std::clamp(c.anchorLinePosition, 0.0, static_cast<double>(std::max<size_t>(lineA.size(), 1) - 1));
-    choiceSides[0].windowVx = params.searchWindowUm / voxelA;
-    choiceSides[0].reuseVx = params.reuseUm / voxelA;
+    choiceSides[0].windowVx = params.searchWindowUm / voxel;
+    choiceSides[0].reuseVx = params.reuseUm / voxel;
     choiceSides[1].name = nameB;
     choiceSides[1].source = choiceSourceFromStoredFiber(*fiberB);
     choiceSides[1].anchorPosition = *anchorB;
-    choiceSides[1].windowVx = params.searchWindowUm / voxelB;
-    choiceSides[1].reuseVx = params.reuseUm / voxelB;
+    choiceSides[1].windowVx = params.searchWindowUm / voxel;
+    choiceSides[1].reuseVx = params.reuseUm / voxel;
     double passDistance = 0.0;
     if (const auto error = planAutoLinkChoices(choiceSides, &passDistance)) {
         return refuse(*error);
@@ -4254,7 +4214,6 @@ void LineAnnotationController::runDialogAutoLink(const DialogAutoLinkCapture& c)
         placementB.session = makeIntersectionLineSession(
             *fiberB, sideB.choice.linePosition, cv::Vec3d{0.0, 0.0, 1.0},
             "fiber_auto_link_" + fiberB->uuid, nullptr);
-        placementB.session->fiberBaseToVolumeScale = *scaleB;
         placementB.session->suppressErrorDialogs = false;
         placementB.choice = sideB.choice;
         if (!ensureSessionSolveBackends(*placementB.session, [&]() { return check(true); })) {
@@ -4406,9 +4365,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         }
     };
     if (!readFiber()) return;
-    const auto coordinateScale = fiberCoordinateScale(fiberId, true);
-    if (!coordinateScale) return;
-    const double fiberBaseToVolumeScale = *coordinateScale;
+    if (!ensureFiberInVolume(fiberId, true)) return;
     // Binding the coordinates publishes a new revision; open the current one.
     auto stored = readFiber();
     if (!stored) return;
@@ -4440,7 +4397,6 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberOptimizationMode = fiber.optimizationMode;
     session->modelOnly = fiber.modelOnly;
     session->coordinateBaseShapeZYX = coordinateBaseShapeZYX;
-    session->fiberBaseToVolumeScale = fiberBaseToVolumeScale;
     session->branches = fiber.branches;
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
@@ -4467,7 +4423,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         CChunkedVolumeViewer::CameraState camera;
         camera.scale = 1.0f;
         auto sourcePlane = std::make_shared<PlaneSurface>(
-            toVec3f(seedPoint * fiberBaseToVolumeScale),
+            toVec3f(seedPoint),
             toVec3f(sourceSliceNormal));
         (void)launchSession(SourceKind::Plane,
                             nextSurfaceName(),
@@ -4495,7 +4451,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         session->inspectionFrameOnly = !session->normalSampler && !session->modelOnly;
         session->optimizedLine = session->modelOnly
             ? FiberFollowService::instance().lineModel(reopeningFiber.linePoints,
-                _state->currentVolume()->voxelSize() * session->fiberBaseToVolumeScale)
+                _state->currentVolume()->voxelSize())
             : session->inspectionFrameOnly
             ? vc::lasagna::lineModelForInspection(reopeningFiber.linePoints)
             : lineModelFromPoints(reopeningFiber.linePoints, session->normalSampler.get());
@@ -4628,7 +4584,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                   0,
                   static_cast<int>(reopeningFiber.linePoints.size() - 1)))]
     );
-    const cv::Vec3d displayOrigin = origin * fiberBaseToVolumeScale;
+    const cv::Vec3d displayOrigin = origin;
     auto sourcePlane = std::make_shared<PlaneSurface>(
         cv::Vec3f{static_cast<float>(displayOrigin[0]),
                   static_cast<float>(displayOrigin[1]),
@@ -5053,6 +5009,9 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
         throw std::runtime_error("The current volume package has no root directory");
     }
 
+    // Atlas coordinates are the open volume's voxels; the fiber is read in them.
+    if (!ensureFiberInVolume(fiberId, true))
+        throw std::runtime_error("Bind the fiber to the active volume before creating an atlas");
     const auto stored = readStoredFiber(fiberId, true);
     if (!stored) {
         throw std::runtime_error("Selected fiber is not available");
@@ -5090,12 +5049,6 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
     input.controlPoints =
         vc3d::line_annotation::storedControlPointPositions(stored->controlPoints);
     input.linePoints = stored->linePoints;
-    const auto scale = fiberCoordinateScale(fiberId,true);
-    if (!scale) throw std::runtime_error("Bind the fiber's volume and scale before creating an atlas");
-    input.storePin=fiberPin(fiberId);
-    input.storeToAtlasScale=*scale;
-    for(auto& point:input.controlPoints) point*=*scale;
-    for(auto& point:input.linePoints) point*=*scale;
     vc::atlas::validateFiberInputControlPoints(input);
     atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
                " control_points=" + std::to_string(input.controlPoints.size()));
@@ -5138,6 +5091,7 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
         *_state->objectStoreSession(), *attachment, *selected.surface,
         atlasDir.filename().string() + "_base", baseMeta.dump());
     auto atlas = vc::atlas::createSingleFiberAtlas(atlasDir.filename().string(),
+                                                   volume->id(),
                                                    input,
                                                    basePin,
                                                    zeroWindingColumn,
@@ -5206,14 +5160,8 @@ LineAnnotationController::StoredFiber LineAnnotationController::fiberInVolumeCoo
     const StoredFiber& fiber) const
 {
     ensureFiberLines(fiber);
-    const auto scale = storedFiberScale(fiber);
-    if (!scale) throw std::runtime_error("Bind the fiber to the active volume before using its geometry");
-    auto result = fiber;
-    for (auto& point : result.controlPoints)
-        for (int axis = 0; axis < 3; ++axis) point[axis] *= *scale;
-    for (auto& point : result.linePoints) point *= *scale;
-    result.width *= *scale;
-    return result;
+    if (!fiberInVolume(fiber)) throw std::runtime_error("Bind the fiber to the active volume before using its geometry");
+    return fiber;
 }
 
 void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* targetArea)
@@ -5319,7 +5267,7 @@ void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* target
             const auto nearby = readStoredFibersInVolumeBox(boxAroundPoints(displayFiber.linePoints, extent), true);
             overlayData.fibers.reserve(nearby.size());
             for (const StoredFiber& fiber : nearby) {
-                if (!fiber.editorError.empty() || !storedFiberScale(fiber)) continue;
+                if (!fiber.editorError.empty() || !fiberInVolume(fiber)) continue;
                 const auto display = fiberInVolumeCoordinates(fiber);
                 overlayData.fibers.push_back(FiberSliceOverlayController::FiberData{
                     fiber.id,
@@ -5419,7 +5367,6 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
         auto makeInput = [this, &volpkgRoot](const StoredFiber& fiber) {
             const auto display = fiberInVolumeCoordinates(fiber);
             vc::atlas::FiberInput input;
-            input.storeToAtlasScale = *storedFiberScale(fiber);
             input.storePin=fiber.storePin;
             input.fiberPath=relativeFiberPath(fiber);
             input.controlPoints =
@@ -5987,7 +5934,7 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
             sideConfig.orientedPointNormals =
                 orientedLineNormalsForSession(*side.editSession);
             side.lineViews = vc::lasagna::buildLineViewSurfaces(
-                lineModelForVolumeDisplay(side.editSession->optimizedLine, side.editSession->fiberBaseToVolumeScale),
+                side.editSession->optimizedLine,
                 sideConfig);
             Logger()->info("Intersection {} strip built from sampled normals: fiber={} points={} surface={} side_slice={}",
                            side.displayPrefix,
@@ -6356,11 +6303,9 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                             views.lineUpVectors = lineUpVectors;
                             views.controlPoints = controlMarkersForSession(*session);
                             views.branchLinePoints = generatedBranchLinePointsForSession(*session);
-                            views.branchLinks = generatedBranchLinkMarkers(
-                                session->branches, session->fiberBaseToVolumeScale);
+                            views.branchLinks = generatedBranchLinkMarkers(session->branches);
                             views.predSnapPoints =
-                                generatedPredSnapMarkers(session->controlPoints, session->predSnapSet,
-                                                         session->fiberBaseToVolumeScale);
+                                generatedPredSnapMarkers(session->controlPoints, session->predSnapSet);
                             vc3d::line_annotation::applyGeneratedOverlay(
                                 chunkedViewer,
                                 surfaceName,
@@ -6489,11 +6434,9 @@ bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessa
                     views.stripPositionMap = stripPositionMap;
                     views.controlPoints = controlMarkersForSession(*session);
                     views.branchLinePoints = generatedBranchLinePointsForSession(*session);
-                    views.branchLinks = generatedBranchLinkMarkers(
-                        session->branches, session->fiberBaseToVolumeScale);
+                    views.branchLinks = generatedBranchLinkMarkers(session->branches);
                     views.predSnapPoints =
-                        generatedPredSnapMarkers(session->controlPoints, session->predSnapSet,
-                                                 session->fiberBaseToVolumeScale);
+                        generatedPredSnapMarkers(session->controlPoints, session->predSnapSet);
                     auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(
                         views,
                         focus,
@@ -6920,12 +6863,6 @@ LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& 
             }
         }
     }
-    if (!approximatelyEqual(session.fiberBaseToVolumeScale, 1.0)) {
-        const float scale = static_cast<float>(session.fiberBaseToVolumeScale);
-        for (auto& marker : markers) {
-            marker.point *= scale;
-        }
-    }
     // Arc lengths on the session's live line, the line the markers' positions
     // index, in DISPLAY units (the strip map and the dialog's line are built
     // from the display-scaled line, like marker.point above). The dialog may
@@ -6933,7 +6870,6 @@ LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& 
     // controls before any landing), so the overview bar takes distances from
     // here, never from the positions.
     {
-        const double displayScale = session.fiberBaseToVolumeScale;
         const auto& points = session.optimizedLine.points;
         std::vector<double> cumulative(points.size(), 0.0);
         for (size_t i = 1; i < points.size(); ++i) {
@@ -6954,8 +6890,8 @@ LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& 
             const size_t lower = static_cast<size_t>(std::floor(p));
             const size_t upper = std::min(lower + 1, cumulative.size() - 1);
             const double t = p - static_cast<double>(lower);
-            marker.arcLength = (cumulative[lower] * (1.0 - t) + cumulative[upper] * t) * displayScale;
-            marker.lineArcLength = total * displayScale;
+            marker.arcLength = cumulative[lower] * (1.0 - t) + cumulative[upper] * t;
+            marker.lineArcLength = total;
             marker.lineRevision = session.lineRevision;
             // On the line: the control's own point (session space, before the
             // display scaling above) is where the line is at its position.
@@ -7939,7 +7875,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
 
     // The map covers every store fiber bound to the current volume.
     std::vector<StoredFiber> fibers = readStoredFibers(std::nullopt, true);
-    std::erase_if(fibers, [&](const StoredFiber& fiber) { return !fiber.editorError.empty() || !storedFiberScale(fiber); });
+    std::erase_if(fibers, [&](const StoredFiber& fiber) { return !fiber.editorError.empty() || !fiberInVolume(fiber); });
     std::unordered_set<uint64_t> boundIds;
     boundIds.reserve(fibers.size());
     for (const StoredFiber& fiber : fibers) boundIds.insert(fiber.id);
@@ -8103,13 +8039,8 @@ LineAnnotationController::fiberSnapshotsFromStorageWithPaths()
         geometry.points.reserve(fiber.linePoints.size());
         for (const auto& point : fiber.linePoints)
             geometry.points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
-        const auto scale = storedFiberScale(fiber);
-        geometry.coordinateKnown = scale.has_value();
-        if (scale) {
-            geometry.storeToQueryScale = *scale;
-            for (auto& point : geometry.points) point.position *= *scale;
-            for (auto& point : geometry.controlPoints) point *= *scale;
-        }
+        // Bound fibers are read in the volume's voxels.
+        geometry.coordinateKnown = fiberInVolume(fiber);
         snapshots.push_back({relativeFiberPath(fiber),std::move(geometry),fiber.id,fiber.hvClassification,fiber.manualHvTag,fiber.tags});
     }
     return snapshots;
@@ -8177,7 +8108,7 @@ void LineAnnotationController::refreshChangedStoreFibers()
     if (!changed.empty()) discardFiberPanes(changed);
     for (const auto& [uuid, state] : reopen) {
         const auto id = fiberIdForUuid(uuid);
-        if (!id || !fiberCoordinateScale(id, false)) continue;
+        if (!id || !ensureFiberInVolume(id, false)) continue;
         openFiber(id);
         // A pane being edited stays editable on the new revision.
         if (!state.editing || !enableFiberEditing(id) || !state.retry) continue;
@@ -8763,12 +8694,11 @@ std::optional<size_t> LineAnnotationController::placeControlInSession(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             true,
             generatedSpanAlignmentMetricsForSession(session));
         pane->dialog->setGeneratedPredSnapPoints(
-            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
-                                     session.fiberBaseToVolumeScale));
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
 
     const std::string updateEventName = std::string(collapsedControlCount > 1
@@ -8891,7 +8821,6 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
     linkedSeedRecord->normalSampler = templateSession.normalSampler;
     linkedSeedRecord->modelOnly = templateSession.modelOnly;
     linkedSeedRecord->coordinateBaseShapeZYX = templateSession.coordinateBaseShapeZYX;
-    linkedSeedRecord->fiberBaseToVolumeScale = templateSession.fiberBaseToVolumeScale;
     ensureSessionFiberIdentity(*linkedSeedRecord);
 
     // The seed keeps the view's requested link direction as its own
@@ -9196,7 +9125,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             false,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -9343,12 +9272,10 @@ std::optional<QString> LineAnnotationController::linkSessionControlToStoredContr
     if (!finitePoint(localPoint) || !finitePoint(farPoint)) {
         return tr("Could not determine finite endpoints for the link.");
     }
-    const auto farScale = fiberCoordinateScaleForVolume(farFiber->id, _state ? _state->currentVolume() : nullptr);
-    if (!farScale) {
+    if (!fiberBoundToVolume(farFiber->id, _state ? _state->currentVolume() : nullptr)) {
         return tr("Bind the linked fiber to the active volume before linking.");
     }
-    const cv::Vec3d fallbackDirection = normalizedOrZero(
-        farPoint * (*farScale / session.fiberBaseToVolumeScale) - localPoint);
+    const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
     const cv::Vec3d localDirection = endpointTangentFromLinePoints(
         linePointPositions(session.optimizedLine),
         localPoint,
@@ -9383,7 +9310,7 @@ std::optional<QString> LineAnnotationController::linkSessionControlToStoredContr
             pane->dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(session),
                 generatedBranchLinePointsForSession(session),
-                generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+                generatedBranchLinkMarkers(session.branches),
                 true,
                 generatedSpanAlignmentMetricsForSession(session));
         }
@@ -10376,7 +10303,7 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -10480,7 +10407,7 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -10536,8 +10463,7 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
             predDtValue);
         if (pane->dialog) {
             pane->dialog->setGeneratedPredSnapPoints(
-                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
-                                         session.fiberBaseToVolumeScale));
+                generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not save pred-snap point: %1")
@@ -10713,12 +10639,11 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             true,
             generatedSpanAlignmentMetricsForSession(session));
         pane->dialog->setGeneratedPredSnapPoints(
-            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
-                                     session.fiberBaseToVolumeScale));
+            generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
 }
 
@@ -10730,12 +10655,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         try {
             if (!_state || !_state->currentVolume())
                 throw std::runtime_error("No active volume is loaded.");
-            if(session.storePin && !session.storePin->objectRevision.empty()) {
-                const auto scale=fiberCoordinateScale(session.fiberId,false);
-                if(!scale) throw std::runtime_error("Fiber coordinate binding is missing");
-                session.fiberBaseToVolumeScale=*scale;
-            } else session.fiberBaseToVolumeScale = vc3d::line_annotation::resolveFiberBaseToVolumeScale(
-                session.coordinateBaseShapeZYX, _state->currentVolume()->shape());
+            if(session.storePin && !session.storePin->objectRevision.empty() && !ensureFiberInVolume(session.fiberId,false))
+                throw std::runtime_error("Fiber coordinate binding is missing");
             return true;
         } catch (const std::exception& ex) {
             showError(QString::fromUtf8(ex.what()), session.suppressErrorDialogs);
@@ -11280,7 +11201,7 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
             otherPane.dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(other),
                 generatedBranchLinePointsForSession(other),
-                generatedBranchLinkMarkers(other.branches, other.fiberBaseToVolumeScale),
+                generatedBranchLinkMarkers(other.branches),
                 true,
                 generatedSpanAlignmentMetricsForSession(other));
         } else {
@@ -11292,7 +11213,7 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches, session.fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(session.branches),
             true,
             generatedSpanAlignmentMetricsForSession(session));
     }
@@ -12651,7 +12572,7 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
         if (_state && _state->currentVolume()) {
             const double voxelSizeUm = _state->currentVolume()->voxelSize();
             if (voxelSizeUm > 0.0 && std::isfinite(voxelSizeUm)) {
-                request.traceConfig.baseVoxelSizeUm = voxelSizeUm * session.fiberBaseToVolumeScale;
+                request.traceConfig.baseVoxelSizeUm = voxelSizeUm;
             }
         }
     } catch (...) {
@@ -13892,11 +13813,9 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
 
     cv::Vec2f volumeCenterXY{kNan, kNan};
     if (volume) {
-        const float volumeToFiberBase =
-            static_cast<float>(1.0 / session.fiberBaseToVolumeScale);
         volumeCenterXY = {
-            static_cast<float>(volume->sliceWidth()) * 0.5f * volumeToFiberBase,
-            static_cast<float>(volume->sliceHeight()) * 0.5f * volumeToFiberBase};
+            static_cast<float>(volume->sliceWidth()) * 0.5f,
+            static_cast<float>(volume->sliceHeight()) * 0.5f};
     }
 
     // Pass 1: chain signs along the line. Each valid normal is aligned to
@@ -14012,12 +13931,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
             if (!volume) {
                 throw std::runtime_error("no active volume is loaded");
             }
-            if(session.storePin && !session.storePin->objectRevision.empty()) {
-                const auto scale=fiberCoordinateScale(session.fiberId,false);
-                if(!scale) throw std::runtime_error("Fiber coordinate binding is missing");
-                session.fiberBaseToVolumeScale=*scale;
-            } else session.fiberBaseToVolumeScale = vc3d::line_annotation::resolveFiberBaseToVolumeScale(
-                    session.coordinateBaseShapeZYX, volume->shape());
+            if(session.storePin && !session.storePin->objectRevision.empty() && !ensureFiberInVolume(session.fiberId,false))
+                throw std::runtime_error("Fiber coordinate binding is missing");
         } catch (const std::exception& ex) {
             session.error = ex.what();
             showError(tr("Could not map the fiber into the active volume: %1")
@@ -14064,8 +13979,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     vc::lasagna::LineViewSurfaces views;
     vc::lasagna::LineModel displayLine;
     try {
-        displayLine = lineModelForVolumeDisplay(
-            session.optimizedLine, session.fiberBaseToVolumeScale);
+        displayLine = session.optimizedLine;
         vc::lasagna::LineViewConfig viewConfig;
         viewConfig.controlPointLinePositions.reserve(session.controlPoints.size());
         for (const auto& control : session.controlPoints) {
@@ -14151,19 +14065,17 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     session.generatedSurfaceNames.push_back(session.generatedLineSurfaceName);
     session.generatedSurfaceNames.push_back(session.generatedLineSideSliceName);
 
-    const cv::Vec3d displaySeed =
-        session.seedPoint * session.fiberBaseToVolumeScale;
+    const cv::Vec3d displaySeed = session.seedPoint;
     const cv::Vec3f seedPoint{static_cast<float>(displaySeed[0]),
                               static_cast<float>(displaySeed[1]),
                               static_cast<float>(displaySeed[2])};
     const cv::Vec3f focusPoint = session.focusedControlPoint
-        ? toVec3f(*session.focusedControlPoint * session.fiberBaseToVolumeScale)
+        ? toVec3f(*session.focusedControlPoint)
         : seedPoint;
 
     LineAnnotationDialog::GeneratedViews generatedViews;
-    generatedViews.fiberWidth = session.fiberWidth * session.fiberBaseToVolumeScale;
+    generatedViews.fiberWidth = session.fiberWidth;
     generatedViews.fiberWidthGapFraction = session.fiberWidthGapFraction;
-    generatedViews.fiberBaseToVolumeScale = session.fiberBaseToVolumeScale;
     generatedViews.hasManualDisplayNormals = hasManualNormals;
     for (size_t i = 0; i < session.displayField.controlOffsets.size(); ++i)
         generatedViews.controlAngleOffsetsDegrees.push_back(
@@ -14220,8 +14132,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
                 volumeToAnnotationScale);
     }
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
-    generatedViews.branchLinks = generatedBranchLinkMarkers(
-        session.branches, session.fiberBaseToVolumeScale);
+    generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
     generatedViews.seedPoint = seedPoint;
     generatedViews.focusPoint = focusPoint;
     generatedViews.lineRevision = session.lineRevision;
@@ -14238,8 +14149,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         vc3d::line_annotation::generatedControlLinePositionRange(
             generatedViews.controlPoints);
     generatedViews.predSnapPoints =
-        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet,
-                                 session.fiberBaseToVolumeScale);
+        generatedPredSnapMarkers(session.controlPoints, session.predSnapSet);
     const double maxLinePosition =
         static_cast<double>(std::max<size_t>(1, session.optimizedLine.points.size()) - 1);
     double initialCenterPosition = std::clamp(session.focusedLinePosition,
@@ -14562,21 +14472,6 @@ LineAnnotationController::paneForSurface(const std::string& surfaceName) const
                          surfaceName) != pane.session->generatedSurfaceNames.end();
     });
     return it == _panes.end() ? nullptr : &*it;
-}
-
-cv::Vec3f LineAnnotationController::fiberBasePointFromViewer(
-    const std::string& surfaceName,
-    cv::Vec3f volumePoint) const
-{
-    const auto* pane = paneForSurface(surfaceName);
-    if (!pane || !pane->session) {
-        return volumePoint;
-    }
-    const double scale = pane->session->fiberBaseToVolumeScale;
-    if (!(scale > 0.0) || !std::isfinite(scale) || approximatelyEqual(scale, 1.0)) {
-        return volumePoint;
-    }
-    return volumePoint * static_cast<float>(1.0 / scale);
 }
 
 std::optional<std::string> LineAnnotationController::pickDataset(
@@ -15363,18 +15258,10 @@ LineAnnotationController::generatedBranchLinePointsForSession(
         if (branch.branchFiberId == 0 || !seenFiberIds.insert(branch.branchFiberId).second) {
             continue;
         }
-        const auto scale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr);
-        if (!scale) continue;
+        if (!fiberBoundToVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr)) continue;
         std::vector<cv::Vec3d> linePoints = linePointsForFiber(branch.branchFiberId);
         if (linePoints.size() >= 2) {
-            auto displayed = generatedLinePoints(linePoints);
-            if (!approximatelyEqual(*scale, 1.0)) {
-                const float factor = static_cast<float>(*scale);
-                for (auto& point : displayed) {
-                    point *= factor;
-                }
-            }
-            branches.push_back(std::move(displayed));
+            branches.push_back(generatedLinePoints(linePoints));
         }
     }
     return branches;
@@ -15400,7 +15287,7 @@ void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
         pane.dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(*pane.session),
             generatedBranchLinePointsForSession(*pane.session),
-            generatedBranchLinkMarkers(pane.session->branches, pane.session->fiberBaseToVolumeScale),
+            generatedBranchLinkMarkers(pane.session->branches),
             true,
             generatedSpanAlignmentMetricsForSession(*pane.session));
     }
@@ -15725,8 +15612,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     const auto attachment=_state->objectStoreAttachment();
     const auto volume=_state->currentVolume();
     if(!attachment || !volume) return;
-    // Strip points are in the session's fiber frame; candidates join it there.
-    const double sourceScale=pane->session->fiberBaseToVolumeScale;
+    // Strip points and candidates are in the volume's voxels.
     std::array<double,6> stripBounds{INFINITY,INFINITY,INFINITY,-INFINITY,-INFINITY,-INFINITY};
     for(int row=0;row<request.stripPoints.rows;++row) for(int col=0;col<request.stripPoints.cols;++col) {
         const auto point=request.stripPoints(row,col);
@@ -15739,25 +15625,18 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     std::vector<std::string> selected;
     connection->read(*attachment,[&](const auto& db,const auto& txn,const auto&) {
         vc::objects::ObjectSelection selection;selection.kind="fiber";selection.volume=volume->id();
-        auto bounds=stripBounds;for(auto& value:bounds)value*=sourceScale;selection.bbox=bounds;
+        selection.bbox=stripBounds;
         for(const auto& region:db.spatialRegions(txn,selection)) selected.push_back(region.objectUuid);
         request.unboundFibers=static_cast<size_t>(db.unboundObjectCount(txn,"fiber",volume->id()));
     });
     std::sort(selected.begin(),selected.end());
     selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
     const auto stored=readStoredFibers(selected,true);
-    std::unordered_map<uint64_t,double> factors;
-    for(const auto& fiber:stored) if(const auto scale=storedFiberScale(fiber)) factors[fiber.id]=*scale/sourceScale;
-    for(const auto& open:_panes) if(open.session && open.session->fiberId!=0)
-        factors[open.session->fiberId]=open.session->fiberBaseToVolumeScale/sourceScale;
+    std::unordered_set<uint64_t> inVolume;
+    for(const auto& fiber:stored) if(fiberInVolume(fiber)) inVolume.insert(fiber.id);
+    for(const auto& open:_panes) if(open.session && open.session->fiberId!=0) inVolume.insert(open.session->fiberId);
     request.fibers = fiberSnapshotsForSideStripQuery(stored);
-    std::erase_if(request.fibers,[&](const auto& candidate) { return !factors.contains(candidate.polyline->id); });
-    for(auto& candidate:request.fibers) if(const double factor=factors.at(candidate.polyline->id);factor!=1.0) {
-        auto transformed=std::make_shared<vc::atlas::FiberPolyline>(*candidate.polyline);
-        for(auto& point:transformed->points) point.position*=factor;
-        for(auto& point:transformed->controlPoints) point*=factor;
-        candidate.geometryHash=sideStripFiberGeometryHash(*transformed);candidate.polyline=std::move(transformed);
-    }
+    std::erase_if(request.fibers,[&](const auto& candidate) { return !inVolume.contains(candidate.polyline->id); });
 
     } catch(const std::exception& error) {
         showError(QString::fromUtf8(error.what()),request.suppressErrorDialogs);
@@ -15773,9 +15652,8 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         }
         vc::atlas::FiberSideStripLineQuery query;
         query.fiberId = branch.branchFiberId;
-        const auto linkedScale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state->currentVolume());
-        if (!linkedScale) continue;
-        query.point = branch.branchControlPointPosition * (*linkedScale / pane->session->fiberBaseToVolumeScale);
+        if (!fiberBoundToVolume(branch.branchFiberId, _state->currentVolume())) continue;
+        query.point = branch.branchControlPointPosition;
         query.direction = normalizedOrZero(branch.branchControlPointDirection);
         query.connectorStart = branch.controlPointPosition;
         request.branchLinks.push_back(query);
@@ -16924,7 +16802,7 @@ bool LineAnnotationController::prepareSessionLineModel(LineAnnotationSession& se
             return false;
         }
         session.optimizedLine = FiberFollowService::instance().lineModel(
-            linePoints, _state->currentVolume()->voxelSize() * session.fiberBaseToVolumeScale);
+            linePoints, _state->currentVolume()->voxelSize());
     } else {
         session.optimizedLine = lineModelFromPoints(linePoints, session.normalSampler.get());
     }
@@ -16961,15 +16839,10 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberWidthGapFraction = fiber.widthGapFraction;
     session->fiberOptimizationMode = fiber.optimizationMode;
     session->modelOnly = fiber.modelOnly;
-    if (const auto volume = _state->currentVolume()) {
-        const auto scale = storedFiberScale(fiber);
-        if (!scale) throw std::runtime_error("Fiber coordinate binding is missing");
-        session->fiberBaseToVolumeScale = *scale;
-    }
+    if (_state->currentVolume() && !fiberInVolume(fiber)) throw std::runtime_error("Fiber coordinate binding is missing");
     // Carried through to the saved fiber; without it a re-save from this
     // pane-less session (re-optimization, intersection edits) drops the
-    // fiber's coordinate_base_shape_zyx. Geometry here stays in base
-    // coordinates; the display transform is applied only when building views.
+    // fiber's coordinate_base_shape_zyx.
     session->coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
     session->branches = fiber.branches;
     session->focusedLinePosition = std::clamp(
@@ -17094,8 +16967,6 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     fiber.storePin = session.storePin;
     fiber.coordinateBaseShapeZYX = session.coordinateBaseShapeZYX;
     if (!fiber.coordinateBaseShapeZYX && (!session.storePin || session.storePin->objectRevision.empty())) {
-        if (!approximatelyEqual(session.fiberBaseToVolumeScale, 1.0))
-            throw std::runtime_error("Cannot save a scaled fiber without its coordinate base shape");
         const auto volume = _state ? _state->currentVolume() : nullptr;
         if (!volume)
             throw std::runtime_error("Cannot save a fiber without a coordinate base shape or active volume");
@@ -17429,11 +17300,9 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     if ((!snapshot.fiber.storePin || snapshot.fiber.storePin->objectRevision.empty()) && snapshot.fiber.coordinateIdentity.empty())
         copyCoordinateIdentityToJson(snapshot.fiber.coordinateIdentity, coordinateIdentityForState(_state));
     if ((!fiber.storePin || fiber.storePin->objectRevision.empty()) && _state && _state->currentVolume()) {
+        // A fiber created in an annotation pane is in the volume's voxels.
         for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == fiber.uuid) {
-            const auto volume = _state->currentVolume();
-            const double scale = pane.session->fiberBaseToVolumeScale;
-            if (!(scale > 0) || !std::isfinite(scale)) throw std::runtime_error("Unknown fiber creation frame");
-            snapshot.fiber.coordinateIdentity.update(coordinateBindingForVolume(*volume,1.0/scale));
+            snapshot.fiber.coordinateIdentity.update(coordinateBindingForVolume(*_state->currentVolume(),1.0));
             break;
         }
     }
@@ -17609,7 +17478,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 for (const auto* key : {"coordinates", "coordinate_binding"})
                     if (metadata.contains(key)) fiber.coordinateIdentity[key] = metadata.at(key);
                 if (object.fiber) {
-                    fiber.width = fiber.frame ? vc3d::line_annotation::mapFiberWidth(fiber.frame->storedToVolume, object.fiber->width)
+                    fiber.width = fiber.frame ? vc::fibers::mapFiberWidth(fiber.frame->storedToVolume, object.fiber->width)
                                               : object.fiber->width;
                     fiber.widthGapFraction = object.fiber->widthGapFraction;
                     if (!object.fiber->optimizationMode.empty())
@@ -17631,8 +17500,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     cp.storeId = geometry.controlPointIds.at(i);
                     if (fiber.frame) {
                         const auto& m = fiber.frame->storedToVolume;
-                        if (cp.direction) cp.direction = vc3d::line_annotation::mapFiberDirection(m, *cp.direction);
-                        if (cp.displayNormal) cp.displayNormal = vc3d::line_annotation::mapFiberNormal(m, *cp.displayNormal);
+                        if (cp.direction) cp.direction = vc::fibers::mapFiberDirection(m, *cp.direction);
+                        if (cp.displayNormal) cp.displayNormal = vc::fibers::mapFiberNormal(m, *cp.displayNormal);
                     }
                     fiber.controlPoints.push_back(std::move(cp));
                 }
@@ -17702,7 +17571,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     // Anchor directions are in each fiber's stored frame.
                     const auto direction = [](const StoredFiber& fiber, const Anchor& anchor) {
                         const cv::Vec3d d{(*anchor.direction)[0], (*anchor.direction)[1], (*anchor.direction)[2]};
-                        return fiber.frame ? vc3d::line_annotation::mapFiberDirection(fiber.frame->storedToVolume, d) : d;
+                        return fiber.frame ? vc::fibers::mapFiberDirection(fiber.frame->storedToVolume, d) : d;
                     };
                     branch.controlPointDirection = direction(local, own);
                     branch.branchControlPointDirection = direction(target, other);
@@ -17843,12 +17712,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 for (size_t i = 0; i < stored.controlPoints.size(); ++i) {
                     auto& cp = stored.controlPoints[i];
                     cp[0] = canonical.controlPoints[i][0]; cp[1] = canonical.controlPoints[i][1]; cp[2] = canonical.controlPoints[i][2];
-                    if (cp.direction) cp.direction = vc3d::line_annotation::mapFiberDirection(inverse, *cp.direction);
-                    if (cp.displayNormal) cp.displayNormal = vc3d::line_annotation::mapFiberNormal(inverse, *cp.displayNormal);
+                    if (cp.direction) cp.direction = vc::fibers::mapFiberDirection(inverse, *cp.direction);
+                    if (cp.displayNormal) cp.displayNormal = vc::fibers::mapFiberNormal(inverse, *cp.displayNormal);
                 }
                 for (size_t i = 0; i < stored.linePoints.size(); ++i)
                     stored.linePoints[i] = {canonical.linePoints[i][0], canonical.linePoints[i][1], canonical.linePoints[i][2]};
-                stored.width = vc3d::line_annotation::mapFiberWidth(inverse, fiber.width);
+                stored.width = vc::fibers::mapFiberWidth(inverse, fiber.width);
                 stored.hvClassification = vc3d::line_annotation::classifyFiberHv(
                     vc3d::line_annotation::storedControlPointPositions(stored.controlPoints));
                 // The object keeps the frame it was created in.
@@ -17929,7 +17798,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 auto anchor = [&](const StoredFiber& fiber, int index, const cv::Vec3d& shown) {
                     const auto& stored = inStoredFrame(fiber);
                     const auto direction = fiber.frame
-                        ? vc3d::line_annotation::mapFiberDirection(fiber.frame->storedToVolume.inverse(), shown) : shown;
+                        ? vc::fibers::mapFiberDirection(fiber.frame->storedToVolume.inverse(), shown) : shown;
                     Anchor a;
                     const auto& cp = stored.controlPoints.at(index);
                     a.position = {cp[0],cp[1],cp[2]}; a.direction = {direction[0],direction[1],direction[2]};
@@ -18006,13 +17875,13 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
 #include "LineAnnotationObjectStoreTest.inc"
 #endif
 
-std::optional<double> LineAnnotationController::fiberCoordinateScale(uint64_t id, bool prompt)
+bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
 {
     const auto volume=_state ? _state->currentVolume() : nullptr;
-    if (const auto scale = fiberCoordinateScaleForVolume(id, volume)) return scale;
-    if (!prompt || _errorDialogsSuppressed || !volume) return std::nullopt;
+    if (fiberBoundToVolume(id, volume)) return true;
+    if (!prompt || _errorDialogsSuppressed || !volume) return false;
     const auto stored=readStoredFiber(id, true);
-    if (!stored || !stored->storePin) return std::nullopt;
+    if (!stored || !stored->storePin) return false;
     const auto& fiber=*stored; const auto pin=*fiber.storePin;
     using Json=nlohmann::json;
     Json metadata;
@@ -18037,37 +17906,32 @@ std::optional<double> LineAnnotationController::fiberCoordinateScale(uint64_t id
         .arg(QString::fromStdString(known.dump())).arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]);
     bool accepted=false;
     const auto answer=QInputDialog::getText(_parentWidget.data(),tr("Bind Fiber Coordinates"),message,QLineEdit::Normal,{},&accepted);
-    if (!accepted) return std::nullopt;
+    if (!accepted) return false;
     bool valid=false;const double scale=answer.toDouble(&valid);
-    if (!valid || !(scale>0) || !std::isfinite(scale)) { showError(tr("Enter a positive finite coordinate scale."));return std::nullopt; }
+    if (!valid || !(scale>0) || !std::isfinite(scale)) { showError(tr("Enter a positive finite coordinate scale."));return false; }
     vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,scale);
-    // Bound fibers are read in the volume's voxels.
-    return 1.0;
+    return true;
 }
 
-std::optional<double> LineAnnotationController::fiberCoordinateScaleForVolume(
-    uint64_t id, const std::shared_ptr<Volume>& volume) const
+bool LineAnnotationController::fiberBoundToVolume(uint64_t id, const std::shared_ptr<Volume>& volume) const
 {
     const auto uuid = fiberUuidForId(id);
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    if (!volume || uuid.empty() || !attachment) return std::nullopt;
-    // Bound fibers (by scale or a registration) are read in the volume's voxels.
+    if (!volume || uuid.empty() || !attachment) return false;
     bool bound = false;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto object = db.objectByUuid(txn, uuid);
         bound = object && !object->retired &&
                 db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta), volume->id()).has_value();
     });
-    return bound ? std::optional(1.0) : std::nullopt;
+    return bound;
 }
 
-std::optional<double> LineAnnotationController::storedFiberScale(const StoredFiber& fiber) const
+bool LineAnnotationController::fiberInVolume(const StoredFiber& fiber) const
 {
     const auto volume = _state ? _state->currentVolume() : nullptr;
-    if (!volume || !fiber.storePin) return std::nullopt;
-    // Read in the open volume's voxels when bound to it.
-    return fiber.frame && fiber.frame->volume == volume->id() ? std::optional(1.0) : std::nullopt;
+    return volume && fiber.storePin && fiber.frame && fiber.frame->volume == volume->id();
 }
 
 uint64_t LineAnnotationController::fiberIdForUuid(const std::string& uuid) const

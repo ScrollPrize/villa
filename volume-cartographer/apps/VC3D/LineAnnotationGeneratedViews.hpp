@@ -286,29 +286,11 @@ struct GeneratedSpanAlignmentMetric {
     bool damaged = false;
 };
 
-// Positions cross from the stored fiber grid to the viewer grid together;
-// directions and line indices are independent of that uniform scale.
-inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
-                                          double localScale, double linkedScale)
-{
-    marker.localControlPoint *= static_cast<float>(localScale);
-    marker.linkedControlPoint *= static_cast<float>(linkedScale);
-    marker.planePoint *= static_cast<float>(linkedScale);
-}
-
-inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,
-                                          double scale)
-{
-    marker.controlPoint *= static_cast<float>(scale);
-    marker.snapPoint *= static_cast<float>(scale);
-}
-
 struct GeneratedViews {
     // Revision of the line these views were built from; 0 when unknown.
     uint64_t lineRevision = 0;
     double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
     double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
-    double fiberBaseToVolumeScale = 1.0;
     bool hasManualDisplayNormals = false;
     std::vector<double> controlAngleOffsetsDegrees;
     std::string lineSurfaceName;

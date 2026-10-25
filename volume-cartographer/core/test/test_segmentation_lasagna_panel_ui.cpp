@@ -524,7 +524,8 @@ int main(int argc, char** argv)
         std::string geometry;
         const auto receipt = session->act(attachment, {{document.object.uuid, std::nullopt}}, [&](auto& db, auto& txn) {
             auto object = document.object;
-            object.meta = nlohmann::json{{"source", document.source}}.dump();
+            object.meta = nlohmann::json{{"source", document.source},
+                                         {"coordinates", {{"volume_uuid", "atlas-volume"}, {"scale_factor", 1}}}}.dump();
             db.upsertObject(txn, object);
             geometry = db.putGeometry(txn, object.uuid, document.geometry);
         });
@@ -533,8 +534,8 @@ int main(int argc, char** argv)
     };
     auto writeAtlas = [&](const QString& name, std::optional<vo::PinnedObject> fiber, bool withBase) {
         const auto atlasDir = std::filesystem::path(volpkgRoot.toStdString()) / "atlases" / name.toStdString();
-        nlohmann::json metadata{{"type", "vc3d_atlas"}, {"version", 6}, {"name", name.toStdString()},
-                                {"zero_winding_column", 1}};
+        nlohmann::json metadata{{"type", "vc3d_atlas"}, {"version", 7}, {"name", name.toStdString()},
+                                {"volume", "atlas-volume"}, {"zero_winding_column", 1}};
         if (withBase) {
             auto base = wrappedSurface();
             metadata["base"] = {{"object", pinJson(vc::atlas::storeAtlasBaseSurface(

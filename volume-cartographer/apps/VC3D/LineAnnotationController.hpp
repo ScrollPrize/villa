@@ -418,8 +418,10 @@ public:
     [[nodiscard]] std::string fiberUuidForId(uint64_t id) const;
     // The current head of an active fiber, read from the store.
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
-    std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
-    [[nodiscard]] std::optional<double> fiberCoordinateScaleForVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
+    // Fibers bound to the open volume (by scale or a registration) are read
+    // and edited in its voxels. Optionally prompts to bind an unbound fiber.
+    bool ensureFiberInVolume(uint64_t id, bool prompt = false);
+    [[nodiscard]] bool fiberBoundToVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
     // The current volume's stored umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
@@ -1162,9 +1164,7 @@ private:
     [[nodiscard]] std::vector<std::string> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
-    [[nodiscard]] cv::Vec3f fiberBasePointFromViewer(
-        const std::string& surfaceName,
-        cv::Vec3f volumePoint) const;
+
     // "H"/"V" from the manual tag, falling back to the automatic classification;
     // empty when unknown or the fiber is not in the store.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
@@ -1193,8 +1193,8 @@ private:
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
         const std::array<double, 6>& volumeBox, bool lines = false) const;
     [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
-    // Stored units -> current volume voxels for a fiber read from the store.
-    [[nodiscard]] std::optional<double> storedFiberScale(const StoredFiber& fiber) const;
+    // A fiber read from the store in the open volume's voxels.
+    [[nodiscard]] bool fiberInVolume(const StoredFiber& fiber) const;
     void registerFiberId(const std::string& uuid, uint64_t id) const;
     // Drops everything derived from the previous attachment.
     void resetStoreDerivedState();
@@ -1441,7 +1441,7 @@ private:
     void refreshChangedStoreFibers();
     void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
-        const std::vector<FiberBranchRef>& branches, double localScale) const;
+        const std::vector<FiberBranchRef>& branches) const;
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
     // Tears down the intersection-inspection workspace when one of its

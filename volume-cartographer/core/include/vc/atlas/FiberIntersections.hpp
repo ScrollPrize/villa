@@ -31,7 +31,7 @@ struct FiberPolyline {
     std::vector<FiberPoint> points;
     std::vector<cv::Vec3d> controlPoints;
     std::optional<vc::objects::PinnedObject> storePin;
-    double storeToQueryScale = 1.0;
+    // Positions are in the query volume's voxels (the fiber is bound to it).
     bool coordinateKnown = true;
 };
 
@@ -302,6 +302,8 @@ private:
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr,
     FiberIntersectionProgressCallback progressCallback = {},
     FiberIntersectionCancelCallback cancelCallback = {},
-    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {},
+    // With a store: the query volume, in whose voxels the fibers are given.
+    const std::string& volume = {});
 
 } // namespace vc::atlas

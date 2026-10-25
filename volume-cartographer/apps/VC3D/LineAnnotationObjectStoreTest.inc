@@ -191,7 +191,7 @@ int runObjectStoreControllerTests()
                 return fiber;
             };
             auto s = read(scaled), r = read(registered);
-            require(s.frame && r.frame && controller.storedFiberScale(s) == 1.0 && controller.storedFiberScale(r) == 1.0,
+            require(s.frame && r.frame && controller.fiberInVolume(s) && controller.fiberInVolume(r),
                     "fibers bound by scale or registration are read in the volume");
             require(cv::Vec3d(s.controlPoints[1]) == cv::Vec3d{5,2,3} && s.width == 4, "scale-bound fiber in volume voxels");
             require(cv::Vec3d(r.controlPoints[0]) == cv::Vec3d{7,4,9}, "registered fiber in volume voxels");
@@ -448,7 +448,7 @@ int runObjectStoreControllerTests()
                 require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
         }
         a = resolve(a.uuid); b = resolve(b.uuid);
-        require(controller.generatedBranchLinkMarkers(a.branches, 1.0).empty(), "unbound peers have no branch markers");
+        require(controller.generatedBranchLinkMarkers(a.branches).empty(), "unbound peers have no branch markers");
         {
             auto changedSession = std::make_shared<Controller::LineAnnotationSession>();
             changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin;
@@ -664,41 +664,40 @@ int runObjectStoreControllerTests()
             auto fiber=resolve(everything.front().uuid);
             if(const char* ct=std::getenv("VC3D_OBJECT_STORE_SMOKE_CT")) {
                 state.setCurrentVolume(Volume::New(ct));
-                require(!controller.fiberCoordinateScale(fiber.id,false),"unbound real fiber requires explicit assignment");
+                require(!controller.ensureFiberInVolume(fiber.id,false) && !fiber.frame,"unbound real fiber requires explicit assignment");
+                const auto stored = fiber;
                 QTimer::singleShot(0,[] {
                     for(auto* widget:QApplication::topLevelWidgets()) if(auto* input=qobject_cast<QInputDialog*>(widget)) {
                         input->setTextValue("4");input->accept();
                     }
                 });
                 controller._errorDialogsSuppressed=false;
-                const auto factor=controller.fiberCoordinateScale(fiber.id,true);
+                const bool bound=controller.ensureFiberInVolume(fiber.id,true);
                 controller._errorDialogsSuppressed=true;
-                require(factor && *factor==0.25,"explicit scale-2 binding persists");
+                require(bound,"explicit scale-4 binding persists");
                 fiber=resolve(fiber.uuid);
                 auto mismatched = fiber.coordinateIdentity;
                 mismatched["coordinates"]["volume_uuid"] = vc::objects::util::newUuid();
                 require(!vc::objects::geometryScaleToVolume(mismatched, state.currentVolume()->id()),
                         "matching display ID cannot override conflicting volume UUID");
-                const auto display = controller.fiberInVolumeCoordinates(fiber);
-                require(display.controlPoints.front() == fiber.controlPoints.front() * .25 && display.linePoints.front() == fiber.linePoints.front() * .25, "display geometry uses explicit binding");
-                require(resolve(fiber.uuid).linePoints == fiber.linePoints, "display transform does not change stored geometry");
+                require(fiber.frame && cv::Vec3d(fiber.controlPoints.front()) == cv::Vec3d(stored.controlPoints.front()) * .25 &&
+                        fiber.linePoints.front() == stored.linePoints.front() * .25, "a bound fiber is read in the volume's voxels");
                 require(!fiber.branches.empty(), "real fixture has a linked peer");
                 const auto branch = fiber.branches.front();
                 auto peer = controller.readStoredFiber(branch.branchFiberId, true);
                 require(peer.has_value(), "linked peer is present");
-                const auto peerScale = controller.fiberCoordinateScaleForVolume(peer->id, state.currentVolume());
-                require(peerScale.has_value(), "linked peer is bound to the CT");
-                const auto markers = controller.generatedBranchLinkMarkers({branch}, .25);
-                require(markers.size() == 1 && markers[0].localControlPoint == toVec3f(branch.controlPointPosition) * .25f &&
-                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition) * float(*peerScale),
-                    "linked markers use both coordinate frames");
+                require(controller.fiberBoundToVolume(peer->id, state.currentVolume()), "linked peer is bound to the CT");
+                const auto markers = controller.generatedBranchLinkMarkers({branch});
+                require(markers.size() == 1 && markers[0].localControlPoint == toVec3f(branch.controlPointPosition) &&
+                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition),
+                    "linked markers are in the volume's voxels");
                 Controller::LineAnnotationSession preview;
-                preview.branches = {branch}; preview.fiberBaseToVolumeScale = .25; preview.showLinkedLineOverlays = true;
-                const auto native = la::linePointsBetweenOuterControlPoints(peer->linePoints, la::storedControlPointPositions(peer->controlPoints));
+                preview.branches = {branch}; preview.showLinkedLineOverlays = true;
+                const auto line = la::linePointsBetweenOuterControlPoints(peer->linePoints, la::storedControlPointPositions(peer->controlPoints));
                 const auto overlays = controller.generatedBranchLinePointsForSession(preview);
-                require(overlays.size() == 1 && overlays.front().front() == toVec3f(native.front()) * float(*peerScale),
-                    "linked polyline uses its own frame");
-                const auto point=fiber.controlPoints.front()*(*factor);
+                require(overlays.size() == 1 && overlays.front().front() == toVec3f(line.front()),
+                    "linked polyline is in the volume's voxels");
+                const cv::Vec3d point=fiber.controlPoints.front();
                 Array3D<uint8_t> crop({2,2,2});
                 require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");
                 std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, sampled XYZ " << point << "\n";

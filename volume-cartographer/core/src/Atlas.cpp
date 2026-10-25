@@ -4,6 +4,8 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include "vc/atlas/Atlas.hpp"
+#include "vc/core/types/FiberFrame.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -43,7 +45,7 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kControlPointMatchEpsilon = 1.0e-8;
-constexpr int kAtlasMetadataVersion = 6;
+constexpr int kAtlasMetadataVersion = 7;
 constexpr std::array<const char*, 5> kCoordinateMetadataKeys{
     "vc_open_data_coordinate_space",
     "vc_open_data_source_path",
@@ -301,7 +303,17 @@ std::optional<vc::objects::AttachmentIdentity> pinnedAttachment(const vc::object
     return std::nullopt;
 }
 
-nlohmann::json storedFiberDocument(const FiberMapping& mapping,
+// The pinned revision through the store's mapping into the atlas volume.
+vc::objects::TransformedGeometryView atlasFiberView(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+    const vc::objects::PinnedObject& pin, const std::string& volume)
+{
+    const auto revision = db.objectRevision(txn, pin.objectRevision);
+    if (!revision || revision->objectUuid != pin.object.objectUuid || revision->geometryRevision != pin.geometryRevision || !pin.geometryRevision)
+        throw std::runtime_error("Atlas fiber revision is unavailable");
+    if (volume.empty()) throw std::runtime_error("Atlas metadata names no volume; rebuild required");
+    return vc::objects::GeometrySnapshot(db, txn).fiber(pin.object.objectUuid, *pin.geometryRevision).viewTransformedAt(volume);
+}
+nlohmann::json storedFiberDocument(const FiberMapping& mapping, const std::string& volume,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
     if(!store || !mapping.storePin) throw std::runtime_error("Attach the atlas object store before reading its fibers");
@@ -310,49 +322,50 @@ nlohmann::json storedFiberDocument(const FiberMapping& mapping,
     if(!attachment) throw std::runtime_error("Atlas references a different object store");
     nlohmann::json result;
     store->read(*attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
-        const auto revision=db.objectRevision(txn,pin.objectRevision);
-        if(!revision || revision->objectUuid!=pin.object.objectUuid || revision->geometryRevision!=pin.geometryRevision || !pin.geometryRevision)
-            throw std::runtime_error("Atlas fiber revision is unavailable");
+        const auto view=atlasFiberView(db,txn,pin,volume);
         result=nlohmann::json::parse(vc::objects::fiberRevisionJson(db,txn,pin.objectRevision));
         if(cancelled.load()) throw std::runtime_error("Atlas fiber read cancelled");
-    });
-    if (!(mapping.storeToAtlasScale > 0) || !std::isfinite(mapping.storeToAtlasScale))
-        throw std::runtime_error("Invalid stored atlas coordinate transform");
-    if (mapping.storeToAtlasScale != 1.0) {
-        for (const auto* key : {"control_points","line_points"}) for (auto& entry : result.at(key)) {
-            auto& xyz = entry.is_object() ? entry.at("position") : entry;
-            for (auto& value : xyz) value = value.get<double>() * mapping.storeToAtlasScale;
-        }
-        if (result.contains("width")) result["width"] = result["width"].get<double>() * mapping.storeToAtlasScale;
-        // The transport geometry is in atlas coordinates; its original grid
+        const auto& m=view.mapping();
+        if(m==vc::objects::VolumeAffine::identity()) return;
+        // The transport geometry in atlas coordinates; its original grid
         // dimensions no longer describe the serialized coordinates.
+        for (const auto* key : {"control_points","line_points"}) {
+            auto& entries=result.at(key);
+            const auto shown=view.points(key,0,int64_t(entries.size()));
+            for (size_t i=0;i<entries.size();++i) {
+                auto& entry=entries[i];
+                (entry.is_object() ? entry.at("position") : entry)=shown[i];
+                if(!entry.is_object()) continue;
+                const auto vector=[&](const char* name,auto map) {
+                    if(!entry.contains(name)) return;
+                    const auto v=entry.at(name).template get<std::array<double,3>>();
+                    const auto mapped=map(m,cv::Vec3d{v[0],v[1],v[2]});
+                    entry[name]={mapped[0],mapped[1],mapped[2]};
+                };
+                vector("direction",vc::fibers::mapFiberDirection);
+                vector("display_normal",vc::fibers::mapFiberNormal);
+            }
+        }
+        if (result.contains("width")) result["width"]=vc::fibers::mapFiberWidth(m,result["width"].get<double>());
         result.erase("coordinate_base_shape_zyx");
-        auto coordinates = vc::objects::geometryCoordinates(result.value("coordinates", nlohmann::json::object()));
-        if (!coordinates["scale_factor"].is_null())
-            coordinates["scale_factor"] = coordinates["scale_factor"].get<double>() * mapping.storeToAtlasScale;
-        result["coordinates"] = vc::objects::geometryCoordinates(std::move(coordinates));
-    }
+        result["coordinates"]=vc::objects::geometryCoordinates({{"volume_uuid",volume},{"scale_factor",1}});
+    });
     return result;
 }
-FiberInput loadMappedFiberInput(const FiberMapping& mapping,
+FiberInput loadMappedFiberInput(const FiberMapping& mapping, const std::string& volume,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
     if (!store || !mapping.storePin) throw std::runtime_error("Atlas fiber requires an object store revision pin");
     const auto& pin = *mapping.storePin;
     const auto attachment = pinnedAttachment(*store, pin);
     if (!attachment) throw std::runtime_error("Atlas references a different object store");
-    if (!(mapping.storeToAtlasScale > 0) || !std::isfinite(mapping.storeToAtlasScale))
-        throw std::runtime_error("Invalid stored atlas coordinate transform");
     FiberInput input;
     input.fiberPath = mapping.fiberPath; input.storePin = mapping.storePin;
-    input.storeToAtlasScale = mapping.storeToAtlasScale;
     store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto revision = db.objectRevision(txn, pin.objectRevision);
-        if (!revision || revision->objectUuid != pin.object.objectUuid || revision->geometryRevision != pin.geometryRevision || !pin.geometryRevision)
-            throw std::runtime_error("Atlas fiber revision is unavailable");
-        const auto geometry = std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn, *pin.geometryRevision)));
-        for (const auto& p : geometry.controlPoints) input.controlPoints.push_back(cv::Vec3d{p[0],p[1],p[2]} * mapping.storeToAtlasScale);
-        for (const auto& p : geometry.linePoints) input.linePoints.push_back(cv::Vec3d{p[0],p[1],p[2]} * mapping.storeToAtlasScale);
+        const auto view = atlasFiberView(db, txn, pin, volume);
+        const auto& fiber = std::get<vc::objects::FiberView>(view.canonical());
+        for (const auto& p : view.points("control_points", 0, fiber.controlPointCount())) input.controlPoints.push_back(cv::Vec3d{p[0],p[1],p[2]});
+        for (const auto& p : view.points("line_points", 0, fiber.linePointCount())) input.linePoints.push_back(cv::Vec3d{p[0],p[1],p[2]});
     });
     validateFiberInputControlPoints(input);
     return input;
@@ -445,6 +458,7 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
     }
     atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
     atlas.metadata.basePin = atlasObjectPin(metadata.value("base", nlohmann::json::object()));
+    atlas.metadata.volume = metadata.value("volume", std::string{});
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
@@ -471,7 +485,6 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
         const auto root = readJsonFile(mappingPath);
         FiberMapping mapping;
         mapping.storePin = atlasObjectPin(root);
-        mapping.storeToAtlasScale = root.value("store_to_atlas_scale",1.0);
         if (!mapping.storePin) throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
         mapping.fiberPath = fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid;
         mapping.windingOffset = 0;
@@ -1051,6 +1064,8 @@ void Atlas::save(const fs::path& atlasDir) const
     if (metadata.basePin) {
         metadataJson["base"] = {{"object", atlasObjectPinJson(*metadata.basePin)}};
     }
+    if (metadata.volume.empty()) throw std::runtime_error("Atlas metadata requires its volume");
+    metadataJson["volume"] = metadata.volume;
     saveCoordinateMetadata(metadata, metadataJson);
     writeJsonFile(atlasDir / "metadata.json", metadataJson);
 
@@ -1066,7 +1081,7 @@ void Atlas::save(const fs::path& atlasDir) const
         nlohmann::json root;
         root["type"] = "vc3d_atlas_fiber_mapping";
         root["version"] = kFiberMappingVersion;
-        if (fiber.storePin) { root["object"] = atlasObjectPinJson(*fiber.storePin); root["store_to_atlas_scale"]=fiber.storeToAtlasScale; }
+        if (fiber.storePin) { root["object"] = atlasObjectPinJson(*fiber.storePin); }
         else throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
         root["line_anchors"] = nlohmann::json::array();
         for (const auto& anchor : fiber.lineAnchors) {
@@ -1103,6 +1118,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
     }
     atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
     atlas.metadata.basePin = atlasObjectPin(metadata.value("base", nlohmann::json::object()));
+    atlas.metadata.volume = metadata.value("volume", std::string{});
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
@@ -1142,7 +1158,6 @@ Atlas Atlas::load(const fs::path& atlasDir,
             }
             FiberMapping mapping;
             mapping.storePin = atlasObjectPin(root);
-        mapping.storeToAtlasScale = root.value("store_to_atlas_scale",1.0);
         if (!mapping.storePin) throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
         mapping.fiberPath = fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid;
             mapping.windingOffset = 0;
@@ -1156,7 +1171,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
                 throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
                                          " references missing fiber path; rebuild required");
             }
-            const FiberInput sourceFiber = loadMappedFiberInput(mapping, store);
+            const FiberInput sourceFiber = loadMappedFiberInput(mapping, atlas.metadata.volume, store);
             validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingPath);
             atlas.fibers.push_back(std::move(mapping));
         }
@@ -1234,7 +1249,7 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
         if (oldMapping.fiberPath.empty()) {
             throw std::runtime_error("cannot rebuild atlas mapping with missing fiber path");
         }
-        const FiberInput input = loadMappedFiberInput(oldMapping, store);
+        const FiberInput input = loadMappedFiberInput(oldMapping, legacy.metadata.volume, store);
         rebuilt.fibers.push_back(
             mapFiberToBaseSurface(input, baseSurface, baseIndex, normalSampler, options));
         rebuiltInputs.push_back(input);
@@ -2127,7 +2142,7 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
         const fs::path attachmentPath =
             atlasPredSnapAttachmentPath(atlasDir, mapping.fiberPath);
         const bool existed = fs::exists(attachmentPath);
-        const FiberInput input = loadMappedFiberInput(mapping, store);
+        const FiberInput input = loadMappedFiberInput(mapping, atlas.metadata.volume, store);
         (void)ensureAtlasPredSnapSet(atlasDir, input, mapping, baseSurface, sampler);
         if (!existed && fs::exists(attachmentPath)) {
             ++report.attachmentsCreated;
@@ -3100,7 +3115,7 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
                   << mapping.fiberPath.generic_string()
                   << " controls=" << mapping.controlAnchors.size()
                   << std::endl;
-        const FiberInput input = loadMappedFiberInput(mapping, store);
+        const FiberInput input = loadMappedFiberInput(mapping, atlas.metadata.volume, store);
         AtlasPredSnapSet set = ensureAtlasPredSnapSet(atlasDir,
                                                       input,
                                                       mapping,
@@ -3735,7 +3750,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
             throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
                                      " references missing fiber path: ");
         }
-        const FiberInput sourceFiber = loadMappedFiberInput(mapping, store);
+        const FiberInput sourceFiber = loadMappedFiberInput(mapping, exportData.atlas.metadata.volume, store);
         validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingFiles[i]);
 
         LasagnaAtlasObject object;
@@ -3747,7 +3762,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                 exportData.transportDirectory=std::shared_ptr<fs::path>(new fs::path(temp),[](auto* path){std::error_code ec;fs::remove_all(*path,ec);delete path;});
             }
             object.fiberPath=*exportData.transportDirectory/(mapping.storePin->object.objectUuid+".json");
-            writeJsonFile(object.fiberPath,storedFiberDocument(mapping,store));
+            writeJsonFile(object.fiberPath,storedFiberDocument(mapping,exportData.atlas.metadata.volume,store));
         }
         object.mappingPath = mappingFiles[i];
         object.predSnapAttachmentPath = atlasPredSnapAttachmentPath(atlasDir, mapping.fiberPath);
@@ -4587,7 +4602,6 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     FiberMapping mapping;
     mapping.fiberPath = validatedFiber.fiberPath;
     mapping.storePin = validatedFiber.storePin;
-    mapping.storeToAtlasScale = validatedFiber.storeToAtlasScale;
     for (int i = mappedFirst; i <= mappedLast; ++i) {
         if (!anchors[static_cast<size_t>(i)]) {
             break;
@@ -4615,6 +4629,7 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
 }
 
 Atlas createSingleFiberAtlas(const std::string& atlasName,
+                             const std::string& volume,
                              const FiberInput& fiber,
                              const vc::objects::PinnedObject& basePin,
                              int zeroWindingColumn,
@@ -4622,6 +4637,7 @@ Atlas createSingleFiberAtlas(const std::string& atlasName,
 {
     Atlas atlas;
     atlas.metadata.name = sanitizeAtlasName(atlasName);
+    atlas.metadata.volume = volume;
     atlas.metadata.basePin = basePin;
     atlas.metadata.zeroWindingColumn = zeroWindingColumn;
     atlas.metadata.seedLineIndex = seedLineIndexForFiber(fiber);

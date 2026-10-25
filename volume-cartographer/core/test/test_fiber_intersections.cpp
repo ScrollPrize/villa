@@ -721,7 +721,8 @@ TEST_CASE("Store selected candidates preserve indexed refinement and reject stal
     for(auto& value:fibers) {
         const auto uuid=util::newUuid();std::string geometry;
         const auto receipt=session->act(attachment,{{uuid,{}}},[&](auto& db,auto& txn) {
-            ObjectRecord record;record.uuid=uuid;record.kind="fiber";record.name="same name";db.upsertObject(txn,record);
+            ObjectRecord record;record.uuid=uuid;record.kind="fiber";record.name="same name";
+            record.meta=R"({"coordinates":{"volume_uuid":"query-volume","scale_factor":1}})";db.upsertObject(txn,record);
             vc::geometry::Fiber data;
             for(const auto& point:value.points) data.linePoints.push_back({point.position[0],point.position[1],point.position[2]});
             data.controlPoints={data.linePoints.front(),data.linePoints.back()};
@@ -732,7 +733,7 @@ TEST_CASE("Store selected candidates preserve indexed refinement and reject stal
     vc::atlas::FiberIntersectionBroadPhaseOptions broad;broad.maxDistance=1;broad.maxSampleSpacing=1;broad.clusterArclength=2;
     vc::atlas::FiberIntersectionCeresOptions ceres;ceres.deduplicateArclength=2;
     auto indexed=vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres);
-    auto stored=vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session);
+    auto stored=vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session,"query-volume");
     REQUIRE(stored.size()==indexed.size()); REQUIRE(stored.size()==2);
     for(size_t i=0;i<stored.size();++i) {
         CHECK(stored[i].sourceArclength==indexed[i].sourceArclength);
@@ -741,10 +742,15 @@ TEST_CASE("Store selected candidates preserve indexed refinement and reject stal
         CHECK(stored[i].sourcePoint==indexed[i].sourcePoint);
         CHECK(stored[i].targetPoint==indexed[i].targetPoint);
     }
+    // A volume registered at half scale: the store maps the fibers into it.
+    const auto registration=util::newUuid();
+    session->act(attachment,{{registration,std::nullopt}},[&](auto& db,auto& txn) {
+        (void)db.registerVolumeTransform(txn,"query-volume","half-volume",VolumeAffine::scale(0.5),"half",registration);
+    });
     auto scaled=fibers;
-    for(auto& f:scaled) {f.storeToQueryScale=0.5;for(auto& point:f.points) point.position*=0.5;for(auto& point:f.controlPoints)point*=0.5;}
+    for(auto& f:scaled) {for(auto& point:f.points) point.position*=0.5;for(auto& point:f.controlPoints)point*=0.5;}
     auto scaledIndexed=vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres);
-    auto scaledStored=vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session);
+    auto scaledStored=vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session,"half-volume");
     REQUIRE(scaledStored.size()==scaledIndexed.size());
     for(size_t i=0;i<scaledStored.size();++i) {
         CHECK(scaledStored[i].sourcePoint==scaledIndexed[i].sourcePoint);
@@ -752,10 +758,10 @@ TEST_CASE("Store selected candidates preserve indexed refinement and reject stal
         CHECK(scaledStored[i].sourceArclength==scaledIndexed[i].sourceArclength);
     }
     scaled.back().coordinateKnown=false;
-    CHECK_THROWS(vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session));
-    CHECK_NOTHROW(vc::atlas::searchFiberIntersections(scaled,{1},{2},nullptr,broad,ceres,nullptr,{},{},session));
+    CHECK_THROWS(vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session,"half-volume"));
+    CHECK_NOTHROW(vc::atlas::searchFiberIntersections(scaled,{1},{2},nullptr,broad,ceres,nullptr,{},{},session,"half-volume"));
     auto pin=*fibers.front().storePin;
     session->act(attachment,{{pin.object.objectUuid,pin.objectRevision}},[&](auto& db,auto& txn) {db.setMeta(txn,pin.object.objectUuid,"external","true");});
-    CHECK_THROWS(vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session));
+    CHECK_THROWS(vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session,"query-volume"));
     session->detach(attachment);std::filesystem::remove(path);
 }

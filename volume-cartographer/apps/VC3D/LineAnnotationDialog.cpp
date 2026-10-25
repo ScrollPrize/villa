@@ -1411,7 +1411,7 @@ void LineAnnotationDialog::setFiberWidth(double baseVoxels, double gapFraction)
 {
     const QSignalBlocker blocker(_fiberWidthSpin);
     if (_fiberWidthSpin->value() != baseVoxels) _fiberWidthSpin->setValue(baseVoxels);
-    _generatedViews.fiberWidth = baseVoxels * _generatedViews.fiberBaseToVolumeScale;
+    _generatedViews.fiberWidth = baseVoxels;
     _generatedViews.fiberWidthGapFraction = gapFraction;
     updateFiberDisplayControlsAndGuides();
 }
@@ -1422,8 +1422,7 @@ void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
     _angleControlIndex.reset();
     const auto& arcs = currentLineArclengths();
     const double currentArc = vc3d::fiber_slice::arclengthAtLinePosition(arcs, _currentLinePosition);
-    double nearest = vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels *
-                     _generatedViews.fiberBaseToVolumeScale;
+    double nearest = vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
     std::vector<double> positions;
     for (const auto& cp : _generatedViews.controlPoints) positions.push_back(cp.linePosition);
     const auto nearby = vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
@@ -6526,8 +6525,7 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         const auto uv=viewer->sceneToSurfaceCoords(scene);
         const GeneratedOverlay::ControlPointMarker* chosen=nullptr;
         cv::Vec2d chosenUV;
-        double best=vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels *
-                    _generatedViews.fiberBaseToVolumeScale;
+        double best=vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
         for (const auto& cp : _generatedViews.controlPoints) {
             // The column the marker is drawn at (shared with the markers and
             // hover zones): a provisional control's own index may index the

@@ -35,6 +35,9 @@ struct AtlasMetadata {
     // The stored surface (an init shell chosen at creation) at the revision the
     // atlas was built on; its coordinates are atlas coordinates.
     std::optional<vc::objects::PinnedObject> basePin;
+    // The volume whose voxels are atlas coordinates. Fibers are read through
+    // the store's mapping into it (bound by scale or through a registration).
+    std::string volume;
     int zeroWindingColumn = 0;
     int seedLineIndex = 0;
     double seedAtlasU = 0.0;
@@ -56,7 +59,6 @@ struct FiberMapping {
     std::vector<AtlasAnchor> lineAnchors;
     std::vector<AtlasAnchor> controlAnchors;
     std::optional<vc::objects::PinnedObject> storePin;
-    double storeToAtlasScale = 1.0;
 };
 
 struct AtlasLinkEndpoint {
@@ -122,7 +124,6 @@ struct FiberInput {
     std::vector<cv::Vec3d> linePoints;
     std::vector<int> controlLineIndices;
     std::optional<vc::objects::PinnedObject> storePin;
-    double storeToAtlasScale = 1.0;
 };
 
 struct SurfaceCandidate {
@@ -514,7 +515,9 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const vc::lasagna::NormalSampler& normalSampler,
                                    const LineMappingOptions& options = {});
 
+// `fiber` is in the voxels of `volume`, the atlas coordinate frame.
 Atlas createSingleFiberAtlas(const std::string& atlasName,
+                             const std::string& volume,
                              const FiberInput& fiber,
                              const vc::objects::PinnedObject& basePin,
                              int zeroWindingColumn,

@@ -820,7 +820,6 @@ vc::atlas::FiberInput fiberInputFromSnapshot(const std::filesystem::path& fiberP
     vc::atlas::FiberInput input;
     input.fiberPath = fiberPath;
     input.storePin = fiber.storePin;
-    input.storeToAtlasScale = fiber.storeToQueryScale;
     input.controlPoints = fiber.controlPoints;
     input.linePoints = linePointsFromPolyline(fiber);
     vc::atlas::validateFiberInputControlPoints(input);
@@ -5617,6 +5616,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     auto cancelFlag = _atlasSearchCancelFlag;
     const auto atlasDirForWorker = _currentAtlasDir;
     watcher->setFuture(QtConcurrent::run([store = _state->objectStoreSession(), fibers = std::move(fibers),
+                                          volume = _state->currentVolume() ? _state->currentVolume()->id() : std::string{},
                                           sourceFiberIds = std::move(sourceFiberIds),
                                           targetFiberIds = std::move(targetFiberIds),
                                           fiberPathById = std::move(fiberPathById),
@@ -5698,7 +5698,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
                                                               ceres,
                                                               &windingSampler,
                                                               progressCallback,
-                                                              cancelCallback, store);
+                                                              cancelCallback, store, volume);
         if (debugSearch) {
             qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
                 .arg(atlasSearchIdListString(sourceFiberIds),

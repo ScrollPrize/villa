@@ -727,8 +727,8 @@ private:
 
 class SearchFiberPointIndex {
 public:
-    explicit SearchFiberPointIndex(double maxSampleSpacing, std::shared_ptr<vc::objects::ObjectStoreSession> store)
-        : maxSampleSpacing_(sanitizedSampleSpacing(maxSampleSpacing)), store_(std::move(store))
+    SearchFiberPointIndex(double maxSampleSpacing, std::shared_ptr<vc::objects::ObjectStoreSession> store, std::string volume)
+        : maxSampleSpacing_(sanitizedSampleSpacing(maxSampleSpacing)), store_(std::move(store)), volume_(std::move(volume))
     {
     }
 
@@ -736,10 +736,10 @@ public:
     {
         if (store_) {
             if (!fiber.storePin) throw std::runtime_error("Store search requires pinned fibers");
-            if (!fiber.coordinateKnown || !(fiber.storeToQueryScale > 0) || !std::isfinite(fiber.storeToQueryScale))
-                throw std::runtime_error("Bind every participating fiber's volume and scale before an exhaustive search");
+            if (!fiber.coordinateKnown)
+                throw std::runtime_error("Bind every participating fiber to the volume before an exhaustive search");
+            if (volume_.empty()) throw std::runtime_error("Store search requires the query volume");
             pins_.emplace(fiber.id, *fiber.storePin);
-            scales_.emplace(fiber.id, fiber.storeToQueryScale);
         }
         auto samples = denseSamplesForFiber(fiber, maxSampleSpacing_);
         auto values = pointValuesForFiber(fiber, samples);
@@ -782,20 +782,17 @@ public:
                 bounds[axis+3]=std::max(bounds[axis+3],sample.position[axis]+maxDistance);
             }
             store_->read(pin.attachment, [&](const auto& db,const auto& txn,const auto& canceled) {
-                std::map<double,std::vector<std::string>> groups;
+                // The store maps each fiber's frame (scale or registration) to the volume.
+                vc::objects::ObjectSelection selection;selection.kind="fiber";selection.volume=volume_;selection.bbox=bounds;
                 for(const auto& [id, target]:pins_) {
                     if(canceled || (cancelCallback && cancelCallback())) throw std::runtime_error("Fiber search canceled");
                     const auto head=db.currentObjectRevision(txn,target.object.objectUuid);
                     if(target.attachment!=pin.attachment || !head || head->uuid!=target.objectRevision)
                         throw std::runtime_error("Fiber search superseded by a committed edit");
-                    groups[scales_.at(id)].push_back(target.object.objectUuid);
+                    selection.uuids.push_back(target.object.objectUuid);
                 }
                 std::unordered_set<std::string> matches;
-                for (const auto& [scale,uuids] : groups) {
-                    vc::objects::ObjectSelection selection;selection.kind="fiber";selection.uuids=uuids;
-                    auto nativeBounds=bounds;for(auto& value:nativeBounds)value/=scale;selection.bbox=nativeBounds;
-                    for(const auto& region:db.spatialRegions(txn,selection)) matches.insert(region.objectUuid);
-                }
+                for(const auto& object:db.selectObjects(txn,selection,std::vector<std::string>{})) matches.insert(object.uuid);
                 for(const auto& [id,target]:pins_) if(matches.contains(target.object.objectUuid)) selected.insert(id);
             });
         }
@@ -982,7 +979,7 @@ public:
 private:
     std::shared_ptr<vc::objects::ObjectStoreSession> store_;
     std::unordered_map<uint64_t, vc::objects::PinnedObject> pins_;
-    std::map<uint64_t,double> scales_;
+    std::string volume_;
     double maxSampleSpacing_ = kDefaultMaxSampleSpacing;
     std::unordered_map<uint64_t, std::vector<FiberDenseSample>> samplesByFiberId_;
     std::vector<PointRTreeValue> values_;
@@ -2081,14 +2078,15 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     const vc::lasagna::LasagnaNormalSampler* windingSampler,
     FiberIntersectionProgressCallback progressCallback,
     FiberIntersectionCancelCallback cancelCallback,
-    std::shared_ptr<vc::objects::ObjectStoreSession> store)
+    std::shared_ptr<vc::objects::ObjectStoreSession> store,
+    const std::string& volume)
 {
     // Store snapshots already carry revisions; the legacy cache is keyed only
     // by runtime generations and cannot represent attachment or frame changes.
     if (windingSampler || store) cache = nullptr;
 
     std::unordered_map<uint64_t, const FiberPolyline*> byId;
-    SearchFiberPointIndex index(broad.maxSampleSpacing, std::move(store));
+    SearchFiberPointIndex index(broad.maxSampleSpacing, std::move(store), volume);
     if (progressCallback) {
         progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex, 0, fibers.size());
     }

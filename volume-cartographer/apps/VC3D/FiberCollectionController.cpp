@@ -598,7 +598,7 @@ void FiberCollectionController::navigate(int index)
 {
     if (!selected_ || !enabled_ || !selectedPin_) return;
     selection_.index = index;
-    if (!selectedBound_) selectedBound_ = annotations_->fiberCoordinateScale(uint64_t(selected_), true).has_value();
+    if (!selectedBound_) selectedBound_ = annotations_->ensureFiberInVolume(uint64_t(selected_), true);
     if (!selectedBound_) return;
     ++navigationRevision_;
     pendingIndex_ = index;
