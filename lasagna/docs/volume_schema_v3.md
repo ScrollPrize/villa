@@ -31,6 +31,16 @@ coordinate conventions, inference resolution, or pyramid reduction methods.
 The immediate scope is Lasagna volumes. The same layout can accommodate
 Fiber prediction channels without defining new Fiber channel encodings here.
 
+The fiber full-volume runner exports `presence`, `nx`, and `ny` (fiber
+direction), plus `width` when the checkpoint has a width head. Checkpoints
+with a normal head also export `sheet_nx`, `sheet_ny`, and `sheet_grad_mag`
+(fiber/sheet normal, distinct from fiber direction). H/V is not exported.
+These channels share the resolution group when stored at the same scale.
+`presence` remains the validity channel; by default, zero presence blanks
+all other channels, including the normal channels. The manifest's channel
+inventory describes actual exports; checkpoint annotation settings describe
+the model heads, not an independent export switch.
+
 ## Layout and naming
 
 `sd<N>` identifies a group whose finest stored level has `scaledown: N`.

@@ -2682,6 +2682,40 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	return int(value % int(worker_count))
 
 
+class _ReadyChunkQueue:
+	"""Coordinator-owned FIFO per chunk, shared ready queue across all workers.
+
+	Callers enqueue in canonical tile order. A chunk stays locked until its
+	worker acknowledges completion; independent chunks may finish in any order.
+	Memory is bounded by the caller's existing result-slot window.
+	"""
+	def __init__(self):
+		self.pending = {}
+		self.ready = deque()
+		self.active = set()
+
+	def put(self, key, value):
+		if key not in self.pending:
+			self.pending[key] = deque()
+			self.ready.append(key)
+		self.pending[key].append(value)
+
+	def take(self):
+		if not self.ready:
+			return None
+		key = self.ready.popleft()
+		assert key not in self.active
+		self.active.add(key)
+		return key, self.pending[key].popleft()
+
+	def complete(self, key):
+		self.active.remove(key)
+		if self.pending[key]:
+			self.ready.append(key)
+		else:
+			del self.pending[key]
+
+
 def _record_array(record: np.ndarray, layout: _SharedArrayLayout) -> np.ndarray:
 	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=record,
 		offset=layout.offset)
@@ -4436,7 +4470,10 @@ def run_tiled_inference_3d(
 			commit_time = 0.0
 			accum_task_id = 0
 			accum_pending: dict[int, dict[str, Any]] = {}
+			accum_ready = _ReadyChunkQueue()
+			accum_next_worker = 0
 			accum_work_sum = 0.0
+			accum_counts = [0 for _ in accum_queues]
 			accum_queue_wait = 0.0
 			accum_started_at: float | None = None
 			accum_backends: set[str] = set()
@@ -4592,6 +4629,8 @@ def run_tiled_inference_3d(
 					)
 				if message[0] != "result":
 					raise RuntimeError(f"unknown accumulator worker message: {message}")
+				accum_ready.complete(metadata["queue_key"])
+				accum_counts[source_worker] += 1
 				accum_backends.add(str(message[4]))
 				accum_work_sum += float(message[5])
 				g = metadata["group"]
@@ -4671,30 +4710,37 @@ def run_tiled_inference_3d(
 					accum_started_at = time.perf_counter()
 
 			def _pump_accumulator_submissions(seq: int, event: dict[str, Any]) -> bool:
-				nonlocal accum_task_id, accum_queue_wait
-				pending = event.get("accum_to_submit")
+				nonlocal accum_task_id
+				pending = event.pop("accum_to_submit", None)
 				if not pending:
 					return False
-				progressed = False
-				while pending:
-					task_template, metadata = pending[0]
+				for task_template, metadata in pending:
 					task = replace(task_template, task_id=accum_task_id, event_seq=int(seq))
-					owner = _stable_accumulator_owner(task.sd, task.origin, len(accum_queues))
-					if len(accum_outstanding[owner]) >= 2:
-						break
-					wait_started = time.perf_counter()
-					try:
-						accum_queues[owner].put_nowait(task)
-					except queue.Full:
-						break
-					accum_queue_wait += time.perf_counter() - wait_started
-					pending.popleft()
-					accum_pending[accum_task_id] = metadata
-					accum_outstanding[owner][accum_task_id] = int(seq)
+					key = (task.sd, task.origin)
+					metadata["queue_key"] = key
+					accum_ready.put(key, (task, metadata))
 					accum_task_id += 1
+				return True
+
+			def _dispatch_ready_accumulation() -> bool:
+				nonlocal accum_next_worker, accum_queue_wait
+				progressed = False
+				for offset in range(len(accum_queues)):
+					owner = (accum_next_worker + offset) % len(accum_queues)
+					if accum_outstanding[owner]:
+						continue
+					item = accum_ready.take()
+					if item is None:
+						break
+					_key, (task, metadata) = item
+					wait_started = time.perf_counter()
+					# One outstanding task per worker: its two-slot queue cannot be full.
+					accum_queues[owner].put_nowait(task)
+					accum_queue_wait += time.perf_counter() - wait_started
+					accum_pending[task.task_id] = metadata
+					accum_outstanding[owner][task.task_id] = task.event_seq
 					progressed = True
-				if not pending:
-					event.pop("accum_to_submit", None)
+				accum_next_worker = (accum_next_worker + 1) % max(1, len(accum_queues))
 				return progressed
 
 			def _validate_worker_ownership() -> None:
@@ -4995,6 +5041,7 @@ def run_tiled_inference_3d(
 							event["status"] = "done_accum"
 						next_accum_dispatch += 1
 						made_progress = True
+					made_progress = _dispatch_ready_accumulation() or made_progress
 					commit_started = time.perf_counter()
 					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_accum"):
 						event = events.pop(next_commit)
@@ -5096,6 +5143,7 @@ def run_tiled_inference_3d(
 					f"[predict3d] accumulator stats workers={len(accum_processes)} tasks={accum_task_id} "
 					f"work_sum={accum_work_sum:.2f}s queue_wait={accum_queue_wait:.2f}s "
 					f"wall={accum_wall:.2f}s rate={accum_rate:.2f}tasks/s "
+					f"worker_tasks={accum_counts} "
 					f"backends={','.join(sorted(accum_backends)) or ('native-sync' if not accum_processes else 'none')}",
 					flush=True,
 				)

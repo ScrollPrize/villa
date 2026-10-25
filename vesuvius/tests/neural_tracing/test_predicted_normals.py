@@ -1,10 +1,58 @@
 import numpy as np
+import json
 import pytest
 import torch
+import zarr
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import FiberTrace3DPredictAdapter
 from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import validate_cached_model
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
 from lasagna.normal_encoding import encode_normal_nxny_u8
+
+
+@pytest.mark.parametrize('normal', [False, True])
+def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal):
+    from vesuvius.neural_tracing.fiber_trace_3d import infer
+    from lasagna.lasagna_volume import LasagnaVolume
+
+    cfg = {'annotations': {'normal_weight': int(normal), 'width_weight': 1, 'hv_weight': 1},
+           'model_3d': {'features_per_stage': [8, 16], 'normalization': 'group', 'output_stride': 2}}
+    torch.manual_seed(7)
+    model = build_fiber_trace_3d_model(cfg).eval()
+    monkeypatch.setattr(FiberTrace3DPredictAdapter, 'load_model', lambda self, device: model)
+    checkpoint = tmp_path / 'model.pt'
+    torch.save({'config': cfg, 'step': 123}, checkpoint)
+    source = tmp_path / 'input.zarr'
+    kwargs = dict(mode='w', shape=(16, 16, 16), chunks=(8, 8, 8), dtype='uint8')
+    try:
+        array = zarr.open_array(str(source), zarr_format=2, **kwargs)
+    except TypeError:  # Zarr 2 uses v2 by default.
+        array = zarr.open_array(str(source), **kwargs)
+    array[:] = 100
+    for fmt in ('compact', 'legacy'):
+        output = tmp_path / fmt / 'prediction.lasagna.json'
+        infer.run_fiber_trace_3d_inference(
+            input_path=str(source), output_path=output, checkpoint=checkpoint,
+            output_format=fmt, device='cpu', no_download=True, base_ref=str(source), base_scale=0,
+            tile_size=16, overlap=0, border=0, inference_scaledown_power=1,
+            levels=3, ome_chunk=4, flush_workers=0, accumulator_workers=0,
+            inference_precision='off',
+        )
+        manifest = LasagnaVolume.load(output.parent / 'prediction.zarr' if fmt == 'compact' else output)
+        channels = {c for group in manifest.groups.values() for c in group.channels}
+        expected = {'presence', 'nx', 'ny', 'width'}
+        if normal:
+            expected |= {'sheet_nx', 'sheet_ny', 'sheet_grad_mag'}
+        assert channels == expected
+        provenance = json.loads((output.parent / 'inference.json').read_text())
+        schema = provenance['checkpoint']['output_schema']
+        assert schema['annotations'] == cfg['annotations']
+        assert 'annotation_products_exported' not in schema
+    if normal:
+        array = zarr.open_array(str(tmp_path / 'compact/prediction.zarr/sd1/1'), mode='r')
+        assert array.shape[0] == array.chunks[0] == 7
+        assert np.any(array[-1] == 255)
+        values = array[:]
+        assert np.all(values[:, values[0] == 0] == 0)
 
 
 @pytest.mark.parametrize('width', [False, True])

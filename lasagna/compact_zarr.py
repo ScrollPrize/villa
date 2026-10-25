@@ -1,9 +1,9 @@
 """Schema-v3 packed prediction storage, shared by full and demand inference."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+from functools import lru_cache, partial
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import threading
@@ -111,6 +111,57 @@ def atomic_chunk(array_path, origin, values):
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@lru_cache(maxsize=8)
+def _pyramid_source(path):
+    return zarr.open_array(path, mode="r")
+
+
+def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
+                                channel_dtypes, blank_invalid):
+    """Spawn-safe packed chunk worker; reduction math matches the legacy path."""
+    from lasagna.omezarr_pyramid import _mean_pool2x_u8, _mean_pool2x_f32, _moment_pool2x_normals
+    from lasagna.tiled_predict3d import _product_channel_kind
+    if chunk_file(dest_path, origin).is_file():
+        return "skipped_existing"
+    source = _pyramid_source(source_path)
+    chunks = _array_metadata(dest_path)["chunks"]
+    slices = tuple(slice(o*2, min((o+c)*2, n)) for o,c,n in zip(origin, chunks[1:], source.shape[1:]))
+    raw = np.asarray(source[(slice(None), *slices)])
+    output = [_mean_pool2x_u8(raw[i], zero_overrides=(_product_channel_kind(name) == "grad_mag"))
+              if channel_dtypes[name] == np.dtype("uint8") else _mean_pool2x_f32(raw[i])
+              for i, name in enumerate(names)]
+    for i, name in enumerate(names):
+        if _product_channel_kind(name) == "nx":
+            sibling = name[:-2] + "ny"
+            if sibling in names:
+                j = names.index(sibling)
+                presence = name[:-2] + "presence"
+                mask = None
+                if blank_invalid:
+                    ps = [raw[k] for k,c in enumerate(names) if c == "presence" or c.endswith("_presence")]
+                    if presence in names:
+                        mask = raw[names.index(presence)]
+                    elif ps:
+                        mask = np.maximum.reduce(ps)
+                output[i], output[j] = _moment_pool2x_normals(raw[i], raw[j], validity=mask)
+    if blank_invalid:
+        # Width/embeddings are undefined at zero presence, not physical zero.
+        ps = [raw[i] for i,name in enumerate(names) if name == "presence" or name.endswith("_presence")]
+        if ps:
+            valid = (np.maximum.reduce(ps) != 0).astype(np.float32)
+            denominator = _mean_pool2x_f32(valid)
+            for i,name in enumerate(names):
+                if name == "width" or name.startswith("embedding_"):
+                    mean = _mean_pool2x_f32(raw[i] * valid) / np.maximum(denominator, 1e-12)
+                    output[i] = (np.rint(mean).clip(0,255).astype(np.uint8)
+                                 if channel_dtypes[name] == np.dtype("uint8") else mean)
+    values = dict(zip(names, output))
+    if blank_invalid:
+        values = blank_fiber_channels(values)
+    atomic_chunk(dest_path, origin, np.stack([values[k] for k in names]))
+    return "written"
 
 
 class CompactOutputAdapter:
@@ -244,9 +295,10 @@ class CompactOutputAdapter:
         except (OSError, ValueError, RuntimeError):
             return False
 
-    def build_pyramids(self, workers=1):
-        from lasagna.omezarr_pyramid import _mean_pool2x_u8, _mean_pool2x_f32, _moment_pool2x_normals
-        from lasagna.tiled_predict3d import _product_channel_kind
+    def build_pyramids(self, workers=0):
+        from lasagna.omezarr_pyramid import _run_pool
+        if workers <= 0:
+            workers = max(1, multiprocessing.cpu_count())
         for native, products in self.by_level.items():
             names = [c.name for p in products for c in p.channels]
             channel_dtypes = {c.name: np.dtype(p.dtype) for p in products for c in p.channels}
@@ -260,44 +312,8 @@ class CompactOutputAdapter:
                     if file.is_file() and all(part.isdigit() for part in file.relative_to(parent).parts):
                         indices = tuple(map(int, file.relative_to(parent).parts[1:]))
                         origins.add(tuple((i*c//2//d)*d for i,c,d in zip(indices, source.chunks[1:], dest.chunks[1:])))
-                def build(origin):
-                    if chunk_file(self.array_path(products[0], level), origin).is_file():
-                        return
-                    slices = tuple(slice(o*2, min((o+c)*2, n)) for o,c,n in zip(origin, dest.chunks[1:], source.shape[1:]))
-                    raw = np.asarray(source[(slice(None), *slices)])
-                    output = [_mean_pool2x_u8(raw[i], zero_overrides=(_product_channel_kind(name) == "grad_mag"))
-                              if channel_dtypes[name] == np.dtype("uint8") else _mean_pool2x_f32(raw[i])
-                              for i, name in enumerate(names)]
-                    for i, name in enumerate(names):
-                        if _product_channel_kind(name) == "nx":
-                            sibling = name[:-2] + "ny"
-                            if sibling in names:
-                                j = names.index(sibling)
-                                presence = name[:-2] + "presence"
-                                mask = None
-                                if self.blank_invalid:
-                                    ps = [raw[k] for k,c in enumerate(names) if c == "presence" or c.endswith("_presence")]
-                                    if presence in names:
-                                        mask = raw[names.index(presence)]
-                                    elif ps:
-                                        mask = np.maximum.reduce(ps)
-                                output[i], output[j] = _moment_pool2x_normals(raw[i], raw[j], validity=mask)
-                    if self.blank_invalid:
-                        # Width/embeddings are undefined at zero presence, not
-                        # physical zero measurements to average into valid data.
-                        ps = [raw[i] for i,name in enumerate(names) if name == "presence" or name.endswith("_presence")]
-                        if ps:
-                            valid = (np.maximum.reduce(ps) != 0).astype(np.float32)
-                            denominator = _mean_pool2x_f32(valid)
-                            for i,name in enumerate(names):
-                                if name == "width" or name.startswith("embedding_"):
-                                    mean = _mean_pool2x_f32(raw[i] * valid) / np.maximum(denominator, 1e-12)
-                                    output[i] = (np.rint(mean).clip(0,255).astype(np.uint8)
-                                                 if channel_dtypes[name] == np.dtype("uint8") else mean)
-                    values = dict(zip(names, output))
-                    if self.blank_invalid:
-                        values = blank_fiber_channels(values)
-                    atomic_chunk(self.array_path(products[0], level), origin, np.stack([values[k] for k in names]))
-                with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-                    for _ in pool.map(build, sorted(origins)):
-                        pass
+                worker = partial(_build_compact_pyramid_chunk,
+                    source_path=str(parent), dest_path=str(self.array_path(products[0], level)),
+                    names=names, channel_dtypes=channel_dtypes, blank_invalid=self.blank_invalid)
+                _run_pool(sorted(origins), worker, workers=workers,
+                          tag=f"[pyramid sd{native} L{level}]")

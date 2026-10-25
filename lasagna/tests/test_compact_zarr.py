@@ -53,6 +53,39 @@ def test_packed_atomic_blank_resume_pyramid(tmp_path):
     assert not chunk_file(tmp_path / "prediction.zarr/sd0/1", (0, 0, 0)).exists()
 
 
+def test_pyramid_auto_workers_progress_resume_and_exact_output(tmp_path, monkeypatch, capsys):
+    import lasagna.compact_zarr as compact
+    monkeypatch.setattr(compact.multiprocessing, "cpu_count", lambda: 2)
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"])
+    rng = np.random.default_rng(19)
+    data = {name: rng.integers(0, 256, (16, 16, 16), dtype=np.uint8) for name in p.channel_names}
+    data['presence'][::2] = 0
+    results = []
+    for workers in (1, 0):
+        root = tmp_path / f"workers{workers}.zarr"
+        output = CompactOutputAdapter(root=root, products=(p,), n_levels=3,
+                                      validity_channel="presence", blank_invalid=True)
+        output.prepare(base_shape_zyx=(16, 16, 16), ome_chunk=4)
+        for z in range(0, 16, 4):
+            for y in range(0, 16, 4):
+                for x in range(0, 16, 4):
+                    output.write_products_chunk([(p, {name: a[z:z+4,y:y+4,x:x+4] for name,a in data.items()})],
+                                                chunk_origin_zyx=(z,y,x))
+        output.build_pyramids(workers=workers)
+        results.append([zarr.open_array(str(root / 'sd0' / str(level)), mode='r')[:] for level in (1,2)])
+        published = chunk_file(root / 'sd0/1', (0,0,0))
+        modified = published.stat().st_mtime_ns
+        output.build_pyramids(workers=workers)
+        assert published.stat().st_mtime_ns == modified
+    for serial, parallel in zip(*results):
+        np.testing.assert_array_equal(serial, parallel)
+    log = capsys.readouterr().out
+    assert '[pyramid sd0 L1] workers=2 native_threads_per_worker=1' in log
+    assert '8/8 (100.0%)' in log
+    assert 'skip_existing=8' in log
+    assert 'eta ' in log
+
+
 def test_scales_validity_and_zero_chunks(tmp_path):
     cos = product("cos", ["cos"])
     normal = product("normal", ["grad_mag", "nx", "ny"], level=1)
