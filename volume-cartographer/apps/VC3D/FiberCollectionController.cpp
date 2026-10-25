@@ -1013,11 +1013,14 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                 for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber", "meta"})) {
                     if (cancel->load() || cancelled.load()) return;
                     if (!object.fiber || object.fiber->linePointCount == 0) continue;
+                    // The selection also lists fibers registered to the volume; fibers
+                    // are only drawn in a volume they are bound to by scale.
+                    const auto factor = vc::objects::geometryScaleToVolume(Json::parse(object.meta), volume);
                     const auto head = db.currentGeometry(txn, object.uuid);
-                    if (!head) continue;
+                    if (!factor || !head) continue;
                     uuids.push_back(object.uuid);
                     revisions.push_back(head->uuid);
-                    factors.push_back(*vc::objects::geometryScaleToVolume(Json::parse(object.meta), volume));
+                    factors.push_back(*factor);
                 }
                 if (revisions.empty()) return;
                 const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
