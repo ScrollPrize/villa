@@ -21,6 +21,7 @@
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -230,12 +231,19 @@ QJsonObject AgentBridgeServer::handleViewerSetIntersects(const QJsonValue& param
     ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
     const QJsonObject p = params.toObject();
 
-    // The GUI's own filter application (SurfacePanelController::applyFilters)
-    // always seeds the drawn set with "segmentation"; mirror that invariant
-    // here rather than trusting the caller to include it.
+    // Viewers draw the surfaces they hold by name, always the active one
+    // ("segmentation", as SurfacePanelController::applyFilters seeds it); stored
+    // surfaces (catalog UUIDs) are drawn on every plane viewer by the store
+    // surface overlay, like the surface panel's visible set.
     std::set<std::string> ids{"segmentation"};
-    for (const QJsonValue& e : p.value("surfaceIds").toArray())
-        ids.insert(e.toString().toStdString());
+    std::vector<std::string> stored;
+    const auto* catalog = _window ? _window->_surfaceCatalog.get() : nullptr;
+    for (const QJsonValue& e : p.value("surfaceIds").toArray()) {
+        const auto id = e.toString().toStdString();
+        if (catalog && catalog->row(id)) stored.push_back(id);
+        else ids.insert(id);
+    }
+    if (!stored.empty() && _window->_storeSurfaceOverlay) _window->_storeSurfaceOverlay->setSurfaces(stored);
 
     QJsonArray appliedToViewers;
     if (p.contains("viewer") && !p.value("viewer").isNull()) {
@@ -260,6 +268,8 @@ QJsonObject AgentBridgeServer::handleViewerSetIntersects(const QJsonValue& param
 
     QJsonArray surfaceIds;
     for (const auto& id : ids)
+        surfaceIds.append(QString::fromStdString(id));
+    for (const auto& id : stored)
         surfaceIds.append(QString::fromStdString(id));
 
     QJsonObject result;

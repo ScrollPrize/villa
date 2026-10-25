@@ -1286,10 +1286,7 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
         isSameCurrentSurface && isEditUpdate && _surfaceEditInvalidationPending;
     if (isCurrentSurface)
         _surfaceEditInvalidationPending = false;
-    const bool isIntersectionTarget =
-        _intersectTgts.count(name) != 0 ||
-        (_intersectTgts.count("visible_segmentation") != 0 &&
-         (name == "segmentation" || _highlightedSurfaceIds.count(name) != 0));
+    const bool isIntersectionTarget = _intersectTgts.count(name) != 0;
 
     if (!isCurrentSurface) {
         if (isIntersectionTarget) {
@@ -6376,18 +6373,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                 resolved.targets.insert(std::move(quad));
             }
         };
-        for (const auto& name : _intersectTgts) {
-            if (name == "visible_segmentation") {
-                if (_highlightedSurfaceIds.empty()) {
-                    addTarget("segmentation");
-                } else {
-                    for (const auto& id : _highlightedSurfaceIds)
-                        addTarget(id);
-                }
-            } else {
-                addTarget(name);
-            }
-        }
+        for (const auto& name : _intersectTgts)
+            addTarget(name);
         std::size_t th = 0;
         for (const auto& t : resolved.targets)
             th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
