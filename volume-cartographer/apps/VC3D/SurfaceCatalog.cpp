@@ -4,6 +4,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <nlohmann/json.hpp>
 
@@ -38,11 +39,14 @@ Listing list(ObjectStoreSession& session, const std::vector<SurfaceCatalog::Sour
                 if (requested->empty()) return;
                 selection.uuids = *requested;
             }
+            const auto transforms = db.volumeTransforms(txn);
             for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
                 if (cancel.load() || cancelled.load()) return;
                 SurfaceCatalog::Row row;
+                row.mapping = transforms.toVolume(nlohmann::json::parse(record.meta), source.volume,source.scale);
                 row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), source.volume);
                 if (row.toVolume) *row.toVolume *= source.scale;
+                else if(row.mapping)row.toVolume=1.;
                 row.record = std::move(record);
                 row.source = source;
                 row.catalog = catalog;
@@ -127,6 +131,7 @@ void SurfaceCatalog::handle(const StoreSessionEvent& event)
     if (event.kind != StoreSessionEvent::Kind::Committed ||
         std::none_of(listed.begin(), listed.end(), [&](const Source& source) { return source.attachment == event.attachment; }))
         return;
+    if(std::any_of(event.changes.begin(),event.changes.end(),[](const auto& c){return c.kind=="volume_transform"||c.kind=="volume_transform_choice";})){read(std::nullopt);return;}
     std::vector<std::string> changed;
     for (const auto& change : event.changes)
         if (change.kind == "surface") changed.push_back(change.recordUuid);
@@ -201,16 +206,17 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
         const auto revision = db.currentObjectRevision(txn, uuid);
         if (!revision || revision->record.retired || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
-        auto factor = geometryScaleToVolume(nlohmann::json::parse(revision->record.meta), volume);
-        if (!factor) throw std::runtime_error("The surface is not bound to volume " + volume);
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
-        *factor *= scale;
-        opened.surface = load_quad_from_store(db, txn, uuid, *revision->geometryRevision, true, *factor);
+        const auto view=GeometrySnapshot(db,txn).viewTransformedAt(uuid,volume,scale);
+        opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,1,&view);
+        opened.mapping=view.mapping();
+        opened.toVolume=geometryScaleToVolume(nlohmann::json::parse(revision->record.meta),volume).value_or(1.)*scale;
+        opened.surface->meta["vc3d_view"]=utils::Json::parse(nlohmann::json{
+            {"target",volume},{"scale",scale},{"matrix",view.mapping().json()}}.dump());
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
-        opened.toVolume = *factor;
     });
     opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
-    opened.editable = opened.toVolume == 1 && session->writable(attachment);
+    opened.editable = session->writable(attachment);
     return opened;
 }
 

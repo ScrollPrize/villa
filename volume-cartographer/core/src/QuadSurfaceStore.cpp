@@ -99,7 +99,7 @@ vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db,
 } // namespace
 
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
-    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, double toVolume)
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, double toVolume, const vc::objects::TransformedGeometryView* transformed)
 {
     const auto object = db.objectByUuid(txn, objectUuid);
     if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
@@ -122,7 +122,15 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
         }
     }
     cv::Vec2f scale(float(view.scale()[0]), float(view.scale()[1]));
-    if (toVolume != 1) {
+    if (transformed) {
+        if (transformed->revision().uuid != revision->uuid) throw std::invalid_argument("transformed view revision differs from surface");
+        const auto tile = transformed->readTile(0, 0, rows, cols);
+        scale={float(tile.scale[0]),float(tile.scale[1])};
+        for (int i=0; i<rows*cols; ++i) {
+            const auto& p=tile.points[i];
+            (*points)(i/cols,i%cols)=tile.validity[i] ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
+        }
+    } else if (toVolume != 1) {
         for (auto& p : *points) if (p != kInvalid) p *= float(toVolume);
         scale /= float(toVolume);
     }
@@ -165,7 +173,7 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
     if (!meta.is_object()) meta = nlohmann::json::object();
     // Identity, geometry and file layout belong to the object and its geometry.
     // Status tags belong to the record and are not inherited from a source.
-    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags"})
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags", "vc3d_view"})
         meta.erase(key);
     meta.update(nlohmann::json::parse(metaJson));
     vc::objects::ObjectRecord record;
@@ -199,7 +207,7 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
 
 std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
     QuadSurface& surface, const cv::Rect& rect, const std::string& expected,
-    const vc::objects::ObjectStoreSession::KeepRecorded& decide)
+    const vc::objects::ObjectStoreSession::KeepRecorded& decide, const vc::objects::TransformedGeometryView* transformed)
 {
     const auto revision = currentSurface(db, txn, objectUuid, expected);
     const auto shape = pointsShape(revision);
@@ -208,6 +216,17 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
     if (area.empty()) return revision.uuid;
+    if (transformed) {
+        std::vector<vc::geometry::SurfacePoint> desired;
+        desired.reserve(size_t(area.width)*area.height);
+        for(int r=area.y;r<area.y+area.height;++r)for(int c=area.x;c<area.x+area.width;++c) {
+            const auto p=points(r,c);desired.push_back({p[0],p[1],p[2]});
+        }
+        const auto edits=transformed->surfaceEdits(area.y,area.x,area.height,area.width,desired);
+        const auto decisions=decide?decide(db.affectedGeometryEditEdges(txn,objectUuid,edits,revision.uuid))
+            :std::vector<vc::objects::GeometryEdgeEdit>{};
+        return db.editGeometry(txn,objectUuid,edits,revision.uuid,decisions);
+    }
     auto stored = db.readGeometryRectangle(txn, revision.uuid, "points", area.y, area.x, area.height, area.width);
     const bool hasValid = hasArray(revision, "valid");
     auto valid = hasValid ? db.readGeometryRectangle(txn, revision.uuid, "valid", area.y, area.x, area.height, area.width)
@@ -219,8 +238,9 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
             cv::Vec3f old;
             std::memcpy(old.val, stored.data() + i * 12, 12);
             // What this vertex looked like when loaded: masked vertices are sentinels.
-            const cv::Vec3f loaded = usable(old) && (!hasValid || valid[i]) ? old : kInvalid;
-            const cv::Vec3f now = usable(points(area.y + r, area.x + c)) ? points(area.y + r, area.x + c) : kInvalid;
+            cv::Vec3f loaded = usable(old) && (!hasValid || valid[i]) ? old : kInvalid;
+            cv::Vec3f now = points(area.y + r, area.x + c);
+            if (!usable(now)) now=kInvalid;
             if (std::memcmp(now.val, loaded.val, 12) == 0) continue;
             std::memcpy(stored.data() + i * 12, now.val, 12);
             if (hasValid && now != kInvalid && !valid[i]) { valid[i] = 255; validChanged = true; }

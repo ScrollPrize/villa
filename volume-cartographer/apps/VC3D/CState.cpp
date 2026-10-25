@@ -1,6 +1,7 @@
 #include "CState.hpp"
 
 #include "OpenDataCoordinateIdentity.hpp"
+#include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
 
 #include <algorithm>
@@ -20,8 +21,18 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
 namespace {
+
+std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
+{
+    const auto path=vc3d::opendata::cachedOpenDataManifestPath();
+    if(!std::filesystem::exists(path))return {};
+    auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+    graph->addCatalog(vcr::catalog::loadOpenDataManifestFile(path));
+    return graph;
+}
 
 bool isValidSurfacePoint(const cv::Vec3f& point)
 {
@@ -238,6 +249,7 @@ vc::objects::AttachmentIdentity CState::catalogAttachment(const std::filesystem:
     const auto found = _catalogAttachments.find(path);
     if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
     vc::objects::OpenOptions options;
+    options.catalogTransforms=catalogTransformSnapshot();
     options.readOnly = true;
     const auto attachment = _objectStoreSession->attach(path, options);
     _catalogAttachments[path] = attachment;
@@ -254,6 +266,7 @@ void CState::attachObjectStore(const QString& path, const QString& author, bool 
 {
     if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
     vc::objects::OpenOptions options;
+    options.catalogTransforms=catalogTransformSnapshot();
     options.author = author.toStdString();
     options.readOnly = readOnly;
     _objectStoreAttachment = _objectStoreAttachment
@@ -365,15 +378,15 @@ CState::StoredUmbilicus CState::storedUmbilicus() const
             return;
         }
         const auto& record = records.front();
-        const auto scale = vc::objects::geometryScaleToVolume(nlohmann::json::parse(record.meta), volumeId);
         const auto geometry = db.currentGeometry(txn, record.uuid);
-        if (!scale || !geometry) {
+        if (!geometry) {
             result.error = "umbilicus " + record.name + " has no geometry";
             return;
         }
-        const auto stored = std::get<vc::geometry::Umbilicus>(vc::geometry::decode(db.readGeometryData(txn, geometry->uuid)));
-        for (const auto& p : stored.points)
-            result.points.emplace_back(float(p[0] * *scale), float(p[1] * *scale), float(p[2] * *scale));
+        const auto canonical=vc::objects::GeometrySnapshot(db,txn).umbilicus(record.uuid);
+        const auto view=canonical.viewTransformedAt(volumeId);
+        for(const auto& p:view.points("points",0,canonical.size()))
+            result.points.emplace_back(float(p[0]),float(p[1]),float(p[2]));
         result.uuid = record.uuid;
         result.name = record.name;
         result.token = record.uuid + "@" + db.currentObjectRevision(txn, record.uuid)->uuid;

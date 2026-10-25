@@ -6,6 +6,7 @@
 #include "segmentation/SurfaceStoreEdit.hpp"
 #include "vc/core/PointCollections.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreCoordinates.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -89,8 +90,20 @@ int main(int argc, char** argv)
         require(opened.editable && opened.surface->id == native && opened.pin.geometryRevision, "native surfaces open editable and pinned");
         require((*opened.surface->rawPointsPtr())(2, 1) == cv::Vec3f(1, 2, 1), "native points are stored points");
         const auto scaled = catalog.open(half);
-        require(!scaled.editable && scaled.toVolume == 2.0, "scaled surfaces open read-only");
+        require(scaled.editable && scaled.toVolume == 2.0, "store views of scaled surfaces support inverse edits");
         require((*scaled.surface->rawPointsPtr())(2, 1) == cv::Vec3f(2, 4, 2), "scaled points are in volume voxels");
+        {
+            SurfaceStoreEdit edit(session,scaled.pin,scaled.surface->meta.at("vc3d_view").dump());
+            cv::Mat_<cv::Vec3f> grown(4,3,cv::Vec3f(-1,-1,-1));
+            scaled.surface->rawPointsPtr()->copyTo(grown(cv::Rect(0,0,3,3)));
+            grown(3,1)={2,6,2};
+            QuadSurface result(grown,{0.5f,0.5f});
+            edit.save(result,cv::Rect(0,0,3,4));
+            session->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
+                require(GeometrySnapshot(db,txn).surface(half).vertex(3,1)==vc::geometry::SurfacePoint{1,3,1},
+                        "growth keeps the opened view binding even when its output has no metadata");
+            });
+        }
         bool refused = false;
         try { catalog.open(unbound); } catch (const std::exception&) { refused = true; }
         require(refused, "unbound surfaces do not open");
@@ -193,6 +206,33 @@ int main(int argc, char** argv)
         require(std::count(committed.begin(), committed.end(), native) >= 1, "commits name the edited surface");
         catalog.retire({half});
         pump([&] { return !catalog.row(half) && catalog.rows().size() == 3; }, "retired surfaces leave the listing");
+
+        // The store supplies registered views; the application only adapts their tiles.
+        VolumeAffine affine;
+        affine(0,0)=2; affine(0,1)=0.5; affine(0,3)=10; affine(2,3)=20;
+        const auto registration=util::newUuid();
+        session->act(attachment,{{registration,std::nullopt}},[&](auto& db,auto& txn) {
+            db.registerVolumeTransform(txn,"vol2","vol1",affine,"registered scan",registration);
+        });
+        pump([&]{return catalog.row(other)&&catalog.row(other)->mapping.has_value();},"registration commits refresh compatible surfaces");
+        auto registered=catalog.open(other);
+        require((*registered.surface->rawPointsPtr())(2,1)==cv::Vec3f(13,2,21),"surface uses the store's affine view");
+        SurfaceStoreEdit registeredEdit(session,registered.pin);
+        (*registered.surface->rawPointsPtr())(2,1)={15,2,21};
+        registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));
+        session->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
+            require(GeometrySnapshot(db,txn).surface(other).vertex(2,1)==vc::geometry::SurfacePoint{2,2,1},
+                    "registered view edits remain in canonical coordinates");
+            require(nlohmann::json::parse(db.objectByUuid(txn,other)->meta)["coordinates"]["volume_uuid"]=="vol2",
+                    "view edits preserve the paired volume");
+        });
+        const auto conflicting=util::newUuid();
+        session->act(attachment,{{conflicting,std::nullopt}},[&](auto& db,auto& txn) {
+            db.registerVolumeTransform(txn,"vol2","vol1",VolumeAffine::scale(3),"alternative",conflicting);
+        });
+        bool staleMapping=false;
+        try {registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));}catch(const std::exception&){staleMapping=true;}
+        require(staleMapping,"registration conflicts invalidate writable views");
 
         catalog.setSource(std::nullopt, volume);
         require(catalog.rows().empty(), "no attachment lists nothing");

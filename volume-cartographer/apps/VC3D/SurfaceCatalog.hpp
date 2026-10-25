@@ -49,6 +49,7 @@ public:
         vc::objects::ObjectRecord record;
         // Volume voxels per stored unit; nullopt for a surface not bound to the volume.
         std::optional<double> toVolume;
+        std::optional<vc::objects::VolumeAffine> mapping;
         // The store it is in; catalog rows are read-only.
         Source source;
         bool catalog = false;
@@ -59,6 +60,7 @@ public:
         std::shared_ptr<QuadSurface> surface;
         vc::objects::PinnedObject pin;
         double toVolume = 1;
+        vc::objects::VolumeAffine mapping;
         // Writable attachment and stored at the volume's scale: an edit can
         // publish the vertices it changed without rescaling the others.
         bool editable = false;

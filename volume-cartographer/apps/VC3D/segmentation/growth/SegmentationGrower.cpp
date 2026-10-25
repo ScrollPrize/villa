@@ -1,4 +1,5 @@
 #include "SegmentationGrower.hpp"
+#include <vc_object_store/store/GeometryViews.hpp>
 
 #include "OpenDataCoordinateIdentity.hpp"
 
@@ -465,7 +466,8 @@ std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTra
     for (const auto& entry : source.surfaces) {
         try {
             source.session->read(entry.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, entry.toVolume));
+                const auto view=vc::objects::GeometrySnapshot(db,txn).viewTransformedAt(entry.uuid,entry.targetVolume,entry.targetScale);
+                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, 1, &view));
             });
         } catch (const std::exception& ex) {
             // e.g. a catalog surface whose geometry was never fetched.
@@ -728,7 +730,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 std::find(row.record.tags.begin(), row.record.tags.end(), sourceTag.toStdString()) == row.record.tags.end()) {
                 continue;
             }
-            source.surfaces.push_back({row.source.attachment, uuid, *row.toVolume});
+            source.surfaces.push_back({row.source.attachment, uuid, row.source.volume, row.source.scale});
             source.key += QStringLiteral("|%1@%2").arg(QString::fromStdString(uuid), QString::fromStdString(row.record.changedAt));
         }
 

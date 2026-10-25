@@ -1,5 +1,7 @@
 #pragma once
 
+namespace vc::objects { class TransformedGeometryView; }
+
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -586,7 +588,8 @@ private:
 // toVolume scales the stored coordinates (and the grid's step) into a volume's voxels.
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore&, const vc::objects::Txn&,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt,
-    bool applyValidity = true, double toVolume = 1);
+    bool applyValidity = true, double toVolume = 1,
+    const vc::objects::TransformedGeometryView* transformed = nullptr);
 // Reads channels of an immutable geometry revision through a session on demand.
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
@@ -605,7 +608,8 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
 // for relationships the edit affects. Returns the new (or unchanged) geometry revision.
 std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
     QuadSurface&, const cv::Rect& rect, const std::string& expected,
-    const vc::objects::ObjectStoreSession::KeepRecorded& decide = {});
+    const vc::objects::ObjectStoreSession::KeepRecorded& decide = {},
+    const vc::objects::TransformedGeometryView* transformed = nullptr);
 // Replace the named channels ("mask" is `valid`) with the surface's and remove `remove`.
 std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
     QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,

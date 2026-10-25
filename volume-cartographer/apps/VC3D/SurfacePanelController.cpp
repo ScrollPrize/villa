@@ -198,6 +198,11 @@ void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const Surfa
     item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(row.record.uuid));
     item->setData(SURFACE_ID_COLUMN, kUnboundRole, !row.toVolume.has_value());
     item->setText(SURFACE_ID_COLUMN, name);
+    const auto coordinates=row_meta(row).value("coordinates",nlohmann::json::object());
+    const auto source=coordinates.value("volume_uuid",nlohmann::json(nullptr));
+    item->setToolTip(SURFACE_ID_COLUMN,tr("Source volume: %1\n%2")
+        .arg(source.is_string()?QString::fromStdString(source.get<std::string>()):tr("Unknown"))
+        .arg(row.mapping?tr("Available in the open volume"):tr("No resolved mapping to the open volume")));
     item->setText(SURFACE_LONG_ID_COLUMN, longId);
     // A surface whose voxel size was unknown has no area_cm2 at all, and "-"
     // is honest where "-1.000" is not.
@@ -1694,8 +1699,11 @@ void SurfacePanelController::applyFiltersInternal()
         }
         if (show && hasZRangeFilter) {
             const auto& bbox = row->record.surface ? row->record.surface->bbox : std::nullopt;
-            show = bbox && row->toVolume &&
-                   (*bbox)[2] * *row->toVolume <= zUpperBound && (*bbox)[5] * *row->toVolume >= zLowerBound;
+            show = bbox && row->mapping;
+            if(show) {
+                const auto transformed=vc::objects::transformBounds(*bbox,*row->mapping);
+                show=transformed[2]<=zUpperBound&&transformed[5]>=zLowerBound;
+            }
         }
         if (show && isChecked(_filters.unreviewed)) {
             show = !has_tag(*row, "reviewed");

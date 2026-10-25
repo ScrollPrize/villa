@@ -41,8 +41,8 @@ struct PatchTracerSource {
         // The store it is in (the user's or a read-only catalog store).
         vc::objects::AttachmentIdentity attachment;
         std::string uuid;
-        // Volume voxels per stored unit.
-        double toVolume = 1;
+        std::string targetVolume;
+        double targetScale = 1;
     };
     std::vector<Surface> surfaces;
     // Identifies the source's content: tag, surfaces and their change stamps.

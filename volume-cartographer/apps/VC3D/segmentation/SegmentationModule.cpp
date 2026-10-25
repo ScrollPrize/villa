@@ -3042,7 +3042,8 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
         return nullptr;
     }
     try {
-        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), *pin);
+        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), *pin,
+            surface->meta.contains("vc3d_view") ? std::optional(surface->meta.at("vc3d_view").dump()) : std::nullopt);
     } catch (const std::exception& error) {
         emit statusMessageRequested(tr("Cannot edit surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
         return nullptr;

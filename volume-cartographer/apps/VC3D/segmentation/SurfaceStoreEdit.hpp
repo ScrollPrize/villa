@@ -14,7 +14,8 @@ class QuadSurface;
 class SurfaceStoreEdit
 {
 public:
-    SurfaceStoreEdit(std::shared_ptr<vc::objects::ObjectStoreSession> session, vc::objects::PinnedObject pin);
+    SurfaceStoreEdit(std::shared_ptr<vc::objects::ObjectStoreSession> session, vc::objects::PinnedObject pin,
+                     std::optional<std::string> viewBinding = std::nullopt);
 
     // An editing session holds the object (vc3d::store::holdForEditing) until
     // release(); throws when the store is read-only or the pin is stale.
@@ -38,4 +39,5 @@ private:
     vc::objects::PinnedObject _pin;
     const vc::objects::PinnedObject _origin;
     vc::objects::LeaseHold _lease;
+    std::optional<std::string> _viewBinding;
 };

@@ -135,7 +135,7 @@ int runSurfacePanelStoreTests()
         // The Patch Tracer reads each source surface from the store it is in.
         PatchTracerSource tracerSource{state.objectStoreSession(), {}, {}};
         for (const auto& [uuid, row] : catalog.rows())
-            if (row.toVolume) tracerSource.surfaces.push_back({row.source.attachment, uuid, *row.toVolume});
+            if (row.mapping) tracerSource.surfaces.push_back({row.source.attachment, uuid, row.source.volume, row.source.scale});
         const auto tracerSurfaces = loadPatchTracerSurfaces(tracerSource);
         require(tracerSource.surfaces.size() == 3 && tracerSurfaces.size() == 3 &&
                 std::any_of(tracerSurfaces.begin(), tracerSurfaces.end(), [](const auto& surface) {
