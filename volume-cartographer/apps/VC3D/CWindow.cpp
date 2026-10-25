@@ -9086,10 +9086,6 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
-// Renders <segment>/mask.tif on the calling (worker) thread with no GUI side
-// effects. append=false writes a single-layer binary mask; append=true appends a
-// surface-image layer to an existing mask (or creates a two-layer mask+image file).
-// Throws std::runtime_error on failure; returns a status string on success.
 QString CWindow::getCurrentVolumePath() const
 {
     auto volume = _state->currentVolume();

@@ -141,8 +141,8 @@ public:
                                   bool isAutoApproval = false);
 
     // Composite the pending+saved approval QImages into the surface's "approval"
-    // channel (in memory only). Disk persistence is the SegmentationModule
-    // autosave's job (saveOverwrite writes all channels).
+    // channel (in memory only). Committing it to the store is the
+    // SegmentationModule autosave's job.
     void composeApprovalMaskToSurface(QuadSurface* surface);
 
     // Compose the edited mask onto the surface channel and record it for the

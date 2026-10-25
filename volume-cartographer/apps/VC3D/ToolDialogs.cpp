@@ -1852,10 +1852,9 @@ void VisLasagnaObjDialog::updateSessionFromUI()
 // ============================================================================
 // MergeTifxyzDialog
 //
-// Edits a 2D grid of tifxyz directory names plus the RANSAC tunables for
-// vc_merge_tifxyz, writes a merge.json into <volpkg>/, and exposes the
-// path + tunables to the caller. Each cell holds a name resolved against
-// <volpkg>/<paths_dir>/. Empty cells are allowed; adjacency in the grid
+// Edits a 2D grid of stored surfaces plus the RANSAC tunables for
+// vc_merge_tifxyz and exposes its merge.json + tunables to the caller. Each
+// cell holds a surface UUID. Empty cells are allowed; adjacency in the grid
 // drives RANSAC alignment.
 // ============================================================================
 
@@ -2215,9 +2214,8 @@ QString MergeTifxyzDialog::mergeJsonText() const
 
     // Whitespace-delimited string rows can't represent interior empty
     // cells -- the parser splits the row on whitespace and looks each
-    // token up as a directory under <paths_dir>, so a literal "" token
-    // would be searched for as the directory `""` and the run would
-    // fail. Switch to JSON array rows (with `null` for empty cells)
+    // token up as a surface, so a literal "" token would be searched
+    // for as the surface `""` and the run would fail. Switch to JSON array rows (with `null` for empty cells)
     // whenever the grid has any blank, which is the form gmResolveGrid
     // already handles. Solid grids keep the more compact string form.
     bool hasEmpty = false;
@@ -2375,14 +2373,10 @@ void MergeTifxyzDialog::accept()
 // ============================================================================
 // MergePatchDialog
 //
-// Two-input front-end for vc_merge_patch. Picks a parent + child tifxyz from
-// the volpkg, exposes the binary's tunables, and previews the auto-detected
-// parent/child role assignment (cheap: countValidPoints() against the
-// already-loaded VolumePkg surface cache).
+// Two-input front-end for vc_merge_patch. Picks a parent + child stored
+// surface, exposes the binary's tunables, and previews the auto-detected
+// parent/child role assignment from the surfaces' recorded areas.
 // ============================================================================
-
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/QuadSurface.hpp"
 
 #include <QComboBox>
 

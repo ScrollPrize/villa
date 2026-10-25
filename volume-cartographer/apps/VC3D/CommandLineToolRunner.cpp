@@ -259,7 +259,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         return false;
     }
 
-    // vc_merge_tifxyz and vc_merge_patch are path-only tools (segment dirs);
+    // vc_merge_tifxyz and vc_merge_patch only read and write stored surfaces;
     // no volume required.
     const bool needsVolume = !isCustom
                              && tool != Tool::MergeTifxyz

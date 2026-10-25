@@ -326,8 +326,7 @@ void SurfaceRotationOverlayController::cancelRotate()
 {
     // Restore the un-previewed source surface — but only if no save
     // worker is currently mutating it. Publishing _sourceSurface
-    // while applyRotation()'s background transform / saveOverwrite()
-    // is running would point surfaceChanged consumers at a cv::Mat
+    // while applyRotation()'s background transform is running would point surfaceChanged consumers at a cv::Mat
     // the worker is concurrently writing, racing on _points and the
     // ancillary channels. Whatever was previously active (typically
     // the last _previewSurface from a dial drag) stays in place; the
@@ -348,8 +347,8 @@ void SurfaceRotationOverlayController::cancelRotate()
     // mismatched session id and drop its state changes. We do NOT
     // clear _saveInFlight here: the worker is still running and a
     // new Apply on a freshly begun session must wait for it to
-    // finish, otherwise two workers could race rotate()/saveOverwrite()
-    // on the same QuadSurface (the new session may target the very
+    // finish, otherwise two workers could race the transform on the
+    // same QuadSurface (the new session may target the very
     // same segment). The finished slot clears _saveInFlight whether
     // it applies or drops the result.
     ++_saveSessionId;
@@ -547,7 +546,7 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     // While a save worker is running, _sourceSurface is being mutated
-    // (rotate + saveOverwrite) on the worker thread. Cloning it here on
+    // (the transform) on the worker thread. Cloning it here on
     // the UI thread would race the worker's writes — read while another
     // thread mutates the same cv::Mat data. Skip the preview update; the
     // worker will tear the controller down via its finished slot anyway.
@@ -579,8 +578,8 @@ void SurfaceRotationOverlayController::applyRotation()
     }
 
     // Reentrancy guard: another save is already running for this
-    // surface. A second rotate()/saveOverwrite() racing the first
-    // would mutate _points and the on-disk files concurrently.
+    // surface. A second transform racing the first would mutate
+    // _points concurrently.
     // Just ignore the duplicate Apply.
     if (_saveInFlight) {
         return;

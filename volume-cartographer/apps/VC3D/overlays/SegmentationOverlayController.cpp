@@ -607,9 +607,8 @@ void SegmentationOverlayController::composeApprovalMaskToSurface(QuadSurface* su
         }
     }
 
-    // Stash the composited mask onto the surface's approval channel. Disk
-    // persistence is the single SegmentationModule autosave's job (saveOverwrite
-    // writes x/y/z + meta + all channels incl. approval every 10s).
+    // Stash the composited mask onto the surface's approval channel. Committing
+    // it to the store is the SegmentationModule autosave's job.
     surface->setChannel("approval", approvalMask);
 
     // Update saved image to match what we just wrote and clear pending

@@ -225,9 +225,8 @@ class QLabel;
 
 // MergeTifxyzDialog
 //
-// Edits a 2D grid of tifxyz directory names and the RANSAC tunables for
-// vc_merge_tifxyz, then writes a merge.json into the volpkg root and
-// returns its path. The grid layout encodes the surface adjacency that
+// Edits a 2D grid of stored surfaces and the RANSAC tunables for
+// vc_merge_tifxyz and builds its merge.json. The grid layout encodes the surface adjacency that
 // the merge tool RANSAC-aligns; empty cells are allowed; selection in
 // the segment list is used as the seed but the user can edit / append.
 class MergeTifxyzDialog : public QDialog {
@@ -304,18 +303,15 @@ class QSpinBox;
 class QLineEdit;
 class QLabel;
 class QCheckBox;
-class VolumePkg;
 
 // MergePatchDialog
 //
-// Two-input cousin of MergeTifxyzDialog: picks a parent + child tifxyz from
-// the volpkg, exposes vc_merge_patch's tunables (border-cells, blend-cells,
+// Two-input cousin of MergeTifxyzDialog: picks a parent + child stored
+// surface, exposes vc_merge_patch's tunables (border-cells, blend-cells,
 // idw-k, RANSAC set, anchor-cap, OMP threads), and surfaces the role
-// auto-detect / explicit-override the binary supports. The parent dir is
-// overwritten in place by the binary; the dialog shows a banner up front so
-// the user knows. Recovery is via the rotating backup ring
-// (<parent_dir>/backups/<parent_name>/{0..7}/) that the binary populates via
-// QuadSurface::saveOverwrite.
+// auto-detect / explicit-override the binary supports. The binary edits the
+// parent in place (a new geometry revision); the dialog shows a banner up
+// front so the user knows.
 class MergePatchDialog : public QDialog {
     Q_OBJECT
 public:
