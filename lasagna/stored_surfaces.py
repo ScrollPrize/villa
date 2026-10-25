@@ -135,7 +135,8 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSu
 		geometry = db.geometry_revision(revision)
 		shapes = {array["name"]: array["shape"] for array in geometry["arrays"]}
 		xyz = np.frombuffer(db.read_geometry_array(revision, "points"), dtype="<f4").reshape(shapes["points"]).copy()
-		missing = xyz[..., 0] == INVALID
+		# Missing: any coordinate -1 or non-finite (the store's rule), or marked invalid.
+		missing = ~np.isfinite(xyz).all(axis=-1) | (xyz == INVALID).any(axis=-1)
 		if "valid" in shapes:
 			valid = np.frombuffer(db.read_geometry_array(revision, "valid"), dtype="u1").reshape(shapes["valid"])
 			missing |= valid == 0
@@ -155,7 +156,7 @@ def create_surface(store: str | Path, xyz: np.ndarray, *, name: str, scale: floa
 	points = np.ascontiguousarray(np.asarray(xyz, dtype="<f4"))
 	if points.ndim != 3 or points.shape[2] != 3:
 		raise ValueError(f"expected an (H, W, 3) grid, got {points.shape}")
-	missing = ~np.isfinite(points).all(axis=2) | (points == INVALID).all(axis=2)
+	missing = ~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)
 	points[missing] = INVALID
 	arrays = [dict(name="points", dtype="<f4", shape=list(points.shape), data=points.tobytes())]
 	for channel_name, values in sorted((channels or {}).items()):

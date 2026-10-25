@@ -78,6 +78,19 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			with self.assertRaisesRegex(ValueError, "needs a store"):
 				tifxyz_io.load_tifxyz(ref)
 
+	def test_missing_vertices_follow_the_store_rule(self) -> None:
+		# Any -1 or non-finite coordinate is missing, read and written; z = 0 is a slice.
+		with tempfile.TemporaryDirectory() as td:
+			store = Path(td) / "objects.vcobj"
+			ObjectStore.create(str(store), author="test").close()
+			xyz = np.full((1, 3, 3), 30.0, "<f4")
+			xyz[0, 0] = (5, -1, 30)
+			xyz[0, 1] = (6, 7, 0)
+			uid = stored_surfaces.create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
+			surface = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
+			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
+			self.assertEqual(surface.xyz[0, 1].tolist(), [6.0, 7.0, 0.0])
+
 	def test_approval_surface_scales_in_memory(self) -> None:
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"
