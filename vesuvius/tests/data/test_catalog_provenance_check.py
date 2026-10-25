@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
+
 from vesuvius.data.catalog_provenance_check import (
     find_future_scan_segments,
+    load_metadata,
     parse_date,
 )
 
@@ -79,6 +84,26 @@ def test_unresolvable_dates_are_not_comparable():
     assert total == 1
     assert comparable == 0
     assert findings == []
+
+
+def test_revision_hashes_decompressed_bytes(tmp_path):
+    # A plain .json copy and its gzip-encoded form of the same revision must
+    # produce the same digest, so runs are comparable regardless of encoding.
+    payload = json.dumps({"samples": {}}, sort_keys=True).encode("utf-8")
+    expected = hashlib.sha256(payload).hexdigest()
+
+    plain = tmp_path / "metadata.json"
+    plain.write_bytes(payload)
+    gzipped = tmp_path / "metadata.json.gz"
+    gzipped.write_bytes(gzip.compress(payload))
+
+    _, rev_plain = load_metadata(None, str(plain))
+    _, rev_gz = load_metadata(None, str(gzipped))
+
+    assert rev_plain.sha256 == expected
+    assert rev_gz.sha256 == expected
+    assert rev_plain.n_bytes == len(payload)
+    assert expected in rev_plain.summary()
 
 
 def test_declared_id_absent_from_paths_is_false():

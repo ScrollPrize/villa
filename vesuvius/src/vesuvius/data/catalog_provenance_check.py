@@ -15,6 +15,10 @@ and compares that scan date with the segment's own ``creation.date``. It reports
 every segment where the scan is newer than the segment, writes an optional CSV,
 and exits non-zero when any are found (so it can gate CI or a data-publish step).
 
+The summary names the catalog revision the run read (a SHA-256 of
+``metadata.json`` over its decompressed bytes), so counts stay comparable across
+runs as the catalog grows (new segments and volumes are added between runs).
+
 To help tell a stale *pointer* from a real mis-assignment, each row also reports
 whether the declared ``original_volume_id`` actually appears among the segment's
 own data paths (``...-volume-<id>...``). When it does, the field reads like a
@@ -34,6 +38,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import re
 import sys
@@ -48,6 +53,24 @@ DEFAULT_METADATA_URL = (
 
 # Volume ids are 14-digit timestamps; data paths spell them as "...-volume-<id>".
 _VOLUME_ID_IN_PATH = re.compile(r"volume-(\d{14})")
+
+
+@dataclass(frozen=True)
+class CatalogRevision:
+    """Identifies the exact catalog bytes a run read, for cross-run comparison.
+
+    The catalog moves often (segments and volumes are added between runs), so a
+    bare count of findings cannot be compared across runs or implementations
+    without pinning which revision produced it. The digest is taken over the
+    decompressed UTF-8 bytes, so a local copy and the gzip-encoded public object
+    of the same revision hash identically.
+    """
+
+    sha256: str
+    n_bytes: int
+
+    def summary(self) -> str:
+        return f"catalog metadata.json: sha256 {self.sha256} ({self.n_bytes} bytes)"
 
 
 @dataclass(frozen=True)
@@ -89,8 +112,13 @@ def parse_date(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def load_metadata(url: str | None, path: str | None) -> Mapping[str, Any]:
-    """Load the catalog JSON from a local file or the public URL (gzip-aware)."""
+def load_metadata(url: str | None, path: str | None) -> tuple[Mapping[str, Any], CatalogRevision]:
+    """Load the catalog JSON from a local file or the public URL (gzip-aware).
+
+    Returns the parsed mapping together with a :class:`CatalogRevision` that
+    pins exactly which catalog bytes were read, so a run is comparable to another
+    run (or another implementation) of the same checker.
+    """
     if path:
         with open(path, "rb") as handle:
             raw = handle.read()
@@ -102,7 +130,8 @@ def load_metadata(url: str | None, path: str | None) -> Mapping[str, Any]:
         raw = gzip.decompress(raw)
     except (OSError, gzip.BadGzipFile):
         pass
-    return json.loads(raw.decode("utf-8"))
+    revision = CatalogRevision(sha256=hashlib.sha256(raw).hexdigest(), n_bytes=len(raw))
+    return json.loads(raw.decode("utf-8")), revision
 
 
 def _creation_date(entry: Any) -> datetime | None:
@@ -194,7 +223,8 @@ def write_csv(findings: Sequence[Finding], path: str) -> None:
             )
 
 
-def _report(findings: Sequence[Finding], total: int, comparable: int) -> None:
+def _report(findings: Sequence[Finding], total: int, comparable: int, revision: CatalogRevision) -> None:
+    print(revision.summary())
     by_sample: dict[str, int] = {}
     for f in findings:
         by_sample[f.sample] = by_sample.get(f.sample, 0) + 1
@@ -234,18 +264,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    metadata = load_metadata(
+    metadata, revision = load_metadata(
         None if args.metadata_file else args.metadata_url, args.metadata_file
     )
     findings, total, comparable = find_future_scan_segments(metadata)
 
     if args.quiet:
+        print(revision.summary())
         print(
             f"segments: {total} total, {comparable} checked, {len(findings)} with a "
             f"scan newer than the segment"
         )
     else:
-        _report(findings, total, comparable)
+        _report(findings, total, comparable, revision)
     if args.csv:
         write_csv(findings, args.csv)
         print(f"\nwrote {len(findings)} rows to {args.csv}")
