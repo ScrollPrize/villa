@@ -35,6 +35,15 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/InpaintSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
+#include "vc/core/util/TifxyzIdentity.hpp"
+
+#include <unistd.h>
+
 namespace fs = std::filesystem;
 
 // ------------------------------
@@ -360,6 +369,15 @@ struct Flatboi {
   Flatboi(const std::string& obj_path, int max_iter_, igl::MappingEnergyType energy_)
     : input_obj(obj_path), max_iter(max_iter_), energy(energy_) {
     read_mesh();
+  }
+
+  // An in-memory mesh with per-vertex initial UVs. `output_path` names the
+  // energy and heatmap files as an input OBJ would.
+  Flatboi(Eigen::MatrixXd V_, Eigen::MatrixXi F_, Eigen::MatrixXd TC_, int max_iter_,
+          igl::MappingEnergyType energy_, const std::string& output_path)
+    : input_obj(output_path), max_iter(max_iter_), energy(energy_),
+      V(std::move(V_)), F(std::move(F_)), TC(std::move(TC_)), FTC(F), have_per_corner_uv(true) {
+    if(V.rows() == 0 || F.rows() == 0) throw std::runtime_error("Empty mesh.");
   }
 
   void read_mesh() {
@@ -932,6 +950,230 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 }
 
 // ------------------------------
+// Surface mode
+// ------------------------------
+// Flattens a surface (stored, or a tifxyz directory) into a new one without
+// OBJ files: the mesh of the grid's valid quads with their grid positions as
+// initial UVs (as vc_tifxyz2obj writes them), SLIM, then the flattened mesh
+// rasterized onto a grid at the source's sampling density (as vc_obj2tifxyz
+// with a source surface). With keep_percent < 100 SLIM runs on a decimated grid
+// and every full-grid vertex takes the UV of the point at its grid position in
+// the decimated mesh.
+namespace surface_mode {
+
+struct Lifted {
+  std::vector<cv::Vec2f> uvs;  // per full-grid vertex
+  std::vector<bool> valid;
+};
+
+// UVs of the full grid's mesh vertices from the decimated mesh's flattened UVs.
+// A vertex in a decimated quad takes the barycentric mix of that quad's
+// triangle; one beyond the decimated quads (a hole, or the rows/columns past
+// the last decimated sample) takes the nearest decimated vertex within two cells.
+static Lifted lift(const vc::meshing::GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarse,
+                   const vc::meshing::GridMesh& coarse_mesh, const Eigen::MatrixXd& coarse_uv, int stride)
+{
+  cv::Mat_<int> index(coarse.size(), -1);
+  for (std::size_t i = 0; i < coarse_mesh.cells.size(); ++i) index(coarse_mesh.cells[i]) = static_cast<int>(i);
+  const auto uv_of = [&](int r, int c) {
+    const int i = index(r, c);
+    return cv::Vec2d(coarse_uv(i, 0), coarse_uv(i, 1));
+  };
+
+  Lifted lifted;
+  lifted.uvs.resize(fine.cells.size());
+  lifted.valid.assign(fine.cells.size(), false);
+  #pragma omp parallel for schedule(static)
+  for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(fine.cells.size()); ++i) {
+    const double gr = double(fine.cells[i][0]) / stride;
+    const double gc = double(fine.cells[i][1]) / stride;
+    const int qr = std::clamp(int(std::floor(gr)), 0, std::max(0, coarse.rows - 2));
+    const int qc = std::clamp(int(std::floor(gc)), 0, std::max(0, coarse.cols - 2));
+    if (coarse.rows > 1 && coarse.cols > 1 && loc_valid(coarse, cv::Vec2d(qr, qc))) {
+      // The quad's faces are (r+1,c)(r,c)(r,c+1) below the diagonal u+v=1
+      // and (r+1,c)(r,c+1)(r+1,c+1) above it.
+      const double u = std::clamp(gc - qc, 0.0, 1.0);
+      const double v = std::clamp(gr - qr, 0.0, 1.0);
+      cv::Vec2d uv;
+      if (u + v <= 1.0)
+        uv = (1.0 - u - v) * uv_of(qr, qc) + u * uv_of(qr, qc + 1) + v * uv_of(qr + 1, qc);
+      else
+        uv = (u + v - 1.0) * uv_of(qr + 1, qc + 1) + (1.0 - v) * uv_of(qr, qc + 1) + (1.0 - u) * uv_of(qr + 1, qc);
+      lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
+      lifted.valid[i] = true;
+      continue;
+    }
+    double best = std::numeric_limits<double>::infinity();
+    const int cr = int(std::lround(gr)), cc = int(std::lround(gc));
+    for (int r = std::max(0, cr - 2); r <= std::min(coarse.rows - 1, cr + 2); ++r)
+      for (int c = std::max(0, cc - 2); c <= std::min(coarse.cols - 1, cc + 2); ++c) {
+        if (index(r, c) < 0) continue;
+        const double d = (r - gr) * (r - gr) + (c - gc) * (c - gc);
+        if (d < best) {
+          best = d;
+          const cv::Vec2d uv = uv_of(r, c);
+          lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
+          lifted.valid[i] = true;
+        }
+      }
+  }
+  return lifted;
+}
+
+struct Options {
+  int iters = 50;
+  igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
+  std::string energy_label = "symmetric_dirichlet";
+  double conv_tol = 0.0;
+  float keep_percent = 100.0f;
+  bool inpaint = false;
+};
+
+// The flattened surface, or nullptr when SLIM diverged. Energies and heatmaps
+// are named after `report_path` as after an input OBJ.
+static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options& opt,
+                                            const fs::path& report_path, const std::string& run_name)
+{
+  cv::Mat_<cv::Vec3f> full = surface.rawPoints().clone();
+
+  // Initial UVs are grid positions scaled by 1/scale, as vc_tifxyz2obj writes them.
+  const cv::Vec2f scale = surface.scale();
+  const float uv_fac_x = (std::isfinite(scale[0]) && scale[0] > 0.f) ? 1.0f / scale[0] : 1.0f;
+  const float uv_fac_y = (std::isfinite(scale[1]) && scale[1] > 0.f) ? 1.0f / scale[1] : 1.0f;
+
+  const bool decimating = opt.keep_percent > 0.0f && opt.keep_percent < 100.0f;
+  int stride = 1;
+  cv::Mat_<cv::Vec3f> coarse = decimating ? vc::meshing::decimateGrid(full, opt.keep_percent / 100.0f, &stride) : full;
+  if (decimating)
+    std::cout << "Decimated " << full.rows << " x " << full.cols << " to " << coarse.rows << " x " << coarse.cols
+              << " (stride " << stride << ")\n";
+  // Interior holes add boundary loops that break SLIM; fill them if asked.
+  if (opt.inpaint) {
+    for (auto* points : decimating ? std::vector{&coarse, &full} : std::vector{&full}) {
+      const int filled = vc::core::util::inpaintSurfaceHoles(*points);
+      if (filled > 0) std::cerr << "warning: inpainted " << filled << " invalid surface cell(s)\n";
+    }
+  }
+
+  const auto coarse_mesh = vc::meshing::meshGrid(coarse);
+  if (coarse_mesh.faces.empty()) throw std::runtime_error("the surface has no valid quads");
+  Eigen::MatrixXd V(coarse_mesh.positions.size(), 3), TC(coarse_mesh.positions.size(), 2);
+  for (std::size_t i = 0; i < coarse_mesh.positions.size(); ++i) {
+    const auto& p = coarse_mesh.positions[i];
+    V.row(i) << p[0], p[1], p[2];
+    TC.row(i) << float(coarse_mesh.cells[i][1]) * uv_fac_x, float(coarse_mesh.cells[i][0]) * uv_fac_y;
+  }
+  Eigen::MatrixXi F(coarse_mesh.faces.size(), 3);
+  for (std::size_t f = 0; f < coarse_mesh.faces.size(); ++f)
+    F.row(f) << coarse_mesh.faces[f][0], coarse_mesh.faces[f][1], coarse_mesh.faces[f][2];
+
+  Flatboi fb(std::move(V), std::move(F), std::move(TC), opt.iters, opt.energy, report_path.string());
+  fb.conv_tol = opt.conv_tol;
+  WBLogger wblog(run_name, opt.iters);
+  auto [uv_out, energies] = fb.slim_run("original", wblog.enabled() ? &wblog : nullptr);
+  bool diverged = !uv_out.allFinite();
+  for (std::size_t k = 1; k < energies.size() && !diverged; ++k) diverged = !std::isfinite(energies[k]);
+  if (diverged) {
+    std::cerr << "Error: SLIM diverged (NaN energy or non-finite UVs). "
+              << "Try a lower --keep percent (smaller mesh).\n";
+    return nullptr;
+  }
+  save_energies(report_path, energies);
+  const auto heatmaps = fb.save_uv_heatmaps(uv_out);
+  if (wblog.enabled()) {
+    wblog.log_image("heatmap/L2",       heatmaps.L2.string());
+    wblog.log_image("heatmap/Linf",     heatmaps.Linf.string());
+    wblog.log_image("heatmap/kappa",    heatmaps.kappa.string());
+    wblog.log_image("heatmap/log_area", heatmaps.logarea.string());
+    wblog.finish();
+  }
+
+  // The flattened mesh at full resolution.
+  const auto fine_mesh = decimating ? vc::meshing::meshGrid(full) : coarse_mesh;
+  std::vector<cv::Vec2f> uvs(fine_mesh.positions.size());
+  std::vector<bool> uv_valid(fine_mesh.positions.size(), true);
+  if (decimating) {
+    auto lifted = lift(fine_mesh, coarse, coarse_mesh, uv_out, stride);
+    uvs = std::move(lifted.uvs);
+    uv_valid = std::move(lifted.valid);
+  } else {
+    for (std::size_t i = 0; i < uvs.size(); ++i) uvs[i] = cv::Vec2f(float(uv_out(i, 0)), float(uv_out(i, 1)));
+  }
+  std::vector<vc::meshing::UvFace> faces;
+  faces.reserve(fine_mesh.faces.size());
+  for (const auto& f : fine_mesh.faces)
+    if (uv_valid[f[0]] && uv_valid[f[1]] && uv_valid[f[2]])
+      faces.push_back({{f[0], f[1], f[2]}, {f[0], f[1], f[2]}});
+  if (faces.size() != fine_mesh.faces.size())
+    std::cerr << "warning: " << (fine_mesh.faces.size() - faces.size()) << " triangle(s) had no flattened UVs\n";
+
+  // Rasterized at the source's sampling density, as vc_obj2tifxyz --tifxyz-source does.
+  vc::meshing::UvGridRasterizer rasterizer;
+  if (scale[0] > 0.f && scale[1] > 0.f) rasterizer.setSrcScale(scale);
+  std::vector<cv::Vec2f> cells;
+  cells.reserve(fine_mesh.cells.size());
+  for (const auto& cell : fine_mesh.cells) cells.emplace_back(float(cell[1]), float(cell[0]));
+  rasterizer.setMesh(fine_mesh.positions, std::move(uvs), std::move(faces));
+  const cv::Mat approval = surface.channel("approval", SURF_CHANNEL_NORESIZE);
+  if (!approval.empty()) {
+    rasterizer.setGridUV(std::move(cells));
+    rasterizer.setSrcApproval(approval);
+  }
+  rasterizer.determineGridDimensions(1.0f);
+  std::unique_ptr<QuadSurface> flat(rasterizer.createQuadSurface(1.0f));
+  flat->meta = surface.meta;
+  if (rasterizer.hasApproval()) flat->setChannel("approval", rasterizer.outApproval());
+  return flat;
+}
+
+static nlohmann::json parameters(const Options& opt)
+{
+  return {{"iterations", opt.iters}, {"energy", opt.energy_label}, {"tolerance", opt.conv_tol},
+          {"keep_percent", opt.keep_percent}, {"inpaint", opt.inpaint}};
+}
+
+// A stored surface into a new surface object; reports go to its artifact directory.
+static int run_store(const StoreOutputArgs& output, const std::string& source, const Options& opt)
+{
+  StoreSurfaces store(output.store, "flatboi");
+  const auto surface = store.load(source);
+  const fs::path report_dir = fs::temp_directory_path() / ("flatboi-" + source + "-" + std::to_string(::getpid()));
+  fs::create_directories(report_dir);
+  const auto flat = flatten(*surface, opt, report_dir / "slim.obj", source);
+  if (!flat) return 3;
+
+  const std::string name = !output.name.empty() ? output.name
+      : (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi";
+  const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.coordinates());
+  const auto artifacts = store.artifactDirectory(uuid);
+  for (const auto& entry : fs::directory_iterator(report_dir)) {
+    std::error_code ignored;
+    fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
+  }
+  std::error_code ignored;
+  fs::remove_all(report_dir, ignored);
+  store.finish();
+  std::cout << "surface_uuid: " << uuid << std::endl;
+  return 0;
+}
+
+// A tifxyz directory into a new one (a new surface: fresh uuid); reports are
+// written beside it as <output>_energies_flatboi.txt and <output>_heat_*.png.
+static int run_tifxyz(const fs::path& input, const fs::path& output, const Options& opt)
+{
+  if (fs::exists(output)) throw std::runtime_error("output exists: " + output.string());
+  const auto surface = load_quad_from_tifxyz(input.string());
+  const auto flat = flatten(*surface, opt, output.parent_path() / (output.filename().string() + ".obj"), input.string());
+  if (!flat) return 3;
+  flat->meta["uuid"] = vc::util::resolveTifxyzUuid("");
+  flat->save(output);
+  std::cout << "Wrote: " << output << "\n";
+  return 0;
+}
+
+} // namespace surface_mode
+
+// ------------------------------
 // main
 // ------------------------------
 int main(int argc, char** argv) {
@@ -945,29 +1187,74 @@ int main(int argc, char** argv) {
 
   auto print_usage = [&]() {
     std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
+              << "       " << argv[0] << " <tifxyz-dir> --output=<dir> [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
+              << "       " << argv[0] << " --store=<store> --source-surface=<uuid> [--name=<name>] [--tag=<tag>]...\n"
+              << "                [--volume-uuid=<id>] [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
               << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
-              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n";
+              << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n"
+              << "  a tifxyz surface (directory or stored) is flattened into a new surface: a tifxyz\n"
+              << "  directory at --output, or a stored surface (prints surface_uuid:);\n"
+              << "  --keep=<p> runs SLIM on ~p percent of the grid points and lifts the UVs to the\n"
+              << "  full grid, --inpaint fills interior holes first\n";
   };
 
+  StoreOutputArgs store_output;
+  std::string source_surface;
+  std::string tifxyz_output;
+  float keep_percent = 100.0f;
+  bool inpaint = false;
   std::vector<std::string> positional;
-  for (int i = 1; i < argc; ++i) {
-    std::string a = argv[i];
-    if (a.rfind("--tol=", 0) == 0) {
-      conv_tol = std::atof(a.c_str() + 6);
-    } else if (a == "--help" || a == "-h") {
-      print_usage();
-      return 0;
-    } else {
-      positional.push_back(std::move(a));
+  try {
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a.rfind("--tol=", 0) == 0) {
+        conv_tol = std::atof(a.c_str() + 6);
+      } else if (a == "--help" || a == "-h") {
+        print_usage();
+        return 0;
+      } else if (store_output.parse(a)) {
+      } else if (a.rfind("--source-surface=", 0) == 0) {
+        source_surface = a.substr(17);
+      } else if (a.rfind("--output=", 0) == 0) {
+        tifxyz_output = a.substr(9);
+      } else if (a.rfind("--keep=", 0) == 0) {
+        keep_percent = std::stof(a.substr(7));
+        if (!(keep_percent > 0.0f && keep_percent <= 100.0f)) throw std::invalid_argument("--keep must be in (0, 100]");
+      } else if (a == "--inpaint") {
+        inpaint = true;
+      } else {
+        positional.push_back(std::move(a));
+      }
     }
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
   }
 
+  const bool store_mode = !store_output.store.empty();
+  if (store_mode != !source_surface.empty()) {
+    std::cerr << "--store and --source-surface go together\n"; return 1;
+  }
+  if (!store_mode && (!store_output.name.empty() || !store_output.tags.empty() || !store_output.volume.empty())) {
+    std::cerr << "--name, --tag and --volume-uuid need --store\n"; return 1;
+  }
+  // The OBJ or tifxyz path, or nothing in store mode.
+  if (store_mode) positional.insert(positional.begin(), std::string());
   if (positional.empty() || positional.size() > 3) { print_usage(); return 1; }
   obj_path = positional[0];
   if (positional.size() >= 2) iters = std::atoi(positional[1].c_str());
   if (iters <= 0) { std::cerr << "iters must be > 0\n"; return 1; }
-  if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
-  if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
+  const bool tifxyz_mode = !store_mode && fs::is_directory(obj_path);
+  if (tifxyz_mode == tifxyz_output.empty()) {
+    std::cerr << "--output=<dir> is the output of a tifxyz input, and only of one\n"; return 1;
+  }
+  if (!store_mode && !tifxyz_mode) {
+    if (keep_percent < 100.0f || inpaint) {
+      std::cerr << "--keep and --inpaint need a surface input (tifxyz or --store)\n"; return 1;
+    }
+    if (!fs::exists(obj_path)) { std::cerr << "File not found: " << obj_path << "\n"; return 1; }
+    if (fs::path(obj_path).extension() != ".obj") { std::cerr << "Input must be .obj\n"; return 1; }
+  }
 
   if (positional.size() == 3) {
     std::string e_lower = positional[2];
@@ -1001,6 +1288,17 @@ int main(int argc, char** argv) {
 
   std::ios::sync_with_stdio(false);
   std::cout.setf(std::ios::unitbuf); // line-buffered: flush on '\n'
+
+  if (store_mode || tifxyz_mode) {
+    const surface_mode::Options options{iters, energy, energy_label, conv_tol, keep_percent, inpaint};
+    try {
+      return store_mode ? surface_mode::run_store(store_output, source_surface, options)
+                        : surface_mode::run_tifxyz(obj_path, tifxyz_output, options);
+    } catch (const std::exception& e) {
+      std::cerr << "Error: " << e.what() << "\n";
+      return 2;
+    }
+  }
 
   try {
     Flatboi fb(obj_path, iters, energy);

@@ -758,13 +758,9 @@ include_directories(core/include)
 add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
 add_subdirectory(libs/volcomp)
-# igl::core is needed by flatboi (SLIM) and by apps/vc_obj_uv_lift; fetch it
-# here — before the sanitizer flags below — so both consumers see the target
-# even when flatboi is off (Windows).
-if(VC_BUILD_FLATBOI OR VC_BUILD_APPS)
-    include(cmake/FetchLibigl.cmake)
-endif()
+# flatboi (SLIM) needs igl::core; fetch it here, before the sanitizer flags below.
 if(VC_BUILD_FLATBOI)
+    include(cmake/FetchLibigl.cmake)
     add_subdirectory(libs/flatboi)
 endif()
 

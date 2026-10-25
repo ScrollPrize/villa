@@ -376,3 +376,55 @@ TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources"
     // The tracer's debug snapshots land in the output's artifacts, not a target directory.
     CHECK(fs::is_directory(fs::path(f.store.string() + ".artifacts") / uuid / "grow_debug"));
 }
+
+TEST_CASE("flatboi flattens a surface like the OBJ chain it replaces")
+{
+    const char* flatboi = std::getenv("VC_FLATBOI_BIN");
+    if (!flatboi) {
+        MESSAGE("flatboi is not built; skipped");
+        return;
+    }
+    Fixture f;
+    // One thread: PaStiX's threaded solve is not bitwise repeatable.
+    const std::string env = "PASTIX_NUM_THREADS=1 OMP_NUM_THREADS=1 ";
+    const auto bin = env + tool("VC_FLATBOI_BIN");
+    const auto obj = f.dir / "mesh.obj";
+    run(tool("VC_TIFXYZ2OBJ_BIN") + " \"" + f.tifxyz.string() + "\" \"" + obj.string() + "\"", f.dir / "obj.log");
+    run(bin + " \"" + obj.string() + "\" 10", f.dir / "slim.log");
+    run(tool("VC_OBJ2TIFXYZ_BIN") + " \"" + (f.dir / "mesh_flatboi.obj").string() + "\" \"" + (f.dir / "flat").string() +
+        "\" --tifxyz-source=\"" + f.tifxyz.string() + "\"", f.dir / "tifxyz.log");
+    const std::string store = " --store=\"" + f.store.string() + "\" --source-surface=" + f.uuid;
+    const auto uuid = surfaceUuid(run(bin + store + " --tag=flat 10", f.dir / "store.log"));
+    const auto coarse = surfaceUuid(run(bin + store + " --keep=50 --name=coarse 10", f.dir / "keep.log"));
+    run(bin + " \"" + f.tifxyz.string() + "\" --output=\"" + (f.dir / "direct").string() + "\" 10", f.dir / "direct.log");
+
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto files = load_quad_from_tifxyz(f.dir / "flat");
+    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+    // The OBJ chain rounds positions and UVs to six decimals in the text files.
+    const cv::Mat_<cv::Vec3f>& a = *stored->rawPointsPtr();
+    const cv::Mat_<cv::Vec3f>& b = *files->rawPointsPtr();
+    for (int r = 0; r < a.rows; ++r)
+        for (int c = 0; c < a.cols; ++c) {
+            REQUIRE((a(r, c)[0] == -1.f) == (b(r, c)[0] == -1.f));
+            CHECK(cv::norm(a(r, c) - b(r, c)) < 0.01);
+        }
+    CHECK(stored->_scale == files->_scale);
+    // A tifxyz input runs the same pipeline as a stored one.
+    CHECK(cv::norm(a, *load_quad_from_tifxyz(f.dir / "direct")->rawPointsPtr(), cv::NORM_INF) == 0);
+    const auto object = db.objectByUuid(txn, uuid);
+    CHECK(object->name == "surface_flatboi");
+    CHECK(object->tags == std::vector<std::string>{"flat"});
+    const auto meta = nlohmann::json::parse(object->meta);
+    CHECK(meta.at("provenance").at("tool") == "flatboi");
+    CHECK(meta.at("provenance").at("sources") == nlohmann::json::array({f.uuid}));
+    CHECK(meta.at("coordinates").at("volume_uuid") == "vol");
+    CHECK(fs::is_regular_file(fs::path(f.store.string() + ".artifacts") / uuid / "slim_energies_flatboi.txt"));
+
+    // Decimated: SLIM on every other row and column, UVs lifted to the full grid.
+    CHECK(load_quad_from_store(db, txn, coarse)->countValidPoints() > 0);
+    CHECK(db.objectByUuid(txn, coarse)->name == "coarse");
+}
