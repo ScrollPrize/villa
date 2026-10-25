@@ -33,7 +33,9 @@ VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
     for(const auto& object:objectsByKind(txn,"volume_transform")) {
         const auto meta=nlohmann::json::parse(object.meta);
         const auto& value=meta.at("registration");
-        result.graph.add({object.uuid,currentObjectRevision(txn,object.uuid)->uuid,
+        const auto head=currentObjectRevision(txn,object.uuid);
+        if(!head)throw std::runtime_error("commit new volume registrations before resolving views");
+        result.graph.add({object.uuid,head->uuid,
             value.at("source_volume").get<std::string>(),value.at("target_volume").get<std::string>(),
             VolumeAffine::fromJson(value.at("matrix")),value.value("description",std::string{})});
     }

@@ -12,6 +12,9 @@ int main() try {
     {
         auto txn=db.write();
         registration=db.registerVolumeTransform(txn,"a","b",matrix,"scan registration");
+        bool pending=false;
+        try { (void)db.volumeTransforms(txn); } catch(const std::runtime_error&) { pending=true; }
+        require(pending,"new registrations must have a published revision before resolving views");
         auto add=[&](const std::string& kind,const vc::geometry::Geometry& geometry){
             ObjectRecord r;r.kind=kind;r.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
             auto id=db.upsertObject(txn,r);db.putGeometry(txn,id,vc::geometry::encode(geometry));return id;
