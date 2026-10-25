@@ -2747,7 +2747,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--crop", "--crop-xyzwhd", dest="crop_xyzwhd", type=int, nargs=6, default=None,
 		metavar=("X", "Y", "Z", "W", "H", "D"), help="Crop region: x y z w h d.")
 	p.add_argument("--pred-dt", default=None, help="Prediction zarr for distance-to-surface channel.")
-	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu" (default: cuda if available).')
+	p.add_argument("--device", default=None,
+		help='Device, e.g. "cuda", "mps" or "cpu" (default: cuda if available, else mps, else cpu).')
 	p.add_argument("--devices", default=None,
 		help='Multi-GPU selection: "all" or comma-separated CUDA devices, e.g. "cuda:0,cuda:1".')
 	p.add_argument("--prefetch-workers", type=int, default=0,

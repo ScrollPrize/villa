@@ -458,8 +458,12 @@ def resolve_inference_devices(
 	devices: str | Sequence[str | torch.device] | None = None,
 	cuda_available: bool | None = None,
 	cuda_count: int | None = None,
+	mps_available: bool | None = None,
 ) -> tuple[torch.device, ...]:
-	"""Resolve legacy singular or explicit plural inference device selection."""
+	"""Resolve legacy singular or explicit plural inference device selection.
+
+	``auto`` (or no device) picks cuda:0, then Apple Silicon's mps, then cpu.
+	"""
 	if device is not None and devices is not None:
 		raise ValueError("pass either --device or --devices, not both")
 	available = torch.cuda.is_available() if cuda_available is None else bool(cuda_available)
@@ -467,7 +471,10 @@ def resolve_inference_devices(
 	if devices is None:
 		requested = "auto" if device is None else str(device).strip().lower()
 		if requested == "auto":
-			return (torch.device("cuda:0" if available and count > 0 else "cpu"),)
+			if available and count > 0:
+				return (torch.device("cuda:0"),)
+			mps = torch.backends.mps.is_available() if mps_available is None else bool(mps_available)
+			return (torch.device("mps" if mps else "cpu"),)
 		resolved = torch.device(requested)
 		if resolved.type == "cuda":
 			index = 0 if resolved.index is None else int(resolved.index)

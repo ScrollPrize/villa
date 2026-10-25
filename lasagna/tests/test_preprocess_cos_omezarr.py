@@ -340,7 +340,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 	def test_shared_multi_gpu_device_resolution(self):
 		self.assertEqual(
-			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0),
+			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0, mps_available=False),
 			(torch.device("cpu"),),
 		)
 		self.assertEqual(
@@ -355,6 +355,33 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			resolve_inference_devices(device="cuda", devices="all", cuda_available=True, cuda_count=2)
 		with self.assertRaisesRegex(ValueError, "duplicate"):
 			resolve_inference_devices(devices="cuda,cuda:0", cuda_available=True, cuda_count=2)
+
+	def test_auto_device_prefers_cuda_then_mps_then_cpu(self):
+		# Auto selection asks torch, so both backends are mocked and no GPU is touched.
+		def resolve(*, cuda: bool, mps: bool, **kwargs):
+			with mock.patch.object(torch.cuda, "is_available", return_value=cuda), \
+				 mock.patch.object(torch.cuda, "device_count", return_value=1 if cuda else 0), \
+				 mock.patch.object(torch.backends.mps, "is_available", return_value=mps):
+				return resolve_inference_devices(**kwargs)
+
+		self.assertEqual(resolve(cuda=False, mps=True), (torch.device("mps"),))
+		self.assertEqual(resolve(cuda=False, mps=True, device="auto"), (torch.device("mps"),))
+		self.assertEqual(resolve(cuda=True, mps=True), (torch.device("cuda:0"),))
+		self.assertEqual(resolve(cuda=False, mps=False), (torch.device("cpu"),))
+		# An explicit device still wins over the automatic choice.
+		self.assertEqual(resolve(cuda=False, mps=True, device="cpu"), (torch.device("cpu"),))
+		self.assertEqual(resolve(cuda=True, mps=True, device="cpu"), (torch.device("cpu"),))
+		self.assertEqual(resolve(cuda=True, mps=False, device="cuda"), (torch.device("cuda:0"),))
+		self.assertEqual(
+			resolve_inference_devices(cuda_available=False, cuda_count=0, mps_available=True),
+			(torch.device("mps"),),
+		)
+		# CUDA hosts resolve exactly as before, without asking about MPS.
+		with mock.patch.object(torch.backends.mps, "is_available", side_effect=AssertionError("MPS queried")):
+			self.assertEqual(
+				resolve_inference_devices(cuda_available=True, cuda_count=2),
+				(torch.device("cuda:0"),),
+			)
 
 	def test_shared_auto_download_forwards_workers_to_input_and_pred_dt(self):
 		with mock.patch.object(shared_predict3d, "_download_one_path") as download_one:
