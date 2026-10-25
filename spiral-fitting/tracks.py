@@ -3003,6 +3003,33 @@ def _crossing_row_alignments(
     return row_alignment
 
 
+def _mps_shape_bucket(count):
+    """Round ``count`` up to one of 16 sizes per power of two (<= 6.25% padding)."""
+    if count <= 1024:
+        return 1024
+    step = 1 << (count.bit_length() - 5)
+    return -(-count // step) * step
+
+
+def _transform_shape_bucketed(transform, points):
+    """Apply a per-point transform with the point count rounded to a bucket on MPS.
+
+    MPS compiles and caches one graph per input shape, and each cached graph
+    keeps its own intermediate buffers alive outside the caching allocator.
+    Track samples change size every step, so without bucketing driver memory
+    grows by ~0.35 GB per fit step until the process is killed.  Padding rows
+    repeat the first point and are sliced off, so they get no gradient.
+    """
+    count = int(points.shape[0])
+    if points.device.type != 'mps' or count == 0:
+        return transform(points)
+    padded = _mps_shape_bucket(count)
+    if padded == count:
+        return transform(points)
+    pad = points[:1].expand(padded - count, *points.shape[1:])
+    return transform(torch.cat([points, pad]))[:count]
+
+
 def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_target_cache=None):
     """Yield radius then DT losses so the caller can backward them separately.
 
@@ -3034,7 +3061,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     row_starts = sample['row_starts']
     group_id = sample['group_id']
     num_groups = sample['num_groups']
-    sampled_spiral = slice_to_spiral_transform(sampled_scroll)
+    sampled_spiral = _transform_shape_bucketed(
+        slice_to_spiral_transform, sampled_scroll)
     theta, _, shifted_radii = get_theta_and_radii(sampled_spiral[..., 1:], dr_per_winding)
     shifted_radii, crossing_adjustments = _unwrap_ragged_track_radii(
         theta, shifted_radii, dr_per_winding, row_id, row_starts,
@@ -3109,7 +3137,8 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     # inputs before constructing the inverse-transform graph.
     del radius_loss, sampled_spiral, theta, shifted_radii, crossing_adjustments
     del target_radii, target_shifted_radii
-    target_scroll_zyxs = slice_to_spiral_transform.inv(target_spiral_zyxs)
+    target_scroll_zyxs = _transform_shape_bucketed(
+        slice_to_spiral_transform.inv, target_spiral_zyxs)
 
     within_p = cfg['track_dt_within_track_norm_p']
     across_p = cfg['track_dt_norm_p']
