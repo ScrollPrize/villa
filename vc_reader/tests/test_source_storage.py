@@ -707,6 +707,15 @@ class RemoteTests(RemoteFixtureCase):
             old.read((0, 0), (5, 7))
         old.close()
 
+    def test_uncached_remote_image_under_a_symlinked_temp_dir(self):
+        # The default temporary directory on macOS is under the /var -> /private/var symlink.
+        (self.root/'real-tmp').mkdir()
+        (self.root/'link-tmp').symlink_to(self.root/'real-tmp', target_is_directory=True)
+        source = Source('linked', Storage(self.url+'/image.png', 'png'))
+        with patch('tempfile.tempdir', str(self.root/'link-tmp')):
+            with source.open(cache_writes=False) as reader:
+                np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
+
     def test_remote_demand_reads_go_through_the_prefetch_scheduler(self):
         data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
         path = self.root/'prefetch.zarr'
