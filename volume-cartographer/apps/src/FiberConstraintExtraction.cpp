@@ -1,4 +1,5 @@
 #include "FiberConstraintExtraction.hpp"
+#include "FiberConstraintGeometry.hpp"
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/core/util/AtomicFile.hpp"
@@ -117,14 +118,10 @@ int runFiberConstraintExtraction(int argc, char** argv)
     // geometry (the record's ingest summary is not updated by edits).
     std::vector<std::string> ids, revisions;
     std::vector<double> scales;
-    for(const auto& [uuid,scale]:members) {
-        const auto head=store.currentGeometry(txn,uuid);
-        if(!head)throw std::runtime_error("Fiber "+uuid+" has no geometry");
-        const auto line=std::find_if(head->arrays.begin(),head->arrays.end(),[](const auto& a){return a.name=="line_points";});
-        if(line==head->arrays.end() || line->shape.empty() || line->shape[0]<2) continue;
-        ids.push_back(uuid);
-        revisions.push_back(head->uuid);
-        scales.push_back(scale);
+    for(const auto& selected:selectFiberConstraintGeometry(store,txn,members)) {
+        ids.push_back(selected.uuid);
+        revisions.push_back(selected.revision);
+        scales.push_back(selected.scale);
     }
     if (ids.empty()) throw std::runtime_error("No fibers intersect selection box");
     const double querySeconds=seconds(queryStart);
