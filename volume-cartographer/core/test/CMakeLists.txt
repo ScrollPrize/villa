@@ -107,13 +107,14 @@ qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlay
 qt6_wrap_cpp(viewer_manager_overlay_test_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+qt6_wrap_cpp(surface_catalog_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_ink_detection_overlay
     SOURCES test_ink_detection_overlay.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
@@ -125,7 +126,8 @@ vc_add_test(NAME test_ink_detection_overlay
             ${viewer_manager_overlay_test_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
-    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+            ${surface_catalog_ink_detection_moc}
+    LIBS vc_object_store::vc_objects vc_object_store::vc_object_geometry doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
@@ -898,11 +900,9 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCache.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSegmentCacheIO.hpp
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.hpp
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna Ceres::ceres)

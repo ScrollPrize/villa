@@ -1,17 +1,34 @@
 #pragma once
 
 #include "OpenDataManifest.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataSurfaceStore.hpp"
 
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 class VolumePkg;
 
 namespace vc3d::opendata {
+
+struct OpenDataSampleDownloadProgress {
+    int totalSegments = 0;
+    int completedSegments = 0;
+    int failedSegments = 0;
+    int totalFiles = 0;
+    int completedFiles = 0;
+    int activeWorkers = 0;
+    int totalWorkers = 0;
+    std::string segmentId;
+    std::string fileName;
+    std::string status;
+};
+
+using OpenDataSampleProgressCallback =
+    std::function<void(const OpenDataSampleDownloadProgress&)>;
 
 struct OpenDataSampleProjectResult {
     int supportedVolumes = 0;
@@ -21,12 +38,10 @@ struct OpenDataSampleProjectResult {
     int attachedLasagnaDatasets = 0;
     int attachedNormalGrids = 0;
     int supportedTifxyzSegments = 0;
-    int cachedTifxyzSegments = 0;
-    int attachedSegmentEntries = 0;
-    int skippedTifxyzSegments = 0;
+    // Representations recorded in the sample's surface store (new ones counted in addedSurfaces).
+    int importedSurfaces = 0;
+    int addedSurfaces = 0;
     int failedTifxyzSegments = 0;
-    int transformedTifxyzSegments = 0;
-    int failedTransformedTifxyzSegments = 0;
     std::string preferredVolumeId;
     std::vector<std::string> messages;
 };
@@ -52,12 +67,12 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     const OpenDataSample& sample,
     const OpenDataResourceSelection* selection = nullptr);
 
-void attachOpenDataSampleSegments(
-    VolumePkg& pkg,
+// Record the sample's segments (only `segmentIds` when given) as surfaces in
+// its surface store.
+void importOpenDataSampleSurfaces(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback = {},
-    bool individualEntries = false);
+    const std::optional<std::vector<std::string>>& segmentIds = std::nullopt);
 
 } // namespace vc3d::opendata

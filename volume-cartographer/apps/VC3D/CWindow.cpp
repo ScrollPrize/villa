@@ -6,6 +6,7 @@
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
+#include "OpenDataSurfaceStore.hpp"
 
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
@@ -297,63 +298,6 @@ cv::Matx44d coordinateLevelScale(int level)
         0, 0, 0, 1);
 }
 
-bool isOpenDataSegmentsEntry(const vc::project::Entry& entry)
-{
-    if (std::find(entry.tags.begin(), entry.tags.end(), "open-data") != entry.tags.end()) {
-        return true;
-    }
-    return std::any_of(entry.tags.begin(), entry.tags.end(), [](const std::string& tag) {
-        constexpr std::string_view sourcePrefix = "vc-open-data-source-volume-id:";
-        constexpr std::string_view targetPrefix = "vc-open-data-target-volume-id:";
-        return tag.rfind(sourcePrefix, 0) == 0 || tag.rfind(targetPrefix, 0) == 0;
-    });
-}
-
-bool isAvailableOpenDataSegmentsEntry(const VolumePkg& pkg,
-                                      const vc::project::Entry& entry)
-{
-    if (!isOpenDataSegmentsEntry(entry)) {
-        return false;
-    }
-    if (vc::project::isLocationRemote(entry.location)) {
-        return true;
-    }
-
-    std::error_code ec;
-    const auto path = vc::project::resolveLocalPath(
-        entry.location,
-        pkg.path().parent_path());
-    if (!std::filesystem::is_directory(path, ec) || ec) {
-        return false;
-    }
-    if (std::find(entry.tags.begin(), entry.tags.end(),
-                  "vc-open-data-segment-aggregate") != entry.tags.end()) {
-        return true;
-    }
-    return vc::project::validateLocation(
-        vc::project::Category::Segments,
-        path.string()).empty();
-}
-
-bool isSelectedEditableOpenDataSegmentsEntry(
-    const VolumePkg& pkg,
-    const vc::project::Entry& entry)
-{
-    if (!vc::project::hasEntryTag(entry, "open-data-editable") ||
-        vc::project::isLocationRemote(entry.location)) {
-        return false;
-    }
-    const auto selectedPath = pkg.outputSegmentsPath();
-    if (selectedPath.empty()) {
-        return false;
-    }
-    const auto entryPath = vc::project::resolveLocalPath(
-        entry.location, pkg.path().parent_path());
-    std::error_code error;
-    return std::filesystem::equivalent(selectedPath, entryPath, error) &&
-           !error;
-}
-
 std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
                                                        const std::string& loadedVolumeId)
 {
@@ -379,103 +323,6 @@ std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
     return candidates;
 }
 
-const vc::project::Entry* findOpenDataSegmentsEntryForVolume(const VolumePkg& pkg,
-                                                             const QString& catalogVolumeId)
-{
-    if (catalogVolumeId.isEmpty()) {
-        return nullptr;
-    }
-
-    const std::string targetTag = "vc-open-data-target-volume-id:" + catalogVolumeId.toStdString();
-    const std::string sourceTag = "vc-open-data-source-volume-id:" + catalogVolumeId.toStdString();
-    const vc::project::Entry* targetMatch = nullptr;
-    const vc::project::Entry* sourceMatch = nullptr;
-
-    for (const auto& entry : pkg.segmentEntries()) {
-        if (!isAvailableOpenDataSegmentsEntry(pkg, entry)) {
-            continue;
-        }
-        if (std::find(entry.tags.begin(), entry.tags.end(), targetTag) != entry.tags.end()) {
-            if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
-                return &entry;
-            }
-            if (!targetMatch) {
-                targetMatch = &entry;
-            }
-            continue;
-        }
-        if (std::find(entry.tags.begin(), entry.tags.end(), sourceTag) !=
-            entry.tags.end()) {
-            if (!sourceMatch ||
-                isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
-                sourceMatch = &entry;
-            }
-        }
-    }
-
-    return targetMatch ? targetMatch : sourceMatch;
-}
-
-const vc::project::Entry* findOpenDataSegmentsEntryForLoadedVolume(const VolumePkg& pkg,
-                                                                   const std::string& loadedVolumeId,
-                                                                   QString* matchedCatalogVolumeId = nullptr)
-{
-    const auto coordinateSpace =
-        openDataCoordinateSpaceForLoadedVolume(pkg, loadedVolumeId);
-    if (!coordinateSpace.empty()) {
-        const std::string coordinateTag =
-            "vc-open-data-coordinate-space:" + coordinateSpace;
-        const vc::project::Entry* coordinateMatch = nullptr;
-        for (const auto& entry : pkg.segmentEntries()) {
-            if (isAvailableOpenDataSegmentsEntry(pkg, entry) &&
-                std::find(entry.tags.begin(), entry.tags.end(), coordinateTag) !=
-                    entry.tags.end()) {
-                if (isSelectedEditableOpenDataSegmentsEntry(pkg, entry)) {
-                    coordinateMatch = &entry;
-                    break;
-                }
-                if (!coordinateMatch) {
-                    coordinateMatch = &entry;
-                }
-            }
-        }
-        if (coordinateMatch && matchedCatalogVolumeId) {
-            *matchedCatalogVolumeId =
-                openDataCatalogVolumeIdForLoadedVolume(pkg, loadedVolumeId);
-        }
-        if (coordinateMatch) {
-            return coordinateMatch;
-        }
-        // Explicitly identified assets must never fall back to lineage-only
-        // association, because native and virtual views share that lineage.
-        return nullptr;
-    }
-
-    for (const QString& candidate : openDataCatalogVolumeIdCandidates(pkg, loadedVolumeId)) {
-        if (const auto* entry = findOpenDataSegmentsEntryForVolume(pkg, candidate)) {
-            if (matchedCatalogVolumeId) {
-                *matchedCatalogVolumeId = candidate;
-            }
-            return entry;
-        }
-    }
-    return nullptr;
-}
-
-bool packageHasOpenDataSegments(const VolumePkg& pkg)
-{
-    for (const auto& entry : pkg.segmentEntries()) {
-        if (isAvailableOpenDataSegmentsEntry(pkg, entry)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool volumeHasOpenDataSegmentsEntry(const VolumePkg& pkg, const std::string& loadedVolumeId)
-{
-    return findOpenDataSegmentsEntryForLoadedVolume(pkg, loadedVolumeId) != nullptr;
-}
 
 class DockMenuMainWindow : public QMainWindow
 {
@@ -4094,6 +3941,28 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
     }
 }
 
+void CWindow::updateCatalogSurfaceSources()
+{
+    // An Open Data volume shows its catalog volume's surfaces at its pyramid level.
+    std::vector<SurfaceCatalog::Source> sources;
+    const auto volume = _state->currentVolume();
+    if (volume && _state->vpkg()) {
+        if (const auto catalog = vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(volume->id()))) {
+            const auto store = vc3d::opendata::surfaceStorePath(vc3d::remoteCachePathFs(), catalog->sampleId);
+            std::error_code ec;
+            if (std::filesystem::exists(store, ec)) {
+                try {
+                    sources.push_back({_state->catalogAttachment(store), catalog->volumeId,
+                                       1.0 / double(1 << catalog->level)});
+                } catch (const std::exception& error) {
+                    showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
+                }
+            }
+        }
+    }
+    _surfaceCatalog->setCatalogSources(std::move(sources));
+}
+
 void CWindow::loadLasagnaResults(Surface* surface)
 {
     std::optional<nlohmann::json> corr, atlas;
@@ -6679,8 +6548,16 @@ void CWindow::CreateWidgets(void)
 
     // The surface list reads the user's store for the current volume.
     _surfaceCatalog = std::make_unique<SurfaceCatalog>(_state->objectStoreSession(), this);
+    if (_inkDetectionOverlay) {
+        _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
+    }
+    // Open Data surfaces come from the sample's catalog store, read-only, fetched when opened.
+    _surfaceCatalog->setFetcher([](const std::filesystem::path& store, const std::string& uuid) {
+        vc3d::opendata::materializeSurface(store, uuid);
+    });
     auto updateSurfaceSource = [this]() {
         _surfaceCatalog->setSource(_state->objectStoreAttachment(), _state->currentVolume());
+        updateCatalogSurfaceSources();
         LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
     };
     connect(_state, &CState::objectStoreChanged, _surfaceCatalog.get(),
@@ -6711,13 +6588,14 @@ void CWindow::CreateWidgets(void)
     // it is being edited (its edits continue from their own revisions).
     connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
         const auto active = _state->activeSurface().lock();
-        if (!active || std::find(uuids.begin(), uuids.end(), active->id) == uuids.end() || !_surfaceCatalog->attachment()) {
+        const auto* row = active ? _surfaceCatalog->row(active->id) : nullptr;
+        if (!row || std::find(uuids.begin(), uuids.end(), active->id) == uuids.end()) {
             return;
         }
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
         std::optional<std::string> head;
-        _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        _surfaceCatalog->session()->read(row->source.attachment, [&](const auto& db, const auto& txn, const auto&) {
             if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
         });
         if (!head || (known && known->objectRevision == *head)) {
@@ -8706,7 +8584,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     QVector<QPair<QString, QString>> volumeEntries;
     QVector<QPair<QString, QString>> openDataVolumeIdMap;
     std::set<QString> preferredOpenDataSourceIds;
-    std::set<QString> openDataVolumesWithoutSegments;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
     const bool hasExplicitPreferredVolume = !activeCandidate.isEmpty();
@@ -8741,7 +8618,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
-    const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
     const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
@@ -8755,9 +8631,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
-            if (hasOpenDataSegments && !volumeHasOpenDataSegmentsEntry(*_state->vpkg(), id)) {
-                openDataVolumesWithoutSegments.insert(idStr);
-            }
             const auto loadedVolumeTags = _state->vpkg()->volumeTags(id);
             const bool preferredOpenDataSource =
                 std::find(loadedVolumeTags.begin(), loadedVolumeTags.end(),
@@ -8836,12 +8709,6 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             const int row = selector->count() - 1;
             const auto sourcePath = vc3d::volumeDisplayPath(*_state->vpkg(), id.toStdString());
             selector->setItemData(row, sourcePath, Qt::ToolTipRole);
-            if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
-                selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
-                selector->setItemData(row,
-                                      sourcePath + QStringLiteral("\n") + tr("No segment transform is available for this volume."),
-                                      Qt::ToolTipRole);
-            }
         }
         if (activeCandidate.isEmpty()) {
             if (selector->count() > 0) {

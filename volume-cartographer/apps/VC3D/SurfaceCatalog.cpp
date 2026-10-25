@@ -35,6 +35,36 @@ void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachme
     if (attachment_ == attachment && volume_ == volume) return;
     attachment_ = attachment;
     volume_ = std::move(volume);
+    restart();
+}
+
+void SurfaceCatalog::setCatalogSources(std::vector<Source> sources)
+{
+    if (catalogSources_ == sources) return;
+    catalogSources_ = std::move(sources);
+    restart();
+}
+
+std::function<void()> SurfaceCatalog::fetchJob(const std::string& uuid) const
+{
+    const auto* listed = row(uuid);
+    if (!listed || !listed->catalog || !fetcher_) throw std::runtime_error("The surface has no geometry");
+    std::filesystem::path store;
+    session_->read(listed->source.attachment, [&](const auto& db, const auto&, const auto&) { store = db.path(); });
+    return [fetcher = fetcher_, store, uuid]() { fetcher(store, uuid); };
+}
+
+std::vector<SurfaceCatalog::Source> SurfaceCatalog::sources() const
+{
+    std::vector<Source> sources;
+    if (!volume_) return sources;
+    if (attachment_) sources.push_back({*attachment_, volume_->id(), 1});
+    sources.insert(sources.end(), catalogSources_.begin(), catalogSources_.end());
+    return sources;
+}
+
+void SurfaceCatalog::restart()
+{
     ++generation_;
     if (cancelled_) cancelled_->store(true);
     cancelled_.reset();
@@ -50,7 +80,10 @@ void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachme
 
 void SurfaceCatalog::handle(const StoreSessionEvent& event)
 {
-    if (!attachment_ || event.attachment != *attachment_ || event.kind != StoreSessionEvent::Kind::Committed) return;
+    const auto listed = sources();
+    if (event.kind != StoreSessionEvent::Kind::Committed ||
+        std::none_of(listed.begin(), listed.end(), [&](const Source& source) { return source.attachment == event.attachment; }))
+        return;
     std::vector<std::string> changed;
     for (const auto& change : event.changes)
         if (change.kind == "surface") changed.push_back(change.recordUuid);
@@ -81,7 +114,8 @@ void SurfaceCatalog::read(std::optional<std::vector<std::string>> uuids)
 // One read at a time, so results merge in commit order.
 void SurfaceCatalog::schedule()
 {
-    if (busy_ || !attachment_ || !volume_ || (!pendingFull_ && pending_.empty())) return;
+    const auto listed = sources();
+    if (busy_ || listed.empty() || (!pendingFull_ && pending_.empty())) return;
     std::optional<std::vector<std::string>> requested;
     if (!std::exchange(pendingFull_, false)) requested = std::vector<std::string>(pending_.begin(), pending_.end());
     else loading_ = true;
@@ -89,26 +123,33 @@ void SurfaceCatalog::schedule()
     busy_ = true;
     cancelled_ = std::make_shared<std::atomic_bool>(false);
     vc3d::store::background<Listing>(this,
-        [session = session_, attachment = *attachment_, volume = volume_->id(), requested, cancel = cancelled_]() {
+        [session = session_, listed, user = attachment_, requested, cancel = cancelled_]() {
             Listing listing;
             listing.requested = requested;
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
-                ObjectSelection selection;
-                selection.kind = "surface";
-                selection.volume = volume;
-                selection.includeUnbound = true;
-                if (requested) {
-                    if (requested->empty()) return;
-                    selection.uuids = *requested;
-                }
-                for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
-                    if (cancel->load() || cancelled.load()) return;
-                    SurfaceCatalog::Row row;
-                    row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), volume);
-                    row.record = std::move(record);
-                    listing.rows.push_back(std::move(row));
-                }
-            });
+            for (const auto& source : listed) {
+                const bool catalog = source.attachment != user;
+                session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
+                    ObjectSelection selection;
+                    selection.kind = "surface";
+                    selection.volume = source.volume;
+                    // Catalog stores list only what they hold for this volume.
+                    selection.includeUnbound = !catalog;
+                    if (requested) {
+                        if (requested->empty()) return;
+                        selection.uuids = *requested;
+                    }
+                    for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
+                        if (cancel->load() || cancelled.load()) return;
+                        SurfaceCatalog::Row row;
+                        row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), source.volume);
+                        if (row.toVolume) *row.toVolume *= source.scale;
+                        row.record = std::move(record);
+                        row.source = source;
+                        row.catalog = catalog;
+                        listing.rows.push_back(std::move(row));
+                    }
+                });
+            }
             return listing;
         },
         [this, generation = generation_, requested](vc3d::store::Outcome<Listing> result) {
@@ -128,22 +169,25 @@ void SurfaceCatalog::schedule()
 
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid) const
 {
+    if (const auto* listed = row(uuid))
+        return open(session_, listed->source.attachment, listed->source.volume, uuid, listed->source.scale);
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
     return open(session_, *attachment_, volume_->id(), uuid);
 }
 
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSession>& session,
                                             const AttachmentIdentity& attachment, const std::string& volume,
-                                            const std::string& uuid)
+                                            const std::string& uuid, double scale)
 {
     Opened opened;
     session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto revision = db.currentObjectRevision(txn, uuid);
         if (!revision || revision->record.retired || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
-        const auto factor = geometryScaleToVolume(nlohmann::json::parse(revision->record.meta), volume);
+        auto factor = geometryScaleToVolume(nlohmann::json::parse(revision->record.meta), volume);
         if (!factor) throw std::runtime_error("The surface is not bound to volume " + volume);
-        if (!revision->geometryRevision) throw std::runtime_error("The surface has no geometry");
+        if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
+        *factor *= scale;
         opened.surface = load_quad_from_store(db, txn, uuid, *revision->geometryRevision, true, *factor);
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
         opened.toVolume = *factor;
@@ -207,6 +251,15 @@ void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
 std::string SurfaceCatalog::copy(const std::string& uuid, const std::string& name)
 {
     if (!attachment_) throw std::runtime_error("Attach an object store first");
+    if (const auto* listed = row(uuid); listed && listed->catalog) {
+        // A catalog surface becomes the user's: its geometry in the open volume's
+        // voxels, bound to that volume, so it can be edited.
+        auto opened = open(uuid);
+        const nlohmann::json provenance{{"tool", "vc3d_copy"},
+                                        {"parameters", {{"store_uuid", listed->source.attachment.storeUuid}}},
+                                        {"sources", {uuid}}};
+        return create(*opened.surface, name, provenance);
+    }
     const auto copied = session_->copyObject(*attachment_, *attachment_, uuid);
     rename(copied, name);
     return copied;
@@ -230,12 +283,21 @@ std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double
                                                          const std::optional<std::vector<std::string>>& uuids) const
 {
     std::vector<SurfaceProximityHit> hits;
-    if (!attachment_ || !volume_) return hits;
-    SurfaceProximityQuery query;
-    query.point = point;
-    query.tolerance = tolerance;
-    query.uuids = uuids;
-    query.volume = volume_->id();
-    session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) { hits = db.nearestSurfaces(txn, query); });
+    for (const auto& source : sources()) {
+        // Queries are in the bound volume's voxels; hits come back in the open volume's.
+        SurfaceProximityQuery query;
+        query.point = {point[0] / source.scale, point[1] / source.scale, point[2] / source.scale};
+        query.tolerance = tolerance / source.scale;
+        query.uuids = uuids;
+        query.volume = source.volume;
+        session_->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (auto hit : db.nearestSurfaces(txn, query)) {
+                for (auto& value : hit.point) value *= source.scale;
+                hit.distance *= source.scale;
+                hits.push_back(std::move(hit));
+            }
+        });
+    }
+    std::stable_sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) { return a.distance < b.distance; });
     return hits;
 }

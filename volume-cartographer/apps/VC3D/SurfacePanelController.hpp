@@ -167,6 +167,7 @@ private:
     SurfaceTreeWidgetItem* itemFor(const std::string& id) const;
     // Open the selected surface and announce it.
     void activate(const std::string& id, bool preserveEditing);
+    void fetchThenActivate(const std::string& id, bool preserveEditing);
 
     void connectFilterSignals();
     void connectTagSignals();
@@ -207,6 +208,8 @@ private:
     QDialog* _filterDialog{nullptr};
     VCCollection* _pointCollection{nullptr};
     std::string _currentSurfaceId;
+    // The catalog surface being fetched for activation (the last one asked for).
+    std::string _fetchingSurfaceId;
     std::optional<SurfaceCatalog::Opened> _opened;
     std::vector<std::string> _visibleSurfaceIds;
     QMetaObject::Connection _pointSetModelConnection;

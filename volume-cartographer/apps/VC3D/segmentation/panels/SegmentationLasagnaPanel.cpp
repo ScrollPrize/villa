@@ -2216,6 +2216,13 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     // The segmentation surface is the job's input and, for re-optimization,
     // the source of its model (left with it in the store by the fit that made it).
     const SurfaceCatalog::Row* activeRow = activeSurfaceRow(state, _surfaceCatalog);
+    if (activeRow && activeRow->catalog) {
+        // The service works on the user's store; catalog surfaces are read-only.
+        auto msg = tr("%1 is a catalog surface; copy it to your store first.")
+                       .arg(QString::fromStdString(activeRow->record.name));
+        showStatus(msg, 7000);
+        return SubmissionResult::failure(msg);
+    }
     const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
     const std::string activeUuid = activeRow ? activeRow->record.uuid : std::string{};
     const bool hasModel = activeRow && mgr.surfaceModel(activeUuid).has_value();

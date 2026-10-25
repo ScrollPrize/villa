@@ -100,7 +100,7 @@ std::optional<vc3d::store::Region> StoreSurfaceOverlayController::region(VolumeV
 
 bool StoreSurfaceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return viewer && !_surfaces.empty() && _catalog->attachment() && _catalog->volume() &&
+    return viewer && !_surfaces.empty() && !_catalog->sources().empty() &&
            dynamic_cast<PlaneSurface*>(viewer->currentSurface()) &&
            viewer->surfName() != "segmentation";
 }
@@ -124,19 +124,29 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
     const auto cancel = v.region.cancelled;
     const auto revision = _revision;
     vc3d::store::background<Listing>(this,
-        [session = _catalog->session(), attachment = *_catalog->attachment(), volume = _catalog->volume()->id(),
-         uuids = _surfaces, query, cancel]() {
+        [session = _catalog->session(), sources = _catalog->sources(), uuids = _surfaces, query, cancel]() {
             Listing listing;
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
-                vc::objects::RegionOptions options;
-                options.kind = "surface";
-                options.volume = volume;
-                options.uuids = uuids;
-                auto result = db.geometryRegion(txn, vc3d::store::regionSlice(query), options,
-                                                [&](const auto&) { return cancel->load() || cancelled.load(); });
-                listing.complete = result.complete();
-                for (auto& run : result.runs) listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
-            });
+            listing.complete = true;
+            for (const auto& source : sources) {
+                // The slab in the bound volume's voxels; runs back in the open volume's.
+                auto slice = vc3d::store::regionSlice(query);
+                for (auto& value : slice.origin) value /= source.scale;
+                for (auto& value : slice.localBounds) value /= source.scale;
+                session->read(source.attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
+                    vc::objects::RegionOptions options;
+                    options.kind = "surface";
+                    options.volume = source.volume;
+                    options.uuids = uuids;
+                    auto result = db.geometryRegion(txn, slice, options,
+                                                    [&](const auto&) { return cancel->load() || cancelled.load(); });
+                    listing.complete = listing.complete && result.complete();
+                    for (auto& run : result.runs) {
+                        if (source.scale != 1)
+                            for (auto& point : run.points) for (auto& value : point) value *= source.scale;
+                        listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
+                    }
+                });
+            }
             return listing;
         },
         [this, viewer, cancel, view, query, revision](vc3d::store::Outcome<Listing> result) {

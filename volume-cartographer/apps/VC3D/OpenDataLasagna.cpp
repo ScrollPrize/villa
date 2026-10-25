@@ -1,7 +1,6 @@
 #include "OpenDataLasagna.hpp"
 
 #include "OpenDataNormalGrids.hpp"
-#include "OpenDataSegmentCacheIO.hpp"
 #include "VCSettings.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -12,6 +11,7 @@
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "utils/zarr.hpp"
 
+#include <QSaveFile>
 #include <QUrl>
 #include <QXmlStreamReader>
 
@@ -28,6 +28,17 @@
 
 namespace vc3d::opendata {
 namespace {
+
+// Write a marker file whole or not at all.
+void writeMarker(const std::filesystem::path& path, const std::string& text)
+{
+    std::filesystem::create_directories(path.parent_path());
+    QSaveFile output(QString::fromStdString(path.string()));
+    if (!output.open(QIODevice::WriteOnly) ||
+        output.write(text.data(), qint64(text.size())) != qint64(text.size()) || !output.commit()) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
+}
 
 std::string lowerCopy(std::string value)
 {
@@ -507,7 +518,7 @@ std::filesystem::path prepareOpenDataLasagna(
                         markerChanged = true;
                     }
                     if (markerChanged) {
-                        detail::writeStringAtomic(markerPath, marker.dump(2));
+                        writeMarker(markerPath, marker.dump(2));
                     }
                     validatePrepared(info, manifest);
                     return manifest;
@@ -540,7 +551,7 @@ std::filesystem::path prepareOpenDataLasagna(
             marker["source_to_base"] = *info.sourceToBase;
         if (info.baseShapeZYX)
             marker["base_shape_zyx"] = *info.baseShapeZYX;
-        detail::writeStringAtomic(
+        writeMarker(
             finalDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
         try {
             validatePrepared(info, cached.path);

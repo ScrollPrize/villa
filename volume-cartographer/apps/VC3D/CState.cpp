@@ -214,6 +214,24 @@ CState::~CState()
     if (!_objectStoreOwner && _objectStoreAttachment) {
         try { _objectStoreSession->detach(*_objectStoreAttachment); } catch (...) {}
     }
+    if (!_objectStoreOwner) {
+        for (const auto& [path, attachment] : _catalogAttachments) {
+            try { _objectStoreSession->detach(attachment); } catch (...) {}
+        }
+    }
+}
+
+vc::objects::AttachmentIdentity CState::catalogAttachment(const std::filesystem::path& path)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(path);
+    const auto found = _catalogAttachments.find(path);
+    if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
+    vc::objects::OpenOptions options;
+    options.readOnly = true;
+    const auto attachment = _objectStoreSession->attach(path, options);
+    _catalogAttachments[path] = attachment;
+    pollObjectStoreChanges();
+    return attachment;
 }
 
 std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() const

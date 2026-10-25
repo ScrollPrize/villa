@@ -1,7 +1,7 @@
 #include "SegmentationModule.hpp"
 #include "SurfaceStoreEdit.hpp"
 
-#include "../OpenDataSegmentCache.hpp"
+#include "../OpenDataManifest.hpp"
 #include "../OpenDataCoordinateIdentity.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"

@@ -58,7 +58,6 @@ private slots:
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
     void cacheSelectedSegment();
-    void openSelectedSegmentCacheFolder();
     void syncSelectedSampleCache();
     void openSelectedSample();
     void createSelectedProject();
@@ -101,7 +100,6 @@ private:
     [[nodiscard]] QString selectedVolumeUrl() const;
     [[nodiscard]] QString selectedRepresentationUrl() const;
     [[nodiscard]] QString selectedSegmentUrl() const;
-    [[nodiscard]] std::filesystem::path selectedSegmentCacheDir() const;
     [[nodiscard]] std::filesystem::path cacheRoot() const;
     [[nodiscard]] std::filesystem::path cachedManifestPath() const;
     [[nodiscard]] std::filesystem::path cacheMetadataPath() const;
@@ -131,7 +129,6 @@ private:
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
     QPushButton* _cacheSegmentButton{nullptr};
-    QPushButton* _openSegmentCacheFolderButton{nullptr};
     QPushButton* _syncSampleCacheButton{nullptr};
     QCheckBox* _doNotShowOnNextOpenCheck{nullptr};
 

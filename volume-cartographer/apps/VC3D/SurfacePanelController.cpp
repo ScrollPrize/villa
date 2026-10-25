@@ -257,6 +257,13 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
     try {
         _opened = _catalog->open(id);
         surface = _opened->surface;
+    } catch (const SurfaceCatalog::NoGeometry&) {
+        const auto* row = _catalog->row(id);
+        if (row && row->catalog) {
+            fetchThenActivate(id, preserveEditing);
+            return;
+        }
+        emit statusMessageRequested(tr("Cannot open surface %1: it has no geometry").arg(idQString), 8000);
     } catch (const std::exception& error) {
         emit statusMessageRequested(tr("Cannot open surface %1: %2").arg(idQString, QString::fromUtf8(error.what())), 8000);
     }
@@ -276,6 +283,37 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
     if (isCurrentOnlyFilterEnabled()) {
         applyFilters();
     }
+}
+
+// A catalog surface still remote: fetch its geometry in the background, then
+// open it if it is still the one asked for.
+void SurfacePanelController::fetchThenActivate(const std::string& id, bool preserveEditing)
+{
+    _fetchingSurfaceId = id;
+    emit statusMessageRequested(tr("Fetching surface %1 from the catalog...").arg(QString::fromStdString(id)), 0);
+    std::function<void()> job;
+    try {
+        job = _catalog->fetchJob(id);
+    } catch (const std::exception& error) {
+        _fetchingSurfaceId.clear();
+        emit statusMessageRequested(tr("Cannot fetch surface %1: %2").arg(QString::fromStdString(id), QString::fromUtf8(error.what())), 8000);
+        return;
+    }
+    vc3d::store::background<bool>(this,
+        [job]() {
+            job();
+            return true;
+        },
+        [this, id, preserveEditing](vc3d::store::Outcome<bool> result) {
+            if (_fetchingSurfaceId != id) return;
+            _fetchingSurfaceId.clear();
+            if (!result.error.isEmpty()) {
+                emit statusMessageRequested(tr("Cannot fetch surface %1: %2").arg(QString::fromStdString(id), result.error), 8000);
+                return;
+            }
+            emit statusMessageRequested(tr("Fetched surface %1").arg(QString::fromStdString(id)), 3000);
+            activate(id, preserveEditing);
+        });
 }
 
 void SurfacePanelController::handleTreeSelectionChanged()
@@ -359,8 +397,14 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         targets << segmentId;
     }
 
-    // Tools and edits need the surface in this volume's voxels on a writable store.
-    const bool writable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
+    // Tools and edits need the surface in this volume's voxels on a writable store;
+    // catalog surfaces are read-only.
+    const bool storeWritable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
+    const bool writable = storeWritable &&
+        std::none_of(targets.begin(), targets.end(), [this](const QString& id) {
+            const auto* row = _catalog->row(id.toStdString());
+            return row && row->catalog;
+        });
     auto bound = [this](const QString& id) {
         const auto* row = _catalog->row(id.toStdString());
         return row && row->toVolume;
@@ -413,7 +457,8 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
-    copySurfaceMenu->setEnabled(writable);
+    // Copying a catalog surface makes an editable one in your store.
+    copySurfaceMenu->setEnabled(storeWritable);
     if (selectedSegmentIds.size() <= 1) {
         QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
         connect(copySurfaceAction, &QAction::triggered, this, [this, segmentIdStd]() { copySurface(segmentIdStd); });
@@ -1412,7 +1457,7 @@ std::vector<QString> checkedNames(QComboBox* box)
 void SurfacePanelController::refreshProximityFilters()
 {
     const auto generation = ++_proximityGeneration;
-    if (!_catalog || !_catalog->attachment() || !_catalog->volume()) {
+    if (!_catalog || _catalog->sources().empty()) {
         _focusAnswer.reset();
         _pointSetAnswer.reset();
         return;
@@ -1434,9 +1479,9 @@ void SurfacePanelController::refreshProximityFilters()
     }
     struct Answers { ProximityAnswer focus, pointSets; };
     vc3d::store::background<Answers>(this,
-        [session = _catalog->session(), attachment = *_catalog->attachment(), volume = _catalog->volume()->id(),
-         focus, pointSets, focusRadius]() {
-            auto answer = [&](const auto& db, const auto& txn, const auto& sets, double tolerance) {
+        [session = _catalog->session(), sources = _catalog->sources(), focus, pointSets, focusRadius]() {
+            // Each store is asked in its bound volume's voxels.
+            auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
                 result.pointSets = sets;
                 result.tolerance = tolerance;
@@ -1444,12 +1489,16 @@ void SurfacePanelController::refreshProximityFilters()
                     std::set<std::string> any, all;
                     bool first = true;
                     for (const auto& point : points) {
-                        vc::objects::SurfaceProximityQuery query;
-                        query.point = point;
-                        query.tolerance = tolerance;
-                        query.volume = volume;
                         std::set<std::string> near;
-                        for (const auto& hit : db.nearestSurfaces(txn, query)) near.insert(hit.objectUuid);
+                        for (const auto& source : sources) {
+                            vc::objects::SurfaceProximityQuery query;
+                            query.point = {point[0] / source.scale, point[1] / source.scale, point[2] / source.scale};
+                            query.tolerance = tolerance / source.scale;
+                            query.volume = source.volume;
+                            session->read(source.attachment, [&](const auto& db, const auto& txn, const auto&) {
+                                for (const auto& hit : db.nearestSurfaces(txn, query)) near.insert(hit.objectUuid);
+                            });
+                        }
                         any.insert(near.begin(), near.end());
                         if (first) all = near;
                         else std::erase_if(all, [&](const std::string& uuid) { return !near.contains(uuid); });
@@ -1461,10 +1510,8 @@ void SurfacePanelController::refreshProximityFilters()
                 return result;
             };
             Answers answers;
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                answers.focus = answer(db, txn, focus, focusRadius);
-                answers.pointSets = answer(db, txn, pointSets, kPointSetTolerance);
-            });
+            answers.focus = answer(focus, focusRadius);
+            answers.pointSets = answer(pointSets, kPointSetTolerance);
             return answers;
         },
         [this, generation](vc3d::store::Outcome<Answers> result) {
@@ -1701,7 +1748,7 @@ void SurfacePanelController::updateTagCheckboxStates(const SurfaceCatalog::Row* 
     }
 
     const bool writable = _catalog && _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
-    setTagCheckboxEnabled(row != nullptr && writable);
+    setTagCheckboxEnabled(row != nullptr && !row->catalog && writable);
     if (row) {
         for (const auto& [box, name] : std::vector<std::pair<QCheckBox*, const char*>>{
                  {_tags.approved, "approved"}, {_tags.defective, "defective"},

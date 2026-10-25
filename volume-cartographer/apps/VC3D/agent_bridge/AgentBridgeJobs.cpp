@@ -39,7 +39,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -88,7 +88,7 @@ void AgentBridgeServer::completeCatalogOpenJob(
 
         QJsonObject attached;
         attached["volumes"] = outcome.result.attachedVolumeEntries;
-        attached["segments"] = outcome.result.attachedSegmentEntries;
+        attached["surfaces"] = outcome.result.importedSurfaces;
         attached["normalGrids"] = outcome.result.attachedNormalGrids;
         attached["lasagnaDatasets"] = outcome.result.attachedLasagnaDatasets;
         body["attached"] = attached;

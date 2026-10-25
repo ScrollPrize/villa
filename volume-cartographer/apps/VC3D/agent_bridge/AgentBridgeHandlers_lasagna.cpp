@@ -40,7 +40,7 @@
 #include "OpenDataLasagna.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"

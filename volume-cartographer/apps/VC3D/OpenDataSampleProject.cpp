@@ -2,7 +2,6 @@
 
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataLasagna.hpp"
-#include "OpenDataSegmentCache.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
@@ -421,21 +420,18 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                 " manifest-backed Lasagna dataset(s).");
         }
     }
-    // Reconcile against the current manifest on every open. This is metadata-
-    // only for lazy segments and also removes stale layout entries from older
-    // cached projects.
-    if (selection && selection->segmentIds) {
-        auto segmentSample = sample;
-        std::erase_if(segmentSample.segments, [&](const auto& segment) {
-            const auto& ids = *selection->segmentIds;
-            return std::find(ids.begin(), ids.end(), segment.id) == ids.end();
-        });
-        attachOpenDataSampleSegments(*pkg, segmentSample, remoteCacheRoot, result,
-                                    progressCallback, true);
-    } else {
-        attachOpenDataSampleSegments(*pkg, sample, remoteCacheRoot, result,
-                                    progressCallback);
+    // Segments are surfaces of the sample's store; records follow the current
+    // manifest on every open (geometry is fetched when a surface is opened).
+    if (progressCallback) {
+        OpenDataSampleDownloadProgress progress;
+        progress.totalSegments = static_cast<int>(sample.tifxyzSegmentCount());
+        progress.status = "importing-surfaces";
+        progressCallback(progress);
     }
+    importOpenDataSampleSurfaces(sample, remoteCacheRoot, result,
+                                 selection && selection->segmentIds
+                                     ? std::optional(*selection->segmentIds)
+                                     : std::nullopt);
     // Catalog loads remain unresolved until volume tags, normal-grid paths,
     // and every segment representation/cache entry have been reconciled.
     if (newProject) {
@@ -826,29 +822,22 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     return result;
 }
 
-void attachOpenDataSampleSegments(
-    VolumePkg& pkg,
+void importOpenDataSampleSurfaces(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback,
-    bool individualEntries)
+    const std::optional<std::vector<std::string>>& segmentIds)
 {
-    const auto cacheResult = reconcileOpenDataSampleSegments(
-        pkg,
-        sample,
-        remoteCacheRoot,
-        progressCallback, false, individualEntries);
-    result.supportedTifxyzSegments += cacheResult.supportedTifxyzSegments;
-    result.cachedTifxyzSegments += cacheResult.cachedTifxyzSegments;
-    result.attachedSegmentEntries += cacheResult.attachedSegmentEntries;
-    result.skippedTifxyzSegments += cacheResult.skippedTifxyzSegments;
-    result.failedTifxyzSegments += cacheResult.failedTifxyzSegments;
-    result.transformedTifxyzSegments += cacheResult.transformedTifxyzSegments;
-    result.failedTransformedTifxyzSegments += cacheResult.failedTransformedTifxyzSegments;
-    result.messages.insert(result.messages.end(),
-                           cacheResult.messages.begin(),
-                           cacheResult.messages.end());
+    result.supportedTifxyzSegments += static_cast<int>(sample.tifxyzSegmentCount());
+    try {
+        const auto imported = importSampleSurfaces(remoteCacheRoot, sample, segmentIds);
+        result.importedSurfaces += imported.representations;
+        result.addedSurfaces += imported.added;
+        result.messages.insert(result.messages.end(), imported.messages.begin(), imported.messages.end());
+    } catch (const std::exception& error) {
+        result.failedTifxyzSegments += static_cast<int>(sample.tifxyzSegmentCount());
+        result.messages.push_back(std::string("Importing Open Data surfaces failed: ") + error.what());
+    }
 }
 
 

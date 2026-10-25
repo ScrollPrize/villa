@@ -24,7 +24,7 @@
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
@@ -522,13 +522,10 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
 }
 
 
+// A catalog (Open Data) surface copied into the user's store in the open
+// volume's voxels, then activated: the editable copy.
 QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     if (_window->_segmentationWidget &&
         _window->_segmentationWidget->isEditingEnabled()) {
         throw AgentBridgeError{
@@ -547,225 +544,29 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
             QJsonObject{{"param", "segmentId"}},
         };
     }
-    const std::string segmentId = segmentIdQ.toStdString();
-
-    std::shared_ptr<Segmentation> source;
+    auto* panel = _window->_surfacePanel.get();
+    auto* catalog = panel ? panel->catalog() : nullptr;
+    const auto* row = catalog ? catalog->row(segmentIdQ.toStdString()) : nullptr;
+    if (!row) {
+        throw AgentBridgeError{-32007, QStringLiteral("Unknown surface: %1").arg(segmentIdQ)};
+    }
+    if (!row->catalog) {
+        throw AgentBridgeError{-32602, QStringLiteral("%1 is already in your store").arg(segmentIdQ),
+                               QJsonObject{{"param", "segmentId"}}};
+    }
+    const QString name = p.value("name").toString(QString::fromStdString(row->record.name) + QStringLiteral("_editable"));
+    std::string copied;
     try {
-        source = vpkg->segmentation(segmentId);
-    } catch (...) {
-    }
-    if (!source) {
-        throw AgentBridgeError{
-            -32007,
-            QStringLiteral("Unknown segment id: %1").arg(segmentIdQ),
-            QJsonObject{{"kind", "segment"}, {"id", segmentIdQ}},
-        };
-    }
-
-    const std::filesystem::path selectedPath = source->path();
-    std::filesystem::path sourcePath = selectedPath;
-    std::filesystem::path editablePath;
-
-    if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(sourcePath)) {
-        // A successful first call selects the editable source, so an immediate
-        // retry resolves segmentId there instead of in the catalog source.
-        // A default copy root is named after the selected catalog root with an
-        // `_editable` suffix. Recover that root and search it because aggregate
-        // catalog entries can keep the actual segment in a nested representation.
-        constexpr std::string_view suffix = "_editable";
-        const auto selectedRoot = selectedPath.parent_path();
-        const auto selectedRootName = selectedRoot.filename().string();
-        if (selectedRootName.ends_with(suffix)) {
-            const auto catalogRoot = selectedRoot.parent_path() /
-                selectedRootName.substr(0, selectedRootName.size() - suffix.size());
-            std::filesystem::path candidate =
-                catalogRoot / selectedPath.filename();
-            if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(candidate)) {
-                candidate.clear();
-                std::error_code scanError;
-                std::filesystem::recursive_directory_iterator it(
-                    catalogRoot,
-                    std::filesystem::directory_options::skip_permission_denied,
-                    scanError);
-                const std::filesystem::recursive_directory_iterator end;
-                for (; it != end && !scanError; it.increment(scanError)) {
-                    std::error_code entryError;
-                    if (!it->is_directory(entryError) || entryError ||
-                        it->path().filename() != selectedPath.filename()) {
-                        continue;
-                    }
-                    if (vc3d::opendata::isOpenDataCatalogSegmentDirectory(
-                            it->path())) {
-                        candidate = it->path();
-                        break;
-                    }
-                }
-            }
-            const auto candidateEditablePath = candidate.empty()
-                ? std::filesystem::path{}
-                : vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-                      candidate, catalogRoot);
-            std::error_code equivalentError;
-            if (!candidate.empty() &&
-                std::filesystem::equivalent(
-                    selectedPath, candidateEditablePath, equivalentError) &&
-                !equivalentError) {
-                sourcePath = candidate;
-                editablePath = candidateEditablePath;
-            }
-        }
-    }
-
-    if (!vc3d::opendata::isOpenDataCatalogSegmentDirectory(sourcePath)) {
-        throw AgentBridgeError{
-            -32009,
-            "Segment is not an immutable Open Data catalog segment",
-            QJsonObject{
-                {"kind", "segment"},
-                {"id", segmentIdQ},
-                {"path", QString::fromStdString(sourcePath.string())},
-            },
-        };
-    }
-    if (vc3d::opendata::isOpenDataSegmentPlaceholder(sourcePath)) {
-        throw AgentBridgeError{
-            -32009,
-            "Catalog segment must be fetched before it can be copied",
-            QJsonObject{
-                {"kind", "segment"},
-                {"id", segmentIdQ},
-                {"action", "segments.fetch"},
-            },
-        };
-    }
-
-    if (editablePath.empty()) {
-        const auto registeredCatalogRoot =
-            vc3d::opendata::registeredOpenDataCatalogRootForSegment(
-                *vpkg, sourcePath);
-        const auto copySourceRoot = registeredCatalogRoot.empty()
-            ? vpkg->outputSegmentsPath()
-            : registeredCatalogRoot;
-        editablePath =
-            vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-                sourcePath, copySourceRoot);
-    }
-    const std::filesystem::path editableRoot = editablePath.parent_path();
-    const std::string editableId = editablePath.filename().string();
-    std::error_code existsError;
-    const bool alreadyExisted = std::filesystem::exists(editablePath, existsError);
-    if (existsError) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not inspect editable segment destination",
-            QJsonObject{{"detail", QString::fromStdString(existsError.message())}},
-        };
-    }
-
-    try {
-        vc3d::opendata::copyCatalogSegmentToEditableDirectory(
-            *vpkg, sourcePath, editablePath);
-        vc3d::opendata::attachEditableOpenDataSegmentRoot(
-            *vpkg, sourcePath, editableRoot, true);
-
-        auto editableSurface = vpkg->loadSurface(editableId);
-        if (!editableSurface) {
-            editableSurface = std::make_shared<QuadSurface>(editablePath);
-        }
-        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-            *editableSurface, *vpkg, state->currentVolumeId());
-        editableSurface->save_meta();
+        copied = catalog->copy(segmentIdQ.toStdString(), name.toStdString());
     } catch (const std::exception& error) {
-        throw AgentBridgeError{
-            -32005,
-            "Could not create editable segment copy",
-            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
-        };
+        throw AgentBridgeError{-32000, QStringLiteral("Copy failed: %1").arg(QString::fromUtf8(error.what()))};
     }
-
-    try {
-        _window->refreshCurrentVolumePackageUi();
-    } catch (const std::exception& error) {
-        Logger()->warn(
-            "Editable segment copy was committed, but the VC3D UI could not "
-            "refresh: {}",
-            error.what());
-    } catch (...) {
-        Logger()->warn(
-            "Editable segment copy was committed, but the VC3D UI could not "
-            "refresh");
-    }
-
-    SurfacePanelController* panel =
-        _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        throw AgentBridgeError{
-            -32010,
-            "Surface panel unavailable",
-            QJsonObject{
-                {"detail", "editable copy was created but could not be activated"},
-                {"path", QString::fromStdString(editablePath.string())},
-            },
-        };
-    }
-    QString activationError;
-    if (!panel->activateSurfaceById(editableId, &activationError)) {
-        throw AgentBridgeError{
-            -32005,
-            "Editable segment copy was created but could not be activated",
-            QJsonObject{
-                {"detail", activationError},
-                {"path", QString::fromStdString(editablePath.string())},
-            },
-        };
-    }
-
-    auto equivalentPath = [](const std::filesystem::path& lhs,
-                             const std::filesystem::path& rhs) {
-        std::error_code error;
-        return std::filesystem::equivalent(lhs, rhs, error) && !error;
-    };
-    std::filesystem::path resolvedPath;
-    try {
-        if (auto resolved = vpkg->segmentation(editableId)) {
-            resolvedPath = resolved->path();
-        }
-    } catch (...) {
-    }
-    const auto activeSurface =
-        std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
-    const auto activeWeakSurface =
-        std::dynamic_pointer_cast<QuadSurface>(state->activeSurface().lock());
-    const std::filesystem::path activePath =
-        activeSurface ? activeSurface->path : std::filesystem::path{};
-    const std::filesystem::path activeWeakPath =
-        activeWeakSurface ? activeWeakSurface->path : std::filesystem::path{};
-    if (state->activeSurfaceId() != editableId ||
-        !equivalentPath(vpkg->outputSegmentsPath(), editableRoot) ||
-        !equivalentPath(resolvedPath, editablePath) ||
-        !equivalentPath(activePath, editablePath) ||
-        !equivalentPath(activeWeakPath, editablePath)) {
-        throw AgentBridgeError{
-            -32005,
-            "Editable segment copy was created but did not remain active",
-            QJsonObject{
-                {"path", QString::fromStdString(editablePath.string())},
-                {"selectedRoot", QString::fromStdString(
-                                     vpkg->outputSegmentsPath().string())},
-                {"resolvedPath", QString::fromStdString(resolvedPath.string())},
-                {"activePath", QString::fromStdString(activePath.string())},
-                {"activeSurfacePath", QString::fromStdString(
-                                          activeWeakPath.string())},
-            },
-        };
-    }
-
+    panel->activateSurfaceById(copied);
     return QJsonObject{
-        {"created", !alreadyExisted},
-        {"alreadyExisted", alreadyExisted},
-        {"segmentId", QString::fromStdString(editableId)},
-        {"sourcePath", QString::fromStdString(sourcePath.string())},
-        {"path", QString::fromStdString(editablePath.string())},
+        {"created", true},
+        {"segmentId", QString::fromStdString(copied)},
+        {"sourceId", segmentIdQ},
+        {"name", name},
         {"activated", true},
     };
 }

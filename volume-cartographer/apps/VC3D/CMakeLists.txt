@@ -77,10 +77,8 @@ set(srcs
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
     OpenDataNormalGrids.hpp
-    OpenDataSegmentCache.cpp
-    OpenDataSegmentCache.hpp
-    OpenDataSegmentCacheIO.cpp
-    OpenDataSegmentCacheIO.hpp
+    OpenDataSurfaceStore.cpp
+    OpenDataSurfaceStore.hpp
     SurfaceAffineTransformController.cpp
     SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp

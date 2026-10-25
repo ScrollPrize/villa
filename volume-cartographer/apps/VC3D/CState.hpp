@@ -3,6 +3,8 @@
 #include <QObject>
 #include <QString>
 #include <cstdint>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +51,9 @@ public:
     std::optional<vc::objects::AttachmentIdentity> objectStoreAttachment() const;
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
+    // A read-only catalog store (one per Open Data sample) beside the user's,
+    // attached on first use; only the catalog importer writes to it.
+    vc::objects::AttachmentIdentity catalogAttachment(const std::filesystem::path& path);
     void pollObjectStoreChanges();
 
     // --- VolumePkg ---
@@ -142,6 +147,7 @@ private:
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
     std::optional<vc::objects::AttachmentIdentity> _objectStoreAttachment;
+    std::map<std::filesystem::path, vc::objects::AttachmentIdentity> _catalogAttachments;
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;

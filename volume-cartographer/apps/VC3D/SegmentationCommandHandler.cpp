@@ -7,7 +7,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "vc/core/util/Uuid.hpp"
 
 #include <functional>
@@ -1470,6 +1470,12 @@ SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchEr
     if (!row) {
         setErr(tr("Surface not in the object store: %1").arg(QString::fromStdString(id)),
                CommandLaunchError::SegmentNotFound);
+        return std::nullopt;
+    }
+    if (row->catalog) {
+        setErr(tr("%1 is a read-only catalog surface; copy it to your store first.")
+                   .arg(QString::fromStdString(row->record.name.empty() ? id : row->record.name)),
+               CommandLaunchError::InvalidState);
         return std::nullopt;
     }
     if (row->toVolume != 1.0) {

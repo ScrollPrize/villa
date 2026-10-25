@@ -3,10 +3,10 @@
 #include "../CState.hpp"
 #include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "../ObjectStoreRegions.hpp"
+#include "../OpenDataSurfaceStore.hpp"
+#include "../SurfaceCatalog.hpp"
 
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -23,85 +23,6 @@
 
 namespace {
 constexpr qreal kInkDetectionZ = 18.0;
-
-std::string lowerCopy(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
-bool isJpegPath(const std::filesystem::path& path)
-{
-    const std::string ext = lowerCopy(path.extension().string());
-    return ext == ".jpg" || ext == ".jpeg";
-}
-
-std::string detectionGroupKey(const vc3d::opendata::OpenDataInkDetectionEntry& entry)
-{
-    if (!entry.segmentLongId.empty()) {
-        return "long:" + entry.segmentLongId;
-    }
-    if (!entry.sampleId.empty() || !entry.segmentId.empty()) {
-        return "segment:" + entry.sampleId + "/" + entry.segmentId;
-    }
-    return "path:" + entry.localPath.parent_path().parent_path().string();
-}
-
-std::string canonicalSegmentKey(const QuadSurface& surface,
-                                const std::string& fallback)
-{
-    for (const char* key : {
-             "vc_open_data_segment_long_id",
-             "vc_open_data_catalog_segment_lineage_id",
-             "vc_open_data_segment_id",
-         }) {
-        const auto value = vc::json::string_or(surface.meta, key, std::string{});
-        if (!value.empty()) {
-            return value;
-        }
-    }
-    return fallback;
-}
-
-std::vector<vc3d::opendata::OpenDataInkDetectionEntry> inkDetectionsForAttachedSegmentPath(
-    const std::filesystem::path& segmentPath)
-{
-    std::vector<vc3d::opendata::OpenDataInkDetectionEntry> out =
-        vc3d::opendata::cachedInkDetectionsForSegmentDirectory(segmentPath);
-
-    std::error_code ec;
-    if (!std::filesystem::is_directory(segmentPath, ec)) {
-        return out;
-    }
-
-    std::filesystem::recursive_directory_iterator it(segmentPath, ec);
-    const std::filesystem::recursive_directory_iterator end;
-    while (!ec && it != end) {
-        if (!it->is_directory(ec) || ec) {
-            ec.clear();
-            it.increment(ec);
-            continue;
-        }
-
-        auto childEntries =
-            vc3d::opendata::cachedInkDetectionsForSegmentDirectory(it->path());
-        out.insert(out.end(),
-                   std::make_move_iterator(childEntries.begin()),
-                   std::make_move_iterator(childEntries.end()));
-
-        // Catalog segment entries are aggregate volume roots whose concrete
-        // representations live at <kind>/<segment>. Conventional segment
-        // folders are shallower, so two levels covers both without walking
-        // arbitrary auxiliary trees within a materialized segment.
-        if (it.depth() >= 1) {
-            it.disable_recursion_pending();
-        }
-        it.increment(ec);
-    }
-    return out;
-}
 
 cv::Mat_<uint8_t> toU8Scalar(const cv::Mat& src)
 {
@@ -211,8 +132,6 @@ InkDetectionOverlayController::InkDetectionOverlayController(CState* state, QObj
     , _state(state)
 {
     if (_state) {
-        connect(_state, &CState::vpkgChanged, this, &InkDetectionOverlayController::refreshAvailableDetections);
-        connect(_state, &CState::surfacesLoaded, this, &InkDetectionOverlayController::refreshAvailableDetections);
         connect(_state, &CState::surfaceChanged, this, [this](const std::string& name, std::shared_ptr<Surface>, bool isEditUpdate) {
             if (isEditUpdate && name == "segmentation" && activeSegmentKey() == _selectedSegmentKey) {
                 return;
@@ -222,66 +141,19 @@ InkDetectionOverlayController::InkDetectionOverlayController(CState* state, QObj
             }
         });
     }
+}
+
+void InkDetectionOverlayController::setSurfaceCatalog(SurfaceCatalog* catalog)
+{
+    _catalog = catalog;
+    if (_catalog) {
+        connect(_catalog, &SurfaceCatalog::rowsChanged, this, &InkDetectionOverlayController::refreshAvailableDetections);
+    }
     refreshAvailableDetections();
 }
 
 void InkDetectionOverlayController::refreshAvailableDetections()
 {
-    std::vector<Option> next;
-    std::set<std::filesystem::path> seen;
-    std::set<std::string> seenSourceUrls;
-
-    if (_state && _state->vpkg()) {
-        std::vector<vc3d::opendata::OpenDataInkDetectionEntry> entries;
-        for (const auto& segmentPath : _state->vpkg()->availableSegmentPaths()) {
-            auto pathEntries = inkDetectionsForAttachedSegmentPath(segmentPath);
-            entries.insert(entries.end(),
-                           std::make_move_iterator(pathEntries.begin()),
-                           std::make_move_iterator(pathEntries.end()));
-        }
-
-        std::set<std::string> groupsWithJpeg;
-        for (const auto& entry : entries) {
-            if (isJpegPath(entry.localPath)) {
-                groupsWithJpeg.insert(detectionGroupKey(entry));
-            }
-        }
-
-        for (const auto& entry : entries) {
-            if (!isJpegPath(entry.localPath) &&
-                groupsWithJpeg.find(detectionGroupKey(entry)) != groupsWithJpeg.end()) {
-                continue;
-            }
-            if (!entry.sourceUrl.empty() && !seenSourceUrls.insert(entry.sourceUrl).second) {
-                continue;
-            }
-            std::error_code ec;
-            auto canonical = std::filesystem::weakly_canonical(entry.localPath, ec);
-            if (ec) {
-                canonical = entry.localPath.lexically_normal();
-            }
-            if (!seen.insert(canonical).second) {
-                continue;
-            }
-
-            Option option;
-            option.label = QString::fromStdString(entry.label);
-            option.sampleId = entry.sampleId;
-            option.segmentId = entry.segmentId;
-            option.segmentLongId = entry.segmentLongId;
-            option.localPath = canonical;
-            next.push_back(std::move(option));
-        }
-    }
-
-    std::sort(next.begin(), next.end(), [](const Option& a, const Option& b) {
-        if (a.segmentId != b.segmentId) {
-            return a.segmentId < b.segmentId;
-        }
-        return a.label < b.label;
-    });
-
-    _allOptions = std::move(next);
     refreshOptionsForActiveSurface();
 }
 
@@ -444,11 +316,17 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
         _selectedPathBySegment[_selectedSegmentKey] = _selectedPath;
     }
 
+    // The detections a catalog surface was published with, kept in its artifacts.
     const std::string nextSegmentKey = activeSegmentKey();
     std::vector<Option> next;
-    for (const auto& option : _allOptions) {
-        if (optionMatchesSegment(option, nextSegmentKey)) {
-            next.push_back(option);
+    if (const auto* row = _catalog && !nextSegmentKey.empty() ? _catalog->row(nextSegmentKey) : nullptr) {
+        try {
+            const auto artifacts = _catalog->session()->artifactDirectory(row->source.attachment, nextSegmentKey, false);
+            for (const auto& detection : vc3d::opendata::inkDetections(nlohmann::json::parse(row->record.meta), artifacts)) {
+                next.push_back({QString::fromStdString(detection.label), detection.url, detection.file});
+            }
+        } catch (const std::exception&) {
+            next.clear();
         }
     }
 
@@ -489,24 +367,7 @@ std::string InkDetectionOverlayController::activeSegmentKey() const
         return {};
     }
     auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-    if (!surface) {
-        return {};
-    }
-    if (auto active = _state->activeSurface().lock();
-        active.get() == surface.get() && !_state->activeSurfaceId().empty()) {
-        return canonicalSegmentKey(*surface, _state->activeSurfaceId());
-    }
-    return canonicalSegmentKey(*surface, surface->id);
-}
-
-bool InkDetectionOverlayController::optionMatchesSegment(
-    const Option& option,
-    const std::string& segmentKey) const
-{
-    if (segmentKey.empty()) {
-        return false;
-    }
-    return option.segmentId == segmentKey || option.segmentLongId == segmentKey;
+    return surface ? surface->id : std::string{};
 }
 
 void InkDetectionOverlayController::loadSelectedImage()
@@ -515,6 +376,31 @@ void InkDetectionOverlayController::loadSelectedImage()
         return;
     }
 
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(_selectedPath, ec)) {
+        // Published images are downloaded into the surface's artifacts when first shown.
+        const auto option = std::find_if(_options.begin(), _options.end(), [&](const Option& candidate) {
+            return candidate.localPath == _selectedPath;
+        });
+        if (option == _options.end() || _fetchingPath == _selectedPath) {
+            return;
+        }
+        _fetchingPath = _selectedPath;
+        const vc3d::opendata::InkDetection detection{option->label.toStdString(), {}, option->url, option->localPath};
+        vc3d::store::background<bool>(this,
+            [detection]() {
+                vc3d::opendata::fetchInkDetection(detection);
+                return true;
+            },
+            [this, path = detection.file](vc3d::store::Outcome<bool> result) {
+                _fetchingPath.clear();
+                if (result.error.isEmpty() && _selectedPath == path) {
+                    loadSelectedImage();
+                    refreshAll();
+                }
+            });
+        return;
+    }
     const cv::Mat src = cv::imread(_selectedPath.string(), cv::IMREAD_UNCHANGED);
     if (src.empty()) {
         return;
@@ -598,16 +484,5 @@ bool InkDetectionOverlayController::imageMatchesSurface(const QuadSurface& surfa
         return false;
     }
 
-    std::string segmentKey = surface.id;
-    if (_state) {
-        if (auto active = _state->activeSurface().lock();
-            active.get() == &surface && !_state->activeSurfaceId().empty()) {
-            segmentKey = _state->activeSurfaceId();
-        }
-        if (segmentKey.empty()) {
-            segmentKey = _state->findSurfaceId(const_cast<QuadSurface*>(&surface));
-        }
-    }
-    segmentKey = canonicalSegmentKey(surface, segmentKey);
-    return optionMatchesSegment(*optionIt, segmentKey);
+    return surface.id == _selectedSegmentKey;
 }

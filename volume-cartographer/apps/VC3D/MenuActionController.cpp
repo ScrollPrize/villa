@@ -864,65 +864,22 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                     if (!progressDialog) {
                         return;
                     }
-                    const int totalDone = progress.completedSegments + progress.failedSegments;
-                    const QString segment = QString::fromStdString(progress.segmentId);
-                    const QString file = QString::fromStdString(progress.fileName);
                     const QString status = QString::fromStdString(progress.status);
-                    const bool transforming = status.startsWith(QStringLiteral("transform-"));
-                    const bool preparing = status.startsWith(
-                        QStringLiteral("placeholder"));
                     const bool resolvingVolumes =
                         status == QStringLiteral("resolving-volumes");
                     const bool projectReady =
                         status == QStringLiteral("project-ready");
-                    QString label = resolvingVolumes
+                    const QString label = resolvingVolumes
                         ? QObject::tr("Opening remote volumes in parallel...")
                         : projectReady
                         ? QObject::tr("Open-data project is ready.")
-                        : preparing
-                        ? QObject::tr("Preparing segment metadata: %1/%2 representations.")
-                              .arg(progress.completedSegments)
-                              .arg(progress.totalSegments)
-                        : transforming
-                        ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
-                              .arg(progress.totalWorkers)
-                              .arg(totalDone)
-                              .arg(progress.totalSegments)
-                        : QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
-                              .arg(progress.totalWorkers)
-                              .arg(totalDone)
-                              .arg(progress.totalSegments)
-                              .arg(progress.completedFiles)
-                              .arg(progress.totalFiles);
-                    if (!resolvingVolumes && !projectReady &&
-                        !segment.isEmpty() && !file.isEmpty()) {
-                        label += transforming
-                            ? QObject::tr("\n%1 -> %2").arg(segment, file)
-                            : QObject::tr("\n%1: %2").arg(segment, file);
-                    } else if (!resolvingVolumes && !projectReady &&
-                               !segment.isEmpty()) {
-                        label += QObject::tr("\n%1").arg(segment);
-                    }
-                    if (progress.failedSegments > 0) {
-                        label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
-                    }
-                    if (resolvingVolumes) {
-                        progressDialog->setRange(0, 0);
-                    } else if (projectReady) {
+                        : QObject::tr("Recording %1 segment(s) in the sample's surface store...")
+                              .arg(progress.totalSegments);
+                    if (projectReady) {
                         progressDialog->setRange(0, 1);
                         progressDialog->setValue(1);
-                    } else if (preparing) {
-                        progressDialog->setRange(
-                            0, std::max(progress.totalSegments, 1));
-                        progressDialog->setValue(std::min(
-                            progress.completedSegments,
-                            std::max(progress.totalSegments, 1)));
                     } else {
-                        progressDialog->setMaximum(
-                            std::max(progress.totalFiles, 1));
-                        progressDialog->setValue(std::min(
-                            progress.completedFiles,
-                            std::max(progress.totalFiles, 1)));
+                        progressDialog->setRange(0, 0);
                     }
                     progressDialog->setLabelText(label);
                 },
@@ -1061,16 +1018,20 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
     }
     startOpenDataVolumePrefill(
         _window && _window->_state ? _window->_state->currentVolume() : nullptr);
+    if (_window) {
+        // The import may have created the sample's surface store.
+        _window->updateCatalogSurfaceSources();
+    }
 
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
                           .arg(sampleId)
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
     if (task.tifxyzSegmentCount > 0) {
-        message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
-                       .arg(result.cachedTifxyzSegments)
+        message += QObject::tr(" %1 tifxyz segments are %2 surfaces of the sample store (%3 new).")
                        .arg(result.supportedTifxyzSegments)
-                       .arg(result.attachedSegmentEntries);
+                       .arg(result.importedSurfaces)
+                       .arg(result.addedSurfaces);
     }
     if (_window && _window->statusBar()) {
         _window->showStatusBarMessage(message, 7000);

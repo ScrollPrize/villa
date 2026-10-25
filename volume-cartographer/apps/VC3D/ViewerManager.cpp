@@ -1,6 +1,6 @@
 #include "ViewerManager.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"

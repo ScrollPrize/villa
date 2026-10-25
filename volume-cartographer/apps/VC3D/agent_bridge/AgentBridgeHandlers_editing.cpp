@@ -40,9 +40,10 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "ViewerManager.hpp"
@@ -342,17 +343,12 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
     }
 
     if (enabled) {
-        auto surface = std::dynamic_pointer_cast<QuadSurface>(
-            state->surface("segmentation"));
-        if (!surface) {
-            surface = state->activeSurface().lock();
-        }
-        if (surface && !surface->path.empty() &&
-            vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
+        auto* catalog = _window->_surfacePanel ? _window->_surfacePanel->catalog() : nullptr;
+        const auto* row = catalog ? catalog->row(state->activeSurfaceId()) : nullptr;
+        if (row && row->catalog) {
             QJsonObject data;
             data["kind"] = "segment";
             data["id"] = QString::fromStdString(state->activeSurfaceId());
-            data["path"] = QString::fromStdString(surface->path.string());
             data["action"] = "segments.create_editable_copy";
             data["detail"] =
                 "catalog segments are immutable; create and activate an "
