@@ -37,6 +37,21 @@ def test_read_surface_applies_validity_and_volume_scale(tmp_path):
         read_surface(tmp_path / 'objects.vcobj', uid, volume='other')
 
 
+def test_read_surface_uses_the_store_missing_vertex_rule(tmp_path):
+    """Any -1 or non-finite coordinate is a missing vertex; z = 0 is a slice, not a missing vertex."""
+    rows, cols = np.mgrid[:2, :3]
+    points = np.stack([cols + 10.0, rows + 20.0, np.full(rows.shape, 30.0)], axis=-1).astype('<f4')
+    points[0, 1] = (11, -1, 30)
+    points[0, 2] = (12, 20, np.nan)
+    points[1, 0] = (10, 21, 0)
+    with ObjectStore.create(str(tmp_path / 'objects.vcobj'), author='test') as db:
+        uid = db.upsert_object(dict(kind='surface', meta=dict(coordinates=dict(volume_uuid='vol', scale_factor=1))))
+        db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
+            dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())]))
+    surface = read_surface(tmp_path / 'objects.vcobj', uid, volume='vol')
+    assert surface._mask.tolist() == [[True, False, False], [True, True, True]]
+
+
 def test_create_surface_records_binding_provenance_and_missing_vertices(tmp_path):
     source, _, _ = _store_with_surface(tmp_path / 'objects.vcobj')
     zyxs = np.full((3, 4, 3), 5.0, np.float32)

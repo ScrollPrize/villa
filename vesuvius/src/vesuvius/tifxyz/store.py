@@ -31,7 +31,8 @@ def read_surface(path, surface_uuid, *, volume, geometry_revision=None):
         shapes = {array['name']: array['shape'] for array in geometry['arrays']}
         points = np.frombuffer(store.read_geometry_array(revision, 'points'), dtype='<f4').reshape(shapes['points'])
         points = points.copy()
-        missing = points[..., 0] == INVALID
+        # Missing: any coordinate -1 or non-finite (the store's rule), or marked invalid.
+        missing = ~np.isfinite(points).all(axis=-1) | (points == INVALID).any(axis=-1)
         if 'valid' in shapes:
             valid = np.frombuffer(store.read_geometry_array(revision, 'valid'), dtype='u1').reshape(shapes['valid'])
             missing |= valid == 0
