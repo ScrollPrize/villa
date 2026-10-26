@@ -3662,6 +3662,12 @@ void SegmentationCommandHandler::onGrowTrackPatches()
                              tr("A command-line tool is already running."));
         return;
     }
+    CommandLaunchError error;
+    const auto store = storeForTools(&error);
+    if (!store) {
+        QMessageBox::warning(_parentWidget, tr("Grow Track Patches"), error.message);
+        return;
+    }
 
     GrowTrackPatchesDialog dlg(_parentWidget);
     if (dlg.exec() != QDialog::Accepted) {
@@ -3686,9 +3692,10 @@ void SegmentationCommandHandler::onGrowTrackPatches()
         return;
     }
 
-    // Build full args: script path as first arg followed by dialog args
+    // The patches become surfaces of the current volume, like traced ones.
     QStringList args;
-    args << script << scriptArgs;
+    args << script << scriptArgs << QStringLiteral("--store") << store->store
+         << QStringLiteral("--volume-uuid") << store->volumeUuid << QStringLiteral("--tag") << QStringLiteral("paths");
 
     if (dlg.ompThreads() > 0) {
         _cmdRunner->setNextOmpThreads(dlg.ompThreads());

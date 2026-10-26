@@ -653,14 +653,13 @@ public:
 
     QString tracksPath() const;
     QString crossingsPath() const;
-    QString outputPath() const;
     QString venvPath() const;
     // Resolved python executable (handles venv dir -> bin/python)
     QString resolvedPython() const;
     // Absolute path to grow_track_graph.py (resolved at runtime)
     QString scriptPath() const;
     // Full argument list for the script invocation excluding the python
-    // executable and script path: [tracks, crossings, output, ...options]
+    // executable, the script path and the store arguments: [tracks, crossings, ...options]
     QStringList buildArgs() const;
     int ompThreads() const; // -1 if unset
 
@@ -673,7 +672,6 @@ private:
 
     QLineEdit* edtTracks_{nullptr};
     QLineEdit* edtCrossings_{nullptr};
-    QLineEdit* edtOutput_{nullptr};
     QLineEdit* edtVenv_{nullptr};
 
     QRadioButton* rbSeeds_{nullptr};

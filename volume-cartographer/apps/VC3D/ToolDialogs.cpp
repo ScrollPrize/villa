@@ -2728,9 +2728,6 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
 
     QWidget* wTracks = pathPicker(this, edtTracks_, tr("Select packed .vctracks directory"), true);
     QWidget* wCross = pathPicker(this, edtCrossings_, tr("Select crossings .npz file"), false);
-    // For output directory we allow typing a non-existing path; the picker
-    // browses an existing parent, but the text field is freely editable.
-    QWidget* wOut = pathPicker(this, edtOutput_, tr("Select output directory"), true);
     // venv picker: python binary inside venv
     QWidget* wVenv = pathPicker(this, edtVenv_, tr("Select venv Python"), false);
     // Enhance venv button to also allow directory selection (venv root)
@@ -2764,12 +2761,10 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
 
     edtTracks_->setPlaceholderText(tr("/path/to/tracks.vctracks  (directory with metadata.json)"));
     edtCrossings_->setPlaceholderText(tr("/path/to/crossings.npz  (uncompressed)"));
-    edtOutput_->setPlaceholderText(tr("/path/to/output  (parent directory for .tifxyz patches)"));
     edtVenv_->setPlaceholderText(tr("/path/to/venv/bin/python  or  /path/to/venv"));
 
     ioForm->addRow(tr("Tracks (.vctracks dir):"), wTracks);
     ioForm->addRow(tr("Crossings (.npz):"), wCross);
-    ioForm->addRow(tr("Output dir:"), wOut);
     ioForm->addRow(tr("Venv Python:"), wVenv);
     main->addWidget(ioBox);
 
@@ -2942,12 +2937,11 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     main->addWidget(buttons);
 
-    ensureDialogWidthForEdits(this, {edtTracks_, edtCrossings_, edtOutput_, edtVenv_, edtSeeds_});
+    ensureDialogWidthForEdits(this, {edtTracks_, edtCrossings_, edtVenv_, edtSeeds_});
 }
 
 QString GrowTrackPatchesDialog::tracksPath() const { return edtTracks_->text().trimmed(); }
 QString GrowTrackPatchesDialog::crossingsPath() const { return edtCrossings_->text().trimmed(); }
-QString GrowTrackPatchesDialog::outputPath() const { return edtOutput_->text().trimmed(); }
 QString GrowTrackPatchesDialog::venvPath() const { return edtVenv_->text().trimmed(); }
 
 QString GrowTrackPatchesDialog::resolvedPython() const
@@ -2987,7 +2981,7 @@ QString GrowTrackPatchesDialog::scriptPath() const
 QStringList GrowTrackPatchesDialog::buildArgs() const
 {
     QStringList args;
-    args << tracksPath() << crossingsPath() << outputPath();
+    args << tracksPath() << crossingsPath();
 
     if (rbSeeds_->isChecked()) {
         const QString txt = edtSeeds_->text().trimmed();
@@ -3052,7 +3046,6 @@ void GrowTrackPatchesDialog::accept()
 {
     const QString tracks = tracksPath();
     const QString crossings = crossingsPath();
-    const QString out = outputPath();
     const QString venv = venvPath();
 
     if (tracks.isEmpty()) {
@@ -3061,10 +3054,6 @@ void GrowTrackPatchesDialog::accept()
     }
     if (crossings.isEmpty()) {
         QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select a crossings .npz file."));
-        return;
-    }
-    if (out.isEmpty()) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select an output directory."));
         return;
     }
     if (venv.isEmpty()) {
