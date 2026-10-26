@@ -39,7 +39,7 @@ Decisions:
 
 The initial contracts were reviewed on `origin/fibers-to-obj-store` at
 `193e6d38783e`. This branch now integrates upstream through
-`a180d351711521720a26f0065573f15c3228f95b`; use the integrated checkout's APIs
+`affe83f75`; use the integrated checkout's APIs
 for the remaining fitter work.
 
 - Stored geometry is available through Python typed/snapshot APIs: patch grids,
@@ -58,7 +58,7 @@ for the remaining fitter work.
   geometry. Ordinary and adjacent branches are distinct classifications of
   `fiber_branch` relationships.
 - Patch-overlap edges currently anchor whole geometries and retain a fitted UV
-  pose and statistics, not the actual inlier correspondence list. Step 4 adds
+  pose and statistics, not the actual inlier correspondence list. Step 4 added
   `overlap_correspondences()` to materialize deterministic pairs using the
   detector's shared agreement traversal, recorded direction, grid scales and
   agreement radius. Metadata-mode detection is required for these pose units.
@@ -299,12 +299,12 @@ reusable existing materialization helpers rather than copying their code.
 
 ### Patch-overlap relationships
 
-- Add store-side deterministic materialization of valid correspondence pairs for
-  an accepted overlap edge using its stored UV pose and current pinned geometry.
-  Verify pose direction and coordinate units; do not assume raw grid-index units.
-- Prefer persisting representative inlier pairs during detection if this avoids
-  repeating geometric matching. Reuse detector helpers, not a second fitter-side
-  overlap implementation.
+- Use the store-side deterministic materialization added in step 4 for valid
+  correspondence pairs from an accepted overlap edge's stored UV pose.
+  `overlap_correspondences()` reuses the detector's agreement traversal; no
+  additional matching implementation or persisted-pair format is needed here.
+  It reads current geometry; verify the returned revisions against the frozen
+  snapshot and interpret the returned endpoint order and units as in step 9.
 - Produce small synthetic same-surface collections with concrete points on both
   patches, zero relative annotation and valid chain nodes. Feed the same relative
   winding loss and seam machinery; this introduces a new constraint source.
@@ -328,7 +328,7 @@ the relationship graph alone cannot supply seam corrections.
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
 Steps 1–8 are implemented; steps 9–12 remain. Upstream
-through `a180d351711521720a26f0065573f15c3228f95b` is now integrated. Keep store
+through `affe83f75` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
 snapshot APIs rather than rebuilding them in the fitter.
@@ -374,19 +374,46 @@ snapshot APIs rather than rebuilding them in the fitter.
    Establish raw line/control-to-runtime mappings and consumed anchors before
    trimming or decimation; the current file loader discards source points too
    early for this adapter. Replace the single `on_patch` assumption with attachment
-   views sharing physical chain/theta nodes. Expose the existing C++
-   `fiberBranchControlIndex()` helper to Python in a separate store commit before
-   using it here; it is not yet bound.
-9. **Fitter: integrate overlap constraints and sampling.** Turn correspondence
-   pairs into same-surface constraints using the existing relative loss and seam
-   machinery. Introduce explicit overlap sampling weights and report counts by
-   family and sampling group.
+   views sharing physical chain/theta nodes. The existing C++
+   `fiberBranchControlIndex()` helper is now exposed as
+   `fiber_branch_control_index()` and used by the adapter.
+9. **Fitter: integrate overlap constraints and sampling.** Call the existing
+   `store.overlap_correspondences(edge_uuids, volume_uuid)` for the snapshot's
+   accepted overlap edges; do not implement pose matching or discovery again.
+   Results use stored edge endpoint order, grid (row, column), and XYZ already
+   in reference-volume voxels. Match endpoints by UUID, verify returned geometry
+   revisions against the snapshot, and reverse XYZ to ZYX without rescaling.
+   Report per-edge materialization errors. Filter pairs through the shared
+   retained sampling mask, reporting pairs/edges lost to unfitted patches or
+   unsampled quads as for the other attachment families.
+   Turn retained pairs into zero-relative-winding constraints using the existing
+   loss and seam machinery. Preserve each pair's correspondence and physical
+   chain; do not invent a path through an unordered list of independent pairs.
+   Add an explicit overlap group to the existing PCL sampling machinery, keeping
+   an edge's weight independent of how many pairs it produces. Extend the shared
+   constraints report and provenance. Test endpoint reversal, non-unit scales,
+   retained masks, multiple pairs, seam corrections and group weighting.
 10. **CLI: implement startup and frozen-input lifecycle.** Add default refresh,
    aggregated failure exit, approved-only/no-refresh modes, rank-zero coordination,
    manifest agreement, external-input frame conversion and resume validation.
    Select the fiber-patch normal source (lasagna, else `normal_ct`, else none).
    Wire the adapter into `fit_spiral.py` as the supported ingestion path and
    record complete input/frame provenance in logs and checkpoints.
+   Reuse `InputRequest`, selector/frame validation, `read_snapshot`,
+   `materialize`, `derive_point_views`, the store's detector APIs, and the
+   existing distributed/checkpoint plumbing. Resolve selection once, skip
+   detectors with empty required selections, collect both exceptions and
+   reports with `failed`, and capture the final snapshot after refresh. Extend
+   the existing manifest with external-input frames and materialization settings
+   rather than adding a second provenance format; reject incompatible resumes.
+   Disable the old per-step model-direction relinker and any file reload or
+   proximity re-derivation reachable from the CLI in this step: frozen inputs
+   must already hold before step 11 deletes the obsolete implementations.
+   Test two-rank success/failure and manifest agreement, no-refresh read-only
+   operation, approved-only filtering, non-unit external/track scales, and
+   resume mismatch rejection. Include a real-data startup smoke test; investigate
+   the existing PCL refresh invalid-point failure rather than treating the
+   synthetic adapter tests as proof that dataset refresh works.
 11. **Fitter: remove obsolete ingestion and linking.** Delete filesystem
     patch/fiber/PCL loaders, proximity linking, side filtering, relinking paths,
     and all then-unused helpers, options, tests and documentation. Retain no
@@ -409,7 +436,7 @@ Notes from steps 5–8 that the remaining steps build on:
 
 - `FitContext(object_store_inputs=...)` takes `object_store_inputs.FitInputs`
   and skips file loading and linking; step 10 builds it from config and makes
-  it the only path. `materialize()` takes the z window, default erosion and
+  it the only path. `materialize()` takes the z window and margin, default erosion and
   `pcl_fiber_min_point_spacing` explicitly.
 - Default PCL sampling groups are `abs_winding`, `relative_windings` and
   `same_windings` by role and annotation, unless `meta.sampling_group` is set;
