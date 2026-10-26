@@ -10,4 +10,7 @@ std::string storeSharedPayload(sqlite3*, const std::string&, std::span<const uin
 std::string publishStructuralSnapshot(ObjectStore&, WriteTxn&, const std::string&, const GeometryData&, SharedJson,
     const std::string&, const std::vector<GeometryEdgeEdit>&,
     const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds = std::nullopt);
+// The edges publishStructuralSnapshot(data, changedIds) requires decisions for.
+std::vector<EdgeRecord> structuralSnapshotEdges(const ObjectStore&, const Txn&, const std::string&, const GeometryData&,
+    const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds = std::nullopt);
 }
