@@ -445,6 +445,9 @@ def point_annotations(store, geometry_revision, point_ids):
 ABSOLUTE_PCL_GROUP = 'abs_winding'
 RELATIVE_PCL_GROUP = 'relative_windings'
 SAME_WINDING_PCL_GROUP = 'same_windings'
+# Patch-overlap pairs default to their own group, so a dense overlap graph
+# cannot crowd out the PCL groups; an edge's ``meta.sampling_group`` overrides it.
+PATCH_OVERLAP_GROUP = 'patch_overlaps'
 
 
 @dataclasses.dataclass
@@ -456,6 +459,8 @@ class FitInputs:
     whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
     ``fiber_links`` holds their resolved same-winding branch links.
+    ``patch_overlaps`` maps resident ids to the two-point same-surface
+    collections of materialize_patch_overlaps.
     ``dropped_attachments`` lists ``(edge UUID, reason)`` for consumed
     attachments whose quad the patch losses do not sample (on_retained_quad).
     """
@@ -466,6 +471,7 @@ class FitInputs:
     fiber_links: list
     counts: Counter
     dropped_attachments: list = dataclasses.field(default_factory=list)
+    patch_overlaps: dict = dataclasses.field(default_factory=dict)
 
     def report(self, max_named=5):
         lines = snapshot_report(self.snapshot) + [
@@ -828,12 +834,112 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     return catalog, links, counts
 
 
+def _overlap_point(cid, index, patch_uuid, grid, xyz, edge_uuid):
+    zyx = np.asarray(xyz, dtype=np.float64)[::-1].astype(np.float32)
+    return {'id': index, 'collectionId': cid, 'p': zyx[::-1].tolist(),
+            'zyx': zyx, 'winding_annotation': 0.0, 'creation_time': 0,
+            'on_patch': {'id': patch_uuid,
+                         'ij': [float(grid[0]), float(grid[1])],
+                         'edge_uuid': edge_uuid}}
+
+
+def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
+                               max_pairs, first_id=0, dropped=None):
+    """Same-surface pair collections of the snapshot's patch overlaps.
+
+    The store materializes each consumed overlap edge's point pairs from its
+    stored pose (``overlap_correspondences``); nothing is matched here. Pairs
+    follow the stored endpoint order, with (row, col) grids and XYZ already in
+    fit-volume voxels, so only the axes are reversed. Each pair becomes one
+    collection of two points, the pair's point on either patch, with zero
+    relative winding: the relative-winding loss then compares exactly that
+    correspondence along its own two-node chain. Every pair of an edge
+    carries ``sampling_member_weight`` 1 / (its retained pairs), so an edge
+    weighs the same however many pairs it produces.
+
+    A pair on a quad either patch's losses do not sample is dropped; an edge
+    losing every pair is appended to ``dropped``. Edge errors, and pairs
+    computed from geometry other than the snapshot's, are reported together.
+    Returns ``(collections keyed by resident id, counts)``.
+    """
+    edges = {rel.uuid: rel for rel in snapshot.relationships_of('patch_overlap')}
+    collections, counts, problems = {}, Counter(), []
+    if not edges:
+        return collections, counts
+    results = store.overlap_correspondences(
+        list(edges), snapshot.volume_uuid, float(pair_spacing), int(max_pairs))
+    cid = first_id
+    for result in results:
+        rel = edges.pop(result['edge_uuid'], None)
+        if rel is None:
+            problems.append(f'patch overlap {result["edge_uuid"]} was not requested')
+            continue
+        if result['error'] is not None:
+            problems.append(f'patch overlap {rel.uuid}: {result["error"]}')
+            continue
+        ends = ((result['a'], result['a_geometry_revision']),
+                (result['b'], result['b_geometry_revision']))
+        if sorted(uuid for uuid, _ in ends) != sorted((rel.a, rel.b)):
+            problems.append(f'patch overlap {rel.uuid} was materialized between '
+                            f'{result["a"]} and {result["b"]}')
+            continue
+        stale = [uuid for uuid, revision in ends
+                 if snapshot.objects[uuid].geometry_revision != revision]
+        if stale:
+            problems.append(f'patch overlap {rel.uuid} was materialized from '
+                            f'geometry of {", ".join(stale)} other than the snapshot\'s')
+            continue
+        a, b = result['a'], result['b']
+        if a not in patches or b not in patches:
+            counts['patch overlaps with unfitted patches'] += 1
+            continue
+        kept = [pair for pair in result['pairs']
+                if on_retained_quad(patches[a], pair['a_grid'])
+                and on_retained_quad(patches[b], pair['b_grid'])]
+        if len(kept) < len(result['pairs']):
+            counts['overlap pairs off sampled quads'] += len(result['pairs']) - len(kept)
+        if not kept:
+            counts['patch overlaps off sampled quads'] += 1
+            if dropped is not None:
+                dropped.append((rel.uuid, 'no pair on sampled quads'))
+            continue
+        group = rel.meta.get('sampling_group') or PATCH_OVERLAP_GROUP
+        for index, pair in enumerate(kept):
+            collections[cid] = {
+                'id': cid, 'name': f'overlap {rel.uuid} pair {index}',
+                'points': {
+                    0: _overlap_point(cid, 0, a, pair['a_grid'], pair['a_xyz'], rel.uuid),
+                    1: _overlap_point(cid, 1, b, pair['b_grid'], pair['b_xyz'], rel.uuid)},
+                'color': [0.0, 0.0, 0.0], 'source_file': None,
+                'sampling_group': group,
+                'sampling_member_weight': 1.0 / len(kept),
+                'metadata': {
+                    'winding_is_absolute': False,
+                    'input_role': 'patch_overlap',
+                    'resident_collection_id': cid,
+                    'edge_uuid': rel.uuid,
+                    'edge_revision': rel.revision,
+                    'pair_distance': float(pair['distance']),
+                },
+            }
+            cid += 1
+        counts['patch overlaps'] += 1
+        counts['overlap pairs'] += len(kept)
+    problems.extend(f'patch overlap {uuid} returned no result' for uuid in edges)
+    if problems:
+        raise ObjectStoreInputError(problems)
+    return collections, counts
+
+
 def materialize(store, snapshot, *, z_begin, z_end, z_margin,
-                erode_cells_default, fiber_min_point_spacing=0.0):
+                erode_cells_default, fiber_min_point_spacing=0.0,
+                overlap_pair_spacing=8.0, overlap_max_pairs=16):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
-    pcl_fiber_min_point_spacing); resident ids number PCLs, then fibers.
+    pcl_fiber_min_point_spacing); patch overlaps yield at most
+    ``overlap_max_pairs`` pairs ``overlap_pair_spacing`` voxels apart.
+    Resident ids number PCLs, then fibers, then overlap pairs.
     """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
@@ -846,8 +952,25 @@ def materialize(store, snapshot, *, z_begin, z_end, z_margin,
         store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
         first_id=len(point_collections), dropped=dropped)
     counts.update(fiber_counts)
+    patch_overlaps, overlap_counts = materialize_patch_overlaps(
+        store, snapshot, patches, pair_spacing=overlap_pair_spacing,
+        max_pairs=overlap_max_pairs,
+        first_id=len(point_collections) + len(fibers), dropped=dropped)
+    counts.update(overlap_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
-                     fiber_links, counts, dropped)
+                     fiber_links, counts, dropped_attachments=dropped,
+                     patch_overlaps=patch_overlaps)
+
+
+def materialize_from_config(store, snapshot, config):
+    """materialize() with the fit configuration's window and settings."""
+    return materialize(
+        store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
+        z_margin=config['patch_loss_z_margin'],
+        erode_cells_default=config['patch_erode_patches'],
+        fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'],
+        overlap_pair_spacing=config['pcl_patch_overlap_pair_spacing'],
+        overlap_max_pairs=config['pcl_patch_overlap_max_pairs'])
 
 
 @dataclasses.dataclass
@@ -874,7 +997,19 @@ class PointViews:
             f'fiber links: {len(self.resolved_links)} in '
             f'{len(self.link_components)} component(s); {len(merged)} merged '
             'cross-patch fiber component(s)',
+            f'patch overlaps: {len(self.overlap_edges)} edge(s) as '
+            f'{self.overlap_pairs} pair view(s)',
         ]
+
+    @property
+    def overlap_edges(self):
+        return {pcl['metadata']['edge_uuid'] for pcl in self.cross_patch
+                if pcl['metadata'].get('input_role') == 'patch_overlap'}
+
+    @property
+    def overlap_pairs(self):
+        return sum(1 for pcl in self.cross_patch
+                   if pcl['metadata'].get('input_role') == 'patch_overlap')
 
 
 def derive_point_views(inputs, patches, config):
@@ -883,13 +1018,15 @@ def derive_point_views(inputs, patches, config):
     The store's relationships already attach points to patches, so the
     collections go straight to the shared classification: regular PCLs
     through regular_pcl_views, fibers through fiber_training_views, where
-    every fiber with a usable in-ROI path keeps its strip. ``patches`` are the
-    patches the fit uses; ``config`` the fit configuration. Raises the
-    runtime validation errors (e.g. unannotated absolute points).
+    every fiber with a usable in-ROI path keeps its strip. Patch-overlap
+    pairs are cross-patch views as they are, after the regular and fiber ones.
+    ``patches`` are the patches the fit uses; ``config`` the fit
+    configuration. Raises the runtime validation errors (e.g. unannotated
+    absolute points).
     """
     from pcl_views import (catalog_copy_of_pcl, fiber_training_views,
-                           prepare_fiber_catalog, regular_pcl_views,
-                           vertical_fiber_radial_offset)
+                           group_points_by_patch, prepare_fiber_catalog,
+                           regular_pcl_views, vertical_fiber_radial_offset)
     from spiral_helpers import SequenceChain
 
     point_collections = inputs.point_collections
@@ -917,9 +1054,16 @@ def derive_point_views(inputs, patches, config):
             strip_every_fiber=True)
     strips.extend(fiber_strips)
     strip_groups.extend(fiber_groups)
+    overlaps = []
+    for pcl in inputs.patch_overlaps.values():
+        pcl['chain'] = SequenceChain(pcl)
+        group_points_by_patch(pcl, patches)
+        if len(pcl['points_by_patch']) == 2:
+            overlaps.append(pcl)
     return PointViews(
-        list(cross_patch.values()) + fiber_cross_patch, strips, strip_groups,
-        inputs.fibers, regular_pcl_catalog, resolved_links, link_components)
+        list(cross_patch.values()) + fiber_cross_patch + overlaps, strips,
+        strip_groups, inputs.fibers, regular_pcl_catalog, resolved_links,
+        link_components)
 
 
 # ---------------------------------------------------------------------------
@@ -956,11 +1100,7 @@ def snapshot_report(snapshot):
 def constraints_report(store, snapshot, config):
     """Materialize and derive the runtime views as a fit would, and describe
     them; raises the same validation errors a fit would."""
-    inputs = materialize(
-        store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
-        z_margin=config['patch_loss_z_margin'],
-        erode_cells_default=config['patch_erode_patches'],
-        fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'])
+    inputs = materialize_from_config(store, snapshot, config)
     views = derive_point_views(inputs, inputs.patches, config)
     return inputs.report() + views.report()
 

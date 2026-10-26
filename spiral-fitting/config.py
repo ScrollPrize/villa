@@ -277,7 +277,9 @@ NEW_FIT_KEYS = frozenset(
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction"}
+       "pcl_vertical_fiber_min_z_fraction",
+       # Materialized from the object store when the fit loads its inputs.
+       "pcl_patch_overlap_pair_spacing", "pcl_patch_overlap_max_pairs"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_")
@@ -372,6 +374,7 @@ def _field_spec(key, default):
                     "dt_target_update_interval",
                     "pcl_link_window_points",
                     "pcl_link_window_min_points",
+                    "pcl_patch_overlap_max_pairs",
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 1_000_000_000),
@@ -538,6 +541,13 @@ class Config:
         self.pcl_use_fiber_links = True
         # Include unapproved (pending) links.
         self.pcl_use_pending_fiber_links = False
+        # Object-store patch overlaps become same-surface point pairs sampled
+        # this many reference-volume voxels apart, at most max_pairs per edge
+        # (object_store_inputs.materialize_patch_overlaps). Each edge weighs
+        # the same in the 'patch_overlaps' sampling group however many pairs
+        # it yields.
+        self.pcl_patch_overlap_pair_spacing = 8.0
+        self.pcl_patch_overlap_max_pairs = 16
         # Vertical/horizontal classification of fiber strips, used for radial
         # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
         # tag when the recorded certainty (0..1) reaches the threshold, then a

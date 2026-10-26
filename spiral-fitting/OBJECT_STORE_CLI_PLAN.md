@@ -327,7 +327,7 @@ the relationship graph alone cannot supply seam corrections.
 
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
-Steps 1–8 are implemented; steps 9–12 remain. Upstream
+Steps 1–9 are implemented; steps 10–12 remain. Upstream
 through `affe83f75` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
@@ -452,6 +452,16 @@ Notes from steps 5–8 that the remaining steps build on:
   validation and counts the actual views.
 - `pcl_use_fiber_links` still gates branch links; `pcl_use_pending_fiber_links`
   no longer applies to store links (approval follows the snapshot policy).
+- Step 9: each retained overlap pair is a two-point collection (one point on
+  each patch, stored endpoint order, zero relative winding) whose chain is just
+  that pair, so the relative-winding loss never routes between pairs. Pairs
+  carry `sampling_member_weight` 1/(retained pairs of their edge), honoured by
+  `FitContext._rebuild_pcl_sampling_strata`; the default group is
+  `patch_overlaps` (`meta.sampling_group` on the edge overrides it), so an
+  explicit `pcl_sampling_weights` must name it. `pcl_patch_overlap_pair_spacing`
+  and `pcl_patch_overlap_max_pairs` pass through to `overlap_correspondences`;
+  `materialize_from_config()` applies every materialization setting of a fit
+  config.
 - `tests/data/object_store_reference.json` is the file loader's output for the
   synthetic fixture in `tests/object_store_reference.py`. Delete
   `tests/test_object_store_reference.py` with the file loader in step 11; the

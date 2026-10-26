@@ -1357,11 +1357,14 @@ class FitContext:
         # draw samples at most sample_count_relative_winding_patch_pairs_per_pcl
         # patch pairs regardless of pcl size, so without this a component would
         # get ~1/N the pair-sampling pressure its N members had before merging.
+        # A collection's explicit sampling_member_weight (patch-overlap pairs,
+        # which share one edge's weight) takes precedence.
         self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
             [pcl['sampling_group'] if len(pcl['points']) > 1 else None
              for pcl in self.cross_patch_pcls],
             self.config,
-            member_weights=[len(pcl.get('link_member_cids', ())) or 1
+            member_weights=[pcl.get('sampling_member_weight')
+                            or len(pcl.get('link_member_cids', ())) or 1
                             for pcl in self.cross_patch_pcls],
         )
         self._rebuild_unattached_components()
@@ -1979,7 +1982,8 @@ class FitContext:
         self.link_distance_tolerance = float(
             self.config['pcl_link_distance_tolerance'])
         resident_ids = [*inputs.point_collections,
-                        *(pcl['id'] for pcl in inputs.fibers.values())]
+                        *(pcl['id'] for pcl in inputs.fibers.values()),
+                        *inputs.patch_overlaps]
         return max(resident_ids, default=-1) + 1
 
     def _load_and_link_file_inputs(self):
