@@ -33,7 +33,7 @@ def test_read_surface_applies_validity_and_volume_scale(tmp_path):
     assert not surface._mask[0, 0] and not surface._mask[2, 3] and surface._mask[1, 1]
     assert surface._x[2, 3] == -1 and surface._x[0, 0] == -1
     assert surface._x[1, 1] == pytest.approx(points[1, 1, 0] / 2)
-    with pytest.raises(ValueError, match='not bound'):
+    with pytest.raises(ValueError, match='does not map'):
         read_surface(tmp_path / 'objects.vcobj', uid, volume='other')
 
 

@@ -73,7 +73,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			self.assertEqual(float(surface.d[1, 1]), 3.0)
 			self.assertFalse(bool(surface.valid[4, 5]))
 
-			with self.assertRaisesRegex(ValueError, "not bound"):
+			with self.assertRaisesRegex(ValueError, "does not map"):
 				tifxyz_io.load_tifxyz(ref, store=store, volume="other")
 			with self.assertRaisesRegex(ValueError, "needs a store"):
 				tifxyz_io.load_tifxyz(ref)

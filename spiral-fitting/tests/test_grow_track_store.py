@@ -24,7 +24,7 @@ def test_grown_patches_are_stored_surfaces_found_by_seed(tmp_path):
     args = Namespace(store=store, volume_uuid="vol", tag=["paths"])
     uid = ggt.store_surface(args, 7, bordered, meta, (0.05, 0.05))
 
-    points, valid, scale, record = vc_object_store.surfaces.read_surface(store, uid, volume="vol")
+    points, valid, scale, record, *_ = vc_object_store.surfaces.read_surface(store, uid, volume="vol")
     assert valid.sum() == 12 and not valid[0].any() and scale == (0.05, 0.05)
     np.testing.assert_array_equal(points[1:-1, 1:-1], grid.astype(np.float32))
     assert record["tags"] == ["paths"] and record["meta"]["provenance"]["tool"] == "grow_track_graph"
