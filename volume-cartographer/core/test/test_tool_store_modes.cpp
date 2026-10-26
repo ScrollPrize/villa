@@ -284,7 +284,7 @@ TEST_CASE("vc_merge_tifxyz stores the merge of stored surfaces like a tifxyz mer
     }
     std::ofstream(f.dir / "merge.json") << R"({"rows":["surface_a surface_b"]})";
     std::ofstream(f.dir / "merge-store.json") << nlohmann::json{{"rows", {uuidA + " " + uuidB}}}.dump();
-    const auto bin = tool("VC_MERGE_TIFXYZ_BIN") + " --obj2tifxyz " + tool("VC_OBJ2TIFXYZ_LEGACY_BIN");
+    const auto bin = tool("VC_MERGE_TIFXYZ_BIN");
     run(bin + " --merge \"" + (f.dir / "merge.json").string() + "\"", f.dir / "file.log");
     const auto uuid = surfaceUuid(run(bin + " --merge \"" + (f.dir / "merge-store.json").string() + "\" --store \"" +
                                       f.store.string() + "\" --tag merged --volume-uuid vol", f.dir / "store.log"));

@@ -101,4 +101,29 @@ private:
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
 };
 
+// Rasterizes a UV-mapped triangle mesh onto a grid `step` voxels apart: the
+// grid spans the faces' UV bounds sized by the UV-to-3D scale (voxels per UV
+// unit: the area-weighted median or mean of the triangles' Jacobian norms, or
+// given), and each grid point takes the barycentric mix of the first triangle
+// covering it. The surface's scale is 1/step.
+class StepUvRasterizer {
+public:
+    enum class ScaleMethod { Median, Mean, Manual };
+    void setMesh(std::vector<cv::Vec3f> vertices, std::vector<cv::Vec2f> uvs, std::vector<UvFace> faces);
+    void determineGridDimensions(float step = 20.0f, ScaleMethod method = ScaleMethod::Median,
+                                 cv::Vec2d manualScale = cv::Vec2d(1.0, 1.0));
+    QuadSurface* createQuadSurface();
+
+private:
+    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face) const;
+
+    std::vector<cv::Vec3f> vertices;
+    std::vector<cv::Vec2f> uvs;
+    std::vector<UvFace> faces;
+    cv::Vec2f uv_min, uv_max;
+    cv::Vec2i grid_size;
+    cv::Vec2d full_resolution;  // full voxel resolution before the step
+    float step_size = 20.0f;
+};
+
 } // namespace vc::meshing
