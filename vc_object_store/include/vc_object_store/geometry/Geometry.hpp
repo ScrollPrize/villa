@@ -73,8 +73,11 @@ std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t mask
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
 // A surface vertex has coordinates unless a component is -1 or non-finite;
-// missing vertices are stored as the (-1,-1,-1) sentinel. (Legacy tifxyz files
-// mark them with z <= 0; their readers convert at the file boundary.)
+// missing vertices are stored as the (-1,-1,-1) sentinel.
 bool validSurfacePoint(const SurfacePoint&);
+// tifxyz grids, and the in-memory grids of tools that read and write them,
+// also mark missing vertices with z <= 0 (tracers leave extrapolations there).
+// Their readers and writers convert with this rule at that boundary.
+bool validTifxyzPoint(const SurfacePoint&);
 
 } // namespace vc::geometry

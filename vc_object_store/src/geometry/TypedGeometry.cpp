@@ -48,6 +48,7 @@ bool validSurfacePoint(const SurfacePoint& p)
         if (!std::isfinite(v) || v == -1) return false;
     return true;
 }
+bool validTifxyzPoint(const SurfacePoint& p) { return p[2] > 0 && validSurfacePoint(p); }
 std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t maskRows, int64_t maskColumns,
                                       int64_t rows, int64_t columns)
 {

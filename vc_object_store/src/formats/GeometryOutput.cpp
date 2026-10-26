@@ -93,8 +93,7 @@ void surface(const Snapshot& s, Json attributes, const fs::path& path, bool vali
                 throw std::runtime_error("missing surface vertices must use the (-1,-1,-1) sentinel");
             continue;
         }
-        // tifxyz readers treat z <= 0 as missing.
-        if (xyz[i+2] <= 0)
+        if (!vc::geometry::validTifxyzPoint({xyz[i], xyz[i+1], xyz[i+2]}))
             throw std::runtime_error("tifxyz cannot hold a surface vertex at z <= 0");
         for (int a = 0; a < 3; ++a) {
             low[a] = any ? std::min(low[a], xyz[i+a]) : xyz[i+a];
