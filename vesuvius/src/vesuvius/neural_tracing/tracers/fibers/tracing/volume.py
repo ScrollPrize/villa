@@ -35,9 +35,9 @@ parallel), so overlapping pieces of one fiber can be joined later.
 
 Outputs (OUT): tiles/TILE.npz (the pieces of the tile's dots in grid xyz, ids, seeds, families, stop reasons, links;
 written last, it marks the tile done), fibers/TILE/*.json (VC3D fibers in base coordinates; --no-json skips them),
-tiles.jsonl (one line per finished tile), progress.json, run.json; status lines on stdout; at the end fibers.afv,
-an Automated Fiber Volume of every fiber for VC3D (volume_afv.py; native L0 xyz in the frame of the open-data CT, or
-of --afv-template). Rerunning with the same OUT resumes: finished tiles are kept (their fibers own their space), the
+tiles.jsonl (one line per finished tile), progress.json, run.json; status lines on stdout; at the end fibers.vcobj,
+a VC object store of every fiber for VC3D (volume_store.py; native L0 xyz bound to the volume of the open-data CT, or
+of --fibers-template; fiber UUIDs derived from run.json's fiber_namespace). Rerunning with the same OUT resumes: finished tiles are kept (their fibers own their space), the
 rest are redone; settings that change the fibers must be the same.
 
   python -m vesuvius.neural_tracing.tracers.fibers.tracing.volume --presence PRESENCE_LEVEL \\
@@ -55,6 +55,7 @@ import shutil
 import signal
 import sys
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -69,9 +70,9 @@ from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_k
 from vesuvius.neural_tracing.tracers.fibers.tracing.inference import make_fiber_json
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
     add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import file_sha256
+from vesuvius.neural_tracing.tracers.shared.annotations.open_data import file_sha256
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
-from vesuvius.neural_tracing.tracers.fibers.tracing.volume_afv import export_afv
+from vesuvius.neural_tracing.tracers.fibers.tracing.volume_store import export_store
 from vesuvius.neural_tracing.tracers.models.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
@@ -854,11 +855,11 @@ def main(argv=None):
     ap.add_argument('--sampling-seed', type=int, default=0)
     add_volume_arguments(ap)
     ap.add_argument('--no-json', dest='json', action='store_false')
-    ap.add_argument('--afv-template',
-                    help='.afv of the same scan: the coordinate frame of OUT/fibers.afv, written at the end (default: '
-                         "the frame of the CT, when a Vesuvius open-data store; volume_afv.py writes it any time from "
-                         'the finished tiles)')
-    ap.add_argument('--no-afv', dest='afv', action='store_false')
+    ap.add_argument('--fibers-template',
+                    help='fiber store of the same scan: the volume of OUT/fibers.vcobj, written at the end (default: '
+                         "the volume of the CT, when a Vesuvius open-data store; volume_store.py writes it any time "
+                         'from the finished tiles)')
+    ap.add_argument('--no-fibers', dest='fibers', action='store_false')
     ap.add_argument('--status-every', type=float, default=60., help='seconds between status lines')
     ap.add_argument('--base-um', type=float, default=2.4, help='base voxel size for reported lengths (Paris4 2.4)')
     ap.add_argument('--device', default='cuda')
@@ -887,9 +888,10 @@ def main(argv=None):
     run_json = out/'run.json'
     if run_json.exists():
         old = json.loads(run_json.read_text())
+        record['fiber_namespace'] = old.get('fiber_namespace')  # drawn when the run started
         # settings that only change speed or reporting may differ on resume
         speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks', 'cuda_graph',
-                      'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template',  # speed or the end-of-run export
+                      'axis_workers', 'tile_workers', 'tile_ahead', 'fibers', 'fibers_template',  # speed or the end-of-run export
                       'cache_dir', 'frame_checkpoint')  # locations (the frame model is pinned by its sha256)
         # derived from the (compared) checkpoint and --ct; absent from runs started before they were recorded
         derived = ('ct_zarr', 'checkpoint_sha256')
@@ -897,7 +899,10 @@ def main(argv=None):
                    and not (k in derived and k not in old)]
         if changed:
             raise SystemExit(f'{out} holds a run with different settings: {changed}')
+        if args.fibers and not record['fiber_namespace']:
+            raise SystemExit(f'{out}/run.json has no fiber_namespace for the fiber store export (or pass --no-fibers)')
     else:
+        record['fiber_namespace'] = str(uuid.uuid4())  # the UUID namespace of the run's exported fibers
         run_json.write_text(json.dumps(record, indent=1))
     owned = Owned(args.tile)
     done, next_id = load_done(out, owned)
@@ -999,11 +1004,11 @@ def main(argv=None):
             status(force=True)
             w_bands += st.read_weight
             print(f'z row {int(z)} done in {(time.time()-t_band)/60:.1f} min', flush=True)
-        if args.afv:
-            t_afv = time.time()
-            result = export_afv(out, out/'fibers.afv', args.afv_template)
+        if args.fibers:
+            t_fibers = time.time()
+            result = export_store(out, out/'fibers.vcobj', args.fibers_template)
             print(f'wrote {result["path"]}: {result["fibers"]} fibers, {result["points"]} points '
-                  f'({time.time()-t_afv:.0f}s)', flush=True)
+                  f'({time.time()-t_fibers:.0f}s)', flush=True)
     finally:
         tracer.close()
         if getattr(tracer, 'axis_pool', None) is not None:

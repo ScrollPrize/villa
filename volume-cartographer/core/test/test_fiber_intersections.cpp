@@ -704,3 +704,58 @@ TEST_CASE("Fiber intersection cache keys include pair generations and options")
     cache.pruneFiber(1);
     CHECK(cache.size() == 0);
 }
+
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/Uuid.hpp"
+TEST_CASE("Store selected candidates preserve indexed refinement and reject stale pins")
+{
+    using namespace vc::objects;
+    const auto path=std::filesystem::temp_directory_path()/(util::newUuid()+".vcobj");
+    OpenOptions options;options.author="spatial-regression";
+    {auto db=ObjectStore::create(path,options);}
+    auto session=std::make_shared<ObjectStoreSession>();const auto attachment=session->attach(path,options);
+    std::vector<vc::atlas::FiberPolyline> fibers{
+        fiber(1,1,{p(0,0,1),p(400,0,1)}),
+        fiber(2,1,{p(100,-20,1),p(100,20,1),p(300,20,1),p(300,-20,1)}),
+        fiber(3,1,{p(0,10000,1),p(100,10000,1)})};
+    for(auto& value:fibers) {
+        const auto uuid=util::newUuid();std::string geometry;
+        const auto receipt=session->act(attachment,{{uuid,{}}},[&](auto& db,auto& txn) {
+            ObjectRecord record;record.uuid=uuid;record.kind="fiber";record.name="same name";db.upsertObject(txn,record);
+            vc::geometry::Fiber data;
+            for(const auto& point:value.points) data.linePoints.push_back({point.position[0],point.position[1],point.position[2]});
+            data.controlPoints={data.linePoints.front(),data.linePoints.back()};
+            geometry=db.putGeometry(txn,uuid,vc::geometry::encode(data));
+        });
+        value.storePin=PinnedObject{attachment,{attachment.storeUuid,uuid},*receipt.at(uuid),geometry};
+    }
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;broad.maxDistance=1;broad.maxSampleSpacing=1;broad.clusterArclength=2;
+    vc::atlas::FiberIntersectionCeresOptions ceres;ceres.deduplicateArclength=2;
+    auto indexed=vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres);
+    auto stored=vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session);
+    REQUIRE(stored.size()==indexed.size()); REQUIRE(stored.size()==2);
+    for(size_t i=0;i<stored.size();++i) {
+        CHECK(stored[i].sourceArclength==indexed[i].sourceArclength);
+        CHECK(stored[i].targetArclength==indexed[i].targetArclength);
+        CHECK(stored[i].candidateDistance==indexed[i].candidateDistance);
+        CHECK(stored[i].sourcePoint==indexed[i].sourcePoint);
+        CHECK(stored[i].targetPoint==indexed[i].targetPoint);
+    }
+    auto scaled=fibers;
+    for(auto& f:scaled) {f.storeToQueryScale=0.5;for(auto& point:f.points) point.position*=0.5;for(auto& point:f.controlPoints)point*=0.5;}
+    auto scaledIndexed=vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres);
+    auto scaledStored=vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session);
+    REQUIRE(scaledStored.size()==scaledIndexed.size());
+    for(size_t i=0;i<scaledStored.size();++i) {
+        CHECK(scaledStored[i].sourcePoint==scaledIndexed[i].sourcePoint);
+        CHECK(scaledStored[i].targetPoint==scaledIndexed[i].targetPoint);
+        CHECK(scaledStored[i].sourceArclength==scaledIndexed[i].sourceArclength);
+    }
+    scaled.back().coordinateKnown=false;
+    CHECK_THROWS(vc::atlas::searchFiberIntersections(scaled,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session));
+    CHECK_NOTHROW(vc::atlas::searchFiberIntersections(scaled,{1},{2},nullptr,broad,ceres,nullptr,{},{},session));
+    auto pin=*fibers.front().storePin;
+    session->act(attachment,{{pin.object.objectUuid,pin.objectRevision}},[&](auto& db,auto& txn) {db.setMeta(txn,pin.object.objectUuid,"external","true");});
+    CHECK_THROWS(vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session));
+    session->detach();std::filesystem::remove(path);
+}

@@ -55,7 +55,7 @@ public:
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
 {
-    requestBytes(bytes.size(), &FiberRegionStats::verifiedBytes);
+    requestBytes(bytes.size(), &RegionStats::verifiedBytes);
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int size = 0;
     if (EVP_Digest(bytes.data(), bytes.size(), digest, &size, EVP_sha256(), nullptr) != 1)
@@ -168,10 +168,9 @@ void forEachGeometryChunk(const GeometryArray& array, int64_t tile, Visit&& visi
         }
 }
 
-inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTileSize = GeometryStorageOptions{}.patchTileSize)
+inline nlohmann::json geometrySchema(const GeometryData& data)
 {
     using Json = nlohmann::json;
-    validatePatchTileSize(patchTileSize);
     if (data.kind != "patch" && data.kind != "fiber" && data.kind != "point_collection" && data.kind != "track")
         throw std::invalid_argument("geometry: unsupported object kind " + data.kind);
     if (data.formatVersion != 1 || data.coordinateSystem != "source_xyz")
@@ -204,11 +203,9 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
     if (data.kind == "fiber") {
         require("control_points", "<f8", 2, true);
         require("line_points", "<f8", 2, true);
-        if (arrays.contains("control_point_ids")) {
-            require("control_point_ids", "<i8", 1, false);
-            if (arrays["control_point_ids"]["shape"][0] != arrays["control_points"]["shape"][0])
-                throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
-        }
+        require("control_point_ids", "<i8", 1, false);
+        if (arrays["control_point_ids"]["shape"][0] != arrays["control_points"]["shape"][0])
+            throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
     }
     if (data.kind == "track") require("points", "<i4", 2, true);
     if (data.kind == "point_collection") {
@@ -217,6 +214,14 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
         if (arrays["points"]["shape"][0] != arrays["point_ids"]["shape"][0])
             throw std::invalid_argument("geometry: point IDs and coordinates differ in length");
     }
+    return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},
+        {"attributes", attributes}, {"arrays", arrays}};
+}
+inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTileSize = GeometryStorageOptions{}.patchTileSize)
+{
+    validatePatchTileSize(patchTileSize);
+    auto manifest = geometrySchema(data);
+    auto& arrays = manifest["arrays"];
     for (const auto& array : data.arrays) {
         auto& descriptor = arrays[array.name];
         const auto tile = data.kind == "patch" ? patchTileSize : 0;
@@ -225,7 +230,6 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
             descriptor["chunks"].push_back(geometryPayloadHash(array.name, bytes));
         });
     }
-    return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},
-        {"attributes", attributes}, {"arrays", arrays}};
+    return manifest;
 }
 } // namespace vc::objects::detail

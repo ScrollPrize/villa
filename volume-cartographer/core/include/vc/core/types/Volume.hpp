@@ -45,6 +45,13 @@ public:
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
+    // Open an existing local volume and apply project-entry metadata (see
+    // vc::project::volumeMetadataFromEntryTags) over its meta.json, as
+    // NewFromUrl does for a remote volume. A catalog volume ID gives a local
+    // copy of a catalog volume the same identity as the streamed volume.
+    static std::shared_ptr<Volume> New(std::filesystem::path path,
+                                       const utils::Json& metadata);
+
     struct PyramidPolicy {
         enum class Reduction {
             Mean,
@@ -111,6 +118,8 @@ public:
     [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
+    // Source identity before project/catalog metadata overrides, with the
+    // logical base level included. Annotation IDs do not rename disk caches.
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
@@ -299,6 +308,7 @@ protected:
     bool isRemote_ = false;
     std::string remoteUrl_;
     std::string remoteLocator_;
+    std::string remoteCacheId_;
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;
     vc::HttpAuth remoteAuth_;

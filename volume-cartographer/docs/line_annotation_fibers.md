@@ -1,32 +1,63 @@
 # VC3D Line Annotation Fibers
 
-## Fiber coordinate shape
+## Storage and coordinates
 
-Every saved fiber includes `coordinate_base_shape_zyx`, the dimensions of the
-grid its stored points index. New viewer annotations record the active volume's
-exact shape; linked fibers inherit the parent session's shape and display scale.
-Headless inference annotations require the inference manifest's `base_shape_zyx`.
-These are coordinate-frame dimensions, not necessarily the scan's finest grid.
-Opening older unstamped fibers first uses their recorded/selected inference
-manifest; without one, their existing unscaled active-volume interpretation is
-recorded on save. Saving without a valid shape fails rather than omitting it.
-Once resolved, this shape is retained in the loaded fiber and its open sessions
-before saves are queued. Changing the active volume or inference dataset does
-not reinterpret previously resolved geometry.
-Package loading happens before volume activation. Load-time metadata writes
-(including assigning a missing UUID) that cannot yet resolve a coordinate shape
-are deferred until a volume becomes active. The already generated in-memory UUID
-is preserved during that wait; existing UUIDs are not replaced. Deferred writes
-are discarded on a fiber reload/package change, and this retry does not enable
-writes withheld for unresolved branch-link issues.
+Attach an existing `.vcobj` database with **File → Object Store → Attach Object Store**.
+**Attach Read-only Object Store** supports browsing without permitting writes.
+VC3D edits geometry, annotations, relationships and retirement directly through
+the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
+objects and retire the original in that transaction. VC3D retains pinned working
+snapshots; the database owns revision history and synchronization.
+The Fibers panel lists catalog pages from the store's records; selecting or
+expanding a fiber reads its exact span details from its current revision. The
+total length sums the listed fibers' stored lengths. Closing a read-only view does
+not remove its catalog entry.
 
-Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
-unchanged. There is no import/export scale control or API parameter; the shape
-determines the display conversion into the active volume. Agent requests that
-still supply `scale` are rejected. Old collection-level `scale` metadata is not
-applied; it described a transform already baked into the exported points.
-Previously scaled exports with inconsistent shape metadata need correction
-at their source; they cannot be repaired unambiguously on import.
+In the Fibers panel a click selects a fiber (and focuses the main views when
+they are shown); a double click opens it in Line Annotation, a span row at that
+span.
+
+A stored fiber opens read-only, from the Fibers panel, a viewer, a linked
+control point or the agent bridge (`fiber.open`), so opening it never re-solves
+or rewrites it. The view needs no Lasagna dataset; without one the strips use an
+inspection frame. **Enable editing** in the window's top bar switches the same
+view to editing: it checks that the store still holds the revision on screen,
+asks for the dataset editing needs, and rebuilds the strips in the sheet frame.
+A single-point fiber is traced at that moment. Fibers created or merged in the
+window open editable; `fiber.open` takes `editable: true` for the same. With a
+read-only store attachment the button stays disabled.
+
+Each fiber's explicit coordinate binding determines its transform into the active
+volume. Unbound fibers remain listed but are excluded from spatial overlays and
+search until bound. Slice, intersection, map and point-collection views apply the
+same per-fiber transform. Stored geometry and solver coordinates remain unchanged.
+`coordinate_base_shape_zyx`, when present, describes the stored coordinate grid.
+
+Import/export is an explicit transfer operation. VC3D imports current **version 4**
+`vc3d_fiber` JSON with UUIDs and exports that format. There is no implicit file
+migration, filename identity inference, gap repair, branch stripping, project
+fiber-folder lookup or `.afv` backend. Store records load directly from typed
+geometry and relationships, independently of their original ingestion format.
+Control-only fibers remain in the catalog and round-trip through import/export
+without generating line points. Import/export does not rescale points.
+
+Spiral stages newly drawn and reopened fibers, including their linked endpoints,
+as input drafts. Subsequent edits refresh those drafts; applying them to the fit
+remains an explicit action. Fiber identity is the object UUID, not its display name.
+
+Atlas mappings require object-store revision pins. The atlas inspection,
+constraint export and pred-snap rebuild tools accept `--object-store PATH` and
+open that database read-only. Native JSON needed by external processing tools is
+materialized explicitly from pinned revisions into temporary transfer files.
+
+Example build and checks (existing configured Ninja build):
+
+```sh
+ninja -C build VC3D test_atlas vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
+build/bin/test_atlas
+build/bin/vc_atlas_inspect /path/to/atlas --object-store /path/to/objects.vcobj
+```
 
 ## CP direction annotations
 
@@ -65,21 +96,10 @@ the cross-section plane normal. Existing auto/manual optimization scheduling is
 retained; edits dirty adjacent spans and connected spline runs follow the normal
 optimization path. Saved display-normal corrections remain separate.
 
-VC3D writes line annotations as `vc3d_fiber` JSON, currently **version 4**.
-Version 3 stores `control_points` as objects with a required `position`. Every
-non-final control point owns a required `segment_to_next` descriptor for its
-span to control point `i+1`; the final control point cannot contain
-`segment_to_next`. Version 4 is version 3 plus an optional `tags` array of
-strings on each span descriptor, written only when non-empty, so a span
-without tags serializes exactly as in version 3. A version-3 span carrying
-`tags` is rejected, so the version is a true signal of what a file may
-contain. Every loader (the core strict loader, VC3D, the python format
-package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D writes 4, and so
-does the lasagna line probe for a re-optimized result (its plain `--output`
-copy still copies the validated input as-is, whatever its version). The merge tool treats 3 and 4 as one lineage (a v3 base
-with v4 sides is the normal state after an upgrade, not a conflict) and
-writes the merge as version 4 when any side is 4. Builds older than version 4
-refuse to load a version-4 file. A control point
+VC3D's explicit transfer format is `vc3d_fiber` JSON **version 4**.
+Control points are objects with a required `position`. Every non-final control
+point owns a `segment_to_next` descriptor; the final control point has none.
+Span descriptors may carry an optional `tags` array. A control point
 may also carry an optional `tags` array of strings, written only when non-empty;
 the one tag today is `kollesis_termination`, set from the control point's
 Ctrl+right-click menu ("Kollesis termination", a toggle) to mark where the fiber
@@ -135,13 +155,13 @@ The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
 the same arclength radius as CP replacement, and is disabled outside that radius.
 Setting an angle to zero removes its manual normal.
 
-Version-3 JSON stores optional top-level `width`, always-written top-level
+Version-4 transfer JSON stores optional top-level `width`, always-written top-level
 `width_gap_fraction` (default 0.2), and optional per-control-point
 `display_normal: [x,y,z]` and `display_normal_source`. The source is `manual`
 for explicit angle/edge-drag edits, `interpolated` for inheritance on CP
 creation, and `unknown` for older normals without provenance. Training should
 select only `manual`. Normal and provenance travel together through saving,
-replacement, reversal, split/merge, optimization and remote three-way sync.
+replacement, reversal, split/merge and optimization.
 Clearing a normal omits both fields. The normal is the baked world-space unit normal,
 not an angle. The gap is a dimensionless fraction between 0 and 1; missing
 values load as 0.2 and are explicitly written on the next save. Existing values
@@ -178,12 +198,11 @@ overlay through the main window's shared toggle action. **Space** continues to
 toggle cross-view mouse-follow. The annotation menu also exposes the overlay
 toggle. This is independent of width/normal guide visibility.
 
-Edits use the ordinary queued fiber save/sync path without retracing or changing
+Edits commit through the database without retracing or changing
 review tags. CP metadata follows CP movement, reversal and split; each split
 inherits width and gap. Joining fibers uses the clicked fiber's nonzero width
-and its gap, otherwise the other fiber's width and gap. Three-way sync merges
-width, gap and per-CP normal changes
-independently of span refits; divergent edits and edits to removed CPs conflict.
+and its gap, otherwise the other fiber's width and gap. Database revision
+checks reject stale edits before any changes are committed.
 
 The former cross-section polygon/line editor and `cross_sections` storage are
 removed. Old records are not migrated and are omitted when rewriting a fiber.
@@ -325,9 +344,9 @@ through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
 is never guessed. Centimetres show two decimals everywhere. The shared
 formatting lives in `FiberLengthDisplay.hpp`.
 
-- The Fibers dock's `len` column carries the unit in its header (`len (cm)`
-  or `len (vx)`), the cells are bare numbers, and a total over the loaded
-  fibers sits at the top of the dock.
+- The Fibers panel's `len` column carries the unit in its header (`len (cm)`
+  or `len (vx)`), the cells are bare numbers, and a total over the listed
+  fibers sits above the list.
 - The main window's status bar shows "Fiber length" for the fiber open in
   the active Line Annotation tab, left of the cache figures; it hides when
   another workspace is active.
@@ -419,14 +438,14 @@ of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
    spacing (so nothing collapses), not beyond a kollesis termination, not in
    a gap span and inside the focus bounds, then the two spans around it are
    re-optimized synchronously (wait cursor) and the fiber is saved;
-5. links the two control points with a **pending automatic link**, saves both
-   files and waits for the writes before reporting success in the status line.
+5. links the two control points with a **pending automatic link**, committed
+   with both fibers in one checked object-store action, and reports the result
+   in the status line.
 
 While step 4 and 5 run, the operation holds the same guard a merge or split
 holds: a rename, delete, import, merge or split started from the dock meanwhile
-is refused ("A merge, split or link is in progress"). If the pair save fails,
-the link is withdrawn from the loaded fibers (every copy, including an edit's
-synced moves of its endpoints during the wait) and the status line says so.
+is refused ("A merge, split or link is in progress"). A failed link commit
+changes nothing, and the status line says so.
 
 ### Linking from a fiber-intersection X
 
@@ -466,35 +485,28 @@ link outranks (pending blue / orange). The control-point menu's approve entry re
 link, exactly like approving a pending link. "Mark link as pending" on an
 approved link makes a plain (human) pending link.
 
-File format: the link entry carries `"auto": true` next to `"pending": true`,
-only while pending and only in the ordinary `branches` array (never on an
-adjacent link); approving removes both keys. The key is mirrored onto the
-reciprocal entry like `pending` (`fiber_merge.py` keeps the two in lockstep and
-drops a stray `auto` that lost its `pending` or sits in `adjacent_branches`).
-An older VC3D strips the key on resave; the link then reads as a plain pending
-link on BOTH sides (the loader reconciles the two refs that way, and a reload
-applies the same downgrade to the refs of any open session of either fiber, so
-a later save of that session cannot write the mark back), and the next pair
-save converges the files. Whenever two refs of one link are combined (a
-collapse of two control points, a dedup, the sync merge), the result is
+Storage: the link is one `fiber_branch` edge whose metadata carries
+`"auto": true` only while it is pending and ordinary (never on an adjacent
+link); approving, or re-flagging an approved link as pending, removes it.
+Transfer documents write `"auto": true` next to `"pending": true` on both
+reciprocal entries; an import whose two entries disagree on it is rejected
+like any other conflicting reciprocal declaration. Whenever two refs of one
+link are combined (a collapse of two control points, a dedup), the result is
 automatic only if every pending contributor was; a human-made pending link
-outranks, and an approved contributor says nothing about it. In the sync merge
-a differing mark with both sides still pending is arbitrated against the base
-(the side that changed it wins; without a base the human state wins).
+outranks, and an approved contributor says nothing about it.
 
 Refusals are shown in the map's status line. Everything decidable up front
 refuses with nothing changed: the fibers do not meet on the map, one of them
 is read-only or open in a session that did not finish its optimization, a
 fiber's control points do not resolve in line order (or its line passes
 through one of its controls twice), no admissible position for a new control
-in the search window, the pair would not resolve on reload (different
-sources), the two existing controls are already linked to each other. A
-failure after the first fiber's new control was placed and saved (the second
-fiber's re-optimization or save, a change to the fibers, the package, the
-umbilicus, the focus bounds or the active volume while the operation yielded,
-or the link's own write) leaves that first control in place - a plain, unlinked
-control point - and the message says so; a failed write means the loaded
-fibers may differ from the files, so reload before further edits.
+in the search window, the two existing controls are already linked to each
+other. A
+failure after the first fiber's new control was placed and committed (the
+second fiber's re-optimization or commit, a change to the fibers, the store
+attachment, the umbilicus, the focus bounds or the active volume while the
+operation yielded, or the link's own commit) leaves that first control in
+place - a plain, unlinked control point - and the message says so.
 
 ## Overview bar during re-optimization
 
@@ -590,8 +602,8 @@ unlink, approve or mark pending - an unreviewed automatic link's entry reads
 break); new annotations at the click; and the corrections reset.
 
 The top-level `optimization_mode` is either `lasagna` or
-`native_fiber_trace3d`. It is required in version 3; only legacy version-1
-files may omit it and default to `lasagna`. The mode
+`native_fiber_trace3d`. It defaults to `lasagna` when a typed geometry export
+has no optimization annotations. The mode
 selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `global`. A segment goal is `global`, `cspline`, `lasagna`, or `trace`; its
 `interp_mode` is the actual producer of the stored geometry and is one of
@@ -837,10 +849,8 @@ UI like any other tag: the fiber panel's tag checkboxes and the Line
 Annotation toolbar's tag pills, where `reviewed` is pinned first and always
 offered even in a volpkg where no fiber carries it yet. The only
 programmatic change is the mode-switch strip described above; ordinary
-control-point edits, merges, and splits never touch it, and
-`scripts/fiber_merge.py` treats it as a plain tag under the usual
-three-way tag merge. `scripts/vc_sync.py hfsync` publishes gated on it
-(`reviewed` is its default `--tag`), so the tag doubles as the publish gate.
+control-point edits, merges, and splits never touch it. It has no publishing
+side effects.
 
 The fiber panel's `interp` column shows the interpolation provenance per
 fiber — `legacy` (no trace spans), `predictions` (trace spans, native mode),
@@ -906,53 +916,22 @@ the reconstructed exact public manifest URL, never its local cache path.
 Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
 the metric and message. Labels are laid out in viewport pixels, remain visible
 while any part of their span intersects the view, and use a deterministic
-second row when one row cannot avoid overlap. Legacy version-1 fibers remain
-readable and acquire explicit version-3 descriptors on the next save. The
-unpublished file version 2 and its pre-v3 descriptor schemas are unsupported.
-This does not affect the current `tracer_version: 2` stored inside a version-3
-segment descriptor.
+second row when one row cannot avoid overlap.
 
-All v3 readers validate this complete contract before using even geometry-only
-data. VC3D, native CLI tools, Atlas, Lasagna, Spiral, Python training loaders,
-and sync reject a missing mode, a missing non-final descriptor, a descriptor on
-the final CP, malformed config, or inconsistent mode diagnostics. They never
-repair, normalize, tag, or rewrite invalid v3 input. Sync routes it to the
-manual conflict workflow and keeps local, remote, and base files unchanged.
+Transfer readers accept only version 4 with explicit UUIDs. Tracing annotations
+are optional for typed geometry; when present, descriptors and their diagnostics
+are validated. A descriptor on the final control point is invalid. Evaluation
+that depends on trace provenance requires the per-span descriptors.
 
-## Sync Conflict Handling
+## Database persistence
 
-`scripts/vc_sync.py` compares local and S3 content with the last successfully
-synced shadow copy. When both versions changed, `scripts/fiber_merge.py`
-performs a three-way merge. Version-3 fibers are divided into complete stored
-span results: each result contains its dense CP-to-CP line slice and the
-starting CP's complete `segment_to_next` descriptor. Geometry and metadata are
-never merged field by field or selected by generation.
+VC3D uses the database's checked transactions, geometry edit APIs, relationships
+and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
+or publish fibers to Hugging Face. S3/SFTP fiber merging and one-off fiber tag
+migration scripts have been retired. Generic file transfers remain available
+through `scripts/vc_sync.py`.
 
-A span run changed on only one side is retained verbatim, and identical
-two-sided results converge. Separate local and remote changes can be combined
-only when at least one complete base span between them is unchanged on both
-sides. Adjacent edits, different edits to the same run, overlapping topology
-changes, missing ordered CP/line anchors, and inexact joins are conflicts.
-`optimization_mode` follows the same base-aware policy: one changed side wins,
-equal changes converge, and different two-sided changes conflict.
-
-An ambiguous merge does not modify the fiber. The sync tool stores local,
-remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
-complete local version, keep the complete remote version, or skip. Those
-questions are asked before the link-consistency planning of the other
-conflicts: a decided file ([l]ocal or [r]emote) is a known source the planner
-can plan its linked neighbours against, so their auto-merges land in the same
-run; only a skipped file blocks the neighbours that depend on it, which are
-then asked about in turn. A merge that dropped its link to a peer deleted on
-both sides (or pending local deletion) needs no reciprocal fix and is not
-treated as a dangling link. `--dry-run` reports content-merge eligibility only;
-link consistency is assessed in a real run. Existing
-base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
-only after geometry merges cleanly. Version-1 fibers retain the older merge
-behavior, including the CP-polyline `needs_reoptimization`
-fallback for disjoint geometry edits.
-
-`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent new v3
+`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent version-4
 Lasagna result: exact CP positions and existing goals are retained, actual span
 modes become `lasagna`, the input normal manifest and per-span maximum normal
 alignment error are recorded, trace-only diagnostics are cleared, and geometry

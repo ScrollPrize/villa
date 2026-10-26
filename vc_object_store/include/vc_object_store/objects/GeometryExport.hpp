@@ -2,9 +2,9 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
-// Reconstruct native files from immutable geometry and current DB annotations/topology.
-// Explicit revisions must belong to the object; native edges must bind that revision.
-// Returns the exported revision UUID. No database or source-file writes occur.
+// Reconstruct native files from an immutable object revision (default: current).
+// Explicit pins select metadata and topology at that object revision's publication.
+// Returns its geometry revision UUID. No database or source-file writes occur.
 // The parent directory must exist. Existing destinations require overwrite;
 // directories are replaced as a whole, never merged. Publication is atomic
 // (directory publication requires Linux renameat2 support).

@@ -13,22 +13,6 @@
 
 namespace vc3d::line_annotation {
 
-// Resolve legacy metadata once. Later volume/dataset selections must not
-// change the coordinate grid of unchanged stored geometry.
-template <typename Resolve>
-const std::optional<std::array<std::size_t, 3>>& retainFiberCoordinateShape(
-    std::optional<std::array<std::size_t, 3>>& shape, Resolve&& resolve)
-{
-    if (!shape) {
-        const auto resolved = resolve();
-        if (!resolved || std::any_of(resolved->begin(), resolved->end(),
-                                    [](std::size_t n) { return n == 0; }))
-            throw std::runtime_error("Cannot resolve a positive fiber coordinate shape");
-        shape = resolved;
-    }
-    return shape;
-}
-
 // A viewer-created fiber uses the viewer's volume grid, not an inferred
 // level-0 grid (whose dimensions cannot be recovered exactly by scaling).
 inline std::array<std::size_t, 3> fiberCoordinateShapeFromVolume(
@@ -98,26 +82,6 @@ inline FiberNormalCoordinateScales resolveFiberNormalCoordinateScales(
         fiberBaseToNormalBase,
         traceToNormalBase,
     };
-}
-
-// Manifest locations to consult, in order, for a fiber that does not store
-// its own coordinate base shape: the manifest its trace spans recorded, then
-// the package's selected fiber-inference dataset. Older fibers recorded
-// absolute manifest paths that may since have moved, so the package selection
-// (which is what traces them today) is the fallback.
-inline std::vector<std::string> fiberBaseShapeManifestCandidates(
-    const std::string& fiberManifestLocation,
-    const std::string& selectedFiberInferenceDataset)
-{
-    std::vector<std::string> candidates;
-    if (!fiberManifestLocation.empty()) {
-        candidates.push_back(fiberManifestLocation);
-    }
-    if (!selectedFiberInferenceDataset.empty() &&
-        selectedFiberInferenceDataset != fiberManifestLocation) {
-        candidates.push_back(selectedFiberInferenceDataset);
-    }
-    return candidates;
 }
 
 } // namespace vc3d::line_annotation

@@ -12,8 +12,11 @@ def test_spanning_brackets_skip_shorter_candidate_and_limit():
     np.testing.assert_array_equal(brackets(*args[:3],15.,*args[4:])[:,0],[-1,-1])
 
 
+IDS=np.array([f'00000000-0000-4000-8000-00000000000{k}' for k in range(4)])
+
+
 class SyntheticCurves:
-    ids=np.arange(4)
+    ids=IDS
     def sample(self,source,arc):
         xyz=np.zeros((len(source),3));normal=np.tile([0.,0.,1.],(len(source),1))
         h=source<2
@@ -25,7 +28,7 @@ class SyntheticCurves:
 
 def fixture():
     d=dict(phase=np.array([0.,0.,0.,.1]),z=np.array([0.,100.,0.,0.]),family=np.array([0,0,1,1]),
-        node_ds=np.tile([0.,50.,100.],(4,1)),source_id=np.arange(4),start=np.zeros(4),end=np.full(4,100.))
+        node_ds=np.tile([0.,50.,100.],(4,1)),source_id=IDS,start=np.zeros(4),end=np.full(4,100.))
     state=np.zeros((4,6));state[:,:2]=np.log([.9,.1])
     return d,state,np.array([1000.]),dict(layout_mode='shared_anchor',broken_threshold=.5)
 
@@ -77,30 +80,34 @@ def test_reversed_source_arc_maps_same_surface():
 def test_curve_bank_actual_polyline_and_normal_invalidity(tmp_path,monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_curve_bank as m
     xyz=np.array([[0.,0.,10.],[10.,0.,10.],[10.,10.,10.]])
-    monkeypatch.setattr(m,'read_afv_polylines',lambda *_:[({'id':7},xyz)])
+    fid='00000000-0000-4000-8000-000000000007'
+    monkeypatch.setattr(m,'read_polylines',lambda _,ids:[({'id':str(i)},xyz) for i in ids])
     normals=np.array([[0,0,0,1,1],[16,0,0,1,1],[20,0,0,1,1]],dtype='<f8')
     normals.tofile(tmp_path/'normals.bin')
     (tmp_path/'index.json').write_text(json.dumps(dict(format='fiber-normal-curves',columns=['arc','nx','ny','nz','valid'],
-        index=[[7,0,3]],statistics=dict(samples=3,sample_spacing_base=16))))
-    sign=dict(ids=np.array([7]),broken=np.array([False]),normal_sign=np.array([-1]))
-    bank=m.CurveBank('unused',[7],tmp_path,sign)
+        index=[[fid,0,3]],statistics=dict(samples=3,sample_spacing_base=16))))
+    sign=dict(ids=np.array([fid]),broken=np.array([False]),normal_sign=np.array([-1]))
+    bank=m.CurveBank('unused',[fid],tmp_path,sign)
     point,n,ok=bank.sample(np.array([0,0,0]),np.array([5.,15.,20.]))
     np.testing.assert_allclose(point,[[5,0,10],[10,5,10],[10,10,10]])
     np.testing.assert_allclose(n,np.tile([0,0,-1],(3,1)));assert ok.all()
     with pytest.raises(ValueError,match='outside'):bank.sample(np.array([0]),np.array([21.]))
     del bank
     normals[1,4]=0;normals.tofile(tmp_path/'normals.bin')
-    bank=m.CurveBank('unused',[7],tmp_path,sign)
+    bank=m.CurveBank('unused',[fid],tmp_path,sign)
     assert not bank.sample(np.array([0]),np.array([5.]))[2][0]
 
 
 def test_source_hash_validation(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface as m
-    cfg={key:str(tmp_path/key) for key in ('database','afv','stage1','tensor_cache')}
-    for key in ('database','afv','stage1'): (tmp_path/key).write_text(key)
-    expected={key:m.uv.sha256_file(cfg[key]) for key in ('database','afv','stage1')}
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, write_fibers
+    cfg={key:str(tmp_path/key) for key in ('database','fibers','stage1','tensor_cache')}
+    for key in ('database','stage1'): (tmp_path/key).write_text(key)
+    write_fibers(cfg['fibers'],[(dict(),np.array([[0.,0,0],[1.,0,0]]))],volume='123')
+    expected={key:m.uv.sha256_file(cfg[key]) for key in ('database','stage1')}
+    expected['fibers']=fibers_digest(cfg['fibers'])
     (tmp_path/'tensor_cache.json').write_text(json.dumps(dict(signature=expected)))
-    doc=dict(provenance=dict(config=dict(orient_database=cfg['database'],afv=cfg['afv'])))
+    doc=dict(provenance=dict(config=dict(orient_database=cfg['database'],fibers=cfg['fibers'])))
     assert m.validate_sources(cfg,doc)==expected
     (tmp_path/'database').write_text('replaced same pathname')
     with pytest.raises(ValueError,match='hash mismatch'):m.validate_sources(cfg,doc)

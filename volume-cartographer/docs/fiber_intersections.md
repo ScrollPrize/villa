@@ -27,9 +27,8 @@ override stale global entries without rebuilding the whole global tree.
 
 ## Generations
 
-Saved VC3D fiber JSON now carries a `generation` field. Legacy fiber files that
-do not have the field load as generation `1`. New fibers start at generation
-`1`; saving an existing fiber increments its generation.
+Fiber generations come from object-store records. Working snapshots pin both
+object and geometry revisions; checked publications reject stale edits.
 
 Deleting or saving a fiber prunes any atlas-search cache entries that mention
 that fiber. Atlas search builds its in-memory index from the current fiber

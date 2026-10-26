@@ -4,13 +4,13 @@ from pathlib import Path
 import sqlite3
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fiber_volume, open_store, read_polylines
 from .fiber_normal_convention import inward_solution
 
 
 def spatial_subset(ids, centers, count):
     """Deterministic coverage sample, equal axis weight (not random statistics)."""
-    ids=np.asarray(ids,dtype=np.int64);centers=np.asarray(centers,dtype=float)
+    ids=np.asarray(ids,dtype=str);centers=np.asarray(centers,dtype=float)
     if count<1 or not len(ids) or centers.shape!=(len(ids),3) or not np.isfinite(centers).all():
         raise ValueError('Invalid spatial subset inputs')
     extent=np.ptp(centers,axis=0)
@@ -23,6 +23,13 @@ def spatial_subset(ids, centers, count):
         distance[chosen]=-1
         next_index=int(np.argmax(distance))
     return ids[chosen].tolist()
+
+
+def catalog_rows(path):
+    """(id, bbox center x, y, z, length) of every fiber of the store, in UUID order; volume voxels."""
+    rows=fiber_catalog(path,fiber_volume(path))
+    if any(r['bbox'] is None for r in rows):raise ValueError('Fiber without bounding box')
+    return [(r['id'],*((np.asarray(r['bbox'][:3])+r['bbox'][3:])/2).tolist(),r['length']) for r in rows]
 
 
 def obj_edges(first_vertex, count):
@@ -39,10 +46,10 @@ def obj_fiber(fid, points, first_vertex, broken, material=None):
 def repair_obj_lines(config):
     root=Path(config['output_root'])
     document=json.loads((root/'index.json').read_text());records=document['records']
-    source=document.get('config',{}).get('afv')
+    source=document.get('config',{}).get('fibers')
     raw=None
     if source:
-        raw={int(row['id']):points for row,points in read_afv_polylines(source,[r['fiber_id'] for r in records])}
+        raw={row['id']:points for row,points in read_polylines(source,[r['fiber_id'] for r in records])}
         first=1
         for r in records:
             r['obj_first_vertex']=first;r['obj_vertex_count']=len(raw[r['fiber_id']]);first+=r['obj_vertex_count']
@@ -50,7 +57,7 @@ def repair_obj_lines(config):
     for name,chosen in [('fibers.obj',records),('broken_fibers.obj',[r for r in records if r['broken']])]:
         path=root/name;lines=path.read_text().splitlines(keepends=True)
         if raw is not None:
-            first=1;parts=['# Original full AFV curves; explicit pairwise edges\nmtllib fibers.mtl\n']
+            first=1;parts=['# Original full fiber curves; explicit pairwise edges\nmtllib fibers.mtl\n']
             for r in chosen:
                 points=raw[r['fiber_id']]
                 parts.append(obj_fiber(r['fiber_id'],points,first,r['broken']));first+=len(points)
@@ -109,24 +116,26 @@ def tube_mesh(points, radius=80., sides=12):
     return np.concatenate(vertices),np.asarray(faces,dtype=np.int32)
 
 
-def load_umbilicus_frame(path, afv_root):
-    """Shared native-L0 frame validation for geometry export and layout priors."""
+def umbilicus_frame(path, volume):
+    """Shared volume-voxel frame validation for geometry export and layout priors: the umbilicus document must name
+    the fibers' volume (``fiber_volume``). Returns (control points XYZ, voxel size mm) from the document itself."""
     document=json.loads(Path(path).read_text());metadata=document['metadata']
-    expected=afv_root['coordinate_base_shape_zyx']
     shape=[metadata['volume_slices'],metadata['volume_height'],metadata['volume_width']]
-    acquisition=afv_root['vc_open_data_coordinate_space'].split('/')[-1]
-    if (shape!=expected or not metadata['volume'].startswith(acquisition+'-')
-            or not np.isclose(metadata['voxelsize_um'],afv_root['voxel_size_mm']*1000,rtol=0,atol=1e-9)):
-        raise ValueError('Umbilicus/AFV coordinate frame mismatch')
+    if not metadata['volume'].startswith(str(volume)+'-'):
+        raise ValueError('Umbilicus/fiber volume coordinate frame mismatch')
     # Published control points are native L0 despite source_annotation mentioning L2.
     points=np.array([[p[k] for k in ('x','y','z')] for p in document['control_points']],dtype=float)
     if np.any(points<0) or np.any(points>=np.asarray(shape[::-1])):
         raise ValueError('Umbilicus coordinates outside native volume')
-    return points
+    return points,float(metadata['voxelsize_um'])/1000
 
 
-def export_umbilicus(root, path, afv_root, radius):
-    points=load_umbilicus_frame(path,afv_root)
+def load_umbilicus_frame(path, volume):
+    return umbilicus_frame(path,volume)[0]
+
+
+def export_umbilicus(root, path, volume, radius):
+    points=load_umbilicus_frame(path,volume)
     vv,ff=tube_mesh(points,radius)
     write_ply(root/'umbilicus.ply',vv,ff,np.tile([255,145,20],(len(vv),1)))
     (root/'umbilicus.obj').write_text('# Native L0 umbilicus centerline\nmtllib fibers.mtl\n'+obj_fiber('umbilicus',points,1,False))
@@ -174,7 +183,7 @@ def subset_mesh(vertices,faces,colors,indices):
 
 
 def export_classified_layers(root,records,raw,vertices,faces,colors):
-    geometry={int(row['id']):points for row,points in raw};layers={}
+    geometry={row['id']:points for row,points in raw};layers={}
     for label,name in enumerate(('h','v','broken')):
         chosen=[r for r in records if r['hv_label']==label];first=1;indices=[];arrow_offset=0
         with (root/f'{name}_fibers.obj').open('w') as stream:
@@ -206,7 +215,7 @@ def update_arrows(config):
         if target.exists():raise FileExistsError(target)
         with target.with_suffix('.npz.partial').open('wb') as stream:np.savez(stream,**solution)
         target.with_suffix('.npz.partial').replace(target)
-    lookup={int(fid):i for i,fid in enumerate(solution['ids'])}
+    lookup={fid:i for i,fid in enumerate(solution['ids'].tolist())}
     old_convention=document.get('normal_convention','outward')
     if old_convention not in ('inward','outward'):raise ValueError('Unknown indexed convention')
     length=float(config['arrow_length']);radius=float(config['arrow_radius'])
@@ -244,7 +253,7 @@ def export(config):
     root=Path(config['output_root'])
     if root.exists():raise FileExistsError('Choose a new visualization directory')
     solution_path=Path(config['solution']);solution=inward_solution(np.load(solution_path,allow_pickle=False))
-    ids=solution['ids'];lookup={int(fid):i for i,fid in enumerate(ids)}
+    ids=solution['ids'];lookup={fid:i for i,fid in enumerate(ids.tolist())}
     if len(lookup)!=len(ids) or not np.isin(solution['normal_sign'],[-1,1]).all():
         raise ValueError('Duplicate solution IDs or invalid signs')
     dbpath=Path(config['database'])
@@ -262,22 +271,21 @@ def export(config):
         if not np.array_equal(hv['inherited_broken'],solution['broken']) or np.any(hv['labels'][solution['broken']]!=2):
             raise ValueError('H/V changed inherited exclusions')
     db=sqlite3.connect(dbpath.resolve().as_uri()+'?mode=ro',uri=True)
-    afvpath=Path(config['afv'])
-    afv=sqlite3.connect(afvpath.resolve().as_uri()+'?mode=ro',uri=True)
+    fibers=Path(config['fibers']);volume=fiber_volume(fibers)
     get_meta=lambda c,k:json.loads(c.execute('SELECT value FROM metadata WHERE key=?',(k,)).fetchone()[0])
-    if get_meta(db,'provenance')['afv_uuid']!=get_meta(afv,'uuid'):
-        raise ValueError('Wrong source AFV')
+    with open_store(fibers) as store:
+        if get_meta(db,'provenance')['fibers_store_uuid']!=store.uuid:raise ValueError('Wrong source fiber store')
     selected=config.get('fiber_ids')
     bounds=config.get('bounds_xyz')
     focus=None
-    selection_semantics='AFV block-AABB intersection candidates; full source curves retained, NOT clipped'
+    selection_semantics='Fiber store line-point block-AABB intersection candidates; full source curves retained, NOT clipped'
     if config.get('hv_sample_counts') is not None:
         if hv is None or selected is not None or bounds is not None or config.get('sample_count') is not None or config.get('exclude_broken',False):
             raise ValueError('H/V stratification requires H/V solution, no other selection, and includes broken')
         counts=config['hv_sample_counts']
         if len(counts)!=3 or any(int(c)!=c or c<0 for c in counts):raise ValueError('Expected H,V,broken counts')
         selected=[];remaining=list(counts)
-        for fid, in afv.execute('SELECT id FROM fibers ORDER BY length DESC,id'):
+        for fid in [r['id'] for r in sorted(fiber_catalog(fibers,volume),key=lambda r:(-r['length'],r['id']))]:
             if fid not in lookup:continue
             label=int(hv['labels'][lookup[fid]])
             if remaining[label]>0:selected.append(fid);remaining[label]-=1
@@ -286,7 +294,7 @@ def export(config):
         selection_semantics='Longest per H/V/broken group, stable ID ties; deliberately stratified and length-biased, not population proportions; whole original curves'
     if config.get('sample_count') is not None:
         if selected is not None or bounds is not None:raise ValueError('Use sample_count OR explicit IDs/bounds')
-        rows=afv.execute('SELECT id,(min_x+max_x)/2.,(min_y+max_y)/2.,(min_z+max_z)/2.,length FROM fibers ORDER BY id').fetchall()
+        rows=catalog_rows(fibers)
         rows=[r for r in rows if r[0] in lookup and (not config.get('exclude_broken',False) or not solution['broken'][lookup[r[0]]])]
         pool=config.get('longest_candidate_count')
         if pool is not None:
@@ -294,7 +302,7 @@ def export(config):
             rows=sorted(sorted(rows,key=lambda r:(-r[4],r[0]))[:int(pool)],key=lambda r:r[0])
         selected=spatial_subset([r[0] for r in rows],[r[1:4] for r in rows],int(config['sample_count']))
         selection_semantics='Whole-scroll deterministic farthest-point sample of fiber bbox centers, normalized per XYZ axis; whole fibers, no clipping'
-        if pool is not None:selection_semantics+=f'; candidates restricted to {int(pool)} longest eligible fibers by AFV arc length'
+        if pool is not None:selection_semantics+=f'; candidates restricted to {int(pool)} longest eligible fibers by store arc length'
     if selected is None:
         if bounds is None:
             # Highest-degree broken fiber provides a reproducible diagnostic region.
@@ -302,23 +310,23 @@ def export(config):
             degree=np.bincount(np.concatenate([tensors['i'],tensors['j']]),minlength=len(ids))
             candidates=np.flatnonzero(solution['broken'] & (degree>0))
             if not len(candidates):candidates=np.flatnonzero(degree>0)
-            focus=int(ids[candidates[np.argmax(degree[candidates])]])
+            focus=str(ids[candidates[np.argmax(degree[candidates])]])
             pos=db.execute('SELECT ax,ay,az FROM constraints WHERE fiber_a=? UNION ALL SELECT bx,by,bz FROM constraints WHERE fiber_b=? LIMIT 1',(focus,focus)).fetchone()
             center=np.asarray(pos);half=float(config.get('crop_size',512))/2
             bounds=[(center-half).tolist(),(center+half).tolist()]
         lo,hi=np.asarray(bounds,dtype=float)
         if not np.isfinite([lo,hi]).all() or np.any(lo>=hi):raise ValueError('Invalid bbox')
-        selected=[r[0] for r in afv.execute('SELECT DISTINCT b.fiber_id FROM block_bounds r JOIN blocks b ON b.id=r.id '
-            'WHERE r.max_x>=? AND r.min_x<=? AND r.max_y>=? AND r.min_y<=? AND r.max_z>=? AND r.min_z<=? ORDER BY b.fiber_id',
-            (lo[0],hi[0],lo[1],hi[1],lo[2],hi[2]))]
-    selected=sorted(set(map(int,selected)))
+        with open_store(fibers) as store:
+            selected=[r['object_uuid'] for r in store.spatial_regions([*lo.tolist(),*hi.tolist()],object_kind='fiber',volume=volume)
+                      if r['array_name']=='line_points']
+    selected=sorted(set(map(str,selected)))
     if config.get('exclude_broken',False):
         selected=[fid for fid in selected if fid in lookup and not solution['broken'][lookup[fid]]]
     if not selected or len(selected)>config.get('max_fibers',10000):raise ValueError(f'Invalid/oversized selection: {len(selected)} fibers')
     if not all(fid in lookup for fid in selected):raise ValueError('Selection contains fibers absent from solution')
     spacing=float(config.get('arrow_spacing',256));length=float(config.get('arrow_length',64))
     if spacing<=0 or length<=0:raise ValueError('Positive arrow spacing/length required')
-    raw=read_afv_polylines(afvpath,selected)
+    raw=read_polylines(fibers,selected,volume=volume)
     if sum(len(points) for _,points in raw)>config.get('max_points',1000000):
         raise ValueError('Selection exceeds point limit; use fewer fibers')
     root.mkdir(parents=True)
@@ -327,9 +335,9 @@ def export(config):
     with (root/'fibers.obj').open('w') as obj, (root/'broken_fibers.obj').open('w') as broken_obj:
         broken_vertex=1
         broken_obj.write('# Broken fiber overlay; manually color this layer red if viewer ignores OBJ line materials\nmtllib fibers.mtl\nusemtl broken\n')
-        obj.write('# Original full AFV curves; native L0 XYZ/base voxels\nmtllib fibers.mtl\n')
+        obj.write('# Original full fiber curves; native L0 XYZ/base voxels\nmtllib fibers.mtl\n')
         for row,points in raw:
-            fid=int(row['id']);k=lookup[fid];broken=bool(solution['broken'][k]);sign=int(solution['normal_sign'][k])
+            fid=row['id'];k=lookup[fid];broken=bool(solution['broken'][k]);sign=int(solution['normal_sign'][k])
             label=int(hv['labels'][k]) if hv is not None else None
             if hv is not None:broken=label==2
             obj.write(obj_fiber(fid,points,line_vertex,broken,('h','v','broken')[label] if label is not None else None))
@@ -371,7 +379,7 @@ def export(config):
         units='native L0 XYZ/base voxels',fibers=len(records),broken_fibers=sum(r['broken'] for r in records),
         arrows=sum(len(r['arrows']) for r in records),mesh_vertices=len(vertices),mesh_faces=len(faces),records=records)
     if config.get('umbilicus'):
-        report['umbilicus']=export_umbilicus(root,config['umbilicus'],get_meta(afv,'root'),float(config.get('umbilicus_radius',80)))
+        report['umbilicus']=export_umbilicus(root,config['umbilicus'],volume,float(config.get('umbilicus_radius',80)))
     if hv is not None:
         report['hv_solution_sha256']=sha256_file(config['hv_solution'])
         report['layers']=export_classified_layers(root,records,raw,vertices,faces,color)

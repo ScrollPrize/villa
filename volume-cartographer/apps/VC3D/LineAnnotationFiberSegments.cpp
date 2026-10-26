@@ -1394,11 +1394,8 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         "meeting_error_base_voxels", "meeting_error_ratio",
         "meeting_source", "failure_code", "failure_detail",
         "lasagna_failure_code", "lasagna_failure_detail", "config"};
-    // Span tags arrived with format version 4; a version-3 span carrying
-    // them is an unknown field, so the version stays a true signal.
-    if (fiberVersion >= 4) {
-        segmentKeys.insert("tags");
-    }
+    if (fiberVersion != 4) throw std::runtime_error("Fiber transfer requires version 4");
+    segmentKeys.insert("tags");
     rejectUnknownKeys(json, segmentKeys, "segment_to_next");
 
     FiberTraceSegmentMetadata metadata;
@@ -2085,11 +2082,8 @@ nlohmann::json storedControlPointToJson(const StoredControlPoint& control)
 
 StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fiberVersion)
 {
-    if (fiberVersion == 1) {
-        return StoredControlPoint{pointFromJson(json)};
-    }
-    if ((fiberVersion != 3 && fiberVersion != 4) || !json.is_object()) {
-        throw std::runtime_error("version-3/4 control point entries must be objects");
+    if (fiberVersion != 4 || !json.is_object()) {
+        throw std::runtime_error("version-4 control point entries must be objects");
     }
     rejectUnknownKeys(json, {"position", "segment_to_next", "tags", "display_normal", "display_normal_source", "direction"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};
@@ -2149,9 +2143,30 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
         merged.direction = original[index].direction;
         merged.displayNormalSource = original[index].displayNormalSource;
         merged.identity = original[index].identity;
+        merged.storeId = original[index].storeId;
         result.push_back(std::move(merged));
     }
     return result;
+}
+
+void eraseControlPoint(std::vector<LineControlPoint>& controls, size_t index)
+{
+    if (index >= controls.size()) {
+        throw std::out_of_range("erased control-point index is out of range");
+    }
+    // The stored order is a stable sort by line position: among ties, the
+    // final control is the last one.
+    const auto finalControl = [&controls] {
+        return std::prev(std::max_element(controls.rbegin(), controls.rend(),
+            [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
+                return lhs.linePosition < rhs.linePosition;
+            }).base());
+    };
+    const bool erasedFinal = finalControl() == controls.begin() + static_cast<std::ptrdiff_t>(index);
+    controls.erase(controls.begin() + static_cast<std::ptrdiff_t>(index));
+    if (erasedFinal && !controls.empty()) {
+        finalControl()->segmentToNext.reset();
+    }
 }
 
 ControlPointCollapseResult collapseControlPointsAtClick(
@@ -3176,6 +3191,7 @@ std::vector<StoredControlPoint> reversedStoredControlPoints(
     for (size_t j = 0; j < count; ++j) {
         StoredControlPoint control{
             static_cast<const cv::Vec3d&>(controls[count - 1 - j])};
+        control.storeId = controls[count - 1 - j].storeId;
         control.tags = controls[count - 1 - j].tags;
         control.displayNormal = controls[count - 1 - j].displayNormal;
         control.direction = controls[count - 1 - j].direction;

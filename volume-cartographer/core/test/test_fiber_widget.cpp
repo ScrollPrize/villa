@@ -7,10 +7,13 @@
 #include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QLineEdit>
+#include <QLabel>
 #include <QMetaObject>
+#include <QPersistentModelIndex>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStandardItemModel>
+#include <QSlider>
 #include <QTreeView>
 #include <QThreadPool>
 
@@ -175,57 +178,58 @@ int main(int argc, char** argv)
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
     auto* showFibers = widget.findChild<QCheckBox*>(QStringLiteral("fiberShowFibersCheckBox"));
     require(showFibers != nullptr, "Show fibers checkbox was not found");
-    require(!showFibers->isEnabled(), "Show fibers should start disabled");
-    require(!widget.showFibersChecked(), "Show fibers should start unchecked");
-    auto* fiberViewDistance =
-        widget.findChild<QDoubleSpinBox*>(QStringLiteral("fiberViewDistanceSpinBox"));
-    require(fiberViewDistance != nullptr, "Fiber view-distance spinbox was not found");
-    require(widget.fiberViewDistance() == 10.0,
-            "Fiber view distance should default to 10 voxels");
-    int fiberViewDistanceRequests = 0;
-    double requestedFiberViewDistance = 0.0;
+    auto* sliceDistance = widget.findChild<QDoubleSpinBox*>(QStringLiteral("fiberSliceDistanceSpinBox"));
+    require(sliceDistance != nullptr, "Slice distance spinbox was not found");
+    require(widget.displayOptions() == FiberDisplayOptions{}, "Display options should start at their defaults");
+    int optionRequests = 0;
+    FiberDisplayOptions requestedOptions;
     QObject::connect(&widget,
-                     &CFiberWidget::fiberViewDistanceChanged,
+                     &CFiberWidget::displayOptionsChanged,
                      &widget,
-                     [&](double distance) {
-                         ++fiberViewDistanceRequests;
-                         requestedFiberViewDistance = distance;
+                     [&](FiberDisplayOptions options) {
+                         ++optionRequests;
+                         requestedOptions = options;
                      });
-    widget.setFiberViewDistance(25.0);
-    require(widget.fiberViewDistance() == 25.0,
-            "Programmatic fiber view-distance sync did not update the spinbox");
-    require(fiberViewDistanceRequests == 0,
-            "Programmatic fiber view-distance sync should not emit a request");
-    fiberViewDistance->setValue(30.0);
-    require(fiberViewDistanceRequests == 1 && requestedFiberViewDistance == 30.0,
-            "User fiber view-distance change did not emit the requested distance");
-    int showFiberRequests = 0;
-    bool requestedShowFibers = false;
-    QObject::connect(&widget,
-                     &CFiberWidget::showFibersToggled,
-                     &widget,
-                     [&](bool checked) {
-                         ++showFiberRequests;
-                         requestedShowFibers = checked;
-                     });
-    widget.setShowFibersAvailable(true);
-    require(showFibers->isEnabled(), "Loaded fibers should enable Show fibers");
-    widget.setShowFibersChecked(true);
-    require(widget.showFibersChecked(), "Programmatic Show fibers sync did not update the checkbox");
-    require(showFiberRequests == 0,
-            "Programmatic Show fibers sync should not emit a visibility request");
+    FiberDisplayOptions programmatic;
+    programmatic.sliceDistance = 25.0;
+    programmatic.showLinked = true;
+    widget.setDisplayOptions(programmatic);
+    require(widget.displayOptions() == programmatic,
+            "Programmatic display options did not update the controls");
+    require(optionRequests == 0, "Programmatic display options should not emit a request");
+    sliceDistance->setValue(30.0);
+    require(optionRequests == 1 && requestedOptions.sliceDistance == 30.0 && requestedOptions.showLinked,
+            "User slice distance change did not emit the complete options");
     showFibers->setChecked(false);
-    require(showFiberRequests == 1 && !requestedShowFibers,
+    require(optionRequests == 2 && !requestedOptions.showFibers,
             "User Show fibers toggle did not emit the requested state");
-    showFibers->setChecked(true);
-    require(showFiberRequests == 2 && requestedShowFibers,
-            "User Show fibers enable did not emit the requested state");
-    widget.setShowFibersAvailable(false);
-    require(!showFibers->isEnabled(), "Unavailable fibers should disable Show fibers");
-    require(!widget.showFibersChecked(), "Unavailable fibers should reset Show fibers");
-    require(showFiberRequests == 2,
-            "Availability reset should not emit a duplicate visibility request");
-    widget.setShowFibersAvailable(true);
+
+    auto* detach = widget.findChild<QPushButton*>(QStringLiteral("fiberDetachStoreButton"));
+    auto* nextPage = widget.findChild<QPushButton*>(QStringLiteral("fiberNextPageButton"));
+    auto* fiberId = widget.findChild<QLineEdit*>(QStringLiteral("fiberIdEdit"));
+    require(detach && nextPage && fiberId, "Store controls were not found");
+    require(!detach->isEnabled() && !fiberId->isEnabled(), "Store controls should start detached");
+    widget.setStoreStatus(true, QStringLiteral("2 fibers in store"));
+    widget.setNextPageAvailable(true);
+    require(detach->isEnabled() && nextPage->isEnabled() && fiberId->isEnabled(),
+            "An attached store should enable its controls");
+    uint64_t activated = 0;
+    QObject::connect(&widget, &CFiberWidget::fiberActivated, &widget, [&](uint64_t id) { activated = id; });
+    fiberId->setText(QStringLiteral("42"));
+    QMetaObject::invokeMethod(fiberId, "returnPressed");
+    require(activated == 42, "Entering a fiber ID should activate it");
+    widget.setStoreStatus(false, QStringLiteral("No object store attached."));
+    require(!detach->isEnabled() && !nextPage->isEnabled(), "Detaching should disable the store controls");
+
+    auto* trace = widget.findChild<QSlider*>(QStringLiteral("fiberTraceSlider"));
+    require(trace && !trace->isEnabled(), "Trace slider should start disabled");
+    int traceIndex = -1;
+    QObject::connect(&widget, &CFiberWidget::traceIndexChanged, &widget, [&](int index) { traceIndex = index; });
+    widget.setTraceSelection(QStringLiteral("#7"), {}, 11, 5, true);
+    require(trace->isEnabled() && trace->maximum() == 10 && trace->value() == 5 && traceIndex == -1,
+            "Trace selection should set the slider without emitting");
+    trace->setValue(8);
+    require(traceIndex == 8, "Moving the trace slider should emit its index");
     auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
     require(model != nullptr, "Fiber tree should use a standard item model");
     QMetaObject::invokeMethod(treeView->header(),
@@ -570,6 +574,38 @@ int main(int argc, char** argv)
                               Q_ARG(int, 8));
     require(widget.orderedFiberIds() == std::vector<uint64_t>({12, 13, 11}),
             "Descending interp sort should order predictions, mixed, legacy");
+
+    {
+        CFiberWidget lazy;
+        CFiberWidget::FiberEntry pending; pending.id = 99; pending.fileName = "deferred.json";
+        pending.controlPointCount = 3; pending.linePointCount = 100; pending.lengthVx = 40.0; pending.detailsLoaded = false;
+        lazy.setFibers({pending});
+        require(lazy.totalLengthVx() == 40.0, "Catalog rows contribute their stored lengths");
+
+        auto* tree = lazy.findChild<QTreeView*>();
+        require(tree && tree->model()->rowCount(tree->model()->index(0,0)) == 1, "Deferred span geometry retains an expand arrow");
+        uint64_t requested = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberDetailsRequested, &lazy, [&](uint64_t id) { requested = id; });
+        tree->expand(tree->model()->index(0,0));
+        require(requested == 99, "Expanding a deferred fiber requests only its geometry");
+
+        const QPersistentModelIndex row(tree->model()->index(0,0));
+        auto detailed = pending;
+        detailed.detailsLoaded = true;
+        detailed.lengthVx = 38.0;
+        detailed.spans = {CFiberWidget::FiberEntry::SpanEntry{0, 0, 1, 2, 50, 20.0},
+                          CFiberWidget::FiberEntry::SpanEntry{1, 1, 2, 2, 51, 18.0}};
+        lazy.updateFiberDetails(detailed);
+        // A double click on the row that requested these details keeps its press.
+        require(row.isValid() && row == tree->model()->index(0,0), "Details update the listed row in place");
+        require(tree->isExpanded(row) && tree->model()->rowCount(row) == 2,
+                "Details keep the row expanded with its span rows");
+        require(lazy.totalLengthVx() == 38.0, "Details replace the listed length");
+        uint64_t opened = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberOpenRequested, &lazy, [&](uint64_t id) { opened = id; });
+        QMetaObject::invokeMethod(tree, "doubleClicked", Q_ARG(QModelIndex, QModelIndex(row)));
+        require(opened == 99, "Double clicking a fiber requests opening it");
+    }
 
     QThreadPool::globalInstance()->waitForDone();
     return 0;

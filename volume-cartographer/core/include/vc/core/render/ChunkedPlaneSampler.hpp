@@ -168,8 +168,10 @@ public:
 
     // Select one source Zarr level for a complete view. `pixelsPerBaseVoxel`
     // is framebuffer pixels per level-0/base-volume voxel for every renderable
-    // surface. The coarsest level whose largest source-voxel extent satisfies
-    // the quality threshold is selected; no generated coordinates are probed.
+    // surface. The coarsest available level whose largest source-voxel extent
+    // satisfies the quality threshold is selected, or the finest available
+    // level if none qualifies. Empty levels are skipped; no generated
+    // coordinates are probed.
     static int sourceLevelForView(IChunkedArray& array,
                                   float pixelsPerBaseVoxel,
                                   float qualityBias = 0.5f);

@@ -32,7 +32,7 @@ def test_density_reference_metric_uses_map_not_legacy_logits(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_full_slab import reference_metrics
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
     monkeypatch.setattr(ref,'reference_interval_widths',lambda cfg,starts:np.full(len(starts),100.))
-    d=dict(source_id=np.array([1,2]),family=np.array([0,1]),start=np.zeros(2),
+    d=dict(source_id=np.array(['00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002']),family=np.array([0,1]),start=np.zeros(2),
            lengths=np.ones(2),node_ds=np.array([[0,.5,1.],[0,.5,1.]]))
     sol=dict(state=np.array([[0.,.2,0.,4.],[1.,.2,0.,4.]]),widths=np.full(4,100.))
     sample=dict(owner=np.array([0,0,1,1]),arc=np.array([0.,1.,0.,1.]),

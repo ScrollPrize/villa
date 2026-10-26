@@ -1,23 +1,23 @@
-"""Predict the sheet strip of every AFV fiber above a length, sharded over processes (sheet_strip/infer.py per fiber,
+"""Predict the sheet strip of every fiber of a fiber store above a length, sharded over processes (sheet_strip/infer.py per fiber,
 without scoring or renders).
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --afv FIBERS.afv --out OUT \\
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers FIBERS.vcobj --out OUT \\
         [--checkpoint scrollprize/fiber_strip_small_v1] [--min-length-mm 2.5] [--base-voxel-um 2.4] [--step 8] \\
         [--blend 16] [--trim 75] [--shard K N]
 
 ``--checkpoint`` and the CT, frame-model and umbilicus options are infer.py's (a Hugging Face repo by default).
 
-The fibers (AFV catalog order) are dealt to ``N`` shards; shard ``K`` predicts every ``N``-th one from the ``K``-th, so
+The fibers (catalog order: UUID order) are dealt to ``N`` shards; shard ``K`` predicts every ``N``-th one from the ``K``-th, so
 shards can run as parallel processes. A fiber is a decision every ``--step`` trace voxels from its start (as
-infer.py), stitched into a tifxyz at OUT/strips/BUCKET/fiber_ID (patch voxels; BUCKET: the catalog index // 1000;
+infer.py), stitched into a tifxyz at OUT/strips/BUCKET/fiber_UUID (patch voxels; BUCKET: the UUID's first two digits;
 uncompressed single-strip TIFFs, memory-mappable as written). Its nodes within ``--trim`` patch voxels of either fiber
 end, or beyond it, are not kept (-1): the strip is least reliable there (the annotated fiber's ends, few decisions).
 An H fiber runs along its columns and a V fiber along its rows, higher z at the top (``display_grid``; the layout is
 in trace.json). ``expected_error.tif`` lies beside it
 when the model predicts its error (``strip_uncertainty``: the stitched expected |error| per node, voxels; NaN off the
-strip). Each finished fiber appends a line to OUT/index/shard_K.jsonl (fiber id, family, length, decisions, nodes,
+strip). Each finished fiber appends a line to OUT/index/shard_K.jsonl (fiber UUID, family, length, decisions, nodes,
 checkpoint, the mean expected error, seconds); a fiber already in it is skipped, so a stopped shard resumes where it
-left off, also with another checkpoint (run.json lists every checkpoint used). Lengths: the AFV catalog's, in base
+left off, also with another checkpoint (run.json lists every checkpoint used). Lengths: the store catalog's, in base
 voxels of ``--base-voxel-um``.
 """
 from __future__ import annotations
@@ -34,14 +34,14 @@ import torch
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer import (
     BLEND, MIN_HEAD_ARC, STEP, TRIM, StripPredictor, add_checkpoint_arguments, orient_decisions, recorded_file, stitch,
     stitch_values, trim_ends)
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
 
 
-def selected_fibers(afv, min_length_mm, base_voxel_um):
+def selected_fibers(fibers, min_length_mm, base_voxel_um):
     """Catalog indices of the fibers longer than ``min_length_mm``, catalog order."""
-    lengths = np.array([row[3] for row in afv.catalog], np.float64)*base_voxel_um/1000.
+    lengths = np.array([row['length'] for row in fibers.catalog], np.float64)*base_voxel_um/1000.
     return np.flatnonzero(lengths > min_length_mm)
 
 
@@ -86,9 +86,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_checkpoint_arguments(ap)
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--afv', help="AFV fibers (default: the checkpoint run's, when on this machine)")
+    ap.add_argument('--fibers', help="fiber store (default: the checkpoint run's, when on this machine)")
     ap.add_argument('--min-length-mm', type=float, default=2.5)
-    ap.add_argument('--base-voxel-um', type=float, default=2.4, help='voxel size of the AFV catalog lengths')
+    ap.add_argument('--base-voxel-um', type=float, default=2.4, help='voxel size of the store catalog lengths')
     ap.add_argument('--step', type=float, default=STEP, help='trace voxels between decisions (a multiple of the f spacing)')
     ap.add_argument('--blend', type=float, default=BLEND, help='trace voxels: decisions weigh their rows within this of the head')
     ap.add_argument('--trim', type=float, default=TRIM,
@@ -110,11 +110,12 @@ def main(argv=None):
     df = f[1]-f[0]
     if abs(args.step/df-round(args.step/df)) > 1e-6 or args.step <= 0:
         raise SystemExit(f'--step must be a positive multiple of the strip row spacing {df:g}')
-    afv_path = args.afv or recorded_file(predictor.data.get('afv'))
-    if not afv_path:
-        raise SystemExit(f"Pass --afv: the checkpoint's AFV fibers {predictor.data.get('afv')} are not on this machine")
-    afv = AFVFibers(afv_path, predictor.spec.grid_scale, split='all')
-    chosen = selected_fibers(afv, args.min_length_mm, args.base_voxel_um)[k::n]
+    fibers_path = args.fibers or recorded_file(predictor.data.get('fibers'))
+    if not fibers_path:
+        raise SystemExit(f"Pass --fibers: the checkpoint's fiber store {predictor.data.get('fibers')} is not on this "
+                         'machine')
+    fibers = FiberStore(fibers_path, fiber_volume(fibers_path), predictor.spec.grid_scale, split='all')
+    chosen = selected_fibers(fibers, args.min_length_mm, args.base_voxel_um)[k::n]
     if args.limit:
         chosen = chosen[:args.limit]
     (args.out/'index').mkdir(parents=True, exist_ok=True)
@@ -128,31 +129,32 @@ def main(argv=None):
     checkpoints = [c for c in earlier.get('checkpoints', [earlier['checkpoint']] if 'checkpoint' in earlier else [])
                    if c != checkpoint]+[checkpoint]
     atomic_write(args.out/'run.json', (json.dumps(dict(
-        checkpoint=checkpoint, step=predictor.ck.get('step'), checkpoints=checkpoints, afv=str(afv_path),
+        checkpoint=checkpoint, step=predictor.ck.get('step'), checkpoints=checkpoints, fibers=str(fibers_path),
         min_length_mm=args.min_length_mm, base_voxel_um=args.base_voxel_um, decision_step=args.step,
         blend=args.blend, trim_patch_voxels=args.trim, shards=n, units='patch voxels', trace_per_patch=tpp),
         indent=1)+'\n').encode())
     row_step, column_step = df/tpp, (v[1]-v[0])/tpp
     started, decisions = time.time(), 0
-    todo = [c for c in chosen if int(afv.catalog[c][0]) not in done]
+    todo = [c for c in chosen if fibers.catalog[c]['id'] not in done]
     print(f'[shard {k}/{n}] {len(chosen)} fibers, {len(chosen)-len(todo)} done already', flush=True)
     with open(log_path, 'a') as log:
         for count, catalog_index in enumerate(todo, 1):
             tick = time.time()
-            fiber_id, _, family, length = afv.catalog[catalog_index][:4]
-            fiber = afv[catalog_index]
+            row = fibers.catalog[catalog_index]
+            fiber_id, family, length = row['id'], row['family'], row['length']
+            fiber = fibers[catalog_index]
             rows, keep, expected, arcs = strip_of_fiber(predictor, fiber, args.step, args.blend, args.trim*tpp)
-            out = args.out/'strips'/f'{catalog_index//1000:04d}'/f'fiber_{fiber_id}'
+            out = args.out/'strips'/fiber_id[:2]/f'fiber_{fiber_id}'
             nodes = int(keep.sum())
             rows, keep, expected, layout = display_grid(rows, keep, expected, family)
             provenance = dict(checkpoint=checkpoint, step=predictor.ck.get('step'),
-                              afv=str(afv_path), fiber=int(fiber_id), family=family, decision_step=args.step,
+                              fibers=str(fibers_path), fiber=fiber_id, family=family, decision_step=args.step,
                               blend=args.blend, trim_patch_voxels=args.trim, units='patch voxels', trace_per_patch=tpp,
                               first_row_arc_patch_voxels=float((arcs[0]+f[0])/tpp), **layout)
             steps = (column_step, row_step) if layout['fiber_along'] == 'columns' else (row_step, column_step)
             write_surface(out, rows/tpp, keep, *steps, provenance, overwrite=True, voxel_size_um=args.voxel_size_um,
                           mmap_layout=True)
-            record = dict(fiber=int(fiber_id), catalog=int(catalog_index), family=family,
+            record = dict(fiber=fiber_id, catalog=int(catalog_index), family=family,
                           length_mm=float(length)*args.base_voxel_um/1000., decisions=len(arcs),
                           nodes=nodes, path=str(out.relative_to(args.out)), checkpoint=checkpoint)
             if expected is not None:

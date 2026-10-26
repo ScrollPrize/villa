@@ -1,8 +1,8 @@
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/SequenceMetadata.hpp"
+#include "geometry/SequenceIdentity.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "internal/History.hpp"
-#include <numeric>
 
 namespace vc::objects {
 using namespace detail;
@@ -14,53 +14,32 @@ void checked(sqlite3* db) {
 void requireSource(sqlite3* db,const std::string& uuid) {
     execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
 }
-std::string idArray(const std::string& kind,const std::string& name) {
-    if (kind=="point_collection" && name=="points") return "point_ids";
-    if (kind=="fiber" && name=="control_points") return "control_point_ids";
-    return {};
-}
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
     std::vector<int64_t> values(count);
-    if (reader.manifest().at("arrays").contains(ids)) copyScalars<int64_t>(reader.read(ids,0),values);
-    else std::iota(values.begin(),values.end(),0);
+    copyScalars<int64_t>(reader.read(ids,0),values);
     std::set<int64_t> seen;
     for (auto id: values) if (id<0 || !seen.insert(id).second) throw std::invalid_argument("point IDs must be nonnegative and unique");
     if (geometryWork) geometryWork->identityRows+=values.size();
     return values;
 }
-Json annotations(ObjectStore const& store,const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,const std::string& name) {
+Json annotations(const Txn& txn,const GeometryRevision& revision,GeometryReader& reader,const std::string& name) {
     const auto count=reader.manifest().at("arrays").at(name).at("shape").at(0).get<int64_t>();
     auto result=Json(std::vector<Json>(count,Json::object()));
-    if (reader.manifest().contains("sequences") && reader.manifest().at("sequences").contains(name)) {
-        const auto& state=reader.manifest().at("sequences").at(name);
-        const auto ids=idArray(revision.kind,name);
-        auto* db=ObjectStoreImplAccess::conn(txn);
-        MetadataSnapshot snapshot(db,state.at(ids.empty()?"annotations":"identities"));
-        const auto values=ids.empty()?std::vector<int64_t>():idsOf(reader,ids,count);
-        std::vector<bool> seen(count);
-        snapshot.entries([&](int64_t id,const auto& value) {
-            const int64_t row=ids.empty()?id:value.at("row").template get<int64_t>();
-            if(row<0||row>=count||seen[row]||(!ids.empty()&&values[row]!=id))throw std::runtime_error("invalid annotation row");
-            seen[row]=true;result[row]=unpackAnnotation(db,ids.empty()?value:value.at("annotation"));
-        });
-        if(std::find(seen.begin(),seen.end(),false)!=seen.end())throw std::runtime_error("missing point annotation");
-        return result;
-    }
-    const auto key=revision.kind=="point_collection" ? "point_attributes" : name+"_attributes";
-    // Recover annotations belonging to this geometry, including historical
-    // source slices. Unpublished geometry uses the transaction's current record.
-    auto object=*store.objectByUuid(txn,revision.objectUuid);
-    const auto current=store.currentGeometry(txn,revision.objectUuid);
-    if (!current || current->uuid!=revision.uuid) {
-        bool found=false;
-        for (const auto& history:store.objectHistory(txn,revision.objectUuid))
-            if (history.geometryRevision==revision.uuid) { object=history.record; found=true; break; }
-        if (!found) throw std::runtime_error("historical sequence lacks revisioned annotations");
-    }
-    const auto source=Json::parse(object.meta).value("source",Json::object());
-    if (source.contains(key)) result=source.at(key);
-    if (!result.is_array() || result.size()!=size_t(count)) throw std::invalid_argument("point annotations must match the sequence");
-    for (const auto& a:result) if (!a.is_object() && !a.is_null()) throw std::invalid_argument("invalid point annotation");
+    const auto& state = reader.manifest().at("sequences").at(name);
+    const auto ids = sequenceIdArray(revision.kind, name);
+    auto* db = ObjectStoreImplAccess::conn(txn);
+    MetadataSnapshot snapshot(db, state.at(ids.empty() ? "annotations" : "identities"));
+    const auto values = ids.empty() ? std::vector<int64_t>() : idsOf(reader, ids, count);
+    std::vector<bool> seen(count);
+    snapshot.entries([&](int64_t id, const auto& value) {
+        const int64_t row = ids.empty() ? id : value.at("row").template get<int64_t>();
+        if (row < 0 || row >= count || seen[row] || (!ids.empty() && values[row] != id))
+            throw std::runtime_error("invalid annotation row");
+        seen[row] = true;
+        result[row] = unpackAnnotation(db, ids.empty() ? value : value.at("annotation"));
+    });
+    if (!ids.empty() && std::find(seen.begin(), seen.end(), false) != seen.end())
+        throw std::runtime_error("missing point identity");
     return result;
 }
 bool directional(const Json& value) {return annotationDirectional(value);}
@@ -82,7 +61,7 @@ std::string ObjectStore::geometryPointAnnotations(const Txn& txn,const std::stri
     const auto r=geometryRevision(txn,revision);
     if (!r) throw std::invalid_argument("geometry revision not found");
     GeometryReader reader(txn,revision);
-    return annotations(*this,txn,*r,reader,name).dump();
+    return annotations(txn,*r,reader,name).dump();
 }
 std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& objectId,const GeometrySequenceEdit& edit,
     const std::string& expected,const std::vector<GeometryEdgeEdit>& edges)
@@ -99,21 +78,19 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         const auto& a=manifest.at("arrays").at(edit.array); const int64_t oldCount=a.at("shape").at(0);
         const auto stride=geometryByteLength(a.at("dtype"),{3}); const std::string dtype=a.at("dtype");
         if (edit.start<0 || edit.eraseCount<0 || edit.start>oldCount || edit.eraseCount>oldCount-edit.start) throw std::out_of_range("sequence span out of range");
-        const auto idsName=idArray(current->kind,edit.array);
-        const auto oldAttrs=annotations(*this,txn,*current,reader,edit.array);
-        auto state=manifest.value("sequences",Json::object()).value(edit.array,Json::object());
+        const auto idsName=sequenceIdArray(current->kind,edit.array);
+        const auto oldAttrs=annotations(txn,*current,reader,edit.array);
+        auto state=manifest.at("sequences").at(edit.array);
         MetadataSnapshot allocated(db,state.value("allocated",Json()));
         std::vector<int64_t> originalIds;
         if(!idsName.empty()) {
             originalIds=idsOf(reader,idsName,oldCount);
-            if(!state.contains("allocated"))for(auto id:originalIds)allocated.put(id,true);
             // Restoration must not allow a previously allocated ID to be reused.
             Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
                 parseUuid(uuid));
             if(latest.row()) {
                 const auto tip=Json::parse(latest.text(0));
-                if(tip.contains("sequences")&&tip.at("sequences").contains(edit.array)&&tip.at("sequences").at(edit.array).contains("allocated")&&
-                    tip.at("sequences").at(edit.array).at("allocated")!=state.value("allocated",Json()))
+                if(tip.at("sequences").at(edit.array).at("allocated")!=state.at("allocated"))
                     allocated.mergeAllocated(MetadataSnapshot(db,tip.at("sequences").at(edit.array).at("allocated")));
             }
         }
@@ -142,10 +119,9 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                 if(descriptor.at("dtype")!=dtype)throw std::invalid_argument("sequence source layout mismatch");
                 partCoords=source.read(edit.array,part.start*stride,part.count*stride);
                 if(!idsName.empty()) {
-                    if(source.manifest().at("arrays").contains(idsName)) {pointIds.resize(part.count);copyScalars<int64_t>(source.read(idsName,part.start*8,part.count*8),pointIds);}
-                    else {pointIds.resize(part.count);std::iota(pointIds.begin(),pointIds.end(),part.start);}
+                    pointIds.resize(part.count);copyScalars<int64_t>(source.read(idsName,part.start*8,part.count*8),pointIds);
                 }
-                const auto all=annotations(*this,txn,*sourceRevision,source,edit.array);
+                const auto all=annotations(txn,*sourceRevision,source,edit.array);
                 pointAttrs=Json::array();for(auto i=part.start;i<part.start+part.count;++i)pointAttrs.push_back(all.at(i));
             } else {
                 if(part.start||part.count<0||uint64_t(part.count)>uint64_t(INT64_MAX/stride)||part.bytes.size()!=uint64_t(part.count*stride))throw std::invalid_argument("new sequence part byte length mismatch");
@@ -187,7 +163,8 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         MetadataSnapshot metadata(db);
         for(int64_t i=0;i<count;++i) {
             const auto annotation=packAnnotation(db,attrs.at(i));
-            metadata.put(idsName.empty()?i:ids[i],idsName.empty()?annotation:Json{{"row",i},{"annotation",annotation}});
+            if (!idsName.empty() || !attrs.at(i).is_object() || !attrs.at(i).empty())
+                metadata.put(idsName.empty()?i:ids[i],idsName.empty()?annotation:Json{{"row",i},{"annotation",annotation}});
         }
         if(idsName.empty())state={{"annotations",metadata.save()}};
         else {
@@ -196,9 +173,6 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
             state={{"identities",metadata.save()},{"allocated",allocated.save()}};
         }
         manifest["sequences"][edit.array]=state;
-        auto source=Json::parse(objectByUuid(txn,uuid)->meta).value("source",Json::object());
-        const auto key=current->kind=="point_collection"?"point_attributes":edit.array+"_attributes";
-        if(source.erase(key))setMeta(txn,uuid,"source",source.dump());
         const auto result=publishStructuralSnapshot(*this,txn,uuid,data,std::move(manifest),expected,edges,idsName.empty()?std::nullopt:std::optional(std::pair{idsName,changedIds}));
         savepoint.release();return result;
     } catch(const std::exception& error) {historyConflict(db,error.what());}

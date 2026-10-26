@@ -6,6 +6,7 @@ import sqlite3
 import time
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, fibers_digest
 from .fiber_normal_sign import launch_tensor_solve
 
 
@@ -46,29 +47,29 @@ def hard_metrics(probs,a,i,j,relation,lengths):
 def run_features(config):
     from .constraint_extraction import run_native_constraints
     native=json.loads(Path(config['native_config']).read_text())
-    paths={key:Path(native[key]) for key in ('afv','umbilicus')}
-    for key,path in paths.items():native[key+'_sha256']=sha256_file(path)
+    identity=lambda:dict(fibers_digest=fibers_digest(native['fibers']),umbilicus_sha256=sha256_file(native['umbilicus']))
+    native.update(identity())
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
     frozen=root/'native_config.json';atomic_write(frozen,native,durable=False)
     run_native_constraints(frozen, config)
-    for key,path in paths.items():
-        if sha256_file(path)!=native[key+'_sha256']:
-            target=Path(native['axial_prior_output']);target.rename(target.with_suffix('.invalid'))
-            raise RuntimeError('Feature input changed during export')
+    if identity()!={key:native[key] for key in ('fibers_digest','umbilicus_sha256')}:
+        target=Path(native['axial_prior_output']);target.rename(target.with_suffix('.invalid'))
+        raise RuntimeError('Feature input changed during export')
 
 
 def verify_feature_source(database,feature):
-    """Bind cached scores to the actual AFV used by the immutable constraint DB."""
+    """Bind cached scores to the actual fiber store used by the immutable constraint DB."""
     with sqlite3.connect(Path(database).resolve().as_uri()+'?mode=ro',uri=True) as db:
         provenance=json.loads(db.execute("SELECT value FROM metadata WHERE key='provenance'").fetchone()[0])
-        source=Path(provenance['config']['afv'])
-        if sha256_file(source)!=feature['afv_sha256']:raise ValueError('Axial/source AFV content mismatch')
-        with sqlite3.connect(source.resolve().as_uri()+'?mode=ro',uri=True) as afv:
-            source_rows=np.asarray(afv.execute('SELECT id,length FROM fibers ORDER BY id').fetchall())
-        rows=np.asarray(db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall())
-        if not np.array_equal(rows[:,0],source_rows[:,0]):raise ValueError('Constraint/AFV IDs differ')
-        if not np.allclose(rows[:,1],source_rows[:,1],rtol=1e-10,atol=1e-6):raise ValueError('Constraint/AFV geometry lengths differ')
-    return dict(afv_sha256=feature['afv_sha256'],fiber_lengths_checked=len(rows))
+        source=provenance['config']['fibers']
+        if fibers_digest(source)!=feature['fibers_digest']:raise ValueError('Axial/source fiber store content mismatch')
+        # Store summary lengths are the line-point arc lengths (volume voxels).
+        source_rows=[(row['id'],row['length']) for row in fiber_catalog(source,provenance['config']['coordinate_space'].split('/')[-1])]
+        rows=db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall()
+        if [r[0] for r in rows]!=[r[0] for r in source_rows]:raise ValueError('Constraint/store IDs differ')
+        if not np.allclose([r[1] for r in rows],[r[1] for r in source_rows],rtol=1e-10,atol=1e-6):
+            raise ValueError('Constraint/store geometry lengths differ')
+    return dict(fibers_digest=feature['fibers_digest'],fiber_lengths_checked=len(rows))
 
 
 def prepare(config):
@@ -81,12 +82,12 @@ def prepare(config):
     if cache.exists() and stamp.exists() and json.loads(stamp.read_text())['signature']==signature:return
     with sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True) as db:
         meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-        if not meta['complete'] or meta['provenance']['afv_uuid']!=feature['afv_uuid']:raise ValueError('Feature/DB identity mismatch')
+        if not meta['complete'] or meta['provenance']['fibers_store_uuid']!=feature['fibers_store_uuid']:raise ValueError('Feature/DB identity mismatch')
         prior_summary=json.loads((stage1.parent/'summary.json').read_text())
         if prior_summary['input']['signature']['database_sha256']!=signature['database']:raise ValueError('Stage1/DB mismatch')
-        rows=np.asarray(db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall())
-        ids=rows[:,0].astype(np.int64);lengths=rows[:,1]
-        if not len(ids) or not np.all(np.diff(ids)>0):raise ValueError('Expected nonempty ascending source IDs')
+        rows=db.execute('SELECT id,length_base FROM fibers ORDER BY source_index').fetchall()
+        ids=np.asarray([r[0] for r in rows],dtype=str);lengths=np.asarray([r[1] for r in rows],dtype=float)
+        if not len(ids) or not np.all(ids[1:]>ids[:-1]):raise ValueError('Expected nonempty ascending source IDs')
         with np.load(stage1,allow_pickle=False) as initial:
             if not np.array_equal(ids,initial['ids']):raise ValueError('Stage1 IDs mismatch')
             inherited=initial['broken'].copy()
@@ -96,10 +97,11 @@ def prepare(config):
         cursor=db.execute('SELECT fiber_a,fiber_b,parallel_score,perpendicular_score FROM constraints ORDER BY id')
         chunks=[];original_parallel=original_perp=ties=0
         while batch:=cursor.fetchmany(65536):
-            x=np.asarray(batch);relation=np.sign(x[:,2]-x[:,3]);ties+=int((relation==0).sum())
+            ends=np.asarray([r[:2] for r in batch],dtype=str);x=np.asarray([r[2:] for r in batch],dtype=float)
+            relation=np.sign(x[:,0]-x[:,1]);ties+=int((relation==0).sum())
             original_parallel+=int((relation>0).sum());original_perp+=int((relation<0).sum())
-            idx=np.searchsorted(ids,x[:,:2].astype(np.int64))
-            if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],x[:,:2]):raise ValueError('Bad endpoint IDs')
+            idx=np.searchsorted(ids,ends)
+            if np.any(idx>=len(ids)) or not np.array_equal(ids[idx],ends):raise ValueError('Bad endpoint IDs')
             keep=~inherited[idx].any(1)&(relation!=0)
             chunks.append(np.column_stack([idx[keep],relation[keep]]))
     edges=np.concatenate(chunks) if chunks else np.empty((0,3))
@@ -113,7 +115,7 @@ def prepare(config):
     np.savez(temporary,ids=ids,active=active,inherited=inherited,a=a[active],lengths=lengths[active],i=i,j=j,
              relation=edges[:,2].astype(np.float32),degree=degree)
     temporary.replace(cache)
-    stats=dict(signature=signature,feature_identity=dict(afv_sha256=feature['afv_sha256'],umbilicus_sha256=feature['umbilicus_sha256']),
+    stats=dict(signature=signature,feature_identity=dict(fibers_digest=feature['fibers_digest'],umbilicus_sha256=feature['umbilicus_sha256']),
                all_fibers=len(ids),inherited_broken=int(inherited.sum()),active_fibers=len(active),active_events=len(i),
                original_parallel=original_parallel,original_perpendicular=original_perp,tied_events_skipped=ties,
                isolated_active_fibers=int((degree==0).sum()),seconds=time.monotonic()-start)

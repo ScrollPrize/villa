@@ -4,16 +4,14 @@
 
 namespace vc::objects {
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
-class GeometryEdit;
 
 // Views share a read transaction and pin a geometry revision. Reads are bounded
 // and preserve native scalar types. Closing their snapshot invalidates all its
-// views/edits; otherwise they keep the snapshot alive. Thread-confined, like Txn.
+// views; otherwise they keep the snapshot alive. Thread-confined, like Txn.
 class GeometryView {
 public:
     const GeometryRevision& revision() const;
     const std::string& objectRevision() const;
-    GeometryEdit edit() const;
 protected:
     explicit GeometryView(std::shared_ptr<detail::GeometryViewState>);
     geometry::Geometry loadGeometry() const;
@@ -71,7 +69,7 @@ using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView
 
 class GeometrySnapshot {
 public:
-    // A borrowed store must outlive this snapshot and its views/edits.
+    // A borrowed store must outlive this snapshot and its views.
     explicit GeometrySnapshot(ObjectStore&);
     // Owning overload useful for application/binding lifetime management.
     explicit GeometrySnapshot(std::shared_ptr<ObjectStore>);
@@ -87,24 +85,4 @@ private:
     std::shared_ptr<detail::GeometryReadState> state_;
 };
 
-// Sparse edits prepared against a snapshot. No writes until commit; the object
-// and geometry revisions are both checked. Existing relationship decisions and
-// transaction semantics apply unchanged. An editor commits at most once.
-class GeometryEdit {
-public:
-    void movePoint(geometry::PointId, const geometry::Point&);
-    void moveControlPoint(int64_t index, const geometry::Point&);
-    void moveLinePoint(int64_t index, const geometry::Point&);
-    void moveTrackPoint(int64_t index, const geometry::TrackPoint&);
-    void moveVertex(int64_t row, int64_t column, const geometry::PatchPoint&);
-    std::vector<EdgeRecord> affectedRelationships() const;
-    std::string commit(const std::vector<GeometryEdgeEdit>& decisions = {});
-private:
-    friend class GeometryView;
-    explicit GeometryEdit(std::shared_ptr<detail::GeometryViewState>);
-    void requireKind(const char*) const;
-    std::shared_ptr<detail::GeometryViewState> state_;
-    std::vector<GeometryArrayEdit> edits_;
-    bool committed_ = false;
-};
 } // namespace vc::objects
