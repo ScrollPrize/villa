@@ -70,10 +70,27 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
 ```
 
 A team can share a store as a hub file on a network share or on any SSH server.
-Each client works on a local replica and syncs with leases:
-`vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj`, or with no mount,
-`vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj`. See
-[hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
+Initialize the hub from a local store that nothing else has open, then copy it
+into place (to a server, use `scp`):
+
+```sh
+vc_object_hub init objects.vcobj
+cp objects.vcobj /mnt/share/hub.vcobj
+```
+
+Nobody opens the hub directly. Each client clones it into a local replica,
+works there, and syncs; editing an object that already exists on the hub needs
+that object's lease (`vc_object_hub lease acquire REPLICA UUID`):
+
+```sh
+vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj
+vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj   # no mount needed
+vc_object_hub sync ~/replica.vcobj
+```
+
+In VC3D, File → Object Store → Clone Hosted Object Store... clones and attaches
+a replica, and Sync Hosted Object Store Now syncs it; initializing a hub is
+command-line only. See [hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
 edits, graph snapshots, spatial queries, and synchronization. Detector distances
