@@ -662,7 +662,7 @@ class Config:
         self.object_store_fiber_uuids = None
         self.object_store_fiber_tags = None
         # CT structure-tensor normals for fiber-patch link refresh when the fit
-        # loads no lasagna normals: a CT zarr whose level object_store_normal_
+        # loads no lasagna normals: a CT zarr whose group object_store_normal_
         # ct_level is downsampled by object_store_normal_ct_downsampling
         # relative to the fit volume, which object_store_normal_ct_volume_uuid
         # must name.

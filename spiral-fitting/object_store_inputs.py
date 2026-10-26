@@ -1198,8 +1198,8 @@ class NormalSource:
             return (f'fiber-patch normals: lasagna at '
                     f'scale {values["ct_to_base_scale"]:g} '
                     f'({values["normal_x_volume"]}, {values["normal_y_volume"]})')
-        return (f'fiber-patch normals: CT {self.ct_volume} level '
-                f'{values["ct_level"]}, downsampling {values["ct_to_base_scale"]:g}')
+        return (f'fiber-patch normals: CT {self.ct_volume}, downsampling '
+                f'{values["ct_to_base_scale"]:g}')
 
     def provenance(self):
         return {'kind': self.kind, 'ct_volume': self.ct_volume or None,
@@ -1215,9 +1215,9 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
     ``{'normal_x', 'normal_y', 'group', 'scale'}``, ``scale`` being the
     group's downsampling relative to the fit volume. The store reads the
     same group arrays the fitter reads, addressed by path (an array is its
-    reader's only level, 0), so no pyramid metadata is consulted. Lasagna
-    and CT normals are exclusive; a configured CT is then ignored with a
-    note.
+    reader's only level, 0), so no pyramid metadata is consulted; a normal
+    CT's level likewise names its group. Lasagna and CT normals are
+    exclusive; a configured CT is then ignored with a note.
     """
     ct_path = config['object_store_normal_ct_path']
     if lasagna is not None:
@@ -1240,8 +1240,9 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
         raise ObjectStoreInputError([
             f'the normal CT belongs to volume {ct_volume}, not the fit volume '
             f'{volume_uuid}'])
-    return NormalSource('ct', str(ct_path), (
-        ('ct_level', int(config['object_store_normal_ct_level'])),
+    level = str(config['object_store_normal_ct_level'])
+    return NormalSource('ct', os.path.join(str(ct_path), level), (
+        ('ct_level', 0),
         ('ct_to_base_scale', float(config['object_store_normal_ct_downsampling']))))
 
 

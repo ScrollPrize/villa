@@ -217,7 +217,7 @@ def test_normal_source_prefers_lasagna_then_ct_then_none():
     config['object_store_normal_ct_volume_uuid'] = VOLUME
     ct = osi.fiber_normal_source(config, volume_uuid=VOLUME)
     assert (ct.kind, ct.ct_volume, dict(ct.parameters)) == (
-        'ct', '/ct.zarr', {'ct_level': 2, 'ct_to_base_scale': 4.0})
+        'ct', '/ct.zarr/2', {'ct_level': 0, 'ct_to_base_scale': 4.0})
     # The store reads the group array the fitter reads, by path, whatever
     # levels the stores' multiscales list.
     lasagna = osi.fiber_normal_source(
