@@ -65,6 +65,22 @@ Downloads for all operating systems are available on the [releases page](https:/
   </div>
 
 </TabItem>
+  <TabItem value="mac-intel" label="Mac (Intel)">
+
+  There is no native build for Intel Macs. Instead, run the Linux x86_64 AppImage from the [releases page](https://github.com/ScrollPrize/villa/releases) inside a small Docker container and show the GUI through XQuartz. Nothing is emulated: the Mac, Docker and the AppImage are all x86_64.
+
+  - Install [Docker Desktop for Mac with Intel chip](https://docs.docker.com/desktop/setup/install/mac-install/) and [XQuartz](https://www.xquartz.org).
+  - In XQuartz → Settings → Security, tick **"Allow connections from network clients"**, quit XQuartz and log out and back in once.
+  - Use the ready-made Dockerfile and launcher from [vc3d-intel-mac](https://github.com/antonietox/vc3d-intel-mac):
+    ```bash
+    git clone https://github.com/antonietox/vc3d-intel-mac && cd vc3d-intel-mac
+    ./fetch-appimage.sh                 # newest linux-x86_64 AppImage from the releases page
+    docker build -t vc3d-intel-mac .
+    ./run-vc3d.sh                       # opens VC3D; quitting it stops the container
+    ```
+  - Keep the chunk cache small on 16 GB Macs (the launcher uses `--cache-size 3`; set `VC3D_CACHE_GB` to change it). The repo's README covers troubleshooting.
+
+  </TabItem>
   <TabItem value="windows" label="Windows">
 
   - Download the windows installer .zip file from the [releases page](https://github.com/ScrollPrize/villa/releases) of the villa repository.
@@ -109,6 +125,7 @@ Downloads for all operating systems are available on the [releases page](https:/
 
 Depending on your install method or operating system, the application may be launched in different ways.
 - **Mac:** Open the application from the Applications folder
+- **Mac (Intel):** From the `vc3d-intel-mac` folder, run `./run-vc3d.sh`
 - **Windows:** Open the application from the Start menu
 - **Linux:** With the AppImage, run `./VC3D-*-linux-x86_64.AppImage VC3D`. With a source build, navigate to the build folder and run the VC3D app. example: `cd build/bin && ./VC3D`
 
