@@ -374,8 +374,9 @@ public:
     // points against.
     [[nodiscard]] std::optional<std::vector<cv::Vec3d>> fiberMapLinePoints(uint64_t fiberId) const;
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
-    // Stored fibers open read-only. Enables editing in the most recent pane of
-    // this fiber (as its Enable editing button does); false when it cannot.
+    // Stored fibers open read-only unless the user's Open fibers editable
+    // setting is on. Enables editing in the most recent pane of this fiber
+    // (as its Enable editing button does); false when it cannot.
     bool enableFiberEditing(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
@@ -1644,6 +1645,8 @@ private:
         vc3d::line_annotation::FiberOptimizationMode)>
         _mergeModePicker;
     bool _errorDialogsSuppressed = false;
+    // Off while changed store fibers reopen: each keeps the editing state it had.
+    bool _applyOpenFibersEditable = true;
     // A merge or split from its menu callback to the end of its commit; the
     // second one refuses, and deletes/renames/imports refuse meanwhile.
     bool _structuralEditInProgress = false;

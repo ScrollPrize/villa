@@ -22,6 +22,7 @@
 #include "Keybinds.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationFiberNaming.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -2345,13 +2346,22 @@ void MenuActionController::convertLegacyVolpkg()
 
 QString MenuActionController::objectStoreAuthor()
 {
-    auto author = qEnvironmentVariable("USER");
-    if (author.isEmpty()) author = qEnvironmentVariable("USERNAME");
-    if (author.isEmpty()) {
-        author = QInputDialog::getText(_window, QObject::tr("Object Store Author"),
-            QObject::tr("Author for recorded edits:"));
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString name = settings.value(vc3d::settings::viewer::USERNAME,
+                                  vc3d::settings::viewer::USERNAME_DEFAULT).toString().trimmed();
+    if (!vc3d::line_annotation::isAnonymousFiberUsername(name.toStdString())) return name;
+    name = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME"));
+    QString prompt = QObject::tr("Username recorded on your object store edits and fiber names:");
+    for (;;) {
+        bool ok = false;
+        name = QInputDialog::getText(_window, QObject::tr("Object Store Username"), prompt,
+                                     QLineEdit::Normal, name, &ok).trimmed();
+        if (!ok) return {};
+        if (!vc3d::line_annotation::isAnonymousFiberUsername(name.toStdString())) break;
+        prompt = QObject::tr("Enter a username other than \"anon\":");
     }
-    return author.trimmed();
+    settings.setValue(vc3d::settings::viewer::USERNAME, name);
+    return name;
 }
 
 void MenuActionController::attachObjectStore()

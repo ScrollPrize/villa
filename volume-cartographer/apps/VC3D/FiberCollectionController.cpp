@@ -52,22 +52,9 @@ Point point(const cv::Vec3f& p, double scale = 1)
 {
     return {p[0] * scale, p[1] * scale, p[2] * scale};
 }
-Point sub(const Point& a, const Point& b)
-{
-    return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-}
 double dot(const Point& a, const Point& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-Point normalized(Point p)
-{
-    const double n = std::sqrt(dot(p, p));
-    if (!(n > 0))
-        throw std::runtime_error("Degenerate slice frame");
-    for (auto& x : p)
-        x /= n;
-    return p;
 }
 bool overlaps(const Bounds& a, const Bounds& b)
 {
@@ -206,6 +193,8 @@ struct SelectedFiber {
 };
 struct RegionResult {
     vc::fibers::RegionPage page;
+    // The store stopped at the display limit (maximumObjects).
+    bool limited{false};
     Bounds coverage;
     std::vector<std::string> blockUuids;
     struct Control {
@@ -313,6 +302,7 @@ struct FiberCollectionController::View {
     std::shared_ptr<std::atomic_bool> cancelled;
     bool busy{false};
     bool complete{true};
+    bool limited{false};
     bool dirty{true};
     QRectF displayedRect;
     qreal displayedDpr{};
@@ -484,10 +474,10 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
             if (preserveSelection && selected_ > 0) selectFiber(selected_, false, false);
         });
 }
-void FiberCollectionController::openCollection(const QString& path)
+void FiberCollectionController::openCollection(const QString& path, const QString& author)
 {
     try {
-        state_->attachObjectStore(path,qEnvironmentVariable("USER",qEnvironmentVariable("USERNAME","vc3d")));
+        state_->attachObjectStore(path,author);
         emit panelRequested();
     } catch(const std::exception& e) { publishStatus(QString::fromUtf8(e.what())); }
 }
@@ -759,20 +749,13 @@ std::optional<FiberCollectionController::Slice> FiberCollectionController::slice
     const auto rect = visibleSceneRect(viewer);
     if (rect.isEmpty())
         return std::nullopt;
-    Slice s;
-    s.origin = point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_);
-    const auto x = point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_);
-    const auto y = point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_);
-    try {
-        s.u = normalized(sub(x, s.origin));
-        s.v = normalized(sub(y, s.origin));
-        s.n = normalized({s.u[1] * s.v[2] - s.u[2] * s.v[1], s.u[2] * s.v[0] - s.u[0] * s.v[2], s.u[0] * s.v[1] - s.u[1] * s.v[0]});
-    } catch (...) {
+    auto s = vc::fibers::viewRegionFromCorners(point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_),
+                                               point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_),
+                                               point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_),
+                                               options_.sliceDistance);
+    if (!s)
         return std::nullopt;
-    }
-    const double d = options_.sliceDistance;
-    s.local = {{0, 0, -d}, {std::sqrt(dot(sub(x, s.origin), sub(x, s.origin))), std::sqrt(dot(sub(y, s.origin), sub(y, s.origin))), d}};
-    s.box = regionBox(s);
+    s->box = regionBox(*s);
     return s;
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -844,6 +827,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 options.family=family;
                 auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel->load() || cancelled.load(); });
                 result.page.complete = region.complete();
+                result.limited = region.stop == vc::objects::RegionStop::ObjectLimit;
                 result.page.decodedBytes = region.stats.outputBytes;
                 // Runs arrive in volume voxels, merged in UUID order with the selected fiber first.
                 std::map<std::string, std::optional<std::string>> drawn;
@@ -933,6 +917,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 v.rings = std::move(region.rings);
                 v.blocks = std::move(region.page.blocks);
                 v.complete = region.page.complete;
+                v.limited = region.limited;
                 v.coverage = region.coverage;
                 v.coverageSlice = query;
             }
@@ -988,10 +973,8 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         if (!v.coverage)
             return;
     }
-    if (!v.coverage) {
-        builder.addText(rect.topLeft() + QPointF(8, 20), tr("Loading fiber region…"), QFont{}, info);
+    if (!v.coverage)
         return;
-    }
     // Reclip cached geometry to the current slice while replacement data is
     // fetched. Do not replace the whole overlay with a blank/loading frame.
     v.displayed = *current;
@@ -1129,12 +1112,13 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
             addLinkMark(builder, viewer->volumeToScene(cvpoint(ring.position, nativeToViewer_)), linkMarkStyle(ring.mark, 1.0f), ring.mark.adjacent);
         }
     }
-    const QString count = options_.maxDisplayed
-        ? tr("%1 visible fibers · max %2").arg(visibleIds.size()).arg(options_.maxDisplayed)
-        : tr("%1 visible fibers").arg(visibleIds.size());
-    builder.addText(rect.topLeft() + QPointF(8, 40), count, QFont{}, info);
-    if (v.busy && !(v.complete && v.coverageSlice && v.coverageSlice->contains(*current)))
-        builder.addText(rect.topLeft() + QPointF(8, 20), tr("Updating fiber region…"), QFont{}, info);
+    // Status only when fibers are missing from the view: the display limit
+    // was reached, or a store budget cut the region short.
+    if (v.limited)
+        builder.addText(rect.topLeft() + QPointF(8, 20),
+                        tr("Showing the maximum of %1 fibers · the view may contain more")
+                            .arg(options_.maxDisplayed),
+                        QFont{}, info);
     else if (!v.complete)
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Partial fiber view · zoom in or increase minimum length"), QFont{}, info);
 }

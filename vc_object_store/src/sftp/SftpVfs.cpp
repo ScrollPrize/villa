@@ -198,11 +198,20 @@ int fileLock(sqlite3_file* file, int level)
     }
     try {
         return withSession(*s.connection, [&](Session& session) {
-            try {
-                session.mkdir(s.lockPath);
-            } catch (const StatusError&) {
-                session.stat(s.lockPath);  // throws unless the lock exists
-                return SQLITE_BUSY;        // another client holds the lock
+            for (int attempt = 0;; ++attempt) {
+                try {
+                    session.mkdir(s.lockPath);
+                    break;
+                } catch (const StatusError& failed) {
+                    try {
+                        session.stat(s.lockPath);
+                        return SQLITE_BUSY;  // another client holds the lock
+                    } catch (const StatusError& missing) {
+                        // A lock released since mkdir is retried; mkdir failing
+                        // with no lock present is the real error.
+                        if (missing.status != vc::sftp::NoSuchFile || attempt == 2) throw failed;
+                    }
+                }
             }
             s.lock = level;
             return SQLITE_OK;

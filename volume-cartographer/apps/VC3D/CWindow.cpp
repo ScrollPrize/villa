@@ -9039,7 +9039,9 @@ bool CWindow::OpenVolume(const QString& path,
 
 void CWindow::attachObjectStore(const QString& path)
 {
-    _fiberCollection->openCollection(path);
+    const auto author = _menuController ? _menuController->objectStoreAuthor() : QString();
+    if (author.isEmpty()) return;
+    _fiberCollection->openCollection(path, author);
 }
 
 bool CWindow::openVolumePackage(const QString& path,

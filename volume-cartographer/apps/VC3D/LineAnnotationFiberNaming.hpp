@@ -40,6 +40,16 @@ inline std::string normalizedFiberUsername(std::string username)
     return normalized;
 }
 
+// True when the name collapses to the "anon" placeholder, so it identifies nobody.
+inline bool isAnonymousFiberUsername(const std::string& username)
+{
+    std::string normalized = normalizedFiberUsername(username);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return normalized == "anon";
+}
+
 inline std::string fiberFileStem(const std::string& username,
                                  const std::string& startedAt,
                                  uint64_t sequence)

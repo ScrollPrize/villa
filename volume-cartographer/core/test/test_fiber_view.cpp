@@ -60,3 +60,33 @@ TEST_CASE("ViewRegion::contains tests a rotated slice by its corners")
     CHECK_FALSE(loaded.contains(tilted));
 }
 
+
+TEST_CASE("viewRegionFromCorners gives an oblique view orthonormal axes covering its rectangle")
+{
+    // An oblique cut's visible rectangle as a viewer reports it: float corners.
+    const auto viewerCorner = [](double x, double y, double z) {
+        return Point{double(float(x)), double(float(y)), double(float(z))};
+    };
+    const Point origin = viewerCorner(4021.37, 2789.11, 6150.73);
+    const Point right = viewerCorner(4021.37 + 812.4 * .6, 2789.11 + 812.4 * .48, 6150.73 + 812.4 * .64);
+    const Point down = viewerCorner(4021.37 - 517.9 * .8, 2789.11 + 517.9 * .36, 6150.73 + 517.9 * .48);
+    const auto region = viewRegionFromCorners(origin, right, down, 4);
+    REQUIRE(region);
+    // The object store's slice contract: orthonormal to 1e-12.
+    const std::array<Point, 3> axes{region->u, region->v, region->n};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            const double dot = axes[i][0] * axes[j][0] + axes[i][1] * axes[j][1] + axes[i][2] * axes[j][2];
+            CHECK(std::abs(dot - (i == j ? 1.0 : 0.0)) <= 1e-12);
+        }
+    const Point opposite{right[0] + down[0] - origin[0], right[1] + down[1] - origin[1], right[2] + down[2] - origin[2]};
+    for (const Point& corner : {origin, right, down, opposite}) {
+        const auto p = region->project(corner);
+        for (int i = 0; i < 3; ++i)
+            CHECK((p[i] >= region->local.lower[i] && p[i] <= region->local.upper[i]));
+    }
+    CHECK(region->local.lower[2] == -4);
+    CHECK(region->local.upper[2] == 4);
+    CHECK_FALSE(viewRegionFromCorners(origin, origin, down, 4));
+    CHECK_FALSE(viewRegionFromCorners(origin, right, right, 4));
+}
