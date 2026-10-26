@@ -146,6 +146,24 @@ The native tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
 `volume_source.txt`. Use `--plan-only` to inspect occupied-chunk and patch
 counts without creating output.
 
+Check whether two (or more) models' flat predictions look like writing or
+like texture. Ink sits on one face of the sheet, so run each checkpoint with
+`--direction both`, then:
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.face_check \
+  /data/predictions/w035_seed42.tif /data/predictions/w035_dense_native.tif \
+  --ct /data/segments/w035/surface-volume.zarr --out w035_face_check.json
+```
+
+Each positional TIFF is a forward map; its `_reverse` sibling is read
+automatically. Per model pair it reports `face_asymmetry` (top-3 % agreement
+on the better face over the other face), `face_consistency` (tile by tile,
+does the same face win), and with `--ct` a sheet check that limits the scores
+to on-sheet pixels plus `ink_on_dark` (share of agreed ink on the darkest
+10 % of the CT; chance 0.10). On the PHerc. 343 First Letters segment the two
+public 9 µm models give 3.2 / 0.52 / 0.09.
+
 ## Checkpoints and metrics
 
 Training embeds the resolved JSON config in each checkpoint. Inference
