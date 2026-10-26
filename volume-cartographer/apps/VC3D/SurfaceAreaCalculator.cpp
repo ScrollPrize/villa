@@ -4,6 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <cmath>
 
 std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(SurfaceCatalog& catalog, const std::vector<std::string>& ids)
@@ -24,15 +25,17 @@ std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(SurfaceCatalog& ca
             const double viewedVx2 = vc::surface::computeSurfaceAreaVox2(*opened.surface);
             double areaVx2 = viewedVx2;
             if (opened.view.mapping != vc::objects::VolumeAffine::identity()) {
+                // The same revision read in the bound volume's voxels, through the store's view of it.
                 catalog.session()->read(opened.pin.attachment, [&](const auto& db, const auto& txn, const auto&) {
                     const auto meta = nlohmann::json::parse(db.objectByUuid(txn, id)->meta);
                     const auto bound = vc::objects::geometryCoordinates(
                         meta.value("coordinates", nlohmann::json::object()))["volume_uuid"];
-                    const auto toBound = bound.is_string()
-                        ? vc::objects::geometryScaleToVolume(meta, bound.template get<std::string>()) : std::nullopt;
-                    if (!toBound) throw std::runtime_error("the surface is not bound to a volume");
-                    const auto stored = load_quad_from_store(db, txn, id, opened.pin.geometryRevision);
-                    areaVx2 = vc::surface::computeSurfaceAreaVox2(*stored) * *toBound * *toBound;
+                    if (!bound.is_string()) throw std::runtime_error("the surface is not bound to a volume");
+                    const auto view = vc::objects::GeometrySnapshot(db, txn)
+                                          .surface(id, opened.pin.geometryRevision)
+                                          .viewTransformedAt(bound.template get<std::string>());
+                    const auto stored = load_quad_from_store(db, txn, id, opened.pin.geometryRevision, true, &view);
+                    areaVx2 = vc::surface::computeSurfaceAreaVox2(*stored);
                 });
             }
             if (!std::isfinite(areaVx2) || !std::isfinite(viewedVx2)) {
