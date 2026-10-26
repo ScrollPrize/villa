@@ -3615,7 +3615,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     const auto navigationTransform =
         (hadVolume && newvol && previousVolumeId != targetVolumeId)
             ? volumeTransformForSwitch(previousVolumeId, targetVolumeId)
-            : std::optional<cv::Matx44d>{};
+            : std::optional<vcr::catalog::Affine>{};
 
     // Switch both independent states before revalidating the canonical overlay.
     // This prevents an incompatible base-volume transition from clearing only
@@ -8410,7 +8410,7 @@ const vcr::catalog::OpenDataManifest* CWindow::cachedOpenDataManifest() const
     return nullptr;
 }
 
-std::optional<cv::Matx44d> CWindow::volumeTransformForSwitch(const std::string& from, const std::string& to) const
+std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std::string& from, const std::string& to) const
 {
     // The store's resolution (catalog registrations, its own and its route
     // choices); without a store, the cached catalog's registrations.
@@ -8427,8 +8427,7 @@ std::optional<cv::Matx44d> CWindow::volumeTransformForSwitch(const std::string& 
     const auto shown = [&](const std::string& id) {
         return _state->vpkg() ? vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(id)) : std::nullopt;
     };
-    const auto mapping = vc3d::opendata::volumeToVolume(std::move(transforms), from, shown(from), to, shown(to));
-    return mapping ? std::optional(vc3d::opendata::cvMatrix(*mapping)) : std::nullopt;
+    return vc3d::opendata::volumeToVolume(std::move(transforms), from, shown(from), to, shown(to));
 }
 
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)

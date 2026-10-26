@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
+#include <vc_reader/affine.hpp>
 
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -195,12 +196,12 @@ public:
     struct ViewerNavigationSnapshot;
     std::shared_ptr<ViewerNavigationSnapshot> captureNavigation() const;
     void restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
-                           const cv::Matx44d& transform);
+                           const vcr::catalog::Affine& transform);
     // Set the volume on the state, re-derive the focus POI (volume-centered
     // when new/absent, clamped otherwise, transformed when a coordinate
     // transform is supplied) and retarget the captured viewer navigation.
     void switchVolume(std::shared_ptr<Volume> volume,
-                      const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+                      const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // --- Fleet setters: apply a viewer preference to every viewer ---
     void setShowDirectionHints(bool show);

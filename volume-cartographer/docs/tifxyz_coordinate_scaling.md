@@ -46,11 +46,18 @@ VC3D does not rescale or transform surfaces itself: stored surfaces open in any
 volume the object store relates to theirs (by coordinate scale or a registration),
 through the store's views. Its Transforms panel lists those volumes, registers a
 new affine to the open volume and chooses among a pair's routes; the store does
-the mapping.
+the mapping. Renders launched from VC3D read the surface the same way
+(`vc_render_tifxyz --store … --surface … --volume-uuid <volume>`).
+
+For tifxyz folders and OBJs, `vc_transform_geom --affine transform.json [--invert]`
+and `vc_render_tifxyz --segmentation … --affine transform.json[:inv]` read a
+`{"transformation_matrix": [3x4 or 4x4 rows]}` file with vc_reader's `Affine`
+(the type the store's registrations use). A singular matrix, or a file without
+`transformation_matrix`, is an error.
 
 Build and test:
 
 ```bash
-cmake --build volume-cartographer/build --target vc_transform_geom test_affine_transform_surface VC3D -j8
-ctest --test-dir volume-cartographer/build -R '^test_affine_transform_surface$' --output-on-failure
+cmake --build volume-cartographer/build --target vc_transform_geom test_transform_surface test_tool_store_modes VC3D -j8
+ctest --test-dir volume-cartographer/build -R '^test_(transform_surface|tool_store_modes)$' --output-on-failure
 ```

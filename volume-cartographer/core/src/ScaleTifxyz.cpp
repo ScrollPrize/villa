@@ -1,4 +1,4 @@
-#include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/TransformSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 

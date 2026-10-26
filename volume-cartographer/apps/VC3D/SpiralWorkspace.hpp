@@ -13,6 +13,7 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <vc_reader/affine.hpp>
 #include <atomic>
 #include <array>
 #include <cstddef>
@@ -57,7 +58,7 @@ public:
     ViewerSplitGrid* viewerGrid() const { return _grid; }
     QComboBox* volumeSelectionControl() const;
     void synchronizeVolume(const std::shared_ptr<Volume>& volume,
-                           const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+                           const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;

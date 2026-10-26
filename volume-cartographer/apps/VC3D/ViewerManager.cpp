@@ -20,7 +20,6 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <QApplication>
@@ -98,16 +97,27 @@ bool finiteVec3(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const vcr::catalog::Affine& matrix)
 {
-    cv::Vec3d transformed;
-    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+    if (!finiteVec3(point)) {
         return std::nullopt;
     }
+    const auto transformed = matrix.apply({point[0], point[1], point[2]});
     const cv::Vec3f out(static_cast<float>(transformed[0]),
                         static_cast<float>(transformed[1]),
                         static_cast<float>(transformed[2]));
     return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+// A direction's normal through the transform, kept when it does not map.
+cv::Vec3f transformNormal(const cv::Vec3f& normal, const vcr::catalog::Affine& matrix)
+{
+    if (!finiteVec3(normal)) {
+        return normal;
+    }
+    const auto mapped = matrix.mapNormal({normal[0], normal[1], normal[2]});
+    const cv::Vec3f out(static_cast<float>(mapped[0]), static_cast<float>(mapped[1]), static_cast<float>(mapped[2]));
+    return finiteVec3(out) && cv::norm(out) > 0.0f ? out : normal;
 }
 
 cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
@@ -120,39 +130,6 @@ cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& vo
     point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
     point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
     return point;
-}
-
-// Uniform distance scale of an affine transform, or nullopt when the linear
-// part is too anisotropic for a single scalar to be meaningful.
-std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
-{
-    cv::Mat linear(3, 3, CV_64F);
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            linear.at<double>(row, col) = matrix(row, col);
-        }
-    }
-
-    cv::SVD svd(linear, cv::SVD::NO_UV);
-    if (svd.w.rows < 3) {
-        return std::nullopt;
-    }
-    const double s0 = svd.w.at<double>(0, 0);
-    const double s1 = svd.w.at<double>(1, 0);
-    const double s2 = svd.w.at<double>(2, 0);
-    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
-        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
-        return std::nullopt;
-    }
-
-    const double mean = (s0 + s1 + s2) / 3.0;
-    const double maxDeviation =
-        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
-    const double relativeDeviation = maxDeviation / mean;
-    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
-        return std::nullopt;
-    }
-    return mean;
 }
 
 std::vector<ViewerManager*>& managerRegistry()
@@ -871,13 +848,15 @@ std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureN
 }
 
 void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
-                                      const cv::Matx44d& transform)
+                                      const vcr::catalog::Affine& transform)
 {
     if (!snapshot || !_state || !_state->currentVolume()) {
         return;
     }
 
-    const auto navigationScale = relativeAffineDistanceScale(transform);
+    // The camera keeps its on-screen scale through a near-similarity (column
+    // lengths within about 2%); other transforms keep the camera as it was.
+    const auto navigationScale = transform.similarityScale(0.04);
     for (const auto& captured : snapshot->entries) {
         CChunkedVolumeViewer* viewer = captured.viewer.data();
         if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
@@ -907,7 +886,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
             : captured.camera.zOffset;
         camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
         if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
-            const auto direction = vc::core::util::transformNormal(
+            const auto direction = transformNormal(
                 captured.camera.zOffsetWorldDir, transform);
             if (finiteVec3(direction)) {
                 camera.zOffsetWorldDir = direction;
@@ -918,7 +897,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
 }
 
 void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
-                                 const std::optional<cv::Matx44d>& navigationTransform)
+                                 const std::optional<vcr::catalog::Affine>& navigationTransform)
 {
     if (!_state) {
         return;
@@ -933,7 +912,7 @@ void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
             transformedFocusPoint = transformPoint(focus->p, *navigationTransform);
             if (cv::norm(focus->n) > 0.0f) {
                 const cv::Vec3f normal =
-                    vc::core::util::transformNormal(focus->n, *navigationTransform);
+                    transformNormal(focus->n, *navigationTransform);
                 if (finiteVec3(normal)) {
                     transformedFocusNormal = normal;
                 }

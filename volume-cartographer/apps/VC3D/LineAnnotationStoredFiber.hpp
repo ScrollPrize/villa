@@ -8,7 +8,7 @@
 // under its former nested names.
 
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
-#include "vc/core/types/FiberFrame.hpp"
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 #include <array>
 #include <nlohmann/json.hpp>
 #include <cstddef>

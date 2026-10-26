@@ -1,11 +1,10 @@
-// Coverage gap-filler for AffineTransform.cpp's QuadSurface-touching code:
-// measureGridAxisSpacing, transformSurfacePoints, refreshTransformedSurfaceState,
-// cloneSurfaceForTransform (lines ~24-100 + ~375-495).
+// vc_transform_geom's tifxyz transforms: an affine between uniform scales with
+// regridding, and uniform scaling that keeps the grid (in memory and streamed).
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/util/AffineTransform.hpp"
+#include "vc/core/util/TransformSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -31,13 +30,6 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float spacing = 1.0f)
             m(r, c) = cv::Vec3f(static_cast<float>(c) * spacing,
                                 static_cast<float>(r) * spacing,
                                 0.f);
-    return m;
-}
-
-cv::Matx44d scaleMatrix(double s)
-{
-    cv::Matx44d m = cv::Matx44d::eye();
-    m(0, 0) = s; m(1, 1) = s; m(2, 2) = s;
     return m;
 }
 
@@ -187,59 +179,53 @@ TEST_CASE("streamed scaling gives a new identity but retains coordinate provenan
     CHECK(utils::Json::parse_file(input / "meta.json").dump() == original.dump());
 }
 
-TEST_CASE("transformSurfacePoints (int scale): no-op on identity + scale=1")
+TEST_CASE("a rigid registration maps every point exactly and keeps the grid")
 {
-    auto pts = makePlanarGrid(8, 8);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    transformSurfacePoints(&qs, 1, std::nullopt);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK((*p)(0, 0) == cv::Vec3f(0, 0, 0));
-}
-
-TEST_CASE("transformSurfacePoints applies pre-scale factor to all points")
-{
-    auto pts = makePlanarGrid(8, 8);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    transformSurfacePoints(&qs, 2, std::nullopt); // pre-scale by 2x
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    // Spacing measurement should fire and resample back to "approximate
-    // original spacing"; we mainly check no NaN and points are still valid.
-    CHECK(std::isfinite((*p)(0, 0)[0]));
-    CHECK(std::isfinite((*p)(p->rows - 1, p->cols - 1)[0]));
-}
-
-TEST_CASE("transformSurfacePoints with a 4x4 affine matrix (uniform scale)")
-{
-    auto pts = makePlanarGrid(20, 20); // big enough to skip the small-grid path
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    auto m = scaleMatrix(2.0);
+    auto pts = makePlanarGrid(24, 24, 2.f);
+    pts(3, 4) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface qs(pts, cv::Vec2f(0.5f, 0.5f));
+    // A quarter turn about z, then a shift.
+    vcr::catalog::Affine m;
+    m(0, 0) = 0; m(0, 1) = -1; m(1, 0) = 1; m(1, 1) = 0;
+    m(0, 3) = 100; m(1, 3) = -20; m(2, 3) = 7;
     transformSurfacePoints(&qs, 1.0, m, 1.0);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK(std::isfinite((*p)(0, 0)[0]));
+    const auto& p = *qs.rawPointsPtr();
+    REQUIRE(p.size() == pts.size());
+    CHECK(p(3, 4) == cv::Vec3f(-1.f, -1.f, -1.f));
+    for (int r = 0; r < p.rows; ++r)
+        for (int c = 0; c < p.cols; ++c) {
+            if (r == 3 && c == 4) continue;
+            const auto q = m.apply({pts(r, c)[0], pts(r, c)[1], pts(r, c)[2]});
+            CHECK(p(r, c) == cv::Vec3f(float(q[0]), float(q[1]), float(q[2])));
+        }
 }
 
-TEST_CASE("transformSurfacePoints handles a tiny grid (small-grid branch)")
+TEST_CASE("scales before and after the affine compose, and the grid follows the spacing")
 {
-    // < 20 rows/cols triggers the "use whole grid" branch in
-    // measureGridAxisSpacing.
-    auto pts = makePlanarGrid(5, 5);
+    auto pts = makePlanarGrid(24, 24);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    transformSurfacePoints(&qs, 1.0, std::nullopt, 1.0);
-    CHECK(qs.rawPointsPtr() != nullptr);
+    transformSurfacePoints(&qs, 2.0, vcr::catalog::Affine::scale(1.5), 2.0);
+    const auto& p = *qs.rawPointsPtr();
+    // Six times the spacing: six times the samples per side, minus the last
+    // interval, and the corners keep their scaled positions.
+    CHECK(p.cols > 5 * pts.cols);
+    CHECK(qs.scale() == cv::Vec2f(1.f, 1.f));
+    CHECK(p(0, 0) == cv::Vec3f(0, 0, 0));
+    const auto far = p(p.rows - 1, p.cols - 1);
+    CHECK(far[0] == doctest::Approx(23 * 6).epsilon(0.05));
+    CHECK(far[1] == doctest::Approx(23 * 6).epsilon(0.05));
 }
 
-TEST_CASE("transformSurfacePoints with sentinel points leaves them as sentinels")
+TEST_CASE("points the affine takes out of float range become invalid")
 {
     auto pts = makePlanarGrid(8, 8);
-    pts(1, 1) = cv::Vec3f(-1.f, -1.f, -1.f);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    transformSurfacePoints(&qs, 1, std::nullopt);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK((*p)(1, 1)[0] == -1.f);
+    vcr::catalog::Affine m;
+    m(0, 3) = 1e39; // beyond float range
+    transformSurfacePoints(&qs, 1.0, m, 1.0);
+    const auto& p = *qs.rawPointsPtr();
+    for (int r = 0; r < p.rows; ++r)
+        for (int c = 0; c < p.cols; ++c) CHECK(p(r, c) == cv::Vec3f(-1.f, -1.f, -1.f));
 }
 
 TEST_CASE("refreshTransformedSurfaceState writes bbox + scale into meta")
@@ -262,37 +248,4 @@ TEST_CASE("refreshTransformedSurfaceState preserves an existing object meta")
     refreshTransformedSurfaceState(&qs);
     CHECK(qs.meta.contains("custom"));
     CHECK(qs.meta.contains("bbox"));
-}
-
-TEST_CASE("cloneSurfaceForTransform deep-copies points + metadata")
-{
-    auto pts = makePlanarGrid(4, 4);
-    auto src = std::make_shared<QuadSurface>(pts, cv::Vec2f(1.f, 1.f));
-    src->id = "src-id";
-    src->meta = utils::Json::object();
-    src->meta["k"] = "v";
-    auto clone = cloneSurfaceForTransform(src);
-    REQUIRE(clone != nullptr);
-    CHECK(clone->id == "src-id");
-    CHECK(clone->meta["k"].get_string() == "v");
-    // Mutating the clone must not affect the source.
-    auto* cp = clone->rawPointsPtr();
-    REQUIRE(cp);
-    (*cp)(0, 0) = cv::Vec3f(-999, -999, -999);
-    CHECK((*src->rawPointsPtr())(0, 0)[0] != -999);
-}
-
-TEST_CASE("cloneSurfaceForTransform with null source returns null")
-{
-    CHECK(cloneSurfaceForTransform(nullptr) == nullptr);
-}
-
-TEST_CASE("cloneSurfaceForTransform handles null meta on the source")
-{
-    auto pts = makePlanarGrid(2, 2);
-    auto src = std::make_shared<QuadSurface>(pts, cv::Vec2f(1.f, 1.f));
-    // src->meta is default-constructed (null Json); clone should make it {}.
-    auto clone = cloneSurfaceForTransform(src);
-    REQUIRE(clone != nullptr);
-    CHECK(clone->meta.is_object());
 }

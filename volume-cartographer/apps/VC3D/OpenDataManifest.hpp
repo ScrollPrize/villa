@@ -1,14 +1,7 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
-#include <opencv2/core/matx.hpp>
 
 namespace vc3d::opendata {
-inline cv::Matx44d cvMatrix(const vcr::catalog::Affine& matrix)
-{
-    cv::Matx44d result;
-    for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) result(r,c) = matrix(r,c);
-    return result;
-}
 std::filesystem::path cachedOpenDataManifestPath();
 // Optional subset of a sample's resources to attach. Each axis is independent:
 // an absent sub-field means "no filter on that axis". A raw source volume is

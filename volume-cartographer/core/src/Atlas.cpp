@@ -4,7 +4,6 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include "vc/atlas/Atlas.hpp"
-#include "vc/core/types/FiberFrame.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
 
 #include "vc/core/util/Geometry.hpp"
@@ -336,17 +335,13 @@ nlohmann::json storedFiberDocument(const FiberMapping& mapping, const std::strin
                 auto& entry=entries[i];
                 (entry.is_object() ? entry.at("position") : entry)=shown[i];
                 if(!entry.is_object()) continue;
-                const auto vector=[&](const char* name,auto map) {
-                    if(!entry.contains(name)) return;
-                    const auto v=entry.at(name).template get<std::array<double,3>>();
-                    const auto mapped=map(m,cv::Vec3d{v[0],v[1],v[2]});
-                    entry[name]={mapped[0],mapped[1],mapped[2]};
-                };
-                vector("direction",vc::fibers::mapFiberDirection);
-                vector("display_normal",vc::fibers::mapFiberNormal);
+                if(entry.contains("direction"))
+                    entry["direction"]=m.mapDirection(entry.at("direction").template get<std::array<double,3>>());
+                if(entry.contains("display_normal"))
+                    entry["display_normal"]=m.mapNormal(entry.at("display_normal").template get<std::array<double,3>>());
             }
         }
-        if (result.contains("width")) result["width"]=vc::fibers::mapFiberWidth(m,result["width"].get<double>());
+        if (result.contains("width")) result["width"]=result["width"].get<double>()*m.lengthScale();
         result.erase("coordinate_base_shape_zyx");
         result["coordinates"]=vc::objects::geometryCoordinates({{"volume_uuid",volume},{"scale_factor",1}});
     });

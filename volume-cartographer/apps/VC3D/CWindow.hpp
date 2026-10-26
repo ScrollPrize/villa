@@ -350,7 +350,7 @@ private slots:
     void rememberCurrentVolumeForPackage(const QString& volumeId) const;
     const vcr::catalog::OpenDataManifest* cachedOpenDataManifest() const;
     // Volume coordinates of `from` in `to` when switching volumes, when the two are related.
-    std::optional<cv::Matx44d> volumeTransformForSwitch(const std::string& from, const std::string& to) const;
+    std::optional<vcr::catalog::Affine> volumeTransformForSwitch(const std::string& from, const std::string& to) const;
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);

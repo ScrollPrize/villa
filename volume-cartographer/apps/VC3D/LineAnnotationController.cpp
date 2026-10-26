@@ -386,6 +386,18 @@ struct LineAnnotationController::IntersectionInspectionSession {
 
 namespace {
 
+// Fiber control-point directions and display normals between frames.
+cv::Vec3d mapDirection(const vc::objects::VolumeAffine& m, const cv::Vec3d& d)
+{
+    const auto r = m.mapDirection({d[0], d[1], d[2]});
+    return {r[0], r[1], r[2]};
+}
+cv::Vec3d mapNormal(const vc::objects::VolumeAffine& m, const cv::Vec3d& n)
+{
+    const auto r = m.mapNormal({n[0], n[1], n[2]});
+    return {r[0], r[1], r[2]};
+}
+
 // A fiber's sampled line in the frame its controls were read in: the open
 // volume's voxels through the store's view, else stored coordinates.
 std::vector<vc::geometry::Point> storedFiberLinePoints(
@@ -17414,7 +17426,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 for (const auto* key : {"coordinates", "coordinate_binding"})
                     if (metadata.contains(key)) fiber.coordinateIdentity[key] = metadata.at(key);
                 if (object.fiber) {
-                    fiber.width = fiber.frame ? vc::fibers::mapFiberWidth(fiber.frame->storedToVolume, object.fiber->width)
+                    fiber.width = fiber.frame ? object.fiber->width * fiber.frame->storedToVolume.lengthScale()
                                               : object.fiber->width;
                     fiber.widthGapFraction = object.fiber->widthGapFraction;
                     if (!object.fiber->optimizationMode.empty())
@@ -17436,8 +17448,8 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     cp.storeId = geometry.controlPointIds.at(i);
                     if (fiber.frame) {
                         const auto& m = fiber.frame->storedToVolume;
-                        if (cp.direction) cp.direction = vc::fibers::mapFiberDirection(m, *cp.direction);
-                        if (cp.displayNormal) cp.displayNormal = vc::fibers::mapFiberNormal(m, *cp.displayNormal);
+                        if (cp.direction) cp.direction = mapDirection(m, *cp.direction);
+                        if (cp.displayNormal) cp.displayNormal = mapNormal(m, *cp.displayNormal);
                     }
                     fiber.controlPoints.push_back(std::move(cp));
                 }
@@ -17507,7 +17519,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     // Anchor directions are in each fiber's stored frame.
                     const auto direction = [](const StoredFiber& fiber, const Anchor& anchor) {
                         const cv::Vec3d d{(*anchor.direction)[0], (*anchor.direction)[1], (*anchor.direction)[2]};
-                        return fiber.frame ? vc::fibers::mapFiberDirection(fiber.frame->storedToVolume, d) : d;
+                        return fiber.frame ? mapDirection(fiber.frame->storedToVolume, d) : d;
                     };
                     branch.controlPointDirection = direction(local, own);
                     branch.branchControlPointDirection = direction(target, other);
@@ -17649,12 +17661,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 for (size_t i = 0; i < stored.controlPoints.size(); ++i) {
                     auto& cp = stored.controlPoints[i];
                     cp[0] = canonical.controlPoints[i][0]; cp[1] = canonical.controlPoints[i][1]; cp[2] = canonical.controlPoints[i][2];
-                    if (cp.direction) cp.direction = vc::fibers::mapFiberDirection(inverse, *cp.direction);
-                    if (cp.displayNormal) cp.displayNormal = vc::fibers::mapFiberNormal(inverse, *cp.displayNormal);
+                    if (cp.direction) cp.direction = mapDirection(inverse, *cp.direction);
+                    if (cp.displayNormal) cp.displayNormal = mapNormal(inverse, *cp.displayNormal);
                 }
                 for (size_t i = 0; i < stored.linePoints.size(); ++i)
                     stored.linePoints[i] = {canonical.linePoints[i][0], canonical.linePoints[i][1], canonical.linePoints[i][2]};
-                stored.width = vc::fibers::mapFiberWidth(inverse, fiber.width);
+                stored.width = fiber.width * inverse.lengthScale();
                 stored.hvClassification = vc3d::line_annotation::classifyFiberHv(
                     vc3d::line_annotation::storedControlPointPositions(stored.controlPoints));
                 // The object keeps the frame it was created in.
@@ -17735,7 +17747,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 auto anchor = [&](const StoredFiber& fiber, int index, const cv::Vec3d& shown) {
                     const auto& stored = inStoredFrame(fiber);
                     const auto direction = fiber.frame
-                        ? vc::fibers::mapFiberDirection(fiber.frame->storedToVolume.inverse(), shown) : shown;
+                        ? mapDirection(fiber.frame->storedToVolume.inverse(), shown) : shown;
                     Anchor a;
                     const auto& cp = stored.controlPoints.at(index);
                     a.position = {cp[0],cp[1],cp[2]}; a.direction = {direction[0],direction[1],direction[2]};

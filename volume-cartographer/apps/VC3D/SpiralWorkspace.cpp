@@ -1863,7 +1863,7 @@ QComboBox* SpiralWorkspace::volumeSelectionControl() const
 
 void SpiralWorkspace::synchronizeVolume(
     const std::shared_ptr<Volume>& volume,
-    const std::optional<cv::Matx44d>& navigationTransform)
+    const std::optional<vcr::catalog::Affine>& navigationTransform)
 {
     const auto package = _mainState ? _mainState->vpkg() : nullptr;
     if (_state->vpkg() != package) {

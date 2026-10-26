@@ -870,8 +870,6 @@ vc_add_test(NAME test_tiff_more)
 
 vc_add_test(NAME test_geometry)
 
-vc_add_test(NAME test_affine_transform)
-
 vc_add_test(NAME test_point_index)
 
 vc_add_test(NAME test_plane_surface)
@@ -956,7 +954,7 @@ vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
-vc_add_test(NAME test_affine_transform_surface)
+vc_add_test(NAME test_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
 vc_add_test(NAME test_quadsurface_smooth)

@@ -15,6 +15,7 @@
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "utils/Json.hpp"
 #include "utils/http_fetch.hpp"
+#include <vc_reader/affine.hpp>
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -43,6 +44,7 @@
 
 namespace po = boost::program_options;
 using Json = utils::Json;
+using Affine = vcr::catalog::Affine;
 
 // ============================================================
 // Logging infrastructure
@@ -108,74 +110,7 @@ static void stopLogFlusher()
 // Affine transform utilities
 // ============================================================
 
-struct AffineTransform {
-    cv::Mat_<double> matrix = cv::Mat_<double>::eye(4, 4);
-};
-
-static bool invertAffineInPlace(AffineTransform& T)
-{
-    cv::Mat A(3, 3, CV_64F), Ainv;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            A.at<double>(r, c) = T.matrix(r, c);
-    if (cv::invert(A, Ainv, cv::DECOMP_LU) < 1e-10) return false;
-
-    cv::Matx33d Ai;
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c)
-            Ai(r, c) = Ainv.at<double>(r, c);
-    cv::Vec3d t(T.matrix(0,3), T.matrix(1,3), T.matrix(2,3));
-    cv::Vec3d ti = -(Ai * t);
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) T.matrix(r, c) = Ai(r, c);
-        T.matrix(r, 3) = ti(r);
-    }
-    T.matrix(3,0) = T.matrix(3,1) = T.matrix(3,2) = 0.0;
-    T.matrix(3,3) = 1.0;
-    return true;
-}
-
-static AffineTransform loadAffineTransform(const std::string& filename)
-{
-    AffineTransform transform;
-    std::ifstream file(filename);
-    if (!file.is_open())
-        throw std::runtime_error("Cannot open affine transform file: " + filename);
-    try {
-        Json j = Json::parse_file(filename);
-        if (j.contains("transformation_matrix")) {
-            auto mat = j["transformation_matrix"];
-            if (mat.size() != 3 && mat.size() != 4)
-                throw std::runtime_error("Affine matrix must have 3 or 4 rows");
-            for (int row = 0; row < (int)mat.size(); row++) {
-                if (mat[row].size() != 4)
-                    throw std::runtime_error("Each row must have 4 elements");
-                for (int col = 0; col < 4; col++)
-                    transform.matrix(row, col) = mat[row][col].get_double();
-            }
-            if (mat.size() == 4) {
-                if (std::abs(transform.matrix(3,0)) > 1e-12 ||
-                    std::abs(transform.matrix(3,1)) > 1e-12 ||
-                    std::abs(transform.matrix(3,2)) > 1e-12 ||
-                    std::abs(transform.matrix(3,3) - 1.0) > 1e-12)
-                    throw std::runtime_error("Bottom affine row must be [0,0,0,1]");
-            }
-        }
-    } catch (const std::exception&) {
-        throw std::runtime_error("Error parsing affine transform file: " + filename);
-    }
-    return transform;
-}
-
-static AffineTransform composeAffine(const AffineTransform& A, const AffineTransform& B)
-{
-    AffineTransform R;
-    cv::Mat tmp = B.matrix * A.matrix;
-    tmp.copyTo(R.matrix);
-    return R;
-}
-
-static void printMat4x4(const cv::Mat_<double>& M, const char* header)
+static void printMat4x4(const Affine& M, const char* header)
 {
     if (header) logPrintf(stdout, "%s\n", header);
     for (int r = 0; r < 4; ++r) {
@@ -198,43 +133,26 @@ static std::pair<std::string, bool> parseAffineSpec(const std::string& spec)
 // Geometry helpers
 // ============================================================
 
-static cv::Vec3f applyAffineToPoint(const cv::Vec3f& pt, const AffineTransform& T)
-{
-    double x = pt[0], y = pt[1], z = pt[2];
-    return cv::Vec3f(
-        float(T.matrix(0,0)*x + T.matrix(0,1)*y + T.matrix(0,2)*z + T.matrix(0,3)),
-        float(T.matrix(1,0)*x + T.matrix(1,1)*y + T.matrix(1,2)*z + T.matrix(1,3)),
-        float(T.matrix(2,0)*x + T.matrix(2,1)*y + T.matrix(2,2)*z + T.matrix(2,3)));
-}
-
 static void applyAffineTransform(cv::Mat_<cv::Vec3f>& points,
                                   cv::Mat_<cv::Vec3f>& normals,
-                                  const AffineTransform& T)
+                                  const Affine& T)
 {
-    cv::Matx33d A(T.matrix(0,0), T.matrix(0,1), T.matrix(0,2),
-                  T.matrix(1,0), T.matrix(1,1), T.matrix(1,2),
-                  T.matrix(2,0), T.matrix(2,1), T.matrix(2,2));
-    cv::Matx33d invAT = A.inv().t();
+    const auto normalTransform = T.normalTransform();
 
     for (int y = 0; y < points.rows; y++)
         for (int x = 0; x < points.cols; x++) {
             cv::Vec3f& pt = points(y, x);
             if (std::isnan(pt[0])) continue;
-            pt = applyAffineToPoint(pt, T);
+            const auto q = T.apply({pt[0], pt[1], pt[2]});
+            pt = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
         }
 
     for (int y = 0; y < normals.rows; y++)
         for (int x = 0; x < normals.cols; x++) {
             cv::Vec3f& n = normals(y, x);
             if (std::isnan(n[0])) continue;
-            double nx = invAT(0,0)*n[0] + invAT(0,1)*n[1] + invAT(0,2)*n[2];
-            double ny = invAT(1,0)*n[0] + invAT(1,1)*n[1] + invAT(1,2)*n[2];
-            double nz = invAT(2,0)*n[0] + invAT(2,1)*n[1] + invAT(2,2)*n[2];
-            const double len2 = nx*nx + ny*ny + nz*nz;
-            if (len2 > 0) {
-                const double invLen = 1.0 / std::sqrt(len2);
-                n = cv::Vec3f(float(nx*invLen), float(ny*invLen), float(nz*invLen));
-            }
+            const auto q = normalTransform.mapDirection({n[0], n[1], n[2]});
+            n = cv::Vec3f(float(q[0]), float(q[1]), float(q[2]));
         }
 }
 
@@ -296,7 +214,7 @@ static void genTile(QuadSurface* surf, const cv::Size& size, float render_scale,
 
 static void prepareBaseAndDirs(const cv::Mat_<cv::Vec3f>& pts, const cv::Mat_<cv::Vec3f>& nrm,
                                 float scale_seg, float ds_scale,
-                                bool hasAffine, const AffineTransform& aff,
+                                bool hasAffine, const Affine& aff,
                                 cv::Mat_<cv::Vec3f>& base, cv::Mat_<cv::Vec3f>& dirs)
 {
     base = pts.clone(); base *= scale_seg;
@@ -505,7 +423,7 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
     float scaleSeg,
     float dsScale,
     bool hasAffine,
-    const AffineTransform& aff,
+    const Affine& aff,
     uint32_t rowStart,
     uint32_t rowEnd,
     uint32_t bandH,
@@ -616,7 +534,7 @@ static void renderBands(
     vc::render::IChunkedArray* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
-    bool hasAffine, const AffineTransform& aff,
+    bool hasAffine, const Affine& aff,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -766,7 +684,7 @@ static void renderTiles(
     vc::render::IChunkedArray* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
-    bool hasAffine, const AffineTransform& aff,
+    bool hasAffine, const Affine& aff,
     int numSlices, double sliceStep,
     const std::vector<float>& accumOffsets, AccumType accumType,
     bool isComposite, int compositeStart, int compositeEnd,
@@ -1550,7 +1468,7 @@ int main(int argc, char *argv[])
     const bool quickTif = parsed["quick-tif"].as<bool>();
 
     // --- Load affines ---
-    AffineTransform affineTransform;
+    Affine affineTransform;
     bool hasAffine = false;
     std::vector<std::pair<std::string,bool>> affineSpecs;
     if (parsed.count("affine"))
@@ -1565,19 +1483,18 @@ int main(int argc, char *argv[])
         for (int k = 0; k < int(affineSpecs.size()); k++) if (inv.count(k)) affineSpecs[k].second = true;
     }
     if (!affineSpecs.empty()) {
-        AffineTransform composed;
+        Affine composed;
         for (int k = 0; k < int(affineSpecs.size()); k++) {
             auto& [path, inv] = affineSpecs[k];
             try {
-                auto T = loadAffineTransform(path);
+                auto T = Affine::loadTransformJson(path);
                 logPrintf(stdout, "Loaded affine[%d]: %s%s\n", k, path.c_str(), inv ? " (invert)" : "");
-                if (inv && !invertAffineInPlace(T)) { logPrintf(stderr, "Error: non-invertible affine[%d]\n", k); return EXIT_FAILURE; }
-                composed = composeAffine(composed, T);
+                composed = (inv ? T.inverse() : T) * composed;
             } catch (const std::exception& e) { logPrintf(stderr, "Error loading affine[%d]: %s\n", k, e.what()); return EXIT_FAILURE; }
         }
         hasAffine = true;
         affineTransform = composed;
-        printMat4x4(affineTransform.matrix, "Final composed affine:");
+        printMat4x4(affineTransform, "Final composed affine:");
     }
 
     // Resolved below from the same CLI/metadata value used for OME-Zarr.
@@ -1845,14 +1762,7 @@ int main(int argc, char *argv[])
         cv::Size full_size = raw_points->size();
 
         // Compute render scale
-        double sA = 1.0;
-        if (hasAffine) {
-            cv::Matx33d A(affineTransform.matrix(0,0), affineTransform.matrix(0,1), affineTransform.matrix(0,2),
-                          affineTransform.matrix(1,0), affineTransform.matrix(1,1), affineTransform.matrix(1,2),
-                          affineTransform.matrix(2,0), affineTransform.matrix(2,1), affineTransform.matrix(2,2));
-            double d = cv::determinant(cv::Mat(A));
-            if (std::isfinite(d) && std::abs(d) > 1e-18) sA = std::cbrt(std::abs(d));
-        }
+        const double sA = hasAffine ? affineTransform.lengthScale() : 1.0;
         double render_scale = double(tgt_scale) * (double(scale_seg) * sA * double(ds_scale));
 
         {
