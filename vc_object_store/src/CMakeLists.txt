@@ -60,6 +60,7 @@ add_library(vc_objects ${_vc_store_library_type}
     GeometryRegion.cpp
     SurfaceProximity.cpp
     ObjectCopy.cpp
+    VolumeUmbilicus.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     sync/Apply.cpp

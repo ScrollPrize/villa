@@ -1,6 +1,8 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/VolumeUmbilicus.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <iostream>
 using namespace vc::objects;
@@ -141,6 +143,40 @@ int main() try {
          auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
         auto read=db.read();
         require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
+    }
+    {
+        // A volume's one umbilicus, read in its voxels; importing another replaces it.
+        ObjectRecord first;first.kind="umbilicus";first.name="first";first.uuid=vc::objects::util::newUuid();
+        first.meta=R"({"coordinates":{"volume_uuid":"c","scale_factor":2}})";
+        vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
+        {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
+        {
+            auto read=db.read();const auto found=volumeUmbilicus(db,read,"c");
+            require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
+                    "the volume's umbilicus in its voxels");
+            require(!volumeUmbilicus(db,read,"d"),"a volume without one has none");
+        }
+        auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
+        RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
+        require(pins.size()==1&&pins.contains(first.uuid),"the replacement pins the umbilicus it replaces");
+        pins[second.uuid]=std::nullopt;
+        {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
+        {
+            auto read=db.read();
+            require(volumeUmbilicus(db,read,"c")->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
+                    "importing replaces the volume's umbilicus");
+        }
+        auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
+        elsewhere.meta=R"({"coordinates":{"volume_uuid":"d","scale_factor":1}})";
+        bool refused=false;
+        try{auto txn=db.write({{elsewhere.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",elsewhere,u);}
+        catch(const std::invalid_argument&){refused=true;}
+        require(refused,"an umbilicus bound elsewhere is not made a volume's umbilicus");
+        auto extra=first;extra.uuid=vc::objects::util::newUuid();
+        {auto txn=db.write();db.upsertObject(txn,extra);db.putGeometry(txn,extra.uuid,vc::geometry::encode(u));txn.commit();}
+        bool several=false;
+        try{auto read=db.read();(void)volumeUmbilicus(db,read,"c");}catch(const std::runtime_error&){several=true;}
+        require(several,"several umbilici for one volume are refused");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
