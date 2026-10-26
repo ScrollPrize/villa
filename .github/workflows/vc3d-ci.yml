@@ -383,11 +383,15 @@ jobs:
             -DCMAKE_Fortran_COMPILER=flang \
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
-            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
+            -DVC_TESTING=ON -DVC_BUILD_APPS=ON \
             -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
           cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
           QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
             --vc3d build/ci-fast-vc3d/bin/VC3D
+          # VC_TESTING compiles VC3D's --test-object-store entry point; the
+          # test shards build without apps, so the controller test runs here.
+          ctest --test-dir build/ci-fast-vc3d --output-on-failure \
+            -R '^object_store_vc3d_controller$'
           sccache --show-stats
 
   cli-compile:
