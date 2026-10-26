@@ -28,7 +28,7 @@ inline void bindCoordinates(vc::objects::ObjectStoreSession& session, const vc::
 {
     const auto assigned = coordinateBindingForVolume(volume, storedUnitsPerVoxel);
     session.editKeepingRelationships(attachment, {{uuid, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
-        for (const auto* key : {"coordinates", "coordinate_binding"}) db.setMeta(txn, uuid, key, assigned.at(key).dump());
+        db.bindGeometryCoordinates(txn, uuid, assigned.at("coordinates"), assigned.at("coordinate_binding"));
         db.keepRecordedRelationshipsOf(txn, uuid);
     });
 }
