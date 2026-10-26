@@ -94,3 +94,38 @@ def test_renumbering_refuses_documents_with_point_links(tmp_path):
         report = store.ingest_geometry_source("point_collection", source, uuid_namespace=NAMESPACE,
                                               renumber_point_ids=True)
         assert report["ingested"] == 0 and "point links" in " ".join(report["problems"]), report
+
+
+def test_v3_pending_auto_branches_survive_shared_reconciliation(tmp_path):
+    from test_derived_uuids import edit_v3_fiber
+
+    directory = tmp_path / "fibers"
+    names = write_v3_fibers(directory)
+    for name in names:
+        edit_v3_fiber(directory, name, lambda document: document["branches"][0].update(pending=True, auto=True))
+    # The shared importer must tolerate separately computed directions without
+    # dropping the reciprocal declaration before checking upstream's auto flag.
+    edit_v3_fiber(directory, names[1], lambda document: document["branches"][0].update(
+        control_point_direction=[0, 1 + 2.0**-52, 0]))
+    with ObjectStore.create(str(tmp_path / "auto.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+        [edge] = store.edges_by_kind("fiber_branch")
+        assert edge["approval_state"] == "pending" and edge["meta"]["auto"] is True
+        exported = tmp_path / "exported"
+        exported.mkdir()
+        for name in names:
+            store.export_geometry(derived("fiber:" + name), exported / (name + ".json"))
+            document = json.loads((exported / (name + ".json")).read_text())
+            assert document["branches"][0]["pending"] is True
+            assert document["branches"][0]["auto"] is True
+    with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", exported)
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+        [restored] = store.edges_by_kind("fiber_branch")
+        assert restored["uuid"] == edge["uuid"] and restored["meta"]["auto"] is True
+    edit_v3_fiber(directory, names[1], lambda document: document["branches"][0].update(auto=False))
+    with ObjectStore.create(str(tmp_path / "conflict.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        assert "conflicting reciprocal fiber branch declarations" in " ".join(report["problems"])
+        assert store.object_count("fiber") == 0
