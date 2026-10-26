@@ -2040,6 +2040,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
             if (!_state->objectStoreSession()->current(event.attachment)) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
+            _storedFiberDecodeCache.clear();
             refreshChangedStoreFibers();
             emit fibersChanged();
         });
@@ -4965,7 +4966,12 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
 
 QString LineAnnotationController::fiberHvDirectionTag(uint64_t fiberId) const
 {
-    const auto fiber = readStoredFiber(fiberId);
+    const auto uuid = fiberUuidForId(fiberId);
+    if (uuid.empty()) {
+        return {};
+    }
+    const auto fibers = readStoredFibersCached(std::vector<std::string>{uuid});
+    const auto* fiber = fibers.empty() ? nullptr : &fibers.front();
     if (!fiber) {
         return {};
     }
@@ -16407,7 +16413,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     });
     std::sort(selected.begin(),selected.end());
     selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
-    const auto stored=readStoredFibers(selected,true);
+    const auto stored=readStoredFibersCached(selected,true);
     std::unordered_map<uint64_t,double> factors;
     for(const auto& fiber:stored) if(const auto scale=storedFiberScale(fiber)) factors[fiber.id]=*scale/sourceScale;
     for(const auto& open:_panes) if(open.session && open.session->fiberId!=0)
@@ -18383,6 +18389,42 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     return readStoredFibers(uuids, lines);
 }
 
+std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersCached(
+    const std::vector<std::string>& uuids, bool lines) const
+{
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    const auto attachment = connection ? connection->attachment() : std::nullopt;
+    if (!attachment || uuids.empty()) return readStoredFibers(uuids, lines);
+    // Same filter and order as readStoredFibers: requested order, first
+    // occurrence, live fibers only.
+    std::vector<std::pair<std::string, uint64_t>> live;
+    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        std::set<std::string> seen;
+        for (const auto& uuid : uuids) if (auto object = db.objectByUuid(txn, uuid)) {
+            if (object->kind == "fiber" && !object->retired && seen.insert(object->uuid).second)
+                live.emplace_back(object->uuid, object->generation);
+        }
+    });
+    std::vector<std::string> missing;
+    for (const auto& [uuid, generation] : live) {
+        const auto cached = _storedFiberDecodeCache.find(uuid);
+        if (cached == _storedFiberDecodeCache.end() || cached->second.generation != generation ||
+            (lines && !cached->second.linePointsLoaded))
+            missing.push_back(uuid);
+    }
+    if (!missing.empty())
+        for (auto& fiber : readStoredFibers(missing, lines)) {
+            auto uuid = fiber.uuid;
+            _storedFiberDecodeCache.insert_or_assign(std::move(uuid), std::move(fiber));
+        }
+    std::vector<StoredFiber> result;
+    result.reserve(live.size());
+    for (const auto& [uuid, generation] : live)
+        if (const auto cached = _storedFiberDecodeCache.find(uuid); cached != _storedFiberDecodeCache.end())
+            result.push_back(cached->second);
+    return result;
+}
+
 std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFiber(
     uint64_t id, bool lines) const
 {
@@ -18399,6 +18441,7 @@ void LineAnnotationController::resetStoreDerivedState()
     _linkCandidate.reset();
     _controlSpanCache.clear();
     _sideStripStoredSnapshotCache.clear(); _sideStripSessionSnapshotCache.clear();
+    _storedFiberDecodeCache.clear();
     _fiberAlignmentMetrics.clear(); _pendingFiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetricTokens.clear(); ++_nextFiberAlignmentMetricToken;
     ++_fiberDataGeneration; ++_fiberMetricsGeneration; _fiberMetricsPending = false;
