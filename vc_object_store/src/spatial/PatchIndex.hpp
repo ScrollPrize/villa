@@ -11,7 +11,14 @@ public:
     using SurfacePtr=std::shared_ptr<PatchGrid>;
     struct SurfaceFilter {const std::unordered_set<PatchGrid*>* includeRaw=nullptr;};
     struct PointQuery {cv::Vec3f worldPoint;float tolerance=1;SurfaceFilter surfaces;};
-    struct LookupResult {SurfacePtr surface; cv::Vec2f grid; float distance;};
+    struct LookupResult {
+        SurfacePtr surface;
+        cv::Vec2f grid;
+        float distance;
+        // Winning quad (column, row). floor(grid) can name a different,
+        // invalid quad when the closest point lies on a shared boundary.
+        cv::Vec2i cell;
+    };
     void rebuild(const std::vector<SurfacePtr>& surfaces);
     std::vector<LookupResult> locateAll(const PointQuery&) const;
     std::optional<LookupResult> locate(const PointQuery&) const;

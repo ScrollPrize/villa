@@ -908,9 +908,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 if (hit) {
                     const auto grid = hit->grid;
                     evidence["patch_grid"] = {grid[0], grid[1]};
-                    const auto* points = patch.surface->quad->rawPointsPtr();
-                    const int row = std::clamp(int(std::floor(grid[1])), 0, points->rows - 2);
-                    const int col = std::clamp(int(std::floor(grid[0])), 0, points->cols - 2);
+                    const int row = hit->cell[1], col = hit->cell[0];
                     c.bAnchor.points = {{"points", {row, col}}, {"points", {row, col+1}},
                                         {"points", {row+1, col}}, {"points", {row+1, col+1}}};
                 }

@@ -411,9 +411,8 @@ snapshot APIs rather than rebuilding them in the fitter.
    must already hold before step 11 deletes the obsolete implementations.
    Test two-rank success/failure and manifest agreement, no-refresh read-only
    operation, approved-only filtering, non-unit external/track scales, and
-   resume mismatch rejection. Include a real-data startup smoke test; investigate
-   the existing PCL refresh invalid-point failure rather than treating the
-   synthetic adapter tests as proof that dataset refresh works.
+   resume mismatch rejection. Include a real-data startup smoke test rather than
+   treating the synthetic adapter tests as proof that dataset refresh works.
 11. **Fitter: remove obsolete ingestion and linking.** Delete filesystem
     patch/fiber/PCL loaders, proximity linking, side filtering, relinking paths,
     and all then-unused helpers, options, tests and documentation. Retain no

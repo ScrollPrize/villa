@@ -113,3 +113,37 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     edits = [dict(array="points", element_offset=0, data=geometry["arrays"][0]["data"])]
     db.edit_geometry(collection, edits, db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(collection, edits, db.current_geometry(collection)["uuid"])])
     assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 0
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_pcl_boundary_hit_keeps_the_valid_source_cell(db, transpose):
+    # Real failure: same_windings.json/same_wrap14, point 975, against
+    # verified_patches/0000_low_band_final, rows 74:77, columns 643:645.
+    # The nearest point lies at row 75, on the last valid quad's upper edge.
+    # floor(hit.grid) instead selects row 75's quad, whose next row is invalid.
+    points = np.array([
+        [[3833.2333984375, 2990.1953125, 8788.232421875],
+         [3844.4677734375, 2974.294677734375, 8788.4228515625]],
+        [[3834.103759765625, 2990.941162109375, 8808.251953125],
+         [3844.956787109375, 2974.7509765625, 8808.44140625]],
+        [[-1, -1, -1], [-1, -1, -1]],
+    ], dtype=np.float32)
+    if transpose:
+        points = points.transpose(1, 0, 2)
+    patch, _ = put(db, "patch", [array("points", points, "<f4")], {"scale": [0.05, 0.05]})
+    collection, _ = put(db, "point_collection", [
+        array("points", [[3842.944091796875, 2978.4453125, 8808.6533203125]], "<f8"),
+        array("point_ids", [975], "<i8"),
+    ])
+    report = db.link_point_collections_to_patches()
+    assert not report["failed"] and report["edges_created"] == 1
+    [edge] = db.edges_of(collection)
+    anchor = edge["a_anchor"] if edge["a"] == patch else edge["b_anchor"]
+    assert edge["meta"]["point_collection_patch"]["ij"][int(transpose)] == 1.0
+    for ref in anchor["points"]:
+        assert (points[tuple(ref["index"])] != -1).all()
+    assert np.linalg.norm(np.asarray(anchor["position"]) -
+                          [3842.944091796875, 2978.4453125, 8808.6533203125]) < 2.5
+    assert not db.edge_geometry_state(edge["uuid"])["stale"]
+    assert not db.link_point_collections_to_patches()["failed"]
+    assert len(db.edges_of(collection)) == 1

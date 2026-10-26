@@ -146,11 +146,11 @@ std::set<size_t> betweenTargets(const std::string& name, const std::map<std::str
     return {}; // Spiral falls back to the general policy if either name is absent.
 }
 
-std::array<double, 3> projection(const Patch& patch, double row, double col, double patchScale)
+std::array<double, 3> projection(const Patch& patch, const PatchIndex::LookupResult& hit, double patchScale)
 {
     const auto& points = *patch.surface->rawPointsPtr();
-    const int r = std::clamp(int(std::floor(row)), 0, points.rows - 2);
-    const int c = std::clamp(int(std::floor(col)), 0, points.cols - 2);
+    const int r = hit.cell[1], c = hit.cell[0];
+    const double row = hit.grid[1], col = hit.grid[0];
     const float dr = std::clamp(float(row - r), 0.0f, 1.0f), dc = std::clamp(float(col - c), 0.0f, 1.0f);
     const auto p00 = points(r, c), p10 = points(r, c + 1), p01 = points(r + 1, c), p11 = points(r + 1, c + 1);
     const auto foot = dr + dc <= 1 ? p00 + dc * (p10 - p00) + dr * (p01 - p00)
@@ -234,10 +234,8 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
             candidate.aUuid = collection.object.uuid; candidate.bUuid = patch.object.uuid;
             candidate.aAnchor.points.push_back({"point_ids", {point.id}});
             candidate.aAnchor.position = point.source;
-            candidate.bAnchor.position = projection(patch, row, col, patch.sourceScale);
-            const auto& grid = *patch.surface->rawPointsPtr();
-            const int r = std::clamp(int(std::floor(row)), 0, grid.rows - 2);
-            const int c = std::clamp(int(std::floor(col)), 0, grid.cols - 2);
+            candidate.bAnchor.position = projection(patch, hit, patch.sourceScale);
+            const int r = hit.cell[1], c = hit.cell[0];
             const double dr = std::clamp(row - r, 0.0, 1.0), dc = std::clamp(col - c, 0.0, 1.0);
             candidate.bAnchor.points = dr + dc <= 1
                 ? std::vector<objects::PointReference>{{"points", {r, c}}, {"points", {r, c+1}}, {"points", {r+1, c}}}

@@ -174,7 +174,7 @@ std::vector<PatchIndex::LookupResult> PatchIndex::locateAll(const PointQuery& qu
                     if (hit.distSq >= current.distanceSquared) continue;
                     const float u = std::clamp(t ? hit.bary[0] + hit.bary[1] : hit.bary[1], 0.f, 1.f);
                     const float v = std::clamp(t ? hit.bary[1] + hit.bary[2] : hit.bary[2], 0.f, 1.f);
-                    current = {LookupResult{surface, {c + u, r + v}, std::sqrt(hit.distSq)}, hit.distSq};
+                    current = {LookupResult{surface, {c + u, r + v}, std::sqrt(hit.distSq), {c, r}}, hit.distSq};
                 }
             }
         }
