@@ -1,0 +1,508 @@
+"""Fit inputs read from a vc_object_store database.
+
+Patches, fibers and point collections (PCLs), and the relationships between
+them, come from one object store. This module turns a selection of them into
+the fitter's runtime inputs in three stages:
+
+1. Snapshot extraction (read_snapshot): resolve object selectors to explicit
+   UUID sets, read every selected object, its geometry revision and the
+   relationships between selected objects in one read view, and filter the
+   relationships by applicability, approval and semantics.
+2. Frame conversion (ObjectFrame): every selected object declares its frame in
+   ``meta.coordinates``; geometry and anchors convert once from stored XYZ to
+   ZYX voxels of one reference volume, the only units the fitter uses.
+3. Runtime materialization: patches, PCL and fiber constraints built from the
+   frozen snapshot (materialize_* below).
+
+The store's automatic detectors are authoritative: their relationships are
+consumed as they are, never relinked by proximity here.
+
+    python object_store_inputs.py STORE.vcobj [--volume V] [--json OUT]
+
+prints the constraints-only report of a selection without training.
+"""
+import argparse
+import dataclasses
+import hashlib
+import json
+import sys
+from collections import Counter
+
+import numpy as np
+
+KINDS = ('patch', 'point_collection', 'fiber')
+KIND_LABELS = {'patch': 'patches', 'point_collection': 'point collections',
+               'fiber': 'fibers'}
+
+# Relationship families the fitter consumes, keyed by (edge kind, endpoint
+# kinds in KINDS order). Patch overlaps and fiber-patch contacts share the
+# detectors' 'same-surface' edge kind and differ by endpoint kinds.
+FAMILIES = {
+    ('point-patch', ('patch', 'point_collection')): 'pcl_patch',
+    ('same-surface', ('patch', 'fiber')): 'fiber_patch',
+    ('same-surface', ('patch', 'patch')): 'patch_overlap',
+    ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
+}
+
+# The coordinates the fitter works in, recorded with every provenance.
+FIT_UNITS = 'reference-volume voxels (ZYX)'
+
+
+class ObjectStoreInputError(ValueError):
+    """A selection, frame or relationship the fitter cannot consume."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__('\n'.join(self.problems))
+
+
+@dataclasses.dataclass(frozen=True)
+class Selector:
+    """Selects objects of one kind.
+
+    ``uuids`` and ``tags`` both None selects every active object of the kind
+    with a geometry revision (the default selection). Otherwise the selection
+    is the union of the listed UUIDs, which must exist, be active and have
+    geometry, and the active objects carrying any listed tag. An explicit
+    selector that matches nothing selects nothing.
+    """
+    uuids: tuple = None
+    tags: tuple = None
+
+    @property
+    def is_default(self):
+        return self.uuids is None and self.tags is None
+
+    def describe(self):
+        if self.is_default:
+            return 'all active'
+        parts = []
+        if self.uuids is not None:
+            parts.append(f'{len(self.uuids)} UUID(s)')
+        if self.tags is not None:
+            parts.append(f'tags {list(self.tags)}')
+        return ' + '.join(parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class InputRequest:
+    """What to read: per-kind selectors, the fit volume and the approval policy.
+
+    ``fit_volume_uuid`` None infers the volume from the selected objects'
+    declarations. ``approved_links_only`` consumes only approved
+    relationships; otherwise pending and approved ones are consumed. Rejected
+    relationships are never consumed.
+    """
+    selectors: dict = dataclasses.field(default_factory=dict)
+    fit_volume_uuid: str = None
+    approved_links_only: bool = False
+
+    def selector(self, kind):
+        return self.selectors.get(kind) or Selector()
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectFrame:
+    """One object's frame: stored XYZ = reference-volume XYZ x scale_factor."""
+    volume_uuid: str
+    scale_factor: float
+    # stored -> fit multiplier from the store's shared coordinate helper.
+    to_fit: float
+
+    def xyz_to_fit_zyx(self, xyz, invalid=None):
+        """Stored XYZ (..., 3) -> float32 fit ZYX. Rows where ``invalid`` is
+        True keep the -1 sentinel rather than becoming scaled coordinates."""
+        xyz = np.asarray(xyz, dtype=np.float64)
+        zyx = (xyz[..., ::-1] * self.to_fit).astype(np.float32)
+        if invalid is not None:
+            zyx[np.asarray(invalid, dtype=bool)] = -1.0
+        return zyx
+
+    def grid_scale_to_fit(self, scale):
+        """Patch grid steps per stored unit -> grid steps per fit voxel."""
+        return [float(value) / self.to_fit for value in scale]
+
+
+@dataclasses.dataclass
+class StoredObject:
+    uuid: str
+    kind: str
+    name: str
+    meta: dict
+    tags: list
+    object_revision: str
+    geometry_revision: str
+    frame: ObjectFrame = None
+
+    def provenance(self):
+        return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
+                'object_revision': self.object_revision,
+                'geometry_revision': self.geometry_revision,
+                'scale_factor': self.frame.scale_factor}
+
+
+@dataclasses.dataclass
+class StoredRelationship:
+    """A consumed relationship with endpoints ordered by kind (KINDS order;
+    UUID order between objects of one kind), not by stored order."""
+    uuid: str
+    revision: str
+    kind: str
+    family: str
+    approval_state: str
+    generation: int
+    a: str
+    b: str
+    a_anchor: dict
+    b_anchor: dict
+    meta: dict
+
+    def provenance(self):
+        return {'uuid': self.uuid, 'revision': self.revision,
+                'kind': self.kind, 'family': self.family,
+                'approval_state': self.approval_state,
+                'generation': self.generation}
+
+
+@dataclasses.dataclass
+class InputSnapshot:
+    """The frozen selection: objects, their frames and consumed relationships."""
+    store_path: str
+    store_uuid: str
+    volume_uuid: str
+    volume_source: str
+    request: InputRequest
+    objects: dict
+    relationships: list
+    exclusions: Counter
+    notes: list
+
+    def objects_of(self, kind):
+        return [obj for obj in self.objects.values() if obj.kind == kind]
+
+    def relationships_of(self, family):
+        return [rel for rel in self.relationships if rel.family == family]
+
+    def manifest(self):
+        """Complete input/frame provenance, in stable order."""
+        return {
+            'store': {'path': self.store_path, 'uuid': self.store_uuid},
+            'volume_uuid': self.volume_uuid,
+            'volume_source': self.volume_source,
+            'units': FIT_UNITS,
+            'approved_links_only': self.request.approved_links_only,
+            'selection': {
+                kind: {'selector': dataclasses.asdict(self.request.selector(kind)),
+                       'count': len(self.objects_of(kind))}
+                for kind in KINDS},
+            'objects': [obj.provenance() for obj in self.objects.values()],
+            'relationships': [rel.provenance() for rel in self.relationships],
+            'excluded_relationships': dict(sorted(self.exclusions.items())),
+        }
+
+    def digest(self):
+        """SHA-256 of the manifest without the store's local path."""
+        manifest = self.manifest()
+        manifest['store'] = {'uuid': self.store_uuid}
+        text = json.dumps(manifest, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(text.encode()).hexdigest()
+
+
+def resolve_selector(store, kind, selector):
+    """Explicit sorted UUIDs selected by ``selector`` among active objects."""
+    if selector.is_default:
+        return sorted(record['uuid'] for record in store.select_objects(
+            object_kind=kind, fields=['uuid']))
+    selected = set()
+    problems = []
+    for uuid in selector.uuids or ():
+        record = store.object(uuid)
+        if record is None:
+            problems.append(f'selected {kind} {uuid} does not exist')
+        elif record['kind'] != kind:
+            problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
+        elif record.get('retired'):
+            problems.append(f'selected {kind} {uuid} is retired')
+        else:
+            selected.add(record['uuid'])
+    if problems:
+        raise ObjectStoreInputError(problems)
+    for tag in selector.tags or ():
+        selected.update(record['uuid'] for record in store.select_objects(
+            object_kind=kind, tag=tag, fields=['uuid']))
+    return sorted(selected)
+
+
+def declared_coordinates(meta):
+    """The normalized ``meta.coordinates`` declaration of an object."""
+    from vc_object_store import geometry_coordinates
+    return geometry_coordinates(meta.get('coordinates') or {})
+
+
+def infer_fit_volume(records, configured=None):
+    """Return ``(volume_uuid, 'inferred' | 'configured')``.
+
+    Selected objects declaring different volumes are an error, even when one
+    of them matches a configured volume: a configuration cannot override a
+    conflict or silently drop objects. Without any declaration (including an
+    empty selection) the volume must be configured.
+    """
+    declared = {}
+    for record in records:
+        volume = declared_coordinates(record['meta'])['volume_uuid']
+        if volume is not None:
+            declared.setdefault(volume, []).append(record['uuid'])
+    if len(declared) > 1:
+        raise ObjectStoreInputError([
+            'selected objects declare different volumes: ' + '; '.join(
+                f'{volume} ({len(uuids)} object(s), e.g. {uuids[0]})'
+                for volume, uuids in sorted(declared.items()))])
+    if configured is not None:
+        if declared and configured not in declared:
+            raise ObjectStoreInputError([
+                f'fit volume {configured} does not match the volume '
+                f'{next(iter(declared))} the selected objects declare'])
+        return configured, 'configured'
+    if not declared:
+        raise ObjectStoreInputError([
+            'no selected object declares a volume; configure fit_volume_uuid'])
+    return next(iter(declared)), 'inferred'
+
+
+def object_frame(meta, volume_uuid):
+    """The object's ObjectFrame in ``volume_uuid``; raises ValueError when its
+    frame is unknown, invalid or in another volume."""
+    from vc_object_store import geometry_scale_to_frame, resolve_geometry_coordinates
+    coordinates = resolve_geometry_coordinates(meta, volume_uuid)
+    return ObjectFrame(volume_uuid, float(coordinates['scale_factor']),
+                       float(geometry_scale_to_frame(meta, volume_uuid)))
+
+
+def _relationship_family(record, kinds):
+    endpoint_kinds = tuple(sorted((kinds[record['a']], kinds[record['b']]),
+                                  key=KINDS.index))
+    family = FAMILIES.get((record['kind'], endpoint_kinds))
+    if family == 'fiber_branch' and (record['meta'] or {}).get('adjacent'):
+        return 'adjacent_branch'
+    return family
+
+
+def _ordered_endpoints(record, kinds):
+    """(a, a_anchor, b, b_anchor) ordered by kind, then UUID."""
+    a, b = record['a'], record['b']
+    key = lambda uuid: (KINDS.index(kinds[uuid]), uuid)
+    if key(b) < key(a):
+        return b, record['b_anchor'], a, record['a_anchor']
+    return a, record['a_anchor'], b, record['b_anchor']
+
+
+def filter_relationships(view_relationships, objects, approved_links_only):
+    """Consumed relationships and exclusion counts.
+
+    A relationship is consumed when both endpoints are selected, it applies
+    to their selected revisions, it belongs to a family the fitter uses and
+    its approval state is allowed (never 'rejected'; only 'approved' in
+    approved-only mode). Adjacent fiber branches are excluded explicitly.
+    """
+    kinds = {uuid: obj.kind for uuid, obj in objects.items()}
+    consumed, exclusions = [], Counter()
+    for entry in view_relationships:
+        record = entry['record']
+        if record['a'] not in kinds or record['b'] not in kinds:
+            exclusions['endpoint outside selection'] += 1
+            continue
+        if not entry['applicable']:
+            exclusions['inapplicable'] += 1
+            continue
+        family = _relationship_family(record, kinds)
+        if family is None:
+            exclusions[f'unused kind {record["kind"]}'] += 1
+            continue
+        if family == 'adjacent_branch':
+            exclusions['adjacent fiber branch'] += 1
+            continue
+        state = record['approval_state']
+        if state == 'rejected':
+            exclusions['rejected'] += 1
+            continue
+        if approved_links_only and state != 'approved':
+            exclusions[f'{state} (approved-only)'] += 1
+            continue
+        a, a_anchor, b, b_anchor = _ordered_endpoints(record, kinds)
+        consumed.append(StoredRelationship(
+            uuid=record['uuid'], revision=entry['uuid'], kind=record['kind'],
+            family=family, approval_state=state,
+            generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
+            b_anchor=b_anchor, meta=record['meta'] or {}))
+    consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
+    return consumed, exclusions
+
+
+def read_snapshot(store, request):
+    """Resolve, validate and freeze one selection of the store.
+
+    Selectors resolve to explicit UUID sets before any volume filter, so
+    conflicting frame declarations among selected objects are seen and fail.
+    Every selected object must declare a frame in the fit volume; all frame
+    problems are reported together.
+    """
+    uuids = {kind: resolve_selector(store, kind, request.selector(kind))
+             for kind in KINDS}
+    selection = {uuid: None for kind in KINDS for uuid in uuids[kind]}
+    view = store.revision_read_view(selection)
+
+    notes, problems = [], []
+    revisions = {revision['object_uuid']: revision for revision in view['objects']}
+    usable = []
+    for kind in KINDS:
+        without_geometry = []
+        for uuid in uuids[kind]:
+            revision = revisions[uuid]
+            if revision['geometry_revision'] is None:
+                without_geometry.append(uuid)
+            else:
+                usable.append(revision)
+        if not without_geometry:
+            continue
+        if request.selector(kind).is_default:
+            notes.append(f'skipped {len(without_geometry)} {KIND_LABELS[kind]} '
+                         'without geometry')
+        else:
+            problems.extend(f'selected {kind} {uuid} has no geometry'
+                            for uuid in without_geometry)
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    volume_uuid, volume_source = infer_fit_volume(
+        [revision['record'] for revision in usable], request.fit_volume_uuid)
+    objects = {}
+    for revision in usable:
+        record = revision['record']
+        try:
+            frame = object_frame(record['meta'], volume_uuid)
+        except ValueError as error:
+            problems.append(f'{record["kind"]} {record["uuid"]} '
+                            f'({record["name"]!r}): {error}')
+            continue
+        objects[record['uuid']] = StoredObject(
+            uuid=record['uuid'], kind=record['kind'], name=record['name'],
+            meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
+            object_revision=revision['uuid'],
+            geometry_revision=revision['geometry_revision'], frame=frame)
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    relationships, exclusions = filter_relationships(
+        view['relationships'], objects, request.approved_links_only)
+    return InputSnapshot(
+        store_path=store.path, store_uuid=store.uuid, volume_uuid=volume_uuid,
+        volume_source=volume_source, request=request, objects=objects,
+        relationships=relationships, exclusions=exclusions, notes=notes)
+
+
+# ---------------------------------------------------------------------------
+# Geometry reads (pinned by geometry revision, so independent of later heads)
+# ---------------------------------------------------------------------------
+
+def read_geometry(store, geometry_revision, names):
+    """``({name: ndarray}, attributes)`` of an immutable geometry revision."""
+    descriptor = store.geometry_revision(geometry_revision)
+    arrays = {array['name']: array for array in descriptor['arrays']}
+    result = {}
+    for name in names:
+        if name not in arrays:
+            raise ObjectStoreInputError(
+                [f'geometry {geometry_revision} has no {name!r} array'])
+        array = arrays[name]
+        data = store.read_geometry_array(geometry_revision, name)
+        result[name] = np.frombuffer(data, dtype=np.dtype(array['dtype'])).reshape(
+            array['shape'])
+    return result, descriptor['attributes'] or {}
+
+
+def point_annotations(store, geometry_revision, point_ids):
+    """{point id: annotation dict} aligned to the stored point order."""
+    annotations = store.geometry_point_annotations(geometry_revision, 'points')
+    if annotations is None:
+        return {}
+    if len(annotations) != len(point_ids):
+        raise ObjectStoreInputError(
+            [f'geometry {geometry_revision} annotations do not match its points'])
+    return {int(point_id): annotation or {}
+            for point_id, annotation in zip(point_ids, annotations)}
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def snapshot_report(snapshot):
+    """Human-readable lines describing the selection and its relationships."""
+    lines = [
+        f'object store {snapshot.store_path} ({snapshot.store_uuid})',
+        f'fit volume {snapshot.volume_uuid} ({snapshot.volume_source}); '
+        f'units: {FIT_UNITS}',
+    ]
+    for kind in KINDS:
+        objects = snapshot.objects_of(kind)
+        scales = Counter(obj.frame.scale_factor for obj in objects)
+        scale_text = ', '.join(f'{count} at scale {scale:g}'
+                               for scale, count in sorted(scales.items()))
+        lines.append(
+            f'{KIND_LABELS[kind]}: {len(objects)} selected '
+            f'({snapshot.request.selector(kind).describe()})'
+            + (f'; {scale_text}' if scale_text else ''))
+    families = Counter(rel.family for rel in snapshot.relationships)
+    mode = 'approved only' if snapshot.request.approved_links_only else 'pending and approved'
+    lines.append(f'relationships consumed ({mode}): ' + (', '.join(
+        f'{family} {count}' for family, count in sorted(families.items())) or 'none'))
+    if snapshot.exclusions:
+        lines.append('relationships excluded: ' + ', '.join(
+            f'{reason} {count}' for reason, count in sorted(snapshot.exclusions.items())))
+    lines.extend(snapshot.notes)
+    return lines
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('store')
+    parser.add_argument('--volume', help='fit volume UUID (default: inferred)')
+    parser.add_argument('--approved-only', action='store_true')
+    for kind, flag in (('patch', 'patch'), ('point_collection', 'pcl'),
+                       ('fiber', 'fiber')):
+        parser.add_argument(f'--{flag}-uuid', action='append', dest=f'{kind}_uuids')
+        parser.add_argument(f'--{flag}-tag', action='append', dest=f'{kind}_tags')
+    parser.add_argument('--json', help='write the manifest and report here')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    from vc_object_store import ObjectStore
+
+    args = _parse_args(argv)
+    selectors = {}
+    for kind in KINDS:
+        uuids, tags = getattr(args, f'{kind}_uuids'), getattr(args, f'{kind}_tags')
+        selectors[kind] = Selector(
+            tuple(uuids) if uuids is not None else None,
+            tuple(tags) if tags is not None else None)
+    request = InputRequest(selectors, args.volume, args.approved_only)
+    with ObjectStore.open(args.store, read_only=True) as store:
+        try:
+            snapshot = read_snapshot(store, request)
+        except ObjectStoreInputError as error:
+            for problem in error.problems:
+                print(f'error: {problem}', file=sys.stderr)
+            return 1
+        lines = snapshot_report(snapshot)
+    print('\n'.join(lines))
+    if args.json:
+        with open(args.json, 'w') as stream:
+            json.dump({'manifest': snapshot.manifest(),
+                       'digest': snapshot.digest(), 'report': lines},
+                      stream, indent=1)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
