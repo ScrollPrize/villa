@@ -452,6 +452,9 @@ def run_fiber_trace_3d_inference(
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
     product_accumulator_dtype: str = "float16",
+    output_format: str = "compact",
+    blank_invalid: bool = True,
+    width_uint8_base: bool = True,
     provenance_context_path: str | Path | None = None,
     _live_cache: LiveOmeZarrCache | None = None,
 ) -> None:
@@ -468,11 +471,11 @@ def run_fiber_trace_3d_inference(
     config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
-    if not output_manifest.name.endswith(".lasagna.json"):
-        raise ValueError(f"output must be .lasagna.json, got: {output_path}")
+    from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
+    output_manifest, output_format = resolve_output(output_manifest, output_format)
     output_dir = output_manifest.parent
     provenance_path = output_dir / "inference.json"
-    json_stem = output_manifest.name.removesuffix(".lasagna.json")
+    json_stem = output_manifest.name.removesuffix(".lasagna.json").removesuffix(".zarr")
     if not json_stem:
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
@@ -514,8 +517,10 @@ def run_fiber_trace_3d_inference(
     resolved_devices = resolve_inference_devices(device=device, devices=devices)
     torch_device = resolved_devices[0]
 
+    from lasagna.cooperative_inference import enabled as cooperative_enabled
     precision_mode, precision_source = _resolve_inference_precision(
         inference_precision, checkpoint=checkpoint, devices=resolved_devices,
+        validate_devices=not cooperative_enabled(resolved_devices),
     )
     config = dict(config)
     effective_training = dict(config.get("training", {}))
@@ -535,6 +540,7 @@ def run_fiber_trace_3d_inference(
             flush=True,
         )
 
+    from .annotations import AnnotationConfig
     predict_adapter = FiberTrace3DPredictAdapter(
         config,
         checkpoint=checkpoint,
@@ -545,25 +551,43 @@ def run_fiber_trace_3d_inference(
         product_prefix=json_stem,
         zarr_path_prefix=output_dir / json_stem,
         recurrent_steps=recurrent_steps,
+        width_uint8_base=width_uint8_base,
+        input_to_base=input_sd,
+        emit_width="width" in AnnotationConfig.from_mapping(config).names,
     )
-    output_adapter = OmeZarrOutputAdapter(
-        products=predict_adapter.output_products,
-        n_levels=n_levels,
-    )
-    create_product_omezarr_groups(
-        products=predict_adapter.output_products,
-        base_shape_zyx=base_shape_zyx,
-        n_levels=n_levels,
-        ome_chunk=int(ome_chunk),
-        ome_compressor=ome_compressor,
-    )
-    write_lasagna_product_manifest(
-        output_path=output_manifest,
-        products=predict_adapter.output_products,
-        base_shape_zyx=base_shape_zyx,
-        crop_xyzwhd_base=crop_xyzwhd,
-		provenance_json="inference.json",
-    )
+    if output_format == "compact":
+        products = predict_adapter.output_products
+        validity = next(c.name for p in products for c in p.channels if c.name == "presence" or c.name.endswith("_presence"))
+        output_adapter = CompactOutputAdapter(root=output_manifest, products=products, n_levels=n_levels,
+            validity_channel=validity, blank_invalid=blank_invalid)
+        output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=int(ome_chunk),
+            ome_compressor=ome_compressor, crop=crop_xyzwhd,
+            provenance="../inference.json", extra_fields={"width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels"})
+    else:
+        output_adapter = OmeZarrOutputAdapter(
+            products=predict_adapter.output_products,
+            n_levels=n_levels,
+        )
+        output_adapter.blank_invalid = blank_invalid
+        create_product_omezarr_groups(
+            products=predict_adapter.output_products,
+            base_shape_zyx=base_shape_zyx,
+            n_levels=n_levels,
+            ome_chunk=int(ome_chunk),
+            ome_compressor=ome_compressor,
+        )
+        write_lasagna_product_manifest(
+            output_path=output_manifest,
+            products=predict_adapter.output_products,
+            base_shape_zyx=base_shape_zyx,
+            crop_xyzwhd_base=crop_xyzwhd,
+            provenance_json="inference.json",
+        )
+        from lasagna.lasagna_volume import LasagnaVolume
+        manifest = LasagnaVolume.load(output_manifest)
+        manifest.extra_fields.update(width_encoding="uint8-base-voxels" if width_uint8_base else "float32-input-voxels",
+                                     blank_invalid=blank_invalid)
+        manifest.save()
 
     try:
         from inference_provenance import (
@@ -649,6 +673,9 @@ def run_fiber_trace_3d_inference(
             "cuda": torch.version.cuda,
         },
         "manifest": output_manifest.name,
+        "output_format": output_format,
+        "blank_invalid": bool(blank_invalid),
+        "width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels",
     })
     write_provenance(provenance_path, provenance)
 
@@ -670,7 +697,7 @@ def run_fiber_trace_3d_inference(
     t0 = time.time()
     model = None
     try:
-        if len(resolved_devices) == 1:
+        if len(resolved_devices) == 1 and not cooperative_enabled(resolved_devices):
             print(
                 f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
                 flush=True,
@@ -724,13 +751,16 @@ def run_fiber_trace_3d_inference(
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
 
-        build_product_omezarr_pyramids(
-            products=predict_adapter.output_products,
-            n_levels=n_levels,
-            ome_chunk=int(ome_chunk),
-            crop_zyx=output_region,
-            workers=int(pyramid_workers),
-        )
+        if output_format == "compact":
+            output_adapter.build_pyramids(workers=int(pyramid_workers))
+        else:
+            build_product_omezarr_pyramids(
+                products=predict_adapter.output_products,
+                n_levels=n_levels,
+                ome_chunk=int(ome_chunk),
+                crop_zyx=output_region,
+                workers=int(pyramid_workers),
+            )
         removed_finish = _cleanup_predict3d_temp_files(
             output_dir,
             f"{json_stem}_",
@@ -773,7 +803,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Legacy Fiber config JSON; omitted when the checkpoint embeds config.",
     )
     parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
-    parser.add_argument("--output", required=True, help="Output .lasagna.json manifest path.")
+    parser.add_argument("--output", required=True, help="Output compact .zarr store (legacy sidecars remain resumable).")
+    parser.add_argument("--output-format", choices=("compact", "legacy"), default="compact")
+    parser.add_argument("--blank-invalid", action=argparse.BooleanOptionalAction, default=True,
+                        help="Zero other Fiber channels wherever quantized presence is zero.")
+    parser.add_argument("--width-uint8-base", action=argparse.BooleanOptionalAction, default=True,
+                        help="Export width rounded/clamped to uint8 base-volume voxels.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
     parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
@@ -932,6 +967,9 @@ def main(argv: list[str] | None = None) -> int:
         input_path=str(args.input),
         output_path=args.output,
         checkpoint=args.checkpoint,
+        output_format=args.output_format,
+        blank_invalid=args.blank_invalid,
+        width_uint8_base=args.width_uint8_base,
         device=args.device,
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,

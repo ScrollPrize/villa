@@ -1125,6 +1125,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 	def test_predict3d_cli_dispatch_preserves_legacy_args(self):
 		args = [
 			"predict3d",
+			"--output-format", "legacy",
 			"--input", "in.zarr",
 			"--output", "out.lasagna.json",
 			"--unet-checkpoint", "model.pt",
@@ -1298,6 +1299,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 							run_preprocess_3d(
 								input_path=str(input_path),
 								output_path=str(output_path),
+								output_format="legacy",
 								unet3d_checkpoint=str(root / "missing_model.pt"),
 								device="cpu",
 								crop_xyzwhd=None,
@@ -1939,6 +1941,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 							run_preprocess_3d(
 								input_path=str(input_path),
 								output_path=str(output_path),
+								output_format="legacy",
 								unet3d_checkpoint=str(root / "missing_model.pt"),
 								device="cpu",
 								crop_xyzwhd=None,
