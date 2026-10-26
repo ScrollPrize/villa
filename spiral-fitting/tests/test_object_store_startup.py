@@ -218,6 +218,7 @@ def test_normal_source_prefers_lasagna_then_ct_then_none():
     ct = osi.fiber_normal_source(config, volume_uuid=VOLUME)
     assert (ct.kind, ct.ct_volume, dict(ct.parameters)) == (
         'ct', '/ct.zarr', {'ct_level': 2, 'ct_to_base_scale': 4.0})
+    # Stores without multiscales metadata hold a group per level.
     lasagna = osi.fiber_normal_source(
         config, {'normal_x': '/nx', 'normal_y': '/ny', 'group': '4', 'scale': 4},
         volume_uuid=VOLUME)
@@ -227,6 +228,38 @@ def test_normal_source_prefers_lasagna_then_ct_then_none():
         'normal_y_volume': '/ny'}
     assert 'ignoring object_store_normal_ct_path' in lasagna.note
     assert lasagna.provenance()['kind'] == 'lasagna'
+    assert lasagna.provenance()['lasagna_group'] == '4'
+
+
+def _multiscales_store(path, levels, v3=False):
+    path.mkdir()
+    attributes = {'multiscales': [{'datasets': [{'path': level} for level in levels]}]}
+    if v3:
+        (path / 'zarr.json').write_text(json.dumps({'attributes': attributes}))
+    else:
+        (path / '.zattrs').write_text(json.dumps(attributes))
+    return str(path)
+
+
+def test_lasagna_group_becomes_the_stores_multiscales_level(tmp_path):
+    # The fitter reads a lasagna group by its path; the store's CT reader
+    # takes the index of that path among the multiscales datasets. A store
+    # holding only groups 4 and 5 reads group 4 as level 0.
+    config = reference.fit_config()
+    lasagna = {'normal_x': _multiscales_store(tmp_path / 'nx', ['4', '5']),
+               'normal_y': _multiscales_store(tmp_path / 'ny', ['4', '5'], v3=True),
+               'group': 4, 'scale': 4}
+    source = osi.fiber_normal_source(config, lasagna, volume_uuid=VOLUME)
+    assert dict(source.parameters)['ct_level'] == 0
+    assert 'lasagna group 4 (store level 0)' in source.describe()
+    lasagna['group'] = '5'
+    assert dict(osi.fiber_normal_source(config, lasagna).parameters)['ct_level'] == 1
+    lasagna['group'] = '3'
+    with pytest.raises(osi.ObjectStoreInputError, match='not a multiscales level'):
+        osi.fiber_normal_source(config, lasagna)
+    lasagna.update(group='4', normal_y=_multiscales_store(tmp_path / 'other', ['0', '4']))
+    with pytest.raises(osi.ObjectStoreInputError, match='different multiscales level'):
+        osi.fiber_normal_source(config, lasagna)
 
 
 def test_fiber_refresh_records_the_chosen_normal_source(tmp_path):

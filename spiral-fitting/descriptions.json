@@ -256,7 +256,7 @@
     "object_store_fiber_uuids": "Fibers to use, by UUID (with the tags below). Unset with no tags selects every active fiber with geometry; an empty list selects none.",
     "object_store_fiber_tags": "Also select the active fibers carrying any of these tags.",
     "object_store_normal_ct_path": "CT zarr whose structure-tensor normals guide fiber-patch link refresh when the fit has no lasagna normals. Lasagna normals are used for link refresh whenever input_use_normals is on and the normal stores exist, even with the dense-normal loss off. Without either, fiber-patch links are gated by the fiber centerline alone, with a warning.",
-    "object_store_normal_ct_level": "Pyramid level of the normal CT zarr to read.",
+    "object_store_normal_ct_level": "Level of the normal CT zarr to read, as the object store numbers it: the index among the zarr's multiscales datasets, or the group named after the number when it has no multiscales metadata.",
     "object_store_normal_ct_downsampling": "Downsampling of the selected normal CT level relative to the fit volume (selected CT voxel = fit voxel / this).",
     "object_store_normal_ct_volume_uuid": "The volume the normal CT belongs to; must be the fit volume.",
     "fit_volume_uuid": "The reference volume whose voxels are the fit's units. Unset infers it from the frames the selected objects declare; it must agree with every declaration.",

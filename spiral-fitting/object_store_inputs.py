@@ -28,6 +28,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import sys
 from collections import Counter
 
@@ -1188,13 +1189,15 @@ class NormalSource:
     ct_volume: str = ''
     parameters: tuple = ()
     note: str = None
+    lasagna_group: str = None
 
     def describe(self):
         if self.kind == 'none':
             return 'fiber-patch normals: none (centerline-only linking)'
         values = dict(self.parameters)
         if self.kind == 'lasagna':
-            return (f'fiber-patch normals: lasagna group {values["ct_level"]} at '
+            return (f'fiber-patch normals: lasagna group {self.lasagna_group} '
+                    f'(store level {values["ct_level"]}) at '
                     f'scale {values["ct_to_base_scale"]:g} '
                     f'({values["normal_x_volume"]}, {values["normal_y_volume"]})')
         return (f'fiber-patch normals: CT {self.ct_volume} level '
@@ -1202,7 +1205,43 @@ class NormalSource:
 
     def provenance(self):
         return {'kind': self.kind, 'ct_volume': self.ct_volume or None,
+                **({'lasagna_group': self.lasagna_group}
+                   if self.lasagna_group is not None else {}),
                 **dict(self.parameters)}
+
+
+def _multiscale_level(zarr_path, group):
+    """The store's level for zarr group ``group`` of the local store at
+    ``zarr_path``.
+
+    The fitter names a lasagna pyramid level by its group path; the store's
+    CT reader takes the index of that path among the ``multiscales`` datasets
+    (or, without multiscales metadata, reads the group named after the
+    level). Stores need not list every level from 0: one holding only groups
+    4 and 5 reads group 4 as level 0.
+    """
+    attributes = None
+    for name, key in (('.zattrs', None), ('zarr.json', 'attributes')):
+        path = os.path.join(str(zarr_path), name)
+        if os.path.isfile(path):
+            with open(path) as stream:
+                document = json.load(stream)
+            attributes = document if key is None else document.get(key) or {}
+            break
+    multiscales = (attributes or {}).get('multiscales')
+    if not multiscales:
+        try:
+            return int(group)
+        except (TypeError, ValueError):
+            raise ObjectStoreInputError([
+                f'lasagna normal group {group!r} of {zarr_path} is not an '
+                'integer zarr group']) from None
+    paths = [str(dataset.get('path')) for dataset in multiscales[0].get('datasets', ())]
+    if str(group) not in paths:
+        raise ObjectStoreInputError([
+            f'lasagna normal group {group!r} is not a multiscales level of '
+            f'{zarr_path} (levels {paths})'])
+    return paths.index(str(group))
 
 
 def fiber_normal_source(config, lasagna=None, volume_uuid=None):
@@ -1212,18 +1251,20 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
     (input_use_normals with normal stores, whether or not the dense-normal
     loss is on):
     ``{'normal_x', 'normal_y', 'group', 'scale'}``, ``scale`` being the
-    group's downsampling relative to the fit volume. The store decodes them
-    as the fitter does. Lasagna and CT normals are exclusive; a configured
+    group's downsampling relative to the fit volume. The store decodes the
+    same group the fitter reads, addressed by its multiscales level
+    (_multiscale_level). Lasagna and CT normals are exclusive; a configured
     CT is then ignored with a note.
     """
     ct_path = config['object_store_normal_ct_path']
     if lasagna is not None:
-        try:
-            level = int(lasagna['group'])
-        except (TypeError, ValueError):
+        levels = {_multiscale_level(lasagna[key], lasagna['group'])
+                  for key in ('normal_x', 'normal_y')}
+        if len(levels) != 1:
             raise ObjectStoreInputError([
-                f'lasagna normal group {lasagna["group"]!r} is not an integer '
-                'zarr group']) from None
+                f'lasagna normal group {lasagna["group"]!r} is a different '
+                'multiscales level of the normal_x and normal_y stores'])
+        level, = levels
         return NormalSource(
             'lasagna', '', (
                 ('ct_level', level),
@@ -1231,7 +1272,8 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
                 ('normal_x_volume', str(lasagna['normal_x'])),
                 ('normal_y_volume', str(lasagna['normal_y']))),
             note=(f'ignoring object_store_normal_ct_path {ct_path!r}: the fit '
-                  'loads lasagna normals') if ct_path else None)
+                  'loads lasagna normals') if ct_path else None,
+            lasagna_group=str(lasagna['group']))
     if not ct_path:
         return NormalSource('none')
     ct_volume = config['object_store_normal_ct_volume_uuid']
