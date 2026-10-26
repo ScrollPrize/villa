@@ -9,6 +9,7 @@
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
 using namespace vc::python;
 namespace {
 nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
@@ -309,6 +310,12 @@ NB_MODULE(_native, m)
     m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume) {
         return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume);
     }, nb::arg("metadata"), nb::arg("volume_uuid"));
+
+    m.def("fiber_branch_control_index", [](const std::vector<int64_t>& controlIds, const nb::dict& anchor) {
+        return vo::fiberBranchControlIndex(controlIds, anchorFromPy(anchor));
+    }, nb::arg("control_point_ids"), nb::arg("anchor"),
+       "Index into control_point_ids of a fiber_branch endpoint anchor's stable control-point ID; "
+       "raises when the anchor names no single control point of this geometry.");
 
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),

@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Patch
+from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Patch, fiber_branch_control_index
 from object_helpers import edge_choice
 
 
@@ -317,6 +317,21 @@ def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tm
     with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as other:
         assert other.ingest_geometry_source('fiber', directory)['problems']
         assert other.object_count('fiber') == 0
+
+
+def test_fiber_branch_control_index_resolves_stable_ids_not_positions(db):
+    anchor = lambda array, ident: dict(points=[dict(array=array, index=[ident])])
+    # Reordered, noncontiguous IDs: the anchor names an ID, never a position.
+    ids = [90, 10, 55]
+    assert fiber_branch_control_index(ids, anchor('control_point_ids', 10)) == 1
+    assert fiber_branch_control_index(ids, anchor('control_point_ids', 55)) == 2
+    for bad in (anchor('control_point_ids', 1), anchor('control_points', 1)):
+        with pytest.raises(RuntimeError, match='absent from selected geometry'):
+            fiber_branch_control_index(ids, bad)
+    two = dict(points=[dict(array='control_point_ids', index=[90]),
+                       dict(array='control_point_ids', index=[10])])
+    with pytest.raises(RuntimeError, match='one control point'):
+        fiber_branch_control_index(ids, two)
 
 
 def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path):
