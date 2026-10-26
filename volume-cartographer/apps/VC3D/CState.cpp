@@ -331,27 +331,26 @@ bool CState::hasVpkg() const { return _vpkg != nullptr; }
 
 std::shared_ptr<Volume> CState::currentVolume() const { return _currentVolume; }
 
-std::string CState::currentVolumeId() const { return _currentVolumeId; }
+std::string CState::currentVolumeId() const { return _currentVolume ? _currentVolume->id() : std::string{}; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     if (_currentVolume == vol) {
-        resolveCurrentVolumeId();
         ++_focusBoundsRevision;
-        emit volumeChanged(_currentVolume, _currentVolumeId);
+        emit volumeChanged(_currentVolume, currentVolumeId());
         emit focusBoundsChanged();
         return;
     }
     _currentVolume = std::move(vol);
-    resolveCurrentVolumeId();
+    const auto volumeId = currentVolumeId();
     _pointCollection->setFileMetadata(
-        (_vpkg && !_currentVolumeId.empty())
+        (_vpkg && !volumeId.empty())
             ? vc3d::opendata::coordinateIdentityJson(
                   vc3d::opendata::coordinateIdentityForVolume(
-                      *_vpkg, _currentVolumeId))
+                      *_vpkg, volumeId))
             : utils::Json::object());
     ++_focusBoundsRevision;
-    emit volumeChanged(_currentVolume, _currentVolumeId);
+    emit volumeChanged(_currentVolume, volumeId);
     emit focusBoundsChanged();
 }
 
@@ -406,9 +405,9 @@ vc3d::annotation::AnnotationFrame CState::annotationFrame() const
     // when coordinateIdentityForVolume cannot resolve a physical resolution.
     std::optional<double> exactFactor;
     std::optional<double> stampedResolution;
-    if (_vpkg && !_currentVolumeId.empty()) {
+    if (_vpkg && _currentVolume) {
         if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                _vpkg->volumeTags(_currentVolumeId))) {
+                _vpkg->volumeTags(_currentVolume->id()))) {
             exactFactor = static_cast<double>(identity->sourceCoordinateScaleFactor);
             if (identity->sourceOriginalResolution > 0.0)
                 stampedResolution = identity->sourceOriginalResolution;
@@ -518,22 +517,6 @@ void CState::clearActiveSurface()
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
 
-void CState::resolveCurrentVolumeId()
-{
-    _currentVolumeId.clear();
-    if (_vpkg && _currentVolume) {
-        for (const auto& id : _vpkg->volumeIDs()) {
-            if (_vpkg->volume(id) == _currentVolume) {
-                _currentVolumeId = id;
-                return;
-            }
-        }
-    }
-    if (_currentVolume) {
-        _currentVolumeId = _currentVolume->id();
-    }
-}
-
 void CState::closeAll()
 {
     emit volumeClosing();
@@ -551,7 +534,6 @@ void CState::closeAll()
     }
 
     _currentVolume = nullptr;
-    _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
@@ -649,11 +631,6 @@ void CState::setSurfacesBatch(
     finishBatch();
 }
 
-void CState::emitSurfacesChanged()
-{
-    emit surfaceChanged("", nullptr, false);
-}
-
 std::shared_ptr<Surface> CState::surface(const std::string& name)
 {
     auto it = _surfs.find(name);
@@ -731,25 +708,4 @@ POI* CState::poi(const std::string& name)
     if (it == _pois.end())
         return nullptr;
     return it->second.get();
-}
-
-std::vector<POI*> CState::pois()
-{
-    std::vector<POI*> result;
-    result.reserve(_pois.size());
-
-    for (auto& [key, ptr] : _pois) {
-        result.push_back(ptr.get());
-    }
-
-    return result;
-}
-
-std::vector<std::string> CState::poiNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _pois)
-        keys.push_back(it.first);
-
-    return keys;
 }

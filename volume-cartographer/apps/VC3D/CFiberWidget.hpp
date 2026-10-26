@@ -110,7 +110,6 @@ public:
     [[nodiscard]] std::optional<double> annotationVoxelSizeUm() const { return _voxelSizeUm; }
     // Sum of every listed fiber's lengthVx (finite values only).
     [[nodiscard]] double totalLengthVx() const;
-    void setAlignmentMetricsPending(bool pending);
     void updateAlignmentMetrics(uint64_t fiberId,
                                 const FiberEntry::AlignmentMetrics& alignment,
                                 const std::vector<FiberEntry::AlignmentMetrics>& spanAlignments);

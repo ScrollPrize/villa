@@ -54,7 +54,6 @@
 #include "volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 

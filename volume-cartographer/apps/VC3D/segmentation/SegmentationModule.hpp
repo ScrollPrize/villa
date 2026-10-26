@@ -247,9 +247,7 @@ signals:
     void editingEnabledChanged(bool enabled);
     void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
-    void pendingChangesChanged(bool pending);
     void stopToolsRequested();
-    void focusPoiRequested(const cv::Vec3f& position, QuadSurface* surface);
     void growSurfaceRequested(SegmentationGrowthMethod method,
                               SegmentationGrowthDirection direction,
                               int steps,
@@ -257,7 +255,6 @@ signals:
     void growthInProgressChanged(bool running);
     // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
-    void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(vc::PointRef point);
     void annotationSelectionCleared();
     void annotationCollectionSelected(uint64_t collectionId);

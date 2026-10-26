@@ -923,19 +923,6 @@ void CFiberWidget::updateTotalLengthLabel()
             .arg(_listedFibers.size()));
 }
 
-void CFiberWidget::setAlignmentMetricsPending(bool pending)
-{
-    FiberEntry::AlignmentMetrics metric;
-    metric.pending = pending;
-    for (auto& fiber : _listedFibers) {
-        fiber.alignment = metric;
-        for (auto& span : fiber.spans) {
-            span.alignment = metric;
-        }
-    }
-    refreshMetricDisplays();
-}
-
 void CFiberWidget::updateAlignmentMetrics(
     uint64_t fiberId,
     const FiberEntry::AlignmentMetrics& alignment,

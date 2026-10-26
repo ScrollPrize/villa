@@ -135,8 +135,8 @@ public:
     // child by valid-cell count unless explicitRoles is set, in which case
     // we pass --parent / --child explicitly. The parent is edited in place
     // (its revision history keeps the pre-patch state).
-    void setMergePatchParams(const QString& parentPath,
-                             const QString& childPath,
+    void setMergePatchParams(const QString& parentSurface,
+                             const QString& childSurface,
                              bool explicitRoles,
                              int borderCells,
                              int blendCells,
@@ -280,8 +280,8 @@ private:
     int     _mergeStripCols{0};
 
     // vc_merge_patch parameters
-    QString _patchParentPath;
-    QString _patchChildPath;
+    QString _patchParentSurface;
+    QString _patchChildSurface;
     bool    _patchExplicitRoles{false};
     int     _patchBorderCells{16};
     int     _patchBlendCells{6};

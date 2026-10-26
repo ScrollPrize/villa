@@ -234,11 +234,10 @@ QJsonObject AgentBridgeServer::launchSeedingBatch(
         // vc_grow_seg_from_seed missing -> -32006.
         if (err.contains(QLatin1String("executable not found"), Qt::CaseInsensitive))
             throw AgentBridgeError{-32006, "vc_grow_seg_from_seed not found", data};
-        // Missing config/paths inputs -> -32007 kind:"file" (mirrors
+        // Missing config inputs -> -32007 kind:"file" (mirrors
         // tracer.run_trace's treatment of a missing trace_params.json).
         if (err.contains(QLatin1String("seed.json"), Qt::CaseInsensitive) ||
-            err.contains(QLatin1String("expand.json"), Qt::CaseInsensitive) ||
-            err.contains(QLatin1String("paths directory"), Qt::CaseInsensitive)) {
+            err.contains(QLatin1String("expand.json"), Qt::CaseInsensitive)) {
             data["kind"] = "file";
             throw AgentBridgeError{-32007, err, data};
         }

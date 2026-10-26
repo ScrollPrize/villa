@@ -975,9 +975,6 @@ void SegmentationModule::saveApprovalMask()
         // publish it to the store (vertices and channels) on its next tick.
         _overlay->composeApprovalMaskToSurface(surface);
         markAutosaveNeeded();
-        if (!surface->id.empty()) {
-            emit approvalMaskSaved(surface->id);
-        }
     }
 }
 
@@ -1134,7 +1131,6 @@ void SegmentationModule::emitPendingChanges()
     }
     const bool pending = _editManager->hasPendingChanges();
     _widget->setPendingChanges(pending);
-    emit pendingChangesChanged(pending);
 }
 
 void SegmentationModule::refreshOverlay()

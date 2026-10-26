@@ -107,7 +107,6 @@ public:
     std::string findSurfaceId(Surface* surf);
     std::vector<std::shared_ptr<Surface>> surfaces();
     std::vector<std::string> surfaceNames();
-    void emitSurfacesChanged();
     // Bumped on every setSurface() that changes the map (including
     // noSignalSend calls), so callers can cheaply detect that a cached view
     // of the surface map is stale.
@@ -117,8 +116,6 @@ public:
     std::unique_ptr<POI> createSurfaceFocusPoi(QuadSurface& surface);
     void setPOI(const std::string& name, POI* poi);
     POI* poi(const std::string& name);
-    std::vector<POI*> pois();
-    std::vector<std::string> poiNames();
 
     // The umbilicus of the current volume: the one live umbilicus object in the
     // attached store bound to it, with its points in the volume's voxels. Its frame
@@ -151,7 +148,6 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
-    void resolveCurrentVolumeId();
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
@@ -160,7 +156,6 @@ private:
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
-    std::string _currentVolumeId;
     std::optional<Rect3D> _focusBounds; // Annotation frame, independent of pyramid level.
     bool _focusBoundsEnabled = false;
     uint64_t _focusBoundsRevision = 0;

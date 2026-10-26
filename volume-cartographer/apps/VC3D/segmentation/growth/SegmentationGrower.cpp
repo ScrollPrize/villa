@@ -1203,16 +1203,22 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
                    kStatusLong);
         return false;
     }
-    const auto storePath = catalog->session()->path(*catalog->attachment());
+    SurfaceCatalog::ToolStore toolStore;
+    try {
+        toolStore = catalog->toolStore();
+    } catch (const std::exception& error) {
+        showStatus(QString::fromUtf8(error.what()), kStatusLong);
+        return false;
+    }
 
     utils::Json customParams = _context.widget->customParamsJson();
 
     CopyDisplacementJob copyJob;
     copyJob.socketPath = socketPath;
-    copyJob.store = QString::fromStdString(storePath.string());
+    copyJob.store = QString::fromStdString(toolStore.store.string());
     copyJob.surfaceUuid = pin->object.objectUuid;
     copyJob.geometryRevision = *pin->geometryRevision;
-    copyJob.volumeUuid = catalog->volume()->id();
+    copyJob.volumeUuid = toolStore.volume;
     copyJob.volumeZarrPath = volumeZarr;
     copyJob.volumeScale = volumeScale;
     copyJob.checkpointPath = copyCheckpointPath;

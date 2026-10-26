@@ -787,10 +787,10 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             // dialog. The binary requires exactly one of these forms.
             args << "--store" << _storePath;
             if (_patchExplicitRoles) {
-                args << "--parent" << _patchParentPath
-                     << "--child"  << _patchChildPath;
+                args << "--parent" << _patchParentSurface
+                     << "--child"  << _patchChildSurface;
             } else {
-                args << _patchParentPath << _patchChildPath;
+                args << _patchParentSurface << _patchChildSurface;
             }
             args << "--border-cells"      << QString::number(_patchBorderCells)
                  << "--blend-cells"       << QString::number(_patchBlendCells)
@@ -851,7 +851,7 @@ QString CommandLineToolRunner::getOutputPath() const
         // An in-place refinement creates nothing: the source changed.
         case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
         // The binary edits the parent in place.
-        case Tool::MergePatch: return _patchParentPath;
+        case Tool::MergePatch: return _patchParentSurface;
         case Tool::CustomCommand: return QString();
         default: return _createdSurfaces.join('\n');
     }
@@ -882,8 +882,8 @@ void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
     _mergeStripCols       = stripCols;
 }
 
-void CommandLineToolRunner::setMergePatchParams(const QString& parentPath,
-                                                const QString& childPath,
+void CommandLineToolRunner::setMergePatchParams(const QString& parentSurface,
+                                                const QString& childSurface,
                                                 bool explicitRoles,
                                                 int borderCells,
                                                 int blendCells,
@@ -895,8 +895,8 @@ void CommandLineToolRunner::setMergePatchParams(const QString& parentPath,
                                                 int ransacSeed,
                                                 int anchorCap)
 {
-    _patchParentPath      = parentPath;
-    _patchChildPath       = childPath;
+    _patchParentSurface      = parentSurface;
+    _patchChildSurface       = childSurface;
     _patchExplicitRoles   = explicitRoles;
     _patchBorderCells     = borderCells;
     _patchBlendCells      = blendCells;

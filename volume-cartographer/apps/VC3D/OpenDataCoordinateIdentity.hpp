@@ -158,20 +158,4 @@ inline void copyCoordinateIdentityToJson(
     target.update(coordinateIdentityJson(identity));
 }
 
-inline void copyCoordinateIdentityToSurface(
-    QuadSurface& surface,
-    const std::optional<CoordinateIdentity>& identity)
-{
-    copyCoordinateIdentityToJson(surface.meta, identity);
-}
-
-inline void copyVolumeCoordinateIdentityToSurface(
-    QuadSurface& surface,
-    const VolumePkg& pkg,
-    const std::string& loadedVolumeId)
-{
-    copyCoordinateIdentityToSurface(
-        surface, coordinateIdentityForVolume(pkg, loadedVolumeId));
-}
-
 } // namespace vc3d::opendata

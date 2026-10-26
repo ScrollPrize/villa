@@ -523,7 +523,6 @@ signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     // Store fibers changed: a commit, an external change or a new attachment.
     void fibersChanged();
-    void fiberAlignmentMetricsReset(bool pending);
     void fiberAlignmentMetricsUpdated(
         uint64_t fiberId,
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,

@@ -104,10 +104,8 @@ public:
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
-    bool toggleTag(Tag tag);
     bool setTagChecked(Tag tag, bool checked);
     void setSelectionLocked(bool locked);
-    void setTransformWarning(const QString& warningText);
     // Retires each surface in the store. The interactive caller is responsible
     // for confirmation.
     bool retireSurfaces(const QStringList& surfaceIds, QString* err = nullptr);

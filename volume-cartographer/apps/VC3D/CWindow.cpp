@@ -3399,11 +3399,6 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSegmentationStopToolsRequested);
     connect(_segmentationModule.get(), &SegmentationModule::growthInProgressChanged,
             this, &CWindow::onSegmentationGrowthStatusChanged);
-    connect(_segmentationModule.get(), &SegmentationModule::focusPoiRequested,
-            this, [this](const cv::Vec3f& position, QuadSurface* base) {
-                Q_UNUSED(position);
-                _axisAlignedSliceController->applyOrientation(base);
-            });
     connect(_segmentationModule.get(), &SegmentationModule::growSurfaceRequested,
             this, &CWindow::onGrowSegmentationSurface);
 
@@ -3795,14 +3790,6 @@ void CWindow::CreateWidgets(void)
                                                               widgetSpanAlignments);
                 }
             };
-        auto setFiberMetricsPending = [this](bool pending) {
-            if (_fiberWidget) {
-                _fiberWidget->setAlignmentMetricsPending(pending);
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setAlignmentMetricsPending(pending);
-            }
-        };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {
                 return;
@@ -3881,10 +3868,6 @@ void CWindow::CreateWidgets(void)
                         }
                     });
         };
-        connect(_lineAnnotationController.get(),
-                &LineAnnotationController::fiberAlignmentMetricsReset,
-                this,
-                setFiberMetricsPending);
         connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fiberAlignmentMetricsUpdated,
                 this,

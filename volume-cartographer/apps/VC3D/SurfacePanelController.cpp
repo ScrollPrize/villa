@@ -904,24 +904,6 @@ bool SurfacePanelController::isCurrentOnlyFilterEnabled() const
     return _filters.currentOnly && _filters.currentOnly->isChecked();
 }
 
-bool SurfacePanelController::toggleTag(Tag tag)
-{
-    QCheckBox* target = nullptr;
-    switch (tag) {
-        case Tag::Approved: target = _tags.approved; break;
-        case Tag::Defective: target = _tags.defective; break;
-        case Tag::Reviewed: target = _tags.reviewed; break;
-        case Tag::Inspect: target = _tags.inspect; break;
-    }
-
-    if (!target || !target->isEnabled()) {
-        return false;
-    }
-
-    target->setCheckState(target->checkState() == Qt::Checked ? Qt::Unchecked : Qt::Checked);
-    return true;
-}
-
 bool SurfacePanelController::setTagChecked(Tag tag, bool checked)
 {
     QCheckBox* target = nullptr;
@@ -968,22 +950,6 @@ void SurfacePanelController::setSelectionLocked(bool locked)
                 _lockedSelectionIds.append(id);
             }
         }
-    }
-}
-
-void SurfacePanelController::setTransformWarning(const QString& warningText)
-{
-    _transformWarningText = warningText;
-    if (!_ui.treeWidget) {
-        return;
-    }
-
-    QTreeWidgetItemIterator it(_ui.treeWidget);
-    while (*it) {
-        if (auto* item = dynamic_cast<SurfaceTreeWidgetItem*>(*it)) {
-            applyTransformWarningStyle(item);
-        }
-        ++it;
     }
 }
 

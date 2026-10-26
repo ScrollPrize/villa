@@ -257,12 +257,6 @@ int main(int argc, char** argv)
             "Span row within the alignment threshold should not be highlighted");
     require(treeView->model()->index(1, 0, secondParent).data(Qt::BackgroundRole).isValid(),
             "Span row with max alignment error > 45 deg was not highlighted");
-    widget.setAlignmentMetricsPending(true);
-    require(model->item(1, 0) == secondItemBeforeMetrics,
-            "Marking metrics pending should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString().contains(
-                QStringLiteral("Sampling")),
-            "Pending metric state should be reflected in the row tooltip");
     widget.updateAlignmentMetrics(
         2,
         makeMetric(26.0, 51.0, 60),
