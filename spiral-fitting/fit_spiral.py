@@ -141,6 +141,8 @@ from loss_maps import (LossMapRecorder, attach_loss_maps_to_manifest,
 from spiral_helpers import (
     REFERENCE_Z_RANGE_NUM_SLICES,
     erode_patch_valid_region,
+    largest_patch_quad_component,
+    patch_sampling_quad_mask,
     load_patch_payload_chunk,
     load_patches,
     load_fiber_point_collection,
@@ -172,18 +174,6 @@ from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
-
-
-def largest_patch_quad_component(mask):
-    """Return only the largest 8-connected True component of a quad mask."""
-    mask = np.asarray(mask, dtype=bool)
-    component_labels, num_components = scipy.ndimage.label(
-        mask, structure=np.ones((3, 3), dtype=bool))
-    if num_components <= 1:
-        return mask.copy()
-    component_sizes = np.bincount(component_labels.reshape(-1))
-    component_sizes[0] = 0
-    return component_labels == int(component_sizes.argmax())
 
 
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
@@ -1332,28 +1322,9 @@ class FitContext:
             'loading', 'Preparing patch sampling',
             step=0, total_steps=len(patches), unit='patches')
         for patch_idx, patch in enumerate(patches):
-            # Use the quad-valid mask so bilinear interpolation at (row_idx+di, j+dj)
-            # is well-defined for di, dj in [0, 1).
-            valid_quad_mask_np = patch.valid_quad_mask.cpu().numpy()
-            # Restrict sampling to quads whose representative z is in [z_begin, z_end),
-            # so patch-loss tracks don't waste samples outside the optimisation ROI.
-            zyxs_z_np = patch.zyxs[..., 0].cpu().numpy()
-            quad_zs_np = (zyxs_z_np[:-1, :-1] + zyxs_z_np[1:, :-1] + zyxs_z_np[:-1, 1:] + zyxs_z_np[1:, 1:]) / 4
-            z_in_roi_np = (
-                    (quad_zs_np >= self.z_begin - self.config['patch_loss_z_margin'])
-                    & (quad_zs_np < self.z_end + self.config['patch_loss_z_margin'])
-            )
-            in_roi_quad_mask_np = valid_quad_mask_np & z_in_roi_np
-            if not in_roi_quad_mask_np.any():
-                # Fallback if no quad falls in the ROI; should be rare since patches
-                # entirely outside the z-ROI are dropped earlier.
-                in_roi_quad_mask_np = valid_quad_mask_np
-            # Every patch loss and its cached theta lift use one connected
-            # surface. Ignore detached islands rather than inventing an
-            # integer winding offset between components. Eight-connectivity
-            # matches both patch edge topology and the former Dijkstra graph.
-            in_roi_quad_mask_np = largest_patch_quad_component(
-                in_roi_quad_mask_np)
+            in_roi_quad_mask_np = patch_sampling_quad_mask(
+                patch, self.z_begin, self.z_end,
+                self.config['patch_loss_z_margin'])
             patch._sampling_valid_quad_mask_np = in_roi_quad_mask_np
             patch_scale = np.asarray(
                 patch.scale.detach().cpu()

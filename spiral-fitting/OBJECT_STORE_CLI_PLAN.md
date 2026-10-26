@@ -417,8 +417,10 @@ Notes from steps 5–8 that the remaining steps build on:
 - A PCL point consumed by two point-patch edges is an error. Fiber points may
   attach to several patches through attachment views.
 - A fiber contact just outside the nearest-line control span widens the span.
-- Store attachments were detected on un-eroded grids. One whose quad erosion
-  removes is dropped (its point becomes unattached) and reported by edge UUID.
+- Store attachments were detected on whole, un-eroded grids. One whose quad
+  the patch losses do not sample (`spiral_helpers.patch_sampling_quad_mask`:
+  eroded, outside the z window, or off the largest connected piece) is
+  dropped (its point becomes unattached) and reported by edge UUID.
 - The constraints report and `FitContext` share
   `object_store_inputs.derive_point_views`, so the report applies the fit's
   validation and counts the actual views.

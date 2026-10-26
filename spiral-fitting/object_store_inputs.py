@@ -457,7 +457,7 @@ class FitInputs:
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
     ``fiber_links`` holds their resolved same-winding branch links.
     ``dropped_attachments`` lists ``(edge UUID, reason)`` for consumed
-    attachments that fall on a patch quad erosion removed.
+    attachments whose quad the patch losses do not sample (on_retained_quad).
     """
     snapshot: InputSnapshot
     patches: dict
@@ -476,21 +476,26 @@ class FitInputs:
             more = len(self.dropped_attachments) - max_named
             lines.append(
                 f'WARNING: {len(self.dropped_attachments)} consumed attachment(s) '
-                f'lie on patch quads removed by erosion and were dropped: {named}'
+                f'lie on patch quads the losses do not sample (eroded, outside '
+                f'the z window or a detached island) and were dropped: {named}'
                 + (f', and {more} more' if more > 0 else ''))
         return lines
 
 
-def materialize_patches(store, snapshot, *, z_begin, z_end, erode_cells_default):
+def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
+                        erode_cells_default):
     """Fit-frame patches of the snapshot, keyed by UUID; and drop counts.
 
     Grid rows and columns are the stored ones: nothing is cropped or
     subsampled, so stored (row, col) anchors are runtime (i, j). Invalid
     vertices keep the -1 sentinel. A patch's own erosion request is
     ``meta.source.spiral_patch_erode_cells``, as in its tifxyz metadata.
+    Each patch carries its loss sampling mask (``z_margin`` is the fit's
+    patch_loss_z_margin), so attachments can be checked against it.
     """
     import torch
-    from spiral_helpers import patch_intersects_z_roi, prepare_patch_for_fit
+    from spiral_helpers import (patch_intersects_z_roi, patch_sampling_quad_mask,
+                                prepare_patch_for_fit)
     from tifxyz import Patch
 
     patches, counts = {}, Counter()
@@ -518,6 +523,8 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, erode_cells_default)
         if reason is not None:
             counts[f'patches dropped by {reason}'] += 1
             continue
+        patch._sampling_valid_quad_mask_np = patch_sampling_quad_mask(
+            patch, z_begin, z_end, z_margin)
         patches[obj.uuid] = patch
     counts['patches'] = len(patches)
     return patches, counts
@@ -558,13 +565,16 @@ def _winding_annotation(obj, point_id, annotation):
 
 
 def on_retained_quad(patch, ij):
-    """Whether (row, col) ``ij`` lies on a valid quad of the fitted patch.
+    """Whether (row, col) ``ij`` lies on a quad the fitted patch's losses keep.
 
-    Uses the winding losses' rule (losses._valid_patch_annotation): the quad
-    is the floor of ``ij``, clamped to the grid. Stored attachments were
-    detected on un-eroded geometry, so erosion can remove their quad.
+    The quads are the patch's sampling mask (spiral_helpers.
+    patch_sampling_quad_mask, stored by materialize_patches exactly as the fit
+    computes it): eroded, restricted to the z window and to the largest
+    connected piece. The quad is the floor of ``ij``, clamped to the grid, as
+    in losses._valid_patch_annotation. Stored attachments were detected on
+    the whole un-eroded grid, so any of these steps can remove their quad.
     """
-    mask = patch.valid_quad_mask
+    mask = patch._sampling_valid_quad_mask_np
     row = min(max(int(ij[0]), 0), mask.shape[0] - 1)
     col = min(max(int(ij[1]), 0), mask.shape[1] - 1)
     return bool(mask[row, col])
@@ -598,8 +608,8 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
     Points are keyed by their stable IDs and carry fit-frame ZYX and their
     aligned ``wind_a`` annotation. Each consumed point-patch edge attaches its
     point to its patch at the recorded (row, col); edges to patches dropped
-    from the fit are counted and ignored. An attachment on a quad erosion
-    removed leaves its point unattached and is appended to ``dropped`` as
+    from the fit are counted and ignored. An attachment on a quad the losses
+    do not sample (on_retained_quad) leaves its point unattached and is appended to ``dropped`` as
     ``(edge UUID, reason)``.
     """
     edges_by_pcl = {}
@@ -638,9 +648,9 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
             elif attachment is None:
                 counts['pcl attachments to unfitted patches'] += 1
             elif not on_retained_quad(patches[attachment['id']], attachment['ij']):
-                counts['pcl attachments on eroded quads'] += 1
+                counts['pcl attachments off sampled quads'] += 1
                 if dropped is not None:
-                    dropped.append((rel.uuid, 'eroded quad'))
+                    dropped.append((rel.uuid, 'quad not sampled'))
             elif 'on_patch' in point:
                 problems.append(
                     f'point {point_id} of point collection {obj.uuid} attaches '
@@ -692,8 +702,8 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     renumber them. Every consumed contact and branch endpoint is kept through
     both. A contact's point lists each patch it attaches to in
     ``point['attachments']``, so one physical point (one chain/theta node) can
-    attach to several patches. A contact on a quad erosion removed is not
-    attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
+    attach to several patches. A contact on a quad the losses do not sample
+    is not attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
     ``links`` are resolved branch links keyed by resident collection id and
     raw line index.
     """
@@ -715,9 +725,9 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             counts['fiber contacts with unfitted patches'] += 1
             continue
         if not on_retained_quad(patches[rel.a], ij):
-            counts['fiber contacts on eroded quads'] += 1
+            counts['fiber contacts off sampled quads'] += 1
             if dropped is not None:
-                dropped.append((rel.uuid, 'eroded quad'))
+                dropped.append((rel.uuid, 'quad not sampled'))
             continue
         contacts[rel.b].setdefault(line_index, []).append(
             {'id': rel.a, 'ij': ij, 'edge_uuid': rel.uuid})
@@ -818,15 +828,15 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     return catalog, links, counts
 
 
-def materialize(store, snapshot, *, z_begin, z_end, erode_cells_default,
-                fiber_min_point_spacing=0.0):
+def materialize(store, snapshot, *, z_begin, z_end, z_margin,
+                erode_cells_default, fiber_min_point_spacing=0.0):
     """Every runtime input of a frozen snapshot.
 
     Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
     pcl_fiber_min_point_spacing); resident ids number PCLs, then fibers.
     """
     patches, counts = materialize_patches(
-        store, snapshot, z_begin=z_begin, z_end=z_end,
+        store, snapshot, z_begin=z_begin, z_end=z_end, z_margin=z_margin,
         erode_cells_default=erode_cells_default)
     dropped = []
     point_collections, pcl_counts = materialize_point_collections(
@@ -948,6 +958,7 @@ def constraints_report(store, snapshot, config):
     them; raises the same validation errors a fit would."""
     inputs = materialize(
         store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
+        z_margin=config['patch_loss_z_margin'],
         erode_cells_default=config['patch_erode_patches'],
         fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'])
     views = derive_point_views(inputs, inputs.patches, config)

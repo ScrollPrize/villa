@@ -30,6 +30,7 @@ def materialize(db, fiber_min_point_spacing=0.0, **request):
     config = reference.fit_config()
     return osi.materialize(db, snapshot, z_begin=config['z_begin'],
                            z_end=config['z_end'],
+                           z_margin=config['patch_loss_z_margin'],
                            erode_cells_default=config['patch_erode_patches'],
                            fiber_min_point_spacing=fiber_min_point_spacing)
 
@@ -211,10 +212,35 @@ def test_attachments_on_eroded_quads_are_dropped_and_reported(db, tmp_path):
     assert 'on_patch' not in points[0] and points[1]['on_patch']['edge_uuid'] == kept
     assert 'attachments' not in inputs.fibers[fiber]['points'][2]
     assert sorted(edge for edge, _ in inputs.dropped_attachments) == sorted([eroded, contact])
-    assert inputs.counts['pcl attachments on eroded quads'] == 1
-    assert inputs.counts['fiber contacts on eroded quads'] == 1
+    assert inputs.counts['pcl attachments off sampled quads'] == 1
+    assert inputs.counts['fiber contacts off sampled quads'] == 1
     warning = [line for line in inputs.report() if line.startswith('WARNING')]
     assert len(warning) == 1 and eroded in warning[0] and contact in warning[0]
+
+
+def test_attachments_on_detached_islands_are_dropped_like_the_losses_do(db):
+    """The losses sample only a patch's largest connected piece."""
+    from types import SimpleNamespace
+    from fit_spiral import FitContext
+    rows, cols = np.mgrid[:16, :20]
+    grid = np.stack([4.0 + rows * 3, np.full(rows.shape, 100.0), 40.0 + cols * 4],
+                    axis=-1)
+    grid[:, 6:9] = -1  # columns 0-5 become a smaller island than 9-19
+    patch = put_patch(db, grid, (0.25, 0.25))
+    pcl = put_pcl(db, {0: ([13.0, 100.0, 52.0], 3.0)}, absolute=True)
+    island = pcl_patch_edge(db, pcl, 0, patch, (3.0, 3.0))
+    inputs = materialize(db)
+    assert inputs.dropped_attachments == [(island, 'quad not sampled')]
+    assert 'on_patch' not in inputs.point_collections[0]['points'][0]
+    # The fit computes the same mask the materializer checked.
+    materialized = inputs.patches[patch]._sampling_valid_quad_mask_np
+    context = SimpleNamespace(
+        _patch_sampling_probabilities=lambda patches: None, progress=None,
+        z_begin=0, z_end=64, config=reference.fit_config())
+    FitContext._prepare_patch_sampling_cache(context, [inputs.patches[patch]])
+    np.testing.assert_array_equal(
+        inputs.patches[patch]._sampling_valid_quad_mask_np, materialized)
+    assert not materialized[3, 3]
 
 
 def test_report_derives_the_runtime_views(db, capsys):

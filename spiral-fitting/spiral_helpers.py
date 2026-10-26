@@ -33,6 +33,47 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
 
 
+def largest_patch_quad_component(mask):
+    """Return only the largest 8-connected True component of a quad mask."""
+    mask = np.asarray(mask, dtype=bool)
+    component_labels, num_components = scipy.ndimage.label(
+        mask, structure=np.ones((3, 3), dtype=bool))
+    if num_components <= 1:
+        return mask.copy()
+    component_sizes = np.bincount(component_labels.reshape(-1))
+    component_sizes[0] = 0
+    return component_labels == int(component_sizes.argmax())
+
+
+def patch_sampling_quad_mask(patch, z_begin, z_end, z_margin):
+    """The quads every patch loss samples and resolves annotations on.
+
+    Valid quads (so bilinear interpolation at (i + di, j + dj) is defined for
+    di, dj in [0, 1)) whose mean z lies in [z_begin - z_margin, z_end +
+    z_margin), falling back to all valid quads when none does, reduced to
+    their largest 8-connected component.
+    """
+    valid_quad_mask_np = patch.valid_quad_mask.cpu().numpy()
+    # Restrict sampling to quads whose representative z is in [z_begin, z_end),
+    # so patch-loss tracks don't waste samples outside the optimisation ROI.
+    zyxs_z_np = patch.zyxs[..., 0].cpu().numpy()
+    quad_zs_np = (zyxs_z_np[:-1, :-1] + zyxs_z_np[1:, :-1] + zyxs_z_np[:-1, 1:] + zyxs_z_np[1:, 1:]) / 4
+    z_in_roi_np = (
+            (quad_zs_np >= z_begin - z_margin)
+            & (quad_zs_np < z_end + z_margin)
+    )
+    in_roi_quad_mask_np = valid_quad_mask_np & z_in_roi_np
+    if not in_roi_quad_mask_np.any():
+        # Fallback if no quad falls in the ROI; should be rare since patches
+        # entirely outside the z-ROI are dropped earlier.
+        in_roi_quad_mask_np = valid_quad_mask_np
+    # Every patch loss and its cached theta lift use one connected
+    # surface. Ignore detached islands rather than inventing an
+    # integer winding offset between components. Eight-connectivity
+    # matches both patch edge topology and the former Dijkstra graph.
+    return largest_patch_quad_component(in_roi_quad_mask_np)
+
+
 def prepare_patch_for_fit(patch, z_begin, z_end, erode_cells_default):
     """Erode a loaded patch for fitting; return why it was dropped, or None.
 
