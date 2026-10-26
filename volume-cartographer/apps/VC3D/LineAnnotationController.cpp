@@ -4434,6 +4434,9 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     const auto coordinateScale = fiberCoordinateScale(fiberId, true);
     if (!coordinateScale) return;
     const double fiberBaseToVolumeScale = *coordinateScale;
+    // Closing the open dialogs saves them, and saving a link revises this
+    // fiber too: pin the revision that is current after the close.
+    if (!prepareForUserFacingLineAnnotationOpen()) return;
     // Binding the coordinates publishes a new revision; open the current one.
     auto stored = readFiber();
     if (!stored) return;
