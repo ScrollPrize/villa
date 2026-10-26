@@ -266,12 +266,8 @@ TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t col
     result.scale=source.scale;
     // A general affine has no single voxel step. Isotropic mappings do, and
     // preserve the existing grid-step convention of a uniformly scaled surface.
-    const auto x=mapping_.apply({1,0,0},true),y=mapping_.apply({0,1,0},true),z=mapping_.apply({0,0,1},true);
-    const auto dot=[](const auto& a,const auto& b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
-    const double squared=dot(x,x),tolerance=1e-12*squared;
-    if(squared>0&&std::abs(dot(y,y)-squared)<=tolerance&&std::abs(dot(z,z)-squared)<=tolerance&&
-       std::abs(dot(x,y))<=tolerance&&std::abs(dot(x,z))<=tolerance&&std::abs(dot(y,z))<=tolerance)
-        for(auto& step:result.scale)step/=std::sqrt(squared);
+    if(const auto similarity=mapping_.similarityScale())
+        for(auto& step:result.scale)step/=*similarity;
     result.points.reserve(source.points.size());result.validity.reserve(source.points.size());
     for(size_t i=0;i<source.points.size();++i) {
         const bool valid=source.valid(i/columns,i%columns);
