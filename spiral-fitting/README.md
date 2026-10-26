@@ -496,6 +496,14 @@ validate this particular sampled-median rule or its combination with Adam.
 
 ## Spiral service host setup
 
+> **The service cannot currently run a fit.** The fitter now reads patches,
+> fibers and point collections only from an object store (see
+> [Object-store inputs](#object-store-inputs)), and the service has not been
+> migrated: it still hands the fitter dataset files and editing-workspace
+> input bindings, which the fitter no longer accepts. Use the command-line
+> fit until the service is ported. The setup below describes the service as
+> it will run again after that migration.
+
 VC3D connects to a Spiral service in one of three modes, all speaking the same
 authenticated HTTP protocol:
 
@@ -758,8 +766,8 @@ the outer shell. For example:
 }
 ```
 
-Most role switches require a whole-fit rebuild; same-winding and relative PCL
-switches apply at the next Run. Disabled roles retain their accepted workspace
+Every role switch requires a whole-fit rebuild: the switches select the
+fit's frozen object-store inputs. Disabled roles retain their accepted workspace
 content, and enabling a role restores that desired content. Disabling a
 prerequisite also disables its dependent supervision: winding inference
 needs the outer shell.
@@ -865,7 +873,7 @@ Regression checks for this workflow (using existing environments/builds):
 # From the repository root:
 AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
   spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
-  spiral-fitting/tests/test_revisioned_runtime.py spiral-fitting/tests/test_revisioned_geometry.py
+  spiral-fitting/tests/test_revisioned_runtime.py
 AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
 AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
 ```
@@ -873,14 +881,7 @@ AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fi
 The workflow tests start a loopback HTTP service and cover remote baseline
 restore, service restart, and edits made while a submission is running.
 The service suite includes transfer, revision, conflict, and publication recovery
-checks; runtime and geometry tests cover worker boundaries and supervision.
-For the retained CUDA check on temporary copies of a real dataset patch:
-
-```bash
-AGENTS_AGENT_MODE=1 SPIRAL_REVISION_LIVE_DATASET=/path/to/dataset \
-  SPIRAL_REVISION_PATCH=patch-directory-name \
-  spiral-fitting/.venv/bin/python -m pytest -q spiral-fitting/tests/test_revisioned_live_fit.py
-```
+checks; the runtime tests cover worker boundaries.
 
 Input uploads only transfer immutable bytes. The editing workspace owns
 acceptance, application, and persistence; there is no separate ephemeral-input

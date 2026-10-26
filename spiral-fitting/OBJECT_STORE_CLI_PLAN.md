@@ -588,9 +588,18 @@ Notes from steps 5–8 that the remaining steps build on:
     built 41 cross-patch views (abs_winding 6, relative_windings 19,
     same_windings 15, fibers 1) and the same 52 strips. The new path has 34
     fewer regular cross-patch views because step 7 drops attachments off
-    the sampled quads (here mostly outside the 100-slice window, which the
-    file path still used), gains 809 overlap pairs, and attaches fibers by 6
-    representative contacts instead of 13 linked points. Old total loss
+    the sampled quads (here mostly outside the 100-slice window), but no
+    constraint is lost: the winding losses resolve every attachment through
+    `losses._valid_patch_annotation`, which skipped those same attachments
+    in the file path too, and attachments never enter the theta topology.
+    The 34 views carried fewer than two usable attachments and produced no
+    loss rows. Dropping them can only help: with
+    `pcl_rel_winding_adjacent_patches_only` a dropped patch between two
+    usable ones no longer blocks their pair, and draws no longer land on
+    unusable points. A collection's dropped points stay in its chain (and
+    make it eligible for an unattached strip). The new path also gains 809
+    overlap pairs and attaches fibers by 6 representative contacts instead
+    of 13 linked points. Old total loss
     1290 -> 224 -> 202 -> 43 -> 44; satisfied patches 31/173, satisfied area
     46.4%, unattached PCLs 17/52. Both decrease to the same scale; the new
     run satisfies more patch area. These are expected consequences of the

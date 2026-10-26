@@ -313,8 +313,6 @@ def fit_environment(
     if num_threads is not None:
         env.update(_native_thread_env(num_threads))
         env["FIT_SPIRAL_NUM_THREADS"] = str(num_threads)
-        env["FIT_SPIRAL_PATCH_LOAD_WORKERS"] = str(num_threads)
-        env["FIT_SPIRAL_PATCH_LOAD_IO_THREADS"] = "1"
     return env
 
 
