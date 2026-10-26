@@ -178,5 +178,19 @@ int main() try {
         try{auto read=db.read();(void)volumeUmbilicus(db,read,"c");}catch(const std::runtime_error&){several=true;}
         require(several,"several umbilici for one volume are refused");
     }
+    {
+        // Binding declares a frame once; a conflicting declaration is refused.
+        std::string loose;
+        {auto txn=db.write();ObjectRecord r;r.kind="fiber";loose=db.upsertObject(txn,r);txn.commit();}
+        const nlohmann::json at{{"volume_uuid","c"},{"scale_factor",2}};
+        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,at,{{"shape_zyx",{1,2,3}}});txn.commit();}
+        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,at);txn.commit();}
+        auto read=db.read();const auto meta=nlohmann::json::parse(db.objectByUuid(read,loose)->meta);
+        require(meta["coordinates"]==at&&meta["coordinate_binding"]["shape_zyx"].size()==3,"bound coordinates and binding");
+        bool conflict=false;
+        try{auto txn=db.write();db.bindGeometryCoordinates(txn,loose,{{"volume_uuid","c"},{"scale_factor",4}});}
+        catch(const std::invalid_argument&){conflict=true;}
+        require(conflict,"a different frame is refused");
+    }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

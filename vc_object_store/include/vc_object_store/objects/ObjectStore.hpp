@@ -548,6 +548,12 @@ public:
     // Both bump generation and reset approval, like any content change.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
+    // Declare an object's coordinate frame: `coordinates` ({volume_uuid,
+    // scale_factor}) merged into its meta.coordinates, refusing a conflict with
+    // what it already declares, and `binding` (how the frame was decided, e.g.
+    // the volume's shape and resolution) as meta.coordinate_binding when given.
+    void bindGeometryCoordinates(WriteTxn&, const std::string& objectUuid, const nlohmann::json& coordinates,
+                                 const nlohmann::json& binding = nullptr);
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
     int64_t journalPosition(const Txn& txn) const;
