@@ -37,8 +37,10 @@ Decisions:
 
 ## Existing interfaces and gaps
 
-Target the `vc_object_store` contracts on `origin/fibers-to-obj-store`
-(reviewed at `193e6d38783e`), rather than the current checkout's store APIs.
+The initial contracts were reviewed on `origin/fibers-to-obj-store` at
+`193e6d38783e`. This branch now integrates upstream through
+`a180d351711521720a26f0065573f15c3228f95b`; use the integrated checkout's APIs
+for the remaining fitter work.
 
 - Stored geometry is available through Python typed/snapshot APIs: patch grids,
   fiber control/line points, and PCL stable point IDs and XYZ arrays.
@@ -56,18 +58,33 @@ Target the `vc_object_store` contracts on `origin/fibers-to-obj-store`
   geometry. Ordinary and adjacent branches are distinct classifications of
   `fiber_branch` relationships.
 - Patch-overlap edges currently anchor whole geometries and retain a fitted UV
-  pose and statistics, not the actual inlier correspondence list.
-- Detector scale options currently apply to an entire geometry kind in a call,
-  rather than individual objects. Mixed source scales require store-side work.
-- Detector `problems` is not currently a uniformly fatal-error channel: patch
-  overlap also places ordinary rejected-pair summaries there.
+  pose and statistics, not the actual inlier correspondence list. Step 4 adds
+  `overlap_correspondences()` to materialize deterministic pairs using the
+  detector's shared agreement traversal, recorded direction, grid scales and
+  agreement radius. Metadata-mode detection is required for these pose units.
+- Metadata-mode detectors now resolve scales per object when `volume_uuid` is
+  supplied. Existing explicit-scale APIs remain available for other callers;
+  their multipliers must be identity in metadata mode.
+- Detector reports distinguish structured `issues` from ordinary diagnostics;
+  use `failed`, not the compatibility `problems` list, to decide whether a run
+  failed. Invalid object frames are collected across selected kinds at stage
+  `validate`, then the detector returns without discovery or writes. Invalid
+  caller parameters and some whole-run errors still raise; startup must collect
+  these exceptions alongside returned failures across independent detectors.
 - Dataset files predate object identities: a tifxyz `meta.json` `uuid` is its
   directory name, and PCL collections and version-3 fibers have no UUID. Store
   ingest admits them with an explicit namespace (`vc_object_ingest
   --derive-uuids`, see the store's `docs/README.md`), giving each one
   `uuid5(namespace, "<kind>:<key>")`, so reingest maps files to the same objects.
   Version-3 fiber ingest (file-named branch targets, reciprocal declarations)
-  comes from `origin/fibers-to-obj-store` `09a64c275`.
+  originated in `origin/fibers-to-obj-store` `09a64c275`. The integrated importer
+  resolves filenames once, then uses the shared relationship importer for
+  reciprocal validation, including ordinary/adjacent, approval and automatic
+  status. Coordinate declarations use the shared conflict checks.
+- Upstream `fiberBatchEndpoints()` identifies out-of-batch fiber endpoints for
+  checked imports. Reuse it where import pinning is needed. Pending ordinary
+  branches preserve `auto` metadata through import/export; this does not approve
+  them or change the fitter's adjacent-branch exclusion.
 - `../spiral/dataset` has two defects that block ingest independently of
   identity. 47 of 247 version-3 branch declarations name fiber files absent from
   `fibers/`, and fiber ingest is atomic. `same_windings.json` collections 175-376
@@ -308,11 +325,13 @@ the relationship graph alone cannot supply seam corrections.
 
 ## Implementation sequence
 
-Implement as the following 12 commits, based on `origin/fibers-to-obj-store`
-(at `259a3548ab5b4813e40def010a816d392d674559` when this sequence was written).
-Use that base's newer volume-targeted selection APIs as well as the contracts
-reviewed above at `193e6d38783e`. Keep store changes separate from fitter changes,
-and include focused regression tests with each functional commit.
+The following 12 steps were originally planned as one commit each, based on
+`origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
+Steps 1–4 and their review fixes are implemented; steps 5–12 remain. Upstream
+through `a180d351711521720a26f0065573f15c3228f95b` is now integrated. Keep store
+changes separate from fitter changes, and include focused regression tests
+with each functional commit. Use the integrated volume-targeted selection and
+snapshot APIs rather than rebuilding them in the fitter.
 
 1. **Store: unify coordinate conversion.** Extend and expose existing coordinate
    helpers in Python; support per-object detector scales and strict frame
@@ -374,6 +393,61 @@ and include focused regression tests with each functional commit.
 Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the
 completed port rather than delaying or weakening input validation.
+
+## Integrated store validation (steps 1–4)
+
+Upstream through `a180d351711521720a26f0065573f15c3228f95b` was merged in
+`f945581d6`, after the review fixes in `642a0d932`. Merge reconciliation keeps
+UUID derivation, opt-in source repairs, shared reciprocal validation and coordinate
+conflict checks, alongside upstream automatic-branch metadata and
+`fiberBatchEndpoints()`. A regression checks pending automatic version-3 branches
+through reciprocal reconciliation, export/reimport and conflicting automatic flags.
+
+Validation used the existing Ubuntu amd64 Release build and Python environment;
+no dependencies were installed. Run from the repository root:
+
+```sh
+export AGENTS_AGENT_MODE=1
+store_build=/tmp/vc-object-coordinate-build
+store_python=/mnt/bcache/projects/vesuvius-scrolls/villa-spiral-simplification/spiral-fitting/.venv/bin/python
+cmake --build "$store_build" -j 6
+ctest --test-dir "$store_build" --output-on-failure
+VC_OBJECT_STORE_BUILD_PYTHON_PATH="$store_build/python" \
+  "$store_python" -m pytest -q vc_object_store/tests/python
+PYTHONPATH="$store_build/python" \
+  "$store_python" vc_object_store/tests/smoke/coordinate_frames.py \
+  ../spiral/dataset /tmp/object-upstream-merge-smoke
+"$store_build/bin/vc_object_ingest" \
+  --db /tmp/object-upstream-merge-ingest.vcobj --author review \
+  --fiber ../spiral/dataset/fibers \
+  --point-collections ../spiral/dataset/same_windings.json \
+  --derive-uuids 4d388e94-79e1-5047-aed1-a901c3dcb146 \
+  --volume-uuid 20260411134726 --scale-factor 1 \
+  --drop-dangling-branches --renumber-point-ids --no-progress
+```
+
+The output paths above must be fresh for a rerun. The ingest namespace is a test
+namespace, and the explicit frame is the test declaration for these source files.
+The ingest command covers fibers and `same_windings.json`; the separate coordinate
+smoke covers one real patch and five collections. Neither imports
+`patch-overlap-pcls.json`.
+
+Results: seven native tests and 97 Python tests passed, including the new merge
+regression. The native `object_store_sftp` fixture and Python
+`test_scripts_sync_a_hub_addressed_over_sftp_with_a_password` failed with
+`SSH write failed`; SFTP investigation was explicitly excluded from this port's
+scope. Local hub tests passed. To run only the agreed validation scope, add
+`-E '^object_store_sftp$'` to CTest and `-k 'not sftp'` to pytest; the full-suite
+results above are not claimed as all passing.
+
+Real ingest imported 111 fibers and 356 collections with zero problems; it
+reported dropped dangling declarations and renumbered 202 colliding collections.
+The coordinate smoke produced 32 identical attachments across explicit and mixed
+scales, with no additions, updates or removals on repeat refresh. macOS/arm64 and
+other upstream subprojects were not tested. These are store checks, not completion
+of the fitter adapter, distributed startup, resume or training acceptance in
+steps 5–12. Upstream hub/SFTP functionality does not add live synchronization or
+concurrent-writer support to this port's immutable-input contract.
 
 ## Verification and acceptance criteria
 
