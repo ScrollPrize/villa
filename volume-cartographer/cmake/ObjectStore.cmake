@@ -16,6 +16,9 @@ function(vc_find_object_store)
         set(VC_OBJECT_STORE_BUILD_TOOLS OFF)
         set(VC_OBJECT_STORE_BUILD_PYTHON OFF)
         set(VC_OBJECT_STORE_BUILD_TESTS ${VC_TESTING})
+        # Each vc_* DLL would otherwise embed and re-export its own copy of the
+        # static store, and PE has no symbol interposition to merge them.
+        set(VC_OBJECT_STORE_SHARED ${WIN32})
         add_subdirectory("${VC_OBJECT_STORE_SOURCE}" "${CMAKE_BINARY_DIR}/object_store")
     endif()
 endfunction()
