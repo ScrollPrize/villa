@@ -392,6 +392,10 @@ snapshot APIs rather than rebuilding them in the fitter.
     and all then-unused helpers, options, tests and documentation. Retain no
     legacy mode or service/workspace compatibility shims. Audit remaining
     references while preserving reusable runtime helpers and external inputs.
+    This includes `FitContext._regular_views_from_catalog_entries()` and the
+    other live relink/re-derivation paths, which duplicate
+    `pcl_views.regular_pcl_views()`: delete them rather than keep a second
+    PCL classification.
 12. **Docs and acceptance: validate the complete port.** Document configuration,
     the one-time dataset ingest (exact `vc_object_ingest` command with
     `--derive-uuids`, `--volume-uuid` and `--scale-factor`, and which sources it
@@ -413,6 +417,11 @@ Notes from steps 5–8 that the remaining steps build on:
 - A PCL point consumed by two point-patch edges is an error. Fiber points may
   attach to several patches through attachment views.
 - A fiber contact just outside the nearest-line control span widens the span.
+- Store attachments were detected on un-eroded grids. One whose quad erosion
+  removes is dropped (its point becomes unattached) and reported by edge UUID.
+- The constraints report and `FitContext` share
+  `object_store_inputs.derive_point_views`, so the report applies the fit's
+  validation and counts the actual views.
 - `pcl_use_fiber_links` still gates branch links; `pcl_use_pending_fiber_links`
   no longer applies to store links (approval follows the snapshot policy).
 - `tests/data/object_store_reference.json` is the file loader's output for the

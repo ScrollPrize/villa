@@ -198,10 +198,39 @@ def test_attachments_to_unfitted_patches_are_counted(db):
     assert inputs.counts['pcl attachments to unfitted patches'] == 1
 
 
-def test_report_lists_materialized_constraints(db, capsys):
+def test_attachments_on_eroded_quads_are_dropped_and_reported(db, tmp_path):
+    from object_store_fixture import fiber_patch_edge, put_fiber
     patch = put_patch(db, _grid())
     pcl = put_pcl(db, {0: _point(0, 1.0), 1: _point(1, 2.0)})
+    eroded = pcl_patch_edge(db, pcl, 0, patch, (0.25, 0.25))
+    kept = pcl_patch_edge(db, pcl, 1, patch, (3.5, 3.5))
+    fiber = put_fiber(db, [[10.0, 104.0, 40.0 + i] for i in range(12)], [0, 11])
+    contact = fiber_patch_edge(db, fiber, 2, patch, (0.5, 6.5))
+    inputs = materialize(db)
+    points = inputs.point_collections[0]['points']
+    assert 'on_patch' not in points[0] and points[1]['on_patch']['edge_uuid'] == kept
+    assert 'attachments' not in inputs.fibers[fiber]['points'][2]
+    assert sorted(edge for edge, _ in inputs.dropped_attachments) == sorted([eroded, contact])
+    assert inputs.counts['pcl attachments on eroded quads'] == 1
+    assert inputs.counts['fiber contacts on eroded quads'] == 1
+    warning = [line for line in inputs.report() if line.startswith('WARNING')]
+    assert len(warning) == 1 and eroded in warning[0] and contact in warning[0]
+
+
+def test_report_derives_the_runtime_views(db, capsys):
+    patch = put_patch(db, _grid())
+    pcl = put_pcl(db, {0: _point(0, 1.0), 1: _point(1, 2.0), 2: _point(2, 2.5)})
     pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    pcl_patch_edge(db, pcl, 1, patch, (2.0, 2.0))
     assert osi.main([db.path, '--z-begin', '0', '--z-end', '64']) == 0
     report = capsys.readouterr().out
-    assert 'constraints: ' in report and 'pcl attachments 1' in report
+    assert 'pcl attachments 2' in report
+    assert 'views: 1 cross-patch (relative_windings 1), 1 strips (relative_windings 1)' in report
+
+
+def test_report_fails_where_a_fit_would(db, capsys):
+    patch = put_patch(db, _grid())
+    pcl = put_pcl(db, {0: _point(0)}, absolute=True)
+    pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
+    assert osi.main([db.path, '--z-begin', '0', '--z-end', '64']) == 1
+    assert 'without a winding annotation' in capsys.readouterr().err

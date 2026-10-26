@@ -90,11 +90,10 @@ from pcl_views import (
     _UnattachedPclStripList,
     catalog_copy_of_pcl,
     longest_run_in_z_window,
-    fiber_training_views,
     materialize_fiber_fit_inputs,
-    prepare_fiber_catalog,
     regular_pcl_views,
     regular_unattached_strip,
+    vertical_fiber_radial_offset,
 )
 from dt_targets import (
     DtTargetCacheManager,
@@ -1990,54 +1989,27 @@ class FitContext:
             )
 
     def _derive_object_store_point_inputs(self, verified_patches, inputs):
-        """Derive point views from object-store attachments; no linking.
+        """Install point views derived from object-store attachments.
 
-        The store's relationships already attach points to patches, so the
-        materialized collections go straight to classification. Returns the
-        next free resident collection id.
+        Uses object_store_inputs.derive_point_views, as the constraints
+        report does, so both apply the same validation. Returns the next free
+        resident collection id.
         """
-        point_collections = inputs.point_collections
-        regular_pcl_catalog = {
-            cid: catalog_copy_of_pcl(pcl)
-            for cid, pcl in point_collections.items()
-        }
-        for pcl in point_collections.values():
-            pcl['chain'] = SequenceChain(pcl)
-        cross_patch, strips, strip_groups = regular_pcl_views(
-            point_collections, verified_patches,
-            z_begin=self.z_begin, z_end=self.z_end,
-            z_margin=self.config['patch_loss_z_margin'],
-            min_point_spacing=self.config['pcl_unattached_pcl_min_point_spacing'])
-        # Fibers keep every source line index through trimming and
-        # decimation; contacts and branch endpoints were retained by the
-        # materializer, and a contact attached to several patches shares one
-        # chain point. Every fiber with a usable in-ROI path keeps its strip.
-        fiber_catalog = inputs.fibers
-        fibers = prepare_fiber_catalog(fiber_catalog)
-        resolved_links = (list(inputs.fiber_links)
-                          if self.config['pcl_use_fiber_links'] else [])
-        fiber_cross_patch, fiber_strips, fiber_groups, link_components = \
-            fiber_training_views(
-                fibers, resolved_links, verified_patches,
-                z_begin=self.z_begin, z_end=self.z_end,
-                z_margin=self.config['patch_loss_z_margin'],
-                min_point_spacing=self.config['pcl_unattached_pcl_min_point_spacing'],
-                vertical_min_z_fraction=self.config['pcl_vertical_fiber_min_z_fraction'],
-                vertical_min_auto_certainty=self.config['pcl_vertical_fiber_min_auto_certainty'],
-                vertical_radial_offset=self._vertical_fiber_radial_offset(),
-                strip_every_fiber=True)
-        strips.extend(fiber_strips)
-        strip_groups.extend(fiber_groups)
-        for line in inputs.report():
+        from object_store_inputs import derive_point_views
+        views = derive_point_views(inputs, verified_patches, self.config)
+        for line in inputs.report() + views.report():
             print(line)
         self._install_point_views(
-            list(cross_patch.values()) + fiber_cross_patch, strips, strip_groups,
-            fiber_catalog=fiber_catalog, regular_pcl_catalog=regular_pcl_catalog,
-            resolved_links=resolved_links, link_components=link_components)
+            views.cross_patch, views.strips, views.strip_groups,
+            fiber_catalog=views.fiber_catalog,
+            regular_pcl_catalog=views.regular_pcl_catalog,
+            resolved_links=views.resolved_links,
+            link_components=views.link_components)
         self.link_distance_tolerance = float(
             self.config['pcl_link_distance_tolerance'])
-        return max([*point_collections, *(pcl['id'] for pcl in fibers.values())],
-                   default=-1) + 1
+        resident_ids = [*inputs.point_collections,
+                        *(pcl['id'] for pcl in inputs.fibers.values())]
+        return max(resident_ids, default=-1) + 1
 
     def _load_and_link_file_inputs(self):
         """Load patches, PCLs and fibers from files and link them by proximity.
@@ -2137,9 +2109,7 @@ class FitContext:
 
     def _vertical_fiber_radial_offset(self):
         """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
-        if not self.config['pcl_vertical_fiber_radial_offset_enabled']:
-            return 0.0
-        return float(self.config['pcl_vertical_fiber_radial_offset_voxels'])
+        return vertical_fiber_radial_offset(self.config)
 
     # ---- Point-to-patch linking options -----------------------------------
 

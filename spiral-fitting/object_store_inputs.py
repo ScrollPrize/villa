@@ -17,10 +17,12 @@ the fitter's runtime inputs in three stages:
 The store's automatic detectors are authoritative: their relationships are
 consumed as they are, never relinked by proximity here.
 
-    python object_store_inputs.py STORE.vcobj [--volume V] [--z-begin Z0 --z-end Z1]
+    python object_store_inputs.py STORE.vcobj [--volume V] \
+        [--z-begin Z0 --z-end Z1 [--config FIT.json]]
 
-prints the selection's report, with its materialized constraint counts when
-a z window is given, without training.
+prints the selection's report without training. Given a z window it also
+materializes and derives the training views exactly as a fit with that
+configuration would, failing on the same validation errors.
 """
 import argparse
 import dataclasses
@@ -454,6 +456,8 @@ class FitInputs:
     whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
     ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
     ``fiber_links`` holds their resolved same-winding branch links.
+    ``dropped_attachments`` lists ``(edge UUID, reason)`` for consumed
+    attachments that fall on a patch quad erosion removed.
     """
     snapshot: InputSnapshot
     patches: dict
@@ -461,11 +465,20 @@ class FitInputs:
     fibers: dict
     fiber_links: list
     counts: Counter
+    dropped_attachments: list = dataclasses.field(default_factory=list)
 
-    def report(self):
-        return snapshot_report(self.snapshot) + [
+    def report(self, max_named=5):
+        lines = snapshot_report(self.snapshot) + [
             'constraints: ' + ', '.join(
                 f'{name} {count}' for name, count in sorted(self.counts.items()))]
+        if self.dropped_attachments:
+            named = ', '.join(edge for edge, _ in self.dropped_attachments[:max_named])
+            more = len(self.dropped_attachments) - max_named
+            lines.append(
+                f'WARNING: {len(self.dropped_attachments)} consumed attachment(s) '
+                f'lie on patch quads removed by erosion and were dropped: {named}'
+                + (f', and {more} more' if more > 0 else ''))
+        return lines
 
 
 def materialize_patches(store, snapshot, *, z_begin, z_end, erode_cells_default):
@@ -544,6 +557,19 @@ def _winding_annotation(obj, point_id, annotation):
     return float(value)
 
 
+def on_retained_quad(patch, ij):
+    """Whether (row, col) ``ij`` lies on a valid quad of the fitted patch.
+
+    Uses the winding losses' rule (losses._valid_patch_annotation): the quad
+    is the floor of ``ij``, clamped to the grid. Stored attachments were
+    detected on un-eroded geometry, so erosion can remove their quad.
+    """
+    mask = patch.valid_quad_mask
+    row = min(max(int(ij[0]), 0), mask.shape[0] - 1)
+    col = min(max(int(ij[1]), 0), mask.shape[1] - 1)
+    return bool(mask[row, col])
+
+
 def _anchor_index(anchor, array):
     points = anchor.get('points') or []
     if len(points) < 1 or points[0]['array'] != array or len(points[0]['index']) != 1:
@@ -565,13 +591,16 @@ def _pcl_attachment(rel, patches):
                       'edge_uuid': rel.uuid}
 
 
-def materialize_point_collections(store, snapshot, patches, first_id=0):
+def materialize_point_collections(store, snapshot, patches, first_id=0,
+                                  dropped=None):
     """Regular PCLs of the snapshot, keyed by resident id in UUID order.
 
     Points are keyed by their stable IDs and carry fit-frame ZYX and their
     aligned ``wind_a`` annotation. Each consumed point-patch edge attaches its
     point to its patch at the recorded (row, col); edges to patches dropped
-    from the fit are counted and ignored.
+    from the fit are counted and ignored. An attachment on a quad erosion
+    removed leaves its point unattached and is appended to ``dropped`` as
+    ``(edge UUID, reason)``.
     """
     edges_by_pcl = {}
     for rel in snapshot.relationships_of('pcl_patch'):
@@ -608,6 +637,10 @@ def materialize_point_collections(store, snapshot, patches, first_id=0):
                                 f'{point_id}, absent from {obj.uuid}')
             elif attachment is None:
                 counts['pcl attachments to unfitted patches'] += 1
+            elif not on_retained_quad(patches[attachment['id']], attachment['ij']):
+                counts['pcl attachments on eroded quads'] += 1
+                if dropped is not None:
+                    dropped.append((rel.uuid, 'eroded quad'))
             elif 'on_patch' in point:
                 problems.append(
                     f'point {point_id} of point collection {obj.uuid} attaches '
@@ -650,7 +683,7 @@ def _fiber_contact(rel):
 
 
 def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
-                       first_id=0):
+                       first_id=0, dropped=None):
     """Fit-frame fibers, their contacts and same-winding branch links.
 
     Returns ``(fiber_catalog, links, counts)``. The catalog maps fiber UUIDs
@@ -659,8 +692,10 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     renumber them. Every consumed contact and branch endpoint is kept through
     both. A contact's point lists each patch it attaches to in
     ``point['attachments']``, so one physical point (one chain/theta node) can
-    attach to several patches. ``links`` are resolved branch links keyed by
-    resident collection id and raw line index.
+    attach to several patches. A contact on a quad erosion removed is not
+    attached, and is appended to ``dropped`` as ``(edge UUID, reason)``.
+    ``links`` are resolved branch links keyed by resident collection id and
+    raw line index.
     """
     from vc_object_store import fiber_branch_control_index
     from spiral_helpers import (_decimate_ordered_points_min_spacing,
@@ -678,6 +713,11 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
             continue
         if rel.a not in patches:
             counts['fiber contacts with unfitted patches'] += 1
+            continue
+        if not on_retained_quad(patches[rel.a], ij):
+            counts['fiber contacts on eroded quads'] += 1
+            if dropped is not None:
+                dropped.append((rel.uuid, 'eroded quad'))
             continue
         contacts[rel.b].setdefault(line_index, []).append(
             {'id': rel.a, 'ij': ij, 'edge_uuid': rel.uuid})
@@ -788,15 +828,88 @@ def materialize(store, snapshot, *, z_begin, z_end, erode_cells_default,
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end,
         erode_cells_default=erode_cells_default)
+    dropped = []
     point_collections, pcl_counts = materialize_point_collections(
-        store, snapshot, patches)
+        store, snapshot, patches, dropped=dropped)
     counts.update(pcl_counts)
     fibers, fiber_links, fiber_counts = materialize_fibers(
         store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
-        first_id=len(point_collections))
+        first_id=len(point_collections), dropped=dropped)
     counts.update(fiber_counts)
     return FitInputs(snapshot, patches, point_collections, fibers,
-                     fiber_links, counts)
+                     fiber_links, counts, dropped)
+
+
+@dataclasses.dataclass
+class PointViews:
+    """The training views FitContext installs (FitContext._install_point_views)."""
+    cross_patch: list
+    strips: list
+    strip_groups: list
+    fiber_catalog: dict
+    regular_pcl_catalog: dict
+    resolved_links: list
+    link_components: list
+
+    def report(self):
+        def by_group(groups):
+            counts = Counter(str(group) for group in groups)
+            return ', '.join(f'{group} {count}' for group, count in sorted(counts.items()))
+        merged = [pcl for pcl in self.cross_patch if pcl.get('link_member_cids')]
+        return [
+            f'views: {len(self.cross_patch)} cross-patch ('
+            + (by_group(pcl['sampling_group'] for pcl in self.cross_patch) or 'none')
+            + f'), {len(self.strips)} strips ('
+            + (by_group(self.strip_groups) or 'none') + ')',
+            f'fiber links: {len(self.resolved_links)} in '
+            f'{len(self.link_components)} component(s); {len(merged)} merged '
+            'cross-patch fiber component(s)',
+        ]
+
+
+def derive_point_views(inputs, patches, config):
+    """Classify materialized inputs into training views; no linking.
+
+    The store's relationships already attach points to patches, so the
+    collections go straight to the shared classification: regular PCLs
+    through regular_pcl_views, fibers through fiber_training_views, where
+    every fiber with a usable in-ROI path keeps its strip. ``patches`` are the
+    patches the fit uses; ``config`` the fit configuration. Raises the
+    runtime validation errors (e.g. unannotated absolute points).
+    """
+    from pcl_views import (catalog_copy_of_pcl, fiber_training_views,
+                           prepare_fiber_catalog, regular_pcl_views,
+                           vertical_fiber_radial_offset)
+    from spiral_helpers import SequenceChain
+
+    point_collections = inputs.point_collections
+    regular_pcl_catalog = {
+        cid: catalog_copy_of_pcl(pcl) for cid, pcl in point_collections.items()}
+    for pcl in point_collections.values():
+        pcl['chain'] = SequenceChain(pcl)
+    cross_patch, strips, strip_groups = regular_pcl_views(
+        point_collections, patches,
+        z_begin=config['z_begin'], z_end=config['z_end'],
+        z_margin=config['patch_loss_z_margin'],
+        min_point_spacing=config['pcl_unattached_pcl_min_point_spacing'])
+    fibers = prepare_fiber_catalog(inputs.fibers)
+    resolved_links = (list(inputs.fiber_links)
+                      if config['pcl_use_fiber_links'] else [])
+    fiber_cross_patch, fiber_strips, fiber_groups, link_components = \
+        fiber_training_views(
+            fibers, resolved_links, patches,
+            z_begin=config['z_begin'], z_end=config['z_end'],
+            z_margin=config['patch_loss_z_margin'],
+            min_point_spacing=config['pcl_unattached_pcl_min_point_spacing'],
+            vertical_min_z_fraction=config['pcl_vertical_fiber_min_z_fraction'],
+            vertical_min_auto_certainty=config['pcl_vertical_fiber_min_auto_certainty'],
+            vertical_radial_offset=vertical_fiber_radial_offset(config),
+            strip_every_fiber=True)
+    strips.extend(fiber_strips)
+    strip_groups.extend(fiber_groups)
+    return PointViews(
+        list(cross_patch.values()) + fiber_cross_patch, strips, strip_groups,
+        inputs.fibers, regular_pcl_catalog, resolved_links, link_components)
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +943,28 @@ def snapshot_report(snapshot):
     return lines
 
 
+def constraints_report(store, snapshot, config):
+    """Materialize and derive the runtime views as a fit would, and describe
+    them; raises the same validation errors a fit would."""
+    inputs = materialize(
+        store, snapshot, z_begin=config['z_begin'], z_end=config['z_end'],
+        erode_cells_default=config['patch_erode_patches'],
+        fiber_min_point_spacing=config['pcl_fiber_min_point_spacing'])
+    views = derive_point_views(inputs, inputs.patches, config)
+    return inputs.report() + views.report()
+
+
+def _report_config(args):
+    from config import Config
+    overrides = {}
+    if args.config:
+        with open(args.config) as stream:
+            overrides = json.load(stream)
+    config = Config(overrides).as_dict()
+    config.update(z_begin=args.z_begin, z_end=args.z_end)
+    return config
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('store')
@@ -842,10 +977,7 @@ def _parse_args(argv):
     parser.add_argument('--z-begin', type=int,
                         help='with --z-end, also materialize the constraints of this z window')
     parser.add_argument('--z-end', type=int)
-    parser.add_argument('--erode-cells', type=int, default=1,
-                        help='default patch erosion (patch_erode_patches)')
-    parser.add_argument('--fiber-spacing', type=float, default=0.0,
-                        help='fiber decimation spacing (pcl_fiber_min_point_spacing)')
+    parser.add_argument('--config', help='fit configuration JSON overriding the defaults')
     parser.add_argument('--json', help='write the manifest and report here')
     return parser.parse_args(argv)
 
@@ -865,14 +997,11 @@ def main(argv=None):
         try:
             snapshot = read_snapshot(store, request)
             if args.z_begin is not None and args.z_end is not None:
-                lines = materialize(
-                    store, snapshot, z_begin=args.z_begin, z_end=args.z_end,
-                    erode_cells_default=args.erode_cells,
-                    fiber_min_point_spacing=args.fiber_spacing).report()
+                lines = constraints_report(store, snapshot, _report_config(args))
             else:
                 lines = snapshot_report(snapshot)
-        except ObjectStoreInputError as error:
-            for problem in error.problems:
+        except ValueError as error:
+            for problem in getattr(error, 'problems', None) or [str(error)]:
                 print(f'error: {problem}', file=sys.stderr)
             return 1
     print('\n'.join(lines))

@@ -197,6 +197,13 @@ def regular_pcl_views(point_collections, verified_patches, *, z_begin, z_end,
     return cross_patch, strips, strip_sampling_groups
 
 
+def vertical_fiber_radial_offset(config):
+    """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""
+    if not config['pcl_vertical_fiber_radial_offset_enabled']:
+        return 0.0
+    return float(config['pcl_vertical_fiber_radial_offset_voxels'])
+
+
 def prepare_fiber_catalog(fiber_catalog):
     """Stamp fiber identity, chains and ZYX on the resident fiber catalog.
 

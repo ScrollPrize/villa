@@ -57,7 +57,7 @@ def test_contacts_and_branch_endpoints_survive_trimming_and_decimation(db):
                         [0, 19], [3, 9])
     fiber_patch_edge(db, fiber, 17, patch, (6.5, 4.25))
     fiber_patch_edge(db, fiber, 17, other_patch, (6.5, 4.25))
-    fiber_patch_edge(db, fiber, 3, patch, (6.5, 0.75))
+    fiber_patch_edge(db, fiber, 3, patch, (6.5, 1.75))
     edge = branch(db, fiber, 11, partner, 9)
     inputs = materialize(db, fiber_min_point_spacing=10.0)
     catalog = inputs.fibers[fiber]
@@ -105,7 +105,7 @@ def test_attachments_to_several_patches_share_one_physical_node(db, tmp_path):
     b = put_patch(db, _grid(x0=60.0), (0.25, 0.25))
     fiber = put_fiber(db, _dense_line(40), [0, 39], [1, 2])
     fiber_patch_edge(db, fiber, 22, a, (6.5, 5.5))
-    fiber_patch_edge(db, fiber, 22, b, (6.5, 0.5))
+    fiber_patch_edge(db, fiber, 22, b, (6.5, 1.5))
     context = adapter_context(db, tmp_path)
     [pcl] = [p for p in context.cross_patch_pcls
              if p['metadata'].get('logical_input_kind') == 'fiber']
