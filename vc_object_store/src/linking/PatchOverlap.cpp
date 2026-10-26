@@ -836,9 +836,14 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
     auto patchFor = [&](const std::string& uuid) -> const LoadedPatch& {
         if (const auto found = patches.find(uuid); found != patches.end()) return found->second;
         const auto objects = inputs.select("patch", {uuid});
+        double scale;
+        try {
+            scale = objects::geometryScaleToFrame(Json::parse(objects.front().meta), params.volumeUuid);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(uuid + ": " + error.what());
+        }
         DetectorReport report;
-        auto loaded = loadPatch(inputs, objects.front(), loading, report,
-            objects::geometryScaleToFrame(Json::parse(objects.front().meta), params.volumeUuid));
+        auto loaded = loadPatch(inputs, objects.front(), loading, report, scale);
         if (!loaded) throw std::runtime_error(report.issues.empty() ? uuid + ": patch could not be loaded" : report.issues.front().message);
         return patches.emplace(uuid, std::move(*loaded)).first->second;
     };

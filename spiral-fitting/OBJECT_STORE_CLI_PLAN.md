@@ -394,61 +394,6 @@ Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the
 completed port rather than delaying or weakening input validation.
 
-## Integrated store validation (steps 1–4)
-
-Upstream through `a180d351711521720a26f0065573f15c3228f95b` was merged in
-`f945581d6`, after the review fixes in `642a0d932`. Merge reconciliation keeps
-UUID derivation, opt-in source repairs, shared reciprocal validation and coordinate
-conflict checks, alongside upstream automatic-branch metadata and
-`fiberBatchEndpoints()`. A regression checks pending automatic version-3 branches
-through reciprocal reconciliation, export/reimport and conflicting automatic flags.
-
-Validation used the existing Ubuntu amd64 Release build and Python environment;
-no dependencies were installed. Run from the repository root:
-
-```sh
-export AGENTS_AGENT_MODE=1
-store_build=/tmp/vc-object-coordinate-build
-store_python=/mnt/bcache/projects/vesuvius-scrolls/villa-spiral-simplification/spiral-fitting/.venv/bin/python
-cmake --build "$store_build" -j 6
-ctest --test-dir "$store_build" --output-on-failure
-VC_OBJECT_STORE_BUILD_PYTHON_PATH="$store_build/python" \
-  "$store_python" -m pytest -q vc_object_store/tests/python
-PYTHONPATH="$store_build/python" \
-  "$store_python" vc_object_store/tests/smoke/coordinate_frames.py \
-  ../spiral/dataset /tmp/object-upstream-merge-smoke
-"$store_build/bin/vc_object_ingest" \
-  --db /tmp/object-upstream-merge-ingest.vcobj --author review \
-  --fiber ../spiral/dataset/fibers \
-  --point-collections ../spiral/dataset/same_windings.json \
-  --derive-uuids 4d388e94-79e1-5047-aed1-a901c3dcb146 \
-  --volume-uuid 20260411134726 --scale-factor 1 \
-  --drop-dangling-branches --renumber-point-ids --no-progress
-```
-
-The output paths above must be fresh for a rerun. The ingest namespace is a test
-namespace, and the explicit frame is the test declaration for these source files.
-The ingest command covers fibers and `same_windings.json`; the separate coordinate
-smoke covers one real patch and five collections. Neither imports
-`patch-overlap-pcls.json`.
-
-Results: seven native tests and 97 Python tests passed, including the new merge
-regression. The native `object_store_sftp` fixture and Python
-`test_scripts_sync_a_hub_addressed_over_sftp_with_a_password` failed with
-`SSH write failed`; SFTP investigation was explicitly excluded from this port's
-scope. Local hub tests passed. To run only the agreed validation scope, add
-`-E '^object_store_sftp$'` to CTest and `-k 'not sftp'` to pytest; the full-suite
-results above are not claimed as all passing.
-
-Real ingest imported 111 fibers and 356 collections with zero problems; it
-reported dropped dangling declarations and renumbered 202 colliding collections.
-The coordinate smoke produced 32 identical attachments across explicit and mixed
-scales, with no additions, updates or removals on repeat refresh. macOS/arm64 and
-other upstream subprojects were not tested. These are store checks, not completion
-of the fitter adapter, distributed startup, resume or training acceptance in
-steps 5–12. Upstream hub/SFTP functionality does not add live synchronization or
-concurrent-writer support to this port's immutable-input contract.
-
 ## Verification and acceptance criteria
 
 Use existing environments and project test entrypoints; no bootstrap/install is

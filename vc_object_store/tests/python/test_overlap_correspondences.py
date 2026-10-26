@@ -150,6 +150,9 @@ def test_unusable_edges_report_errors_independently(db):
     # A changed frame changes the grid scale the pose was fitted in.
     db.set_meta(HIGH, "coordinates", frame(2))
     assert "grid scale differs" in materialize(db, edge)["error"]
+    # A patch moved to another volume names itself.
+    db.set_meta(HIGH, "coordinates", frame(volume="other"))
+    assert materialize(db, edge)["error"] == HIGH + ": geometry volume_uuid does not match target volume"
     db.set_meta(HIGH, "coordinates", frame(1))
     assert materialize(db, edge)["error"] is None
     # An edge kept bound to its recorded revision across a coordinate edit is stale.
