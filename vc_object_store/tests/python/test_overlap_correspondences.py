@@ -104,23 +104,31 @@ def test_deterministic_thinning(db):
     assert thinned["pairs"] == [dense["pairs"][i * n // 50] for i in range(50)]
 
 
-def test_legacy_positional_metadata_resolves_by_uuid_order(db):
-    patch(db, HIGH, flat())
-    patch(db, LOW, flat(10))
+def test_agreement_radius_is_the_detectors(db):
+    # Two planes six voxels apart, accepted under a wide tolerance.
+    patch(db, LOW, flat())
+    patch(db, HIGH, lambda rows, cols: (cols + 10, rows, np.full_like(rows, 26)))
+    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
+    assert report["edges_created"] == 1, report
+    edge = db.edges_by_kind("same-surface")[0]
+    assert edge["meta"]["fit"]["agreement_radius"] == 10
+    result = materialize(db, edge)
+    assert result["error"] is None and result["pairs"]
+    assert all(5.9 < pair["distance"] < 6.1 for pair in result["pairs"])
+
+
+def test_edges_without_recorded_fit_fields_must_be_redetected(db):
+    patch(db, LOW, flat())
+    patch(db, HIGH, flat(10))
     edge = overlap_edge(db)
-    current = materialize(db, edge)
-    meta = edge["meta"]
-    fit = meta["fit"]
-    # The previous detector wrote the seed (smaller UUID) as "a" and pose b -> a.
-    legacy = dict(fit, pose_direction="b_to_a", a_grid_scale=fit["grid_scales"][LOW],
-                  b_grid_scale=fit["grid_scales"][HIGH])
-    for key in ("pose_from", "pose_to", "grid_scales"):
-        del legacy[key]
     whole = dict(whole_geometry=True)
-    old = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="legacy-overlap", a_anchor=whole, b_anchor=whole,
-                           meta=dict(meta, fit=legacy)))
-    [result] = db.overlap_correspondences([old], VOLUME)
-    assert result["error"] is None and result["pairs"] == current["pairs"]
+    for key in ("pose_from", "grid_scales", "agreement_radius"):
+        fit = dict(edge["meta"]["fit"])
+        del fit[key]
+        old = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="old-" + key, a_anchor=whole, b_anchor=whole,
+                               meta=dict(edge["meta"], fit=fit)))
+        [result] = db.overlap_correspondences([old], VOLUME)
+        assert "rerun patch-overlap detection" in result["error"] and result["pairs"] == []
 
 
 def test_unusable_edges_report_errors_independently(db):

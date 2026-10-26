@@ -151,10 +151,10 @@ working patch grid steps per voxel are divided by the XYZ conversion multiplier.
 Invalid patch vertices retain their sentinels. Overlap edges record
 `meta.fit.pose` (row-major `[r00, r01, tx, r10, r11, ty]`), mapping metric UV of
 patch `pose_from` to `pose_to`, with `pose_units = "volume_voxels"` and per-patch
-`grid_scales` (`{uuid: [u, v]}`, grid steps per voxel). Direction and scales are
-keyed by UUID because stored edges order their endpoints independently of the
-detector. Edges written before this used positional `pose_direction = "b_to_a"`
-and `a_grid_scale`/`b_grid_scale`, where "a" was the smaller UUID.
+`grid_scales` (`{uuid: [u, v]}`, grid steps per voxel), and the
+`agreement_radius` (`tolerance + uv_inlier_tolerance`, volume voxels) its dense
+agreement check used. Direction and scales are keyed by UUID because stored
+edges order their endpoints independently of the detector.
 
 ### Overlap correspondences
 
@@ -165,7 +165,7 @@ matching:
 
 ```python
 for result in store.overlap_correspondences(edge_uuids, volume_uuid,
-                                            spacing=8, agreement_radius=5, max_pairs=256):
+                                            spacing=8, max_pairs=256):
     if result["error"]:
         ...  # report; never drop silently
     for pair in result["pairs"]:
@@ -175,27 +175,28 @@ for result in store.overlap_correspondences(edge_uuids, volume_uuid,
 
 Patch a's valid vertices are sampled every `spacing` voxels in row-major order
 and mapped to patch b's metric UV; a pair is kept when b's containing quad is
-valid and the points lie within `agreement_radius` (default: the detector's
-`tolerance + uv_inlier_tolerance`). Agreeing pairs above `max_pairs` are thinned
+valid and the points lie within the edge's recorded `agreement_radius`, the same
+bound detection accepted it with; callers wanting a tighter bound filter on
+`distance`. Agreeing pairs above `max_pairs` are thinned
 evenly in sample order, so results are deterministic. Pairs follow the stored
 edge's a/b order. Each edge reports an `error` instead of pairs when it has no
-volume-frame pose, its geometry is stale, an endpoint's grid scale has changed
+volume-frame pose (including edges detected before the direction, scales and
+radius were recorded), its geometry is stale, an endpoint's grid scale has changed
 since detection, or no pair agrees. Approval filtering is the caller's choice.
 
 Python exposes the existing native `geometry_coordinates`,
 `merge_geometry_coordinates` and `geometry_scale_to_volume` helpers, plus strict
 `resolve_geometry_coordinates` and `geometry_scale_to_frame`. The volume helper
 returns `None` for unknown or mismatched frames. The strict helpers raise instead.
-For fitting downsampling N, use:
+To convert stored coordinates to volume voxels:
 
 ```python
 from vc_object_store import geometry_scale_to_frame
-multiplier = geometry_scale_to_frame(metadata, V, downsample_factor=N)
-fit_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor / N
+multiplier = geometry_scale_to_frame(metadata, V)
+volume_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor
 ```
 
-The strict helper checks representability both before and after downsampling. Consumers must preserve
-invalid vertex sentinels when applying the multiplier to arrays.
+Consumers must preserve invalid vertex sentinels when applying the multiplier to arrays.
 
 Run regression tests against an existing native build and Python environment:
 

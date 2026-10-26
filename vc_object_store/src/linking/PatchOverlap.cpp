@@ -779,6 +779,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
                 metadata["fit"]["pose_to"] = seed.uuid;
                 metadata["fit"]["grid_scales"] = {{seed.uuid, {seed.scale[0], seed.scale[1]}},
                                                   {target.uuid, {target.scale[0], target.scale[1]}}};
+                metadata["fit"]["agreement_radius"] = agreementRadius;
             }
             candidate.meta = metadata.dump();
             candidates.push_back(std::move(candidate));
@@ -811,9 +812,8 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
 {
     using Json = nlohmann::json;
     if (params.volumeUuid.empty()) throw std::invalid_argument("overlap correspondences: volumeUuid is required");
-    if (!(params.spacing > 0) || !std::isfinite(params.spacing) || !(params.agreementRadius > 0) ||
-        !std::isfinite(params.agreementRadius) || params.maxPairs == 0)
-        throw std::invalid_argument("overlap correspondences: spacing, agreementRadius and maxPairs must be positive");
+    if (!(params.spacing > 0) || !std::isfinite(params.spacing) || params.maxPairs == 0)
+        throw std::invalid_argument("overlap correspondences: spacing and maxPairs must be positive");
     detail::StoredGeometry inputs(db);
     PatchOverlapParams loading;
     loading.volumeUuid = params.volumeUuid;
@@ -846,19 +846,15 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
                 fit.value("pose_units", "") != "volume_voxels")
                 throw std::runtime_error("edge pose is not in volume " + params.volumeUuid +
                     " voxels; rerun patch-overlap detection with that volume_uuid");
-            std::string from, to;
-            Json scales;
-            if (fit.contains("pose_from")) {
-                from = fit.at("pose_from").get<std::string>(); to = fit.at("pose_to").get<std::string>();
-                scales = fit.at("grid_scales");
-            } else if (fit.value("pose_direction", "") == "b_to_a") {
-                // Edges written before pose_from/pose_to call the detector's seed "a".
-                // The seed was the patch with the smaller UUID (selection is UUID-ordered),
-                // whatever endpoint order the stored edge uses.
-                const auto [low, high] = std::minmax(edge->aUuid, edge->bUuid);
-                from = high; to = low;
-                scales = {{low, fit.at("a_grid_scale")}, {high, fit.at("b_grid_scale")}};
-            } else throw std::runtime_error("edge does not record its pose direction");
+            if (!fit.contains("pose_from") || !fit.contains("pose_to") || !fit.contains("grid_scales") ||
+                !fit.contains("agreement_radius"))
+                throw std::runtime_error("edge does not record its pose direction, grid scales and agreement radius; "
+                                         "rerun patch-overlap detection");
+            const auto from = fit.at("pose_from").get<std::string>(), to = fit.at("pose_to").get<std::string>();
+            const auto& scales = fit.at("grid_scales");
+            const auto agreementRadius = fit.at("agreement_radius").get<double>();
+            if (!(agreementRadius > 0) || !std::isfinite(agreementRadius))
+                throw std::runtime_error("invalid overlap agreement radius");
             if (std::minmax(from, to) != std::minmax(edge->aUuid, edge->bUuid))
                 throw std::runtime_error("pose endpoints do not match the edge");
             if (db.edgeGeometryState(inputs.read(), edge->uuid).stale)
@@ -883,7 +879,7 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
                 if (!other) continue;
                 const cv::Vec3f delta = *other - sample.xyz;
                 const double distance = std::sqrt(double(delta.dot(delta)));
-                if (distance > params.agreementRadius) continue;
+                if (distance > agreementRadius) continue;
                 OverlapCorrespondence pair;
                 pair.aGrid = {double(sample.row), double(sample.col)};
                 pair.bGrid = {uv.y * b.scale[1], uv.x * b.scale[0]};

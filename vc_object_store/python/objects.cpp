@@ -271,9 +271,9 @@ NB_MODULE(_native, m)
     m.def("resolve_geometry_coordinates", [](const nb::dict& metadata, const std::string& volume) {
         return jsonLoads(vo::resolveGeometryCoordinates(nlohmann::json::parse(jsonDumps(metadata)), volume).dump());
     }, nb::arg("metadata"), nb::arg("volume_uuid"));
-    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume, double downsample) {
-        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume, downsample);
-    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("downsample_factor") = 1.0);
+    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume) {
+        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume);
+    }, nb::arg("metadata"), nb::arg("volume_uuid"));
 
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
@@ -642,8 +642,8 @@ NB_MODULE(_native, m)
         .def(
             "overlap_correspondences",
             [](PyObjectStore& self, const std::vector<std::string>& edges, const std::string& volume,
-               double spacing, double agreementRadius, std::size_t maxPairs) {
-                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, agreementRadius, maxPairs};
+               double spacing, std::size_t maxPairs) {
+                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
                 const auto results = self.withStore<true>([&](auto& db) {
                     return vc::object_links::materializeOverlapCorrespondences(db, edges, p);
                 });
@@ -666,7 +666,7 @@ NB_MODULE(_native, m)
                 return out;
             },
             nb::arg("edge_uuids"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0,
-            nb::arg("agreement_radius") = 5.0, nb::arg("max_pairs") = 256,
+            nb::arg("max_pairs") = 256,
             "Point pairs for accepted patch-overlap edges from their stored poses; grids are (row, column), "
             "XYZ in volume voxels, in stored edge endpoint order. A non-null error means the edge failed.")
         .def(

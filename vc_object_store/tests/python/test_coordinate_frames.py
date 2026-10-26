@@ -42,14 +42,9 @@ def test_shared_resolution_and_round_trip():
     assert geometry_scale_to_volume({}, VOLUME) is None
     assert geometry_scale_to_volume({"coordinates": frame(volume="other")}, VOLUME) is None
     for scale in (0.25, 1, 2, 8):
-        metadata = {"coordinates": frame(scale)}
-        for n in (1, 2, 8):
-            multiplier = geometry_scale_to_frame(metadata, VOLUME, n)
-            xyz = np.array([100., 200., 300.])
-            fitting = xyz * scale * multiplier
-            np.testing.assert_array_equal(fitting * n, xyz)
-            # Selected CT level at D=4; no additional coordinate conversion.
-            np.testing.assert_array_equal(fitting * n / 4, xyz / 4)
+        multiplier = geometry_scale_to_frame({"coordinates": frame(scale)}, VOLUME)
+        xyz = np.array([100., 200., 300.])
+        np.testing.assert_array_equal(xyz * scale * multiplier, xyz)
     assert resolve_geometry_coordinates({"coordinates": frame(2)}, VOLUME) == frame(2)
 
 
@@ -67,15 +62,7 @@ def test_invalid_frames(metadata, reason):
         geometry_scale_to_frame(metadata, VOLUME)
 
 
-@pytest.mark.parametrize("n", [0, -1, float("inf"), float("nan")])
-def test_invalid_downsample(n):
-    with pytest.raises(ValueError, match="positive"):
-        geometry_scale_to_frame({"coordinates": frame()}, VOLUME, n)
-
-
-def test_underflow_and_exact_scale_conflicts():
-    with pytest.raises(ValueError, match="representable"):
-        geometry_scale_to_frame({"coordinates": frame(1e308)}, VOLUME, 1e308)
+def test_exact_scale_conflicts():
     with pytest.raises(ValueError, match="conflict"):
         merge_geometry_coordinates({"scale_factor": 2**53 + 1}, {"scale_factor": float(2**53)})
 

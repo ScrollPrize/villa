@@ -113,18 +113,10 @@ inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata,
     return coordinates;
 }
 
-// Stored XYZ -> volume XYZ -> fitting XYZ. Keep the reciprocal conversion's
-// representability check even when a later downsampling might hide overflow.
-inline double geometryScaleToFrame(const CoordinateJson& metadata, const std::string& volumeId,
-    double downsampleFactor = 1.0)
+// Multiplier from stored XYZ to volume voxels, for a frame that must match.
+inline double geometryScaleToFrame(const CoordinateJson& metadata, const std::string& volumeId)
 {
-    if (!std::isfinite(downsampleFactor) || downsampleFactor <= 0)
-        throw std::invalid_argument("downsample factor must be finite and positive");
     const auto coordinates = resolveGeometryCoordinates(metadata, volumeId);
-    const auto toVolume = geometryScaleToVolume(CoordinateJson{{"coordinates", coordinates}}, volumeId);
-    const double scale = *toVolume / downsampleFactor;
-    if (!std::isfinite(scale) || scale <= 0)
-        throw std::invalid_argument("geometry coordinate conversion is not representable");
-    return scale;
+    return *geometryScaleToVolume(CoordinateJson{{"coordinates", coordinates}}, volumeId);
 }
 } // namespace vc::objects

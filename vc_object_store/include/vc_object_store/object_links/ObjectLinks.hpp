@@ -179,7 +179,8 @@ struct PatchOverlapParams : CoordinateParams {
 // and dense overlap agreement. Accepted pairs become pending edges.
 // With volumeUuid, accepted edges record meta.fit.pose (row-major [r00,r01,tx,
 // r10,r11,ty]) mapping metric UV of patch fit.pose_from to fit.pose_to, in volume
-// voxels, and fit.grid_scales {uuid: [u, v]} (grid steps per voxel). Stored edge
+// voxels, fit.grid_scales {uuid: [u, v]} (grid steps per voxel) and
+// fit.agreement_radius (tolerance + uvInlierTolerance, volume voxels). Stored edge
 // endpoint order is unrelated to the pose direction.
 DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     const PatchOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
@@ -187,14 +188,14 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
 // Concrete point pairs for accepted patch-overlap edges, from each edge's stored
 // pose and the current endpoint geometry. Patch a's valid vertices are sampled
 // every `spacing` voxels in row-major order and mapped to patch b's metric UV;
-// a pair is kept when b is valid there and the two points lie within
-// agreementRadius (default: the detector's tolerance + uvInlierTolerance).
+// a pair is kept when b is valid there and the two points lie within the
+// detector's recorded fit.agreement_radius. Callers wanting a tighter bound
+// filter on each pair's distance.
 // More than maxPairs agreeing pairs are thinned evenly in sample order. The
 // result is deterministic for the same geometry, metadata and parameters.
 struct OverlapCorrespondenceParams {
     std::string volumeUuid;      // required: the edges' coordinate frame
     double spacing = 8.0;        // volume voxels between sampled vertices of patch a
-    double agreementRadius = 5.0;
     std::size_t maxPairs = 256;
 };
 struct OverlapCorrespondence {
