@@ -1715,6 +1715,48 @@ def write_track_crossing_cache(
     return destination
 
 
+def track_store_z_range(z_begin, z_end, scale_factor):
+    """The stored-frame ``[z_lo, z_hi)`` selecting the same tracks as fit
+    ``[z_begin, z_end)`` when stored ZYX = fit ZYX x ``scale_factor``.
+
+    Stored track points lie on integer voxels, so the bounds round up: a
+    stored z is in range exactly when its fit z = z / scale_factor is.
+    """
+    if scale_factor == 1:
+        return z_begin, z_end
+    return (math.ceil(z_begin * scale_factor - 1e-9),
+            math.ceil(z_end * scale_factor - 1e-9))
+
+
+def tracks_in_fit_frame(tracks, scale_factor):
+    """Tracks loaded in their stored frame, converted to fit ZYX.
+
+    Positions and arclengths divide by ``scale_factor``; source ids, point
+    order and indices are kept. Scale 1 returns ``tracks`` itself.
+    """
+    if scale_factor == 1 or tracks is None:
+        return tracks
+    if isinstance(tracks, PackedTrackCollection):
+        return PackedTrackCollection(
+            tracks.coordinates / np.float32(scale_factor), tracks.offsets,
+            tracks.source_ids, tracks.family_codes,
+            tracks.arclengths / scale_factor, tracks.tortuosities,
+            store_path=tracks.store_path, rows=tracks.rows)
+    return [np.asarray(track, dtype=np.float32) / np.float32(scale_factor)
+            for track in tracks]
+
+
+def crossing_cache_in_fit_frame(crossing_cache, scale_factor):
+    """A crossing CSR found in the stored frame, with its arclength
+    positions and clearances in fit voxels; point indices are unchanged."""
+    if scale_factor == 1 or crossing_cache is None:
+        return crossing_cache
+    converted = dict(crossing_cache)
+    for name in ('positions', 'clearances'):
+        converted[name] = np.asarray(crossing_cache[name], dtype=np.float64) / scale_factor
+    return converted
+
+
 def load_track_crossing_cache(path, warn=True, expected_z_range=None):
     """Load a valid adjacent CSR sidecar, or return ``None`` on a safe miss."""
     try:

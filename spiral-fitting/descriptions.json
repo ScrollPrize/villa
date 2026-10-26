@@ -248,6 +248,23 @@
     "shell_table_smooth_sigma_theta": "Gaussian smoothing of the outer-shell radius and confidence tables around the umbilicus, in angle bins (each one turn divided by shell_num_theta_bins), wrapping around the full turn. Larger values give a smoother shell target; 0 disables angular smoothing.",
     "shell_min_confidence": "Minimum shell coverage confidence (0 to 1, smoothed occupancy of the shell table normalised to the best-covered cell) for a shell lookup to count. Below it, outer-shell loss samples are ignored and winding_model supervision pairs are dropped. Raising it restricts both to well-covered parts of the shell.",
     "output_save_png_visualizations": "When on, PNG overlays of the fitted spiral on scroll slices are written at the end of a fit, colored by how well patches and strips are satisfied. This adds slice loading and rendering time at the end of the fit.",
-    "output_num_slices_for_visualization": "Number of z slices, evenly spaced across the z range, rendered as PNG overlays when PNG visualizations are on. More slices take more time and disk space."
+    "output_num_slices_for_visualization": "Number of z slices, evenly spaced across the z range, rendered as PNG overlays when PNG visualizations are on. More slices take more time and disk space.",
+    "object_store_path": "The vc_object_store database the fit reads patches, fibers, point collections and their relationships from. Required by the command-line fit, which loads no patch directories, fiber files or PCL documents.",
+    "object_store_author": "Author recorded on the relationships the startup link refresh writes back to the object store. Required when link refresh is on.",
+    "object_store_refresh_links": "At startup, rerun the store's automatic PCL-patch, fiber-patch and patch-overlap detectors over the selected objects and write their results back to the store before reading the fit's inputs. Any detector failure stops the fit before training. Off reads the store's current relationships without writing.",
+    "object_store_approved_links_only": "Consume only approved relationships (automatic and explicit). Otherwise pending and approved ones are used; rejected ones never are. Refresh still runs, so newly detected links stay pending and are excluded.",
+    "object_store_allow_changed_inputs": "Allow resuming a checkpoint whose recorded object-store inputs, frames or materialization settings differ from this fit's. Off refuses such a resume.",
+    "object_store_patch_uuids": "Patches to fit, by UUID (with the tags below). Unset with no tags selects every active patch with geometry; an empty list selects none.",
+    "object_store_patch_tags": "Also select the active patches carrying any of these tags.",
+    "object_store_pcl_uuids": "Point collections to use, by UUID (with the tags below). Unset with no tags selects every active collection with geometry; an empty list selects none.",
+    "object_store_pcl_tags": "Also select the active point collections carrying any of these tags.",
+    "object_store_fiber_uuids": "Fibers to use, by UUID (with the tags below). Unset with no tags selects every active fiber with geometry; an empty list selects none.",
+    "object_store_fiber_tags": "Also select the active fibers carrying any of these tags.",
+    "object_store_normal_ct_path": "CT zarr whose structure-tensor normals guide fiber-patch link refresh when the fit loads no lasagna normals. Without either, fiber-patch links are gated by the fiber centerline alone.",
+    "object_store_normal_ct_level": "Pyramid level of the normal CT zarr to read.",
+    "object_store_normal_ct_downsampling": "Downsampling of the selected normal CT level relative to the fit volume (selected CT voxel = fit voxel / this).",
+    "object_store_normal_ct_volume_uuid": "The volume the normal CT belongs to; must be the fit volume.",
+    "fit_volume_uuid": "The reference volume whose voxels are the fit's units. Unset infers it from the frames the selected objects declare; it must agree with every declaration.",
+    "track_scale_factor": "Stored track coordinates = fit-volume voxel coordinates x this factor. Required when a track store is attached to an object-store fit; never inferred."
   }
 }

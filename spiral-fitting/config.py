@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 
@@ -32,6 +33,18 @@ _NULL_TYPES = {
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
     "patch_uuid_filter_regex": "string",
+    "object_store_path": "string",
+    "object_store_author": "string",
+    "object_store_patch_uuids": "strings",
+    "object_store_patch_tags": "strings",
+    "object_store_pcl_uuids": "strings",
+    "object_store_pcl_tags": "strings",
+    "object_store_fiber_uuids": "strings",
+    "object_store_fiber_tags": "strings",
+    "object_store_normal_ct_path": "string",
+    "object_store_normal_ct_volume_uuid": "string",
+    "fit_volume_uuid": "string",
+    "track_scale_factor": "number",
 }
 
 # Settings host preparation consumes irreversibly: the patch loader erodes and
@@ -271,9 +284,32 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_link_window_min_points",
 })
 
+# The object-store input selection and frames decide what host preparation
+# reads, refreshes and materializes (object_store_inputs.load_fit_inputs).
+OBJECT_STORE_INPUT_KEYS = frozenset({
+    "object_store_path",
+    "object_store_author",
+    "object_store_refresh_links",
+    "object_store_approved_links_only",
+    "object_store_allow_changed_inputs",
+    "object_store_patch_uuids",
+    "object_store_patch_tags",
+    "object_store_pcl_uuids",
+    "object_store_pcl_tags",
+    "object_store_fiber_uuids",
+    "object_store_fiber_tags",
+    "object_store_normal_ct_path",
+    "object_store_normal_ct_level",
+    "object_store_normal_ct_downsampling",
+    "object_store_normal_ct_volume_uuid",
+    "fit_volume_uuid",
+    "track_scale_factor",
+})
+
 NEW_FIT_KEYS = frozenset(
     set(_Z_RANGE_KEYS)
     | _MODEL_STRUCTURE_KEYS
+    | OBJECT_STORE_INPUT_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
@@ -282,7 +318,7 @@ NEW_FIT_KEYS = frozenset(
        "pcl_patch_overlap_pair_spacing", "pcl_patch_overlap_max_pairs"}
 )
 
-_AUDITED_PREFIXES = ("model_", "input_", "pcl_")
+_AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
 
 
 def _runtime_impact(key):
@@ -640,6 +676,42 @@ class Config:
         self.shell_min_confidence = 0.25
         self.output_save_png_visualizations = False
         self.output_num_slices_for_visualization = 20
+        # Patches, fibers and point collections come from one vc_object_store
+        # database (object_store_inputs.load_fit_inputs; see
+        # OBJECT_STORE_CLI_PLAN.md). Startup refreshes the store's automatic
+        # PCL-patch, fiber-patch and patch-overlap links, writing them back as
+        # object_store_author, unless refresh_links is off; approved_links_only
+        # consumes only approved relationships. A checkpoint resumes only
+        # against identical inputs and frames unless allow_changed_inputs.
+        self.object_store_path = None
+        self.object_store_author = None
+        self.object_store_refresh_links = True
+        self.object_store_approved_links_only = False
+        self.object_store_allow_changed_inputs = False
+        # Object selection per kind: None selects every active object with
+        # geometry; otherwise the listed UUIDs plus objects carrying any
+        # listed tag (an empty list selects nothing).
+        self.object_store_patch_uuids = None
+        self.object_store_patch_tags = None
+        self.object_store_pcl_uuids = None
+        self.object_store_pcl_tags = None
+        self.object_store_fiber_uuids = None
+        self.object_store_fiber_tags = None
+        # CT structure-tensor normals for fiber-patch link refresh when the fit
+        # loads no lasagna normals: a CT zarr whose level object_store_normal_
+        # ct_level is downsampled by object_store_normal_ct_downsampling
+        # relative to the fit volume, which object_store_normal_ct_volume_uuid
+        # must name.
+        self.object_store_normal_ct_path = None
+        self.object_store_normal_ct_level = 0
+        self.object_store_normal_ct_downsampling = 1.0
+        self.object_store_normal_ct_volume_uuid = None
+        # The reference volume every fit coordinate is a voxel of; None infers
+        # it from the selected objects' declared frames.
+        self.fit_volume_uuid = None
+        # Stored track ZYX = fit-volume ZYX x track_scale_factor; required
+        # when a track store is attached to an object-store fit.
+        self.track_scale_factor = None
 
         defaults = vars(self)
         fields = {key: _field_spec(key, value)
@@ -663,6 +735,8 @@ class Config:
                 "string": lambda: isinstance(value, str),
                 "enum": lambda: value in spec["values"],
                 "vector": lambda: isinstance(value, list),
+                "strings": lambda: isinstance(value, list) and all(
+                    isinstance(item, str) for item in value),
                 "dictionary": lambda: isinstance(value, dict),
             }
             if not valid[spec["type"]]():
@@ -680,6 +754,10 @@ class Config:
                     or type(item) not in (int, float)
                     for item_key, item in value.items()):
                 raise ValueError(f"Invalid dictionary value for {key}")
+        for key in ("track_scale_factor", "object_store_normal_ct_downsampling"):
+            if values[key] is not None and not (
+                    math.isfinite(values[key]) and values[key] > 0):
+                raise ValueError(f"{key} must be finite and positive")
         if values["model_gap_expander_capacity_windings"] < 3:
             raise ValueError(
                 "model_gap_expander_capacity_windings must be at least 3")

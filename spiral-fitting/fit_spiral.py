@@ -104,12 +104,16 @@ from dt_targets import (
 from tracks import (
     PackedTrackCollection,
     configure_prepared_track_sampling,
+    crossing_cache_in_fit_frame,
     filter_tracks_to_outer_shell,
     get_track_satisfied_counts_in_chunks,
     iter_track_losses,
     load_track_crossing_cache,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
+    track_crossing_cache_path,
+    track_store_z_range,
+    tracks_in_fit_frame,
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
@@ -1051,6 +1055,25 @@ def realign_optimizer_lr_schedule(
     return lr_scheduler, horizon
 
 
+# Run-boundary settings whose application relinks points by proximity,
+# reloads input documents or re-derives the point views; refused while the
+# fit holds frozen object-store inputs.
+_OBJECT_STORE_FROZEN_KEYS = frozenset({
+    'pcl_fiber_min_point_spacing',
+    'pcl_use_fiber_links',
+    'pcl_use_pending_fiber_links',
+    'pcl_unattached_pcl_min_point_spacing',
+    'pcl_fiber_link_side_filter',
+    'pcl_fiber_link_side_margin_voxels',
+    'pcl_fiber_link_model_direction_step',
+    'pcl_link_distance_tolerance',
+    'pcl_link_window_points',
+    'pcl_link_window_min_points',
+    'input_use_pcl_relative',
+    'input_use_pcl_same_winding',
+})
+
+
 class FitContext:
     """Owner of all mutable state and resources for one spiral fit.
 
@@ -1733,6 +1756,8 @@ class FitContext:
             progress.begin('loading', 'Loading outer shell')
             shell_patch = load_tifxyz(self.shell_path)
 
+        if self.object_store_inputs is None and self.config.get('object_store_path'):
+            self.object_store_inputs = self._load_object_store_inputs()
         if self.object_store_inputs is not None:
             verified_patches = dict(self.object_store_inputs.patches)
             print(f' loaded {len(verified_patches)} patches from the object store')
@@ -1786,8 +1811,22 @@ class FitContext:
                 'loading', 'Resolving track store',
                 detail=os.path.basename(self.tracks_dbm_path))
             print(f'loading tracks from {self.tracks_dbm_path}')
+            # Object-store fits declare the track frame; tracks then load in
+            # their stored frame (ROI included) and convert to fit voxels.
+            track_scale = (self._object_store_track_scale()
+                           if self.object_store_inputs is not None else 1)
+            track_z_lo, track_z_hi = track_store_z_range(
+                self.z_begin, self.z_end, track_scale)
+            if track_scale != 1:
+                print(f'tracks: stored coordinates = fit voxels x {track_scale:g}')
             if track_sampling_config['crossing_precompute_max'] > 0:
-                track_crossing_cache = load_track_crossing_cache(self.tracks_dbm_path)
+                track_crossing_cache = crossing_cache_in_fit_frame(
+                    load_track_crossing_cache(self.tracks_dbm_path), track_scale)
+                if track_crossing_cache is None and track_scale != 1:
+                    raise RuntimeError(
+                        'the track crossing cache is unusable; with '
+                        f'track_scale_factor {track_scale:g} crossings come '
+                        'only from it')
                 if track_crossing_cache is not None:
                     track_graph = TrackGraph(track_crossing_cache)
                     print(
@@ -1796,11 +1835,12 @@ class FitContext:
                         f'{track_graph.build_seconds:.1f}s')
                     track_crossing_cache = None
                 tracks, track_families, track_source_ids = load_tracks_from_dbm(
-                    self.tracks_dbm_path, self.z_begin, self.z_end, return_families=True,
+                    self.tracks_dbm_path, track_z_lo, track_z_hi, return_families=True,
                     return_source_ids=True, progress=progress)
             else:
                 tracks = load_tracks_from_dbm(
-                    self.tracks_dbm_path, self.z_begin, self.z_end, progress=progress)
+                    self.tracks_dbm_path, track_z_lo, track_z_hi, progress=progress)
+            tracks = tracks_in_fit_frame(tracks, track_scale)
             track_reload_source = tracks
             track_reload_families = track_families
             track_reload_source_ids = track_source_ids
@@ -1961,6 +2001,79 @@ class FitContext:
             prepare_patch_dt_target_samples(
                 self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
             )
+
+    def _object_store_track_scale(self):
+        """The declared track_scale_factor of an object-store fit attaching a
+        track store (stored track ZYX = fit ZYX x it); None without tracks."""
+        if not self.tracks_dbm_path:
+            return None
+        scale = self.config['track_scale_factor']
+        if scale is None:
+            raise RuntimeError(
+                'a track store is attached to an object-store fit: declare '
+                'track_scale_factor (stored track coordinates = fit-volume '
+                'voxel coordinates x it); it is never inferred')
+        scale = float(scale)
+        if scale != 1 and self.config['track_crossing_precompute_max'] > 0:
+            # Exact-voxel crossing discovery works on integer stored
+            # coordinates: crossings must come from the stored-frame cache,
+            # and point-level exclusion would rediscover them on scaled ones.
+            if not track_crossing_cache_path(self.tracks_dbm_path).is_file():
+                raise RuntimeError(
+                    f'track_scale_factor {scale:g} needs the track store\'s '
+                    'crossing cache (build_track_crossings.py), found in the '
+                    'stored frame; crossings are not rediscovered in fit voxels')
+            if float(self.config['track_exclusion_radius']) > 0:
+                raise RuntimeError(
+                    f'track_scale_factor {scale:g} with track crossings needs '
+                    'track_exclusion_radius 0: exclusion would rediscover '
+                    'crossings from scaled coordinates')
+        return scale
+
+    def _lasagna_normal_inputs(self):
+        """The fit's lasagna normals as object_store_inputs.fiber_normal_source
+        takes them, or None when the fit loads none."""
+        if not (self.normal_nx_zarr_path and self.normal_ny_zarr_path):
+            return None
+        return {'normal_x': self.normal_nx_zarr_path,
+                'normal_y': self.normal_ny_zarr_path,
+                'group': self.normal_zarr_group, 'scale': self.lasagna_scale}
+
+    def _external_input_frames(self):
+        """Frames of the inputs read outside the object store, for the input
+        manifest. Each is declared in fit-volume voxels: the umbilicus by its
+        coordinate scale, lasagna stores by their downsampling, tracks by
+        track_scale_factor; the others by their existing contract."""
+        frames = {'umbilicus': {
+            'coordinate_scale': float(self.scroll.umbilicus_coordinate_scale)}}
+        if self.normal_nx_zarr_path or self.grad_mag_zarr_path:
+            frames['lasagna'] = {'group': str(self.normal_zarr_group),
+                                 'downsampling': int(self.lasagna_scale)}
+        if self.tracks_dbm_path:
+            frames['tracks'] = {'scale_factor': self._object_store_track_scale()}
+        for name, path in (('outer_shell', self.shell_path),
+                           ('fiber_directions', self.fiber_directions_path),
+                           ('winding_inference', self.winding_inference_path)):
+            if path:
+                frames[name] = {'units': 'fit-volume voxels'}
+        return frames
+
+    def _load_object_store_inputs(self):
+        """Refresh and freeze this fit's object-store inputs
+        (object_store_inputs.load_fit_inputs) and report them."""
+        from object_store_inputs import load_fit_inputs
+        progress_or_null(self.progress).begin(
+            'loading', 'Reading object-store inputs',
+            detail=os.path.basename(str(self.config['object_store_path'])))
+        if self.config['pcl_fiber_link_side_filter']:
+            print('NOTE: pcl_fiber_link_side_filter does not apply to '
+                  'object-store inputs: the store\'s detectors attach fibers')
+        cache = (os.path.join(self.cache_path, 'object_store_strips')
+                 if self.cache_path else None)
+        return load_fit_inputs(
+            self.config, lasagna=self._lasagna_normal_inputs(),
+            external_frames=self._external_input_frames(), dist=self.dist,
+            cache_directory=cache)
 
     def _derive_object_store_point_inputs(self, verified_patches, inputs):
         """Install point views derived from object-store attachments.
@@ -2288,8 +2401,11 @@ class FitContext:
         fiber is relinked once under the fitted winding direction; a
         checkpoint that lands before the step after such a switch relinks
         back under the umbilicus direction. No-op while the side filter is
-        off or the session holds no fibers.
+        off or the session holds no fibers. Object-store inputs are frozen:
+        their links are the store's and are never relinked here.
         """
+        if getattr(self, 'object_store_inputs', None) is not None:
+            return
         if not self.config['pcl_fiber_link_side_filter']:
             return
         if not getattr(self, 'fiber_catalog', None):
@@ -3281,11 +3397,21 @@ class FitContext:
             'numpy_rng_state': np.random.get_state(),
             'torch_cpu_rng_state': torch.random.get_rng_state(),
             'torch_cuda_rng_states': torch.cuda.get_rng_state_all(),
-            'input_manifest': dict(getattr(self.interactive_driver, 'input_manifest', {})),
+            'input_manifest': self._checkpoint_input_manifest(),
             'preview_first_winding': 10,
             **({'torch_mps_rng_state': torch.mps.get_rng_state()}
                if self.device.type == 'mps' else {}),
         }
+
+    def _checkpoint_input_manifest(self):
+        """The interactive input manifest, plus the frozen object-store
+        inputs' manifest and digest when the fit holds them."""
+        manifest = dict(getattr(self.interactive_driver, 'input_manifest', {}))
+        inputs = getattr(self, 'object_store_inputs', None)
+        if inputs is not None and inputs.manifest is not None:
+            manifest['object_store'] = inputs.manifest
+            manifest['object_store_digest'] = inputs.digest
+        return manifest
 
     def save_checkpoint(self, path, completed_iterations):
         destination = os.path.abspath(path)
@@ -3414,6 +3540,12 @@ class FitContext:
                     reasons.append(
                         f'checkpoint base_shape_zyx={list(checkpoint_base_shape)!r} '
                         f'does not match this dataset ({list(self.base_shape_zyx)!r})')
+        inputs = getattr(self, 'object_store_inputs', None)
+        if inputs is not None and inputs.manifest is not None:
+            from object_store_inputs import resume_problems
+            reasons.extend(resume_problems(
+                checkpoint.get('input_manifest'), inputs,
+                allow_changed=self.config['object_store_allow_changed_inputs']))
         checkpoint_dataset = str(
             (checkpoint.get('input_manifest') or {}).get('dataset_root') or '')
         dataset_root = str(getattr(self.paths, 'dataset_root', '') or '')
@@ -4374,6 +4506,11 @@ class FitContext:
         """
         path_changes = dict(path_changes or {})
         changed = set(config)
+        frozen = changed & _OBJECT_STORE_FROZEN_KEYS
+        if getattr(self, 'object_store_inputs', None) is not None and frozen:
+            raise ValueError(
+                'object-store inputs are frozen for this fit; '
+                f'{sorted(frozen)} would relink, reload or re-derive them')
         if any(key.startswith('track_') for key in changed):
             # Validate combined bounds before changing participation or any
             # other resident derivation: restoring config alone cannot undo
@@ -5019,6 +5156,18 @@ class FitContext:
         os.makedirs(self.out_path, exist_ok=True)
         return self.out_path
 
+    def _write_object_store_manifest(self):
+        """Record the frozen object-store inputs' manifest beside the run's
+        outputs (rank zero); checkpoints carry it too."""
+        inputs = self.object_store_inputs
+        if inputs is None or inputs.manifest is None or not self.dist.is_main_process:
+            return
+        path = os.path.join(self.out_path, 'object_store_inputs.json')
+        with open(path, 'w', encoding='utf-8') as stream:
+            json.dump({'digest': inputs.digest, 'manifest': inputs.manifest},
+                      stream, indent=1, sort_keys=True)
+        print(f'object-store input manifest: {path}')
+
     def release_setup_only_tracks(self):
         """Drop the per-track input arrays a resident session no longer needs.
 
@@ -5093,6 +5242,7 @@ class FitContext:
         self.check_cuda_ready()
         self.load_host_inputs()
         self.resolve_output_path()
+        self._write_object_store_manifest()
         self.build_device_state()
 
         # ==========================================================================
@@ -5291,6 +5441,11 @@ if __name__ == '__main__':
         # FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(get_env_config_overrides())
+        if not config['object_store_path']:
+            raise SystemExit(
+                'the command-line fit reads patches, fibers and point '
+                'collections from an object store: set object_store_path '
+                '(FIT_SPIRAL_CONFIG_OVERRIDES)')
         z_range_scaled_count_keys = (
             'sample_count_patches_per_step',
             'sample_count_patches_per_step_for_dt',

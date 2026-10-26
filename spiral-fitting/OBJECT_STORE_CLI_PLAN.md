@@ -327,7 +327,7 @@ the relationship graph alone cannot supply seam corrections.
 
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
-Steps 1–9 are implemented; steps 10–12 remain. Upstream
+Steps 1–10 are implemented; steps 11–12 remain. Upstream
 through `affe83f75` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
@@ -462,6 +462,43 @@ Notes from steps 5–8 that the remaining steps build on:
   and `pcl_patch_overlap_max_pairs` pass through to `overlap_correspondences`;
   `materialize_from_config()` applies every materialization setting of a fit
   config.
+- Step 10: `object_store_inputs.load_fit_inputs()` is the startup lifecycle;
+  `FitContext.load_host_inputs` calls it when `object_store_path` is set and
+  the CLI refuses to run without one. Config names differ from the proposed
+  table where the flat config schema required it: selectors are
+  `object_store_{patch,pcl,fiber}_{uuids,tags}` (a new nullable `strings`
+  type) and `normal_ct` is `object_store_normal_ct_{path,level,downsampling,
+  volume_uuid}`; `object_store_allow_changed_inputs` is the explicit resume
+  policy. Input toggles off select no patches/fibers; the PCL role toggles
+  must agree, since roles are read from metadata. Detector parameters are
+  the store's defaults except the PCL linker's tolerance/window, taken from
+  `pcl_link_*`. The manifest (`input_manifest()`) is the snapshot manifest
+  plus `materialization`, `external_frames` and `link_refresh`; its digest
+  ignores the store path and `link_refresh`. Checkpoints carry it as
+  `input_manifest.object_store[_digest]`, runs write
+  `object_store_inputs.json`, and `inspect_checkpoint` refuses a resume whose
+  manifest differs (naming the changed sections). `apply_config` refuses
+  settings that would relink or reload frozen inputs, and the per-step
+  fiber relinker is a no-op for them; the code itself is deleted in step 11.
+- External frames: tracks convert (positions, ROI bounds, arclengths,
+  crossing positions/clearances) by `track_scale_factor`, required for an
+  object-store fit with tracks. A non-unit scale with crossings needs the
+  stored-frame crossing cache and `track_exclusion_radius` 0, because exact
+  crossing discovery runs only on stored integer coordinates. The umbilicus
+  (scroll-spec coordinate scale) and lasagna (group downsampling) keep their
+  existing declarations; the shell, fiber directions and winding inference
+  are recorded as fit-volume voxels under their existing contracts, without
+  a conversion option yet.
+- Real-data startup smoke: `OBJECT_STORE_SMOKE_STORE=<scratch copy of an
+  ingested store> [OBJECT_STORE_SMOKE_Z=9000:9100] pytest -s
+  tests/test_object_store_startup.py -k real_data`. Run on 2026-10-26 with
+  181 verified patches crossing z 9000-9100 in x 5500-5650, y 3300-3450,
+  the three PCL documents and all fibers (ingest flags `--derive-uuids
+  --renumber-point-ids --drop-dangling-branches --volume-uuid s1-reference
+  --scale-factor 1`): refresh created 553 PCL-patch and 447 overlap links
+  and no fiber-patch links (centerline-only); 173 patches, 28 PCL
+  attachments and 809 overlap pairs were materialized, most attachments
+  lying outside the 100-slice window's sampled quads; ~18 s.
 - `tests/data/object_store_reference.json` is the file loader's output for the
   synthetic fixture in `tests/object_store_reference.py`. Delete
   `tests/test_object_store_reference.py` with the file loader in step 11; the

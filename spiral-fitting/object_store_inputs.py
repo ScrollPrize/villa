@@ -341,16 +341,24 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     return consumed, exclusions
 
 
-def read_snapshot(store, request):
+def resolve_selection(store, request):
+    """{kind: sorted selected UUIDs} of a request's selectors."""
+    return {kind: resolve_selector(store, kind, request.selector(kind))
+            for kind in KINDS}
+
+
+def read_snapshot(store, request, uuids=None):
     """Resolve, validate and freeze one selection of the store.
 
     Selectors resolve to explicit UUID sets before any volume filter, so
     conflicting frame declarations among selected objects are seen and fail.
+    ``uuids`` (resolve_selection's result) reuses a selection resolved
+    earlier, so one startup reads exactly the objects it refreshed.
     Every selected object must declare a frame in the fit volume; all frame
     problems are reported together.
     """
-    uuids = {kind: resolve_selector(store, kind, request.selector(kind))
-             for kind in KINDS}
+    if uuids is None:
+        uuids = resolve_selection(store, request)
     selection = {uuid: None for kind in KINDS for uuid in uuids[kind]}
     view = store.revision_read_view(selection)
 
@@ -472,6 +480,9 @@ class FitInputs:
     counts: Counter
     dropped_attachments: list = dataclasses.field(default_factory=list)
     patch_overlaps: dict = dataclasses.field(default_factory=dict)
+    # Complete input/frame provenance and its digest (load_fit_inputs).
+    manifest: dict = None
+    digest: str = None
 
     def report(self, max_named=5):
         lines = snapshot_report(self.snapshot) + [
@@ -1094,7 +1105,26 @@ def snapshot_report(snapshot):
         lines.append('relationships excluded: ' + ', '.join(
             f'{reason} {count}' for reason, count in sorted(snapshot.exclusions.items())))
     lines.extend(snapshot.notes)
+    lines.extend(f'WARNING: {warning}' for warning in empty_family_warnings(snapshot))
     return lines
+
+
+def empty_family_warnings(snapshot):
+    """Constraint families the selection could hold but that consume nothing."""
+    count = Counter(obj.kind for obj in snapshot.objects.values())
+    expected = {
+        'pcl_patch': count['patch'] and count['point_collection'],
+        'fiber_patch': count['patch'] and count['fiber'],
+        'patch_overlap': count['patch'] > 1,
+    }
+    families = Counter(rel.family for rel in snapshot.relationships)
+    excluded = sum(snapshot.exclusions.values())
+    return [
+        f'no {family} relationships are consumed although the selection has '
+        f'objects for them' + (f' ({excluded} relationship(s) excluded in all)'
+                               if excluded else '')
+        for family, possible in expected.items()
+        if possible and not families[family]]
 
 
 def constraints_report(store, snapshot, config):
@@ -1103,6 +1133,396 @@ def constraints_report(store, snapshot, config):
     inputs = materialize_from_config(store, snapshot, config)
     views = derive_point_views(inputs, inputs.patches, config)
     return inputs.report() + views.report()
+
+
+# ---------------------------------------------------------------------------
+# Startup lifecycle: selection from the fit configuration, one link refresh
+# on rank zero, then a frozen read every rank verifies against the others
+# ---------------------------------------------------------------------------
+
+class LinkRefreshError(ObjectStoreInputError):
+    """Startup link refresh failed; the fit must not train."""
+
+
+_SELECTOR_CONFIG = {'patch': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber'}
+_NONE = Selector(uuids=())
+
+
+def request_from_config(config):
+    """The InputRequest of a fit configuration.
+
+    Each kind's ``object_store_<kind>_uuids``/``_tags`` select objects (both
+    None: every active object). Switching a source's input toggle off
+    selects none of it. The PCL role toggles cannot apply before the roles
+    are read from metadata, so they must agree: all on, or all off.
+    """
+    selectors = {}
+    for kind, name in _SELECTOR_CONFIG.items():
+        uuids = config[f'object_store_{name}_uuids']
+        tags = config[f'object_store_{name}_tags']
+        selectors[kind] = Selector(None if uuids is None else tuple(uuids),
+                                   None if tags is None else tuple(tags))
+    if not config['input_use_verified_patches'] or config['input_disable_patches']:
+        selectors['patch'] = _NONE
+    if not config['input_use_fibers']:
+        selectors['fiber'] = _NONE
+    roles = {key: config[key] for key in (
+        'input_use_pcl_absolute', 'input_use_pcl_relative', 'input_use_pcl_same_winding')}
+    if len(set(roles.values())) > 1:
+        raise ObjectStoreInputError([
+            'object-store PCLs are selected by UUID or tag, not by role: the '
+            f'PCL role toggles must all agree ({roles})'])
+    if not any(roles.values()):
+        selectors['point_collection'] = _NONE
+    return InputRequest(selectors, config['fit_volume_uuid'],
+                        bool(config['object_store_approved_links_only']))
+
+
+@dataclasses.dataclass(frozen=True)
+class NormalSource:
+    """Strip normals for fiber-patch link refresh.
+
+    ``kind`` is 'lasagna' (the fit's own normals), 'ct' (structure-tensor
+    normals of a CT zarr) or 'none' (centerline-only gating).
+    """
+    kind: str
+    ct_volume: str = ''
+    parameters: tuple = ()
+    note: str = None
+
+    def describe(self):
+        if self.kind == 'none':
+            return 'fiber-patch normals: none (centerline-only linking)'
+        values = dict(self.parameters)
+        if self.kind == 'lasagna':
+            return (f'fiber-patch normals: lasagna group {values["ct_level"]} at '
+                    f'scale {values["ct_to_base_scale"]:g} '
+                    f'({values["normal_x_volume"]}, {values["normal_y_volume"]})')
+        return (f'fiber-patch normals: CT {self.ct_volume} level '
+                f'{values["ct_level"]}, downsampling {values["ct_to_base_scale"]:g}')
+
+    def provenance(self):
+        return {'kind': self.kind, 'ct_volume': self.ct_volume or None,
+                **dict(self.parameters)}
+
+
+def fiber_normal_source(config, lasagna=None, volume_uuid=None):
+    """The fiber-patch normal source: lasagna, else normal CT, else none.
+
+    ``lasagna`` describes the fit's lasagna normals when it loads them:
+    ``{'normal_x', 'normal_y', 'group', 'scale'}``, ``scale`` being the
+    group's downsampling relative to the fit volume. The store decodes them
+    as the fitter does. Lasagna and CT normals are exclusive; a configured
+    CT is then ignored with a note.
+    """
+    ct_path = config['object_store_normal_ct_path']
+    if lasagna is not None:
+        try:
+            level = int(lasagna['group'])
+        except (TypeError, ValueError):
+            raise ObjectStoreInputError([
+                f'lasagna normal group {lasagna["group"]!r} is not an integer '
+                'zarr group']) from None
+        return NormalSource(
+            'lasagna', '', (
+                ('ct_level', level),
+                ('ct_to_base_scale', float(lasagna['scale'])),
+                ('normal_x_volume', str(lasagna['normal_x'])),
+                ('normal_y_volume', str(lasagna['normal_y']))),
+            note=(f'ignoring object_store_normal_ct_path {ct_path!r}: the fit '
+                  'loads lasagna normals') if ct_path else None)
+    if not ct_path:
+        return NormalSource('none')
+    ct_volume = config['object_store_normal_ct_volume_uuid']
+    if ct_volume is None:
+        raise ObjectStoreInputError([
+            'object_store_normal_ct_path needs object_store_normal_ct_volume_uuid'])
+    if volume_uuid is not None and ct_volume != volume_uuid:
+        raise ObjectStoreInputError([
+            f'the normal CT belongs to volume {ct_volume}, not the fit volume '
+            f'{volume_uuid}'])
+    return NormalSource('ct', str(ct_path), (
+        ('ct_level', int(config['object_store_normal_ct_level'])),
+        ('ct_to_base_scale', float(config['object_store_normal_ct_downsampling']))))
+
+
+# Detectors the refresh runs, with the object kinds each needs selected.
+DETECTORS = (
+    ('pcl_patch', ('patch', 'point_collection')),
+    ('fiber_patch', ('patch', 'fiber')),
+    ('patch_overlap', ('patch',)),
+)
+
+
+@dataclasses.dataclass
+class RefreshOutcome:
+    detector: str
+    skipped: str = None
+    report: dict = None
+    error: str = None
+
+    @property
+    def failed(self):
+        return self.error is not None or bool(self.report and self.report['failed'])
+
+    @property
+    def committed(self):
+        return bool(self.report and self.report['committed'])
+
+    def lines(self, max_listed=5):
+        if self.skipped is not None:
+            return [f'link refresh {self.detector}: skipped ({self.skipped})']
+        if self.error is not None:
+            return [f'link refresh {self.detector}: FAILED: {self.error}']
+        report = self.report
+        lines = [
+            f'link refresh {self.detector}: {report["edges_created"]} created, '
+            f'{report["edges_updated"]} updated, '
+            f'{report["edges_skipped_existing"]} unchanged, '
+            f'{report["stale_removed"]} stale removed '
+            f'({"committed" if report["committed"] else "nothing committed"})'
+            + ('; FAILED' if report['failed'] else '')]
+        failures = [issue for issue in report['issues'] if issue['severity'] == 'failure']
+        for issue in failures:
+            objects = issue['object_uuids']
+            named = ', '.join(objects[:max_listed]) + (
+                f' and {len(objects) - max_listed} more' if len(objects) > max_listed else '')
+            lines.append(f'  failure at {issue["stage"]}: {issue["reason"]}'
+                         + (f' ({named})' if objects else ''))
+        diagnostics = [issue for issue in report['issues'] if issue['severity'] != 'failure']
+        if diagnostics:
+            lines.append(f'  {sum(issue["count"] or 1 for issue in diagnostics)} '
+                         f'candidate diagnostic(s), e.g. {diagnostics[0]["reason"]}')
+        return lines
+
+
+def refresh_links(store, snapshot, config, normal_source, cache_directory=None):
+    """Run each automatic detector over the snapshot's objects.
+
+    A detector runs only when every object kind it needs is selected, with
+    exactly the selected UUIDs, so its writes and stale-link removal stay
+    within the selection. Exceptions and reported failures are collected
+    for every detector; none stops the others.
+    """
+    selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
+    volume = snapshot.volume_uuid
+    run = {
+        'pcl_patch': lambda: store.link_point_collections_to_patches(
+            volume_uuid=volume, collection_uuids=selected['point_collection'],
+            patch_uuids=selected['patch'],
+            tolerance=float(config['pcl_link_distance_tolerance']),
+            window_points=int(config['pcl_link_window_points']),
+            window_min_points=int(config['pcl_link_window_min_points'])),
+        'fiber_patch': lambda: store.link_fibers_to_patches(
+            normal_source.ct_volume, volume_uuid=volume,
+            fiber_uuids=selected['fiber'], patch_uuids=selected['patch'],
+            **dict(normal_source.parameters),
+            **({'cache_directory': cache_directory} if cache_directory else {})),
+        'patch_overlap': lambda: store.link_patch_overlaps(
+            volume_uuid=volume, patch_uuids=selected['patch']),
+    }
+    outcomes = []
+    for detector, kinds in DETECTORS:
+        empty = [KIND_LABELS[kind] for kind in kinds if not selected[kind]]
+        if empty:
+            outcomes.append(RefreshOutcome(detector, skipped='no selected ' + ' or '.join(empty)))
+            continue
+        try:
+            outcomes.append(RefreshOutcome(detector, report=run[detector]()))
+        except Exception as error:  # noqa: BLE001 - every failure is reported
+            outcomes.append(RefreshOutcome(detector, error=f'{type(error).__name__}: {error}'))
+    return outcomes
+
+
+def refresh_report(outcomes):
+    """Report lines of a refresh, and its problems ([] on success)."""
+    lines = [line for outcome in outcomes for line in outcome.lines()]
+    failed = [outcome.detector for outcome in outcomes if outcome.failed]
+    if not failed:
+        return lines, []
+    committed = [outcome.detector for outcome in outcomes if outcome.committed]
+    problems = lines + [
+        f'link refresh failed in {", ".join(failed)}; the fit will not train. '
+        + (f'{", ".join(committed)} committed before the failure (detectors '
+           'are not rolled back together; a rerun reconciles them)'
+           if committed else 'No detector committed changes.')]
+    return lines, problems
+
+
+def _startup_phase(config, request, lasagna, cache_directory, log):
+    """Rank zero's startup: resolve the selection once, validate it and its
+    frames, then (unless refresh is off) run the detectors as
+    object_store_author. Returns ``(selected UUIDs by kind, report lines)``;
+    raises ObjectStoreInputError on any failure."""
+    from vc_object_store import ObjectStore
+
+    refresh = bool(config['object_store_refresh_links'])
+    author = config['object_store_author']
+    if refresh and not author:
+        raise ObjectStoreInputError([
+            'object_store_author is required to refresh links '
+            '(or set object_store_refresh_links false)'])
+    options = {'author': author} if refresh else {'read_only': True}
+    with ObjectStore.open(config['object_store_path'], **options) as store:
+        uuids = resolve_selection(store, request)
+        snapshot = read_snapshot(store, request, uuids)
+        normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+        if not refresh:
+            return uuids, ['link refresh: off; reading the store\'s current relationships']
+        log(normal.describe())
+        if normal.note:
+            log(normal.note)
+        outcomes = refresh_links(store, snapshot, config, normal, cache_directory)
+    lines, problems = refresh_report(outcomes)
+    if problems:
+        raise LinkRefreshError(problems)
+    return uuids, lines
+
+
+def _broadcast(value, dist):
+    if dist is None or not dist.is_distributed:
+        return value
+    import torch.distributed
+    holder = [value]
+    torch.distributed.broadcast_object_list(holder, src=0)
+    return holder[0]
+
+
+def _all_gather(value, dist):
+    if dist is None or not dist.is_distributed:
+        return [value]
+    import torch.distributed
+    gathered = [None] * dist.world_size
+    torch.distributed.all_gather_object(gathered, value)
+    return gathered
+
+
+# Configuration that shapes the materialized constraints, recorded in the
+# manifest so a resume can tell when they changed.
+MATERIALIZATION_KEYS = (
+    'z_begin', 'z_end', 'patch_loss_z_margin', 'patch_erode_patches',
+    'pcl_fiber_min_point_spacing', 'pcl_patch_overlap_pair_spacing',
+    'pcl_patch_overlap_max_pairs', 'pcl_unattached_pcl_min_point_spacing',
+    'pcl_use_fiber_links', 'pcl_vertical_fiber_min_z_fraction',
+    'pcl_vertical_fiber_min_auto_certainty',
+)
+
+
+def input_manifest(snapshot, config, normal_source, external_frames=None):
+    """The snapshot manifest extended with materialization settings,
+    external-input frames and the link-refresh mode."""
+    manifest = snapshot.manifest()
+    manifest['materialization'] = {key: config[key] for key in MATERIALIZATION_KEYS}
+    manifest['external_frames'] = dict(sorted((external_frames or {}).items()))
+    manifest['link_refresh'] = {
+        'enabled': bool(config['object_store_refresh_links']),
+        'fiber_patch_normals': normal_source.provenance(),
+    }
+    return manifest
+
+
+def _compared(manifest):
+    """The manifest without what does not define the inputs: the store's
+    local path and how links were refreshed (their results are recorded)."""
+    manifest = dict(manifest)
+    manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
+    manifest.pop('link_refresh', None)
+    return manifest
+
+
+def manifest_digest(manifest):
+    text = json.dumps(_compared(manifest), sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def manifest_differences(recorded, current):
+    """Names of the manifest entries (``section`` or ``section.key``) that
+    differ between two manifests."""
+    recorded, current = _compared(recorded), _compared(current)
+    differences = []
+    for key in sorted(set(recorded) | set(current)):
+        old, new = recorded.get(key), current.get(key)
+        if old == new:
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            differences.extend(f'{key}.{sub}' for sub in sorted(set(old) | set(new))
+                               if old.get(sub) != new.get(sub))
+        else:
+            differences.append(key)
+    return differences
+
+
+def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=print):
+    """Reasons a checkpoint may not resume against these frozen inputs.
+
+    The checkpoint must record the same inputs, frames and materialization
+    settings; ``allow_changed`` (object_store_allow_changed_inputs) resumes
+    anyway, with a warning naming what changed.
+    """
+    recorded = (checkpoint_input_manifest or {}).get('object_store')
+    if recorded is None:
+        problem = 'checkpoint records no object-store inputs'
+    else:
+        differences = manifest_differences(recorded, inputs.manifest)
+        if not differences:
+            return []
+        problem = ('checkpoint object-store inputs differ from this fit\'s in '
+                   + ', '.join(differences))
+    if allow_changed:
+        log(f'WARNING: {problem}; resuming anyway (object_store_allow_changed_inputs)')
+        return []
+    return [f'{problem}; set object_store_allow_changed_inputs to resume anyway']
+
+
+def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
+                    cache_directory=None, log=print):
+    """Refresh, freeze and materialize a fit's object-store inputs.
+
+    Rank zero (the only process when ``dist`` is None or single-rank) runs
+    the one refresh phase unless object_store_refresh_links is off; the
+    other ranks wait for its result, and every rank fails when it fails.
+    Every rank then reads the now-immutable store read-only, materializes
+    the same frozen snapshot and closes the store; their manifests must
+    agree before anyone trains. Returns FitInputs carrying ``manifest`` and
+    ``digest``.
+    """
+    from vc_object_store import ObjectStore
+
+    if not config['object_store_path']:
+        raise ObjectStoreInputError(['object_store_path is not configured'])
+    main = dist is None or dist.is_main_process
+    status = None
+    if main:
+        try:
+            uuids, lines = _startup_phase(
+                config, request_from_config(config), lasagna, cache_directory, log)
+            status = {'ok': True, 'uuids': uuids, 'lines': lines}
+        except ObjectStoreInputError as error:
+            status = {'ok': False, 'problems': error.problems}
+        except Exception as error:  # noqa: BLE001 - other ranks must hear of it
+            status = {'ok': False, 'problems': [f'{type(error).__name__}: {error}']}
+    status = _broadcast(status, dist)
+    if not status['ok']:
+        raise LinkRefreshError(status['problems'])
+    if main:
+        for line in status['lines']:
+            log(line)
+
+    request = request_from_config(config)
+    with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+        snapshot = read_snapshot(store, request, status['uuids'])
+        normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+        inputs = materialize_from_config(store, snapshot, config)
+    inputs.manifest = input_manifest(snapshot, config, normal, external_frames)
+    inputs.digest = manifest_digest(inputs.manifest)
+    digests = _all_gather(inputs.digest, dist)
+    if len(set(digests)) > 1:
+        raise ObjectStoreInputError([
+            'ranks read different object-store inputs: '
+            + ', '.join(f'rank {rank} {digest[:12]}' for rank, digest in enumerate(digests))])
+    if main:
+        log(f'object-store inputs frozen: digest {inputs.digest[:16]}')
+    return inputs
 
 
 def _report_config(args):
