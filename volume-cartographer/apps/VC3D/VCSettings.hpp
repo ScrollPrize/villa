@@ -350,6 +350,10 @@ namespace line_annotation {
     // app-global "Sync cursor across views" toggle.
     constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
     constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
+    // Stored fibers the user opens start with editing enabled instead of
+    // read-only. Agent-driven opens and collection inspections ignore it.
+    constexpr auto OPEN_FIBERS_EDITABLE = "lineAnnotation/open_fibers_editable";
+    constexpr bool OPEN_FIBERS_EDITABLE_DEFAULT = false;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";

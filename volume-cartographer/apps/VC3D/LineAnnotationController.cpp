@@ -4477,6 +4477,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->readOnly = true;
     session->suppressFiberSave = true;
     session->editingAvailable = !fiber.readOnly;
+    // The user's opens may start editable; agent-driven (suppressed) opens
+    // and collection inspections stay read-only until editing is requested.
+    const bool openEditable = [&] {
+        if (fiber.readOnly || collectionInspection || _errorDialogsSuppressed || !_applyOpenFibersEditable) {
+            return false;
+        }
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        return settings.value(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE,
+                              vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE_DEFAULT).toBool();
+    }();
 
     if (seedOnlyPoint) {
         // A single-point fiber has no line yet; enabling editing traces it.
@@ -4497,12 +4507,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         auto sourcePlane = std::make_shared<PlaneSurface>(
             toVec3f(seedPoint * fiberBaseToVolumeScale),
             toVec3f(sourceSliceNormal));
-        (void)launchSession(SourceKind::Plane,
-                            nextSurfaceName(),
-                            std::move(sourcePlane),
-                            camera,
-                            sourceSliceNormal,
-                            session);
+        const std::string surfaceName = nextSurfaceName();
+        if (launchSession(SourceKind::Plane,
+                          surfaceName,
+                          std::move(sourcePlane),
+                          camera,
+                          sourceSliceNormal,
+                          session) &&
+            openEditable) {
+            enableSessionEditing(surfaceName);
+        }
         return;
     }
 
@@ -4662,12 +4676,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                   static_cast<float>(displayOrigin[1]),
                   static_cast<float>(displayOrigin[2])},
         cv::Vec3f{0.0f, 0.0f, 1.0f});
-    (void)launchSession(SourceKind::Plane,
-                        nextSurfaceName(),
-                        sourcePlane,
-                        camera,
-                        {0.0, 0.0, 1.0},
-                        std::move(session));
+    const std::string surfaceName = nextSurfaceName();
+    if (launchSession(SourceKind::Plane,
+                      surfaceName,
+                      sourcePlane,
+                      camera,
+                      {0.0, 0.0, 1.0},
+                      std::move(session)) &&
+        openEditable) {
+        enableSessionEditing(surfaceName);
+    }
 }
 
 void LineAnnotationController::deleteFiber(uint64_t fiberId)
@@ -8457,6 +8475,7 @@ void LineAnnotationController::refreshChangedStoreFibers()
         }
     });
     if (!changed.empty()) discardFiberPanes(changed);
+    QScopedValueRollback<bool> keepEditingState(_applyOpenFibersEditable, false);
     for (const auto& [uuid, state] : reopen) {
         const auto id = fiberIdForUuid(uuid);
         if (!id || !fiberCoordinateScale(id, false)) continue;
