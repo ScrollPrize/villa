@@ -33,6 +33,22 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
 
 
+def prepare_patch_for_fit(patch, z_begin, z_end, erode_cells_default):
+    """Erode a loaded patch for fitting; return why it was dropped, or None.
+
+    Applies the patch's own erosion request (else ``erode_cells_default``)
+    in place, then requires a valid vertex inside [z_begin, z_end).
+    """
+    cells_to_erode = patch.erosion_cells(erode_cells_default)
+    if (cells_to_erode > 0
+            and not erode_patch_valid_region(patch, cells_to_erode)):
+        return 'erosion'
+    if not patch_intersects_z_roi(patch, z_begin, z_end):
+        return 'z ROI after erosion'
+    patch.release_derived_caches()
+    return None
+
+
 def load_patch_payload_chunk(path, entries, z_begin, z_end,
                              erode_cells_default, io_threads=1):
     """Load, erode, and z-filter a chunk of patch directories.
@@ -51,13 +67,10 @@ def load_patch_payload_chunk(path, entries, z_begin, z_end,
             patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
             if patch is None:
                 return entry, None, None, 'z ROI prefilter'
-            cells_to_erode = patch.erosion_cells(erode_cells_default)
-            if (cells_to_erode > 0
-                    and not erode_patch_valid_region(patch, cells_to_erode)):
-                return entry, None, None, 'erosion'
-            if not patch_intersects_z_roi(patch, z_begin, z_end):
-                return entry, None, None, 'z ROI after erosion'
-            patch.release_derived_caches()
+            reason = prepare_patch_for_fit(
+                patch, z_begin, z_end, erode_cells_default)
+            if reason is not None:
+                return entry, None, None, reason
             return entry, patch_to_payload(patch), None, None
         except Exception as error:
             return entry, None, str(error), None
@@ -134,6 +147,28 @@ def _decimate_ordered_points_min_spacing(points, min_spacing, return_indices=Fal
     return points[keep]
 
 
+def fiber_control_span(control_xyz, line_xyz):
+    """The fiber polyline fitted against, trimmed to its control-point span.
+
+    Maps each control point to its nearest line point (exact coincidence in
+    practice) and trims the polyline to the span between the first and last
+    mapped control. Returns ``(points, span_begin, control_line_indices)``:
+    the trimmed points, the line index of their first point, and each
+    control's untrimmed line index. Without a usable dense polyline (legacy or
+    degenerate fiber) the control points themselves are the polyline.
+    """
+    num_control_points = len(control_xyz)
+    if len(line_xyz) >= num_control_points and num_control_points >= 1:
+        squared_distances = (
+            (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
+        control_line_indices = squared_distances.argmin(axis=1)
+        span_begin = int(control_line_indices.min())
+        span_end = int(control_line_indices.max())
+        return (line_xyz[span_begin:span_end + 1], span_begin,
+                control_line_indices)
+    return control_xyz, 0, np.arange(num_control_points)
+
+
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
     # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
     # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
@@ -181,21 +216,9 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     num_control_points = len(control_xyz)
 
     line_xyz = np.asarray(parsed.line_points_xyz, dtype=np.float32)
-    if len(line_xyz) >= num_control_points and num_control_points >= 1:
-        # Map each control point to its nearest line point (exact coincidence in
-        # practice), then trim the polyline to the control-point span.
-        squared_distances = (
-            (line_xyz[None, :, :] - control_xyz[:, None, :]) ** 2).sum(axis=-1)
-        control_line_indices = squared_distances.argmin(axis=1)
-        span_begin = int(control_line_indices.min())
-        span_end = int(control_line_indices.max())
-        points_xyz = line_xyz[span_begin:span_end + 1]
-        control_line_indices = control_line_indices - span_begin
-    else:
-        # No usable dense polyline (legacy or degenerate fiber): fall back to
-        # the control points themselves.
-        points_xyz = control_xyz
-        control_line_indices = np.arange(num_control_points)
+    points_xyz, span_begin, control_line_indices = fiber_control_span(
+        control_xyz, line_xyz)
+    control_line_indices = control_line_indices - span_begin
 
     points_xyz = points_xyz * coordinate_scale
     original_num_points = len(points_xyz)

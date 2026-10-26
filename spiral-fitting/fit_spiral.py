@@ -86,6 +86,14 @@ from point_collection import (
     normalise_pcl_winding_annotations,
     umbilicus_inward_direction,
 )
+from pcl_views import (
+    _UnattachedPclStripList,
+    catalog_copy_of_pcl,
+    longest_run_in_z_window,
+    materialize_fiber_fit_inputs,
+    regular_pcl_views,
+    regular_unattached_strip,
+)
 from dt_targets import (
     DtTargetCacheManager,
     compute_patch_dt_target_cache,
@@ -136,12 +144,7 @@ from spiral_helpers import (
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
-    classify_fiber_hv,
     fiber_collection_hv_tag,
-    _decimate_ordered_points_min_spacing,
-    resolve_fiber_links,
-    build_link_components,
-    merge_linked_point_collections,
     SequenceChain,
     scale_and_split_counts,
     _infer_shell_outer_winding_idx,
@@ -742,12 +745,6 @@ class PatchAtlas:
                 + self._theta_node_start)
 
 
-class _UnattachedPclStripList(list):
-    """List of unattached-pcl strip dicts, with a slot for an attached `.flat`
-    GPU bundle that batched satisfaction / winding-range computations reuse."""
-    pass
-
-
 def stamp_loaded_pcl_metadata(pcl, path, explicit_role, resident_collection_id):
     """Record provenance and identity on one regular PCL as it is loaded.
 
@@ -783,240 +780,12 @@ def stamp_loaded_pcl_metadata(pcl, path, explicit_role, resident_collection_id):
         })
     return pcl
 
-
-def catalog_copy_of_pcl(pcl):
-    """Copy a regular PCL without derived chain and patch-view state."""
-    return copy.deepcopy({
-        key: value for key, value in pcl.items()
-        if key not in ('chain', 'points_by_patch')
-    })
-
-
-def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
-    """Return the longest contiguous id-sorted run inside the z window."""
-    best_start = best_end = run_start = 0
-    for position, (_, point) in enumerate(sorted_items):
-        z = point['zyx'][0]
-        if z_begin - z_margin <= z < z_end + z_margin:
-            if position + 1 - run_start > best_end - best_start:
-                best_start, best_end = run_start, position + 1
-        else:
-            run_start = position + 1
-    return sorted_items[best_start:best_end]
-
-
 def subsample_rows(points, max_points, generator):
     """Deterministically keep at most ``max_points`` rows of ``points``."""
     if points.shape[0] <= max_points:
         return points
     order = torch.randperm(points.shape[0], generator=generator)[:max_points]
     return points[order.sort().values]
-
-
-def regular_unattached_strip(pcl_id, pcl, min_point_spacing):
-    """Materialize the unattached-loss strip of a regular PCL."""
-    sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-    if len(sorted_items) < 2:
-        return None
-    zyxs = np.stack(
-        [point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
-    windings = np.array(
-        [point['winding_annotation'] for _, point in sorted_items],
-        dtype=np.float32)
-    zyxs, keep = _decimate_ordered_points_min_spacing(
-        zyxs, min_point_spacing, return_indices=True,
-        force_keep={len(zyxs) - 1})
-    metadata = pcl.get('metadata', {})
-    return {
-        'id': pcl_id,
-        'name': pcl.get('name'),
-        'source_file': pcl.get('source_file'),
-        'zyxs': zyxs,
-        'windings': windings[keep],
-        'link_points': {},
-        'logical_input_kind': metadata.get('logical_input_kind'),
-        'logical_input_id': metadata.get('logical_input_id'),
-        'logical_input_revision': metadata.get('logical_input_revision'),
-    }
-
-
-def materialize_fiber_fit_inputs(
-        fiber_catalog, verified_patches, *, z_begin, z_end, z_margin,
-        min_point_spacing, use_links=True, use_pending_links=False,
-        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
-        vertical_radial_offset=0.0):
-    """Derive every CPU training view from the resident fiber catalog.
-
-    ``fiber_catalog`` is ordered by logical input id and owns the canonical
-    fiber containers. The returned cross-patch PCLs and strips refer to their
-    geometry, but trimming and decimation never mutate the catalog's point
-    membership. Re-running this function over the same catalog therefore
-    produces the same graph and ordered training views.
-
-    Each strip carries ``hv_tag`` ('V', 'H', or None; see
-    spiral_helpers.classify_fiber_hv) and ``is_vertical`` for radial-offset updates.
-    ``radial_offsets`` holds the
-    per-point radial target offset in scroll voxels along the sheet normal,
-    positive in the increasing-winding direction of the fitted spiral (the
-    scan-space winding gradient, not the line to the umbilicus):
-    ``vertical_radial_offset`` on vertical strips (their back-face position
-    relative to the fitted sheet, away from the umbilicus), zero everywhere
-    else.
-    ``radial_offset_bake_scale`` carries each point's accumulated normal
-    stretch through the frozen constraint-bake stack (1 before any bake),
-    read from the catalog point dicts (see accumulate_radial_offset_bake_scale)
-    so the physical offset can be expressed in the resident frame.
-    """
-    point_collections = {}
-    for logical_id, pcl in fiber_catalog.items():
-        logical_id = str(logical_id)
-        metadata = pcl.setdefault('metadata', {})
-        metadata['logical_input_kind'] = 'fiber'
-        metadata['logical_input_id'] = logical_id
-        metadata['winding_is_absolute'] = False
-        metadata.setdefault('input_role', 'fiber')
-        pcl.setdefault('file_basename', f'{logical_id}.json')
-        pcl['sampling_group'] = 'fibers'
-        pcl['chain'] = SequenceChain(pcl)
-        for point in pcl['points'].values():
-            point['collectionId'] = pcl['id']
-            if 'zyx' not in point:
-                point['zyx'] = np.asarray(
-                    [point['p'][2], point['p'][1], point['p'][0]],
-                    dtype=np.float32)
-        if pcl['id'] in point_collections:
-            raise ValueError(f'duplicate resident fiber collection id {pcl["id"]!r}')
-        point_collections[pcl['id']] = pcl
-
-    resolved_links = []
-    if use_links:
-        resolved_links = resolve_fiber_links(
-            point_collections, include_pending=use_pending_links,
-            assume_unannotated=True)
-    link_components = build_link_components(resolved_links)
-    catalog_position = {
-        pcl['id']: position
-        for position, pcl in enumerate(fiber_catalog.values())
-    }
-    link_components = [
-        (sorted(member_cids, key=catalog_position.__getitem__), member_links)
-        for member_cids, member_links in link_components
-    ]
-    link_components.sort(
-        key=lambda component: min(
-            catalog_position[cid] for cid in component[0]))
-    linked_cids = {
-        cid for member_cids, _ in link_components for cid in member_cids
-    }
-
-    cross_patch = {}
-    strip_sources = []
-    for cid, pcl in point_collections.items():
-        num_attached = sum(
-            1 for point in pcl['points'].values() if 'on_patch' in point)
-        num_unattached = len(pcl['points']) - num_attached
-        if num_attached >= 2:
-            cross_patch[cid] = pcl
-        if num_unattached >= 1 or cid in linked_cids:
-            strip_sources.append((cid, pcl))
-
-    if link_components:
-        cross_patch, _ = merge_linked_point_collections(
-            point_collections, link_components, cross_patch)
-
-    # Fiber files carry no winding annotations. Their point dictionaries are
-    # shared by the catalog and derived PCLs, so normalize them directly after
-    # link resolution; subsequent materializations explicitly resolve catalog
-    # fibers as unannotated above.
-    for pcl in point_collections.values():
-        pcl['has_winding_annotations'] = False
-        for point in pcl['points'].values():
-            point['winding_annotation'] = 0.0
-
-    for pcl in cross_patch.values():
-        points_by_patch = {}
-        for _, point in sorted(pcl['points'].items(), key=lambda item: int(item[0])):
-            if 'on_patch' not in point:
-                continue
-            patch_id = point['on_patch']['id']
-            if patch_id in verified_patches:
-                points_by_patch.setdefault(patch_id, []).append(point)
-        pcl['points_by_patch'] = points_by_patch
-
-    link_point_ids_by_coll = {}
-    for link in resolved_links:
-        link_point_ids_by_coll.setdefault(link['a_coll'], set()).add(
-            link['a_point'])
-        link_point_ids_by_coll.setdefault(link['b_coll'], set()).add(
-            link['b_point'])
-
-    strips = _UnattachedPclStripList()
-    sampling_groups = []
-    for cid, pcl in strip_sources:
-        sorted_items = sorted(pcl['points'].items(), key=lambda item: int(item[0]))
-        best_start = best_end = run_start = 0
-        for position, (_, point) in enumerate(sorted_items):
-            z = point['zyx'][0]
-            if z_begin - z_margin <= z < z_end + z_margin:
-                if position + 1 - run_start > best_end - best_start:
-                    best_start, best_end = run_start, position + 1
-            else:
-                run_start = position + 1
-        kept_items = sorted_items[best_start:best_end]
-        if len(kept_items) < 2:
-            continue
-
-        link_ids = link_point_ids_by_coll.get(cid, ())
-        force_keep = {
-            position for position, (point_id, _) in enumerate(kept_items)
-            if int(point_id) in link_ids
-        }
-        zyxs = np.stack(
-            [point['zyx'] for _, point in kept_items], axis=0).astype(np.float32)
-        windings = np.asarray(
-            [point['winding_annotation'] for _, point in kept_items],
-            dtype=np.float32)
-        bake_scale = np.asarray(
-            [point.get('radial_offset_bake_scale', 1.0)
-             for _, point in kept_items],
-            dtype=np.float32)
-        zyxs, keep = _decimate_ordered_points_min_spacing(
-            zyxs, min_point_spacing, return_indices=True,
-            force_keep=force_keep | {len(zyxs) - 1})
-        windings = windings[keep]
-        bake_scale = bake_scale[keep]
-        link_points = {
-            int(kept_items[original_position][0]): strip_position
-            for strip_position, original_position in enumerate(keep)
-            if original_position in force_keep
-        }
-        metadata = pcl.get('metadata', {})
-        hv_tag = classify_fiber_hv(
-            metadata.get('hv_classification'), zyxs,
-            min_z_fraction=vertical_min_z_fraction,
-            min_auto_certainty=vertical_min_auto_certainty)
-        strips.append({
-            'id': cid,
-            'name': pcl.get('name'),
-            'source_file': pcl.get('source_file'),
-            'zyxs': zyxs,
-            'windings': windings,
-            'radial_offsets': np.full(
-                len(zyxs),
-                float(vertical_radial_offset) if hv_tag == 'V' else 0.0,
-                dtype=np.float32),
-            'radial_offset_bake_scale': bake_scale,
-            'link_points': link_points,
-            'hv_tag': hv_tag,
-            'is_vertical': hv_tag == 'V',
-            'logical_input_kind': 'fiber',
-            'logical_input_id': metadata.get('logical_input_id'),
-            'logical_input_revision': metadata.get('logical_input_revision'),
-        })
-        sampling_groups.append(pcl['sampling_group'])
-
-    return (list(cross_patch.values()), strips, sampling_groups,
-            resolved_links, link_components)
 
 
 def _build_strip_flat_bundle(strip_arrays, device):
@@ -1764,138 +1533,16 @@ class FitContext:
         # Regular point collection classification
         # ==========================================================================
 
-        # Classify each pcl from how its points attach to patches:
-        #  - >= 2 attached points => acts as a cross-patch pcl (winding-number loss), using only
-        #    its attached points (grouped by patch below);
-        #  - >= 1 unattached point => acts as an unattached pcl (unattached loss), using the
-        #    entire pcl.
-        # A pcl can fall into both sets. When it does, the unattached entry is an independent copy
-        # so its z-roi trimming / annotation normalisation cannot perturb the cross-patch entry's
-        # points_by_patch (which is built from all attached points, regardless of z).
-        # Exception: pcls flagged metadata.winding_is_absolute carry absolute winding annotations
-        # and are always consumed as cross-patch pcls (never unattached), retained even when they
-        # hold a single point. We only *warn* on any of their points that failed to attach to a
-        # patch -- those points carry no winding target and are simply dropped (they never enter
-        # points_by_patch) -- and assert that every *attached* point carries an explicit, positive
-        # winding annotation (an absolute pcl must not fall back to winding 0), and (once grouped
-        # below) that no patch holds more than one of their points.
-
-        cross_patch_point_collections = {}
-        unattached_point_collections = {}
-        for pid, pcl in point_collections.items():
-            if pid in fiber_point_collections:
-                continue
-            num_attached = sum(1 for point in pcl['points'].values() if 'on_patch' in point)
-            num_unattached = len(pcl['points']) - num_attached
-            if pcl.get('metadata', {}).get('winding_is_absolute', False):
-                if num_unattached > 0:
-                    print(
-                        f'WARNING: winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has '
-                        f'{num_unattached} of {len(pcl["points"])} points not attached to any patch; '
-                        f'dropping the unattached points'
-                    )
-                # Validate only the attached points -- unattached ones are dropped above and never
-                # enter points_by_patch, so their annotations are irrelevant.
-                attached_points = [point for point in pcl['points'].values() if 'on_patch' in point]
-                num_unannotated = sum(1 for point in attached_points if not np.isfinite(point['winding_annotation']))
-                if num_unannotated:
-                    raise ValueError(
-                        f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_unannotated} of '
-                        f'{len(attached_points)} attached points without a winding annotation; absolute pcls '
-                        f'must give every winding number explicitly'
-                    )
-                num_non_positive = sum(1 for point in attached_points if point['winding_annotation'] <= 0)
-                if num_non_positive:
-                    raise ValueError(
-                        f'winding_is_absolute pcl {pid} ({pcl.get("name")!r}) has {num_non_positive} of '
-                        f'{len(attached_points)} attached points with a non-positive winding annotation; '
-                        f'absolute winding numbers must be > 0'
-                    )
-                cross_patch_point_collections[pid] = pcl
-                continue
-            if num_attached >= 2:
-                cross_patch_point_collections[pid] = pcl
-            if num_unattached >= 1:
-                unattached_point_collections[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
-
-        # For unattached pcls, keep only the longest contiguous subrange (in id-sorted
-        # order) of points whose zs lie within [z_begin - margin, z_end + margin); drop
-        # the pcl entirely if fewer than 2 points remain.
-        z_margin = self.config['patch_loss_z_margin']
-        dropped_unattached_pcl_count = 0
-        for pid in list(unattached_point_collections.keys()):
-            pcl = unattached_point_collections[pid]
-            sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-            best_start, best_end = 0, 0
-            run_start = 0
-            for i, (_, point) in enumerate(sorted_items):
-                z = point['zyx'][0]
-                if self.z_begin - z_margin <= z < self.z_end + z_margin:
-                    if i + 1 - run_start > best_end - best_start:
-                        best_start, best_end = run_start, i + 1
-                else:
-                    run_start = i + 1
-            kept_items = sorted_items[best_start:best_end]
-            if len(kept_items) < 2:
-                del unattached_point_collections[pid]
-                dropped_unattached_pcl_count += 1
-            else:
-                pcl['points'] = dict(kept_items)
-        if dropped_unattached_pcl_count:
-            print(f'dropped {dropped_unattached_pcl_count} unattached pcls with <2 points in z-roi')
-
-        normalise_pcl_winding_annotations(cross_patch_point_collections)
-        normalise_pcl_winding_annotations(unattached_point_collections)
-
-        # Group each cross-patch pcl's attached points by patch, for the
-        # winding-number loss. Patches are ordered by the first attached point that
-        # hits them when scanning the pcl's points in int(json-key) order; within
-        # each patch, points are also in int(key) order.
-        for pcl in cross_patch_point_collections.values():
-            points_by_patch = {}
-            for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
-                if 'on_patch' not in point:
-                    continue
-                pid = point['on_patch']['id']
-                if pid not in verified_patches:
-                    continue
-                points_by_patch.setdefault(pid, []).append(point)
-            pcl['points_by_patch'] = points_by_patch
-        unattached_pcl_strips = _UnattachedPclStripList()
-        unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
+        # Fiber junction retention is handled by materialize_fiber_fit_inputs below.
         min_point_spacing = self.config['pcl_unattached_pcl_min_point_spacing']
-        # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
-        # corresponding winding annotations. Strips with <2 points are dropped.
-        # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
-        # so consecutive kept points are at least min_point_spacing apart in 3D scroll space.
-        # The first and last points are always kept. Fiber junction retention is
-        # handled by materialize_fiber_fit_inputs below.
-        for pcl_id, pcl in unattached_point_collections.items():
-            sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-            if len(sorted_items) < 2:
-                continue
-            zyxs = np.stack([point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
-            windings = np.array([point['winding_annotation'] for _, point in sorted_items], dtype=np.float32)
-
-            zyxs, keep = _decimate_ordered_points_min_spacing(
-                zyxs, min_point_spacing, return_indices=True,
-                force_keep={len(zyxs) - 1})
-            windings = windings[keep]
-            unattached_pcl_strips.append({
-                'id': pcl_id,
-                'name': pcl.get('name'),
-                'source_file': pcl.get('source_file'),
-                'zyxs': zyxs,
-                'windings': windings,
-                'link_points': {},
-                'logical_input_kind': pcl.get('metadata', {}).get(
-                    'logical_input_kind'),
-                'logical_input_id': pcl.get('metadata', {}).get(
-                    'logical_input_id'),
-                'logical_input_revision': pcl.get('metadata', {}).get(
-                    'logical_input_revision'),
-            })
-            unattached_strip_sampling_groups.append(pcl['sampling_group'])
+        cross_patch_point_collections, unattached_pcl_strips, \
+            unattached_strip_sampling_groups = regular_pcl_views(
+                {pid: pcl for pid, pcl in point_collections.items()
+                 if pid not in fiber_point_collections},
+                verified_patches,
+                z_begin=self.z_begin, z_end=self.z_end,
+                z_margin=self.config['patch_loss_z_margin'],
+                min_point_spacing=min_point_spacing)
 
         (fiber_cross_patch, fiber_strips, fiber_sampling_groups,
          resolved_links, link_components) = materialize_fiber_fit_inputs(
@@ -1923,7 +1570,19 @@ class FitContext:
         if link_warning is not None:
             print(f'WARNING: {link_warning}')
 
-        cross_patch_pcls = list(cross_patch_point_collections.values())
+        self._install_point_views(
+            list(cross_patch_point_collections.values()),
+            unattached_pcl_strips, unattached_strip_sampling_groups,
+            fiber_catalog=fiber_catalog,
+            regular_pcl_catalog=regular_pcl_catalog,
+            resolved_links=resolved_links, link_components=link_components)
+        self.link_distance_tolerance = link_distance_tolerance
+
+    def _install_point_views(self, cross_patch_pcls, unattached_pcl_strips,
+                             unattached_strip_sampling_groups, *,
+                             fiber_catalog, regular_pcl_catalog,
+                             resolved_links, link_components):
+        """Install derived point-collection views and their sampling strata."""
         print(
             f'pcls: {len(cross_patch_pcls)} cross-patch, '
             f'{len(unattached_pcl_strips)} unattached'
@@ -1966,11 +1625,6 @@ class FitContext:
         self.unattached_component_edges = []
         self.pcl_sampling_strata = {}
         self._rebuild_pcl_sampling_strata()
-
-        # The strip arrays and cross-patch list are the compact training forms.
-        # Drop the JSON-shaped source containers, especially the independent deep
-        # copies made for PCLs that participate in both loss families.
-        self.link_distance_tolerance = link_distance_tolerance
 
     def check_cuda_ready(self):
         """Create the CUDA context before input reads increase host cache pressure."""
