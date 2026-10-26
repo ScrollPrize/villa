@@ -236,12 +236,13 @@ LINE_OPTIONS = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
 
 
 def lasagna(tmp_path, nx, ny, group="2", downsample=2):
-    # Paired nx/ny stores read at <store>/<group>, as the spiral fitter reads them.
+    # Paired nx/ny group arrays, addressed by path (an array's only level is 0)
+    # as the spiral fitter and .lasagna.json address them.
     shape = (192 // downsample,) * 3
     for name, value in (("nx", nx), ("ny", ny)):
         u8_zarr(tmp_path / f"{name}.zarr" / group, np.full(shape, value, np.uint8))
-    return dict(normal_x_volume=str(tmp_path / "nx.zarr"), normal_y_volume=str(tmp_path / "ny.zarr"),
-                ct_level=int(group), ct_to_base_scale=downsample)
+    return dict(normal_x_volume=str(tmp_path / "nx.zarr" / group),
+                normal_y_volume=str(tmp_path / "ny.zarr" / group), ct_level=0, ct_to_base_scale=downsample)
 
 
 def test_fiber_patch_lasagna_normals(db, tmp_path):
@@ -253,8 +254,8 @@ def test_fiber_patch_lasagna_normals(db, tmp_path):
     edge = db.edges_of(uid)[0]
     assert a in (edge["a"], edge["b"])
     assert edge["meta"]["normal_method"] == "lasagna-nxny-u8-nearest-v1"
-    assert edge["meta"]["normal_source"] == {"normal_x": str(tmp_path / "nx.zarr"),
-                                             "normal_y": str(tmp_path / "ny.zarr")}
+    assert edge["meta"]["normal_source"] == {"normal_x": str(tmp_path / "nx.zarr" / "2"),
+                                             "normal_y": str(tmp_path / "ny.zarr" / "2")}
     assert edge["meta"]["fiber_patch"]["patch_grid"] == [32, 32]
 
 
