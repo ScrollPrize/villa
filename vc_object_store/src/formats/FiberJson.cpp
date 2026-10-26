@@ -36,7 +36,8 @@ void version3Coordinates(Json& root)
             throw std::runtime_error("invalid version 3 coordinate space: " + space);
         if (space.substr(level) != "@L0" || root.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0)
             throw std::runtime_error("version 3 fiber coordinates are supported only at level 0: " + space);
-        root["coordinates"] = {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}};
+        root["coordinates"] = mergeGeometryCoordinates(root.value("coordinates", Json::object()),
+            {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}});
     }
     std::vector<std::string> openData;
     for (const auto& [key, value] : root.items())

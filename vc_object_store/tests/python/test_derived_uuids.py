@@ -106,3 +106,54 @@ def test_namespace_must_be_a_uuid(tmp_path, namespace):
     with ObjectStore.create(str(tmp_path / "bad.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=namespace)
         assert report["ingested"] == 0 and "invalid UUID" in " ".join(report["problems"])
+
+
+def edit_v3_fiber(directory, name, change):
+    path = directory / (name + ".json")
+    document = json.loads(path.read_text())
+    change(document)
+    path.write_text(json.dumps(document))
+
+
+def test_v3_reciprocal_branches_are_reconciled_by_the_relationship_importer(tmp_path):
+    directory = tmp_path / "fibers"
+    names = write_v3_fibers(directory)
+
+    def last_bit(document):
+        # Each end computes the shared directions separately.
+        document["branches"][0]["control_point_direction"] = [0, 1 + 2.0**-52, 0]
+    edit_v3_fiber(directory, names[1], last_bit)
+    with ObjectStore.create(str(tmp_path / "close.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+
+    def adjacent(document):
+        document["adjacent_branches"] = document.pop("branches")
+    edit_v3_fiber(directory, names[1], adjacent)
+    with ObjectStore.create(str(tmp_path / "kinds.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        assert "conflicting ordinary/adjacent" in " ".join(report["problems"])
+        assert store.object_count("fiber") == 0
+
+
+@pytest.mark.parametrize("declared,ok", [
+    ({"volume_uuid": "B", "scale_factor": 1}, True),
+    ({"volume_uuid": "B"}, True),
+    ({"volume_uuid": "A", "scale_factor": 2}, False),
+    ({"scale_factor": 2}, False),
+])
+def test_v3_coordinate_space_merges_with_declared_coordinates(tmp_path, declared, ok):
+    directory = tmp_path / "fibers"
+    names = write_v3_fibers(directory)
+    for name in names:
+        edit_v3_fiber(directory, name, lambda d: d.update(
+            coordinates=declared, vc_open_data_coordinate_space="PHerc/B@L0"))
+    with ObjectStore.create(str(tmp_path / "frames.vcobj"), author="test") as store:
+        report = store.ingest_geometry_source("fiber", directory, uuid_namespace=NAMESPACE)
+        if ok:
+            assert report["ingested"] == 2 and not report["problems"], report
+            coordinates = store.object(derived("fiber:" + names[0]))["meta"]["coordinates"]
+            assert coordinates == {"volume_uuid": "B", "scale_factor": 1}
+        else:
+            assert "coordinate conflict" in " ".join(report["problems"]), report
+            assert store.object_count("fiber") == 0
