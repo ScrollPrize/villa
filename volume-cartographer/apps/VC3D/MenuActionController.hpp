@@ -55,8 +55,11 @@ public:
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
-    // Prompts for a .vcobj (and an author when the environment names none) and attaches it.
+    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved) and attaches it.
     void attachObjectStore();
+    // Author recorded on edits: the saved username, asked for until it is not "anon".
+    // Empty means cancelled.
+    QString objectStoreAuthor();
     void cloneHostedStore();
     void detachObjectStore();
     // Resolves sampleId against the cached manifest and opens it. When
@@ -140,8 +143,6 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
-    // Author recorded on edits: the login name, else asked for. Empty means cancelled.
-    QString objectStoreAuthor();
     // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
     void attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
     // remote: a replica of a hosted store.

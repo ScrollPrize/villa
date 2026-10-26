@@ -3906,6 +3906,11 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("  alice  ") == "alice");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("A User/Name") == "A_User_Name");
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(""));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(" ANON "));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername("//"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("anonymous"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("alice"));
     CHECK(vc3d::line_annotation::fiberFileName("alice", "20260605T123456789", 42) ==
           "alice_20260605T123456789_000042.json");
 }
