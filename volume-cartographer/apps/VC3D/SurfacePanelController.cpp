@@ -417,6 +417,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         const auto* row = _catalog->row(id.toStdString());
         return row && row->bound();
     };
+    // Patch edits the parent in place: it takes surfaces stored in the volume's voxels.
     auto toolInput = [this](const QString& id) {
         const auto* row = _catalog->row(id.toStdString());
         return row && row->toolInput();
@@ -425,7 +426,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     const bool allBound = std::all_of(targets.begin(), targets.end(), bound);
     const bool usable = isBound && writable;
     const bool allUsable = allBound && writable;
-    const bool toolUsable = toolInput(segmentId) && writable;
     const bool allToolUsable = std::all_of(targets.begin(), targets.end(), toolInput) && writable;
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
@@ -465,7 +465,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
-    growSegmentAction->setEnabled(toolUsable);
+    growSegmentAction->setEnabled(usable);
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSegmentRequested(segmentId);
     });
@@ -479,17 +479,17 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         copySurfaceMenu->addSeparator();
     }
     QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
-    copyOutAction->setEnabled(toolUsable);
+    copyOutAction->setEnabled(usable);
     connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
         emit neighborCopyRequested(segmentId, true);
     });
     QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
-    copyInAction->setEnabled(toolUsable);
+    copyInAction->setEnabled(usable);
     connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
         emit neighborCopyRequested(segmentId, false);
     });
     QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
-    resumeLocalAction->setEnabled(toolUsable);
+    resumeLocalAction->setEnabled(usable);
     connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
         emit resumeLocalGrowPatchRequested(segmentId);
     });
@@ -502,8 +502,8 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         connect(action, &QAction::triggered, this, [this, segmentId, signal]() { emit (this->*signal)(segmentId); });
         return action;
     };
-    addToolAction(tr("Render segment"), toolUsable, &SurfacePanelController::renderSegmentRequested);
-    addToolAction(tr("Convert to OBJ"), toolUsable, &SurfacePanelController::convertToObjRequested);
+    addToolAction(tr("Render segment"), usable, &SurfacePanelController::renderSegmentRequested);
+    addToolAction(tr("Convert to OBJ"), usable, &SurfacePanelController::convertToObjRequested);
     addToolAction(tr("Lasagna Vis as OBJ"), usable, &SurfacePanelController::visLasagnaObjRequested);
     addToolAction(tr("Crop bounds to valid region"), usable, &SurfacePanelController::cropBoundsRequested);
 
@@ -523,22 +523,22 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     addToolAction(tr("Rotate Surface 90° CW"), usable, &SurfacePanelController::rotateSurfaceRequested);
-    addToolAction(tr("Refine (Alpha-comp)"), toolUsable, &SurfacePanelController::alphaCompRefineRequested);
-    addToolAction(tr("SLIM-flatten"), toolUsable, &SurfacePanelController::slimFlattenRequested);
-    addToolAction(tr("Straighten (vc_straighten)"), toolUsable, &SurfacePanelController::straightenRequested);
-    addToolAction(tr("ABF++ flatten"), toolUsable, &SurfacePanelController::abfFlattenRequested);
+    addToolAction(tr("Refine (Alpha-comp)"), usable, &SurfacePanelController::alphaCompRefineRequested);
+    addToolAction(tr("SLIM-flatten"), usable, &SurfacePanelController::slimFlattenRequested);
+    addToolAction(tr("Straighten (vc_straighten)"), usable, &SurfacePanelController::straightenRequested);
+    addToolAction(tr("ABF++ flatten"), usable, &SurfacePanelController::abfFlattenRequested);
 
     contextMenu.addSeparator();
 
     QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
-    rasterizeAction->setEnabled(allToolUsable);
+    rasterizeAction->setEnabled(allUsable);
     connect(rasterizeAction, &QAction::triggered, this, [this, targets]() {
         emit rasterizeSegmentsRequested(targets);
     });
 
     // Merge only makes sense for >=2 surfaces; gate on selection so it
     // doesn't appear when the user right-clicks a single surface.
-    if (selectedSegmentIds.size() >= 2 && allToolUsable) {
+    if (selectedSegmentIds.size() >= 2 && allUsable) {
         QAction* mergeAction = contextMenu.addAction(tr("Merge surfaces..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergeTifxyzRequested(selectedSegmentIds);

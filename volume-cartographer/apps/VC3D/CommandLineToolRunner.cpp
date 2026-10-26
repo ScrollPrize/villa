@@ -170,9 +170,10 @@ void CommandLineToolRunner::setTraceParams(QString volumePath, QString volumeUui
     _sourceSurfaceUuid = srcSurface;
 }
 
-void CommandLineToolRunner::setToObjParams(QString surfaceUuid, QString objName)
+void CommandLineToolRunner::setToObjParams(QString surfaceUuid, QString objName, QString volumeUuid)
 {
     _surfaceUuid = surfaceUuid;
+    _volumeUuid = volumeUuid;
     _objPath = objName;
 }
 
@@ -740,12 +741,14 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
         case Tool::tifxyz2obj:
             args << "--store" << _storePath
                  << "--surface" << _surfaceUuid
-                 << _objPath;
+                 << _objPath
+                 << QStringLiteral("--volume-uuid=%1").arg(_volumeUuid);
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
             break;
         case Tool::AlphaCompRefine:
             args << QStringLiteral("--store=%1").arg(_storePath)
+                 << QStringLiteral("--volume-uuid=%1").arg(_volumeUuid)
                  << _volumePath
                  << _surfaceUuid
                  << _refineDst
@@ -912,9 +915,11 @@ void CommandLineToolRunner::setMergePatchParams(const QString& parentSurface,
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& srcSurface,
                                                const QString& dstSurface,
-                                               const QString& jsonParams)
+                                               const QString& jsonParams,
+                                               const QString& volumeUuid)
 {
     setVolumePath(volumePath);
+    _volumeUuid = volumeUuid;
     _surfaceUuid = srcSurface;
     _refineDst = dstSurface;
     _jsonParams = jsonParams;

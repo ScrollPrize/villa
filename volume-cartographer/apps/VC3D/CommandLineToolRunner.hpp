@@ -102,13 +102,16 @@ public:
     void setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
                         QString jsonParams, QString srcSurface);
     // vc_tifxyz2obj: export a stored surface to `objName` in its artifact directory.
-    void setToObjParams(QString surfaceUuid, QString objName);
+    // vc_tifxyz2obj: the surface exported in `volumeUuid`'s voxels.
+    void setToObjParams(QString surfaceUuid, QString objName, QString volumeUuid);
     void setToObjOptions(bool normalizeUV, bool alignGrid);
-    // vc_objrefine: `dstSurface` is a new surface's name, or `srcSurface` to refine in place.
+    // vc_objrefine: `dstSurface` is a new surface's name, or `srcSurface` to refine in place;
+    // the surface is read in the voxels of `volumeUuid`, the volume at `volumePath`.
     void setObjRefineParams(const QString& volumePath,
                             const QString& srcSurface,
                             const QString& dstSurface,
-                            const QString& jsonParams);
+                            const QString& jsonParams,
+                            const QString& volumeUuid);
     // vc_grow_seg_from_seed: grow from (resume) `resumeSurface` into a new surface
     // tagged `outputTag` and bound to `volumeUuid`.
     void setNeighborCopyParams(const QString& volumePath,

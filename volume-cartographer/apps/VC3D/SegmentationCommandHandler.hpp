@@ -337,8 +337,10 @@ private:
     // Same, reporting failures in a dialog; `checkRunner` also needs an idle runner.
     std::optional<StoredSurface> requireStoredSurface(const std::string& id, bool checkRunner,
                                                       bool throughView = false);
-    // The listed surfaces stored in the current volume's voxels (tool inputs).
-    std::vector<const SurfaceCatalog::Row*> toolSurfaces() const;
+    // The listed surfaces of the user's store stored in the current volume's
+    // voxels, or (throughView) that open in it, as tools that read through
+    // the store's view take them.
+    std::vector<const SurfaceCatalog::Row*> toolSurfaces(bool throughView = false) const;
     // The attached store's file and the current volume, for tools that read no surface.
     std::optional<StoredSurface> storeForTools(CommandLaunchError* error) const;
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;

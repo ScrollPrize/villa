@@ -1213,7 +1213,7 @@ class StraightenJob : public QObject {
 public:
     StraightenJob(QWidget* parentWidget,
                   SegmentationCommandHandler* handler, const QString& straightenExe,
-                  const QString& storePath, const QString& surfaceUuid,
+                  const QString& storePath, const QString& surfaceUuid, const QString& volumeUuid,
                   const QString& outputName, const QStringList& extraArgs,
                   bool suppressDialogs = false)
         : QObject(handler)
@@ -1238,7 +1238,8 @@ public:
         connect(proc_, &QProcess::errorOccurred, this, &StraightenJob::onProcError_);
 
         QStringList args;
-        args << surfaceUuid << outputName << QStringLiteral("--store") << storePath << extraArgs;
+        args << surfaceUuid << outputName << QStringLiteral("--store") << storePath
+             << QStringLiteral("--volume-uuid") << volumeUuid << extraArgs;
         std::cout << "[straighten] launching: " << straightenExe.toStdString()
                   << " " << args.join(' ').toStdString() << std::endl;
         if (handler_) {
@@ -1661,7 +1662,7 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
 void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, false);
+    const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
     SlimFlattenDialog dlg(_parentWidget, stored->name + QStringLiteral("_flatboi"));
@@ -1697,7 +1698,7 @@ void SegmentationCommandHandler::onSlimFlatten(const std::string& segmentId)
 
 void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, false);
+    const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
     const QString exe = findVcTool("vc_straighten");
@@ -1724,12 +1725,12 @@ void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
               << std::endl;
 
     new StraightenJob(_parentWidget, this, exe, stored->store, QString::fromStdString(stored->uuid),
-                      outputName, args);
+                      stored->volumeUuid, outputName, args);
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, false);
+    const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
     ABFFlattenDialog dlg(_parentWidget);
@@ -1744,7 +1745,7 @@ void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
 {
     // The dialog collects inputs; startRunTrace owns validation and launch.
-    const auto stored = requireStoredSurface(segmentId, true);
+    const auto stored = requireStoredSurface(segmentId, true, true);
     if (!stored) return;
     if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
         QMessageBox::warning(
@@ -1808,7 +1809,7 @@ bool SegmentationCommandHandler::startRunTraceImpl(
         setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
     if (!_cmdRunner) {
         setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
@@ -2012,7 +2013,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
 {
     const CommandLaunchErrorSetter setErr{error};
 
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
     const QString flatboiExe = findFlatboiExecutable();
@@ -2027,6 +2028,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     const int iters = params.iterations > 0 ? params.iterations : 50;
     QStringList args{QStringLiteral("--store=%1").arg(stored->store),
                      QStringLiteral("--source-surface=%1").arg(QString::fromStdString(stored->uuid)),
+                     QStringLiteral("--volume-uuid=%1").arg(stored->volumeUuid),
                      QStringLiteral("--name=%1").arg(outputName)};
     if (params.keepPercent < 100.0) args << QStringLiteral("--keep=%1").arg(params.keepPercent, 0, 'f', 4);
     if (params.inpaintHoles) args << QStringLiteral("--inpaint");
@@ -2047,7 +2049,7 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
                                                  CommandLaunchError* error,
                                                  QString* resolvedOutputName)
 {
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
     // ABF++ runs in-process and reports completion through flattenJobFinished.
@@ -2067,7 +2069,7 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
 {
     const CommandLaunchErrorSetter setErr{error};
 
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
     const QString exe = findVcTool("vc_straighten");
@@ -2096,7 +2098,7 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
     }
 
     new StraightenJob(_parentWidget, this, exe, stored->store, QString::fromStdString(stored->uuid),
-                      outputName, args, /*suppressDialogs=*/true);
+                      stored->volumeUuid, outputName, args, /*suppressDialogs=*/true);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;
@@ -2123,7 +2125,7 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         return;
     }
 
-    const auto stored = requireStoredSurface(segmentId.toStdString(), false);
+    const auto stored = requireStoredSurface(segmentId.toStdString(), false, true);
     if (!stored) return;
 
     QString defaultVolumeId;
@@ -2314,7 +2316,7 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         return;
     }
 
-    if (!requireStoredSurface(segmentId.toStdString(), false)) return;
+    if (!requireStoredSurface(segmentId.toStdString(), false, true)) return;
 
     QString defaultVolumeId;
     const auto volumeOptions = buildVolumeOptionList(&defaultVolumeId);
@@ -2428,7 +2430,7 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                     CommandLaunchError::Busy);
     }
 
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
     QString defaultVolumeId;
@@ -2788,7 +2790,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
 
 void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, true);
+    const auto stored = requireStoredSurface(segmentId, true, true);
     if (!stored) return;
 
     ConvertToObjDialog dlg(_parentWidget, stored->name, stored->name + QStringLiteral(".obj"));
@@ -2804,7 +2806,7 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
 
     // The tool writes into the surface's artifact directory and reports the path.
     _cmdRunner->setStore(stored->store);
-    _cmdRunner->setToObjParams(QString::fromStdString(stored->uuid), objName);
+    _cmdRunner->setToObjParams(QString::fromStdString(stored->uuid), objName, stored->volumeUuid);
     _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
@@ -2999,7 +3001,7 @@ void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
 
 void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, true);
+    const auto stored = requireStoredSurface(segmentId, true, true);
     if (!stored) return;
     if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
         QMessageBox::warning(
@@ -3071,7 +3073,7 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         return fail(tr("No volume package or volume loaded."),
                     CommandLaunchError::InvalidState);
     }
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, !params.inPlace);
     if (!stored) return false;
     if (!_cmdRunner) {
         return fail(tr("Command line tools are not available."),
@@ -3098,6 +3100,17 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         : params.volumePath;
     if (volumePath.isEmpty()) {
         return fail(tr("Unable to determine volume path."));
+    }
+    // The surface is read in the voxels of the volume the refinement samples.
+    std::string sampledVolume;
+    for (const auto& id : _state->vpkg()->volumeIDs()) {
+        const auto volume = _state->vpkg()->volume(id);
+        if (volume && QFileInfo(QString::fromStdString(volume->path().string())).canonicalFilePath() ==
+                          QFileInfo(volumePath).canonicalFilePath())
+            sampledVolume = id;
+    }
+    if (sampledVolume.empty()) {
+        return fail(tr("%1 is not a volume of this project.").arg(volumePath));
     }
 
     // The output is a new surface's name, or the source's UUID to refine in place.
@@ -3130,7 +3143,8 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         });
 
     _cmdRunner->setStore(stored->store);
-    _cmdRunner->setObjRefineParams(volumePath, QString::fromStdString(stored->uuid), destination, paramsPath);
+    _cmdRunner->setObjRefineParams(volumePath, QString::fromStdString(stored->uuid), destination, paramsPath,
+                                   QString::fromStdString(sampledVolume));
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
@@ -3282,7 +3296,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     QStringList missingIds;
     for (const QString& segmentId : rasterIds) {
         CommandLaunchError error;
-        if (auto stored = storedSurface(segmentId.toStdString(), &error)) {
+        if (auto stored = storedSurface(segmentId.toStdString(), &error, true)) {
             store = stored;
             validIds << segmentId;
         } else {
@@ -3365,6 +3379,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     QStringList args;
     args << stagedOutputRootStr
          << QStringLiteral("--store") << store->store
+         << QStringLiteral("--volume-uuid") << store->volumeUuid
          << QStringLiteral("--reference-zarr")
          << referenceZarr
          << QStringLiteral("--chunk-size")
@@ -3379,9 +3394,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
     for (const QString& segmentId : validIds) {
         args << QStringLiteral("--surface") << segmentId;
-    }
-    for (const QString& segmentId : validIds) {
-        args << QStringLiteral("--source-segment") << segmentId;
     }
 
     auto runner = _cmdRunner;
@@ -3468,12 +3480,12 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         tr("Rasterization started for %1 surface(s)...").arg(validIds.size()), 0);
 }
 
-std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces() const
+std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces(bool throughView) const
 {
     std::vector<const SurfaceCatalog::Row*> rows;
     if (auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr) {
         for (const auto& [uuid, row] : catalog->rows())
-            if (row.toolInput()) rows.push_back(&row);
+            if (throughView ? !row.catalog && row.bound() : row.toolInput()) rows.push_back(&row);
     }
     return rows;
 }
@@ -3498,7 +3510,7 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     }
 
     QMap<QString, QString> available;
-    for (const auto* row : toolSurfaces()) {
+    for (const auto* row : toolSurfaces(true)) {
         const auto& record = row->record;
         available.insert(QString::fromStdString(record.uuid),
                          QString::fromStdString(record.name.empty() ? record.uuid : record.name));

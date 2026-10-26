@@ -1198,8 +1198,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
     const auto* row = catalog->row(segmentationSurface->id);
-    if (!pin || !pin->geometryRevision || !row || !row->toolInput()) {
-        showStatus(tr("Copy with NT needs a surface opened from a writable object store in the volume's voxels."),
+    if (!pin || !pin->geometryRevision || !row || row->catalog || !row->bound()) {
+        showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
                    kStatusLong);
         return false;
     }
