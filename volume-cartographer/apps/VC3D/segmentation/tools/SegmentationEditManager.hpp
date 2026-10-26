@@ -153,7 +153,6 @@ public:
     void resetPointerSeed();
 
 private:
-    static bool isInvalidPoint(const cv::Vec3f& value);
     void rebuildPreviewFromOriginal();
     bool buildActiveSamples(const std::pair<int, int>& gridIndex);
     void applyGaussianToSamples(const cv::Vec3f& delta);

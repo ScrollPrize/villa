@@ -201,11 +201,6 @@ float activeSegmentationIntersectionWidth(float baseWidth)
                     baseWidth + kActiveIntersectionMinWidthDelta);
 }
 
-bool validSurfacePoint(const cv::Vec3f& p)
-{
-    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-           p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
-}
 
 bool finiteVec2(const cv::Vec2f& v)
 {
@@ -279,7 +274,7 @@ SafeFocusProjection validateSafeFocusProjection(
     }
 
     result.coord = surface.coord(result.ptr);
-    if (!validSurfacePoint(result.coord)) {
+    if (!validSurfaceVertex(result.coord)) {
         result.reason = "invalid_coord";
         return result;
     }
@@ -433,7 +428,7 @@ void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
         for (int x = 0; x < w; ++x) {
             cv::Vec3f& p = coordRow[x];
             const cv::Vec3f& n = normalRow[x];
-            if (!validSurfacePoint(p) ||
+            if (!validSurfaceVertex(p) ||
                 !std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                 continue;
             }
@@ -4855,7 +4850,7 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         float distance = dist;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
-        if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
+        if (validSurfaceVertex(surfCoord) && finiteVec3(surfNormal)) {
             w = (volPoint - surfCoord).dot(surfNormal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
@@ -6018,8 +6013,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                     (*points)(row + strideY, col + strideX),
                     (*points)(row + strideY, col),
                 };
-                if (!validSurfacePoint(corners[0]) || !validSurfacePoint(corners[1]) ||
-                    !validSurfacePoint(corners[2]) || !validSurfacePoint(corners[3])) {
+                if (!validSurfaceVertex(corners[0]) || !validSurfaceVertex(corners[1]) ||
+                    !validSurfaceVertex(corners[2]) || !validSurfaceVertex(corners[3])) {
                     markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                     continue;

@@ -9,6 +9,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/geometry/Geometry.hpp>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -2785,11 +2786,13 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     read_band_into(std::filesystem::path(path)/"y.tif", *points, 1, W, H);
     read_band_into(std::filesystem::path(path)/"z.tif", *points, 2, W, H);
 
-    // Invalidate by z<=0
+    // Missing vertices by the store's tifxyz rule.
     for (int j=0;j<points->rows;++j)
-        for (int i=0;i<points->cols;++i)
-            if ((*points)(j,i)[2] <= 0.f)
+        for (int i=0;i<points->cols;++i) {
+            const cv::Vec3f& p = (*points)(j,i);
+            if (!vc::geometry::validTifxyzPoint({p[0], p[1], p[2]}))
                 (*points)(j,i) = cv::Vec3f(-1.f,-1.f,-1.f);
+        }
 
     // Optional mask
     const std::filesystem::path maskPath = std::filesystem::path(path)/"mask.tif";

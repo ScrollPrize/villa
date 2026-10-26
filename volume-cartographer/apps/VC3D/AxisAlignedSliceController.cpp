@@ -71,11 +71,6 @@ bool isFiniteVec3(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-bool isValidSurfacePoint(const cv::Vec3f& v)
-{
-    return isFiniteVec3(v) && v[0] != -1.0f && v[1] != -1.0f && v[2] != -1.0f;
-}
-
 struct SegmentSliceFrame {
     cv::Vec3f origin{0, 0, 0};
     cv::Vec3f xNormal{0, 0, 0};
@@ -131,9 +126,9 @@ std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     const cv::Vec3f surfOrigin = segment.coord(ptr, {0, 0, 0});
     const cv::Vec3f xDir = segment.coord(ptr, {1, 0, 0});
     const cv::Vec3f yDir = segment.coord(ptr, {0, 1, 0});
-    if (!isValidSurfacePoint(surfOrigin) ||
-        !isValidSurfacePoint(xDir) ||
-        !isValidSurfacePoint(yDir)) {
+    if (!validSurfaceVertex(surfOrigin) ||
+        !validSurfaceVertex(xDir) ||
+        !validSurfaceVertex(yDir)) {
         return std::nullopt;
     }
 

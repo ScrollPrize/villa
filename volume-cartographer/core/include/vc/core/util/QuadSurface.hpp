@@ -18,6 +18,7 @@ namespace vc::objects { class TransformedGeometryView; }
 
 #include "Surface.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "Rect3D.hpp"
 
 // Surface loading and channel flags
@@ -100,6 +101,10 @@ struct tuple_element<4, QuadRef<T>> { using type = T&; };
 template<typename T>
 struct tuple_element<5, QuadRef<T>> { using type = T&; };
 }
+
+// Whether a grid vertex has coordinates, by the store's rule: missing vertices
+// are the (-1,-1,-1) sentinel (vc::geometry::validSurfacePoint).
+inline bool validSurfaceVertex(const cv::Vec3f& p) { return vc::geometry::validSurfacePoint({p[0], p[1], p[2]}); }
 
 // Range for iterating over valid points
 template<typename PointType>

@@ -46,12 +46,6 @@ vc::objects::OpenOptions viewerOpenOptions()
     return options;
 }
 
-bool isValidSurfacePoint(const cv::Vec3f& point)
-{
-    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
-        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
-}
-
 struct SurfaceFocusPoint {
     cv::Vec3f world{0, 0, 0};
     cv::Vec3f ptr{0, 0, 0};
@@ -77,7 +71,7 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     }
 
     const cv::Vec3f point = (*points)(row, col);
-    if (!isValidSurfacePoint(point)) {
+    if (!validSurfaceVertex(point)) {
         return std::nullopt;
     }
 

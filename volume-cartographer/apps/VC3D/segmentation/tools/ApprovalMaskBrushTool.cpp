@@ -25,11 +25,6 @@ constexpr float kBrushSampleSpacing = 2.0f;       // For accurate stroke data
 constexpr float kOverlayPointSpacing = 20.0f;     // For visual overlay (much sparser)
 
 // Check if a point is invalid (NaN, infinity, or the -1,-1,-1 marker)
-bool isInvalidPoint(const cv::Vec3f& value)
-{
-    return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
-           (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
-}
 
 // Gaussian falloff function
 float gaussianFalloff(float distance, float sigma)
@@ -879,7 +874,7 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(con
 
     // Check if the point at this location is valid
     const cv::Vec3f& point = (*points)(row, col);
-    if (isInvalidPoint(point)) {
+    if (!validSurfaceVertex(point)) {
         // Search nearby for a valid point (small radius since we have precise coordinates)
         constexpr int kSearchRadius = 3;
         for (int dr = -kSearchRadius; dr <= kSearchRadius; ++dr) {
@@ -887,7 +882,7 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(con
                 const int r = row + dr;
                 const int c = col + dc;
                 if (r >= 0 && r < points->rows && c >= 0 && c < points->cols) {
-                    if (!isInvalidPoint((*points)(r, c))) {
+                    if (!!validSurfaceVertex((*points)(r, c))) {
                         return std::make_pair(r, c);
                     }
                 }

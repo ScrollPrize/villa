@@ -1307,7 +1307,7 @@ void SegmentationModule::refreshOverlay()
                 const int col = p.x;
                 line.surfacePoints.push_back(QPointF(col, row));
                 if (row >= 0 && row < preview.rows && col >= 0 && col < preview.cols &&
-                    !ManualAddTool::isInvalidPoint(preview(row, col))) {
+                    validSurfaceVertex(preview(row, col))) {
                     line.worldPoints.push_back(preview(row, col));
                 }
             }
@@ -1341,7 +1341,7 @@ void SegmentationModule::refreshOverlay()
         }
         for (const auto& key : _manualAddTool->fillVertices()) {
             if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
-                !ManualAddTool::isInvalidPoint(preview(key.row, key.col))) {
+                validSurfaceVertex(preview(key.row, key.col))) {
                 state.manualAddPreviewVertices.push_back(preview(key.row, key.col));
             }
         }
@@ -1364,7 +1364,7 @@ void SegmentationModule::refreshOverlay()
                 preview(row + 1, col)
             };
             if (std::all_of(quad.begin(), quad.end(), [](const cv::Vec3f& point) {
-                    return !ManualAddTool::isInvalidPoint(point);
+                    return validSurfaceVertex(point);
                 })) {
                 state.manualAddPreviewQuads.push_back(quad);
             }
@@ -1831,7 +1831,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
         }
 
         const cv::Vec3f& point = (*tracedPoints)(srcRow, srcCol);
-        if (ManualAddTool::isInvalidPoint(point)) {
+        if (!validSurfaceVertex(point)) {
             continue;
         }
         rawPreview(key.row, key.col) = point;
@@ -1857,7 +1857,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
                 continue;
             }
             const cv::Vec3f& point = snapshot(key.row, key.col);
-            if (ManualAddTool::isInvalidPoint(point)) {
+            if (!validSurfaceVertex(point)) {
                 continue;
             }
             boundarySamples.push_back(toTpsSample(key, point));
@@ -1917,7 +1917,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
 
             for (const auto& point : tracedFillPoints) {
                 auto predicted = tps.evaluate(cv::Point2d(point.key.col, point.key.row));
-                if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                if (!predicted || !validSurfaceVertex(*predicted)) {
                     smoothingOk = false;
                     break;
                 }
@@ -1928,7 +1928,7 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
             if (smoothingOk) {
                 for (const auto& key : boundaryKeys) {
                     auto predicted = tps.evaluate(cv::Point2d(key.col, key.row));
-                    if (!predicted || ManualAddTool::isInvalidPoint(*predicted)) {
+                    if (!predicted || !validSurfaceVertex(*predicted)) {
                         smoothingOk = false;
                         break;
                     }
@@ -2340,7 +2340,7 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
         const auto& entry = _manualAddTool->entrySnapshotPoints();
         gridIsInvalid = grid->first >= 0 && grid->first < entry.rows &&
                         grid->second >= 0 && grid->second < entry.cols &&
-                        ManualAddTool::isInvalidPoint(entry(grid->first, grid->second));
+                        !validSurfaceVertex(entry(grid->first, grid->second));
     }
     const int throttleMs = _manualAddTool->config().previewThrottleMs;
     if (gridIsInvalid && throttleMs > 0 &&

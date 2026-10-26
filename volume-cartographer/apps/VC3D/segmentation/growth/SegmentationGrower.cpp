@@ -88,11 +88,6 @@ void ensureGenerationsChannel(QuadSurface* surface)
 
 
 
-bool isInvalidPoint(const cv::Vec3f& value)
-{
-    return !std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]) ||
-           (value[0] == -1.0f && value[1] == -1.0f && value[2] == -1.0f);
-}
 
 std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
                                                           const cv::Vec3f& worldPos,
@@ -128,7 +123,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     approxRow = std::clamp(approxRow, 0, rows - 1);
     approxCol = std::clamp(approxCol, 0, cols - 1);
 
-    if (isInvalidPoint((*points)(approxRow, approxCol))) {
+    if (!validSurfaceVertex((*points)(approxRow, approxCol))) {
         constexpr int kMaxRadius = 12;
         float bestDistSq = std::numeric_limits<float>::max();
         int bestRow = -1;
@@ -136,7 +131,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
 
         auto accumulateCandidate = [&](int r, int c) {
             const cv::Vec3f& candidate = (*points)(r, c);
-            if (isInvalidPoint(candidate)) {
+            if (!validSurfaceVertex(candidate)) {
                 return;
             }
             const cv::Vec3f diff = candidate - worldPos;
@@ -363,7 +358,7 @@ std::optional<CorrectionsBounds> computeCorrectionsBounds(
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& pt = (*points)(r, c);
-            if (isInvalidPoint(pt)) {
+            if (!validSurfaceVertex(pt)) {
                 continue;
             }
 

@@ -207,11 +207,6 @@ static QString findFlatboiExecutable()
 
 namespace { // -------------------- anonymous namespace -------------------------
 
-bool isValidSurfacePoint(const cv::Vec3f& point)
-{
-    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]) &&
-           !(point[0] == -1.f && point[1] == -1.f && point[2] == -1.f);
-}
 
 std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& points)
 {
@@ -226,7 +221,7 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
 
     for (int r = 0; r < points.rows; ++r) {
         for (int c = 0; c < points.cols; ++c) {
-            if (!isValidSurfacePoint(points(r, c))) {
+            if (!validSurfaceVertex(points(r, c))) {
                 continue;
             }
             minRow = std::min(minRow, r);

@@ -70,11 +70,9 @@ GeometryArray validFromMask(const cv::Mat& mask, int rows, int cols)
             vc::geometry::validityFromMask({values.ptr<double>(), values.total()}, values.rows, values.cols, rows, cols)};
 }
 
-// QuadSurface keeps tifxyz semantics: a vertex at z <= 0 is missing, as
-// load_quad_from_tifxyz reads it (tracers leave extrapolations there). The store
-// marks missing vertices only with the sentinel, so the rule applies here, at the
+// QuadSurface keeps tifxyz semantics, so the store's tifxyz rule applies at the
 // QuadSurface boundary, in both directions.
-bool usable(const cv::Vec3f& p) { return p[2] > 0 && vc::geometry::validSurfacePoint({p[0], p[1], p[2]}); }
+bool usable(const cv::Vec3f& p) { return vc::geometry::validTifxyzPoint({p[0], p[1], p[2]}); }
 
 std::vector<int64_t> pointsShape(const vc::objects::GeometryRevision& revision)
 {
