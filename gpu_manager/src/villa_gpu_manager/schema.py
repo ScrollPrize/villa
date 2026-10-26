@@ -47,7 +47,7 @@ FIELDS = {
               "required_capabilities": {"type": "array", "items": {"type": "string"}}},
     "register": {**TASK, "label": {"type": "string", "minLength": 1, "maxLength": 256},
                  "root": {"$ref": "#/$defs/process"}, "request": {"$ref": "#/$defs/request"},
-                 "reconfigure_mode": {"const": "full_release"},
+                 "reconfigure_mode": {"enum": ["full_release", "incremental_release"]},
                  "pausable": {"type": "boolean", "default": True},
                  "adaptable": {"type": "boolean", "default": True}},
     "set_request": {**TASK, "request": {"$ref": "#/$defs/request"}, "expected_request_revision": INTEGER},
