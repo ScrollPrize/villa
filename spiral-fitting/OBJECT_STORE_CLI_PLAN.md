@@ -327,7 +327,7 @@ the relationship graph alone cannot supply seam corrections.
 
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
-Steps 1–4 and their review fixes are implemented; steps 5–12 remain. Upstream
+Steps 1–8 are implemented; steps 9–12 remain. Upstream
 through `a180d351711521720a26f0065573f15c3228f95b` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
@@ -400,6 +400,25 @@ snapshot APIs rather than rebuilding them in the fitter.
     smoke fit. Record exact commands, changed constraint counts, loss behavior
     and complete checkpoint provenance; confirm the smoke fit needs no patch
     directories, fiber JSONs or PCL JSONs.
+
+Notes from steps 5–8 that the remaining steps build on:
+
+- `FitContext(object_store_inputs=...)` takes `object_store_inputs.FitInputs`
+  and skips file loading and linking; step 10 builds it from config and makes
+  it the only path. `materialize()` takes the z window, default erosion and
+  `pcl_fiber_min_point_spacing` explicitly.
+- Default PCL sampling groups are `abs_winding`, `relative_windings` and
+  `same_windings` by role and annotation, unless `meta.sampling_group` is set;
+  fibers stay in `fibers`. Step 9 adds the overlap group.
+- A PCL point consumed by two point-patch edges is an error. Fiber points may
+  attach to several patches through attachment views.
+- A fiber contact just outside the nearest-line control span widens the span.
+- `pcl_use_fiber_links` still gates branch links; `pcl_use_pending_fiber_links`
+  no longer applies to store links (approval follows the snapshot policy).
+- `tests/data/object_store_reference.json` is the file loader's output for the
+  synthetic fixture in `tests/object_store_reference.py`. Delete
+  `tests/test_object_store_reference.py` with the file loader in step 11; the
+  adapter tests keep comparing against the reference file.
 
 Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the
