@@ -1079,7 +1079,8 @@ static nlohmann::json parameters(const Options& opt)
 static int run_store(const StoreOutputArgs& output, const std::string& source, const Options& opt)
 {
   StoreSurfaces store(output.store, "flatboi");
-  const auto surface = store.load(source);
+  // With --volume-uuid the surface is flattened in that volume's voxels.
+  const auto surface = store.load(source, true, output.volume.empty() ? std::nullopt : std::optional(output.volume));
   const fs::path report_dir = fs::temp_directory_path() / ("flatboi-" + source + "-" + std::to_string(::getpid()));
   fs::create_directories(report_dir);
   const auto flat = flatten(*surface, opt, report_dir / "slim.obj", source);

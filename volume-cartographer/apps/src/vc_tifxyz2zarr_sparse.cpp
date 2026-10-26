@@ -1,5 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/TriangleVoxelRaster.hpp"
 #include "vc/core/util/Zarr.hpp"
@@ -1459,7 +1459,6 @@ int main(int argc, char* argv[])
         desc.add_options()
             ("help,h", "Show help")
             ("input", po::value<std::string>(), "Input folder containing tifxyz meshes")
-            ("store", po::value<std::string>(), "Object store holding the meshes (with --surface); the positional is then the output")
             ("surface", po::value<std::vector<std::string>>()->composing(), "Stored surface UUID to rasterize (repeatable, with --store)")
             ("output", po::value<std::string>(), "Output OME-Zarr root")
             ("shape-z", po::value<size_t>(), "Output Z size")
@@ -1488,6 +1487,8 @@ int main(int argc, char* argv[])
             ("chunk-size-z", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-y", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-x", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size");
+        StoreToolOptions::add(desc, "Object store holding the meshes (with --surface); the positional is then the output",
+                              false);
 
         po::positional_options_description pos;
         pos.add("input", 1);
@@ -1500,15 +1501,17 @@ int main(int argc, char* argv[])
                           .run();
         po::store(parsed, vm);
         po::notify(vm);
+        const auto storeOptions = StoreToolOptions::from(vm);
         std::optional<StoreSurfaces> store;
-        if (vm.count("store")) {
+        if (storeOptions) {
             if (!vm.count("surface")) throw std::runtime_error("--store needs at least one --surface");
             // The one positional is the output.
             if (vm.count("input") && !vm.count("output")) vm.insert({"output", vm["input"]});
             vm.erase("input");
             vm.insert({"input", po::variable_value(std::string(), false)});
-            store.emplace(vm["store"].as<std::string>(), "vc_tifxyz2zarr_sparse");
-            loadMesh = [&](const fs::path& uuid) { return store->load(uuid.string()); };
+            store.emplace(storeOptions->store, "vc_tifxyz2zarr_sparse");
+            // Meshes are rasterized in the output volume's voxels.
+            loadMesh = [&](const fs::path& uuid) { return loadToolSurface(&*store, &*storeOptions, uuid.string()); };
         } else if (vm.count("surface")) {
             throw std::runtime_error("--surface needs --store");
         }
@@ -1544,9 +1547,10 @@ int main(int argc, char* argv[])
                                                       : std::nullopt;
         const int sourceGroup = vm["source-group"].as<int>();
         const size_t spoolMemMB = vm["spool-memory-mb"].as<size_t>();
-        const auto sourceSegments = vm.count("source-segment")
-                                       ? vm["source-segment"].as<std::vector<std::string>>()
-                                       : std::vector<std::string>{};
+        // Stored meshes are their own provenance.
+        const auto sourceSegments = vm.count("source-segment") ? vm["source-segment"].as<std::vector<std::string>>()
+                                    : store ? vm["surface"].as<std::vector<std::string>>()
+                                            : std::vector<std::string>{};
         const auto sourceMeshes = vm.count("source-mesh")
                                      ? vm["source-mesh"].as<std::vector<std::string>>()
                                      : std::vector<std::string>{};

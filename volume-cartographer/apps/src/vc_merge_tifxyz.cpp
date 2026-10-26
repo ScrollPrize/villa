@@ -17,7 +17,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -362,8 +362,9 @@ struct GMConfig {
     // Store mode: the grid names stored surface UUIDs and the result becomes a
     // new surface object with these tags and volume binding.
     StoreSurfaces* store{nullptr};
-    std::vector<std::string> tags;
-    std::string volume_uuid;
+    // The inputs are read in storeOptions->volume's voxels when it is given,
+    // and the merge is bound to the volume they were read through.
+    const StoreToolOptions* storeOptions{nullptr};
     std::string ref;            // empty => auto (largest by valid cells)
     // Per-edge RANSAC similarity (CLI-overridable).
     int      ransac_iters{3000};
@@ -417,9 +418,9 @@ struct GMSurface {
     int   valid{0};
 };
 
-GMSurface gmLoadSurface(const GMSurfaceSpec& spec, StoreSurfaces* store)
+GMSurface gmLoadSurface(const GMSurfaceSpec& spec, StoreSurfaces* store, const StoreToolOptions* options)
 {
-    auto up = store ? store->load(spec.path.string()) : load_quad_from_tifxyz(spec.path.string());
+    auto up = loadToolSurface(store, options, spec.path.string());
     if (!up) throw std::runtime_error("failed to load surface: " + spec.path.string());
     GMSurface g;
     g.name = spec.name;
@@ -1750,7 +1751,7 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
     std::cout << "[1/6] loading surfaces" << std::endl;
     st.names.reserve(st.cfg.surfaces.size());
     for (const auto& spec : st.cfg.surfaces) {
-        GMSurface s = gmLoadSurface(spec, st.cfg.store);
+        GMSurface s = gmLoadSurface(spec, st.cfg.store, st.cfg.storeOptions);
         std::cout << "  " << s.name << ": shape=(" << s.H << "," << s.W
                   << "), valid=" << s.valid << "\n";
         st.names.push_back(s.name);
@@ -2252,8 +2253,7 @@ int gmBlendAndRasterize(GMAlignState& st, int strip_cols)
         // Named after the first input, as the directory name is in tifxyz mode.
         const auto& first = st.surfs.at(st.names.front()).qs->meta;
         const std::string name = (first.contains("name") ? first["name"].get_string() : st.names.front()) + "_merged";
-        const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.tags,
-                                            volumeCoordinates(cfg.volume_uuid));
+        const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.storeOptions->tags);
         const auto artifacts = cfg.store->session()->artifactDirectory(cfg.store->attachment(), uuid);
         std::cout << "writing OBJ to " << artifacts / "merge.obj" << "\n";
         gmWriteObj(mesh, obj_header, artifacts / "merge.obj");
@@ -2344,12 +2344,6 @@ int main(int argc, char** argv)
          "Path to <volpkg>/merge.json (required). By default the volpkg "
          "dir is its parent and paths_dir is <volpkg>/paths; pass "
          "--paths-dir to override.")
-        ("store", po::value<std::string>(),
-            "Object store: the merge.json grid names stored surface UUIDs and the merge "
-            "is stored as a new surface (prints surface_uuid:); OBJ and summary go to its "
-            "artifact directory")
-        ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for the stored merge (repeatable)")
-        ("volume-uuid", po::value<std::string>(), "Volume the stored merge is bound to")
         ("paths-dir", po::value<std::string>()->default_value(""),
          "Override the directory holding the input tifxyz subdirs. "
          "Defaults to <merge.json parent>/paths. Useful when the volpkg "
@@ -2411,6 +2405,9 @@ int main(int argc, char** argv)
          "blend cost scales with strip width instead of full grid width. "
          "0 = single-pass blend (default); >= num_grid_cols also collapses "
          "to single-pass.");
+    StoreToolOptions::add(desc, "Object store: the merge.json grid names stored surface UUIDs and the merge is "
+                                "stored as a new surface (prints surface_uuid:); OBJ and summary go to its artifact "
+                                "directory");
 
     po::variables_map vm;
     try {
@@ -2449,16 +2446,14 @@ int main(int argc, char** argv)
     const int strip_cols      = vm["strip-cols"].as<int>();
 
     try {
+        const auto storeOptions = StoreToolOptions::from(vm);
         std::optional<StoreSurfaces> store;
-        if (vm.count("store")) {
+        if (storeOptions) {
             if (!vm["paths-dir"].as<std::string>().empty())
                 throw std::runtime_error("--paths-dir names tifxyz inputs; in store mode the grid names surface UUIDs");
-            store.emplace(vm["store"].as<std::string>(), "vc_merge_tifxyz");
+            store.emplace(storeOptions->store, "vc_merge_tifxyz");
             cfg.store = &*store;
-            if (vm.count("tag")) cfg.tags = vm["tag"].as<std::vector<std::string>>();
-            if (vm.count("volume-uuid")) cfg.volume_uuid = vm["volume-uuid"].as<std::string>();
-        } else if (vm.count("tag") || vm.count("volume-uuid")) {
-            throw std::runtime_error("--tag and --volume-uuid need --store");
+            cfg.storeOptions = &*storeOptions;
         }
         return gmRunGlobalMerge(merge_path, std::move(cfg), strip_cols);
     } catch (const std::exception& e) {

@@ -13,7 +13,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
@@ -295,10 +295,7 @@ static int run_main(int argc, char *argv[])
             ("help,h", "produce help message")
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
             ("target-dir,t", po::value<std::string>(), "Target directory for output (tifxyz mode)")
-            ("store", po::value<std::string>(), "Object store (local or hosted replica) holding input and output surfaces")
             ("surface", po::value<std::string>(), "Stored surface UUID to resume from or to project (store mode)")
-            ("volume-uuid", po::value<std::string>(), "Volume the output surface's coordinates are bound to (store mode)")
-            ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for the output surface (store mode, repeatable)")
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
@@ -310,6 +307,7 @@ static int run_main(int argc, char *argv[])
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
             ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
                                                     "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
+        StoreToolOptions::add(desc, "Object store (local or hosted replica) holding input and output surfaces");
 
         po::variables_map vm;
         try {
@@ -329,17 +327,26 @@ static int run_main(int argc, char *argv[])
 
         vol_path = vm["volume"].as<std::string>();
         params_path = vm["params"].as<std::string>();
-        if (vm.count("store")) store_path = vm["store"].as<std::string>();
+        std::optional<StoreToolOptions> store_options;
+        try {
+            store_options = StoreToolOptions::from(vm);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store_options) {
+            store_path = store_options->store;
+            volume_uuid = store_options->volume;
+            output_tags = store_options->tags;
+        }
         if (vm.count("target-dir")) tgt_dir = vm["target-dir"].as<std::string>();
         if (store_path.empty() == tgt_dir.empty()) {
             std::cerr << "ERROR: specify exactly one of --store and --target-dir" << std::endl;
             return EXIT_FAILURE;
         }
         if (vm.count("surface")) surface_uuid = vm["surface"].as<std::string>();
-        if (vm.count("volume-uuid")) volume_uuid = vm["volume-uuid"].as<std::string>();
-        if (vm.count("tag")) output_tags = vm["tag"].as<std::vector<std::string>>();
-        if (store_path.empty() && (!surface_uuid.empty() || !volume_uuid.empty() || !output_tags.empty())) {
-            std::cerr << "ERROR: --surface, --volume-uuid and --tag require --store" << std::endl;
+        if (store_path.empty() && !surface_uuid.empty()) {
+            std::cerr << "ERROR: --surface requires --store" << std::endl;
             return EXIT_FAILURE;
         }
         if (!store_path.empty() && vm.count("resume")) {

@@ -11,7 +11,7 @@
  */
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
 #include <boost/program_options.hpp>
@@ -27,10 +27,6 @@ int main(int argc, char* argv[]) {
         ("help,h", "Show this help message")
         ("input,i", po::value<std::string>()->required(),
             "Input TIFXYZ directory, or a surface UUID with --store")
-        ("store", po::value<std::string>(),
-            "Object store: the input is a stored surface; the flattened surface is stored as a new "
-            "object (prints surface_uuid:), or --uv-only adds the uv channel to the input")
-        ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for the stored output (repeatable)")
         ("output,o", po::value<std::string>(),
             "Output TIFXYZ directory (default: <input>_flat)")
         ("iterations", po::value<int>()->default_value(10),
@@ -43,6 +39,8 @@ int main(int argc, char* argv[]) {
             "Don't scale output to match original 3D surface area")
         ("uv-only", po::bool_switch()->default_value(false),
             "Only compute and save UV channel, don't create new surface");
+    StoreToolOptions::add(desc, "Object store: the input is a stored surface; the flattened surface is stored as a "
+                                "new object (prints surface_uuid:), or --uv-only adds the uv channel to the input");
 
     po::positional_options_description pos;
     pos.add("input", 1);
@@ -74,16 +72,20 @@ int main(int argc, char* argv[]) {
 
     fs::path inputPath = vm["input"].as<std::string>();
     fs::path outputPath;
+    std::optional<StoreToolOptions> storeOptions;
     std::optional<StoreSurfaces> store;
-    if (vm.count("store")) {
+    try {
+        storeOptions = StoreToolOptions::from(vm);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
+    if (storeOptions) {
         if (vm.count("output")) {
             std::cerr << "--output names a tifxyz directory; stored outputs are new objects" << std::endl;
             return 1;
         }
-        store.emplace(vm["store"].as<std::string>(), "vc_flatten");
-    } else if (vm.count("tag")) {
-        std::cerr << "--tag needs --store" << std::endl;
-        return 1;
+        store.emplace(storeOptions->store, "vc_flatten");
     }
 
     if (store) {
@@ -104,7 +106,7 @@ int main(int argc, char* argv[]) {
 
     // Load surface
     std::cout << "Loading surface: " << inputPath << std::endl;
-    auto surf = store ? store->load(inputPath.string()) : load_quad_from_tifxyz(inputPath.string());
+    auto surf = loadToolSurface(store ? &*store : nullptr, storeOptions ? &*storeOptions : nullptr, inputPath.string());
     if (!surf) {
         std::cerr << "Failed to load surface: " << inputPath << std::endl;
         return 1;
@@ -159,8 +161,7 @@ int main(int argc, char* argv[]) {
             const std::string name = (surf->meta.contains("name") ? surf->meta["name"].get_string() : surf->id) + "_flat";
             const nlohmann::json parameters = {{"iterations", config.maxIterations}, {"downsample", config.downsampleFactor},
                                                {"abf", config.useABF}, {"scale_to_original_area", config.scaleToOriginalArea}};
-            const auto uuid = store->create(*flatSurf, name, parameters, {surf->id},
-                                            vm.count("tag") ? vm["tag"].as<std::vector<std::string>>() : std::vector<std::string>{});
+            const auto uuid = store->create(*flatSurf, name, parameters, {surf->id}, storeOptions->tags);
             store->finish();
             std::cout << "surface_uuid: " << uuid << std::endl;
         } else {

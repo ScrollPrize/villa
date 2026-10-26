@@ -23,7 +23,7 @@
 // bilinear resampling, matching the Python reference.
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -82,15 +82,8 @@ static Grid gridOf(QuadSurface& surf)
 
 static Grid loadGrid(const fs::path& dir)
 {
-    auto surf = load_quad_from_tifxyz(dir.string());
-    Grid g;
-    g.P = surf->rawPointsPtr()->clone();
-    g.scale = surf->scale();
+    Grid g = gridOf(*load_quad_from_tifxyz(dir.string()));
     const int H = g.P.rows, W = g.P.cols;
-    g.valid = cv::Mat_<uint8_t>::zeros(H, W);
-    for (int r = 0; r < H; ++r)
-        for (int c = 0; c < W; ++c)
-            if (!isInvalid(g.P(r, c))) g.valid(r, c) = 1;
 
     // Honor an explicit mask.tif the same way the Python loader does.
     const fs::path mp = dir / "mask.tif";
@@ -782,8 +775,6 @@ int main(int argc, char** argv)
         ("help,h", "show help")
         ("input", po::value<std::string>(&inPath), "input tifxyz dir")
         ("output", po::value<std::string>(&outPath), "output tifxyz dir (must not exist); with --store, the new surface's name")
-        ("store", po::value<std::string>(), "object store: the input is a surface UUID and the result a new surface (prints surface_uuid:)")
-        ("tag", po::value<std::vector<std::string>>()->composing(), "tag for the stored result (repeatable)")
         ("unbend", po::bool_switch(&doUnbend), "run the spine unbend stage")
         ("overlap-pairs", po::value<int>(&overlapCount), "run N overlap-pair passes")
         ("orthogonalize", po::bool_switch(&doOrtho), "run the column orthogonalize stage")
@@ -797,6 +788,7 @@ int main(int argc, char** argv)
         ("stride", po::value<int>(&op.stride)->default_value(2), "subsample stride for the KD-tree")
         ("trim-max-edge", po::value<double>(&trimMaxEdge)->default_value(100.0), "trim cells touching a 3D edge longer than this (voxels)")
         ("seed", po::value<unsigned>(&op.seed)->default_value(7), "RNG seed for the spacing estimate");
+    StoreToolOptions::add(desc, "object store: the input is a surface UUID and the result a new surface (prints surface_uuid:)");
     po::positional_options_description pos;
     pos.add("input", 1).add("output", 1);
     po::variables_map vm;
@@ -814,16 +806,17 @@ int main(int argc, char** argv)
     if (!anyStage) { doUnbend = true; overlapCount = 2; doOrtho = true; doTrim = true; }
     if (overlapCount < 0) overlapCount = 0;
 
+    std::optional<StoreToolOptions> storeOptions;
     std::optional<StoreSurfaces> store;
     std::unique_ptr<QuadSurface> stored;
     Grid g;
     try {
-        if (vm.count("store")) {
-            store.emplace(vm["store"].as<std::string>(), "vc_straighten");
-            stored = store->load(inPath);
+        storeOptions = StoreToolOptions::from(vm);
+        if (storeOptions) {
+            store.emplace(storeOptions->store, "vc_straighten");
+            stored = loadToolSurface(&*store, &*storeOptions, inPath);
             g = gridOf(*stored);
         } else {
-            if (vm.count("tag")) throw std::runtime_error("--tag needs --store");
             g = loadGrid(inPath);
         }
     }
@@ -856,8 +849,7 @@ int main(int argc, char** argv)
                 : (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight";
             const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
                                                {"orthogonalize", doOrtho}, {"trim", doTrim}};
-            const auto uuid = store->create(result, name, parameters, {stored->id},
-                                            vm.count("tag") ? vm["tag"].as<std::vector<std::string>>() : std::vector<std::string>{});
+            const auto uuid = store->create(result, name, parameters, {stored->id}, storeOptions->tags);
             store->finish();
             std::cout << "surface_uuid: " << uuid << "\n";
             return 0;

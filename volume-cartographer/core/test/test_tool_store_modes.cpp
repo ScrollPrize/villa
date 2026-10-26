@@ -103,6 +103,36 @@ TEST_CASE("vc_tifxyz2obj writes the OBJ into the surface's artifact directory")
     CHECK(readFile(stored) == readFile(f.dir / "file.obj"));
 }
 
+TEST_CASE("vc_tifxyz2obj with --volume-uuid exports through the store's view of the surface")
+{
+    Fixture f;
+    // "half" is "vol" at half resolution: the export is in its voxels.
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        auto txn = db.write();
+        db.registerVolumeTransform(txn, "vol", "half", VolumeAffine::scale(0.5), "test");
+        txn.commit();
+    }
+    const auto bin = tool("VC_TIFXYZ2OBJ_BIN");
+    run(bin + " " + f.storeArgs() + " full.obj", f.dir / "full.log");
+    run(bin + " " + f.storeArgs() + " half.obj --volume-uuid=half", f.dir / "half.log");
+    const auto artifacts = fs::path(f.store.string() + ".artifacts") / f.uuid;
+    auto firstVertex = [](const fs::path& obj) {
+        std::ifstream in(obj);
+        for (std::string line; std::getline(in, line);)
+            if (line.rfind("v ", 0) == 0) {
+                std::istringstream fields(line.substr(2));
+                cv::Vec3d v;
+                fields >> v[0] >> v[1] >> v[2];
+                return v;
+            }
+        return cv::Vec3d(-1, -1, -1);
+    };
+    const auto full = firstVertex(artifacts / "full.obj"), half = firstVertex(artifacts / "half.obj");
+    for (int i = 0; i < 3; ++i) CHECK(half[i] == doctest::Approx(full[i] / 2));
+}
+
 TEST_CASE("vc_render_tifxyz renders a stored surface like its tifxyz")
 {
     Fixture f;
@@ -277,6 +307,7 @@ TEST_CASE("vc_merge_tifxyz stores the merge of stored surfaces like a tifxyz mer
         auto txn = db.write();
         for (const auto& [uuid, surface, name] : {std::tuple{uuidA, &a, "surface_a"}, std::tuple{uuidB, &b, "surface_b"}}) {
             ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name;
+            record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
             db.upsertObject(txn, record);
             db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
         }

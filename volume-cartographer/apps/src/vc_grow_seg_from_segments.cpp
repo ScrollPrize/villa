@@ -20,7 +20,7 @@
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
@@ -1006,11 +1006,8 @@ int main(int argc, char *argv[])
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
             ("src-dir,s", po::value<std::string>(), "Directory containing source segments (tifxyz mode)")
             ("target-dir,t", po::value<std::string>(), "Target directory for output traces (tifxyz mode)")
-            ("store", po::value<std::string>(), "Object store: sources are its surfaces and outputs new surface objects (prints surface_uuid:)")
             ("src-surface", po::value<std::string>(), "Stored surface UUID to grow from (store mode)")
             ("source-tag", po::value<std::string>(), "Only surfaces with this tag are sources (store mode; default all)")
-            ("volume-uuid", po::value<std::string>(), "Volume whose surfaces are sources and that outputs are bound to (store mode)")
-            ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for output surfaces (store mode, repeatable)")
             ("params,p", po::value<std::string>(), "JSON parameters file (required unless --sweep is used)")
             ("src-segment", po::value<std::string>(), "Source segment path to grow from")
             ("seed-coord", po::value<std::vector<std::string>>()->composing(), "3D seed coordinate x,y,z. May be repeated")
@@ -1028,6 +1025,7 @@ int main(int argc, char *argv[])
             ("sweep-cutout-cm", po::value<double>()->default_value(5.0), "Center cutout edge length used as sweep seed")
             ("sweep-metric-tolerance", po::value<double>()->default_value(10.0), "Distance tolerance in voxels for sweep coverage metrics")
             ("sweep-max-distance-samples", po::value<int>()->default_value(20000), "Maximum sampled points per direction for sweep distance metrics");
+        StoreToolOptions::add(desc, "Object store: sources are its surfaces and outputs new surface objects (prints surface_uuid:)");
 
         po::variables_map vm;
         try {
@@ -1052,19 +1050,25 @@ int main(int argc, char *argv[])
         }
 
         vol_path = vm["volume"].as<std::string>();
-        if (vm.count("store")) {
+        std::optional<StoreToolOptions> store_options;
+        try {
+            store_options = StoreToolOptions::from(vm);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store_options) {
             if (vm.count("src-dir") || vm.count("target-dir") || vm.count("src-segment") || vm.count("sweep")) {
                 std::cerr << "ERROR: store mode takes --src-surface/--seed-coord and no directories or --sweep" << std::endl;
                 return EXIT_FAILURE;
             }
-            store_path = vm["store"].as<std::string>();
+            store_path = store_options->store;
             if (vm.count("src-surface")) src_surface = vm["src-surface"].as<std::string>();
             if (vm.count("source-tag")) source_tag = vm["source-tag"].as<std::string>();
-            if (vm.count("volume-uuid")) volume_uuid = vm["volume-uuid"].as<std::string>();
-            if (vm.count("tag")) output_tags = vm["tag"].as<std::vector<std::string>>();
+            volume_uuid = store_options->volume;
+            output_tags = store_options->tags;
         } else {
-            if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("src-surface") || vm.count("source-tag") ||
-                vm.count("volume-uuid") || vm.count("tag")) {
+            if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("src-surface") || vm.count("source-tag")) {
                 std::cerr << "ERROR: give --src-dir and --target-dir, or --store with its options" << std::endl;
                 return EXIT_FAILURE;
             }

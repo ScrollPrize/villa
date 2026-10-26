@@ -269,6 +269,7 @@ int main(int argc, char *argv[])
         std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n"
                   << "       " << argv[0] << " --store <store> --surface <uuid> <obj-name> [options]\n"
                   << "  store mode writes the OBJ into the surface's artifact directory and prints obj: <path>\n"
+                  << "  --volume-uuid=<id> : store mode: export in that volume's voxels, through the store's view of the surface\n"
                   << "  --normalize-uv : Normalize UVs to [0,1] range\n"
                   << "  --align-grid   : Align grid Z only (flatten Z per row)\n"
                   << "  --keep=<p>     : Percent of source points to keep (1..100). 100 = no decimation. One pass; stride = round(1/sqrt(p/100)).\n"
@@ -297,7 +298,8 @@ int main(int argc, char *argv[])
     float clean_sigma_k = 5.0f; // default K
     float keep_percent = 100.0f; // 100 = no decimation
     bool inpaint_holes = false;
-    
+    std::optional<std::string> volume_uuid; // store mode: export in this volume's voxels
+
     // Parse optional arguments
     for (int i = first_option; i < argc; ++i) {
         std::string arg = argv[i];
@@ -317,6 +319,8 @@ int main(int argc, char *argv[])
                 std::cerr << "error: --keep needs a numeric percent\n";
                 return EXIT_FAILURE;
             }
+        } else if (store_mode && arg.rfind("--volume-uuid=", 0) == 0) {
+            volume_uuid = arg.substr(14);
         } else if (arg == "--inpaint") {
             inpaint_holes = true;
         } else if (arg == "--no-inpaint") {
@@ -353,7 +357,7 @@ int main(int argc, char *argv[])
         }
         try {
             StoreSurfaces store(argv[2], "vc_tifxyz2obj");
-            surf = store.load(argv[4]);
+            surf = store.load(argv[4], true, volume_uuid);
             obj_path = store.session()->artifactDirectory(store.attachment(), argv[4]) / name;
         } catch (const std::exception& error) {
             std::cerr << "error when loading " << argv[4] << ": " << error.what() << std::endl;

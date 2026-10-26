@@ -363,11 +363,13 @@ int process_tifxyz(const std::filesystem::path& src,
 }
 
 // A stored surface, refined in place when `out` is its UUID, else into a new object named `out`.
+// With `volume` it is read in that volume's voxels (the zarr sampled), and a new object is bound to it.
 int process_stored(StoreSurfaces& store, const std::string& uuid, const std::string& out,
+                   const std::optional<std::string>& volume,
                    const nlohmann::json& parameters, DSReader& reader, const RefinementConfig& cfg)
 {
     try {
-        auto surf = store.load(uuid);
+        auto surf = store.load(uuid, true, volume);
         auto refined = refine_surface(*surf, reader, cfg);
         if (!refined) return EXIT_FAILURE;
         if (out == surf->id || out == uuid) {
@@ -403,18 +405,25 @@ private:
 
 int main(int argc, char *argv[])
 {
-    // Store mode: --store=PATH first, then the surface is a UUID and the output
-    // is that UUID (refine in place) or the name of a new surface.
+    // Store mode: --store=PATH (and --volume-uuid=ID) first, then the surface is
+    // a UUID and the output is that UUID (refine in place) or the name of a new surface.
     std::optional<std::filesystem::path> store_path;
+    std::optional<std::string> volume_uuid;
     if (argc > 1 && std::string(argv[1]).rfind("--store=", 0) == 0) {
         store_path = std::string(argv[1]).substr(8);
         ++argv; --argc;
+        if (argc > 1 && std::string(argv[1]).rfind("--volume-uuid=", 0) == 0) {
+            volume_uuid = std::string(argv[1]).substr(14);
+            ++argv; --argc;
+        }
     }
     if (argc != 5) {
         std::cout << "usage: " << argv[0]
-                  << " [--store=<store>] <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl
+                  << " [--store=<store> [--volume-uuid=<id>]] <zarr-volume> <src-surface> <out-surface> <json-params>"
+                  << std::endl
                   << "  with --store the source is a surface UUID; the output is that UUID (refine in place)"
-                  << " or the name of a new surface" << std::endl;
+                  << " or the name of a new surface; with --volume-uuid the surface is read in that volume's voxels"
+                  << " (the zarr's) through the store's view of it" << std::endl;
         return EXIT_SUCCESS;
     }
 
@@ -462,7 +471,7 @@ int main(int argc, char *argv[])
 
     if (store_path) {
         StoreSurfaces store(*store_path, "vc_objrefine");
-        return process_stored(store, surface_src.string(), surface_dst.string(),
+        return process_stored(store, surface_src.string(), surface_dst.string(), volume_uuid,
                               nlohmann::json::parse(params.dump()), reader, cfg);
     }
 
