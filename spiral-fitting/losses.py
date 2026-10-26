@@ -739,6 +739,12 @@ def _sample_requested_patch_rows(patch_indices, point_cap, patch_atlas):
     return ijs, zyxs, node_ids, mask
 
 
+def _physical_point(entry):
+    """The chain point behind a points_by_patch entry: an attachment view's
+    physical point (which owns the theta node), else the entry itself."""
+    return entry.get('physical', entry)
+
+
 def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
                                patches_dict, patch_atlas, point_collections,
                                sampling_strata, *, crossing_map, cfg,
@@ -773,6 +779,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding,
             p2 = p2s[np.random.randint(len(p2s))]
             ij1 = p1['on_patch']['ij']
             ij2 = p2['on_patch']['ij']
+            p1, p2 = _physical_point(p1), _physical_point(p2)
             attached1 = _valid_patch_annotation(
                 patches_dict, patch_atlas, pid1, ij1[0], ij1[1])
             attached2 = _valid_patch_annotation(
@@ -877,6 +884,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding,
                 patches_dict, patch_atlas, pid, ij[0], ij[1])
             if resolved is None:
                 continue
+            point = _physical_point(point)
             rows.append((
                 resolved[0], resolved[1], int(point['_theta_node_id']),
                 point['winding_annotation']))

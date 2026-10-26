@@ -17,6 +17,7 @@ from spiral_helpers import (
     build_link_components,
     classify_fiber_hv,
     merge_linked_point_collections,
+    point_attachments,
     resolve_fiber_links,
 )
 
@@ -81,15 +82,18 @@ def group_points_by_patch(pcl, verified_patches):
     Patches are ordered by the first attached point that hits them when
     scanning the pcl's points in int(key) order; within each patch, points are
     also in int(key) order. Attachments to patches outside ``verified_patches``
-    are ignored.
+    are ignored. A point with several ``attachments`` enters each patch's list
+    as an attachment view, ``{'on_patch': ..., 'physical': point}``, so all its
+    attachments share the point's chain and theta node.
     """
     points_by_patch = {}
     for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
-        if 'on_patch' not in point:
-            continue
-        patch_id = point['on_patch']['id']
-        if patch_id in verified_patches:
-            points_by_patch.setdefault(patch_id, []).append(point)
+        for on_patch in point_attachments(point):
+            if on_patch['id'] not in verified_patches:
+                continue
+            entry = (point if 'attachments' not in point
+                     else {'on_patch': on_patch, 'physical': point})
+            points_by_patch.setdefault(on_patch['id'], []).append(entry)
     pcl['points_by_patch'] = points_by_patch
 
 
@@ -289,12 +293,16 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
                          *, z_begin, z_end, z_margin, min_point_spacing,
                          vertical_min_z_fraction=0.8,
                          vertical_min_auto_certainty=0.5,
-                         vertical_radial_offset=0.0):
+                         vertical_radial_offset=0.0, strip_every_fiber=False):
     """Derive the fiber training views from prepared fibers and resolved links.
 
     ``point_collections`` are the prepared catalog fibers (prepare_fiber_catalog)
     in catalog order; ``resolved_links`` are same-winding links
     ``{'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}`` between them.
+    A fiber with two or more patch attachments is a cross-patch view (linked
+    fibers merge into one component). Strips come from fibers with an
+    unattached point or a link, or from every fiber with
+    ``strip_every_fiber``; each needs two points in the z window.
     Returns ``(cross_patch, strips, sampling_groups, link_components)``.
     """
     link_components = build_link_components(resolved_links)
@@ -316,11 +324,12 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
     strip_sources = []
     for cid, pcl in point_collections.items():
         num_attached = sum(
-            1 for point in pcl['points'].values() if 'on_patch' in point)
-        num_unattached = len(pcl['points']) - num_attached
+            len(point_attachments(point)) for point in pcl['points'].values())
+        num_unattached = sum(
+            1 for point in pcl['points'].values() if not point_attachments(point))
         if num_attached >= 2:
             cross_patch[cid] = pcl
-        if num_unattached >= 1 or cid in linked_cids:
+        if strip_every_fiber or num_unattached >= 1 or cid in linked_cids:
             strip_sources.append((cid, pcl))
 
     if link_components:

@@ -492,6 +492,18 @@ def resolve_fiber_links(point_collections, include_pending=False,
     return links
 
 
+def point_attachments(point):
+    """The patch attachments of a physical point.
+
+    A point attached to several patches lists them in ``attachments``;
+    otherwise its single attachment, if any, is ``on_patch``.
+    """
+    if 'attachments' in point:
+        return point['attachments']
+    on_patch = point.get('on_patch')
+    return [] if on_patch is None else [on_patch]
+
+
 def build_link_components(resolved_links):
     """Connected components of collections joined by cross-fiber links.
 
@@ -816,8 +828,8 @@ def merge_linked_point_collections(point_collections, link_components,
                 merged_points[len(merged_points)] = point
         for cid, _ in members:
             cross_patch_point_collections.pop(cid, None)
-        num_attached = sum(1 for point in merged_points.values()
-                           if 'on_patch' in point)
+        num_attached = sum(len(point_attachments(point))
+                           for point in merged_points.values())
         if num_attached < 2:
             continue
         merged_id = f'fibercomp:{num_merged}'

@@ -452,10 +452,14 @@ class FitInputs:
     ``patches`` maps patch UUIDs to fit-frame tifxyz.Patch objects in UUID
     order. ``point_collections`` maps resident collection ids to regular PCLs
     whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
+    ``fibers`` maps fiber UUIDs to fiber collections (materialize_fibers) and
+    ``fiber_links`` holds their resolved same-winding branch links.
     """
     snapshot: InputSnapshot
     patches: dict
     point_collections: dict
+    fibers: dict
+    fiber_links: list
     counts: Counter
 
     def report(self):
@@ -634,15 +638,165 @@ def materialize_point_collections(store, snapshot, patches, first_id=0):
     return collections, counts
 
 
-def materialize(store, snapshot, *, z_begin, z_end, erode_cells_default):
-    """Every runtime input of a frozen snapshot."""
+def _fiber_contact(rel):
+    """``(raw line index, ij)`` of a fiber-patch edge's representative contact."""
+    line_index = _anchor_index(rel.b_anchor, 'line_points')
+    grid = (rel.meta.get('fiber_patch') or {}).get('patch_grid')
+    if line_index is None or not isinstance(grid, list) or len(grid) != 2:
+        raise ObjectStoreInputError([
+            f'fiber-patch edge {rel.uuid} lacks a line-point anchor or patch_grid'])
+    # patch_grid is (column, row); attachments use (row, column).
+    return line_index, [float(grid[1]), float(grid[0])]
+
+
+def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
+                       first_id=0):
+    """Fit-frame fibers, their contacts and same-winding branch links.
+
+    Returns ``(fiber_catalog, links, counts)``. The catalog maps fiber UUIDs
+    (in UUID order) to fiber collections whose points are keyed by raw line
+    index: trimming to the control span and min-spacing decimation never
+    renumber them. Every consumed contact and branch endpoint is kept through
+    both. A contact's point lists each patch it attaches to in
+    ``point['attachments']``, so one physical point (one chain/theta node) can
+    attach to several patches. ``links`` are resolved branch links keyed by
+    resident collection id and raw line index.
+    """
+    from vc_object_store import fiber_branch_control_index
+    from spiral_helpers import (_decimate_ordered_points_min_spacing,
+                                fiber_control_span)
+
+    fibers = snapshot.objects_of('fiber')
+    resident_id = {obj.uuid: cid for cid, obj in enumerate(fibers, start=first_id)}
+    contacts = {obj.uuid: {} for obj in fibers}
+    counts, problems = Counter(), []
+    for rel in snapshot.relationships_of('fiber_patch'):
+        try:
+            line_index, ij = _fiber_contact(rel)
+        except ObjectStoreInputError as error:
+            problems.extend(error.problems)
+            continue
+        if rel.a not in patches:
+            counts['fiber contacts with unfitted patches'] += 1
+            continue
+        contacts[rel.b].setdefault(line_index, []).append(
+            {'id': rel.a, 'ij': ij, 'edge_uuid': rel.uuid})
+
+    geometry, endpoints = {}, {obj.uuid: {} for obj in fibers}
+    for obj in fibers:
+        arrays, _ = read_geometry(store, obj.geometry_revision,
+                                  ['control_points', 'line_points', 'control_point_ids'])
+        geometry[obj.uuid] = arrays
+    for rel in snapshot.relationships_of('fiber_branch'):
+        try:
+            control = {
+                uuid: fiber_branch_control_index(
+                    [int(v) for v in geometry[uuid]['control_point_ids']], anchor)
+                for uuid, anchor in ((rel.a, rel.a_anchor), (rel.b, rel.b_anchor))}
+        except RuntimeError as error:
+            problems.append(f'fiber branch {rel.uuid}: {error}')
+            continue
+        endpoints[rel.a][rel.uuid] = control[rel.a]
+        endpoints[rel.b][rel.uuid] = control[rel.b]
+    if problems:
+        raise ObjectStoreInputError(problems)
+
+    catalog, branch_points = {}, {}
+    for obj in fibers:
+        arrays = geometry[obj.uuid]
+        # Fit-frame XYZ, in the stored point order.
+        line = np.ascontiguousarray(
+            obj.frame.xyz_to_fit_zyx(arrays['line_points'])[:, ::-1])
+        controls = np.ascontiguousarray(
+            obj.frame.xyz_to_fit_zyx(arrays['control_points'])[:, ::-1])
+        if len(controls) < 1:
+            raise ObjectStoreInputError([f'fiber {obj.uuid} has no control points'])
+        own_contacts = contacts[obj.uuid]
+        polyline, span_begin, control_line = fiber_control_span(controls, line)
+        if polyline is controls:
+            # No usable dense polyline: the controls are the fiber, and line
+            # point contacts cannot be placed on it.
+            if own_contacts:
+                raise ObjectStoreInputError([
+                    f'fiber {obj.uuid} has contacts but no usable line points'])
+            line = controls
+        span_end = span_begin + len(polyline) - 1
+        outside = [i for i in own_contacts if not span_begin <= i <= span_end]
+        if any(not 0 <= i < len(line) for i in outside):
+            raise ObjectStoreInputError(
+                [f'fiber {obj.uuid} contact outside its {len(line)} line points'])
+        if outside:
+            # The detector's control-span rule can differ by a line point at
+            # each end; keep consumed contacts rather than dropping them.
+            counts['fiber spans widened to keep contacts'] += 1
+            span_begin = min(span_begin, *outside)
+            span_end = max(span_end, *outside)
+        branch_lines = {edge: int(control_line[index])
+                        for edge, index in endpoints[obj.uuid].items()}
+        keep = set(own_contacts) | set(branch_lines.values())
+        span = np.arange(span_begin, span_end + 1)
+        _, kept = _decimate_ordered_points_min_spacing(
+            line[span], min_point_spacing,
+            return_indices=True,
+            force_keep={i - span_begin for i in keep})
+        cid = resident_id[obj.uuid]
+        points = {}
+        for position in kept:
+            raw = int(span[position])
+            xyz = line[raw]
+            point = {'id': raw, 'collectionId': cid, 'p': xyz.tolist(),
+                     'zyx': np.asarray(xyz[::-1], dtype=np.float32),
+                     'winding_annotation': float('nan'), 'creation_time': 0,
+                     'orig_index': raw}
+            if raw in own_contacts:
+                point['attachments'] = own_contacts[raw]
+                counts['fiber attachments'] += len(own_contacts[raw])
+            points[raw] = point
+        source = obj.meta.get('source') or {}
+        catalog[obj.uuid] = {
+            'id': cid, 'name': obj.name, 'points': points,
+            'color': [0.0, 0.0, 0.0], 'source_file': None,
+            'metadata': {
+                'hv_classification': source.get('hv_classification') or {},
+                'logical_input_revision': obj.object_revision,
+                'object_uuid': obj.uuid,
+                'geometry_revision': obj.geometry_revision,
+                'fiber_num_control_points': len(controls),
+            },
+        }
+        branch_points[obj.uuid] = branch_lines
+        counts['fibers'] += 1
+
+    links = []
+    for rel in snapshot.relationships_of('fiber_branch'):
+        links.append({
+            'a_coll': resident_id[rel.a], 'a_point': branch_points[rel.a][rel.uuid],
+            'b_coll': resident_id[rel.b], 'b_point': branch_points[rel.b][rel.uuid],
+            'pending': rel.approval_state != 'approved', 'edge_uuid': rel.uuid,
+        })
+    counts['fiber branches'] = len(links)
+    return catalog, links, counts
+
+
+def materialize(store, snapshot, *, z_begin, z_end, erode_cells_default,
+                fiber_min_point_spacing=0.0):
+    """Every runtime input of a frozen snapshot.
+
+    Fibers are decimated to ``fiber_min_point_spacing`` (the fitter's
+    pcl_fiber_min_point_spacing); resident ids number PCLs, then fibers.
+    """
     patches, counts = materialize_patches(
         store, snapshot, z_begin=z_begin, z_end=z_end,
         erode_cells_default=erode_cells_default)
     point_collections, pcl_counts = materialize_point_collections(
         store, snapshot, patches)
     counts.update(pcl_counts)
-    return FitInputs(snapshot, patches, point_collections, counts)
+    fibers, fiber_links, fiber_counts = materialize_fibers(
+        store, snapshot, patches, min_point_spacing=fiber_min_point_spacing,
+        first_id=len(point_collections))
+    counts.update(fiber_counts)
+    return FitInputs(snapshot, patches, point_collections, fibers,
+                     fiber_links, counts)
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +844,8 @@ def _parse_args(argv):
     parser.add_argument('--z-end', type=int)
     parser.add_argument('--erode-cells', type=int, default=1,
                         help='default patch erosion (patch_erode_patches)')
+    parser.add_argument('--fiber-spacing', type=float, default=0.0,
+                        help='fiber decimation spacing (pcl_fiber_min_point_spacing)')
     parser.add_argument('--json', help='write the manifest and report here')
     return parser.parse_args(argv)
 
@@ -711,7 +867,8 @@ def main(argv=None):
             if args.z_begin is not None and args.z_end is not None:
                 lines = materialize(
                     store, snapshot, z_begin=args.z_begin, z_end=args.z_end,
-                    erode_cells_default=args.erode_cells).report()
+                    erode_cells_default=args.erode_cells,
+                    fiber_min_point_spacing=args.fiber_spacing).report()
             else:
                 lines = snapshot_report(snapshot)
         except ObjectStoreInputError as error:

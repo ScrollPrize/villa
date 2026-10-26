@@ -90,7 +90,9 @@ from pcl_views import (
     _UnattachedPclStripList,
     catalog_copy_of_pcl,
     longest_run_in_z_window,
+    fiber_training_views,
     materialize_fiber_fit_inputs,
+    prepare_fiber_catalog,
     regular_pcl_views,
     regular_unattached_strip,
 )
@@ -2006,15 +2008,36 @@ class FitContext:
             z_begin=self.z_begin, z_end=self.z_end,
             z_margin=self.config['patch_loss_z_margin'],
             min_point_spacing=self.config['pcl_unattached_pcl_min_point_spacing'])
+        # Fibers keep every source line index through trimming and
+        # decimation; contacts and branch endpoints were retained by the
+        # materializer, and a contact attached to several patches shares one
+        # chain point. Every fiber with a usable in-ROI path keeps its strip.
+        fiber_catalog = inputs.fibers
+        fibers = prepare_fiber_catalog(fiber_catalog)
+        resolved_links = (list(inputs.fiber_links)
+                          if self.config['pcl_use_fiber_links'] else [])
+        fiber_cross_patch, fiber_strips, fiber_groups, link_components = \
+            fiber_training_views(
+                fibers, resolved_links, verified_patches,
+                z_begin=self.z_begin, z_end=self.z_end,
+                z_margin=self.config['patch_loss_z_margin'],
+                min_point_spacing=self.config['pcl_unattached_pcl_min_point_spacing'],
+                vertical_min_z_fraction=self.config['pcl_vertical_fiber_min_z_fraction'],
+                vertical_min_auto_certainty=self.config['pcl_vertical_fiber_min_auto_certainty'],
+                vertical_radial_offset=self._vertical_fiber_radial_offset(),
+                strip_every_fiber=True)
+        strips.extend(fiber_strips)
+        strip_groups.extend(fiber_groups)
         for line in inputs.report():
             print(line)
         self._install_point_views(
-            list(cross_patch.values()), strips, strip_groups,
-            fiber_catalog={}, regular_pcl_catalog=regular_pcl_catalog,
-            resolved_links=[], link_components=[])
+            list(cross_patch.values()) + fiber_cross_patch, strips, strip_groups,
+            fiber_catalog=fiber_catalog, regular_pcl_catalog=regular_pcl_catalog,
+            resolved_links=resolved_links, link_components=link_components)
         self.link_distance_tolerance = float(
             self.config['pcl_link_distance_tolerance'])
-        return max(point_collections, default=-1) + 1
+        return max([*point_collections, *(pcl['id'] for pcl in fibers.values())],
+                   default=-1) + 1
 
     def _load_and_link_file_inputs(self):
         """Load patches, PCLs and fibers from files and link them by proximity.

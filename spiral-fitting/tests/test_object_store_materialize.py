@@ -25,12 +25,13 @@ def cpu(monkeypatch):
     monkeypatch.setenv('FIT_SPIRAL_DEVICE', 'cpu')
 
 
-def materialize(db, **request):
+def materialize(db, fiber_min_point_spacing=0.0, **request):
     snapshot = osi.read_snapshot(db, osi.InputRequest(**request))
     config = reference.fit_config()
     return osi.materialize(db, snapshot, z_begin=config['z_begin'],
                            z_end=config['z_end'],
-                           erode_cells_default=config['patch_erode_patches'])
+                           erode_cells_default=config['patch_erode_patches'],
+                           fiber_min_point_spacing=fiber_min_point_spacing)
 
 
 def adapter_context(db, tmp_path):
