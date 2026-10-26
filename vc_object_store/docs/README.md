@@ -32,8 +32,8 @@ Always inspect `problems`.
 history, preserving unrelated metadata. Use store edits for subsequent changes.
 
 Files written before objects carried UUIDs (VC3D tifxyz patches, whose `uuid` is
-their directory name; PCL collections; version-3 fibers) are rejected unless a
-UUID namespace is supplied: `vc_object_ingest --derive-uuids NAMESPACE` or
+their directory name; PCL collections; version-1/3 fibers) can receive dataset
+identities when a UUID namespace is supplied: `vc_object_ingest --derive-uuids NAMESPACE` or
 `ingest_geometry_source(..., uuid_namespace=NAMESPACE)`. Each such source then
 gets `uuid5(NAMESPACE, "<kind>:<key>")`, matching Python's `uuid.uuid5`:
 
@@ -42,6 +42,9 @@ gets `uuid5(NAMESPACE, "<kind>:<key>")`, matching Python's `uuid.uuid5`:
 | `patch` | `meta.json` `uuid` string, else the directory name |
 | `fiber` | file stem; version-3 `branch_file` targets resolve the same way |
 | `point_collection` | `<document stem>:<collection id>` |
+
+Without a namespace, UUID-less fibers retain the default fixed-namespace
+`vc3d_fiber/<filename>` identity; patches and PCLs still require canonical UUIDs.
 
 The object records `meta.source.uuid_derivation = {namespace, name}`. Canonical
 source UUIDs are kept, and tracks keep their `(dataset_ref, external_key)`

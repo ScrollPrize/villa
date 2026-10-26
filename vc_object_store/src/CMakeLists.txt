@@ -1,12 +1,18 @@
+if(VC_OBJECT_STORE_SHARED)
+    set(_vc_store_library_type SHARED)
+else()
+    set(_vc_store_library_type STATIC)
+endif()
+
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
-add_library(vc_geometry STATIC geometry/TypedGeometry.cpp)
+add_library(vc_geometry ${_vc_store_library_type} geometry/TypedGeometry.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # SFTP v3 client over the system OpenSSH program; no SQLite or application types.
-add_library(vc_sftp STATIC sftp/Sftp.cpp sftp/SshProcess.cpp)
+add_library(vc_sftp ${_vc_store_library_type} sftp/Sftp.cpp sftp/SshProcess.cpp)
 target_include_directories(vc_sftp PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 find_package(Threads REQUIRED)
@@ -15,13 +21,14 @@ target_compile_features(vc_sftp PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_sftp ALIAS vc_sftp)
 
 # Primary SQLite object database; no dependency on vc_core or Qt.
-add_library(vc_objects STATIC
+add_library(vc_objects ${_vc_store_library_type}
     sftp/SftpVfs.cpp
     internal/Anchors.cpp
     internal/Sqlite.cpp
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
     internal/RecordJson.cpp
+    Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
@@ -74,11 +81,11 @@ if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
 endif()
 find_package(TIFF REQUIRED)
-add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/PatchGrid.cpp)
+add_library(vc_object_formats ${_vc_store_library_type} Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/PatchGrid.cpp)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
-add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
+add_library(vc_object_geometry ${_vc_store_library_type} geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
     formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)

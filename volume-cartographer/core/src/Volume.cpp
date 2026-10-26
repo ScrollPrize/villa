@@ -1269,6 +1269,23 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 }
 
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
+                                    const utils::Json& metadata)
+{
+    auto volume = std::make_shared<Volume>(std::move(path));
+    if (metadata.is_object()) {
+        if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
+            const double value = metadata["voxelsize"].get_double();
+            volume->hasExplicitVoxelSizeOverride_ = std::isfinite(value) && value > 0.0;
+        }
+        volume->metadata_.update(metadata);
+        volume->metadata_["width"] = volume->_width;
+        volume->metadata_["height"] = volume->_height;
+        volume->metadata_["slices"] = volume->_slices;
+    }
+    return volume;
+}
+
+std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
                                     const ZarrCreateOptions& options)
 {
     if (options.overwriteExisting || !hasAnyLocalZarrArray(path)) {

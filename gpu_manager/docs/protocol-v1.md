@@ -50,7 +50,7 @@ set_paused may omit the token; the kernel-authenticated UID must have permission
 | Operation | Additional body fields | Result |
 | --- | --- | --- |
 | hello | versions: integer array; required_capabilities: string array | capabilities, inventory, peer_uid |
-| register | task_id, token, label, root, request, reconfigure_mode:"full_release"; optional pausable, adaptable (default true) | task, token |
+| register | task_id, token, label, root, request, reconfigure_mode:"full_release" or "incremental_release"; optional pausable, adaptable (default true) | task, token |
 | poll | last_generation: integer | task |
 | set_request | request (complete replacement), expected_request_revision | task |
 | report | generation, phase, held, processes, detail | task |
@@ -79,8 +79,8 @@ Allocation: `{cpu_cores:N,gpus:{GPU_UUID:BYTES}}`. Zero allocation is exactly
 `{cpu_cores:0,gpus:{}}`. Automatic cores are the ceiling of
 `max_cpu_cores * sum(granted_vram/max_vram) / max_gpus`. Manual cores are explicit,
 bounded by the request and host inventory. Partial release may have zero GPU
-memory but positive CPU cores; the full old reservation stays charged until
-all resources are released.
+memory but positive CPU cores; in full-release mode the full old reservation
+stays charged until all resources are released.
 
 ## Task state and lifecycle
 
@@ -154,6 +154,35 @@ duplicate workload on reconnect or interpret disconnection as release. The
 reference `Supervisor` supports both capability modes, including exclusive
 non-pausable startup calibration. It never creates or authorizes new workers
 offline, so a calibration cohort restart waits for restored communication.
+
+## Authorized incremental reconfiguration amendment (2026-10-23)
+
+The user explicitly authorized incremental allocation changes and sticky GPU
+placement. Clients opt in with immutable `reconfigure_mode:"incremental_release"`
+and must require `incremental_release` in hello. Older servers fail negotiation
+before any GPU work; legacy registrations and response shapes remain unchanged.
+Incremental clients must be both pausable and adaptable. The generic full-release
+Supervisor is not an incremental client.
+
+During release, stop admitting new work and drain work using removed/reduced
+resources. Workers whose memory still fits can stay alive. A `released` report
+states the exact retained allocation, bounded componentwise by the old grant.
+Only this acknowledgement reduces the charged grant to the retained allocation.
+Retained resources remain reserved even while a dependent expansion waits.
+The server then issues `initialize` with a fresh generation when the target fits;
+the client applies additions without reconstructing retained workers and reports
+`applied` with the exact new grant. No new work starts before this handshake.
+If a newer target shrinks retained resources further, another release is issued.
+Targets may change while draining; they are never permission to allocate memory.
+Failed reports retain conservative full-release semantics. Pause and exclusivity
+still require zero GPU use. Server restart still requires complete release before
+regrant, including incremental clients. Disconnect alone never frees ownership.
+
+Automatic placement prefers existing (or last granted) GPU UUIDs over moving to
+an otherwise idle GPU, if capacity permits. New tasks prefer GPUs without current
+owners when possible. These are placement preferences, not priority boosts:
+explicit priorities, FIFO ties, minima, allowlists, exclusivity and capacity
+checks retain precedence. The preference also survives a full-release handoff.
 
 ## Retries, recovery and bounds
 

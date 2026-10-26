@@ -568,7 +568,9 @@ part of this task. Add small temporary DB fixtures and focused regression tests.
 - Dataset ingest with a namespace gives patches, PCL collections and fibers the
   documented uuid5 identities (equal to Python's `uuid.uuid5`), resolves
   version-3 branches to them, keeps canonical source UUIDs, and refuses a repeat
-  ingest as existing identities. Without a namespace such sources are rejected.
+  ingest as existing identities. Without a namespace patches and PCLs without
+  canonical UUIDs are rejected; UUID-less fibers use main's fixed namespace
+  and `vc3d_fiber/<filename>` identity instead.
 - CLI smoke inputs require no patch directories, fiber JSONs or PCL JSONs.
   Audit remaining references to removed ingestion code and options; service/
   workspace compatibility is not an acceptance criterion.

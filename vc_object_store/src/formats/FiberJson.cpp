@@ -25,6 +25,16 @@ size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anc
 }
 
 namespace {
+// Version 1 wrote control points as bare XYZ arrays and predates
+// optimization_mode, which VC3D read as "lasagna". Its frame is version 3's.
+void version1Fields(Json& root)
+{
+    if (root.contains("control_points") && root.at("control_points").is_array())
+        for (auto& entry : root.at("control_points"))
+            if (!entry.is_object()) entry = Json{{"position", entry}};
+    if (!root.contains("optimization_mode")) root["optimization_mode"] = "lasagna";
+}
+
 // Version 3 names its frame "SAMPLE/VOLUME_ID@Lk". Only level 0 (scale factor 1) is
 // exactly the store's {volume_uuid, scale_factor 1}; other levels are refused.
 void version3Coordinates(Json& root)
@@ -51,9 +61,10 @@ GeometrySource decodeFiberJson(const std::string& text)
     auto root = Json::parse(text);
     if (root.value("type", "") != "vc3d_fiber") throw std::runtime_error("expected vc3d_fiber JSON");
     const auto version = root.value("version", int64_t(0));
-    if (version != 3 && version != 4)
-        throw std::runtime_error("Fiber transfer requires version 3 or 4");
-    if (version == 3) version3Coordinates(root);
+    if (version != 1 && version != 3 && version != 4)
+        throw std::runtime_error("Fiber transfer requires version 1, 3 or 4");
+    if (version == 1) version1Fields(root);
+    if (version < 4) version3Coordinates(root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";

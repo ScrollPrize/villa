@@ -32,12 +32,21 @@ def write_v3_fibers(directory, kept_uuid=None):
     return names
 
 
-def test_v3_fibers_without_uuids(tmp_path):
+@pytest.mark.parametrize("version", [1, 3])
+def test_legacy_fibers_without_uuids(tmp_path, version):
     names = write_v3_fibers(tmp_path / "fibers")
+    if version == 1:
+        for path in (tmp_path / "fibers").glob("*.json"):
+            document = json.loads(path.read_text())
+            document["version"] = 1
+            document["control_points"] = [p["position"] for p in document["control_points"]]
+            path.write_text(json.dumps(document))
     with ObjectStore.create(str(tmp_path / "plain.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers")
-        assert report["ingested"] == 0 and report["problems"], report
-        assert store.object_count("fiber") == 0
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
+        default_namespace = uuid.UUID("e14f6968-9145-494d-8b06-ab2f2fac7f3b")
+        for name in names:
+            assert store.object(str(uuid.uuid5(default_namespace, "vc3d_fiber/" + name + ".json")))
     with ObjectStore.create(str(tmp_path / "derived.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
         assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])

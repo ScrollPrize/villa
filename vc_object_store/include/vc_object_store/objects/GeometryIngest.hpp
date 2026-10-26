@@ -12,7 +12,8 @@ struct GeometrySource {
     nlohmann::json source;
 };
 // How source files that predate the store's contracts are admitted. Defaults
-// reject such files; each option is an explicit, recorded repair.
+// reject invalid patches/PCLs; UUID-less fibers use the fixed file-name namespace.
+// Each option is an explicit, recorded repair.
 struct SourceIngestOptions {
     // A UUID namespace admitting sources without canonical UUIDs: a tifxyz patch keyed
     // by its meta.json "uuid" or directory name, a PCL collection by "<document stem>:<id>",
