@@ -524,9 +524,9 @@ int runObjectStoreControllerTests()
             auto pending = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(controlsOnly)};
             bool rejected = false; try { controller.commitFiberStoreAction(pending); } catch (...) { rejected = true; }
             require(rejected, "read-only controller cannot publish changes");
-            auto transfer = transferJson(controlsOnly); transfer["version"] = 1;
+            auto transfer = transferJson(controlsOnly); transfer["version"] = 2;
             rejected = false; try { (void)vc::objects::decodeFiberJson(transfer.dump()); } catch (...) { rejected = true; }
-            require(rejected, "legacy file import is rejected without repair");
+            require(rejected, "unsupported fiber version is rejected");
             state.detachObjectStore();
         }
         if(const char* smoke=std::getenv("VC3D_OBJECT_STORE_SMOKE_DB")) {

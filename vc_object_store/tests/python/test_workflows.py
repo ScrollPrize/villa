@@ -412,6 +412,42 @@ def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
         assert store.object_count('fiber') == 0
 
 
+def test_uuidless_fiber_files_are_named_from_their_file_names(tmp_path):
+    import json
+    import uuid
+    files = ['kb_20260713T041915396_000154.json', 'lt_20260707T055926767_000404.json']
+    (tmp_path / 'fibers').mkdir()
+    for i, name in enumerate(files):
+        document = dict(type='vc3d_fiber', version=3, filename=name, sequence=i,
+                        control_points=[{'position': [i, 0, 0]}, {'position': [i, 1, 0]}],
+                        line_points=[[i, 0, 0], [i, 1, 0]],
+                        branches=[dict(branch_file=files[1 - i], branch_fiber_id=1 - i, control_point_index=i,
+                                       branch_control_point_index=1 - i, control_point_position=[0, 0, 0],
+                                       branch_control_point_position=[0, 0, 0],
+                                       control_point_direction=[1, 0, 0] if i == 0 else [0, 1, 0],
+                                       branch_control_point_direction=[0, 1, 0] if i == 0 else [1, 0, 0])])
+        (tmp_path / 'fibers' / name).write_text(json.dumps(document))
+    # Version 1 shares the folder: bare XYZ control points, no optimization_mode.
+    version1 = 'kb_20260712T101010101_000003.json'
+    (tmp_path / 'fibers' / version1).write_text(json.dumps(dict(
+        type='vc3d_fiber', version=1, filename=version1, sequence=3, branches=[],
+        control_points=[[5, 0, 0], [5, 1, 0]], line_points=[[5, 0, 0], [5, 1, 0]])))
+    # RFC 4122 version 5 in the store's fixed namespace: every machine mints the same UUIDs.
+    namespace = uuid.UUID('e14f6968-9145-494d-8b06-ab2f2fac7f3b')
+    expected = {str(uuid.uuid5(namespace, 'vc3d_fiber/' + name)) for name in files}
+    for store_name in ('a.vcobj', 'b.vcobj'):
+        with ObjectStore.create(str(tmp_path / store_name), author='test') as store:
+            assert store.ingest_geometry_source('fiber', tmp_path / 'fibers') == dict(
+                ingested=3, edges_imported=1, problems=[])
+            edge = store.edges_by_kind('fiber_branch')[0]
+            assert {edge['a'], edge['b']} == expected
+            assert store.object(str(uuid.uuid5(namespace, 'vc3d_fiber/' + version1)))['kind'] == 'fiber'
+    # A single-file import resolves its UUID-less branch peer by file name too.
+    with ObjectStore.create(str(tmp_path / 'single.vcobj'), author='test') as store:
+        assert store.ingest_geometry_source('fiber', tmp_path / 'fibers' / files[0])['problems'] == []
+        assert {store.object(uid)['uuid'] for uid in expected} == expected
+
+
 @pytest.mark.parametrize('kind,geometry', [
     ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], [])),
     ('point_collection', PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]])),

@@ -22,6 +22,7 @@ add_library(vc_objects STATIC
     internal/RecordSql.cpp
     internal/EdgeSql.cpp
     internal/RecordJson.cpp
+    Uuid.cpp
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp

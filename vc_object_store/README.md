@@ -35,9 +35,14 @@ updates across geometry kinds; `ingestGeometryBatch` shares one-time ingestion
 of decoded geometry and native topology. Both run inside the caller’s transaction
 and retain the database’s existing revision and relationship checks.
 
-Fiber JSON is an explicit transfer format: readers require version 4 and UUIDs.
-Typed database geometry exports in that format, including control-only fibers.
-There is no old-format migration or compatibility reader.
+Fiber JSON version 4 is the transfer format; typed database geometry exports
+in it, including control-only fibers. File import also reads VC3D version 1
+and 3 fibers and stores them as version 4: a level-0 coordinate space becomes
+the volume binding, `branch_file` links resolve to the named file's UUID, and a
+link declared from both ends is imported once. Version 1 control points are
+bare XYZ arrays, and a missing `optimization_mode` reads as `lasagna`. A fiber
+file without a `uuid` is given a name-based (version 5) UUID derived from its
+file name, so separate imports of the same file agree on its identity.
 
 ## Use
 
@@ -47,6 +52,15 @@ from vc_object_store import ObjectStore
 with ObjectStore.create("objects.vcobj", author="reviewer") as store:
     report = store.ingest_geometry_source("patch", "/data/patch")
 ```
+
+`vc_object_ingest` creates the store when `--db` does not exist yet. To start
+a store from a folder of fiber JSONs:
+
+```sh
+build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --fiber /data/fibers
+```
+
+VC3D can also create an empty store (File → Object Store → New Object Store...).
 
 ```sh
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --patch /data/patch
