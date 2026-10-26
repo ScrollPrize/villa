@@ -22,6 +22,7 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 
 namespace {
@@ -364,35 +365,21 @@ CState::StoredUmbilicus CState::storedUmbilicus() const
         result.token = result.error;
         return result;
     }
-    _objectStoreSession->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::ObjectSelection selection;
-        selection.kind = "umbilicus";
-        selection.volume = volumeId;
-        const auto records = db.selectObjects(txn, selection);
-        if (records.size() != 1) {
-            if (records.empty()) {
-                result.error = "no umbilicus is bound to volume " + volumeId;
-            } else {
-                result.error = "several umbilici are bound to volume " + volumeId + ":";
-                for (const auto& record : records)
-                    result.error += " " + (record.name.empty() ? record.uuid : record.name);
+    try {
+        _objectStoreSession->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            const auto umbilicus = vc::objects::volumeUmbilicus(db, txn, volumeId);
+            if (!umbilicus) {
+                result.error = "no umbilicus maps to volume " + volumeId;
+                return;
             }
-            return;
-        }
-        const auto& record = records.front();
-        const auto geometry = db.currentGeometry(txn, record.uuid);
-        if (!geometry) {
-            result.error = "umbilicus " + record.name + " has no geometry";
-            return;
-        }
-        const auto canonical=vc::objects::GeometrySnapshot(db,txn).umbilicus(record.uuid);
-        const auto view=canonical.viewTransformedAt(volumeId);
-        for(const auto& p:view.points("points",0,canonical.size()))
-            result.points.emplace_back(float(p[0]),float(p[1]),float(p[2]));
-        result.uuid = record.uuid;
-        result.name = record.name;
-        result.token = record.uuid + "@" + db.currentObjectRevision(txn, record.uuid)->uuid;
-    });
+            for (const auto& p : umbilicus->points) result.points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
+            result.uuid = umbilicus->uuid;
+            result.name = umbilicus->name;
+            result.token = umbilicus->uuid + "@" + umbilicus->objectRevision;
+        });
+    } catch (const std::exception& error) {
+        result.error = error.what();
+    }
     if (result.token.empty()) result.token = result.error;
     return result;
 }

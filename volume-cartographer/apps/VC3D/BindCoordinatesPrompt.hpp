@@ -11,11 +11,13 @@
 
 namespace vc3d {
 // Stored units per voxel of `volume` for an object of `kind` ("surface",
-// "fiber"), shown with its metadata and `details` (further lines, e.g. its
-// bounds). nullopt when cancelled or not a positive finite number.
+// "fiber", "umbilicus"), shown with its metadata and `details` (further lines,
+// e.g. its bounds), starting from `suggested` when there is one. nullopt when
+// cancelled or not a positive finite number.
 inline std::optional<double> promptStoredUnitsPerVoxel(QWidget* parent, const QString& title, const QString& kind,
                                                        const Volume& volume, const nlohmann::json& metadata,
-                                                       const QString& details = {})
+                                                       const QString& details = {},
+                                                       std::optional<double> suggested = std::nullopt)
 {
     const auto shape = volume.shape();
     const auto message = QObject::tr("Bind this %1 to the active volume?\n\nVolume: %2\nDimensions Z/Y/X: %3 / %4 / %5\n"
@@ -24,7 +26,8 @@ inline std::optional<double> promptStoredUnitsPerVoxel(QWidget* parent, const QS
         .arg(kind, QString::fromStdString(volume.id())).arg(shape[0]).arg(shape[1]).arg(shape[2]).arg(volume.voxelSize())
         .arg(QString::fromStdString(metadata.dump()), details.isEmpty() ? QString() : details + QLatin1Char('\n'));
     bool accepted = false;
-    const auto answer = QInputDialog::getText(parent, title, message, QLineEdit::Normal, {}, &accepted);
+    const auto answer = QInputDialog::getText(parent, title, message, QLineEdit::Normal,
+                                              suggested ? QString::number(*suggested, 'g', 12) : QString(), &accepted);
     if (!accepted) return std::nullopt;
     bool valid = false;
     const double scale = answer.toDouble(&valid);

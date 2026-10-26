@@ -32,9 +32,11 @@
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "BindCoordinatesPrompt.hpp"
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -1867,24 +1869,17 @@ void MenuActionController::importUmbilicus()
         const QString reason = derived
             ? QObject::tr("Inferred from the points: %1").arg(QString::fromStdString(derived->description))
             : QObject::tr("The file states no frame.");
-        bool accepted = false;
-        storedUnitsPerVoxel = QInputDialog::getDouble(
-            _window, QObject::tr("Bind Umbilicus Coordinates"),
-            QObject::tr("%1\n\nVolume: %2 (X/Y/Z %3 / %4 / %5, %6 µm)\n\n"
-                        "Enter umbilicus units per volume voxel.")
-                .arg(reason, QString::fromStdString(volume->id()))
-                .arg(volume->sliceWidth()).arg(volume->sliceHeight()).arg(volume->numSlices()).arg(voxelSize),
-            storedUnitsPerVoxel, 1e-6, 1e6, 6, &accepted);
-        if (!accepted) return;
+        const auto entered = vc3d::promptStoredUnitsPerVoxel(
+            _window, QObject::tr("Bind Umbilicus Coordinates"), QStringLiteral("umbilicus"), *volume,
+            {{"file", QFileInfo(file).fileName().toStdString()}}, reason,
+            derived ? std::optional(storedUnitsPerVoxel) : std::nullopt);
+        if (!entered) return;
+        storedUnitsPerVoxel = *entered;
     }
 
-    // One umbilicus per volume: importing replaces the ones bound to it.
     vc::objects::RevisionSelection replaced;
     state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::ObjectSelection selection;
-        selection.kind = "umbilicus";
-        selection.volume = volume->id();
-        replaced = db.currentRevisions(txn, selection);
+        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, volume->id());
     });
     if (!replaced.empty() &&
         QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
@@ -1899,19 +1894,16 @@ void MenuActionController::importUmbilicus()
                           {"sources", nlohmann::json::array()}};
     vc::geometry::Umbilicus geometry;
     for (const auto& p : info.controlPoints) geometry.points.push_back({p[0], p[1], p[2]});
-    const auto uuid = vc::objects::util::newUuid();
+    vc::objects::ObjectRecord record;
+    record.uuid = vc::objects::util::newUuid();
+    record.kind = "umbilicus";
+    record.name = QFileInfo(file).completeBaseName().toStdString();
+    record.meta = meta.dump();
     auto pins = replaced;
-    pins[uuid] = std::nullopt;
+    pins[record.uuid] = std::nullopt;
     try {
         state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
-            for (const auto& [id, revision] : replaced) db.retireObject(txn, id);
-            vc::objects::ObjectRecord record;
-            record.uuid = uuid;
-            record.kind = "umbilicus";
-            record.name = QFileInfo(file).completeBaseName().toStdString();
-            record.meta = meta.dump();
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, vc::geometry::encode(geometry));
+            vc::objects::setVolumeUmbilicus(db, txn, volume->id(), record, geometry);
         });
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Import failed"), QString::fromUtf8(e.what()));
@@ -1933,10 +1925,7 @@ void MenuActionController::removeUmbilicus()
     }
     vc::objects::RevisionSelection pins;
     state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::ObjectSelection selection;
-        selection.kind = "umbilicus";
-        selection.volume = volumeId;
-        pins = db.currentRevisions(txn, selection);
+        pins = vc::objects::volumeUmbilicusRevisions(db, txn, volumeId);
     });
     if (pins.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),

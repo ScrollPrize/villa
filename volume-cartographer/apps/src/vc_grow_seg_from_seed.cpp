@@ -14,6 +14,7 @@
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreSurfaces.hpp"
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
@@ -469,6 +470,22 @@ static int run_main(int argc, char *argv[])
     // Stored surfaces are read in the bound volume's voxels, the units of the
     // selection, proximity queries and the output binding below.
     const auto store_volume = volume_uuid.empty() ? std::nullopt : std::optional<std::string>(volume_uuid);
+    // The volume's umbilicus, in its (level 0) voxels, unless the parameters name one.
+    if (store && store_volume && !params.contains("umbilicus_path") && !params.contains("umbilicus_points")) {
+        store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto umbilicus = vc::objects::volumeUmbilicus(db, txn, *store_volume)) {
+                auto points = Json::array();
+                for (const auto& p : umbilicus->points) {
+                    auto xyz = Json::array();
+                    xyz.push_back(p[0]);
+                    xyz.push_back(p[1]);
+                    xyz.push_back(p[2]);
+                    points.push_back(std::move(xyz));
+                }
+                params["umbilicus_points"] = std::move(points);
+            }
+        });
+    }
     const bool resuming = !resume_path.empty() || !surface_uuid.empty();
     // Stored surfaces within `tolerance` of a point (in the bound volume's voxels when given).
     auto stored_surfaces_near = [&](const cv::Vec3d& p, double tolerance) {
