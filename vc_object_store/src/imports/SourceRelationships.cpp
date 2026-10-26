@@ -67,6 +67,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                                              edge.aUuid + " <-> " + edge.bUuid);
                 if (edge.kind == "fiber_branch" &&
                     ((!edge.uuid.empty() && edge.uuid != current.uuid) || edge.approvalState != current.approvalState ||
+                     Json::parse(current.meta).value("auto", false) != Json::parse(edge.meta).value("auto", false) ||
                      (forward ? !sameDirection(current.aAnchor, edge.aAnchor) || !sameDirection(current.bAnchor, edge.bAnchor)
                               : !sameDirection(current.bAnchor, edge.aAnchor) || !sameDirection(current.aAnchor, edge.bAnchor))))
                     throw std::runtime_error("conflicting reciprocal fiber branch declarations");
@@ -90,7 +91,10 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                 edge.bAnchor = load(edge.bUuid).anchor(branch.at("branch_control_point_index").get<int64_t>());
                 for (auto [anchor, field] : {std::pair{&edge.aAnchor, "control_point_direction"}, {&edge.bAnchor, "branch_control_point_direction"}})
                     if (branch.contains(field)) anchor->direction = branch.at(field).get<std::array<double, 3>>();
-                edge.meta = Json{{"source_import", "object-source"}, {"adjacent", std::string(key) == "adjacent_branches"}}.dump();
+                const bool adjacent = std::string(key) == "adjacent_branches";
+                auto meta = Json{{"source_import", "object-source"}, {"adjacent", adjacent}};
+                if (edge.approvalState == "pending" && !adjacent && branch.value("auto", false)) meta["auto"] = true;
+                edge.meta = meta.dump();
                 add(std::move(edge));
             }
         }

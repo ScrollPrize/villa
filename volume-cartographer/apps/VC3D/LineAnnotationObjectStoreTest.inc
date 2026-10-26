@@ -12,6 +12,43 @@ int runObjectStoreControllerTests()
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::util::newUuid()+".vcobj");
+    auto checkHubStatus = [&](CState& state, Controller& controller,
+                              FiberCollectionController& collection,
+                              const std::function<bool()>& catalogReady) {
+        const auto generation = controller._fiberDataGeneration;
+        const auto snapshots = controller._sideStripStoredSnapshotCache.size();
+        int catalogUpdates = 0, fiberUpdates = 0, selectionResets = 0;
+        QObject observer;
+        QObject::connect(&collection, &FiberCollectionController::catalogChanged, &observer,
+            [&](const auto&, bool) { ++catalogUpdates; });
+        QObject::connect(&collection, &FiberCollectionController::selectionChanged, &observer,
+            [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
+        QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
+        std::vector<double> elapsedMs;
+        for (int i = 0; i < 20; ++i) {
+            QElapsedTimer timer; timer.start();
+            state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
+                *state.objectStoreSession()->attachment(), 0, {}});
+            QApplication::processEvents();
+            while (!catalogReady() && timer.elapsed() < 10000) {
+                QApplication::processEvents(); QThread::msleep(1);
+            }
+            require(catalogReady(), "hub status test catalog settles");
+            elapsedMs.push_back(timer.nsecsElapsed() / 1.e6);
+        }
+        std::sort(elapsedMs.begin(), elapsedMs.end());
+        double total = 0;
+        for (const auto ms : elapsedMs) total += ms;
+        std::cout << "hub status events=20 mean_ms=" << total / elapsedMs.size()
+                  << " median_ms=" << (elapsedMs[9] + elapsedMs[10]) / 2
+                  << " p95_ms=" << elapsedMs[18] << " catalog_updates=" << catalogUpdates
+                  << " fiber_updates=" << fiberUpdates << " selection_resets=" << selectionResets << std::endl;
+        require(catalogUpdates == 0 && fiberUpdates == 0 && selectionResets == 0,
+                "hub status does not reload the catalog, redraw fibers or clear selection");
+        require(controller._fiberDataGeneration == generation &&
+                controller._sideStripStoredSnapshotCache.size() == snapshots,
+                "hub status preserves fiber generation and warm snapshots");
+    };
     try {
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
@@ -42,6 +79,9 @@ int runObjectStoreControllerTests()
             require(selected->linePointsLoaded, "selected line decodes on demand");
             std::cout << "read-only attach_ms=" << attachedMs << " first_page_ms=" << pageMs
                       << " selected_ms=" << timer.elapsed()-pageMs << " heartbeats=" << heartbeats << std::endl;
+            require(!controller.fiberSnapshotsForSideStripQuery({*selected}).empty(), "warm real fiber snapshot");
+            collection.selectFiber(id, false, false);
+            checkHubStatus(state, controller, collection, [&] { return !page.empty(); });
             state.detachObjectStore();
             require(controller.fiberUuidForId(id).empty() && !controller.readStoredFiber(id), "detach clears runtime identities");
             return 0;
@@ -97,6 +137,8 @@ int runObjectStoreControllerTests()
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];
         link.controlPointDirection={1,0,0};link.branchControlPointDirection={1,0,0};
+        // An unreviewed automatic link ("Link A and B").
+        link.pending=true;link.autoLink=true;
         a.branches.push_back(link);
         std::swap(link.controlPointPosition,link.branchControlPointPosition); link.branchFiberId=a.id;link.branchFileName=a.fileName;
         b.branches.push_back(link);
@@ -109,6 +151,8 @@ int runObjectStoreControllerTests()
         controller.commitFiberStoreAction(batch);
         a=resolve(a.uuid);b=resolve(b.uuid);
         require(a.branches.size()==1 && b.branches.size()==1,"shared branch roundtrip");
+        require(a.branches[0].pending && a.branches[0].autoLink && b.branches[0].autoLink,
+                "automatic mark is one shared edge state");
         {
             QElapsedTimer timer; timer.start();
             auto linked = [&] { return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
@@ -118,6 +162,39 @@ int runObjectStoreControllerTests()
             require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.toVolume.has_value(); }),
                     "fibers without a binding list without a volume length");
         }
+        require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
+        collection.selectFiber(a.id, false, false);
+        checkHubStatus(state, controller, collection, [&] { return catalog.size() == 2; });
+        {
+            const auto generation = controller._fiberDataGeneration;
+            const auto snapshots = controller._sideStripStoredSnapshotCache.size();
+            int catalogUpdates = 0, fiberUpdates = 0, selectionResets = 0;
+            QObject observer;
+            QObject::connect(&collection, &FiberCollectionController::catalogChanged, &observer,
+                [&](const auto&, bool) { ++catalogUpdates; });
+            QObject::connect(&collection, &FiberCollectionController::selectionChanged, &observer,
+                [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
+            QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
+            const auto connection = state.objectStoreSession();
+            const auto attachment = *connection->attachment();
+            const auto unrelated = vc::util::newUuid();
+            connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
+                ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
+                db.upsertObject(txn, record);
+            });
+            state.pollObjectStoreChanges();
+            // Old/foreign attachments must not invalidate this store's fibers.
+            StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,
+                {vc::util::newUuid(), attachment.generation}, 0, {}};
+            JournalEntry change; change.kind = "fiber"; foreign.changes.push_back(change);
+            state.objectStoreChanged(foreign);
+            QApplication::processEvents();
+            require(catalogUpdates == 0 && fiberUpdates == 0 && selectionResets == 0,
+                    "unrelated and foreign commits preserve catalog and selection");
+            require(controller._fiberDataGeneration == generation &&
+                    controller._sideStripStoredSnapshotCache.size() == snapshots,
+                    "unrelated and foreign commits preserve warm fiber snapshots");
+        }
         const auto transferPaths = controller.fiberTransportPaths({a.id});
         require(transferPaths.size() == 2, "transport includes both linked endpoints");
         auto readDocument = [](const auto& file) { std::ifstream input(file); return nlohmann::json::parse(input); };
@@ -125,6 +202,8 @@ int runObjectStoreControllerTests()
         const auto bWire = readDocument(transferPaths.at(b.uuid));
         require(aWire["branches"][0]["branch_file"] == b.uuid + ".json", "transport serializes branch target UUID");
         require(bWire["branches"][0]["branch_file"] == a.uuid + ".json", "transport serializes reciprocal branch");
+        require(aWire["branches"][0].value("auto", false) && bWire["branches"][0].value("auto", false),
+                "transport writes the automatic mark on both entries");
         require(aWire["name"] == bWire["name"] && aWire["filename"] != bWire["filename"], "same-name fibers have distinct transport identities");
         {
             QTemporaryDir transfers;
@@ -145,7 +224,33 @@ int runObjectStoreControllerTests()
                 require(fiber.fileName == "same_name.json", "display name survives transfer");
                 require(fiber.branches.size() == 1, "shared branch survives transfer");
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
+                require(fiber.branches.front().autoLink, "automatic mark survives transfer");
             }
+        }
+        {
+            // Approval clears the mark on the shared edge.
+            auto approved = a;
+            approved.branches[0].pending = false;
+            const auto generation = controller._fiberDataGeneration;
+            controller.commitFibers({&approved});
+            state.pollObjectStoreChanges();
+            require(controller._fiberDataGeneration > generation && controller._sideStripStoredSnapshotCache.empty(),
+                    "real commits still invalidate fiber geometry snapshots after hub status events");
+            QElapsedTimer timer; timer.start();
+            const auto approvedCatalog = [&] {
+                return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
+                    [](const auto& row) { return row.pendingLinks == 0; });
+            };
+            while (!approvedCatalog() && timer.elapsed() < 10000) { QApplication::processEvents(); QThread::msleep(1); }
+            require(approvedCatalog(), "real commits still refresh catalog link state");
+            const auto again = resolve(a.uuid);
+            require(!again.branches[0].pending && !again.branches[0].autoLink, "approval clears the automatic mark");
+            auto pending = again;
+            pending.branches[0].pending = true;
+            controller.commitFibers({&pending});
+            const auto human = resolve(b.uuid);
+            require(human.branches[0].pending && !human.branches[0].autoLink, "re-flagged link is a human pending link");
+            a=resolve(a.uuid);b=resolve(b.uuid);
         }
         {
             QTemporaryDir directory;

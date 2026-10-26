@@ -14,6 +14,19 @@ int main() try {
                                       Json{{"position",{5.25,2,3}}}})},
         {"line_points",{{1.25,2,3},{5.25,2,3}}}, {"hv_classification",{{"manual_tag","H"}}}};
     const auto doc = decodeFiberJson(root.dump());
+    {
+        // A batch links to the fibers it names outside itself; those are the pins a checked import needs.
+        const auto existing = util::newUuid();
+        auto linked = root; linked["uuid"] = util::newUuid();
+        linked["branches"] = Json::array({Json{{"target_uuid", existing}, {"control_point_index", 0},
+                                               {"branch_control_point_index", 0}}});
+        linked["adjacent_branches"] = linked["branches"];
+        auto back = root; back["uuid"] = existing;
+        require(fiberBatchEndpoints({decodeFiberJson(linked.dump())}) == std::vector<std::string>{existing},
+                "a prepared fiber batch reports the existing fibers it links to");
+        require(fiberBatchEndpoints({decodeFiberJson(linked.dump()), decodeFiberJson(back.dump())}).empty(),
+                "links within the batch need no pins");
+    }
     for (const int version : {1, 2}) {
         auto legacy = root; legacy["version"] = version;
         mustFail([&] { decodeFiberJson(legacy.dump()); });
@@ -69,6 +82,38 @@ int main() try {
         mustFail([&] {fiberRevisionJson(db,txn,*receipt.at(uuid),1);});
     });
     mustFail([&] { session.act(attachment,receipt,[](auto&,auto&) {}); });
+    {
+        // Only linked endpoints participate in checked import concurrency.
+        const auto unrelated = util::newUuid();
+        session.act(attachment, {{unrelated, {}}}, [&](auto& db, auto& txn) {
+            auto record = doc.object; record.uuid = unrelated;
+            db.upsertObject(txn, record); db.putGeometry(txn, unrelated, doc.geometry);
+        });
+        auto linked = root; const auto imported = util::newUuid(); linked["uuid"] = imported;
+        linked["branches"] = Json::array({Json{{"target_uuid", uuid}, {"control_point_index", 0},
+                                               {"branch_control_point_index", 0}}});
+        auto batch = std::vector<GeometrySource>{decodeFiberJson(linked.dump())};
+        RevisionSelection pins{{imported, {}}};
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& target : fiberBatchEndpoints(batch))
+                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+        });
+        { auto txn = external.write(); external.setMeta(txn, unrelated, "concurrent", "true"); txn.commit(); }
+        session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); });
+        // Reusing the new identity still fails even though unrelated fibers are not pinned.
+        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        const auto rejected = util::newUuid(); linked["uuid"] = rejected;
+        batch = {decodeFiberJson(linked.dump())}; pins = {{rejected, {}}};
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& target : fiberBatchEndpoints(batch))
+                pins[target] = db.currentObjectRevision(txn, target)->uuid;
+        });
+        { auto txn = external.write(); external.setMeta(txn, uuid, "concurrent", "true"); txn.commit(); }
+        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, batch); }); });
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            require(!db.objectByUuid(txn, rejected), "a changed linked endpoint rejects the entire import");
+        });
+    }
     const auto a = util::newUuid(), b = util::newUuid(), isolated = util::newUuid();
     std::string ordinary, adjacent;
     const auto networkPins = session.act(attachment, {{a,{}},{b,{}},{isolated,{}}}, [&](auto& db, auto& txn) {
@@ -85,8 +130,10 @@ int main() try {
         edge.aAnchor.points = {{"control_point_ids", {10}}}; edge.bAnchor.points = {{"control_point_ids", {90}}};
         edge.aAnchor.position = {5,2,3}; edge.bAnchor.position = {1,2,3};
         edge.aAnchor.direction = {1,0,0}; edge.bAnchor.direction = {0,1,0};
+        // A stale automatic mark on a reviewed edge is not transported.
+        edge.meta = R"({"auto":true})";
         ordinary = db.addEdge(txn, edge); db.setApproval(txn, ordinary, "approved");
-        edge.meta = R"({"adjacent":true})";
+        edge.meta = R"({"adjacent":true,"auto":true})";
         edge.aAnchor.points = {{"control_point_ids", {90}}}; edge.aAnchor.position = {1,2,3};
         edge.bAnchor.points = {{"control_point_ids", {10}}}; edge.bAnchor.position = {5,2,3};
         adjacent = db.addEdge(txn, edge); db.setApproval(txn, adjacent, "pending");
@@ -102,6 +149,8 @@ int main() try {
         require(link["branch_file"] == b+".json" && link["edge_uuid"] == ordinary && !link["pending"].get<bool>(), "ordinary branch exported from edge");
         require(second["branches"][0]["branch_file"] == a+".json" && second["branches"][0]["control_point_index"] == 0, "reciprocal orientation exported");
         require(first["adjacent_branches"][0]["edge_uuid"] == adjacent && first["adjacent_branches"][0]["pending"].get<bool>(), "adjacent pending edge preserved separately");
+        require(!link.contains("auto") && !first["adjacent_branches"][0].contains("auto"),
+                "automatic mark only on pending ordinary links");
         require(first["coordinates"]["scale_factor"] == 4.0, "coordinate binding exported");
         require(!first.contains("coordinate_binding"), "source annotations cannot restore an absent binding");
         mustFail([&] { fiberNetworkJson(db,txn,{{a,networkPins.at(a)}}); });

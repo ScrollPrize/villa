@@ -26,10 +26,67 @@ class LossStatistics:
     positive_embedding_count: torch.Tensor | None = None
     negative_embedding_sum: torch.Tensor | None = None
     negative_embedding_count: torch.Tensor | None = None
+    contrastive_embedding_sum: torch.Tensor | None = None
+    contrastive_embedding_count: torch.Tensor | None = None
+    short_embedding_sum: torch.Tensor | None = None
+    short_embedding_count: torch.Tensor | None = None
+    long_embedding_sum: torch.Tensor | None = None
+    long_embedding_count: torch.Tensor | None = None
+    distribution_presence_sum: torch.Tensor | None = None
+    distribution_presence_count: torch.Tensor | None = None
+    sideband_left_presence_sum: torch.Tensor | None = None
+    sideband_left_presence_count: torch.Tensor | None = None
+    sideband_right_presence_sum: torch.Tensor | None = None
+    sideband_right_presence_count: torch.Tensor | None = None
+    normal_sum: torch.Tensor | None = None
+    normal_count: torch.Tensor | None = None
+    normal_unweighted_sum: torch.Tensor | None = None
+    width_sum: torch.Tensor | None = None
+    width_count: torch.Tensor | None = None
+    hv_sum: torch.Tensor | None = None
+    hv_count: torch.Tensor | None = None
+    coarse_tube_sum: torch.Tensor | None = None
+    coarse_tube_count: torch.Tensor | None = None
+    coarse_tube_positive_sum: torch.Tensor | None = None
+    coarse_tube_positive_count: torch.Tensor | None = None
+    coarse_tube_negative_sum: torch.Tensor | None = None
+    coarse_tube_negative_count: torch.Tensor | None = None
+    coarse_positive_sum: torch.Tensor | None = None
+    coarse_positive_count: torch.Tensor | None = None
+    coarse_background_sum: torch.Tensor | None = None
+    coarse_background_count: torch.Tensor | None = None
+    coarse_direction_sum: torch.Tensor | None = None
+    coarse_direction_count: torch.Tensor | None = None
+    coarse_angle_sum: torch.Tensor | None = None
+    coarse_angle_count: torch.Tensor | None = None
+
+    # Reporting-only numerators; optimization still consumes the weighted sums.
+    width_unweighted_sum: torch.Tensor | None = None
+    hv_unweighted_sum: torch.Tensor | None = None
+    positive_embedding_unweighted_sum: torch.Tensor | None = None
+    negative_embedding_unweighted_sum: torch.Tensor | None = None
+    contrastive_embedding_unweighted_sum: torch.Tensor | None = None
+    short_embedding_unweighted_sum: torch.Tensor | None = None
+    long_embedding_unweighted_sum: torch.Tensor | None = None
 
     def __post_init__(self):
-        for name in ("positive_embedding_sum", "positive_embedding_count",
-                     "negative_embedding_sum", "negative_embedding_count"):
+        for name in ('coarse_positive', 'coarse_background', 'coarse_direction', 'coarse_angle', 'coarse_tube', 'coarse_tube_positive', 'coarse_tube_negative'):
+            for suffix in ('sum', 'count'):
+                key = name + '_' + suffix
+                if getattr(self, key) is None:
+                    object.__setattr__(self, key, torch.zeros_like(self.direction_count))
+        for name in ("width_unweighted_sum", "hv_unweighted_sum",
+                     "positive_embedding_unweighted_sum", "negative_embedding_unweighted_sum",
+                     "contrastive_embedding_unweighted_sum", "short_embedding_unweighted_sum", "long_embedding_unweighted_sum",
+                     "normal_sum", "normal_count", "normal_unweighted_sum", "width_sum", "width_count", "hv_sum", "hv_count",
+                     "positive_embedding_sum", "positive_embedding_count",
+                     "negative_embedding_sum", "negative_embedding_count",
+                     "contrastive_embedding_sum", "contrastive_embedding_count",
+                     "short_embedding_sum", "short_embedding_count",
+                     "long_embedding_sum", "long_embedding_count",
+                     "distribution_presence_sum", "distribution_presence_count",
+                     "sideband_left_presence_sum", "sideband_left_presence_count",
+                     "sideband_right_presence_sum", "sideband_right_presence_count"):
             if getattr(self, name) is None:
                 object.__setattr__(self, name, torch.zeros_like(self.direction_count))
 

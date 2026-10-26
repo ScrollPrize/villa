@@ -121,6 +121,9 @@ private:
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> views_;
     void clear();
     void invalidate();
+    // Re-query every view while it keeps drawing its current region.
+    void refreshRegions();
+    void publishCount();
     void publishStatus(const QString& text);
     void publishSelection(Selection selection);
     void startPendingAnnotation();
@@ -135,5 +138,7 @@ private:
     // point chains of annotated fibers within the surface's bounds instead.
     void requestChains(VolumeViewerBase* viewer, const std::array<double, 6>& box);
     void collectChainPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder);
+    static void addLinkMark(OverlayBuilder& builder, const QPointF& center,
+                            const OverlayStyle& style, bool adjacent);
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
 };

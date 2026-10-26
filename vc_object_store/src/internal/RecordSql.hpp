@@ -31,7 +31,8 @@ bool wants(const ObjectFields& fields, const std::string& name);
 std::string projectedObjectColumns(const ObjectFields& fields);
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind);
+                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::string& deletedKind = {});
 
 void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol, int genCol);
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Hub.hpp"
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
@@ -27,7 +29,8 @@ struct PinnedObject {
 };
 
 struct StoreSessionEvent {
-    enum class Kind { Attachment, Committed };
+    // Hub: the attached replica's hubStatus() changed.
+    enum class Kind { Attachment, Committed, Hub };
     Kind kind = Kind::Attachment;
     // Empty storeUuid denotes detachment. Generation increases on every switch,
     // including reattachment of the same file/UUID.
@@ -36,6 +39,40 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
+};
+
+// Hosted replicas (objects/Hub.hpp) attached to a session sync in the background.
+struct HubSessionOptions {
+    std::chrono::milliseconds syncInterval{15000};
+    std::chrono::milliseconds pushDelay{2000};  // after a local action, to batch edits
+};
+
+struct HubSessionStatus {
+    std::vector<std::string> pending;   // records changed here and not yet pushed
+    std::vector<HubConflict> conflicts; // block pushing; see resolveHubConflicts
+    std::string error;                  // last failed sync; empty once one succeeds
+    std::optional<int64_t> syncedAtUs;  // last successful sync, UTC Unix microseconds
+    std::vector<HubLease> leases;       // as of the last hub contact
+};
+
+namespace detail { struct HubLeaseCounts; class HubWorker; }
+
+// Keeps objects leased while it lives. Leases are renewed in the background;
+// once no hold remains and the object's changes are pushed, the lease is released.
+class LeaseHold {
+public:
+    LeaseHold() = default;
+    LeaseHold(LeaseHold&&) noexcept;
+    LeaseHold& operator=(LeaseHold&&) noexcept;
+    LeaseHold(const LeaseHold&) = delete;
+    LeaseHold& operator=(const LeaseHold&) = delete;
+    ~LeaseHold() { reset(); }
+    void reset();
+
+private:
+    friend class detail::HubWorker;
+    std::weak_ptr<detail::HubLeaseCounts> counts_;
+    std::vector<std::string> objects_;
 };
 
 // Application-owned connection and lifetime boundary, independent of object kind
@@ -55,7 +92,8 @@ public:
     ObjectStoreSession& operator=(const ObjectStoreSession&) = delete;
 
     // Existing database only; read-only attachments reject all actions. Validation failure preserves the attachment.
-    AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&);
+    // A writable hosted replica also starts background hub sync.
+    AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions& = {});
     void detach();
     std::optional<AttachmentIdentity> attachment() const;
     bool writable() const;
@@ -71,12 +109,23 @@ public:
     // non-fiber records. Events retain attachment identity across replacements.
     std::vector<StoreSessionEvent> takeEvents();
 
+    // Hosted replicas: lease objects before editing them, pulling once if the
+    // hub is ahead. Blocks on the hub; throws HubLeaseRefused when another
+    // replica holds one. Returns an empty hold for other stores.
+    LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects);
+    // nullopt unless a writable hosted replica is attached.
+    std::optional<HubSessionStatus> hubStatus() const;
+    // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.
+    void syncHub();
+    void resolveHubConflicts(const std::string& keep);
+
 private:
     struct Attachment;
     std::shared_ptr<Attachment> acquire(const AttachmentIdentity&, bool write);
     void release(bool write);
     void switchTo(std::shared_ptr<Attachment>);
     void observe(const std::shared_ptr<Attachment>&);
+    void hubChanged(const Attachment*);
 
     // transition_ serializes lifecycle operations; writer_ serializes accepted
     // actions. Neither is held by read callbacks. mutex_ protects admission.

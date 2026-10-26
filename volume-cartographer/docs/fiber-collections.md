@@ -2,10 +2,26 @@
 
 VC3D uses one writable `.vcobj` for fiber geometry, annotations, stable control
 point identities, revisions, and shared branch relationships. Choose **File →
-Attach Object Store**, or launch `VC3D --object-store /data/fibers.vcobj`.
+Object Store → Attach Object Store**, or launch `VC3D --object-store /data/fibers.vcobj`.
+Stores attached from that menu are listed under **File → Object Store → Open Recent
+Object Store**; replicas of hosted stores are tagged *(remote)*.
 Attachment lasts for the session. A failed replacement leaves the current store
 attached. Detaching or replacing it cancels old background reads and closes the
 fiber panes after accepted writes finish.
+
+To share fibers with other people, keep the store as a hosted hub on a network
+share. Choose **File → Object Store → Clone Hosted Object Store...** to copy the
+hub into a local replica and attach it. VC3D then syncs the replica in the background: every 15 s,
+and shortly after each local edit. The status bar shows the sync state. **File → Object
+Store → Sync Hosted Object Store Now** syncs immediately.
+
+Enabling editing of a fiber, and any edit, tag or retire action, first leases
+that fiber from the hub. If someone else holds the lease, VC3D reports who and
+the fiber stays read-only. Leases of fibers still open for editing are renewed.
+Other leases are released once their changes are pushed. When a fiber changed
+both here and on the hub, VC3D asks whether to use the hub's version or keep
+yours. See the store's [hosted hub
+guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas).
 
 Create the database outside VC3D, using the sibling object-store tools:
 
@@ -149,3 +165,9 @@ VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
 Use fresh settings for the default-limit assertion. The check prints attachment,
 first-page and selected-fiber timings and verifies UI heartbeats, deferred line
 geometry, bounded catalog pages, and clearing runtime identities on detach.
+It also dispatches 20 status-only hub events against the loaded catalog and
+reports mean, median and p95 time until the catalog is ready, plus catalog,
+fiber-refresh and selection-reset counts. These events must preserve selection
+and warm fiber snapshots without reloading geometry. Use a local replica when
+testing a hosted store. This measures notification handling, not rendering FPS;
+the regular smoke test separately checks that actual commits refresh the views.

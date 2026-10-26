@@ -483,6 +483,23 @@ TEST_CASE("Volume entry tags produce remote-volume metadata")
     CHECK(metadata.at("name").get_string() == "Overlay");
 }
 
+TEST_CASE("Only native catalog source entries use the catalog volume ID")
+{
+    const std::string catalogTag = "vc-open-data-volume-id:20260102150214";
+    const auto source = vc::project::volumeMetadataFromEntryTags({
+        catalogTag, "vc-open-data-preferred-source",
+        "vc-open-data-source-coordinate-level:0",
+    });
+    CHECK(source.at("uuid").get_string() == "20260102150214");
+    for (const auto& tags : std::vector<std::vector<std::string>>{
+             {}, {catalogTag}, {"vc-open-data-preferred-source"},
+             {"vc-open-data-preferred-source", "vc-open-data-volume-id:"},
+             {catalogTag, "prediction", "vc-open-data-source-coordinate-level:0"},
+             {catalogTag, "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2"}}) {
+        CHECK_FALSE(vc::project::volumeMetadataFromEntryTags(tags).contains("uuid"));
+    }
+}
+
 TEST_CASE("VolumePkg::setOutputSegments / clearOutputSegments toggle")
 {
     auto p = VolumePkg::newEmpty();

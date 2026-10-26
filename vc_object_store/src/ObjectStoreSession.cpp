@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "hub/HubWorker.hpp"
 #include <stdexcept>
 
 namespace vc::objects {
@@ -9,6 +10,8 @@ struct ObjectStoreSession::Attachment {
     bool writable = true;
     std::atomic_bool cancelled{false};
     int64_t journalPosition = 0; // guarded by journal_
+    // Hosted replicas only; declared after store so it stops first.
+    std::unique_ptr<detail::HubWorker> hub;
 };
 
 ObjectStoreSession::~ObjectStoreSession()
@@ -18,7 +21,8 @@ ObjectStoreSession::~ObjectStoreSession()
     try { detach(); } catch (...) {}
 }
 
-AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options)
+AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options,
+                                              const HubSessionOptions& hubOptions)
 {
     std::lock_guard transition(transition_);
     auto next = std::make_shared<Attachment>(ObjectStore::open(path, options));
@@ -31,6 +35,9 @@ AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path,
         next->identity.storeUuid = next->store.uuid(txn);
         next->journalPosition = next->store.journalPosition(txn);
     }
+    if (next->writable && vc::objects::hubStatus(next->store))
+        next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
+            [this, owner = next.get()] { hubChanged(owner); });
     switchTo(next);
     return next->identity;
 }
@@ -59,6 +66,9 @@ void ObjectStoreSession::switchTo(std::shared_ptr<Attachment> next)
     accepting_ = true;
     events_.push_back({StoreSessionEvent::Kind::Attachment, identity,
                       attached_ ? attached_->journalPosition : 0, {}});
+    // Stop the old replica's sync outside the lock its status reports take.
+    lock.unlock();
+    if (previous) previous->hub.reset();
 }
 
 void ObjectStoreSession::detach()
@@ -125,6 +135,7 @@ RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
         callback(attachment->store, txn);
         txn.commit();
         committed = txn.committedRevisions();
+        if (attachment->hub) attachment->hub->requestSync(true);
     } catch (...) { release(true); throw; }
     release(true);
     return committed;
@@ -168,5 +179,41 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
     std::vector<StoreSessionEvent> result;
     result.swap(events_);
     return result;
+}
+
+LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, const std::vector<std::string>& objects)
+{
+    auto attachment = acquire(identity, true);
+    LeaseHold hold;
+    try {
+        if (attachment->hub) hold = attachment->hub->hold(objects);
+    } catch (...) { release(true); throw; }
+    release(true);
+    return hold;
+}
+
+std::optional<HubSessionStatus> ObjectStoreSession::hubStatus() const
+{
+    std::lock_guard lock(mutex_);
+    if (!attached_ || !attached_->hub) return std::nullopt;
+    return attached_->hub->status();
+}
+
+void ObjectStoreSession::syncHub()
+{
+    std::lock_guard lock(mutex_);
+    if (attached_ && attached_->hub) attached_->hub->requestSync(false);
+}
+
+void ObjectStoreSession::resolveHubConflicts(const std::string& keep)
+{
+    std::lock_guard lock(mutex_);
+    if (attached_ && attached_->hub) attached_->hub->requestResolve(keep);
+}
+
+void ObjectStoreSession::hubChanged(const Attachment* owner)
+{
+    std::lock_guard lock(mutex_);
+    if (attached_.get() == owner) events_.push_back({StoreSessionEvent::Kind::Hub, attached_->identity, 0, {}});
 }
 }

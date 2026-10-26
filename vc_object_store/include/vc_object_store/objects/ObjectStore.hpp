@@ -138,6 +138,7 @@ struct SelectedRelationship {
 struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;
+    std::string kind; // the object or edge kind, recorded at the change
     int64_t generation = 0;
     std::string author, hostname, timestamp, changeKind;
     // Approval snapshot after this change; absent for deletion events.
@@ -157,6 +158,11 @@ struct OpenOptions {
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
+    // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
+    // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
+    // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
+    // opens of a hub are rejected so they cannot switch it back to WAL.
+    bool sharedFile = false;
 };
 
 struct ObjectSelection {
@@ -190,10 +196,6 @@ struct ObjectSelection {
     // UUID order (a cursor into them has afterUuid without afterLength).
     // Excluded when minLength is positive. Not valid for spatialRegions.
     bool includeUnbound = false;
-};
-struct ObjectCoordinateGroup {
-    std::string coordinates;
-    int64_t count = 0;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -394,9 +396,10 @@ public:
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
     int64_t objectCount(const Txn& txn, const std::string& kind, bool includeRetired = false) const;
-    // Metadata-only aggregation, without reading geometry or materializing objects.
-    std::vector<ObjectCoordinateGroup> objectCoordinateGroups(const Txn&, const std::string& kind,
-                                                             const std::atomic_bool* cancel = nullptr) const;
+    // Active objects of kind that a volume selection lists as unbound (no
+    // finite positive scale declared for volume). Reads only the unbound index
+    // ranges, so a store bound to one volume is not scanned.
+    int64_t unboundObjectCount(const Txn&, const std::string& kind, const std::string& volume) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
     // Distinct tags on active objects, optionally of one kind, sorted.
     std::vector<std::string> objectTags(const Txn&, const std::optional<std::string>& kind = std::nullopt) const;

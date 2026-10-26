@@ -522,6 +522,13 @@ utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags)
     const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
     if (!nameTag.empty())
         metadata["name"] = nameTag;
+    // Only the native source scan owns the catalog ID. Predictions and
+    // rebased source views also carry this tag, but have distinct identities
+    // and coordinate frames. Apply this on every open, including saved projects.
+    const auto catalogId = tagValueWithPrefix(tags, "vc-open-data-volume-id:");
+    if (!catalogId.empty() &&
+        std::find(tags.begin(), tags.end(), "vc-open-data-preferred-source") != tags.end())
+        metadata["uuid"] = catalogId;
     return metadata;
 }
 

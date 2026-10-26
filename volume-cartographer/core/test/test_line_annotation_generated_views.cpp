@@ -10,6 +10,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
@@ -7442,3 +7443,110 @@ TEST_CASE("Mirrored control edits report tail-policy and goal changes per list")
         CHECK(!outcome.changed);
     }
 }
+
+TEST_CASE("Nearest drawn line position: the foot on the nearest drawn, non-tail segment")
+{
+    using vc3d::line_annotation::nearestDrawnLinePosition;
+    constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+    const double kNan = std::numeric_limits<double>::quiet_NaN();
+    const auto scene = [](const std::vector<cv::Vec3f>& points) {
+        std::vector<QPointF> out;
+        for (const auto& p : points) {
+            out.emplace_back(std::isfinite(p[0]) ? p[0] : std::numeric_limits<double>::quiet_NaN(),
+                             std::isfinite(p[1]) ? p[1] : std::numeric_limits<double>::quiet_NaN());
+        }
+        return out;
+    };
+    SUBCASE("exact fractional foot")
+    {
+        const std::vector<cv::Vec3f> line{{0, 0, 0}, {10, 0, 0}, {20, 0, 0}};
+        const auto position = nearestDrawnLinePosition(line, scene(line), std::nullopt, QPointF(5, 3));
+        REQUIRE(position.has_value());
+        CHECK(*position == doctest::Approx(0.5));
+        const auto later = nearestDrawnLinePosition(line, scene(line), std::nullopt, QPointF(17.5, -2));
+        REQUIRE(later.has_value());
+        CHECK(*later == doctest::Approx(1.75));
+    }
+    SUBCASE("a blanked prefix is never chosen; a blanked interior vertex is bridged")
+    {
+        const std::vector<cv::Vec3f> prefixBlank{{kNanF, kNanF, kNanF}, {10, 0, 0}, {20, 0, 0}};
+        const auto p = nearestDrawnLinePosition(prefixBlank, scene(prefixBlank), std::nullopt, QPointF(0, 1));
+        REQUIRE(p.has_value());
+        CHECK(*p == doctest::Approx(1.0));  // clamped to the first drawn vertex
+        const std::vector<cv::Vec3f> interiorBlank{{0, 0, 0}, {kNanF, kNanF, kNanF}, {20, 0, 0}};
+        const auto bridged = nearestDrawnLinePosition(interiorBlank, scene(interiorBlank), std::nullopt, QPointF(10, 3));
+        REQUIRE(bridged.has_value());
+        CHECK(*bridged == doctest::Approx(1.0));  // the bridge's midpoint, as the renderer draws it
+        const std::vector<cv::Vec3f> suffixBlank{{0, 0, 0}, {10, 0, 0}, {kNanF, kNanF, kNanF}};
+        const auto s = nearestDrawnLinePosition(suffixBlank, scene(suffixBlank), std::nullopt, QPointF(30, 0));
+        REQUIRE(s.has_value());
+        CHECK(*s == doctest::Approx(1.0));
+    }
+    SUBCASE("a tail segment is excluded")
+    {
+        const std::vector<cv::Vec3f> line{{0, 0, 0}, {10, 0, 0}, {20, 0, 0}};
+        // Controls at 1 and 2: the segment 0-1 (midpoint 0.5) is a tail.
+        const std::optional<std::pair<double, double>> range{{1.0, 2.0}};
+        const auto p = nearestDrawnLinePosition(line, scene(line), range, QPointF(2, 1));
+        REQUIRE(p.has_value());
+        CHECK(*p == doctest::Approx(1.0));
+    }
+    SUBCASE("ties take the lower position; nothing drawn gives nullopt")
+    {
+        const std::vector<cv::Vec3f> square{{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}};
+        const auto tie = nearestDrawnLinePosition(square, scene(square), std::nullopt, QPointF(5, 5));
+        REQUIRE(tie.has_value());
+        CHECK(*tie == doctest::Approx(0.5));
+        const std::vector<cv::Vec3f> blank{{kNanF, kNanF, kNanF}, {kNanF, kNanF, kNanF}};
+        CHECK_FALSE(nearestDrawnLinePosition(blank, scene(blank), std::nullopt, QPointF(0, 0)).has_value());
+        const std::vector<cv::Vec3f> one{{0, 0, 0}};
+        CHECK_FALSE(nearestDrawnLinePosition(one, scene(one), std::nullopt, QPointF(0, 0)).has_value());
+        CHECK_FALSE(nearestDrawnLinePosition(square, scene(square), std::nullopt, QPointF(kNan, 0)).has_value());
+    }
+}
+
+TEST_CASE("Auto-link choice facts: a stored record and a session-shaped view of the same fiber agree")
+{
+    using vc3d::line_annotation::autoLinkChoiceFacts;
+    using vc3d::line_annotation::autoLinkChoiceFactsFromStoredFiber;
+    using vc3d::line_annotation::FiberBranchRef;
+    using vc3d::line_annotation::StoredFiber;
+    // Three controls: the middle one linked to another fiber, the last one a
+    // kollesis termination, a gap span between the middle and the last.
+    StoredFiber fiber;
+    fiber.id = 7;
+    fiber.fileName = "a.json";
+    for (int i = 0; i < 3; ++i) {
+        fiber.controlPoints.emplace_back(cv::Vec3d(10.0 * i, 1.0, 2.0));
+    }
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[2].tags,
+                                              vc3d::line_annotation::kKollesisTerminationTag, true);
+    fiber.controlPoints[1].segmentToNext = vc3d::line_annotation::FiberTraceSegmentMetadata{};
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[1].segmentToNext->tags,
+                                              vc3d::line_annotation::kGapSpanTag, true);
+    FiberBranchRef link;
+    link.controlPointIndex = 1;
+    link.branchFiberId = 9;
+    link.branchFileName = "b.json";
+    link.branchControlPointIndex = 0;
+    fiber.branches.push_back(link);
+
+    const auto stored = autoLinkChoiceFactsFromStoredFiber(fiber);
+    // The session-shaped view: positions, the same refs, per-control tags,
+    // per-span gap flags - what choiceSourceFromSession hands the builder.
+    const std::vector<cv::Vec3d> positions{{0, 1, 2}, {10, 1, 2}, {20, 1, 2}};
+    const std::vector<std::vector<std::string>> tags{
+        {}, {}, {std::string(vc3d::line_annotation::kKollesisTerminationTag)}};
+    const std::vector<bool> gaps{false, true, false};
+    const auto session = autoLinkChoiceFacts(positions, fiber.branches, tags, gaps);
+    CHECK(stored == session);
+    REQUIRE(stored.controls.size() == 3);
+    CHECK(stored.linked == std::vector<bool>{false, true, false});
+    CHECK(stored.kollesisTerminations == std::vector<bool>{false, false, true});
+    REQUIRE(stored.gapSpans.size() == 1);
+    CHECK(stored.gapSpans[0] == std::pair<std::size_t, std::size_t>{1, 2});
+    // The control index the chooser reports is the index in this order: the
+    // session's own index for a session.
+    CHECK(stored.controls[1] == cv::Vec3d(10, 1, 2));
+}
+

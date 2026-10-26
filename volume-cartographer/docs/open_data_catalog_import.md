@@ -8,12 +8,24 @@ and Select all/Select none also work. Set the project name and destination
 the currently open project cannot be overwritten through this action.
 
 Fibers live in an explicitly attached object store (`.vcobj`). Project creation
-does not create a fiber directory. Use File → Attach Object Store, then the
+does not create a fiber directory. Use File → Object Store → Attach Object Store, then the
 explicit fiber import command for current-format transfer JSON.
 
 An empty selection creates an empty project. Open Sample still uses the existing
 full-sample workflow. The selective path never loads the cached full-sample project.
 Saved projects reopen through ordinary project loading and use the global cache.
+
+Native catalog source scans use the catalog volume ID (for example,
+`20260102150214`) when opened, including from existing saved projects. This lets
+object-store fibers bound to that ID match the streamed scan automatically.
+Predictions and rebased source views retain distinct IDs; sharing a catalog tag
+does not make their coordinate frames interchangeable.
+
+The annotation ID is separate from the remote chunk-cache identity. Catalog
+scans reuse the original source cache directory (the URL-derived ID, or the
+upstream metadata UUID when present), with separate directories for rebased
+views. Existing directories are neither renamed nor merged. Any cache created
+under the plain catalog ID by the earlier implementation is left untouched.
 
 The initial JSON destination uses the same directory as File -> New Project
 (normally the per-user `.VC3D` directory). Volumes, Representations and Segments

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <map>
+#include <set>
 #include <nlohmann/json.hpp>
 using namespace vc::objects;
 
@@ -132,5 +133,31 @@ int main() try
     require(rejects([&] { store.selectObjects(txn, orphan); }), "unbound listing needs a volume");
     auto unboundRegions = box; unboundRegions.includeUnbound = true;
     require(rejects([&] { store.spatialRegions(txn, unboundRegions); }), "regions cannot place unbound objects");
+
+    require(store.unboundObjectCount(txn, "fiber", volume) == 3 && store.unboundObjectCount(txn, "track", volume) == 0,
+            "unbound count matches the unbound tail");
+
+    // Deleting fibers retires them: they and any frame left without active
+    // objects leave the catalog, the unbound count and the overlay regions.
+    {
+        const std::vector<std::string> retire{ids["a10"], ids["b72"], ids["b60"], ids["loose1"]};
+        RevisionSelection expected;
+        for (const auto& uuid : retire) expected[uuid] = store.currentObjectRevision(txn, uuid)->uuid;
+        auto write = store.write(expected);
+        for (const auto& uuid : retire) store.retireObject(write, uuid);
+        write.commit();
+    }
+    auto after = store.read();
+    require(names(store.selectObjects(after, byLength)) == std::vector<std::string>{"a40", "a30"},
+            "retired objects and their frames leave the volume selection");
+    auto activeUnbound = byLength; activeUnbound.includeUnbound = true;
+    const auto active = names(store.selectObjects(after, activeUnbound));
+    require(active.size() == 4 && active[0] == "a40" && active[1] == "a30" &&
+            std::set<std::string>(active.begin() + 2, active.end()) == std::set<std::string>{"loose2", "elsewhere"},
+            "the unbound tail lists active objects of other or no volumes");
+    require(store.unboundObjectCount(after, "fiber", volume) == 2, "the unbound count skips retired objects");
+    RegionOptions activeRegion; activeRegion.volume = volume;
+    require(store.geometryRegion(after, slice, activeRegion).intersectingObjects == 2,
+            "regions skip the frames of retired objects");
     std::cout << "volume target tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

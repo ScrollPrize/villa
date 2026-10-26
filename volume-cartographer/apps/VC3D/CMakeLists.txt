@@ -44,6 +44,7 @@ set(srcs
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
+    FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp
@@ -211,6 +212,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    SshPrompts.cpp
+    SshPrompts.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp

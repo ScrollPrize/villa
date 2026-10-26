@@ -36,6 +36,11 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 struct StatementPool {
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
+    // Hosted-store bookkeeping for the active write (see hub/HubRules.hpp):
+    // cursors at BEGIN, and whether this write applies hub state verbatim.
+    bool hubApply = false;
+    std::optional<std::string> actingHolder;
+    int64_t startJournal = 0, startGeometry = 0;
     std::map<std::string, std::vector<int64_t>> components;
     size_t componentNodes = 0;
     std::shared_ptr<detail::GeometryReadCache> geometryCache;
@@ -49,10 +54,13 @@ namespace detail {
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);
 void beginSpatialRead(StatementPool&, size_t budget, int version);
 }
+// Hosting role, fixed at open by the presence of the hub_* tables.
+enum class HubRole { None, Hub, Replica };
 struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;
     std::string hostname;
+    HubRole hubRole = HubRole::None;
     sqlite3* writer = nullptr;
     std::mutex writerMutex;
     std::vector<sqlite3*> readerPool;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import copy
 import heapq
 import hashlib
 import itertools
@@ -9,7 +10,13 @@ import math
 import os
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
+from .embedding import (EmbeddingConfig, EmbeddingGeometry, build_eligibility,
+                        InvalidNormalSampleError)
+from .arc_sampling import FiberLocation, ScrollArcSampler, MixedSourceArcSampler
+from .annotations import AnnotationConfig, line_targets
+from .training_spans import training_fiber_spans
+from .refinement import RefinementConfig, RefinementObservation, active_store, arclength, interpolate, export_metadata, resample
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +55,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import (
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _TARGET_MODE_CP_ONLY = 0
 _TARGET_MODE_DENSE_LINE = 1
+_TARGET_MODE_COARSE_AREA = 2
 DEFAULT_VOLUME_CACHE_MEMORY_MIB = 512.0
 _FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 
@@ -55,11 +63,24 @@ _FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 @dataclass(frozen=True)
 class FiberTrace3DConfig:
     datasets: tuple[dict[str, Any], ...]
+    mixed_supervision: bool = False
+    coarse_tube_weight: float = 0.0
+    logical_batch_size: int = 128
+    annotations: AnnotationConfig = field(default_factory=AnnotationConfig)
+    refinement: RefinementConfig = field(default_factory=RefinementConfig)
+    refinement_split: str = "train"
+    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     batch_size: int = 1
     patch_shape_zyx: tuple[int, int, int] = (192, 192, 192)
     seed: int = 1
     cp_margin_voxels: int = 4
     presence_radius_voxels: float = 2.0
+    presence_target_mode: str = "binary"
+    presence_gaussian_width_ratio: float = 4.0
+    presence_gaussian_truncate_sigma: float = 3.0
+    presence_sideband_weight: float = 0.0
+    presence_sideband_half_width_base: float = 64.0
+    presence_sideband_half_height_base: float = 16.0
     presence_negative_edge_margin_voxels: int | None = None
     image_normalization: str = "zscore"
     augment_enabled: bool = True
@@ -86,8 +107,8 @@ class FiberTrace3DConfig:
     augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
     geometry_tile_depth: int = 0
-    geometry_backend: str = "eager"
-    value_augmentation_backend: str = "torch"
+    geometry_backend: str = "auto"
+    value_augmentation_backend: str = "auto"
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
@@ -100,6 +121,7 @@ class FiberTrace3DConfig:
     volume_cache_offline: bool = False
     volume_cache_retry_seconds: float = 0.0
     config_dir: Path | None = None
+    sampling_strategy: str = "control_points"
 
     @property
     def volume_cache_memory_bytes(self) -> int | None:
@@ -119,6 +141,7 @@ class _Record:
     base_shape_zyx: tuple[int, int, int]
     fiber_identity: str
     dataset_config: dict[str, Any]
+    label_breaks: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +169,7 @@ class _Augment3DParams:
     anisotropic_blur_sigma_along: float
     anisotropic_blur_sigma_across: float
     anisotropic_blur_axis_zyx: np.ndarray | None
+    value_seed_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -195,7 +219,7 @@ class FiberTrace3DSample:
     fiber_path: str
     control_point_index: int
     volume: torch.Tensor
-    valid_mask: torch.Tensor
+    valid_mask: torch.Tensor | None
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
     target_mode: int
@@ -204,7 +228,16 @@ class FiberTrace3DSample:
     target_segment_bbox_lo_zyx: torch.Tensor
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
+    target_segment_normals_zyx: torch.Tensor | None = None
+    target_segment_widths_input: torch.Tensor | None = None
+    volume_spacing_base: float = 1.0
+    presence_target_mode: str = "binary"
+    presence_sideband_weight: float = 0.0
     profile_timings_ms: dict[str, float] | None = None
+    embedding_geometry: EmbeddingGeometry | None = None
+    refinement_geometry: RefinementObservation | None = None
+    annotation_targets: np.ndarray | None = None
+    coarse_geometry: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -226,7 +259,7 @@ class _SharedFiberTrace3DPayload:
 
 
 class FiberTrace3DSharedTensorSlots:
-    """Bounded shared storage for large per-sample volume and mask tensors."""
+    """Bounded shared storage for large per-sample volume tensors."""
 
     def __init__(
         self,
@@ -236,15 +269,21 @@ class FiberTrace3DSharedTensorSlots:
         patch_shape_zyx: tuple[int, int, int],
         stream_index_map: Any = None,
         volume_dtype: torch.dtype = torch.float32,
+        embedding_stride: int = 0,
     ) -> None:
         if int(slot_count) <= 0:
             raise ValueError("slot_count must be positive")
+        if type(embedding_stride) is not int or embedding_stride < 0:
+            raise ValueError("embedding_stride must be a nonnegative integer")
         self.start_index = int(start_index)
         self.slot_count = int(slot_count)
         self.stream_index_map = stream_index_map
         shape = (self.slot_count, 1, *(int(v) for v in patch_shape_zyx))
         self.volumes = torch.empty(shape, dtype=volume_dtype).share_memory_()
-        self.valid_masks = torch.empty(shape, dtype=torch.bool).share_memory_()
+        self.embedding_eligibility = None
+        if embedding_stride:
+            embedding_shape = (self.slot_count, *((int(v) + embedding_stride - 1) // embedding_stride for v in patch_shape_zyx))
+            self.embedding_eligibility = torch.empty(embedding_shape, dtype=torch.bool).share_memory_()
         self.generations = torch.full(
             (self.slot_count,), -1, dtype=torch.int64
         ).share_memory_()
@@ -273,7 +312,14 @@ class FiberTrace3DSharedTensorSlots:
         if int(sample.stream_index) != expected_stream_index:
             raise RuntimeError("shared-slot sample/index mismatch")
         self.volumes[slot].copy_(sample.volume)
-        self.valid_masks[slot].copy_(sample.valid_mask)
+        embedding_geometry = sample.embedding_geometry
+        if embedding_geometry is not None:
+            if self.embedding_eligibility is None:
+                raise ValueError("embedding samples require an embedding-enabled shared-slot bank")
+            if embedding_geometry.eligible is None or embedding_geometry.eligible.shape != self.embedding_eligibility[slot].shape:
+                raise ValueError("embedding eligibility does not match the shared-slot shape")
+            self.embedding_eligibility[slot].copy_(embedding_geometry.eligible)
+            embedding_geometry = replace(embedding_geometry, eligible=None)
         self.generations[slot] = generation
         tensor_metadata = {
             name: np.asarray(getattr(sample, name).detach().cpu().numpy())
@@ -287,8 +333,15 @@ class FiberTrace3DSharedTensorSlots:
                 "target_tangent_zyx",
             )
         }
+        if sample.target_segment_normals_zyx is not None:
+            tensor_metadata["target_segment_normals_zyx"] = np.asarray(
+                sample.target_segment_normals_zyx.detach().cpu().numpy()
+            )
+        if sample.target_segment_widths_input is not None:
+            tensor_metadata["target_segment_widths_input"] = sample.target_segment_widths_input.detach().cpu().numpy()
         metadata_sample = replace(
             sample,
+            embedding_geometry=embedding_geometry,
             volume=None,
             valid_mask=None,
             **tensor_metadata,
@@ -321,6 +374,8 @@ class FiberTrace3DSharedTensorSlots:
             )
         value = payload.value
         sample = value.sample if isinstance(value, FiberTrace3DRawSample) else value
+        if sample.embedding_geometry is not None and self.embedding_eligibility is None:
+            raise ValueError("embedding descriptor requires an embedding-enabled shared-slot bank")
         tensor_metadata = {
             name: torch.from_numpy(np.asarray(getattr(sample, name)))
             for name in (
@@ -333,10 +388,18 @@ class FiberTrace3DSharedTensorSlots:
                 "target_tangent_zyx",
             )
         }
+        if sample.target_segment_normals_zyx is not None:
+            tensor_metadata["target_segment_normals_zyx"] = torch.from_numpy(
+                np.asarray(sample.target_segment_normals_zyx)
+            )
+        if sample.target_segment_widths_input is not None:
+            tensor_metadata["target_segment_widths_input"] = torch.from_numpy(np.asarray(sample.target_segment_widths_input))
         restored = replace(
             sample,
+            embedding_geometry=None if sample.embedding_geometry is None else replace(
+                sample.embedding_geometry, eligible=self.embedding_eligibility[slot]),
             volume=self.volumes[slot],
-            valid_mask=self.valid_masks[slot],
+            valid_mask=None,
             **tensor_metadata,
         )
         return (
@@ -345,9 +408,7 @@ class FiberTrace3DSharedTensorSlots:
             else restored
         )
 
-    def batch_tensors(
-        self, indices: list[int], *, allow_wrap: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def batch_tensors(self, indices: list[int], *, allow_wrap: bool = False) -> torch.Tensor:
         if not indices:
             raise ValueError("shared-slot batch must not be empty")
         locations = [self._location(index) for index in indices]
@@ -365,17 +426,16 @@ class FiberTrace3DSharedTensorSlots:
                 )
         end = slots[0] + len(slots)
         if end > self.slot_count:
-            return (
-                torch.cat((self.volumes[slots[0]:], self.volumes[:end - self.slot_count]), dim=0),
-                torch.cat((self.valid_masks[slots[0]:], self.valid_masks[:end - self.slot_count]), dim=0),
-            )
-        return self.volumes[slots[0] : end], self.valid_masks[slots[0] : end]
+            # Only partial/variable batches can straddle the ring. The common
+            # aligned path stays zero-copy; never read another sample's slot.
+            return torch.cat((self.volumes[slots[0]:], self.volumes[:end - self.slot_count]), dim=0)
+        return self.volumes[slots[0] : end]
 
 
 @dataclass(frozen=True)
 class FiberTrace3DBatch:
     volume: torch.Tensor
-    valid_mask: torch.Tensor
+    valid_mask: torch.Tensor | None
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
     stream_indices: torch.Tensor
@@ -391,6 +451,11 @@ class FiberTrace3DBatch:
     target_segment_bbox_lo_zyx: torch.Tensor
     target_segment_bbox_hi_zyx: torch.Tensor
     target_tangent_zyx: torch.Tensor
+    target_segment_normals_zyx: torch.Tensor | None = None
+    target_segment_widths_input: torch.Tensor | None = None
+    volume_spacing_base: torch.Tensor | None = None
+    presence_target_mode: str = "binary"
+    presence_sideband_weight: float = 0.0
     direction_target: torch.Tensor | None = None
     direction_weight: torch.Tensor | None = None
     direction_mask: torch.Tensor | None = None
@@ -398,17 +463,23 @@ class FiberTrace3DBatch:
     direction_target_sparse: torch.Tensor | None = None
     direction_weight_sparse: torch.Tensor | None = None
     direction_tangent_sparse_zyx: torch.Tensor | None = None
+    normal_axis_sparse_zyx: torch.Tensor | None = None
+    width_target_input: torch.Tensor | None = None
     presence_target: torch.Tensor | None = None
+    presence_sideband_mask: torch.Tensor | None = None
     presence_mask: torch.Tensor | None = None
     deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
-
-    # Local effective-batch counts and their lattice, prepared before model forward.
-    normalization_counts: torch.Tensor | None = None
-    # Cached targets retain their lattice even when different strides share a shape.
+    embedding_geometry: tuple[EmbeddingGeometry | None, ...] | None = None
+    refinement_geometry: tuple[RefinementObservation | None, ...] | None = None
+    annotation_targets: tuple[np.ndarray | None, ...] | None = None
+    coarse_geometry: tuple[Any | None, ...] | None = None
     target_output_stride: int | None = None
     normalization_output_stride: int | None = None
+
+    # Local effective-batch target counts, prepared before model forward.
+    normalization_counts: torch.Tensor | None = None
 
     def to(
         self,
@@ -419,9 +490,21 @@ class FiberTrace3DBatch:
         return FiberTrace3DBatch(
             target_output_stride=self.target_output_stride,
             normalization_output_stride=self.normalization_output_stride,
+            coarse_geometry=self.coarse_geometry,
+            annotation_targets=self.annotation_targets,
+            normal_axis_sparse_zyx=None if self.normal_axis_sparse_zyx is None else self.normal_axis_sparse_zyx.to(device, non_blocking=non_blocking),
+            width_target_input=None if self.width_target_input is None else self.width_target_input.to(device, non_blocking=non_blocking),
+            presence_target_mode=self.presence_target_mode,
+            presence_sideband_weight=self.presence_sideband_weight,
+            refinement_geometry=self.refinement_geometry,
             normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
+            embedding_geometry=None if self.embedding_geometry is None else tuple(
+                None if item is None else replace(item, eligible=item.eligible.to(device, non_blocking=non_blocking))
+                for item in self.embedding_geometry),
             volume=self.volume.to(device, non_blocking=non_blocking),
-            valid_mask=self.valid_mask.to(device, non_blocking=non_blocking),
+            valid_mask=None
+            if self.valid_mask is None
+            else self.valid_mask.to(device, non_blocking=non_blocking),
             cp_local_zyx=self.cp_local_zyx.to(device, non_blocking=non_blocking),
             crop_origin_zyx=self.crop_origin_zyx.to(device, non_blocking=non_blocking),
             stream_indices=self.stream_indices.to(device, non_blocking=non_blocking),
@@ -445,6 +528,13 @@ class FiberTrace3DBatch:
             target_tangent_zyx=self.target_tangent_zyx.to(
                 device, non_blocking=non_blocking
             ),
+            target_segment_normals_zyx=None
+            if self.target_segment_normals_zyx is None
+            else self.target_segment_normals_zyx.to(device, non_blocking=non_blocking),
+            target_segment_widths_input=None if self.target_segment_widths_input is None else self.target_segment_widths_input.to(device, non_blocking=non_blocking),
+            volume_spacing_base=None
+            if self.volume_spacing_base is None
+            else self.volume_spacing_base.to(device, non_blocking=non_blocking),
             direction_target=None
             if self.direction_target is None
             else self.direction_target.to(device, non_blocking=non_blocking),
@@ -471,6 +561,9 @@ class FiberTrace3DBatch:
             presence_target=None
             if self.presence_target is None
             else self.presence_target.to(device, non_blocking=non_blocking),
+            presence_sideband_mask=None
+            if self.presence_sideband_mask is None
+            else self.presence_sideband_mask.to(device, non_blocking=non_blocking),
             presence_mask=None
             if self.presence_mask is None
             else self.presence_mask.to(device, non_blocking=non_blocking),
@@ -490,6 +583,9 @@ class FiberTrace3DBatch:
         return replace(
             self,
             normalization_counts=pin(self.normalization_counts),
+            embedding_geometry=None if self.embedding_geometry is None else tuple(
+                None if item is None else replace(item, eligible=pin(item.eligible))
+                for item in self.embedding_geometry),
             volume=pin(self.volume),
             valid_mask=pin(self.valid_mask),
             cp_local_zyx=pin(self.cp_local_zyx),
@@ -501,6 +597,9 @@ class FiberTrace3DBatch:
             target_segment_starts_zyx=pin(self.target_segment_starts_zyx),
             target_segment_ends_zyx=pin(self.target_segment_ends_zyx),
             target_tangent_zyx=pin(self.target_tangent_zyx),
+            target_segment_normals_zyx=pin(self.target_segment_normals_zyx),
+            target_segment_widths_input=pin(self.target_segment_widths_input),
+            volume_spacing_base=pin(self.volume_spacing_base),
             direction_target=pin(self.direction_target),
             direction_weight=pin(self.direction_weight),
             direction_mask=pin(self.direction_mask),
@@ -508,7 +607,10 @@ class FiberTrace3DBatch:
             direction_target_sparse=pin(self.direction_target_sparse),
             direction_weight_sparse=pin(self.direction_weight_sparse),
             direction_tangent_sparse_zyx=pin(self.direction_tangent_sparse_zyx),
+            normal_axis_sparse_zyx=pin(self.normal_axis_sparse_zyx),
+            width_target_input=pin(self.width_target_input),
             presence_target=pin(self.presence_target),
+            presence_sideband_mask=pin(self.presence_sideband_mask),
             presence_mask=pin(self.presence_mask),
         )
 
@@ -518,13 +620,15 @@ class FiberTrace3DBatch:
         for value in vars(self).values():
             if isinstance(value, torch.Tensor) and value.device.type == "cuda":
                 value.record_stream(stream)
+        for item in self.embedding_geometry or ():
+            if item is not None and item.eligible.device.type == "cuda":
+                item.eligible.record_stream(stream)
 
 
 def collate_fiber_trace_3d_samples(
     samples: list[FiberTrace3DSample],
     *,
     volume_batch: torch.Tensor | None = None,
-    valid_mask_batch: torch.Tensor | None = None,
     deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None,
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None,
     profile: bool = False,
@@ -541,6 +645,10 @@ def collate_fiber_trace_3d_samples(
     cpu_total_start = time.process_time() if cpu_total_start is None else float(cpu_total_start)
     wall_start_ns = time.time_ns() if wall_start_ns is None else int(wall_start_ns)
     timings: dict[str, float] | None = None
+    if len({sample.presence_target_mode for sample in samples}) != 1:
+        raise ValueError("cannot collate mixed presence target modes")
+    if len({sample.presence_sideband_weight for sample in samples}) != 1:
+        raise ValueError("cannot collate mixed presence sideband weights")
     if profile:
         timings = {}
         keys = set().union(*(set(sample.profile_timings_ms or {}) for sample in samples))
@@ -561,27 +669,38 @@ def collate_fiber_trace_3d_samples(
         segment_ends = torch.cat([sample.target_segment_ends_zyx for sample in samples])
         segment_bbox_lo = torch.cat([sample.target_segment_bbox_lo_zyx for sample in samples])
         segment_bbox_hi = torch.cat([sample.target_segment_bbox_hi_zyx for sample in samples])
+        segment_normals = (
+            torch.cat([sample.target_segment_normals_zyx for sample in samples])
+            if all(sample.target_segment_normals_zyx is not None for sample in samples)
+            else None
+        )
+        segment_widths = (torch.cat([sample.target_segment_widths_input for sample in samples])
+                          if all(sample.target_segment_widths_input is not None for sample in samples) else None)
     else:
         device = samples[0].volume.device
         segment_starts = torch.zeros((0, 3), dtype=torch.float32, device=device)
         segment_ends = torch.zeros((0, 3), dtype=torch.float32, device=device)
         segment_bbox_lo = torch.zeros((0, 3), dtype=torch.long)
         segment_bbox_hi = torch.zeros((0, 3), dtype=torch.long)
-    if (volume_batch is None) != (valid_mask_batch is None):
-        raise ValueError("volume_batch and valid_mask_batch must be supplied together")
+        segment_normals = None
+        segment_widths = None
     if volume_batch is None:
         volume_batch = torch.stack([sample.volume for sample in samples])
-        valid_mask_batch = torch.stack([sample.valid_mask for sample in samples])
-    assert valid_mask_batch is not None
-    if int(volume_batch.shape[0]) != len(samples) or int(valid_mask_batch.shape[0]) != len(samples):
+    if int(volume_batch.shape[0]) != len(samples):
         raise ValueError("prebuilt batch tensors do not match sample count")
     if deferred_blur_kernels is not None and len(deferred_blur_kernels) != len(samples):
         raise ValueError("deferred blur-kernel count does not match sample count")
     if deferred_augmentation_params is not None and len(deferred_augmentation_params) != len(samples):
         raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
+        coarse_geometry=tuple(sample.coarse_geometry for sample in samples),
+        presence_target_mode=samples[0].presence_target_mode,
+        annotation_targets=tuple(sample.annotation_targets for sample in samples),
+        presence_sideband_weight=samples[0].presence_sideband_weight,
+        refinement_geometry=tuple(sample.refinement_geometry for sample in samples),
+        embedding_geometry=tuple(sample.embedding_geometry for sample in samples),
         volume=volume_batch,
-        valid_mask=valid_mask_batch,
+        valid_mask=None,
         cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples]),
         crop_origin_zyx=torch.stack([sample.crop_origin_zyx for sample in samples]),
         stream_indices=torch.as_tensor(
@@ -605,11 +724,16 @@ def collate_fiber_trace_3d_samples(
         target_modes=torch.as_tensor([sample.target_mode for sample in samples], dtype=torch.long),
         target_segment_offsets=torch.as_tensor(segment_offsets, dtype=torch.long),
         target_segment_counts=torch.as_tensor(segment_counts, dtype=torch.long),
+        volume_spacing_base=torch.as_tensor(
+            [sample.volume_spacing_base for sample in samples], dtype=torch.float32
+        ),
         target_segment_starts_zyx=segment_starts,
         target_segment_ends_zyx=segment_ends,
         target_segment_bbox_lo_zyx=segment_bbox_lo,
         target_segment_bbox_hi_zyx=segment_bbox_hi,
         target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples]),
+        target_segment_normals_zyx=segment_normals,
+        target_segment_widths_input=segment_widths,
         deferred_augmentation_params=deferred_augmentation_params,
         deferred_blur_kernels=deferred_blur_kernels,
         profile_timings_ms={
@@ -731,6 +855,9 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         raise ValueError(
             "augment_anisotropic_blur_orientation must be fiber, random, axis, z, y, or x"
         )
+    presence_target_mode = str(raw.get("presence_target_mode", "binary")).lower()
+    if presence_target_mode not in {"binary", "anisotropic_gaussian"}:
+        raise ValueError("presence_target_mode must be binary or anisotropic_gaussian")
     for unsupported in (
         "augment_shear_x",
         "augment_shear_y",
@@ -744,7 +871,15 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
                 "3D skew/ringing semantics must be specified explicitly"
             )
     return FiberTrace3DConfig(
-        datasets=tuple(dict(entry) for entry in datasets),
+        mixed_supervision=bool(raw.get("mixed_supervision", False)),
+        coarse_tube_weight=float(raw.get("coarse_tube", {}).get("weight", 0.0)),
+        logical_batch_size=int(raw.get("training", {}).get("optimizer_global_batch_size", 128)),
+        annotations=AnnotationConfig.from_mapping(raw),
+       datasets=tuple(dict(entry) for entry in datasets),
+        sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
+        embedding=EmbeddingConfig.from_mapping(raw),
+        refinement=RefinementConfig.parse(raw),
+        refinement_split=raw.get("_refinement_split", "train"),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(
             raw.get("patch_shape_zyx", raw.get("crop_size", [192, 192, 192])),
@@ -753,6 +888,16 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         seed=int(raw.get("seed", 1)),
         cp_margin_voxels=int(raw.get("cp_margin_voxels", raw.get("control_point_margin_voxels", 4))),
         presence_radius_voxels=float(raw.get("presence_radius_voxels", 2.0)),
+        presence_target_mode=presence_target_mode,
+        presence_gaussian_width_ratio=float(raw.get("presence_gaussian_width_ratio", 4.0)),
+        presence_gaussian_truncate_sigma=float(raw.get("presence_gaussian_truncate_sigma", 3.0)),
+        presence_sideband_weight=float(raw.get("presence_sideband_weight", 0.0)),
+        presence_sideband_half_width_base=float(
+            raw.get("presence_sideband_half_width_base", 64.0)
+        ),
+        presence_sideband_half_height_base=float(
+            raw.get("presence_sideband_half_height_base", 16.0)
+        ),
         presence_negative_edge_margin_voxels=(
             None
             if raw.get("presence_negative_edge_margin_voxels") is None
@@ -795,9 +940,9 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
-        geometry_backend=str(raw.get("geometry_backend", "eager")).lower(),
+        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
         value_augmentation_backend=str(
-            raw.get("value_augmentation_backend", "torch")
+            raw.get("value_augmentation_backend", "auto")
         ).lower(),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         prefetch_sampler_workers=_parse_worker_count(
@@ -927,6 +1072,24 @@ def _resolve_fiber_paths(dataset_config: dict[str, Any], config: FiberTrace3DCon
         paths.extend(Path(path) for path in sorted(glob.glob(resolved)))
     if not paths:
         raise ValueError("dataset entry must define fiber_paths or fiber_glob")
+    manifest_path = dataset_config.get("fiber_manifest_path")
+    if manifest_path is not None:
+        from .reviewed_failure_test import validate_failure_union
+        resolved_manifest = Path(_resolve_path(manifest_path, config.config_dir)).resolve()
+        manifest = validate_failure_union(
+            resolved_manifest.parent,
+            expected_count=int(dataset_config.get("fiber_manifest_expected_total", 32)),
+        )
+        collection = dataset_config.get("fiber_manifest_collection", dataset_config.get("scroll_id"))
+        expected = {
+            str((resolved_manifest.parent / "test" / row["path"]).resolve())
+            for row in manifest["files"] if row["source"] == collection
+        }
+        actual = {str(path.resolve()) for path in paths}
+        if actual != expected:
+            raise ValueError(
+                f"dataset paths do not exactly match reviewed-failure manifest collection {collection}"
+            )
     return paths
 
 
@@ -1037,7 +1200,13 @@ def _sample_control_1d(
     *,
     origin: float,
     spacing: float,
+    batch_index=None,
 ) -> torch.Tensor:
+    if isinstance(control, np.ndarray):
+        if batch_index is not None:
+            from scipy.ndimage import map_coordinates
+            return map_coordinates(control, np.stack((batch_index, (coord-origin)/spacing)), order=1, mode="nearest", prefilter=False)
+        return np.interp((coord - origin) / spacing, np.arange(len(control)), control)
     if control.ndim != 1:
         raise ValueError("1D smooth displacement control must be one-dimensional")
     if control.numel() == 1:
@@ -1059,7 +1228,14 @@ def _sample_control_2d(
     origin_b: float,
     spacing_a: float,
     spacing_b: float,
+    batch_index=None,
 ) -> torch.Tensor:
+    if isinstance(control, np.ndarray):
+        from scipy.ndimage import map_coordinates
+        coords = np.stack(((coord_a-origin_a)/spacing_a, (coord_b-origin_b)/spacing_b))
+        if batch_index is not None:
+            coords = np.concatenate((np.asarray(batch_index)[None], coords))
+        return map_coordinates(control.astype(np.float64, copy=False), coords, order=1, mode="nearest", prefilter=False)
     if control.ndim != 2:
         raise ValueError("2D smooth displacement control must be two-dimensional")
     height, width = int(control.shape[0]), int(control.shape[1])
@@ -1096,11 +1272,13 @@ def _smooth_forward_rel_zyx(
     rel_zyx: torch.Tensor,
     smooth: _SmoothDisplacement3DParams | None,
     controls: tuple[torch.Tensor, ...] | None = None,
+    batch_index=None,
 ) -> torch.Tensor:
     if smooth is None or smooth.mode == "none":
         return rel_zyx
-    tensors = _smooth_control_tensors(smooth, device=rel_zyx.device) if controls is None else controls
-    out = rel_zyx.clone()
+    array_backend = isinstance(rel_zyx, np.ndarray)
+    tensors = (smooth.controls if array_backend else _smooth_control_tensors(smooth, device=rel_zyx.device)) if controls is None else controls
+    out = rel_zyx.copy() if array_backend else rel_zyx.clone()
     origin = np.asarray(smooth.control_min_zyx, dtype=np.float64)
     spacing = np.asarray(smooth.control_spacing_zyx, dtype=np.float64)
     if smooth.mode == "1d":
@@ -1109,6 +1287,7 @@ def _smooth_forward_rel_zyx(
             out[..., 2],
             origin=float(origin[2]),
             spacing=float(spacing[2]),
+            batch_index=batch_index,
         )
     elif smooth.mode == "2d":
         out[..., 0] = out[..., 0] + _sample_control_2d(
@@ -1119,6 +1298,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[1]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
     elif smooth.mode == "3d":
         out[..., 0] = out[..., 0] + _sample_control_2d(
@@ -1129,6 +1309,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[1]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
         out[..., 1] = out[..., 1] + _sample_control_2d(
             tensors[1],
@@ -1138,6 +1319,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[2]),
             spacing_a=float(spacing[0]),
             spacing_b=float(spacing[2]),
+            batch_index=batch_index,
         )
         out[..., 2] = out[..., 2] + _sample_control_2d(
             tensors[2],
@@ -1147,6 +1329,7 @@ def _smooth_forward_rel_zyx(
             origin_b=float(origin[1]),
             spacing_a=float(spacing[0]),
             spacing_b=float(spacing[1]),
+            batch_index=batch_index,
         )
     else:
         raise ValueError(f"unsupported smooth displacement mode {smooth.mode!r}")
@@ -1249,6 +1432,8 @@ def _clip_segment_to_aabb(
 
 
 def _uses_dense_fiber_supervision(record: _Record) -> bool:
+    if record.dataset_config.get("dense_supervision", False):
+        return True
     source_format = str(record.fiber.metadata.get("source_format", "")).lower()
     if source_format == "nml":
         return True
@@ -1328,8 +1513,8 @@ def _normalize_image(volume: torch.Tensor, valid_mask: torch.Tensor, mode: str) 
         return (volume - lo) / (hi - lo).clamp_min(1.0e-6)
     raise ValueError(f"unsupported image_normalization {mode!r}")
 
-
 def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
+    """Retained shared 1D kernel helper for trace-to-control-point smoothing."""
     sigma_f = float(sigma)
     if sigma_f <= 0.0:
         return torch.ones((1,), dtype=torch.float32, device=device)
@@ -1337,298 +1522,6 @@ def _gaussian_kernel1d(sigma: float, *, device: torch.device) -> torch.Tensor:
     coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
     kernel = torch.exp(-0.5 * (coords / sigma_f) ** 2)
     return kernel / kernel.sum().clamp_min(1.0e-12)
-
-
-def _perpendicular_axes_zyx(axis_zyx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    axis = axis_zyx.to(dtype=torch.float32)
-    axis = axis / torch.linalg.vector_norm(axis).clamp_min(1.0e-12)
-    ref = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=axis.device)
-    if float(torch.abs(torch.dot(axis, ref)).detach().cpu()) > 0.9:
-        ref = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=axis.device)
-    # torch.cross expects consistent dim. Vectors are in ZYX component order,
-    # but a right-handed basis is enough for sampling offsets.
-    across_a = torch.linalg.cross(axis, ref, dim=0)
-    across_a = across_a / torch.linalg.vector_norm(across_a).clamp_min(1.0e-12)
-    across_b = torch.linalg.cross(axis, across_a, dim=0)
-    across_b = across_b / torch.linalg.vector_norm(across_b).clamp_min(1.0e-12)
-    return axis, across_a, across_b
-
-
-def _oriented_blur_1d(volume: torch.Tensor, axis_zyx: torch.Tensor, sigma: float) -> torch.Tensor:
-    if float(sigma) <= 0.0:
-        return volume
-    kernel = _gaussian_kernel1d(float(sigma), device=volume.device)
-    radius = int((kernel.numel() - 1) // 2)
-    d, h, w = (int(v) for v in volume.shape)
-    base = _zyx_grid((d, h, w), device=volume.device)
-    axis = axis_zyx.to(dtype=torch.float32, device=volume.device)
-    axis = axis / torch.linalg.vector_norm(axis).clamp_min(1.0e-12)
-    accum = torch.zeros_like(volume)
-    data = volume.view(1, 1, d, h, w)
-    for offset, weight in zip(range(-radius, radius + 1), kernel, strict=True):
-        sample_zyx = base + float(offset) * axis.view(1, 1, 1, 3)
-        gx = sample_zyx[..., 2] * (2.0 / float(max(w - 1, 1))) - 1.0 if w > 1 else torch.zeros_like(sample_zyx[..., 2])
-        gy = sample_zyx[..., 1] * (2.0 / float(max(h - 1, 1))) - 1.0 if h > 1 else torch.zeros_like(sample_zyx[..., 1])
-        gz = sample_zyx[..., 0] * (2.0 / float(max(d - 1, 1))) - 1.0 if d > 1 else torch.zeros_like(sample_zyx[..., 0])
-        grid = torch.stack([gx, gy, gz], dim=-1).unsqueeze(0)
-        sampled = F.grid_sample(
-            data,
-            grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True,
-        )[0, 0]
-        accum = accum + sampled * weight
-    return accum
-
-
-def _anisotropic_blur_3d(
-    volume: torch.Tensor,
-    *,
-    axis_zyx: np.ndarray,
-    sigma_along: float,
-    sigma_across: float,
-) -> torch.Tensor:
-    axis = torch.as_tensor(axis_zyx, dtype=torch.float32, device=volume.device)
-    along, across_a, across_b = _perpendicular_axes_zyx(axis)
-    out = _oriented_blur_1d(volume, along, float(sigma_along))
-    out = _oriented_blur_1d(out, across_a, float(sigma_across))
-    out = _oriented_blur_1d(out, across_b, float(sigma_across))
-    return out
-
-
-def _native_value_blur(
-    volume: torch.Tensor,
-    *,
-    axis_zyx: np.ndarray,
-    sigma_along: float,
-    sigma_across: float,
-    backend: str,
-) -> tuple[torch.Tensor | None, bool]:
-    """Run the shared native directional blur when selected and eligible."""
-    eligible = (
-        volume.device.type == "cpu"
-        and volume.dtype == torch.float32
-        and volume.is_contiguous()
-        and not volume.requires_grad
-    )
-    if not eligible:
-        if backend == "native":
-            raise RuntimeError(
-                "value_augmentation_backend='native' requires a contiguous, "
-                "gradient-free float32 CPU tensor"
-            )
-        return None, False
-    if backend not in {"auto", "native"}:
-        return None, False
-    try:
-        from vc.volume import anisotropic_blur_3d
-    except ImportError as exc:
-        if backend == "native":
-            raise RuntimeError(
-                "value_augmentation_backend='native' requires a rebuilt "
-                "volume-cartographer binding with anisotropic_blur_3d"
-            ) from exc
-        return None, False
-    native_result = anisotropic_blur_3d(
-        volume.detach().numpy(),
-        np.ascontiguousarray(axis_zyx, dtype=np.float32),
-        float(sigma_along),
-        float(sigma_across),
-    )
-    return torch.from_numpy(np.asarray(native_result, dtype=np.float32)), True
-
-
-def _native_value_transform(
-    volume: torch.Tensor,
-    valid_mask: torch.Tensor | None = None,
-    *,
-    normalization: str,
-    contrast: float,
-    brightness: float,
-    gamma: float,
-    backend: str,
-) -> tuple[torch.Tensor | None, bool]:
-    if valid_mask is None:
-        # The complete-patch recipe shares the native transform with legacy
-        # mask-aware callers; reuse its immutable all-valid compatibility mask.
-        shape = tuple(int(value) for value in volume.shape)
-        full_patch = _FULL_VALID_MASK_CACHE.get(shape)
-        if full_patch is None:
-            full_patch = np.ones(shape, dtype=bool)
-            _FULL_VALID_MASK_CACHE[shape] = full_patch
-        valid_mask = torch.from_numpy(full_patch)
-    eligible = (
-        volume.device.type == "cpu"
-        and volume.dtype == torch.float32
-        and volume.is_contiguous()
-        and valid_mask.device.type == "cpu"
-        and valid_mask.dtype == torch.bool
-        and valid_mask.is_contiguous()
-        and not volume.requires_grad
-    )
-    if not eligible:
-        if backend == "native":
-            raise RuntimeError(
-                "value_augmentation_backend='native' requires contiguous, "
-                "gradient-free float32 CPU values and a contiguous bool CPU mask"
-            )
-        return None, False
-    if backend not in {"auto", "native"}:
-        return None, False
-    try:
-        from vc.volume import fiber3d_value_transform
-    except ImportError as exc:
-        if backend == "native":
-            raise RuntimeError(
-                "value_augmentation_backend='native' requires a rebuilt "
-                "volume-cartographer binding with fiber3d_value_transform"
-            ) from exc
-        return None, False
-    native_result = fiber3d_value_transform(
-        volume.detach().numpy(),
-        valid_mask.detach().numpy(),
-        str(normalization),
-        float(contrast),
-        float(brightness),
-        float(gamma),
-    )
-    return torch.from_numpy(np.asarray(native_result, dtype=np.float32)), True
-
-
-def apply_value_augmentation_3d(
-    config: FiberTrace3DConfig,
-    volume: torch.Tensor,
-    valid_mask: torch.Tensor,
-    params: _Augment3DParams,
-    *,
-    profile_timings_ms: dict[str, float] | None = None,
-) -> torch.Tensor:
-    """Apply the shared value transform used by synchronous and queued loading."""
-    def record(name: str, started: float) -> None:
-        if profile_timings_ms is not None:
-            profile_timings_ms[name] = (time.perf_counter() - started) * 1000.0
-
-    backend = str(config.value_augmentation_backend)
-    contrast = float(params.contrast) if config.augment_enabled else 1.0
-    brightness = float(params.brightness) if config.augment_enabled else 0.0
-    gamma = float(params.gamma) if config.augment_enabled else 1.0
-    started = time.perf_counter()
-    native_out, value_transform_native_used = _native_value_transform(
-        volume,
-        valid_mask,
-        normalization=config.image_normalization,
-        contrast=contrast,
-        brightness=brightness,
-        gamma=gamma,
-        backend=backend,
-    )
-    if native_out is not None:
-        out = native_out
-        record("value_native_transform_ms", started)
-    else:
-        out = _normalize_image(volume, valid_mask, config.image_normalization)
-        record("value_normalize_ms", started)
-        started = time.perf_counter()
-        if contrast != 1.0:
-            center = out[valid_mask].mean() if bool(valid_mask.any()) else out.mean()
-            out = (out - center) * contrast + center
-        record("value_contrast_ms", started)
-        started = time.perf_counter()
-        if brightness != 0.0:
-            out = out + brightness
-        record("value_brightness_ms", started)
-        started = time.perf_counter()
-        if gamma != 1.0:
-            valid_values = out[valid_mask] if bool(valid_mask.any()) else out.reshape(-1)
-            lo = valid_values.min()
-            hi = valid_values.max()
-            scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-            out = torch.pow(scaled, gamma) * (hi - lo) + lo
-        record("value_gamma_ms", started)
-    if profile_timings_ms is not None:
-        profile_timings_ms["value_native_transform_used"] = float(
-            value_transform_native_used
-        )
-    if not config.augment_enabled:
-        return out
-    started = time.perf_counter()
-    if params.noise_std > 0.0:
-        gen = torch.Generator(device=out.device)
-        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
-        out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
-    record("value_noise_ms", started)
-    started = time.perf_counter()
-    isotropic_native_used = False
-    if params.blur_sigma > 0.0:
-        sigma = float(params.blur_sigma)
-        native_out, isotropic_native_used = _native_value_blur(
-            out,
-            axis_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-            sigma_along=sigma,
-            sigma_across=sigma,
-            backend=backend,
-        )
-        if native_out is not None:
-            out = native_out
-        else:
-            radius = max(1, int(math.ceil(3.0 * sigma)))
-            coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=out.device)
-            kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
-            kernel = kernel / kernel.sum().clamp_min(1.0e-12)
-            data = out.view(1, 1, *out.shape)
-            for axis in range(3):
-                shape = [1, 1, 1, 1, 1]
-                shape[2 + axis] = int(kernel.numel())
-                weight = kernel.view(*shape)
-                padding = [0, 0, 0, 0, 0, 0]
-                padding[(2 - axis) * 2] = radius
-                padding[(2 - axis) * 2 + 1] = radius
-                data = F.conv3d(F.pad(data, padding, mode="replicate"), weight)
-            out = data[0, 0]
-    record("value_isotropic_blur_ms", started)
-    if profile_timings_ms is not None:
-        profile_timings_ms["value_isotropic_native_used"] = float(
-            isotropic_native_used
-        )
-    anisotropic_used = (
-        params.anisotropic_blur_axis_zyx is not None
-        and (
-            params.anisotropic_blur_sigma_along > 0.0
-            or params.anisotropic_blur_sigma_across > 0.0
-        )
-    )
-    started = time.perf_counter()
-    anisotropic_native_used = False
-    if anisotropic_used:
-        native_out, anisotropic_native_used = _native_value_blur(
-            out,
-            axis_zyx=params.anisotropic_blur_axis_zyx,
-            sigma_along=float(params.anisotropic_blur_sigma_along),
-            sigma_across=float(params.anisotropic_blur_sigma_across),
-            backend=backend,
-        )
-        if native_out is not None:
-            out = native_out
-        else:
-            out = _anisotropic_blur_3d(
-                out,
-                axis_zyx=params.anisotropic_blur_axis_zyx,
-                sigma_along=float(params.anisotropic_blur_sigma_along),
-                sigma_across=float(params.anisotropic_blur_sigma_across),
-            )
-    record("value_anisotropic_blur_ms", started)
-    if profile_timings_ms is not None:
-        profile_timings_ms["value_anisotropic_blur_used"] = float(anisotropic_used)
-        profile_timings_ms["value_anisotropic_native_used"] = float(
-            anisotropic_native_used
-        )
-    started = time.perf_counter()
-    result = out if bool(valid_mask.all()) else torch.where(
-        valid_mask, out, torch.zeros_like(out)
-    )
-    record("value_final_mask_ms", started)
-    return result
 
 
 def _perpendicular_basis_zyx(axis_zyx: np.ndarray) -> np.ndarray:
@@ -1871,6 +1764,58 @@ def _apply_blur_kernels_3d(
     )
 
 
+def _native_value_transform(
+    volume: torch.Tensor,
+    *,
+    normalization: str,
+    contrast: float,
+    brightness: float,
+    gamma: float,
+    backend: str,
+) -> tuple[torch.Tensor | None, bool]:
+    eligible = (
+        volume.device.type == "cpu"
+        and volume.dtype == torch.float32
+        and volume.is_contiguous()
+        and not volume.requires_grad
+    )
+    if not eligible:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires contiguous, "
+                "gradient-free contiguous float32 CPU values"
+            )
+        return None, False
+    if backend not in {"auto", "native"}:
+        return None, False
+    try:
+        from vc.volume import fiber3d_value_transform
+    except ImportError as exc:
+        if backend == "native":
+            raise RuntimeError(
+                "value_augmentation_backend='native' requires a rebuilt "
+                "volume-cartographer binding with fiber3d_value_transform"
+            ) from exc
+        return None, False
+    # Invalid source coordinates were zero-filled during sampling. The binding
+    # still accepts its legacy mask argument, so each worker reuses one
+    # immutable all-valid array rather than transporting source validity.
+    shape = tuple(int(value) for value in volume.shape)
+    full_patch = _FULL_VALID_MASK_CACHE.get(shape)
+    if full_patch is None:
+        full_patch = np.ones(shape, dtype=bool)
+        _FULL_VALID_MASK_CACHE[shape] = full_patch
+    native_result = fiber3d_value_transform(
+        volume.detach().numpy(),
+        full_patch,
+        str(normalization),
+        float(contrast),
+        float(brightness),
+        float(gamma),
+    )
+    return torch.from_numpy(np.asarray(native_result, dtype=np.float32)), True
+
+
 def _normalize_complete_image(volume: torch.Tensor, mode: str) -> torch.Tensor:
     mode_l = str(mode).lower()
     if mode_l in {"none", "raw", "identity"}:
@@ -1941,7 +1886,7 @@ def _apply_value_augmentation_prefix_3d(
     started = time.perf_counter()
     if params.noise_std > 0.0:
         gen = torch.Generator(device=out.device)
-        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
+        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index if params.value_seed_index is None else params.value_seed_index) % (2**63 - 1))
         out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
     record("value_noise_ms", started)
     return out
@@ -1968,7 +1913,7 @@ def _apply_value_augmentation_suffix_3d(
     return result
 
 
-def apply_complete_value_augmentation_3d(
+def apply_value_augmentation_3d(
     config: FiberTrace3DConfig,
     volume: torch.Tensor,
     params: _Augment3DParams,
@@ -2093,7 +2038,7 @@ def apply_value_augmentation_batch_3d(
                     continue
                 generator = torch.Generator(device=out.device)
                 generator.manual_seed(
-                    _stable_seed(config.seed, "value_noise", item.stream_index) % (2**63 - 1)
+                    _stable_seed(config.seed, "value_noise", item.stream_index if item.value_seed_index is None else item.value_seed_index) % (2**63 - 1)
                 )
                 noise_parts.append(
                     torch.randn(
@@ -2159,7 +2104,6 @@ def augment_fiber_trace_3d_raw_sample(
     volume = apply_value_augmentation_3d(
         config,
         sample.volume[0],
-        sample.valid_mask[0],
         raw.augmentation,
         profile_timings_ms=timings,
     ).view_as(sample.volume)
@@ -2194,13 +2138,18 @@ def _bounded_data_sample_index(sample_index: int, sample_index_limit: int | None
 
 @dataclass(frozen=True)
 class FiberTrace3DDatasetMetadata:
-    """Allocation-local consumer view; persistent loaders own records/samplers."""
+    """Small CPU-owned description for consumers of already prepared batches.
+
+    No fiber records, samplers, cache handles or mutable refinement state cross
+    the GPU-worker process boundary. The persistent loaders retain those.
+    """
 
     config: FiberTrace3DConfig
     sample_count: int
 
-    def for_config(self, config):
-        import copy
+    def for_config(self, config: FiberTrace3DConfig) -> FiberTrace3DDatasetMetadata:
+        # Physical microbatch and sampler thread limits are allocation-local;
+        # every sampling/target setting must remain the CPU owner's setting.
         adapted = replace(self.config, batch_size=config.batch_size,
             volume_io_threads=config.volume_io_threads,
             volume_decode_threads=config.volume_decode_threads,
@@ -2223,6 +2172,23 @@ class FiberTrace3DLoader:
             )
         if config.presence_radius_voxels <= 0.0:
             raise ValueError("presence_radius_voxels must be > 0")
+        if config.presence_target_mode not in {"binary", "anisotropic_gaussian"}:
+            raise ValueError("unsupported presence_target_mode")
+        if config.annotations.distribution_agreement_gate and config.presence_target_mode != 'anisotropic_gaussian':
+            raise ValueError('distribution_agreement_gate requires anisotropic_gaussian targets')
+        if not math.isfinite(config.presence_gaussian_width_ratio) or config.presence_gaussian_width_ratio < 1.0:
+            raise ValueError("presence_gaussian_width_ratio must be finite and >= 1")
+        if not math.isfinite(config.presence_gaussian_truncate_sigma) or config.presence_gaussian_truncate_sigma <= 0.0:
+            raise ValueError("presence_gaussian_truncate_sigma must be positive finite")
+        if not math.isfinite(config.presence_sideband_weight) or config.presence_sideband_weight < 0.0:
+            raise ValueError("presence_sideband_weight must be finite and >= 0")
+        if config.presence_sideband_weight > 0.0:
+            if config.presence_target_mode != "anisotropic_gaussian":
+                raise ValueError("presence sidebands require anisotropic_gaussian targets")
+            if not math.isfinite(config.presence_sideband_half_width_base) or config.presence_sideband_half_width_base <= 0.0:
+                raise ValueError("presence_sideband_half_width_base must be positive finite")
+            if not math.isfinite(config.presence_sideband_half_height_base) or config.presence_sideband_half_height_base <= 0.0:
+                raise ValueError("presence_sideband_half_height_base must be positive finite")
         if config.augment_scale_min <= 0.0 or config.augment_scale_max <= 0.0:
             raise ValueError("augment_scale_min/max must be > 0")
         if config.augment_scale_min > config.augment_scale_max:
@@ -2258,7 +2224,99 @@ class FiberTrace3DLoader:
         if config.augment_anisotropic_blur_orientation not in {"fiber", "random", "axis", "z", "y", "x"}:
             raise ValueError("unsupported augment_anisotropic_blur_orientation")
         self.config = config
+        modes = {d.get('supervision_mode', 'precise') for d in config.datasets}
+        if modes - {'precise', 'coarse_area'}:
+            raise ValueError(f'unknown dataset supervision modes: {modes}')
+        if 'coarse_area' in modes and not config.mixed_supervision:
+            raise ValueError('coarse_area datasets require mixed_supervision for correct loss normalization')
+        if config.presence_target_mode == "anisotropic_gaussian":
+            if any(not d.get("dense_supervision", False) for d in config.datasets):
+                raise ValueError("anisotropic Gaussian presence targets require dense_supervision for every dataset")
+        if config.refinement.orientation_enabled and config.presence_target_mode != "anisotropic_gaussian":
+            raise ValueError("orientation refinement requires anisotropic_gaussian presence targets")
+        if config.refinement.orientation_enabled and config.presence_gaussian_width_ratio <= 1.0:
+            raise ValueError("orientation refinement requires Gaussian width ratio > 1")
+        self._embedding_normal_records = {}
+        self._missing_normal_samples = 0
+        self._replacement_pools = {}
+        from .parent_width import assign_parent_widths
+        self._width_sources = []
         self.records = self._load_records()
+        precise_indices = [i for i, record in enumerate(self.records)
+                           if record.dataset_config.get('supervision_mode') != 'coarse_area']
+        precise = assign_parent_widths([self.records[i] for i in precise_indices], self._width_sources)
+        for i, record in zip(precise_indices, precise, strict=True):
+            self.records[i] = record
+        del self._width_sources
+        if (config.refinement.width_modulation or config.refinement.width_enabled) and not config.annotations.width_weight:
+            raise ValueError('width-aware refinement requires the annotated width head')
+        if config.embedding.enabled or config.presence_target_mode == 'anisotropic_gaussian' or config.refinement.enabled:
+            for record in self.records:
+                if record.dataset_config.get('supervision_mode') == 'coarse_area':
+                    continue
+                if config.mixed_supervision and 'baked_annotations' not in record.fiber.metadata:
+                    raise ValueError('mixed precise/test fibers require baked normals; runtime Lasagna is not used')
+                if not record.dataset_config.get('lasagna_manifest_path') and 'baked_annotations' not in record.fiber.metadata:
+                    raise ValueError('normal-dependent training requires lasagna_manifest_path or baked_annotations for every fiber')
+        self._refinement_store = None
+        if config.refinement.enabled and (config.refinement.update_enabled or config.refinement_split == "train"):
+            if config.sampling_strategy != "scroll_balanced_arclength":
+                raise ValueError("refinement requires scroll_balanced_arclength and dense supervision")
+            self._refinement_store = active_store()
+            self._refinement_keys = []
+            for record in self.records:
+                if record.dataset_config.get('supervision_mode') == 'coarse_area':
+                    self._refinement_keys.append(None)
+                    continue
+                key = hashlib.sha256(f"{config.refinement_split}:{record.volume_path}:{record.fiber_identity}".encode()).hexdigest()
+                self._refinement_keys.append(key)
+                self._refinement_store.register(key, record.fiber.line_points_zyx.astype(np.float64),
+                    {"source": str(record.fiber.path), "split": config.refinement_split,
+                     "scroll_id": record.dataset_config.get("scroll_id"),
+                     "base_volume_path": record.volume_path, "base_shape_zyx": record.base_shape_zyx,
+                     "source_identity": record.fiber_identity,
+                     "normal_manifest": (str(_resolve_path(record.dataset_config["lasagna_manifest_path"], config.config_dir))
+                         if record.dataset_config.get('lasagna_manifest_path') else 'baked_annotations'),
+                     "control_span": record.fiber.metadata.get("training_control_span"),
+                     "export": export_metadata(record.fiber)}, config.refinement,
+                    allow_resume_addition=config.refinement_split == "test")
+            self._refinement_store.validate_split(
+                [key for key in self._refinement_keys if key is not None], config.refinement_split,
+                allow_extra=config.refinement_split == "test")
+        # Width is global per parent even for frozen test geometry. Do not tie
+        # scalar-state access to whether local test curves are being updated.
+        self._width_store = active_store() if config.refinement.enabled else None
+        if self._width_store is not None:
+            for record in self.records:
+                if record.dataset_config.get('supervision_mode') == 'coarse_area':
+                    continue
+                metadata = record.fiber.metadata
+                if 'parent_width_key' in metadata:
+                    key = hashlib.sha256(f"{config.refinement_split}:{record.volume_path}:{record.fiber_identity}".encode()).hexdigest()
+                    self._width_store.register_width(metadata['parent_width_key'],
+                        metadata['parent_width_baseline'],metadata['parent_fiber'],config.refinement_split,key)
+        if config.sampling_strategy not in {"control_points", "scroll_balanced_arclength"}:
+            raise ValueError("sampling_strategy must be control_points or scroll_balanced_arclength")
+        for record in self.records:
+            if "dense_supervision" in record.dataset_config and type(record.dataset_config["dense_supervision"]) is not bool:
+                raise ValueError("dataset dense_supervision must be a boolean")
+        self._arc_sampler = None
+        if config.sampling_strategy == "scroll_balanced_arclength":
+            if any(not _uses_dense_fiber_supervision(r) for r in self.records):
+                raise ValueError("scroll_balanced_arclength requires dense supervision for every dataset")
+            self._arc_sampler = ScrollArcSampler(self.records)
+        self._mixed_sampler = None
+        if config.mixed_supervision and config.refinement_split == 'train':
+            if config.presence_target_mode != 'anisotropic_gaussian':
+                raise ValueError('mixed supervision currently requires Gaussian precise targets')
+            if self._arc_sampler is None or config.embedding.enabled:
+                raise ValueError('mixed supervision requires arclength sampling without embeddings')
+            if not config.annotations.normal_weight:
+                raise ValueError('mixed supervision requires predicted fiber normal channels')
+            self._mixed_sampler = MixedSourceArcSampler(self.records,
+                global_batch_size=config.logical_batch_size, seed=config.seed)
+        if config.embedding.paired_patches and self._arc_sampler is None:
+            raise ValueError("paired patches require scroll_balanced_arclength sampling")
         self._flat_offsets: list[int] = []
         flat_total = 0
         for record in self.records:
@@ -2271,11 +2329,10 @@ class FiberTrace3DLoader:
 
     @property
     def sample_count(self) -> int:
-        return int(self._flat_sample_count)
+        return int(self._flat_sample_count) * (2 if self.config.embedding.paired_patches else 1)
 
     @property
-    def dataset_metadata(self):
-        import copy
+    def dataset_metadata(self) -> FiberTrace3DDatasetMetadata:
         return FiberTrace3DDatasetMetadata(copy.deepcopy(self.config), self.sample_count)
 
     def _load_records(self) -> list[_Record]:
@@ -2308,12 +2365,15 @@ class FiberTrace3DLoader:
                         volume_spacing_base=1.0,
                         base_shape_zyx=tuple(int(v) for v in volume.shape),
                         fiber_identity=_stable_digest("array", index, id(volume)),
-                        dataset_config=record,
+                        dataset_config={**(self.config.datasets[0] if len(self.config.datasets) == 1 else {}), **record},
                     )
                 )
             return records
 
         for dataset_config in self.config.datasets:
+            dataset_record_start = len(records)
+            source_fibers = 0
+            ineligible_fibers = 0
             volume_path_raw = dataset_config.get("base_volume_path", dataset_config.get("volume_path"))
             if volume_path_raw is None:
                 raise ValueError("dataset entry must define base_volume_path")
@@ -2350,7 +2410,16 @@ class FiberTrace3DLoader:
                     transform_xyz=transform_xyz,
                     transform_identity=transform_identity,
                 )
+                eligible_fibers = []
                 for source_fiber_index, fiber in enumerate(fibers):
+                    from .parent_width import WidthSource
+                    if dataset_config.get('supervision_mode') != 'coarse_area':
+                        self._width_sources.append(WidthSource(fiber,str(volume_path)))
+                    parts = training_fiber_spans(fiber)
+                    source_fibers += 1
+                    ineligible_fibers += not bool(parts)
+                    eligible_fibers.extend((source_fiber_index, part) for part in parts)
+                for source_fiber_index, fiber in eligible_fibers:
                     bad_control = _first_out_of_bounds_control_point(fiber, base_shape_zyx)
                     if bad_control is not None:
                         bad_index, bad_zyx = bad_control
@@ -2367,6 +2436,7 @@ class FiberTrace3DLoader:
                         "fiber3d",
                         str(fiber_path),
                         source_fiber_index,
+                        fiber.metadata.get("training_control_span"),
                         transform_identity,
                         _round_json_array(np.asarray(fiber.line_points_xyz, dtype=np.float64)),
                     )
@@ -2383,6 +2453,15 @@ class FiberTrace3DLoader:
                             dataset_config=dict(dataset_config),
                         )
                     )
+            retained = len(records) - dataset_record_start
+            print(f"fiber_trace_3d training spans: scroll={dataset_config.get('scroll_id', '?')} "
+                  f"sources={source_fibers} eligible_runs={retained} "
+                  f"ineligible_sources={ineligible_fibers} modes=cspline,trace tails=excluded",
+                  flush=True)
+            if not retained:
+                raise ValueError(f"dataset {dataset_config.get('fiber_glob', dataset_config)} "
+                                 "has no eligible training spans (requires cspline/trace "
+                                 "between control points, or explicit NML edges)")
         if not records:
             raise ValueError("no fiber records loaded")
         return records
@@ -2411,8 +2490,20 @@ class FiberTrace3DLoader:
         sample_index: int,
         *,
         sample_mode: str = "random",
-    ) -> tuple[_Record, int, int]:
+    ) -> tuple[_Record, int, int | FiberLocation]:
+        if self.config.embedding.paired_patches:
+            original = self._descriptor_for_unpaired_index(sample_index // 2, sample_mode=sample_mode)
+            if sample_index % 2:
+                return self._arc_sampler.sample_within(self._rng(sample_index // 2, "pair_partner"), [original[1]])
+            return original
+        return self._descriptor_for_unpaired_index(sample_index, sample_mode=sample_mode)
+
+    def _descriptor_for_unpaired_index(self, sample_index, *, sample_mode):
         if sample_mode == "random":
+            if self._mixed_sampler is not None:
+                return self._mixed_sampler.sample(sample_index, self._rng(sample_index, 'mixed_arclength'))
+            if self._arc_sampler is not None:
+                return self._arc_sampler.sample(self._rng(sample_index, "scroll_arclength"))
             return self._descriptor_for_flat_index(self._random_flat_index(sample_index))
         if sample_mode == "flat":
             return self._descriptor_for_flat_index(int(sample_index) % int(self._flat_sample_count))
@@ -2421,19 +2512,24 @@ class FiberTrace3DLoader:
     def _rng(self, sample_index: int, purpose: str) -> np.random.Generator:
         return np.random.default_rng(_stable_seed(self.config.seed, purpose, int(sample_index)))
 
-    def _control_point_volume_zyx(self, record: _Record, cp_index: int) -> np.ndarray:
+    def _control_point_volume_zyx(self, record: _Record, cp_index: int | FiberLocation) -> np.ndarray:
+        if isinstance(cp_index, FiberLocation):
+            return np.asarray(cp_index.xyz[::-1], dtype=np.float64) / float(record.volume_spacing_base)
         cp_zyx_base = np.asarray(record.fiber.control_points_zyx[int(cp_index)], dtype=np.float64)
         return cp_zyx_base / float(record.volume_spacing_base)
 
-    def _line_tangent_volume_zyx(self, record: _Record, cp_index: int) -> np.ndarray:
+    def _line_tangent_volume_zyx(self, record: _Record, cp_index: int | FiberLocation) -> np.ndarray:
         line_points = np.asarray(record.fiber.line_points_zyx, dtype=np.float64) / float(
             record.volume_spacing_base
         )
         if line_points.shape[0] < 2:
             return np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
-        line_index = control_point_line_index(record.fiber, int(cp_index))
-        prev_index = max(0, int(line_index) - 1)
-        next_index = min(int(line_points.shape[0]) - 1, int(line_index) + 1)
+        if isinstance(cp_index, FiberLocation):
+            prev_index, next_index = cp_index.segment_index, cp_index.segment_index + 1
+        else:
+            line_index = control_point_line_index(record.fiber, int(cp_index))
+            prev_index = max(0, int(line_index) - 1)
+            next_index = min(int(line_points.shape[0]) - 1, int(line_index) + 1)
         tangent = line_points[next_index] - line_points[prev_index]
         norm = float(np.linalg.norm(tangent))
         if not math.isfinite(norm) or norm <= 1.0e-12:
@@ -2519,7 +2615,7 @@ class FiberTrace3DLoader:
     def _anisotropic_axis_zyx(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         source_to_output_zyx: np.ndarray,
         rng: np.random.Generator,
     ) -> np.ndarray | None:
@@ -2565,8 +2661,9 @@ class FiberTrace3DLoader:
     def _sample_augment_params(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         sample_index: int,
+        value_index: int | None = None,
     ) -> _Augment3DParams:
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.int64)
         margin = int(self.config.cp_margin_voxels)
@@ -2599,6 +2696,9 @@ class FiberTrace3DLoader:
             else:
                 rotation = np.eye(3, dtype=np.float64)
             source_to_output = rotation @ np.diag(flip * scale)
+            geometry_rng = rng
+            if value_index is not None:
+                rng = self._rng(value_index, "paired_value")
             brightness = (
                 float(rng.uniform(-self.config.augment_brightness, self.config.augment_brightness))
                 if self.config.augment_brightness > 0.0
@@ -2607,7 +2707,15 @@ class FiberTrace3DLoader:
             contrast = float(rng.uniform(self.config.augment_contrast_min, self.config.augment_contrast_max))
             gamma = float(rng.uniform(self.config.augment_gamma_min, self.config.augment_gamma_max))
             noise_std = float(self.config.augment_noise_std)
-            blur_sigma = float(self.config.augment_blur_sigma)
+            blur_sigma = float(rng.uniform(0.0, self.config.augment_blur_sigma))
+            directional_sigma_along = float(
+                rng.uniform(0.0, self.config.augment_anisotropic_blur_sigma_along)
+            )
+            directional_sigma_across = float(
+                rng.uniform(0.0, self.config.augment_anisotropic_blur_sigma_across)
+            )
+            if value_index is not None:
+                rng = geometry_rng
         else:
             cp_local = center
             source_to_output = np.eye(3, dtype=np.float64)
@@ -2616,12 +2724,14 @@ class FiberTrace3DLoader:
             gamma = 1.0
             noise_std = 0.0
             blur_sigma = 0.0
+            directional_sigma_along = 0.0
+            directional_sigma_across = 0.0
         smooth = self._make_smooth_params(sample_index, rng)
         anisotropic_axis = self._anisotropic_axis_zyx(
             record,
             cp_index,
             source_to_output,
-            rng,
+            rng if value_index is None else self._rng(value_index, "paired_blur_axis"),
         )
 
         return _Augment3DParams(
@@ -2636,13 +2746,14 @@ class FiberTrace3DLoader:
             noise_std=noise_std,
             blur_sigma=blur_sigma,
             smooth=smooth,
-            anisotropic_blur_sigma_along=float(self.config.augment_anisotropic_blur_sigma_along)
+            anisotropic_blur_sigma_along=directional_sigma_along
             if anisotropic_axis is not None
             else 0.0,
-            anisotropic_blur_sigma_across=float(self.config.augment_anisotropic_blur_sigma_across)
+            anisotropic_blur_sigma_across=directional_sigma_across
             if anisotropic_axis is not None
             else 0.0,
             anisotropic_blur_axis_zyx=anisotropic_axis,
+            value_seed_index=value_index,
         )
 
     def _output_points_to_source_volume_np(
@@ -2696,7 +2807,7 @@ class FiberTrace3DLoader:
     def _prefetch_source_bbox(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
     ) -> tuple[np.ndarray, np.ndarray]:
         cp = self._control_point_volume_zyx(record, cp_index)
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.float64)
@@ -2730,7 +2841,7 @@ class FiberTrace3DLoader:
     def _prefetch_envelope_bbox_selected(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
     ) -> tuple[int, np.ndarray, np.ndarray]:
         start_selected, end_selected = self._prefetch_source_bbox(record, cp_index)
         selected_shape = np.asarray(
@@ -2916,9 +3027,17 @@ class FiberTrace3DLoader:
         self,
         points_volume_zyx: np.ndarray,
         params: _Augment3DParams | _GeometryMaps3D,
+        *, array_backend: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         if isinstance(params, _GeometryMaps3D):
             params = params.params
+        if array_backend:
+            # Sparse refinement queries share the same ordered shear mapping;
+            # native SciPy interpolation avoids dozens of tiny Torch dispatches.
+            relative = np.asarray(points_volume_zyx, dtype=np.float64) - params.cp_volume_zyx
+            mapped = params.cp_local_zyx + _smooth_forward_rel_zyx(relative, params.smooth) @ params.source_to_output_zyx.T
+            valid = np.isfinite(mapped).all(axis=1) & (mapped >= 0).all(axis=1) & (mapped <= np.asarray(self.config.patch_shape_zyx)-1).all(axis=1)
+            return mapped, valid
         points_np = np.asarray(points_volume_zyx, dtype=np.float32)
         points = torch.as_tensor(
             points_np,
@@ -2953,7 +3072,7 @@ class FiberTrace3DLoader:
         *,
         device: torch.device,
         profile_timings_ms: dict[str, float] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, None]:
         start = time.perf_counter()
         if geometry.backward_source_base_zyx is not None:
             coords_base = geometry.backward_source_base_zyx
@@ -2990,35 +3109,39 @@ class FiberTrace3DLoader:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     profile_timings_ms[f"vc_{key}"] = float(value)
         start = time.perf_counter()
-        sampled_np = np.asarray(result.image, dtype=np.float32)
-        sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
-        sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=device)
-        sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=device)
-        sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
+        # The native sampler initializes uncovered output to zero. Keep its
+        # compact uint8 result through shared storage and H2D; complete CUDA
+        # augmentation performs the only float32 conversion.
+        sampled_np = np.asarray(result.image, dtype=np.uint8)
+        sampled = torch.as_tensor(sampled_np, dtype=torch.uint8, device=device)
         if profile_timings_ms is not None:
             profile_timings_ms["volume_tensor_ms"] = (time.perf_counter() - start) * 1000.0
-        return sampled, sampled_valid
+        return sampled, None
 
     def _apply_value_augmentation(
         self,
         volume: torch.Tensor,
-        valid_mask: torch.Tensor,
         params: _Augment3DParams,
     ) -> torch.Tensor:
-        return apply_value_augmentation_3d(self.config, volume, valid_mask, params)
+        return apply_value_augmentation_3d(self.config, volume, params)
 
     def _line_window_for_labels(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
     ) -> tuple[np.ndarray, int]:
         line_points = np.asarray(record.fiber.line_points_zyx, dtype=np.float64) / float(
             record.volume_spacing_base
         )
-        line_index = control_point_line_index(record.fiber, int(cp_index))
+        line_index = (cp_index.segment_index if isinstance(cp_index, FiberLocation)
+                      else control_point_line_index(record.fiber, int(cp_index)))
         if line_points.shape[0] < 2:
             raise ValueError("fiber line must contain at least two points")
+        if record.dataset_config.get("dense_supervision", False) or isinstance(cp_index, FiberLocation):
+            # Later parts of the same fiber can re-enter the patch. Arc-window
+            # truncation would falsely label them negative.
+            return line_points, line_index
         cumulative = np.concatenate(
             [
                 np.zeros((1,), dtype=np.float64),
@@ -3043,7 +3166,7 @@ class FiberTrace3DLoader:
     def _cp_only_target_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         segment_starts: np.ndarray,
         segment_ends: np.ndarray,
@@ -3063,7 +3186,7 @@ class FiberTrace3DLoader:
     def _target_tangent_output_zyx(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
     ) -> np.ndarray:
         tangent_src = self._line_tangent_volume_zyx(record, cp_index).astype(np.float64)
@@ -3092,13 +3215,16 @@ class FiberTrace3DLoader:
     def _line_segment_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         *,
         patch_shape: tuple[int, int, int],
         radius: float,
         profile_timings_ms: dict[str, float] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        refinement_orientation: np.ndarray | None = None,
+        refinement_material: np.ndarray | None = None,
+        refinement_baseline: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
         start = time.perf_counter()
         line_points, _local_line_index = self._line_window_for_labels(
             record,
@@ -3115,9 +3241,48 @@ class FiberTrace3DLoader:
         points_out, _points_valid = self._source_points_to_output_np(line_points, params)
         segment_start = points_out[:-1].astype(np.float32)
         segment_end = points_out[1:].astype(np.float32)
+        segment_mid_source = (line_points[:-1] + line_points[1:]) * 0.5
+        segment_orientation = None
+        normal_sample_mid_base = segment_mid_source * float(record.volume_spacing_base)
+        if refinement_orientation is not None:
+            from .refinement import interpolate_orientation, orientation_angles
+            if (refinement_material is None or refinement_baseline is None or
+                    len(refinement_orientation) != len(line_points) or
+                    len(refinement_material) != len(line_points)):
+                raise ValueError("refined target orientation/material geometry mismatch")
+            midpoint_state = interpolate_orientation(
+                refinement_orientation,
+                refinement_material,
+                0.5 * (refinement_material[:-1] + refinement_material[1:]),
+            )
+            segment_orientation = orientation_angles(midpoint_state)
+            baseline_nodes = interpolate(
+                refinement_baseline[:, :3], refinement_baseline[:, 3], refinement_material)
+            normal_sample_mid_base = 0.5 * (baseline_nodes[:-1] + baseline_nodes[1:])
         valid_segments = np.isfinite(segment_start).all(axis=1) & np.isfinite(segment_end).all(axis=1)
+        if record.label_breaks:
+            valid_segments[list(record.label_breaks)] = False
+        if record.dataset_config.get("dense_supervision", False) or isinstance(cp_index, FiberLocation):
+            # Whole fibers can be long: reject disjoint segment boxes in NumPy
+            # before exact clipping. Keep source order and boundary-touching
+            # segments; this changes neither accepted segments nor target math.
+            valid_segments &= np.all(
+                np.maximum(segment_start, segment_end) >= np.full(3, -radius, dtype=np.float64), axis=1,
+            )
+            valid_segments &= np.all(
+                np.minimum(segment_start, segment_end)
+                <= np.asarray(patch_shape, dtype=np.float64) - 1.0 + radius, axis=1,
+            )
         segment_start = segment_start[valid_segments]
+        global_line_index = (cp_index.segment_index if isinstance(cp_index, FiberLocation)
+                             else control_point_line_index(record.fiber, int(cp_index)))
+        segment_indices = np.flatnonzero(valid_segments) + global_line_index - _local_line_index
         segment_end = segment_end[valid_segments]
+        segment_mid_source = segment_mid_source[valid_segments]
+        segment_tangent_source = np.diff(line_points, axis=0)[valid_segments]
+        normal_sample_mid_base = normal_sample_mid_base[valid_segments]
+        if segment_orientation is not None:
+            segment_orientation = segment_orientation[valid_segments]
         if profile_timings_ms is not None:
             profile_timings_ms["target_points_to_output_ms"] = (
                 time.perf_counter() - start
@@ -3130,8 +3295,20 @@ class FiberTrace3DLoader:
         ends: list[np.ndarray] = []
         bbox_los: list[np.ndarray] = []
         bbox_his: list[np.ndarray] = []
+        source_midpoints: list[np.ndarray] = []
+        normal_sample_midpoints: list[np.ndarray] = []
+        normal_segment_indices: list[int] = []
+        source_tangents: list[np.ndarray] = []
+        orientations: list[float] = []
+        width_indices: list[int] = []
+        width_fractions: list[np.ndarray] = []
         bbox_voxels = 0
-        for p0_raw, p1_raw in zip(segment_start, segment_end, strict=True):
+        orientation_values = (np.zeros(len(segment_start)) if segment_orientation is None
+                              else segment_orientation)
+        for p0_raw, p1_raw, midpoint_source, normal_midpoint, tangent_source, angle, segment_index in zip(
+            segment_start, segment_end, segment_mid_source, normal_sample_mid_base,
+            segment_tangent_source, orientation_values, segment_indices, strict=True
+        ):
             clipped = _clip_segment_to_aabb(
                 p0_raw,
                 p1_raw,
@@ -3154,41 +3331,108 @@ class FiberTrace3DLoader:
                 continue
             bbox_voxels += int(np.prod(hi - lo))
             starts.append(p0)
+            normal_segment_indices.append(int(segment_index))
+            if self.config.annotations.width_weight:
+                raw_vector = p1_raw.astype(np.float64) - p0_raw
+                fractions = ((np.stack((p0,p1)) - p0_raw) @ raw_vector / np.dot(raw_vector, raw_vector)).clip(0,1)
+                width_indices.append(int(segment_index))
+                width_fractions.append(fractions)
             ends.append(p1)
             bbox_los.append(lo.astype(np.int64))
             bbox_his.append(hi.astype(np.int64))
+            source_midpoints.append(midpoint_source)
+            normal_sample_midpoints.append(normal_midpoint)
+            source_tangents.append(tangent_source)
+            orientations.append(float(angle))
         if profile_timings_ms is not None:
             profile_timings_ms["target_clip_ms"] = (time.perf_counter() - start) * 1000.0
             profile_timings_ms["target_spec_segments"] = float(len(starts))
             profile_timings_ms["target_spec_bbox_voxels"] = float(bbox_voxels)
         if not starts:
             raise ValueError("label line window has no patch-overlapping segments")
+        normals_out = None
+        if record.dataset_config.get('supervision_mode') == 'coarse_area':
+            # Placeholder only: coarse segments never enter Gaussian rasterization.
+            normals_out = np.zeros((len(starts), 3), dtype=np.float32)
+        elif self.config.presence_target_mode == "anisotropic_gaussian":
+            midpoints = np.stack(source_midpoints, axis=0).astype(np.float64)
+            normals_base = self._sample_native_normals(
+                record,
+                np.stack(normal_sample_midpoints, axis=0).astype(np.float64),
+                profile_timings_ms,
+                segment_indices=normal_segment_indices,
+            )
+            if refinement_orientation is not None:
+                from .refinement import rotate_normals_about_tangent
+                # Rotation is defined in the unaugmented source frame. Clipping
+                # and uniform scale do not change the segment direction.
+                normals_base = rotate_normals_about_tangent(
+                    normals_base,
+                    np.stack(source_tangents, axis=0),
+                    np.asarray(orientations),
+                )
+            normals_out = self._transform_surface_normals_to_output(
+                midpoints,
+                normals_base,
+                params,
+            )
+            output_segments = np.stack(ends, axis=0) - np.stack(starts, axis=0)
+            tangents = output_segments / np.linalg.norm(output_segments, axis=1, keepdims=True)
+            perpendicular = normals_out - tangents * np.sum(normals_out * tangents, axis=1, keepdims=True)
+            if np.any(np.linalg.norm(perpendicular, axis=1) <= 1.0e-6):
+                raise InvalidNormalSampleError("Gaussian target normal is parallel to its fiber segment")
+        widths_out = None
+        if self.config.annotations.width_weight and record.dataset_config.get('supervision_mode') != 'coarse_area':
+            from .annotations import segment_endpoint_widths
+            widths_out = segment_endpoint_widths(self, record, params, width_indices, width_fractions)
+        elif self.config.annotations.width_weight:
+            widths_out = np.zeros((len(starts), 2), dtype=np.float32)
         return (
             np.stack(starts, axis=0).astype(np.float32),
             np.stack(ends, axis=0).astype(np.float32),
             np.stack(bbox_los, axis=0).astype(np.int64),
             np.stack(bbox_his, axis=0).astype(np.int64),
+            normals_out,
+            widths_out,
         )
 
     def _build_target_spec(
         self,
         record: _Record,
-        cp_index: int,
+        cp_index: int | FiberLocation,
         params: _Augment3DParams,
         profile_timings_ms: dict[str, float] | None = None,
+        *,
+        refinement_orientation: np.ndarray | None = None,
+        refinement_baseline: np.ndarray | None = None,
+        refinement_material: np.ndarray | None = None,
     ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         patch_shape = tuple(int(v) for v in self.config.patch_shape_zyx)
         radius = float(self.config.presence_radius_voxels)
-        segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi = self._line_segment_spec(
+        if self.config.presence_target_mode == "anisotropic_gaussian":
+            radius *= (
+                float(self.config.presence_gaussian_width_ratio)
+                * float(self.config.presence_gaussian_truncate_sigma)
+            )
+        if self.config.presence_sideband_weight > 0.0:
+            radius = max(
+                radius,
+                float(self.config.presence_sideband_half_width_base)
+                / float(record.volume_spacing_base),
+            )
+        segment_starts, segment_ends, segment_bbox_lo, segment_bbox_hi, segment_normals, segment_widths = self._line_segment_spec(
             record,
             cp_index,
             params,
             patch_shape=patch_shape,
             radius=radius,
             profile_timings_ms=profile_timings_ms,
+            refinement_orientation=refinement_orientation,
+            refinement_material=refinement_material,
+            refinement_baseline=refinement_baseline,
         )
         if not _uses_dense_fiber_supervision(record):
-            return self._cp_only_target_spec(
+            target = self._cp_only_target_spec(
                 record,
                 cp_index,
                 params,
@@ -3197,16 +3441,177 @@ class FiberTrace3DLoader:
                 segment_bbox_lo,
                 segment_bbox_hi,
             )
+            return (*target, None, segment_widths)
         return (
-            _TARGET_MODE_DENSE_LINE,
+            _TARGET_MODE_COARSE_AREA if record.dataset_config.get('supervision_mode') == 'coarse_area' else _TARGET_MODE_DENSE_LINE,
             segment_starts,
             segment_ends,
             segment_bbox_lo,
             segment_bbox_hi,
             self._target_tangent_output_zyx(record, cp_index, params),
+            segment_normals,
+            segment_widths,
         )
 
+    def _coarse_geometry(self, record, cp_index, params):
+        from .coarse_supervision import CoarseGeometry, center_rotation_frame, jittered_coarse_sites
+        points, _ = self._line_window_for_labels(record, cp_index, params)
+        base = points * record.volume_spacing_base
+        arc = arclength(base)
+        sites, offsets = jittered_coarse_sites(
+            arc[-1], _stable_seed(self.config.seed, "coarse_sites", params.stream_index))
+        positions = interpolate(base, arc, sites)
+        segments = np.clip(np.searchsorted(arc, sites, side='right') - 1, 0, len(base)-2)
+        tangents = np.diff(base, axis=0)[segments]
+        tangents /= np.linalg.norm(tangents, axis=1, keepdims=True).clip(1e-12)
+        source = positions / record.volume_spacing_base
+        centers, valid = self._source_points_to_output_np(source, params, array_backend=True)
+        jac = center_rotation_frame(self._source_to_output_jacobian(source, params),
+                                    record.volume_spacing_base)
+        # Rotate at the center only; no stretching/shearing of the ellipse.
+        # Keep the full fixed-size search disk in the crop.
+        bounds = 40 * np.linalg.norm(jac, axis=-1)
+        hi = np.asarray(self.config.patch_shape_zyx) - 1
+        valid &= np.all((centers - bounds >= 0) & (centers + bounds <= hi), axis=1)
+        if not valid.any():
+            raise InvalidNormalSampleError('coarse sample has no complete 80x40-base cross-section inside crop')
+        site_indices = np.flatnonzero(valid)
+        centers, tangents, jac = centers[valid], tangents[valid], jac[valid]
+        radii = 40 * np.linalg.svd(jac, compute_uv=False)[:, 0]
+        # Swept envelope plus site spheres cover all predicted orientations.
+        # Dense sites alone would leave gaps; adjacent centers share swept tubes.
+        starts = centers.copy()
+        ends = np.concatenate((centers[1:], centers[-1:]))
+        gaps = np.r_[np.diff(site_indices) != 1, False]
+        ends[gaps] = starts[gaps]  # Never bridge separate visits through the crop.
+        radii = np.maximum(radii, np.r_[radii[1:], radii[-1]])
+        return CoarseGeometry(*(np.asarray(v, dtype=np.float32) for v in
+                                (centers, tangents, jac, starts, ends, radii)), offsets=offsets)
+
+    def _sample_native_normals(self, record, points, timings=None, *, material=None, segment_indices=None):
+        """Shared native validity/encoding-aware path for embedding and refinement."""
+        from .annotations import sample_baked_normals
+        baked = sample_baked_normals(record.fiber, points, material=material, segment_indices=segment_indices)
+        if baked is not None:
+            return baked
+        from vc.volume import NormalSampler
+        manifest = _resolve_path(record.dataset_config["lasagna_manifest_path"], self.config.config_dir)
+        if manifest not in self._embedding_normal_records:
+            opened = time.perf_counter()
+            self._embedding_normal_records[manifest] = NormalSampler(
+                manifest, self.config.volume_cache_dir or "")
+            if timings is not None:
+                timings["embedding_normal_open_ms"] = (time.perf_counter()-opened)*1000
+        sampler = self._embedding_normal_records[manifest]
+
+        xyz = np.ascontiguousarray(points[:, ::-1], dtype=np.float32)
+        started = time.perf_counter()
+        normals, valid = sampler.sample(xyz, threads=1)
+        if timings is not None:
+            timings["embedding_normals_ms"] = timings.get("embedding_normals_ms", 0.) + (time.perf_counter()-started)*1000
+        if not valid.all():
+            raise InvalidNormalSampleError(
+                f"invalid normal (including zero grad_mag) "
+                f"manifest={manifest} invalid={np.count_nonzero(~valid)}/{len(valid)}")
+        return normals[:, ::-1]
+
+    def _source_to_output_jacobian(self, points_volume_zyx, params):
+        """Local Jacobian shared by surface-normal and annotated-width targets."""
+        from .annotations import coordinate_jacobian
+        points = np.asarray(points_volume_zyx, dtype=np.float64)
+        return coordinate_jacobian(points,
+            lambda query:self._source_points_to_output_np(query,params,array_backend=True)[0])
+
+    def _transform_surface_normals_to_output(self, points_volume_zyx, normals_zyx, params):
+        """Push surface-normal covectors through the exact sparse augmentation map."""
+        normals = np.asarray(normals_zyx, dtype=np.float64)
+        if normals.shape != np.shape(points_volume_zyx) or normals.ndim != 2 or normals.shape[1] != 3:
+            raise ValueError("segment normal transformation requires matching Nx3 points/normals")
+        jacobian = self._source_to_output_jacobian(points_volume_zyx, params)
+        transformed = np.linalg.solve(jacobian.transpose(0, 2, 1), normals[..., None])[..., 0]
+        lengths = np.linalg.norm(transformed, axis=1)
+        if not np.isfinite(transformed).all() or np.any(lengths <= 1.0e-10):
+            raise InvalidNormalSampleError("invalid transformed Gaussian target normal")
+        return (transformed / lengths[:, None]).astype(np.float32)
+
+    def _build_embedding_geometry(self, record, record_index, params, timings=None):
+        cfg = self.config.embedding
+        if not cfg.enabled:
+            return None
+
+        eligible = build_eligibility(
+            self.config.patch_shape_zyx, cfg.output_stride,
+            lambda points: self._output_points_to_source_volume_np(points, params) * record.volume_spacing_base,
+            record.fiber.line_points_zyx, lambda points: self._sample_native_normals(record, points, timings), record.base_shape_zyx)
+        return EmbeddingGeometry(eligible, _stable_seed(self.config.seed, params.stream_index, "embedding"),
+                                 cfg.pairs(self.config.patch_shape_zyx), cfg.output_stride, cfg.weight,
+                                 cfg.objective, cfg.negatives_per_anchor, cfg.temperature, cfg.margin,
+                                 short_range_channels=cfg.short_range_channels)
+
     def load_raw_sample(
+        self, sample_index: int, *, sample_index_limit: int | None = None,
+        sample_mode: str = "random", device: torch.device | str = "cpu",
+        profile: bool = False,
+    ) -> FiberTrace3DRawSample:
+        """Replace invalid-normal samples within their original scroll/group.
+
+        Queue identity remains canonical. Replacement draws and augmentations
+        are keyed only by that identity and attempt, not worker/rank state.
+        """
+        data_index = _bounded_data_sample_index(int(sample_index), sample_index_limit)
+        if self.config.embedding.paired_patches and sample_index_limit and sample_index_limit % 2:
+            raise ValueError("paired sample index limit must be even")
+        original = self.descriptor_for_sample_index(data_index, sample_mode=sample_mode)
+        descriptor = original
+        for attempt in range(129):
+            augmentation_index = int(sample_index) if attempt == 0 else (
+                _stable_seed(self.config.seed, "missing_normal_augmentation", sample_index, attempt) % (2**63-1))
+            try:
+                return self._load_raw_sample_once(sample_index, sample_index_limit=sample_index_limit,
+                    sample_mode=sample_mode, device=device, profile=profile,
+                    descriptor=descriptor, augmentation_index=augmentation_index)
+            except InvalidNormalSampleError as exc:
+                self._missing_normal_samples += 1
+                if self._missing_normal_samples == 1 or self._missing_normal_samples % 100 == 0:
+                    print(f"fiber loader: skip invalid-normal sample={sample_index} attempt={attempt} "
+                          f"worker_skipped={self._missing_normal_samples} fiber={descriptor[0].fiber.path} {exc}", flush=True)
+                if attempt == 128:
+                    raise RuntimeError(f"no normal-supported sample after 128 replacements: "
+                        f"sample={sample_index} original_fiber={original[0].fiber.path}: {exc}") from exc
+                descriptor = self._replacement_descriptor(original, sample_index, attempt+1, sample_mode)
+        raise AssertionError("unreachable")
+
+    def _replacement_descriptor(self, original, sample_index, attempt, sample_mode):
+        record = original[0]
+        if self.config.embedding.paired_patches:
+            # Never replace one partner with a different fiber.
+            return self._arc_sampler.sample_within(
+                self._rng(sample_index, f"pair_normal_retry_{attempt}"), [original[1]])
+        def group(r):
+            return (r.dataset_config.get("scroll_id", r.volume_path),
+                    r.dataset_config.get("supervision_mode", "precise"),
+                    r.dataset_config.get("sampling_group"))
+        key = group(record)
+        if key not in self._replacement_pools:
+            self._replacement_pools[key] = tuple(i for i,r in enumerate(self.records) if group(r) == key)
+        ids = self._replacement_pools[key]
+        rng = np.random.default_rng(_stable_seed(self.config.seed, "missing_normal_replacement", sample_index, attempt))
+        if sample_mode == "random" and self._arc_sampler is not None:
+            return self._arc_sampler.sample_within(rng, ids)
+        counts = np.cumsum([len(self.records[i].fiber.control_points_xyz) for i in ids])
+        flat = int(rng.integers(int(counts[-1])))
+        local = int(np.searchsorted(counts, flat, side="right"))
+        cp = flat - (int(counts[local-1]) if local else 0)
+        return self.records[ids[local]], ids[local], cp
+
+    @staticmethod
+    def _refined_location(curve, location):
+        segment = min(len(curve) - 2, max(0, int(np.searchsorted(curve[:, 3], location) - 1)))
+        fraction = (location - curve[segment, 3]) / (curve[segment+1, 3] - curve[segment, 3])
+        point = (1-fraction)*curve[segment, :3] + fraction*curve[segment+1, :3]
+        return FiberLocation(segment, fraction, tuple(point[::-1]))
+
+    def _load_raw_sample_once(
         self,
         sample_index: int,
         *,
@@ -3214,6 +3619,8 @@ class FiberTrace3DLoader:
         sample_mode: str = "random",
         device: torch.device | str = "cpu",
         profile: bool = False,
+        descriptor=None,
+        augmentation_index: int | None = None,
     ) -> FiberTrace3DRawSample:
         stream_index = int(sample_index)
         total_start = time.perf_counter()
@@ -3222,16 +3629,112 @@ class FiberTrace3DLoader:
         resolved_device = torch.device(device)
         start = time.perf_counter()
         data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
-        record, record_index, cp_index = self.descriptor_for_sample_index(
-            data_index,
-            sample_mode=sample_mode,
-        )
+        record, record_index, cp_index = descriptor
+        coarse = record.dataset_config.get('supervision_mode') == 'coarse_area'
+        if not coarse and self._width_store is not None and 'parent_width_key' in record.fiber.metadata:
+            from .parent_width import width_metadata
+            width = self._width_store.read_width(record.fiber.metadata['parent_width_key'])
+            record = replace(record, fiber=replace(record.fiber,
+                metadata=width_metadata(record.fiber.metadata, width)))
+        source_record = record
+        fixed_test = not coarse and self._refinement_store is not None and self.config.refinement_split == "test"
+        # Freeze all crop/augmentation decisions on the original GT descriptor.
+        fixed_params = (self._sample_augment_params(record, cp_index, augmentation_index,
+            value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
+            if fixed_test else None)
+        refinement_current = None
+        refinement_orientation = None
+        refinement_baseline = None
+        if not coarse and self._refinement_store is not None:
+            key = self._refinement_keys[record_index]
+            if fixed_test:
+                baseline = self._refinement_store.baseline(key)
+                refinement_current = resample(baseline[:, :3], baseline[:, 3],
+                    max(2, int(np.ceil(baseline[-1, 3] / self.config.refinement.spacing_base)) + 1))
+            else:
+                refinement_current, refinement_orientation = self._refinement_store.read_state(key)
+            if fixed_test:
+                refinement_orientation = np.zeros((len(refinement_current), 2), dtype=np.float64)
+                refinement_orientation[:, 0] = 1.0
+            refinement_baseline = self._refinement_store.baseline(key)
+            reference_arc = arclength(record.fiber.line_points_zyx.astype(np.float64))
+            if isinstance(cp_index, FiberLocation):
+                location = reference_arc[cp_index.segment_index] + cp_index.fraction * (
+                    reference_arc[cp_index.segment_index + 1] - reference_arc[cp_index.segment_index])
+            else:
+                location = reference_arc[control_point_line_index(record.fiber, cp_index)]
+            cp_index = self._refined_location(refinement_current, location)
+            from .annotations import resample_baked_metadata
+            record = replace(record, fiber=replace(record.fiber,
+                line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32),
+                metadata=resample_baked_metadata(record.fiber, reference_arc, refinement_current[:, 3])))
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        params = self._sample_augment_params(record, cp_index, stream_index)
+        params = fixed_params if fixed_test else self._sample_augment_params(record, cp_index, augmentation_index,
+            value_index=stream_index // 2 if self.config.embedding.paired_patches else None)
+        refinement_geometry = None
+        if refinement_current is not None and self.config.refinement.update_enabled:
+            patch_points, valid = self._source_points_to_output_np(
+                refinement_current[:, :3] / record.volume_spacing_base, params)
+            # Include one outside/context node on either side. Separate visits
+            # to a curved fiber may be disjoint; never span an outside gap.
+            near = np.flatnonzero(valid)
+            if len(near):
+                groups = np.split(near, np.flatnonzero(np.diff(near) > 1) + 1)
+                group = min(groups, key=lambda g: np.min(np.abs(g - cp_index.segment_index)))
+                section_start, section_stop = max(0, int(group[0])-1), min(len(refinement_current), int(group[-1])+2)
+                current = refinement_current[section_start:section_stop].copy()
+                if len(current) >= 3:
+                    baseline = refinement_baseline
+                    lo = max(0, int(np.searchsorted(baseline[:, 3], current[0, 3])-1))
+                    hi = min(len(baseline), int(np.searchsorted(baseline[:, 3], current[-1, 3]))+2)
+                    local_baseline = baseline[lo:hi].copy()
+                    observation_start = section_start
+                    if fixed_test:
+                        local_orientation = refinement_orientation[section_start:section_stop].copy()
+                        key, current, local_orientation = self._refinement_store.test_patch(key, data_index, params,
+                            self.config.patch_shape_zyx, record.volume_spacing_base,
+                            section_start, current, local_baseline, local_orientation)
+                        observation_start = 0
+                        # Keep other visits of the same fiber as original GT;
+                        # never replace the whole target with a clipped polyline.
+                        refinement_current[section_start:section_stop] = current
+                        refinement_orientation[section_start:section_stop] = local_orientation
+                        cp_index = self._refined_location(refinement_current, location)
+                        record = replace(record, fiber=replace(record.fiber,
+                            line_points_xyz=refinement_current[:, :3][:, ::-1].astype(np.float32),
+                            metadata=resample_baked_metadata(source_record.fiber, reference_arc, refinement_current[:, 3])),
+                            label_breaks=tuple(i for i in (section_start-1, section_stop-1)
+                                              if 0 <= i < len(refinement_current)-1))
+                    ref = interpolate(baseline[:, :3], baseline[:, 3], current[:, 3])
+                    try:
+                        normals = self._sample_native_normals(source_record, ref, timings, material=current[:, 3])
+                    except InvalidNormalSampleError:
+                        # Invalid support means no geometric evidence. Preserve
+                        # valid CT/GT training samples, without a fake normal.
+                        normals = None
+                    if normals is not None:
+                        refinement_geometry = RefinementObservation(
+                            key, observation_start, current, local_baseline, normals, params,
+                            record.volume_spacing_base, self.config.patch_shape_zyx,
+                            self.config.refinement, self.config.embedding.output_stride,
+                            independent_piece=fixed_test,
+                            orientation=refinement_orientation[section_start:section_stop].copy(),
+                            orientation_sigma_thickness_output=float(self.config.presence_radius_voxels),
+                            orientation_width_ratio=float(self.config.presence_gaussian_width_ratio),
+                            parent_width_key=record.fiber.metadata.get('parent_width_key'),
+                            width_base=float(record.fiber.metadata.get('width', 0)),
+                        )
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
+        embedding_start = time.perf_counter()
+        embedding_geometry = self._build_embedding_geometry(record, record_index, params, timings)
+        if self.config.embedding.paired_patches:
+            embedding_geometry = replace(embedding_geometry, pair_id=stream_index // 2,
+                pair_member=stream_index % 2, fiber_id=f"{record_index}:{record.fiber.path}")
+        if timings is not None:
+            timings["embedding_geometry_ms"] = (time.perf_counter() - embedding_start) * 1000.0
         start = time.perf_counter()
         geometry = self._build_geometry_maps(
             params,
@@ -3259,11 +3762,20 @@ class FiberTrace3DLoader:
             segment_bbox_lo,
             segment_bbox_hi,
             target_tangent,
+            target_segment_normals,
+            target_segment_widths,
         ) = self._build_target_spec(
             record,
             cp_index,
             params,
             timings,
+            refinement_orientation=(refinement_orientation
+                                    if self.config.refinement.orientation_enabled else None),
+            refinement_baseline=(refinement_baseline
+                                 if self.config.refinement.orientation_enabled else None),
+            refinement_material=(refinement_current[:, 3]
+                                 if (refinement_current is not None and
+                                     self.config.refinement.orientation_enabled) else None),
         )
         if timings is not None:
             timings["target_spec_total_ms"] = (time.perf_counter() - start) * 1000.0
@@ -3273,13 +3785,20 @@ class FiberTrace3DLoader:
             timings["raw_sample_total_ms"] = load_wall_ms
             timings["raw_sample_cpu_ms"] = load_cpu_ms
         sample = FiberTrace3DSample(
+            annotation_targets=line_targets(self, record, params, hv_only=coarse),
+            coarse_geometry=self._coarse_geometry(record, cp_index, params) if coarse else None,
+            presence_target_mode=self.config.presence_target_mode,
+            presence_sideband_weight=self.config.presence_sideband_weight,
+            volume_spacing_base=float(record.volume_spacing_base),
+            embedding_geometry=embedding_geometry,
+            refinement_geometry=refinement_geometry,
             stream_index=stream_index,
             data_index=int(data_index),
             record_index=int(record_index),
             fiber_path="" if record.fiber.path is None else str(record.fiber.path),
-            control_point_index=int(cp_index),
+            control_point_index=(-1 if isinstance(cp_index, FiberLocation) else int(cp_index)),
             volume=volume.view(1, *self.config.patch_shape_zyx),
-            valid_mask=valid.view(1, *self.config.patch_shape_zyx),
+            valid_mask=None,
             cp_local_zyx=torch.as_tensor(params.cp_local_zyx, dtype=torch.float32, device=resolved_device),
             crop_origin_zyx=torch.as_tensor(
                 np.floor(params.cp_volume_zyx - params.cp_local_zyx).astype(np.float32),
@@ -3310,6 +3829,15 @@ class FiberTrace3DLoader:
                 dtype=torch.float32,
                 device=resolved_device,
             ),
+            target_segment_normals_zyx=None
+            if target_segment_normals is None
+            else torch.as_tensor(
+                target_segment_normals,
+                dtype=torch.float32,
+                device=resolved_device,
+            ),
+            target_segment_widths_input=None if target_segment_widths is None else torch.as_tensor(
+                target_segment_widths, dtype=torch.float32, device=resolved_device),
             profile_timings_ms=timings,
         )
         return FiberTrace3DRawSample(
@@ -3769,12 +4297,26 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
     if raw.get("_array_records") is not None and datasets is None:
         datasets = [{"array_records": True}]
     cfg = FiberTrace3DConfig(
-        datasets=tuple(dict(entry) for entry in datasets),
+        mixed_supervision=bool(raw.get("mixed_supervision", False)),
+        coarse_tube_weight=float(raw.get("coarse_tube", {}).get("weight", 0.0)),
+        logical_batch_size=int(raw.get("training", {}).get("optimizer_global_batch_size", 128)),
+        annotations=AnnotationConfig.from_mapping(raw),
+       datasets=tuple(dict(entry) for entry in datasets),
+        sampling_strategy=str(raw.get("sampling_strategy", "control_points")),
+        embedding=EmbeddingConfig.from_mapping(raw),
+        refinement=RefinementConfig.parse(raw),
+        refinement_split=raw.get("_refinement_split", "train"),
         batch_size=int(raw.get("batch_size", 1)),
         patch_shape_zyx=_as_zyx3(raw.get("patch_shape_zyx", [192, 192, 192]), key="patch_shape_zyx"),
         seed=int(raw.get("seed", 1)),
         cp_margin_voxels=int(raw.get("cp_margin_voxels", 4)),
         presence_radius_voxels=float(raw.get("presence_radius_voxels", 2.0)),
+        presence_target_mode=str(raw.get("presence_target_mode", "binary")).lower(),
+        presence_gaussian_width_ratio=float(raw.get("presence_gaussian_width_ratio", 4.0)),
+        presence_gaussian_truncate_sigma=float(raw.get("presence_gaussian_truncate_sigma", 3.0)),
+        presence_sideband_weight=float(raw.get("presence_sideband_weight", 0.0)),
+        presence_sideband_half_width_base=float(raw.get("presence_sideband_half_width_base", 64.0)),
+        presence_sideband_half_height_base=float(raw.get("presence_sideband_half_height_base", 16.0)),
         presence_negative_edge_margin_voxels=(
             None
             if raw.get("presence_negative_edge_margin_voxels") is None
@@ -3825,9 +4367,9 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
-        geometry_backend=str(raw.get("geometry_backend", "eager")).lower(),
+        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
         value_augmentation_backend=str(
-            raw.get("value_augmentation_backend", "torch")
+            raw.get("value_augmentation_backend", "auto")
         ).lower(),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
         prefetch_sampler_workers=_parse_worker_count(

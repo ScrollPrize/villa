@@ -845,3 +845,37 @@ TEST_CASE("full replay overview compositor keeps four-strip blocks intact across
         doctest::Contains("exceeds the JPEG height limit"),
         std::invalid_argument);
 }
+
+
+TEST_CASE("training replay artifact roundtrip validates geometry and filter accounting")
+{
+    using namespace vc::fiber_tracer;
+    class Normals final : public vc::lasagna::NormalSampler {
+        vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override {
+            return {{0,1,0}, true, {}};
+        }
+    } normals;
+    const auto reference = makePolylineArcGeometry({{0,0,0},{40,0,0}});
+    ReplaySegmentRunner runner = [](const PolylineArcSample& seed, double, int,
+            const ReplayPointObserver& observe, const FiberTraceProgressCallback&) {
+        for (double x = seed.arc + 10; x <= 40; x += 10)
+            if (!observe({x,0,0}, x * .01, int(x/10))) break;
+        return std::string("stopped");
+    };
+    auto replay = traceReferenceReplayCore(reference, 0, 40, 10, 3, 2, 0, 4, 1,
+                                           normals, 1, runner);
+    const auto document = fiberReplayTraceJson(replay, 2);
+    CHECK(fiberReplayTraceJson(fiberReplayTraceFromJson(document), 2) == document);
+    auto corrupt = document;
+    corrupt["segments"][0]["trace_points_base_xyz"][0] = {0,0};
+    CHECK_THROWS(fiberReplayTraceFromJson(corrupt));
+    corrupt = document;
+    corrupt["segments"][0]["trace_cumulative_losses"] = nlohmann::json::array();
+    CHECK_THROWS(fiberReplayTraceFromJson(corrupt));
+    corrupt = document;
+    corrupt["filtered_stops"] = {{20,10,30}};
+    CHECK_THROWS(fiberReplayTraceFromJson(corrupt));
+    corrupt = document;
+    corrupt["version"] = 99;
+    CHECK_THROWS(fiberReplayTraceFromJson(corrupt));
+}

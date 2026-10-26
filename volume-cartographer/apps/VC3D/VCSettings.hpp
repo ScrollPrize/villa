@@ -74,6 +74,14 @@ namespace project {
 }
 
 // -----------------------------------------------------------------------------
+// Object Store Settings
+// -----------------------------------------------------------------------------
+namespace object_store {
+    // Settings array, most recent first; entries hold path, read_only, remote.
+    constexpr auto RECENT = "object_store/recent";
+}
+
+// -----------------------------------------------------------------------------
 // Viewer Settings
 // -----------------------------------------------------------------------------
 namespace viewer {
@@ -518,8 +526,8 @@ namespace volume_overlay {
     constexpr auto OPACITY = "opacity";
     constexpr auto WINDOW_LOW = "window_low";
     constexpr auto WINDOW_HIGH = "window_high";
-    constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto INTENSITY_AS_ALPHA = "intensity_as_alpha";
     constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";

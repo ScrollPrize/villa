@@ -111,7 +111,9 @@ session from a callback. Replacement validates the new database first, drains
 accepted writes, and cancels/waits for old readers. Include the attachment
 generation in asynchronous requests and caches: even reattaching the same store
 invalidates old requests. `takeEvents()` polls local and external commits for
-all object kinds; call it from the application's event loop. `finalize()` waits
+all object kinds; call it from the application's event loop. Each change carries
+its record's object or edge `kind` (kept for deletions too), so a consumer
+filters by kind without looking the record up. `finalize()` waits
 for accepted writes; edits are already committed by `act()`.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
@@ -253,6 +255,148 @@ history. A fresh retired replica may lack an active revision to restore: restore
 on the originating replica and sync, or copy its full database. Metadata-only
 JSON import rejects lifecycle-bearing exports.
 
+## Hosted hub and replicas
+
+A team shares one store by keeping a **hub** `.vcobj` on a network filesystem
+(an sshfs mount, NFS or SMB) or on any server reachable over SSH, addressed as
+`sftp://[user@]host[:port]/path/hub.vcobj` (`ssh://` works too). Nobody opens the hub to work. Each client clones
+it into a local **replica** and opens that replica like any other store, so reads
+and viewport queries stay on local disk. Hosting needs no server process. Public
+signatures are in [Hub.hpp](../include/vc_object_store/objects/Hub.hpp).
+
+```sh
+vc_object_hub init objects.vcobj        # locally, with no other connections
+cp objects.vcobj /mnt/share/hub.vcobj   # then place it on the share
+vc_object_hub clone /mnt/share/hub.vcobj ~/objects-replica.vcobj
+vc_object_hub lease acquire ~/objects-replica.vcobj UUID
+#   ... edit UUID with any client of the replica ...
+vc_object_hub sync ~/objects-replica.vcobj
+# or, with no mount at all:
+vc_object_hub clone sftp://alice@data.example.org/share/hub.vcobj ~/objects-replica.vcobj
+```
+
+**SFTP addresses.** Hub files addressed as `sftp://` or `ssh://` open through
+the store's own SQLite VFS, which speaks SFTP v3 to the system OpenSSH `ssh`
+program (`ssh -s host sftp`), so `~/.ssh/config`, keys, the agent, ProxyJump and
+`known_hosts` apply as usual and nothing needs mounting. The protocol client is
+the `vc_object_store::vc_sftp` library (`include/vc_object_store/sftp/Sftp.hpp`),
+which VC3D also uses for remote volumes. It locks with the same `<hub>.lock`
+directory as the `unix-dotfile` VFS, so clients on a mount and clients using an
+address can share one hub. The server must offer OpenSSH's `fsync@openssh.com`
+extension (stock OpenSSH does), or writes could not be made durable; the VFS
+refuses to open a hub for writing without it.
+- Without a registered authenticator, `ssh` runs in batch mode: keys and the
+  agent only, and only hosts already in `known_hosts`.
+- With one (`vc::sftp::setAuthenticator`, Python `set_sftp_authenticator`), every
+  ssh prompt (password, key passphrase, one-time code, accepting a new host key)
+  goes to the application through `SSH_ASKPASS`, with ssh's own wording. The
+  helper relays prompts through FIFOs in a private 0700 directory, so secrets
+  never appear in arguments or the environment. An accepted answer is reused
+  when a later connection to the same destination asks the same question; a
+  question repeated within one connection means the answer was wrong, so the
+  user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal
+  (Python: `use_terminal_sftp_prompts()`). Prompts need Linux or macOS; on
+  Windows `ssh` always runs in batch mode.
+- One ssh connection per destination serves every hub file and helper in a
+  process. A broken connection reconnects on next use, unless writes were still
+  unacknowledged; then the operation fails and SQLite rolls back from its journal.
+- Writes are pipelined and collected before any read, sync or unlock, so a
+  commit costs about one round trip plus the bytes. Each page read is still one
+  round trip, as over sshfs.
+
+The hub keeps SQLite's rollback journal and opens through the `unix-dotfile`
+VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
+atomic `mkdir`, which works on network filesystems where WAL's shared memory and
+byte-range locks do not. Only hub operations open the file, and each holds the
+lock briefly. An ordinary open of a hub is refused, so nothing can switch it back
+to WAL. Stores without the `hub_*` tables behave exactly as before. That includes
+two-store `synchronize`, which hub sync does not use.
+
+**Leases.** Changing the record or geometry of an object that exists on the hub
+requires this replica to hold that object's lease. The check runs at commit, in
+the library, so it covers every client of the replica. Objects created locally
+need no lease until they are pushed, and a push grants their creator a lease.
+`acquire_leases` is all-or-nothing. It refuses objects another replica holds,
+and objects changed on the hub since this replica last pulled them
+(`HubLeaseRefused::held` / `stale`); pull, then retry. Leases expire after their
+duration (default ten minutes), so clients need roughly synchronized clocks.
+Releasing a lease requires its changes to be pushed first. The hub enforces
+unexpired leases on direct edits too.
+
+Relationships are shared records, not leased. Linking to someone else's object,
+or saving an edit that revalidates its links, does not need the other object's
+lease. Two replicas changing the same relationship produce a conflict.
+
+**Sync.** A replica tracks the hub's journal cursor, the hub version (latest
+journal sequence) of each record it installed, and its own unpushed changes.
+- `hubPull` installs records changed on the hub since the cursor, with their
+  geometry history, in one replica transaction.
+- `hubPush` publishes local changes in one hub transaction. Each record must
+  still have the hub version it was edited from, and each changed hub object must
+  be leased to this replica. The push copies geometry history, validates
+  relationship dependencies like `synchronize`, and verifies the result.
+- A retry after a push whose outcome was lost recognizes its own records.
+
+**Applications** do not drive sync themselves. When an `ObjectStoreSession`
+attaches a writable hosted replica, it starts a background worker. The worker
+pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
+after each `act()`; pulled changes arrive through `takeEvents()` like any other
+external commit. Before editing, a caller takes
+`holdLeases(attachment, uuids)`. The returned `LeaseHold` keeps the leases
+renewed while it lives. Once no hold remains and the changes are pushed, the
+worker releases the lease. A hold pulls once first if the hub is ahead, and it
+is a no-op for ordinary stores, so callers need not check what they attached.
+`hubStatus()` reports pending records, conflicts, the last error and sync time,
+and a `StoreSessionEvent::Kind::Hub` event announces each change.
+`syncHub()` and `resolveHubConflicts(keep)` act asynchronously. Scripts that
+do not use a session call `hub_sync` and the lease functions directly.
+
+Records changed both locally and on the hub become conflicts, and pushing stops
+until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
+record. `"local"` publishes this replica's record over it and requires the lease.
+Object revision UUIDs are per replica, as with `synchronize`. Geometry revision
+UUIDs and the store UUID are shared.
+
+**Operations.**
+- `clone` copies the hub file in large reads without holding the lock. It then
+  checks, under the lock, that the header's change counter and the file size are
+  unchanged; every commit changes the counter, so the copy is consistent. After
+  three interrupted attempts it falls back to SQLite's backup API in locked steps.
+  That fallback reads one page per request and is slow over a network.
+- A client that dies while holding the hub lock leaves `<hub>.lock` behind, and
+  every other client waits on it. Once no client is syncing, run
+  `vc_object_hub unlock HUB --force` (a path or an address; library
+  `hubLockAge`/`removeHubLock`); the next open rolls back the interrupted
+  write from its journal.
+- The share must apply `mkdir` atomically and must not serve stale cached data
+  to SQLite. Mount NFS with `noac`. Mount sshfs (3.x) with
+  `-o direct_io,dir_cache=no,entry_timeout=0,attr_timeout=0,negative_timeout=0`,
+  so page reads and the existence of `<hub>-journal` always come from the
+  server.
+- A process keeps one connection per hub and author open. SQLite then keeps
+  its page cache between operations while the hub is unchanged, instead of
+  rereading the header and schema over the network each time.
+- Hub operations wait up to 60 s for the lock. The lock is not fair, so heavy
+  contention can still time out an operation; retry it.
+- `detach` turns a replica back into an ordinary store.
+
+Measured on 2026-10-23 with RelWithDebInfo on Ubuntu arm64, median of 10
+iterations. "Local disk" uses a synthetic 20,000-fiber hub (354 MB). "Network"
+uses 765 real fibers with 186 links (98 MB) on a remote host, mounted with the
+sshfs options above at about 18 ms round-trip time.
+
+| Operation | Local disk | Network |
+| --- | ---: | ---: |
+| Clone | 0.4 s | 3.8 s |
+| Lease acquire | 13 ms | 460 ms |
+| One-fiber push (metadata + geometry edit) | 19 ms | 520 ms |
+| Pull of that change on another replica | 10 ms | 1,080 ms |
+| Sync with nothing to do | 6 ms | 140 ms |
+
+The first operation of a process also opens the hub, which takes about 2 s over
+the network. A pull after any hub commit rereads the index pages it needs: in
+rollback-journal mode, SQLite drops its page cache whenever the file changes.
+
 ## Volume identity and coordinate scale
 
 Geometry objects use `meta.coordinates = {"volume_uuid": ..., "scale_factor": ...}`.
@@ -389,10 +533,6 @@ setup participates in cancellation and work/processing budgets.
 
 C++ `ObjectSelection::coordinates` and `RegionOptions::coordinates` accept
 an exact JSON coordinate declaration (missing fields compare as null).
-`objectCoordinateGroups(txn, "fiber", cancel)` aggregates current metadata without
-materializing object records or decoding geometry. This lets a viewer query each
-coordinate frame directly, without constructing an inclusion list for every
-object in the store.
 
 A volume target instead queries in one volume's voxels across every frame
 declared in it. `ObjectSelection::volume` / `select_objects(volume=...)`,
@@ -409,6 +549,18 @@ other volumes' frames) in UUID order after the bound ones, unless a positive
 minimum length is set; a cursor into them carries `after_uuid` without
 `after_length`. `volume` and `coordinates` are exclusive. Region queries drive the persisted R-tree and order only
 spatial candidates by UUID. Geometry and intersection predicates are unchanged.
+
+Volume targets never parse every object's metadata. The `objects` table carries
+`coordinate_volume` and `coordinate_scale`, virtual generated columns equal to
+`json_extract` of `meta.coordinates`, indexed as `objects_coordinates(kind,
+coordinate_volume, coordinate_scale)` (schema version 16; earlier stores are
+rejected and must be rebuilt). Version 16 also records object/edge kinds in the
+journal, including deletions, for selective cache invalidation. A target finds its frames with one index seek per
+distinct scale, and the unbound tail reads only the index ranges outside the
+volume's binding. `unboundObjectCount(txn, kind, volume)` counts that tail the
+same way. SQLite never answers a generated column from an index alone, so an
+aggregate over these columns (a GROUP BY or count of a whole kind) still reads
+every row; new queries should seek index ranges instead.
 
 | Budget | Default | Charged work |
 | --- | ---: | --- |
@@ -464,32 +616,34 @@ for import/export without relationship detectors or their CT reader dependency.
 VC3D uses this configuration; the standalone tools/Python build keeps detectors
 on by default. The existing OpenCV/TIFF dependencies supply native formats.
 
-## Large-store opening and volume-ID correction
+## Large-store reads and volume-ID correction
 
-Build and run the read-only Paris 4 timing harness from this directory:
+`bench_volume_queries` times the volume-targeted reads VC3D issues (viewport
+regions, a line-annotation strip's candidates, the unbound count, a catalog page
+with its unbound tail, and a curved view's control-chain selection), five runs
+each, read-only. Build and run it from this directory; the VC3D read-only
+harness is documented in `docs/fiber-collections.md` in the sibling project:
 
 ```sh
-AGENTS_AGENT_MODE=1 ninja -C build bench_fiber_open
-build/bin/bench_fiber_open /path/to/paris4-fibers.vcobj
+AGENTS_AGENT_MODE=1 ninja -C build bench_volume_queries
+build/bin/bench_volume_queries /path/to/paris4-fibers.vcobj 20260411134726
 ```
 
-The harness uses the fixed source-voxel viewport centered at `(17000,15500,55000)`,
-with half-extents `(1024,1024,3)`, and a 5,000-fiber cap. On Ubuntu arm64,
-RelWithDebInfo (`-O2 -g`), three consecutive runs on the 931,104-fiber Paris 4
-store gave these mean / min / median / max region-query times (seconds):
+On the 931,104-fiber Paris 4 store (Ubuntu arm64, RelWithDebInfo, warm cache;
+"before" is schema 13, "after" the same data with the schema 14 columns and index),
+median milliseconds:
 
-| Query | Mean | Min | Median | Max | Coverage |
-| --- | ---: | ---: | ---: | ---: | --- |
-| UUID-first scan | 3.550 | 2.325 | 2.371 | 5.952 | 50 fibers, SQL budget exhausted |
-| R-tree-first candidates | 0.0583 | 0.0578 | 0.0580 | 0.0590 | All 142 intersecting fibers |
+| Read | Before | After |
+| --- | ---: | ---: |
+| Region 300×200×6 | 810 | 32 |
+| Region 1500×1000×6 | 826 | 52 |
+| Strip candidates (`spatialRegions`) | 802 | 15 |
+| Unbound count (was a per-binding count + `objectCount`) | 2,516 + 69 | 0.004 |
+| Catalog page of 200 with unbound tail | 3,148 | 1.2 |
+| Control-chain selection | 920 | 47 |
 
-SQLite VM work fell from 10,000,000 steps (the budget) to 386,464. The previous
-query returned partial coverage, so this is not a like-for-like throughput ratio.
-These measurements were collected while incremental builds were also running;
-no cold-cache claims are made. Metadata aggregation averaged 2.922 s after the
-change, a 200-row page with revision pins 0.0089 s. VC3D performs both in background
-workers. The VC3D read-only harness is documented in `docs/fiber-collections.md`
-in the sibling project. No numeric representations or predicates were changed.
+Query results were identical on both schemas (checked with
+`test_object_store_volume_target`).
 
 Older imports may contain a UUIDv5-derived volume binding. Correcting a known
 binding is explicit and preserves prior revisions and all geometry. First preview:

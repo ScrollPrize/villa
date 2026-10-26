@@ -112,7 +112,7 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq",
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation,record_kind FROM journal WHERE seq>? ORDER BY seq",
         afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
@@ -129,6 +129,7 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
         e.approvedAt = s.optText(9);
         e.approvedHost = s.optText(10);
         if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
+        e.kind = s.text(12);
         out.push_back(std::move(e));
     }
     return out;

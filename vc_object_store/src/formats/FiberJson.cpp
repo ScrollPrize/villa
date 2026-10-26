@@ -101,6 +101,22 @@ GeometrySource decodeFiberJson(const std::string& text)
     p.source = std::move(root);
     return p;
 }
+std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>& batch)
+{
+    std::set<std::string> inBatch, targets;
+    for (const auto& entry : batch) inBatch.insert(entry.object.uuid);
+    for (const auto& entry : batch) {
+        if (entry.object.kind != "fiber") continue;
+        for (const auto* key : {"branches", "adjacent_branches"})
+            for (const auto& branch : entry.source.value(key, Json::array()))
+                targets.insert(util::canonicalUuid(branch.at("target_uuid").get<std::string>()));
+    }
+    std::vector<std::string> result;
+    for (const auto& target : targets)
+        if (!inBatch.contains(target)) result.push_back(target);
+    return result;
+}
+
 std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
                            const std::string& source)
 {
@@ -191,12 +207,17 @@ Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& ed
     if (!own.direction || !other.direction) throw std::runtime_error("Fiber branch endpoint direction is missing");
     const auto [i, position] = endpoint(ownGeometry, own);
     const auto [j, targetPosition] = endpoint(otherGeometry, other);
-    return Json{{"edge_uuid", edge.uuid}, {"target_uuid", otherGeometry.objectUuid},
+    const bool pending = edge.approvalState != "approved";
+    const auto meta = Json::parse(edge.meta);
+    auto entry = Json{{"edge_uuid", edge.uuid}, {"target_uuid", otherGeometry.objectUuid},
         {"branch_file", otherGeometry.objectUuid + ".json"},
         {"control_point_index", i}, {"branch_control_point_index", j},
         {"control_point_position", position}, {"branch_control_point_position", targetPosition},
         {"control_point_direction", *own.direction}, {"branch_control_point_direction", *other.direction},
-        {"pending", edge.approvalState != "approved"}};
+        {"pending", pending}};
+    // An unreviewed automatic link: only while pending, never adjacent.
+    if (pending && !meta.value("adjacent", false) && meta.value("auto", false)) entry["auto"] = true;
+    return entry;
 }
 }
 

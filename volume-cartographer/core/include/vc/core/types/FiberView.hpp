@@ -38,7 +38,7 @@ struct ViewRegion {
     Bounds box, local;
     bool operator==(const ViewRegion&) const = default;
     Point project(const Point& point) const;
-    // Exact for slices sharing the same axes; conservatively false otherwise.
+    // Exact for any axes: true when every corner of other's box lies in this box.
     bool contains(const ViewRegion& other) const;
 };
 bool clipSegment(const Point&, const Point&, const Bounds&, double&, double&);

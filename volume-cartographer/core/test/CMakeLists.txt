@@ -66,6 +66,7 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
+vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
 vc_add_test(NAME test_sampling_wait_profile)
 add_test(NAME test_sampling_wait_profile_enabled
@@ -283,13 +284,18 @@ vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_json LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_trace_winding_bp LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_lasagna_normal_alignment LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reference_replay_benchmark LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
@@ -810,8 +816,9 @@ vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: opens the PHerc 0172 volume and reads small chunks.
-vc_add_test(NAME test_volume_live_s3)
+# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+vc_add_test(NAME test_volume_live_s3
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)

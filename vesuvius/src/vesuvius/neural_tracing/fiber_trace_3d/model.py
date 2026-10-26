@@ -15,6 +15,8 @@ from vesuvius.neural_tracing.fiber_trace.model import (
     _derive_unet_strides,
 )
 from vesuvius.neural_tracing.nets.vesuvius_unet3d import Vesuvius3dUnetModel
+from .embedding import EmbeddingConfig
+from .annotations import AnnotationConfig
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,10 @@ class FiberTrace3DModelConfig:
     squeeze_excitation: bool = False
     normalization: str = "batch"
     output_stride: int = 1
+    embedding_channels: int = 0
+    embedding_objective: str = "pairwise"
+    embedding_short_range_channels: int = 0
+    annotations: AnnotationConfig = AnnotationConfig()
 
 
 class FiberTrace3DNet(nn.Module):
@@ -45,6 +51,16 @@ class FiberTrace3DNet(nn.Module):
         if not cfg.features_per_stage:
             raise ValueError("features_per_stage must not be empty")
         self.conditioned_decoder_enabled = bool(cfg.conditioned_decoder_enabled)
+        self.embedding_channels = int(cfg.embedding_channels)
+        self.annotations = cfg.annotations
+        if self.annotations.names and self.conditioned_decoder_enabled:
+            raise ValueError("annotated heads require the unconditioned U-Net")
+        self.embedding_objective = cfg.embedding_objective
+        self.embedding_short_range_channels = int(cfg.embedding_short_range_channels)
+        if self.embedding_channels < 0 or (self.embedding_channels and self.conditioned_decoder_enabled):
+            raise ValueError("embedding channels require an unconditioned U-Net")
+        if not 0 <= self.embedding_short_range_channels < max(1, self.embedding_channels):
+            raise ValueError("invalid embedding short-range channel split")
         if self.conditioned_decoder_enabled:
             if int(cfg.output_channels) != 7:
                 raise ValueError(
@@ -87,7 +103,7 @@ class FiberTrace3DNet(nn.Module):
         backbone_out_channels = (
             int(cfg.conditioned_latent_channels)
             if self.conditioned_decoder_enabled
-            else int(cfg.output_channels)
+            else int(cfg.output_channels) + self.embedding_channels + self.annotations.channels
         )
         self.net = Vesuvius3dUnetModel(
             int(cfg.input_channels),
@@ -127,6 +143,8 @@ class FiberTrace3DNet(nn.Module):
         conditioned_point_indices_bzyx: torch.Tensor | None = None,
         conditioned_point_query_n6: torch.Tensor | None = None,
         return_conditioned_components: bool = False,
+        return_embeddings: bool = False,
+        return_annotations: bool = False,
     ) -> torch.Tensor | dict[str, torch.Tensor | None]:
         if volume.ndim != 5:
             raise ValueError("volume must have shape B,C,D,H,W")
@@ -176,7 +194,14 @@ class FiberTrace3DNet(nn.Module):
                 "conditioned forward arguments require conditioned decoder mode"
             )
         raw = self.net(volume)
-        return torch.sigmoid(raw)
+        prediction = torch.sigmoid(raw[:, :self.output_channels])
+        if return_embeddings or return_annotations:
+            end = self.output_channels + self.embedding_channels
+            return {"prediction": prediction,
+                    "presence_logits": raw[:, 6],
+                    "embeddings": raw[:, self.output_channels:end],
+                    "annotations": raw[:, end:]}
+        return prediction
 
     def encode_volume(self, volume: torch.Tensor) -> torch.Tensor:
         if not self.conditioned_decoder_enabled:
@@ -350,6 +375,7 @@ def presence_outputs(output: torch.Tensor) -> torch.Tensor:
 
 
 def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
+    embedding = EmbeddingConfig.from_mapping(config)
     model_cfg = dict(config.get("model_3d", config.get("model", {})))
     features_per_stage = _derive_features_per_stage(model_cfg)
     strides = _derive_unet_strides(
@@ -368,7 +394,7 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
     else:
         direction_branch_count = int(model_cfg.get("direction_branch_count", 1))
         output_channels = direction_branch_count * 7
-    return FiberTrace3DNet(
+    model = FiberTrace3DNet(
         FiberTrace3DModelConfig(
             input_channels=int(model_cfg.get("input_channels", 1)),
             output_channels=output_channels,
@@ -393,5 +419,13 @@ def build_fiber_trace_3d_model(config: dict[str, Any]) -> FiberTrace3DNet:
             squeeze_excitation=bool(model_cfg.get("squeeze_excitation", False)),
             normalization=str(model_cfg.get("normalization", "batch")),
             output_stride=int(model_cfg.get("output_stride", 1)),
+            embedding_channels=embedding.channels if embedding.enabled else 0,
+            embedding_objective=embedding.objective,
+            embedding_short_range_channels=embedding.short_range_channels,
+            annotations=AnnotationConfig.from_mapping(config),
         )
     )
+    model.coarse_supervision = bool(config.get('mixed_supervision', False))
+    from .coarse_supervision import CoarseTubeConfig
+    model.coarse_tube = CoarseTubeConfig.from_raw(config)
+    return model

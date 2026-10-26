@@ -52,6 +52,30 @@ entries, 4/4 branch-producer tests, and the fresh-database bridge smoke passed.
 The Spiral workflow skips three optional real-fixture checks, and the brush
 patch suite skips one; both test entries pass. `git diff --check` is clean.
 
+## Fiber fix regressions
+
+The journal-kind backport uses schema 16. Older stores are rejected; recreate or
+reimport them rather than opening them with the new binaries. The dependent
+tifxyz branch uses a separate schema version for its surface changes.
+
+Build and run the focused checks from `volume-cartographer` with `VC_TESTING=ON`:
+
+```sh
+ninja -C build VC3D vc_fiber_constraints test_fiber_constraint_geometry \
+  test_object_store_session test_object_store_fiber_json test_object_store_fiber_session
+ctest --test-dir build --output-on-failure \
+  -R '^(object_store_(session|fiber_json|fiber_session|vc3d_controller)|test_fiber_constraint_geometry)$'
+VC_FIBER_CONSTRAINT_FIXTURE=/path/to/native-fiber-collection \
+  ctest --test-dir build -V -R '^test_fiber_constraint_geometry$'
+```
+
+The optional collection check imports into a disposable store and trims an
+unlinked fiber through the two-point threshold. It verifies that extraction
+selects the current geometry despite the unchanged ingest summary. Input files
+are only read. The standard tests also check narrow import pins, conflicts on
+linked endpoints, journal kinds after deletion, old-schema rejection, and cache
+preservation on unrelated, foreign-store, and hub-status events.
+
 ## Limits
 
 Validation is on Ubuntu aarch64, using offscreen Qt. macOS and amd64 have not been

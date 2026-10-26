@@ -15,13 +15,20 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP ON CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 457f612aa0379a73fd750d8b8e61eb8b11bf45fd)
+        GIT_TAG 103b502ad784df14c876100d87f601c0b6c46888) # v0.2.0
     FetchContent_MakeAvailable(vc_delta3d)
 endif()
 if(TARGET vc_delta3d)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
-add_library(vc_reader_native SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+# Embedding builds (the object store's Python module) link the reader statically so
+# the module carries no shared library of its own to install.
+option(VC_READER_SHARED_READER "Build the native reader as a shared library" ON)
+if(VC_READER_SHARED_READER)
+    add_library(vc_reader_native SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+else()
+    add_library(vc_reader_native STATIC "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+endif()
 add_library(vc_reader::reader ALIAS vc_reader_native)
 set_target_properties(vc_reader_native PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME reader)
 target_compile_features(vc_reader_native PUBLIC cxx_std_20)

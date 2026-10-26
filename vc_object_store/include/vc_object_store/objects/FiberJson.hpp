@@ -7,6 +7,9 @@ namespace vc::objects {
 size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor&);
 
 GeometrySource decodeFiberJson(const std::string& json);
+// The fibers outside a prepared fiber batch that its branches link to: the
+// existing endpoints a checked ingestGeometryBatch caller must pin.
+std::vector<std::string> fiberBatchEndpoints(const std::vector<GeometrySource>&);
 // Encode already pinned geometry and annotations; does not read moving heads.
 std::string encodeFiberJson(const std::string& objectUuid, const GeometryData&,
                             const std::string& sourceAnnotations);

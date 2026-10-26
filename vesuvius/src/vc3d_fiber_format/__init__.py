@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +121,18 @@ def _points(raw: Any, *, label: str) -> tuple[tuple[float, float, float], ...]:
             _number(value, label=f"{label}[{index}]") for value in point
         ))
     return tuple(result)
+
+
+def serialize_segment_metadata(segment: FiberTraceSegmentMetadata) -> dict[str, Any]:
+    """Inverse of the canonical V3 parser; derived outcome is not serialized."""
+    result = asdict(segment)
+    result.pop("outcome")
+    tags = result.pop("tags", ())
+    if tags:
+        result["tags"] = list(tags)
+    result.update(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2)
+    parse_segment_metadata(result, version=4 if tags else 3)
+    return result
 
 
 def parse_segment_metadata(raw: Any, *, version: int = 3) -> FiberTraceSegmentMetadata:
@@ -282,11 +294,10 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            allowed = {"position", "segment_to_next", "tags"}
-            if version == 4:
-                allowed.update({"direction", "display_normal", "display_normal_source"})
+            # Editor hints are validated without changing reference geometry or span eligibility.
+            allowed = {"position", "segment_to_next", "tags", "direction", "display_normal", "display_normal_source"}
             if not isinstance(control, dict) or not set(control) <= allowed:
-                raise ValueError("unsupported control point fields")
+                raise ValueError("version-3/4 control point contains unknown fields")
             for field in ("direction", "display_normal"):
                 if field in control:
                     vector = _points([control[field]], label=f"control point {field}")[0]

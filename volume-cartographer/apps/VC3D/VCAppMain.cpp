@@ -13,6 +13,7 @@
 #include <QImageReader>
 
 #include "CWindow.hpp"
+#include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
@@ -342,6 +343,7 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+    vc3d::installSshPrompts();
 
     // Handle this before constructing the main window. QCommandLineParser's
     // built-in version option normally exits from process(), but keeping the

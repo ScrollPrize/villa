@@ -13,6 +13,16 @@ void detail::beginSpatialRead(StatementPool& pool, size_t budget, int version)
 }
 
 namespace {
+// Objects of a kind not bound to a volume, NOT (volume IS v AND
+// COALESCE(scale>0,0)), as ranges of objects_coordinates.
+std::string unboundObjectIdsSql(const std::string& kind, const std::string& volume)
+{
+    const auto arm = " UNION ALL SELECT id FROM objects INDEXED BY objects_coordinates WHERE kind=" + kind + " AND ";
+    return "SELECT id FROM objects INDEXED BY objects_coordinates WHERE kind=" + kind + " AND coordinate_volume IS NULL" +
+        arm + "coordinate_volume<" + volume + arm + "coordinate_volume>" + volume +
+        arm + "coordinate_volume=" + volume + " AND coordinate_scale IS NULL" +
+        arm + "coordinate_volume=" + volume + " AND coordinate_scale<=0";
+}
 struct SelectionFilter {
     std::string sql;
     std::vector<std::string> parameters;
@@ -66,8 +76,17 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
     if (selection.family) bind(" AND d.family=?", *selection.family);
     if (selection.minLength) bind(" AND d.length>=?", nlohmann::json(*selection.minLength).dump());
     if (frame && frame->unboundVolume) {
-        bind(" AND NOT (json_extract(o.meta,'$.coordinates.volume_uuid') IS ?", *frame->unboundVolume);
-        filter.sql += " AND COALESCE(json_extract(o.meta,'$.coordinates.scale_factor')>0,0))";
+        if (selection.kind) {
+            // Index ranges, so a store bound to one volume is not scanned.
+            const auto kind = "?" + std::to_string(filter.parameters.size() + 1);
+            const auto volume = "?" + std::to_string(filter.parameters.size() + 2);
+            filter.sql += " AND o.id IN (" + unboundObjectIdsSql(kind, volume) + ")";
+            filter.parameters.push_back(*selection.kind);
+            filter.parameters.push_back(*frame->unboundVolume);
+        } else {
+            bind(" AND NOT (o.coordinate_volume IS ?", *frame->unboundVolume);
+            filter.sql += " AND COALESCE(o.coordinate_scale>0,0))";
+        }
     }
     if (frame && frame->cursor) {
         // Volume order within a frame: shorter volume length, or the same
@@ -212,7 +231,8 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
                                                        const std::string& columns, const FrameFilter* frame)
 {
     auto filter = objectFilter(db, selection, frame);
-    const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag;
+    const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag ||
+                            (frame && frame->unboundVolume && selection.kind);
     // Force primary-key candidate probes instead of scanning objects_kind_uuid
     // to avoid a sort when the R-tree returned only a few matches.
     const bool typed = selection.family || selection.minLength || selection.orderBy == "length_desc";
@@ -256,6 +276,15 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
         return position.at(a.uuid) < position.at(b.uuid);
     });
     return records;
+}
+
+int64_t ObjectStore::unboundObjectCount(const Txn& txn, const std::string& kind, const std::string& volume) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    Statement count(db, "SELECT count(*) FROM objects o NOT INDEXED WHERE o.id IN (" + unboundObjectIdsSql("?1", "?2") +
+                        ") AND " + activeObjectSql("o.id"), kind, volume);
+    (void)count.row();
+    return count.i64(0);
 }
 
 std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const ObjectSelection& selection) const

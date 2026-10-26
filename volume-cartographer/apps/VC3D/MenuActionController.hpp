@@ -41,6 +41,7 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
+    static constexpr size_t kMaxRecentObjectStores = 10;
 
     explicit MenuActionController(CWindow* window);
     ~MenuActionController() override;
@@ -56,6 +57,7 @@ public:
     bool isOpenDataCatalogVisible() const;
     // Prompts for a .vcobj (and an author when the environment names none) and attaches it.
     void attachObjectStore();
+    void cloneHostedStore();
     void detachObjectStore();
     // Resolves sampleId against the cached manifest and opens it. When
     // interactive is false, prompts, progress dialogs, and message boxes are
@@ -138,6 +140,16 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
+    // Author recorded on edits: the login name, else asked for. Empty means cancelled.
+    QString objectStoreAuthor();
+    // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
+    void attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
+    // remote: a replica of a hosted store.
+    struct RecentObjectStore { QString path; bool readOnly{false}; bool remote{false}; };
+    std::vector<RecentObjectStore> loadRecentObjectStores() const;
+    void saveRecentObjectStores(const std::vector<RecentObjectStore>& stores);
+    void refreshRecentObjectStoreMenu();
+    void openRecentObjectStore(const RecentObjectStore& store);
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
@@ -196,6 +208,8 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
+    QMenu* _objectStoreMenu{nullptr};
+    QMenu* _recentObjectStoreMenu{nullptr};
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
