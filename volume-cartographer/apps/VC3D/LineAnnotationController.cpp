@@ -10908,7 +10908,8 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     vc3d::line_annotation::invalidateSegmentsAdjacentToControl(
         session.controlPoints, static_cast<size_t>(deletedControlIndex));
-    session.controlPoints.erase(selected);
+    vc3d::line_annotation::eraseControlPoint(
+        session.controlPoints, static_cast<size_t>(deletedControlIndex));
     // Deleting a point can part two breaks or make two others neighbours.
     vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
     // The session's geometry changed (no solve is in flight - this handler

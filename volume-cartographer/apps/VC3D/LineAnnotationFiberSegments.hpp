@@ -193,6 +193,11 @@ struct ControlPointCollapseResult {
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint);
 
+// Removes one control. Deleting the final control deletes the span that ended
+// at it, whose descriptor lives on the new final control: clearing it
+// restores the v3 final-CP contract.
+void eraseControlPoint(std::vector<LineControlPoint>& controls, size_t index);
+
 struct PreparedControlPointEdit {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPointsBeforeLineUpdate;

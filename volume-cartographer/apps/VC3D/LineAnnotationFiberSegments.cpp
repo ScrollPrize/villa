@@ -2149,6 +2149,26 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
     return result;
 }
 
+void eraseControlPoint(std::vector<LineControlPoint>& controls, size_t index)
+{
+    if (index >= controls.size()) {
+        throw std::out_of_range("erased control-point index is out of range");
+    }
+    // The stored order is a stable sort by line position: among ties, the
+    // final control is the last one.
+    const auto finalControl = [&controls] {
+        return std::prev(std::max_element(controls.rbegin(), controls.rend(),
+            [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
+                return lhs.linePosition < rhs.linePosition;
+            }).base());
+    };
+    const bool erasedFinal = finalControl() == controls.begin() + static_cast<std::ptrdiff_t>(index);
+    controls.erase(controls.begin() + static_cast<std::ptrdiff_t>(index));
+    if (erasedFinal && !controls.empty()) {
+        finalControl()->segmentToNext.reset();
+    }
+}
+
 ControlPointCollapseResult collapseControlPointsAtClick(
     const std::vector<LineControlPoint>& controls,
     std::vector<size_t> collapsedIndices,
