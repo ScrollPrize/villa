@@ -19,7 +19,7 @@ changed it.
 ## 2. Jobs are tagged by `source`, and concurrency is per-source
 
 Long-running operations return a `jobId` and are tagged with a `source`
-(`tool` / `growth` / `lasagna` / `atlas` / `catalog` / `flatten`). Starting a
+(`tool` / `growth` / `lasagna` / `catalog` / `flatten`). Starting a
 *second* job of the **same** source while one is active fails with
 `-32004 JOB_RUNNING`. Jobs of *different* sources run fine concurrently — a
 Lasagna optimization and a render job can both be in flight at once. Poll

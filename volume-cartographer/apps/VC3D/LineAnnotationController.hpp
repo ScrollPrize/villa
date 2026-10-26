@@ -332,8 +332,7 @@ public:
     };
     // Phase B: finalizes, saves and closes every live session of the two
     // fibers (dialogs through the ordinary open preparation, dialog-less
-    // panes and the intersection inspection explicitly, each saved before
-    // its pane is erased), then the structural-edit preflight. After it, no
+    // panes explicitly, each saved before its pane is erased), then the structural-edit preflight. After it, no
     // session of either fiber exists; the caller re-verifies its map
     // dependencies (a save may have moved the fiber generation) before
     // locating the meeting on the map.
@@ -1087,8 +1086,7 @@ private:
     void invalidateScrollUmbilicus();
     // Rebuilds the generated views of panes whose recorded orientation epoch is
     // behind the controller's — which is what actually re-applies sheet normals
-    // after the umbilicus or the active volume changed — and the intersection
-    // inspection's strips, which have no generated-view sessions of their own.
+    // after the umbilicus or the active volume changed.
     // Failures are logged per pane and do not stop the others.
     void refreshStaleGeneratedViews();
     // Coalesces refreshStaleGeneratedViews() onto the next event-loop turn:
@@ -1648,7 +1646,7 @@ private:
     // global one so teardown is bounded by waitForDone() in the destructor
     // (after requesting cooperative cancellation) and so long solves cannot
     // starve the global pool's other users. Two threads: one live editing
-    // session plus one intersection-inspection or merged-fiber reopt session
+    // session plus one merged-fiber reopt session
     // can solve concurrently; solves within one session are serialized by the
     // per-session coalescing queue.
     QThreadPool _lineSolvePool;

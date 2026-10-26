@@ -147,9 +147,9 @@ async def vc3d_describe_catalog_sample(
     pixel size, data format) and derived representations categorized by kind
     (normal_grids / lasagna / prediction), each with a stable "ref" ("vi:ai")
     usable in vc3d_open_catalog_sample's resources.representationRefs. Fiber
-    tracing and atlas creation need a "lasagna"-kind representation resolvable
-    for the selected volume; a "normal_grids" store is a separate resource and
-    does not enable tracing.
+    tracing needs a "lasagna"-kind representation resolvable for the selected
+    volume; a "normal_grids" store is a separate resource and does not enable
+    tracing.
 
     refresh: force a fresh manifest fetch (up to 30 s) before describing.
     """

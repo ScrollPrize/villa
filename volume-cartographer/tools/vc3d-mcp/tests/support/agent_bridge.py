@@ -177,14 +177,6 @@ class FakeAgentBridgeServer:
                         "source": "tool", "outputDir": "/tmp/traces"},
             )
             self._start_job(job_id)
-        elif method == "atlas.search_start":
-            job_id = "job-6"
-            self._job_kinds[job_id] = "atlas.fiber_search"
-            await self._reply(
-                writer, req_id,
-                result={"jobId": job_id, "kind": "atlas.fiber_search", "source": "atlas"},
-            )
-            self._start_job(job_id)
         elif method == "never_replies":
             return  # deliberately no response (cancel / disconnect tests)
         elif method == "lasagna.start_optimization":

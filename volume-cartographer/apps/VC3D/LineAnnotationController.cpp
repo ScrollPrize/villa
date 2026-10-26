@@ -2986,10 +2986,8 @@ LineAnnotationController::prepareAutoLinkParticipants(
     }
 
     // The dialog-less copies the finalize walk never sees: every remaining
-    // pane of a participant, plus both sessions of the intersection
-    // inspection when it involves one (its teardown erases both). Each is
-    // finalized and saved BEFORE any pane is erased; a failure retains
-    // everything.
+    // pane of a participant. Each is finalized and saved BEFORE any pane is
+    // erased; a failure retains everything.
     std::vector<std::string> retire;
     const auto addRetire = [&retire](const std::string& surfaceName) {
         if (!surfaceName.empty() &&

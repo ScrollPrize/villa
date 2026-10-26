@@ -95,8 +95,8 @@ volume's voxels, followed by fibers not bound to that volume. Each row's details
 expanded. Every edit, tag and link action reads the fiber's current revision and
 commits a checked action; a link is one shared edge, so changing it never rewrites
 the fiber at the other end. Opening a fiber in Line Annotation reads it and its
-linked peers in one snapshot. Whole-store tools (detailed export, the fiber map,
-atlas search) query the whole store when they run.
+linked peers in one snapshot. Whole-store tools (detailed export, the fiber map)
+query the whole store when they run.
 
 VC3D queries in the active volume's voxels through the store's volume target
 (`ObjectSelection::volume`, `RegionOptions::volume`), which spans every

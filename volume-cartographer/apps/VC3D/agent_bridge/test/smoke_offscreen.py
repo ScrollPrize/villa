@@ -203,23 +203,6 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
         return False, f"unexpected {type(e).__name__}: {e}"
 
 
-def expect_prevalidation_accepts(
-    client: BridgeClient,
-    method: str,
-    params: object,
-) -> tuple[bool, str]:
-    try:
-        client.call(method, params, timeout=RPC_TIMEOUT)
-        return True, "request passed descriptor validation"
-    except BridgeError as error:
-        return (
-            error.code != -32602,
-            f"request reached handler precondition code={error.code}",
-        )
-    except Exception as error:  # noqa: BLE001
-        return False, f"unexpected {type(error).__name__}: {error}"
-
-
 def check_rpc_describe(
     client: BridgeClient,
     results: Results,
@@ -285,10 +268,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 114
-            and coverage.get("registered") == 114
+            and coverage.get("described") == 105
+            and coverage.get("registered") == 105
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 114
+            and len(snapshot["methods"]) == 105
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -340,13 +323,6 @@ def check_rpc_describe(
         "scale",
     )
     results.record("render_scale_float_range", ok, detail)
-
-    ok, detail = expect_prevalidation_accepts(
-        client,
-        "atlas.search_start",
-        {"requiredTags": None, "excludedTags": None},
-    )
-    results.record("atlas_null_tag_filters", ok, detail)
 
 
 def check_viewer_normalization(client: BridgeClient, results: Results) -> None:

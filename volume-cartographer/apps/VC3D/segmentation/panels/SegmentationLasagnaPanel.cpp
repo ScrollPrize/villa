@@ -81,59 +81,6 @@ double bytesToMiB(qint64 bytes)
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
-QString md5Ref(const QByteArray& bytes)
-{
-    return QStringLiteral("md5:%1").arg(QString::fromLatin1(
-        QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
-}
-
-QJsonObject makeObjectRef(const QString& type,
-                          const QString& name,
-                          const QString& hash,
-                          const QString& format = QString())
-{
-    QJsonObject ref;
-    ref[QStringLiteral("type")] = type;
-    ref[QStringLiteral("name")] = name;
-    ref[QStringLiteral("hash")] = hash;
-    if (!format.isEmpty()) {
-        ref[QStringLiteral("format")] = format;
-    }
-    return ref;
-}
-
-QJsonObject fileArtifactForPath(const std::filesystem::path& path,
-                                const QString& type,
-                                const QString& refName,
-                                const QString& format,
-                                qint64* rawBytes)
-{
-    QFile f(QString::fromStdString(path.string()));
-    if (!f.open(QIODevice::ReadOnly)) {
-        return {};
-    }
-    const QByteArray bytes = f.readAll();
-    if (rawBytes) {
-        *rawBytes += bytes.size();
-    }
-    QJsonObject upload;
-    upload[QStringLiteral("object")] = makeObjectRef(type, refName, md5Ref(bytes), format);
-    upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
-    upload[QStringLiteral("_local_path")] = QString::fromStdString(path.string());
-    return upload;
-}
-
-QJsonObject bytesArtifact(const QByteArray& bytes,
-                          const QString& type,
-                          const QString& refName,
-                          const QString& format)
-{
-    QJsonObject upload;
-    upload[QStringLiteral("object")] = makeObjectRef(type, refName, md5Ref(bytes), format);
-    upload[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
-    return upload;
-}
-
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
 {
     QStringList names;
@@ -921,25 +868,6 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
                     .arg(overallProgress * 100.0, 0, 'f', 1)
                     .arg(loss, 0, 'g', 5);
             _progressLabel->setText(label);
-            _progressLabel->setStyleSheet(QString());
-            _progressLabel->setVisible(true);
-        }
-        syncCompactStatusFromFull();
-    });
-    connect(&mgr, &LasagnaServiceManager::artifactUploadProgress, this,
-            [this](const QString& /*jobId*/, int current, int total, double progress,
-                   const QString& label) {
-        if (_progressBar) {
-            _progressBar->setRange(0, 1000);
-            _progressBar->setValue(static_cast<int>(progress * 1000.0));
-            _progressBar->setFormat(tr("Artifact upload: %1%").arg(progress * 100.0, 0, 'f', 1));
-            _progressBar->setVisible(true);
-        }
-        if (_progressLabel) {
-            const QString count = total > 0 ? tr(" (%1/%2)").arg(current).arg(total) : QString();
-            _progressLabel->setText(tr("Artifact upload: %1%2")
-                                        .arg(label.isEmpty() ? tr("Syncing artifacts") : label)
-                                        .arg(count));
             _progressLabel->setStyleSheet(QString());
             _progressLabel->setVisible(true);
         }

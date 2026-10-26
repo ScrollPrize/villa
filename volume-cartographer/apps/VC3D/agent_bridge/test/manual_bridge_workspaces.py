@@ -1,4 +1,4 @@
-"""Manual Lasagna, atlas, and fiber workspace checks."""
+"""Manual Lasagna and fiber workspace checks."""
 
 from __future__ import annotations
 
@@ -102,125 +102,6 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
         # 9. Liveness proof: the process must still be fully responsive after
         # everything above, including both service-start paths.
         call_checked("ping after lasagna smoke (proves no hang)", "ping")
-    except VC3DDiedError:
-        return
-
-
-def run_atlas_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> None:
-    """Exercise atlas.* RPCs.
-
-    The local fixture has no atlas directory, no saved fibers and no Lasagna
-    dataset, so success paths are unreachable here -- every step below proves a
-    documented error is returned PROMPTLY (no hang: the interactive
-    counterparts of these calls reach QMessageBoxes -- 'Load an atlas before
-    remapping.', the atlas rebuild prompt, showError in
-    showIntersectionInspection -- which would block forever offscreen), and
-    that the process stays alive and responsive throughout.
-    """
-
-    def call_checked(name: str, method: str, params: dict | None = None,
-                      timeout: float = 15.0):
-        try:
-            result, _ = client.call(method, params, timeout=timeout)
-            rec.step(name, True, json.dumps(result)[:300])
-            return result
-        except BridgeError as e:
-            rec.step(name, False, f"code={e.code} message={e.message} data={e.data}")
-            return None
-        except TimeoutError as e:
-            if proc.exit_code() is not None:
-                record_process_death(proc, rec, name)
-                raise VC3DDiedError(name)
-            rec.step(name, False, f"TIMEOUT (VC3D still alive): {e}")
-            return None
-
-    def call_expect_error(name: str, method: str, params: dict, expected_code: int,
-                          timeout: float = 15.0):
-        try:
-            result, _ = client.call(method, params, timeout=timeout)
-            rec.step(name, False, f"expected error {expected_code}, got success: {result}")
-        except BridgeError as e:
-            rec.step(name, e.code == expected_code,
-                     f"code={e.code} message={e.message} data={e.data}")
-        except TimeoutError as e:
-            if proc.exit_code() is not None:
-                record_process_death(proc, rec, name)
-                raise VC3DDiedError(name)
-            rec.step(name, False, f"TIMEOUT (VC3D still alive): {e}")
-
-    try:
-        # 1. atlas.status always works; with no atlas open both fields are
-        # null and no search is running.
-        status = call_checked("atlas.status (no atlas open)", "atlas.status")
-        if status is not None:
-            ok = (status.get("atlasDir") is None and status.get("atlasName") is None
-                  and isinstance(status.get("search"), dict)
-                  and status["search"].get("running") is False
-                  and status["search"].get("phaseCount") == 5
-                  and status["search"].get("resultCount") == 0)
-            rec.step("atlas.status shape (dir/name null, search idle, phaseCount 5)",
-                     ok, json.dumps(status)[:300])
-
-        # 2. atlas.open error paths: missing params, absolute missing dir,
-        # relative missing dir (resolved against the volpkg root). The
-        # interactive path would raise dialogs; these must return -32602/-32007.
-        call_expect_error("atlas.open (missing atlasDir)", "atlas.open", {}, -32602)
-        call_expect_error("atlas.open (absolute dir missing)", "atlas.open",
-                           {"atlasDir": "/nonexistent/agent-bridge-atlas"}, -32007)
-        call_expect_error("atlas.open (relative dir missing)", "atlas.open",
-                           {"atlasDir": "atlases/agent-bridge-nonexistent"}, -32007)
-
-        # 3. atlas.search_start param validation.
-        call_expect_error("atlas.search_start (bad mode)", "atlas.search_start",
-                           {"mode": "not_a_real_mode"}, -32602)
-        call_expect_error("atlas.search_start (negative maxDistance)", "atlas.search_start",
-                           {"mode": "non_atlas_only", "maxDistance": -1.0}, -32602)
-        call_expect_error("atlas.search_start (requiredTags not an array)",
-                           "atlas.search_start",
-                           {"mode": "non_atlas_only", "requiredTags": "tag"}, -32602)
-
-        # 4. atlas.search_start preconditions: default mode with no atlas open
-        # -> -32007 kind:"atlas"; non_atlas_only with no saved fibers ->
-        # -32005 (headless launcher failure). Both used to be QMessageBox
-        # paths in the interactive slot -- must NOT hang.
-        call_expect_error("atlas.search_start (atlas_to_non_atlas, no atlas open)",
-                           "atlas.search_start", {}, -32007)
-        call_expect_error("atlas.search_start (non_atlas_only, no saved fibers)",
-                           "atlas.search_start", {"mode": "non_atlas_only"}, -32005)
-
-        # 5. atlas.search_cancel with nothing running -> -32007 kind:"job".
-        call_expect_error("atlas.search_cancel (idle)", "atlas.search_cancel", {}, -32007)
-
-        # 6. atlas.search_results: empty set is NOT an error (total 0);
-        # negative offset / bad limit are -32602.
-        res = call_checked("atlas.search_results (empty)", "atlas.search_results")
-        if res is not None:
-            rec.step("atlas.search_results empty shape (total 0, results [])",
-                     res.get("total") == 0 and res.get("offset") == 0
-                     and res.get("results") == [],
-                     json.dumps(res)[:200])
-        call_expect_error("atlas.search_results (negative offset)", "atlas.search_results",
-                           {"offset": -1}, -32602)
-        call_expect_error("atlas.search_results (limit 0)", "atlas.search_results",
-                           {"limit": 0}, -32602)
-
-        # 7. atlas.open_result: no results -> -32007 kind:"result"; bad index
-        # type -> -32602. The interactive path shows QMessageBoxes / showError
-        # dialogs -- must NOT hang.
-        call_expect_error("atlas.open_result (no results)", "atlas.open_result",
-                           {"index": 0}, -32007)
-        call_expect_error("atlas.open_result (bad index type)", "atlas.open_result",
-                           {"index": "zero"}, -32602)
-
-        # 8. atlas.remap / atlas.optimize_snap_candidates with no atlas open
-        # -> -32007 kind:"atlas" (interactive: 'Load an atlas before ...'
-        # QMessageBoxes -- must NOT hang).
-        call_expect_error("atlas.remap (no atlas open)", "atlas.remap", {}, -32007)
-        call_expect_error("atlas.optimize_snap_candidates (no atlas open)",
-                           "atlas.optimize_snap_candidates", {}, -32007)
-
-        # 9. Liveness proof after everything above.
-        call_checked("ping after atlas smoke (proves no hang)", "ping")
     except VC3DDiedError:
         return
 
@@ -425,36 +306,14 @@ def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
                 rec.step("fiber.open (real fiber) fails CLEANLY without dataset-picker hang",
                          False, f"HANG: {e}")
 
-        # 9. fiber.create_atlas: unknown id, then the real fiber. Same "clean
-        # error, no dialog hang" contract (interactive failure path is a
-        # showError QMessageBox; success path used to reach the rebuild-prompt-
-        # capable interactive atlas display).
-        call_expect_error("fiber.create_atlas (unknown fiber) -> -32007", "fiber.create_atlas",
-                          {"fiberId": "999999999"}, -32007)
-        if fiber_id:
-            try:
-                r, dt = client.call("fiber.create_atlas", {"fiberId": fiber_id}, timeout=120.0)
-                rec.step("fiber.create_atlas (real fiber) unexpected success (dataset resolved)",
-                         "atlasDir" in r, f"({ms(dt):.0f}ms) {json.dumps(r)[:300]}")
-            except BridgeError as e:
-                rec.step("fiber.create_atlas fails CLEANLY (no Lasagna dataset), no dialog hang",
-                         e.code == -32005,
-                         f"code={e.code} message={e.message} data={e.data}")
-            except TimeoutError as e:
-                if proc.exit_code() is not None:
-                    record_process_death(proc, rec, "fiber.create_atlas real fiber")
-                    raise VC3DDiedError("fiber.create_atlas real fiber")
-                rec.step("fiber.create_atlas fails CLEANLY (no Lasagna dataset), no dialog hang",
-                         False, f"HANG: {e}")
-
-        # 10. fiber.save: the deferred reply confirms persistence without the
+        # 9. fiber.save: the deferred reply confirms persistence without the
         # interactive path's nested event loop.
         sv = call_checked("fiber.save confirms persistence",
                           "fiber.save", {}, timeout=20.0)
         if sv is not None:
             rec.step("fiber.save result shape", sv.get("saved") is True, json.dumps(sv))
 
-        # 11. fiber.launch error paths + the real gesture.
+        # 10. fiber.launch error paths + the real gesture.
         call_expect_error("fiber.launch (bogus viewer) -> -32002", "fiber.launch",
                           {"viewer": "not-a-viewer",
                            "position": {"x": 0, "y": 0, "z": 0}}, -32002)
@@ -488,7 +347,7 @@ def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
                 rec.step("fiber.launch (real point) fails CLEANLY without dataset-picker hang",
                          False, f"HANG: {e}")
 
-        # 12. fiber.delete error paths, then cleanup of everything we imported
+        # 11. fiber.delete error paths, then cleanup of everything we imported
         # (leaves the fixture's fiber set exactly as found).
         call_expect_error("fiber.delete (empty list) -> -32602", "fiber.delete",
                           {"fiberIds": []}, -32602)

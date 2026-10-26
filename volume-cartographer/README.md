@@ -187,8 +187,8 @@ translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
 Coordinate-bearing artifacts created by VC3D retain the selected source view
-in their JSON metadata (surface records, point collections, fibers, and atlas
-`metadata.json`). For example:
+in their JSON metadata (surface records, point collections, and fibers). For
+example:
 
 ```json
 {

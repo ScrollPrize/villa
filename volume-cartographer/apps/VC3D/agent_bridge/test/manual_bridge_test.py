@@ -52,7 +52,6 @@ from manual_bridge_support import (  # noqa: E402
     pct,
 )
 from manual_bridge_workspaces import (  # noqa: E402
-    run_atlas_smoke,
     run_fiber_smoke,
     run_lasagna_smoke,
 )
@@ -88,8 +87,8 @@ def run_offscreen(args) -> dict:
         rec.step("ping", r.get("pong") is True, f"pid={r.get('pid')} version={r.get('version')} ({ms(dt):.2f}ms)")
 
         # 2. volume.open on the real local fixture, explicitly selecting the
-        # raw scan volume that the pre-existing traces/ segments and our
-        # curated seed point were computed against.
+        # raw scan volume that our curated seed point and the surfaces in the
+        # attached object store were computed against.
         vpkg_path = str(args.volpkg)
         r, dt = client.call("volume.open",
                              {"path": vpkg_path, "volumeId": LOCAL_RAW_VOLUME_ID},
@@ -443,10 +442,6 @@ def run_offscreen(args) -> dict:
         # Lasagna needs the original fixture, before catalog.open_sample replaces
         # the project. Every timeout includes a process-liveness check.
         run_lasagna_smoke(client, rec, proc)
-
-        # The fixture has no atlas data, so exercise every atlas error path and
-        # verify that none opens a dialog or terminates the process.
-        run_atlas_smoke(client, rec, proc)
 
         # Exercise a real fiber import/export round trip before the catalog
         # suite replaces the fixture, then delete the imported fibers.

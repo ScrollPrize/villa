@@ -29,8 +29,8 @@ read-only store attachment the button stays disabled.
 
 Each fiber's explicit coordinate binding determines its transform into the active
 volume. Unbound fibers remain listed but are excluded from spatial overlays and
-search until bound. Slice, intersection, map and point-collection views apply the
-same per-fiber transform. Stored geometry and solver coordinates remain unchanged.
+search until bound. Slice, map and point-collection views apply the same
+per-fiber transform. Stored geometry and solver coordinates remain unchanged.
 `coordinate_base_shape_zyx`, when present, describes the stored coordinate grid.
 
 Import/export is an explicit transfer operation. VC3D imports current **version 4**
@@ -316,10 +316,9 @@ the next dispatch, and a goal change or tail refresh from such an interior
 solves the whole line rather than certifying provisional spans.
 
 A gap span is closed to placement: the click, the `/` and `0` keys and the
-current-position marker (cut views, strips, overview bar and the
-intersection-inspection panes) treat any line position strictly inside it as
-blocked (red marker) until one of the breaks is removed. A break is refused
-at or immediately next to a kollesis termination (line-order neighbours), from
+current-position marker (cut views, strips and overview bar) treat any line
+position strictly inside it as blocked (red marker) until one of the breaks is
+removed. A break is refused at or immediately next to a kollesis termination (line-order neighbours), from
 the point menu and the span menu alike, so the span next to a sheet join can
 never become a gap. When a gap span
 forms, its `interp_goal` becomes `cspline` and the span is re-solved (the
@@ -429,8 +428,7 @@ of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
 
 1. finalizes, saves and closes any open Line Annotation of either fiber (what
    opening another fiber does; annotations of other fibers stay open), and
-   every dialog-less session of them (the intersection inspection included),
-   saving each first. If that saved something the map is stale: it updates
+   every dialog-less session of them, saving each first. If that saved something the map is stale: it updates
    by itself and the link continues on the rebuilt map without a second
    gesture, as long as both fibers still draw where the click saw them. If
    the saved work moved one of them on the map, the status line asks you to

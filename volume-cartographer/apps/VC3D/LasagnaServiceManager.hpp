@@ -127,8 +127,6 @@ signals:
     void optimizationProgress(const QString& stage, int step, int totalSteps, double loss,
                               double stageProgress, double overallProgress,
                               const QString& stageName);
-    void artifactUploadProgress(const QString& jobId, int current, int total, double progress,
-                                const QString& label);
     // The surfaces a job created (UUIDs in the attached store).
     void optimizationFinished(const QStringList& surfaceUuids);
     void optimizationError(const QString& message);

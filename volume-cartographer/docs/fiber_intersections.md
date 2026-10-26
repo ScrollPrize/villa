@@ -5,15 +5,15 @@ a single Ceres refinement per candidate.
 
 ## Spatial Index
 
-Atlas search builds a fresh one-shot point R-tree for each search run. The
-search index is append-only for that run, stores dense samples by fiber id, and
-is created with the requested `maxSampleSpacing` before pair search starts.
+`searchFiberIntersections` builds a fresh one-shot point R-tree for each run.
+The search index is append-only for that run, stores dense samples by fiber id,
+and is created with the requested `maxSampleSpacing` before pair search starts.
 This keeps phase 2 progress tied to inserting the current fiber snapshot and
 avoids hidden rebuilds during pair search.
 
 Pair search precomputes per-fiber candidate lists and then refines requested
 source/target pairs through a dynamic worker queue. Phase 3 progress counts
-both candidate-list scans and requested pair slots, so the UI continues to
+both candidate-list scans and requested pair slots, so progress continues to
 advance during candidate preparation as well as Ceres refinement.
 
 `vc::atlas::FiberSpatialIndex` remains available for legacy/incremental
@@ -30,10 +30,8 @@ override stale global entries without rebuilding the whole global tree.
 Fiber generations come from object-store records. Working snapshots pin both
 object and geometry revisions; checked publications reject stale edits.
 
-Deleting or saving a fiber prunes any atlas-search cache entries that mention
-that fiber. Atlas search builds its in-memory index from the current fiber
-snapshot on the next run, so there is no long-lived atlas search index to
-update.
+Each search builds its in-memory index from the fiber snapshot it is given, so
+there is no long-lived search index to update.
 
 ## Candidate Search
 
@@ -73,52 +71,6 @@ deduplicated.
 `vc::atlas::FiberIntersectionCache` is in-memory only. Keys are unordered fiber
 pairs plus both generations, broad-phase options, and Ceres options. Searches
 skip pairs that are already covered by a cache hit.
-
-## Atlas Search Dock
-
-The `Atlas Object Search` dock shows the selected atlas, search controls,
-progress/cancel state, and a result table. The first implemented mode searches
-all fibers mapped into the selected atlas against all saved fibers, which covers
-in-atlas to outside-atlas pairs and in-atlas to in-atlas pairs.
-
-Atlas mappings are used only to decide membership. Intersection geometry is
-searched in the original saved fiber volume coordinates. Results are displayed
-in the table and are not persisted into atlas metadata.
-
-Ctrl-clicking in the atlas viewer focuses the main volume view at the clicked
-volume point and leaves the atlas camera unchanged.
-
-## Intersection Inspection GUI
-
-Opening an intersection creates an MDI inspection layout with the horizontal
-display fiber on the left and the vertical display fiber on the right. Manual
-H/V tags take precedence over automatic scores when choosing this display
-ordering. The stored source/target identities of the intersection result are
-not changed by display ordering.
-
-Each side shows previous/current/next cross slices, a connection slice, a
-follow slice, and a side-strip line slice. Cross and follow panes do not show
-full line projections or generic crossing ellipses. They show the generated
-line-position dot from the shared line-annotation generated overlay, nearby
-control points from the same shared overlay, and an intersection `X` only when
-the intersection point is within the existing 5% visible-viewport distance
-threshold of the current slice plane.
-
-Side-strip panes use the shared generated strip overlay. They show the center
-line, all control points, the bracketing slice markers, and the current
-intersection/focus position as a high-z-order `X` so it remains visible over
-control-point markers.
-
-Left-clicking generated cross, follow, or strip panes edits/adds a control
-point at the pane's generated line position. Right-clicking uses the shared
-generated-view context menu; it offers `Delete control point` and `New line
-annotation`. Deletion is not hard-wired into intersection mouse-press handlers.
-
-Follow panes track the mouse position over their side-strip pane until frozen.
-Pressing Space freezes or unfreezes the active side's follow slice; when no
-active side is known, Space toggles both. Frozen follow slices snap to a nearby
-control-point line position using the same snapping tolerance as generated line
-annotation views.
 
 ## Live Editing Preparation
 

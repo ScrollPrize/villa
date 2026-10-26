@@ -188,15 +188,14 @@ per source is tracked:
 | `tool` | `CommandLineToolRunner` lifecycle |
 | `growth` | segmentation growth lifecycle |
 | `lasagna` | Lasagna optimization lifecycle |
-| `atlas` | bridge-started atlas search lifecycle |
 | `catalog` | Open Data sample open lifecycle |
 | `flatten` | SLIM, ABF, and straighten lifecycle |
 | `seeding` | bridge-started run or expand batch |
 | `autosave` | explicit dirty-segment save |
 
 Application work started outside the bridge is represented when its lifecycle
-is observable, but only bridge-started atlas and seeding operations are
-registered as jobs. A source retains its eight most recent terminal records.
+is observable, but only bridge-started seeding operations are registered as
+jobs. A source retains its eight most recent terminal records.
 
 `job.status` accepts `jobId`, `source`, or neither. With neither it returns the
 most recently started job across all sources. Its record contains:
@@ -244,7 +243,7 @@ An explicit RPC is treated as consent for the requested mutation, never as
 consent for unrelated prompts. Bridge calls use dialog-free application cores:
 
 - project and catalog opens never ask whether to replace the current project;
-- segment, fiber, atlas, rendering, tracing, and flatten operations report
+- segment, fiber, rendering, tracing, and flatten operations report
   failures through JSON-RPC or job state;
 - interactive menu actions remain responsible for file pickers, confirmation
   prompts, status widgets, and message boxes;
@@ -346,18 +345,15 @@ values may be finite floats or null where the method declares clearing.
 Metadata and tags are idempotent setters. Save/load methods use explicit paths
 and never open file pickers.
 
-### Lasagna, atlas, and fibers
+### Lasagna and fibers
 
 - Lasagna service and job queries use deferred responses from the service
   manager. Optimization is tracked as a `lasagna` job.
-- Atlas open, remap, result selection, and candidate optimization use
-  dialog-free `CWindow` operations. Only bridge-started searches become
-  `atlas` jobs.
 - Fiber ids are strings on the wire. Bulk deletion validates every id before
   removing any fiber. Import/export paths are explicit. Save waits for the
   controller's persistence completion signal.
-- Fiber launch and create-atlas operations suppress dataset pickers and atlas
-  rebuild prompts; missing prerequisites become ordinary errors.
+- Fiber launch suppresses dataset pickers; missing prerequisites become
+  ordinary errors.
 
 ### Seeding, rendering, flattening, and mesh operations
 
@@ -413,16 +409,8 @@ is the sole bridge method without an MCP tool.
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
-| `vc3d_atlas_open_result` | `atlas.open_result` |
-| `vc3d_atlas_open` | `atlas.open` |
-| `vc3d_atlas_optimize_snap_candidates` | `atlas.optimize_snap_candidates` |
-| `vc3d_atlas_remap` | `atlas.remap` |
-| `vc3d_atlas_search_cancel` | `atlas.search_cancel` |
-| `vc3d_atlas_search_results` | `atlas.search_results` |
-| `vc3d_atlas_search_start` | `atlas.search_start` |
-| `vc3d_atlas_status` | `atlas.status` |
 | `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
-| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
+| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_clear_all_points` | `points.clear_all` |
 | `vc3d_clear_point_collection` | `points.clear_collection` |
@@ -437,7 +425,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
-| `vc3d_fiber_create_atlas` | `fiber.create_atlas` |
 | `vc3d_fiber_delete` | `fiber.delete` |
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |
@@ -560,7 +547,7 @@ volume-package fixtures and is intentionally separate from hermetic CI.
 - Some jobs expose no cancellation authority.
 - Viewer settings that exist only on live viewer instances fall back to
   persisted defaults when no viewer exists.
-- External tools, remote catalogs, atlas data, Lasagna services, and real
-  fixture geometry require their corresponding runtime resources.
+- External tools, remote catalogs, Lasagna services, and real fixture
+  geometry require their corresponding runtime resources.
 - The local bridge is a trusted-user control surface, not a remote security
   boundary.
