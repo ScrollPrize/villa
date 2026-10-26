@@ -17,9 +17,10 @@ the fitter's runtime inputs in three stages:
 The store's automatic detectors are authoritative: their relationships are
 consumed as they are, never relinked by proximity here.
 
-    python object_store_inputs.py STORE.vcobj [--volume V] [--json OUT]
+    python object_store_inputs.py STORE.vcobj [--volume V] [--z-begin Z0 --z-end Z1]
 
-prints the constraints-only report of a selection without training.
+prints the selection's report, with its materialized constraint counts when
+a z window is given, without training.
 """
 import argparse
 import dataclasses
@@ -433,6 +434,218 @@ def point_annotations(store, geometry_revision, point_ids):
 
 
 # ---------------------------------------------------------------------------
+# Runtime materialization
+# ---------------------------------------------------------------------------
+
+# Deterministic default sampling groups (the stems of the conventional PCL
+# documents, so existing pcl_sampling_weights keep applying). An object's
+# ``meta.sampling_group`` overrides them.
+ABSOLUTE_PCL_GROUP = 'abs_winding'
+RELATIVE_PCL_GROUP = 'relative_windings'
+SAME_WINDING_PCL_GROUP = 'same_windings'
+
+
+@dataclasses.dataclass
+class FitInputs:
+    """Runtime inputs materialized from a frozen snapshot.
+
+    ``patches`` maps patch UUIDs to fit-frame tifxyz.Patch objects in UUID
+    order. ``point_collections`` maps resident collection ids to regular PCLs
+    whose attached points carry ``on_patch`` ({'id', 'ij', 'edge_uuid'}).
+    """
+    snapshot: InputSnapshot
+    patches: dict
+    point_collections: dict
+    counts: Counter
+
+    def report(self):
+        return snapshot_report(self.snapshot) + [
+            'constraints: ' + ', '.join(
+                f'{name} {count}' for name, count in sorted(self.counts.items()))]
+
+
+def materialize_patches(store, snapshot, *, z_begin, z_end, erode_cells_default):
+    """Fit-frame patches of the snapshot, keyed by UUID; and drop counts.
+
+    Grid rows and columns are the stored ones: nothing is cropped or
+    subsampled, so stored (row, col) anchors are runtime (i, j). Invalid
+    vertices keep the -1 sentinel. A patch's own erosion request is
+    ``meta.source.spiral_patch_erode_cells``, as in its tifxyz metadata.
+    """
+    import torch
+    from spiral_helpers import patch_intersects_z_roi, prepare_patch_for_fit
+    from tifxyz import Patch
+
+    patches, counts = {}, Counter()
+    for obj in snapshot.objects_of('patch'):
+        arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'])
+        points = arrays['points']
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ObjectStoreInputError(
+                [f'patch {obj.uuid} points have shape {points.shape}'])
+        invalid = np.all(points == -1, axis=-1)
+        zyxs = obj.frame.xyz_to_fit_zyx(points, invalid)
+        valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
+                       & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
+        if not valid_quads.any():
+            counts['patches without valid quads'] += 1
+            continue
+        erosion = (obj.meta.get('source') or {}).get('spiral_patch_erode_cells')
+        patch = Patch(torch.from_numpy(zyxs),
+                      torch.tensor(obj.frame.grid_scale_to_fit(attributes['scale'])),
+                      None, None, obj.uuid, erosion)
+        if not patch_intersects_z_roi(patch, z_begin, z_end):
+            counts['patches outside z ROI'] += 1
+            continue
+        reason = prepare_patch_for_fit(patch, z_begin, z_end, erode_cells_default)
+        if reason is not None:
+            counts[f'patches dropped by {reason}'] += 1
+            continue
+        patches[obj.uuid] = patch
+    counts['patches'] = len(patches)
+    return patches, counts
+
+
+def pcl_role(obj, relationships):
+    """True for an absolute-winding PCL, from ``meta.source.winding_is_absolute``.
+
+    A non-boolean value, or detector evidence recorded under the other role,
+    is an error rather than a guess.
+    """
+    value = (obj.meta.get('source') or {}).get('winding_is_absolute', False)
+    if not isinstance(value, bool):
+        raise ObjectStoreInputError([
+            f'point collection {obj.uuid} ({obj.name!r}) has a non-boolean '
+            f'winding_is_absolute {value!r}'])
+    for rel in relationships:
+        recorded = (rel.meta.get('point_collection_patch') or {}).get(
+            'winding_is_absolute')
+        if recorded is not None and recorded != value:
+            raise ObjectStoreInputError([
+                f'point collection {obj.uuid} ({obj.name!r}) is '
+                f'{"absolute" if value else "relative"}, but edge {rel.uuid} '
+                f'was detected as {"absolute" if recorded else "relative"}; '
+                'refresh its links'])
+    return value
+
+
+def _winding_annotation(obj, point_id, annotation):
+    value = annotation.get('wind_a')
+    if value is None:
+        return float('nan')
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ObjectStoreInputError([
+            f'point collection {obj.uuid} point {point_id} has a non-numeric '
+            f'wind_a {value!r}'])
+    return float(value)
+
+
+def _anchor_index(anchor, array):
+    points = anchor.get('points') or []
+    if len(points) < 1 or points[0]['array'] != array or len(points[0]['index']) != 1:
+        return None
+    return int(points[0]['index'][0])
+
+
+def _pcl_attachment(rel, patches):
+    """``(point id, on_patch)`` of a pcl-patch edge, or (point id, None) when
+    its patch is not fitted; raises when the edge cannot be materialized."""
+    point_id = _anchor_index(rel.b_anchor, 'point_ids')
+    ij = (rel.meta.get('point_collection_patch') or {}).get('ij')
+    if point_id is None or not isinstance(ij, list) or len(ij) != 2:
+        raise ObjectStoreInputError([
+            f'point-patch edge {rel.uuid} lacks a point ID anchor or patch ij'])
+    if rel.a not in patches:
+        return point_id, None
+    return point_id, {'id': rel.a, 'ij': [float(ij[0]), float(ij[1])],
+                      'edge_uuid': rel.uuid}
+
+
+def materialize_point_collections(store, snapshot, patches, first_id=0):
+    """Regular PCLs of the snapshot, keyed by resident id in UUID order.
+
+    Points are keyed by their stable IDs and carry fit-frame ZYX and their
+    aligned ``wind_a`` annotation. Each consumed point-patch edge attaches its
+    point to its patch at the recorded (row, col); edges to patches dropped
+    from the fit are counted and ignored.
+    """
+    edges_by_pcl = {}
+    for rel in snapshot.relationships_of('pcl_patch'):
+        edges_by_pcl.setdefault(rel.b, []).append(rel)
+    collections, counts, problems = {}, Counter(), []
+    for cid, obj in enumerate(snapshot.objects_of('point_collection'), start=first_id):
+        arrays, _ = read_geometry(store, obj.geometry_revision, ['points', 'point_ids'])
+        point_ids = [int(point_id) for point_id in arrays['point_ids']]
+        if len(set(point_ids)) != len(point_ids):
+            raise ObjectStoreInputError(
+                [f'point collection {obj.uuid} repeats point IDs'])
+        annotations = point_annotations(store, obj.geometry_revision, point_ids)
+        edges = edges_by_pcl.get(obj.uuid, [])
+        absolute = pcl_role(obj, edges)
+        zyxs = obj.frame.xyz_to_fit_zyx(arrays['points'])
+        points = {}
+        for point_id, zyx in sorted(zip(point_ids, zyxs), key=lambda item: item[0]):
+            points[point_id] = {
+                'id': point_id, 'collectionId': cid, 'p': zyx[::-1].tolist(),
+                'zyx': zyx,
+                'winding_annotation': _winding_annotation(
+                    obj, point_id, annotations.get(point_id, {})),
+                'creation_time': 0,
+            }
+        for rel in edges:
+            try:
+                point_id, attachment = _pcl_attachment(rel, patches)
+            except ObjectStoreInputError as error:
+                problems.extend(error.problems)
+                continue
+            point = points.get(point_id)
+            if point is None:
+                problems.append(f'point-patch edge {rel.uuid} names point '
+                                f'{point_id}, absent from {obj.uuid}')
+            elif attachment is None:
+                counts['pcl attachments to unfitted patches'] += 1
+            elif 'on_patch' in point:
+                problems.append(
+                    f'point {point_id} of point collection {obj.uuid} attaches '
+                    f'to patches {point["on_patch"]["id"]} and {attachment["id"]}')
+            else:
+                point['on_patch'] = attachment
+                counts['pcl attachments'] += 1
+        annotated = any(np.isfinite(p['winding_annotation']) for p in points.values())
+        group = obj.meta.get('sampling_group') or (
+            ABSOLUTE_PCL_GROUP if absolute else
+            RELATIVE_PCL_GROUP if annotated else SAME_WINDING_PCL_GROUP)
+        collections[cid] = {
+            'id': cid, 'name': obj.name, 'points': points, 'color': [0.0, 0.0, 0.0],
+            'source_file': None, 'sampling_group': group,
+            'metadata': {
+                'winding_is_absolute': absolute,
+                'input_role': 'absolute' if absolute else 'object_store',
+                'resident_collection_id': cid,
+                'object_uuid': obj.uuid,
+                'object_revision': obj.object_revision,
+                'geometry_revision': obj.geometry_revision,
+            },
+        }
+        counts['absolute point collections' if absolute
+               else 'relative point collections'] += 1
+    if problems:
+        raise ObjectStoreInputError(problems)
+    return collections, counts
+
+
+def materialize(store, snapshot, *, z_begin, z_end, erode_cells_default):
+    """Every runtime input of a frozen snapshot."""
+    patches, counts = materialize_patches(
+        store, snapshot, z_begin=z_begin, z_end=z_end,
+        erode_cells_default=erode_cells_default)
+    point_collections, pcl_counts = materialize_point_collections(
+        store, snapshot, patches)
+    counts.update(pcl_counts)
+    return FitInputs(snapshot, patches, point_collections, counts)
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -472,6 +685,11 @@ def _parse_args(argv):
                        ('fiber', 'fiber')):
         parser.add_argument(f'--{flag}-uuid', action='append', dest=f'{kind}_uuids')
         parser.add_argument(f'--{flag}-tag', action='append', dest=f'{kind}_tags')
+    parser.add_argument('--z-begin', type=int,
+                        help='with --z-end, also materialize the constraints of this z window')
+    parser.add_argument('--z-end', type=int)
+    parser.add_argument('--erode-cells', type=int, default=1,
+                        help='default patch erosion (patch_erode_patches)')
     parser.add_argument('--json', help='write the manifest and report here')
     return parser.parse_args(argv)
 
@@ -490,11 +708,16 @@ def main(argv=None):
     with ObjectStore.open(args.store, read_only=True) as store:
         try:
             snapshot = read_snapshot(store, request)
+            if args.z_begin is not None and args.z_end is not None:
+                lines = materialize(
+                    store, snapshot, z_begin=args.z_begin, z_end=args.z_end,
+                    erode_cells_default=args.erode_cells).report()
+            else:
+                lines = snapshot_report(snapshot)
         except ObjectStoreInputError as error:
             for problem in error.problems:
                 print(f'error: {problem}', file=sys.stderr)
             return 1
-        lines = snapshot_report(snapshot)
     print('\n'.join(lines))
     if args.json:
         with open(args.json, 'w') as stream:

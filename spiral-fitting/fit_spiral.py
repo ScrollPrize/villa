@@ -1080,7 +1080,7 @@ class FitContext:
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None,
-                 input_bindings=None):
+                 input_bindings=None, object_store_inputs=None):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
@@ -1132,6 +1132,10 @@ class FitContext:
         # Editing-workspace records a resident build binds before its first
         # derivation (see _bind_input_records). None outside a workspace.
         self.input_bindings = tuple(input_bindings or ())
+        # object_store_inputs.FitInputs materialized from a frozen object-store
+        # snapshot. When given, load_host_inputs takes patches and point
+        # constraints from it instead of loading files and linking points.
+        self.object_store_inputs = object_store_inputs
         self.progress = progress
         self.resume_path = resume_path or None
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
@@ -1754,94 +1758,13 @@ class FitContext:
             progress.begin('loading', 'Loading outer shell')
             shell_patch = load_tifxyz(self.shell_path)
 
-        use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
-        if not use_verified_patches:
-            verified_patches = {}
-            print('skipping patch loading')
+        if self.object_store_inputs is not None:
+            verified_patches = dict(self.object_store_inputs.patches)
+            print(f' loaded {len(verified_patches)} patches from the object store')
+            next_id = self._derive_object_store_point_inputs(
+                verified_patches, self.object_store_inputs)
         else:
-            verified_patches = self._load_patches_from_dir(
-                self.verified_patches_path, 'verified patches')
-            if not verified_patches:
-                raise RuntimeError('No patches could be loaded')
-
-        print(f" loaded {len(verified_patches)} patches")
-
-        # ==========================================================================
-        # Point collection loading
-        # ==========================================================================
-
-        # Load all pcls in full-resolution voxel space, link every point to patches,
-        # and split into cross-patch / unattached sets. Verified patches must already
-        # be filtered to the z-roi.
-        point_collections = {}
-        next_id = 0
-        input_specs = self.pcl_input_specs
-        progress.begin(
-            'loading', 'Loading point collections',
-            step=0, total_steps=len(input_specs), unit='inputs')
-        for spec_number, (pattern, explicit_role) in enumerate(input_specs, start=1):
-            expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
-            for path in expanded:
-                loaded = load_point_collection(path) or {}
-                for pcl in loaded.values():
-                    stamp_loaded_pcl_metadata(pcl, path, explicit_role, next_id)
-                    point_collections[next_id] = pcl
-                    next_id += 1
-            progress.update(
-                spec_number, detail=f'{len(point_collections):,} collections loaded')
-
-        progress.begin('loading', 'Loading fiber point collections')
-        fiber_point_collections, next_id = load_fiber_point_collections(
-            self.fibers_path,
-            next_id,
-            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
-            base_shape_zyx=getattr(self, 'base_shape_zyx', None),
-        )
-        # All fibers (horizontal, vertical, and merged link components) form one
-        # sampling group, rather than one group per source file like the regular pcls.
-        for pcl in fiber_point_collections.values():
-            pcl['sampling_group'] = 'fibers'
-            source = pcl.get('source_file', '')
-            logical_id = os.path.splitext(os.path.basename(source))[0]
-            try:
-                with open(source, 'rb') as stream:
-                    revision = hashlib.sha256(stream.read()).hexdigest()
-            except OSError:
-                revision = None
-            pcl.setdefault('metadata', {}).update({
-                'logical_input_kind': 'fiber',
-                'logical_input_id': logical_id,
-                'logical_input_revision': revision,
-            })
-            # Staging paths are content-addressed; branch records address the
-            # stable logical document name instead.
-            pcl['file_basename'] = f'{logical_id}.json'
-        fiber_catalog = {
-            str(pcl['metadata']['logical_input_id']): pcl
-            for pcl in fiber_point_collections.values()
-        }
-        point_collections.update(fiber_point_collections)
-
-        if self.interactive_driver is not None:
-            self._source_point_collections = {
-                pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
-            }
-            self._source_verified_patches = dict(verified_patches)
-            if self.input_bindings:
-                # Bind the editing workspace's identities before the one
-                # derivation, so the service need not replay the unchanged
-                # baseline through a second full relink after the build.
-                self._workspace_membership = {}
-                self.next_id = next_id
-                self._bind_input_records(self.input_bindings)
-                next_id = self.next_id
-                verified_patches = {
-                    pid: patch for pid, patch in verified_patches.items()
-                    if pid in self._source_verified_patches}
-                point_collections, fiber_point_collections = \
-                    self._enabled_point_inputs()
-        self._derive_point_inputs(
-            verified_patches, point_collections, fiber_point_collections)
+            verified_patches, next_id = self._load_and_link_file_inputs()
         unattached_pcl_strips = self.unattached_pcl_strips
         link_distance_tolerance = self.link_distance_tolerance
 
@@ -2063,6 +1986,131 @@ class FitContext:
             prepare_patch_dt_target_samples(
                 self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
             )
+
+    def _derive_object_store_point_inputs(self, verified_patches, inputs):
+        """Derive point views from object-store attachments; no linking.
+
+        The store's relationships already attach points to patches, so the
+        materialized collections go straight to classification. Returns the
+        next free resident collection id.
+        """
+        point_collections = inputs.point_collections
+        regular_pcl_catalog = {
+            cid: catalog_copy_of_pcl(pcl)
+            for cid, pcl in point_collections.items()
+        }
+        for pcl in point_collections.values():
+            pcl['chain'] = SequenceChain(pcl)
+        cross_patch, strips, strip_groups = regular_pcl_views(
+            point_collections, verified_patches,
+            z_begin=self.z_begin, z_end=self.z_end,
+            z_margin=self.config['patch_loss_z_margin'],
+            min_point_spacing=self.config['pcl_unattached_pcl_min_point_spacing'])
+        for line in inputs.report():
+            print(line)
+        self._install_point_views(
+            list(cross_patch.values()), strips, strip_groups,
+            fiber_catalog={}, regular_pcl_catalog=regular_pcl_catalog,
+            resolved_links=[], link_components=[])
+        self.link_distance_tolerance = float(
+            self.config['pcl_link_distance_tolerance'])
+        return max(point_collections, default=-1) + 1
+
+    def _load_and_link_file_inputs(self):
+        """Load patches, PCLs and fibers from files and link them by proximity.
+
+        Returns ``(verified_patches, next_id)`` after deriving the point views.
+        """
+        progress = progress_or_null(self.progress)
+        use_verified_patches = bool(self.verified_patches_path) and not self.config['input_disable_patches']
+        if not use_verified_patches:
+            verified_patches = {}
+            print('skipping patch loading')
+        else:
+            verified_patches = self._load_patches_from_dir(
+                self.verified_patches_path, 'verified patches')
+            if not verified_patches:
+                raise RuntimeError('No patches could be loaded')
+
+        print(f" loaded {len(verified_patches)} patches")
+
+        # ==========================================================================
+        # Point collection loading
+        # ==========================================================================
+
+        # Load all pcls in full-resolution voxel space, link every point to patches,
+        # and split into cross-patch / unattached sets. Verified patches must already
+        # be filtered to the z-roi.
+        point_collections = {}
+        next_id = 0
+        input_specs = self.pcl_input_specs
+        progress.begin(
+            'loading', 'Loading point collections',
+            step=0, total_steps=len(input_specs), unit='inputs')
+        for spec_number, (pattern, explicit_role) in enumerate(input_specs, start=1):
+            expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+            for path in expanded:
+                loaded = load_point_collection(path) or {}
+                for pcl in loaded.values():
+                    stamp_loaded_pcl_metadata(pcl, path, explicit_role, next_id)
+                    point_collections[next_id] = pcl
+                    next_id += 1
+            progress.update(
+                spec_number, detail=f'{len(point_collections):,} collections loaded')
+
+        progress.begin('loading', 'Loading fiber point collections')
+        fiber_point_collections, next_id = load_fiber_point_collections(
+            self.fibers_path,
+            next_id,
+            min_point_spacing=self.config['pcl_fiber_min_point_spacing'],
+            base_shape_zyx=getattr(self, 'base_shape_zyx', None),
+        )
+        # All fibers (horizontal, vertical, and merged link components) form one
+        # sampling group, rather than one group per source file like the regular pcls.
+        for pcl in fiber_point_collections.values():
+            pcl['sampling_group'] = 'fibers'
+            source = pcl.get('source_file', '')
+            logical_id = os.path.splitext(os.path.basename(source))[0]
+            try:
+                with open(source, 'rb') as stream:
+                    revision = hashlib.sha256(stream.read()).hexdigest()
+            except OSError:
+                revision = None
+            pcl.setdefault('metadata', {}).update({
+                'logical_input_kind': 'fiber',
+                'logical_input_id': logical_id,
+                'logical_input_revision': revision,
+            })
+            # Staging paths are content-addressed; branch records address the
+            # stable logical document name instead.
+            pcl['file_basename'] = f'{logical_id}.json'
+        fiber_catalog = {
+            str(pcl['metadata']['logical_input_id']): pcl
+            for pcl in fiber_point_collections.values()
+        }
+        point_collections.update(fiber_point_collections)
+
+        if self.interactive_driver is not None:
+            self._source_point_collections = {
+                pid: catalog_copy_of_pcl(pcl) for pid, pcl in point_collections.items()
+            }
+            self._source_verified_patches = dict(verified_patches)
+            if self.input_bindings:
+                # Bind the editing workspace's identities before the one
+                # derivation, so the service need not replay the unchanged
+                # baseline through a second full relink after the build.
+                self._workspace_membership = {}
+                self.next_id = next_id
+                self._bind_input_records(self.input_bindings)
+                next_id = self.next_id
+                verified_patches = {
+                    pid: patch for pid, patch in verified_patches.items()
+                    if pid in self._source_verified_patches}
+                point_collections, fiber_point_collections = \
+                    self._enabled_point_inputs()
+        self._derive_point_inputs(
+            verified_patches, point_collections, fiber_point_collections)
+        return verified_patches, next_id
 
     def _vertical_fiber_radial_offset(self):
         """Radial target offset (voxels) applied to vertical fiber strips; 0 when off."""

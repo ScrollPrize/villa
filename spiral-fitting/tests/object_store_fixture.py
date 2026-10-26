@@ -42,12 +42,15 @@ def put_patch(db, zyxs, scale=(1, 1), *, coordinates=frame(), **record):
                coordinates=coordinates, **record)
 
 
-def put_pcl(db, points, *, coordinates=frame(), absolute=None, **record):
-    """A PCL from {point id: (fit ZYX, wind_a or None)}."""
+def put_pcl(db, points, *, coordinates=frame(), absolute=None, source=None,
+            **record):
+    """A PCL from {point id: (fit ZYX, wind_a or None)}; ``source`` adds
+    ``meta.source`` fields."""
     factor = (coordinates or {}).get('scale_factor') or 1
     ids = list(points)
     xyz = [np.asarray(points[i][0], dtype=np.float64)[::-1] * factor for i in ids]
-    source = {'point_attributes': [{'wind_a': points[i][1]} for i in ids]}
+    source = {**(source or {}),
+              'point_attributes': [{'wind_a': points[i][1]} for i in ids]}
     if absolute is not None:
         source['winding_is_absolute'] = absolute
     return put(db, 'point_collection',
@@ -103,3 +106,60 @@ def fiber_patch_edge(db, fiber, line_index, patch, ij, **record):
         'meta': {'fiber_patch': {'median_line_index': line_index,
                                  'patch_grid': [float(ij[1]), float(ij[0])]}},
         **record})
+
+
+def reference_attachments(reference):
+    """{rounded ZYX: [(patch name, ij), ...]} from a reference summary."""
+    attachments = {}
+    for pcl in reference['constraints']['cross_patch']:
+        for name, points in pcl['points_by_patch']:
+            for key, ij in points:
+                entry = (name, tuple(ij))
+                found = attachments.setdefault(tuple(key), [])
+                if entry not in found:
+                    found.append(entry)
+    return attachments
+
+
+def write_reference_store(db, reference, *, fibers=True):
+    """Ingest object_store_reference.FIXTURE with its reference attachments
+    as explicit edges. Returns {object name: UUID}."""
+    import object_store_reference as fixture
+    from object_store_reference import _point_key
+
+    attachments = reference_attachments(reference)
+
+    def attached(zyx):
+        return attachments.get(tuple(_point_key({'zyx': np.float32(zyx)})), [])
+
+    uuids = {}
+    for patch in fixture.PATCHES:
+        uuids[patch['name']] = put_patch(
+            db, patch['zyxs'], patch['scale'], uuid=patch['uuid'],
+            name=patch['name'])
+    for document in fixture.PCL_DOCUMENTS:
+        for collection in document['collections']:
+            points = {point_id: (point['zyx'], point['wind'])
+                      for point_id, point in collection['points'].items()}
+            uid = put_pcl(db, points, uuid=collection['uuid'],
+                          name=collection['name'],
+                          absolute=document['role'] == 'absolute')
+            uuids[collection['name']] = uid
+            for point_id, point in collection['points'].items():
+                for name, ij in attached(point['zyx']):
+                    pcl_patch_edge(db, uid, point_id, uuids[name], ij)
+    if not fibers:
+        return uuids
+    for fiber in fixture.FIBERS:
+        uid = put_fiber(db, fiber['line'], fiber['controls'],
+                        [100 + 7 * k for k in range(len(fiber['controls']))],
+                        uuid=fiber['uuid'], name=fiber['name'])
+        uuids[fiber['name']] = uid
+        for line_index, zyx in enumerate(fiber['line']):
+            for name, ij in attached(zyx):
+                fiber_patch_edge(db, uid, line_index, uuids[name], ij)
+    controls = {fiber['name']: fiber['controls'] for fiber in fixture.FIBERS}
+    for a, a_control, b, b_control in fixture.FIBER_BRANCHES:
+        branch(db, uuids[a], 100 + 7 * a_control, uuids[b], 100 + 7 * b_control)
+        assert a_control < len(controls[a]) and b_control < len(controls[b])
+    return uuids
