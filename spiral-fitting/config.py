@@ -32,7 +32,6 @@ _NULL_TYPES = {
     "track_max_tortuosity": "number",
     "loss_start_track_dt": "integer",
     "loss_start_unattached_pcl_dt": "integer",
-    "patch_uuid_filter_regex": "string",
     "object_store_path": "string",
     "object_store_author": "string",
     "object_store_patch_uuids": "strings",
@@ -47,13 +46,12 @@ _NULL_TYPES = {
     "track_scale_factor": "number",
 }
 
-# Settings host preparation consumes irreversibly: the patch loader erodes and
-# filters entries before they reach the resident pools, and the dense-spacing
+# Settings host preparation consumes irreversibly: patch materialization
+# erodes patches before they reach the resident pools, and the dense-spacing
 # mode decides which dense stores are opened. Nothing retained by a resident
 # session can re-derive their effect, so they demand a full rebuild.
 _PREPARED_INPUT_FIELDS = {
     "patch_erode_patches",
-    "patch_uuid_filter_regex",
     "dense_spacing_mode",
 }
 
@@ -240,25 +238,26 @@ _RUN_MUTABLE_MODEL_KEYS = frozenset({
     "model_gap_expander_num_windings",
 })
 
-# input_ keys a resident session applies at a Run boundary: the participation
-# toggles of the editable point-collection roles (same-winding, relative).
-# Their documents are ordinary regular collections, so FitContext.apply_config
-# loads them through the live-incorporation path when a toggle turns on (the
-# dataset's conventional document plus any document the session request
-# named) and drops the role's resident collections when it turns off. The
-# other roles keep their load-time semantics: absolute annotations are
-# consumed by the theta/winding supervision set up at build, and drawn
-# control points have no live add/remove path.
-_RUN_MUTABLE_INPUT_KEYS = frozenset({
-    "input_use_pcl_relative",
-    "input_use_pcl_same_winding",
-})
-
 # input_ keys: hard participation gates deciding what host preparation loads
 # and which dense stores open. Always a rebuild.
-_INPUT_GATE_KEYS = (_INPUT_TOGGLE_KEYS - _RUN_MUTABLE_INPUT_KEYS) | {
+_INPUT_GATE_KEYS = _INPUT_TOGGLE_KEYS | {
     "input_disable_patches",
 }
+
+# pcl_ settings that shape the frozen object-store inputs: the startup link
+# refresh (object_store_inputs.refresh_links), materialization and the point
+# views derived from them. A resident fit cannot re-derive them; they are a
+# rebuild, and FitContext.apply_config refuses them.
+OBJECT_STORE_PCL_KEYS = frozenset({
+    "pcl_link_distance_tolerance",
+    "pcl_link_window_points",
+    "pcl_link_window_min_points",
+    "pcl_fiber_min_point_spacing",
+    "pcl_patch_overlap_pair_spacing",
+    "pcl_patch_overlap_max_pairs",
+    "pcl_use_fiber_links",
+    "pcl_unattached_pcl_min_point_spacing",
+})
 
 _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_vertical_fiber_radial_offset_enabled",
@@ -266,22 +265,6 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
     "pcl_rel_winding_adjacent_patches_only",
     "pcl_stratified_pcl_sampling",
     "pcl_sampling_weights",
-    "pcl_use_fiber_links",
-    "pcl_use_pending_fiber_links",
-    "pcl_unattached_pcl_min_point_spacing",
-    "pcl_fiber_min_point_spacing",
-    # The fiber link side rules relink every resident fiber (the fiber
-    # catalog is re-linked against the resident patches and its views
-    # re-materialised); see FitContext._relink_fibers_to_patches. The
-    # tolerance and window settings relink every resident collection, regular
-    # and fiber, and re-derive every view from the retained catalogs; see
-    # FitContext._relink_all_points_to_patches.
-    "pcl_fiber_link_side_filter",
-    "pcl_fiber_link_side_margin_voxels",
-    "pcl_fiber_link_model_direction_step",
-    "pcl_link_distance_tolerance",
-    "pcl_link_window_points",
-    "pcl_link_window_min_points",
 })
 
 # The object-store input selection and frames decide what host preparation
@@ -310,12 +293,11 @@ NEW_FIT_KEYS = frozenset(
     set(_Z_RANGE_KEYS)
     | _MODEL_STRUCTURE_KEYS
     | OBJECT_STORE_INPUT_KEYS
+    | OBJECT_STORE_PCL_KEYS
     | _INPUT_GATE_KEYS
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction",
-       # Materialized from the object store when the fit loads its inputs.
-       "pcl_patch_overlap_pair_spacing", "pcl_patch_overlap_max_pairs"}
+       "pcl_vertical_fiber_min_z_fraction"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
@@ -324,8 +306,7 @@ _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
 def _runtime_impact(key):
     if key in NEW_FIT_KEYS:
         return "new_fit"
-    if (key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS
-            or key in _RUN_MUTABLE_INPUT_KEYS):
+    if key in _RUN_MUTABLE_MODEL_KEYS or key in _RUN_MUTABLE_PCL_KEYS:
         return "run_boundary"
     if key.startswith(_AUDITED_PREFIXES):
         return "new_fit"
@@ -338,8 +319,7 @@ def unaudited_prefixed_keys(keys):
     Such a key is reported as "new_fit" by construction; this exists so the
     tests (and anyone adding a setting) can see the omission explicitly.
     """
-    tables = (NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
-              | _RUN_MUTABLE_INPUT_KEYS)
+    tables = NEW_FIT_KEYS | _RUN_MUTABLE_MODEL_KEYS | _RUN_MUTABLE_PCL_KEYS
     return sorted(key for key in keys
                   if key.startswith(_AUDITED_PREFIXES) and key not in tables)
 
@@ -539,44 +519,28 @@ class Config:
         self.input_use_winding_inference = True
         self.input_use_outer_shell = True
         self.input_disable_patches = False
-        # When set, only patch directory entries (uuid-named) whose name
-        # matches this regex (re.search) are loaded; None loads everything.
-        self.patch_uuid_filter_regex = None
         self.pcl_rel_winding_adjacent_patches_only = True
         self.pcl_stratified_pcl_sampling = True
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
-        # Point-to-patch linking (point_collection.link_points_to_patches;
-        # see descriptions.json). Every point attaches to a patch surface
-        # within this many scroll voxels; window_min_points > 1 additionally
+        # The object store's point-patch link detector, run by the startup
+        # link refresh (object_store_inputs.refresh_links; see
+        # descriptions.json): a point attaches to a patch surface within this
+        # many reference-volume voxels; window_min_points > 1 additionally
         # requires that many of a centred window of window_points consecutive
         # points to lie within tolerance of a candidate before it is eligible.
         self.pcl_link_distance_tolerance = 2.5
         self.pcl_link_window_points = 1
         self.pcl_link_window_min_points = 1
-        # Fiber side rules: vertical fibers (on the sheet's back) attach only
-        # to patches in front of them (inward, toward the umbilicus / lower
-        # winding), horizontal fibers (on the sheet's front) only to patches
-        # behind them, each with a margin for points on the surface itself.
-        # The inward direction comes from the umbilicus until
-        # pcl_fiber_link_model_direction_step steps have run, then from the
-        # fitted winding (every fiber relinks once at the switch, or at the
-        # first step after loading a checkpoint that far along).
-        self.pcl_fiber_link_side_filter = False
-        self.pcl_fiber_link_side_margin_voxels = 0.5
-        self.pcl_fiber_link_model_direction_step = 10000
-        # Cross-fiber links ("branches"): same-winding continuations between
-        # fibers. When on, linked collections merge into per-component
-        # cross-patch pcls with an explicit fiber graph (winding ties propagate
-        # through junctions whether or not the junction points attach to
-        # patches), and the unattached-strip loss samples chain walks that hop
-        # fibers at junctions. Link endpoints are resolved by their explicit
-        # control_point indices (mapped through decimation via
-        # kept_orig_indices).
+        # Cross-fiber links (the store's ordinary fiber_branch relationships):
+        # same-winding continuations between fibers. When on, linked fibers
+        # merge into per-component cross-patch pcls with an explicit fiber
+        # graph (winding ties propagate through junctions whether or not the
+        # junction points attach to patches), and the unattached-strip loss
+        # samples chain walks that hop fibers at junctions. Pending branches
+        # are used unless object_store_approved_links_only.
         self.pcl_use_fiber_links = True
-        # Include unapproved (pending) links.
-        self.pcl_use_pending_fiber_links = False
         # Object-store patch overlaps become same-surface point pairs sampled
         # this many reference-volume voxels apart, at most max_pairs per edge
         # (object_store_inputs.materialize_patch_overlaps). Each edge weighs
@@ -585,7 +549,7 @@ class Config:
         self.pcl_patch_overlap_pair_spacing = 8.0
         self.pcl_patch_overlap_max_pairs = 16
         # Vertical/horizontal classification of fiber strips, used for radial
-        # offsets and patch-side linking. VC3D's manual tag wins, then its automatic
+        # offsets. VC3D's manual tag wins, then its automatic
         # tag when the recorded certainty (0..1) reaches the threshold, then a
         # geometric fallback: a strip whose z extent is at least this fraction
         # of its path length is vertical.

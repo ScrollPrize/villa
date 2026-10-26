@@ -3,9 +3,9 @@ import pytest
 import torch
 
 from config import Config, FitConfig
-from fit_session import (RUN_MUTABLE_PCL_ROLES, PclInputSpec, PclRole,
-                         ScrollSpec, SpiralInputPaths,
-                         conventional_pcl_document_path, pcl_role_toggle_key)
+from fit_session import (PclInputSpec, PclRole, ScrollSpec, SpiralInputPaths,
+                         conventional_input_paths,
+                         conventional_pcl_document_path)
 from fit_spiral import FitContext
 import losses
 
@@ -53,30 +53,14 @@ def test_disabled_sources_are_removed_before_any_loader_can_see_them():
 
     context = make_context(config, paths)
 
-    assert context.verified_patches_path is None
-    assert context.fibers_path is None
     assert context.tracks_dbm_path is None
     assert context.normal_nx_zarr_path is None
     assert context.normal_ny_zarr_path is None
     assert context.grad_mag_zarr_path is None
     assert context.winding_inference_path is None
     assert context.shell_path is None
-    assert context.pcl_input_specs == []
-    assert context._configured_pcl_sources == paths.pcls
     assert context.config["loss_weight_track_radius"] == 73.0
     assert context.config["sample_count_tracks_per_step"] == 1234
-
-
-def test_run_mutable_pcl_roles_match_the_run_boundary_toggle_keys():
-    # fit_session names the roles apply_config can turn on and off; config
-    # classifies their keys. The two lists must describe the same roles.
-    fields = Config.catalog()["schema"]["fields"]
-    run_boundary_toggles = {
-        key for key, spec in fields.items()
-        if key.startswith("input_use_pcl_")
-        and spec["runtime_impact"] == "run_boundary"}
-    assert run_boundary_toggles == {
-        pcl_role_toggle_key(role) for role in RUN_MUTABLE_PCL_ROLES}
 
 
 def test_conventional_pcl_document_path_matches_dataset_resolution(tmp_path):
@@ -86,28 +70,16 @@ def test_conventional_pcl_document_path_matches_dataset_resolution(tmp_path):
     assert conventional_pcl_document_path("", "same_winding") == ""
 
 
-def test_pcl_role_toggles_filter_documents_independently():
-    config = Config({
-        "input_use_pcl_relative": False,
-        "input_use_pcl_drawn_control_points": False,
-    }).as_dict()
-    paths = SpiralInputPaths(
-        umbilicus="/inputs/umbilicus.json",
-        verified_patches="/inputs/verified",
-        pcls=(
-            PclInputSpec("/inputs/absolute.json", PclRole.ABSOLUTE),
-            PclInputSpec("/inputs/relative.json", PclRole.RELATIVE),
-            PclInputSpec("/inputs/same.json", PclRole.SAME_WINDING),
-            PclInputSpec("/inputs/drawn.json", PclRole.DRAWN_CONTROL_POINTS),
-        ),
-    )
-
-    context = make_context(config, paths)
-
-    assert context.pcl_input_specs == [
-        ("/inputs/absolute.json", "absolute"),
-        ("/inputs/same.json", "same_winding"),
-    ]
+def test_cli_paths_name_no_patch_fiber_or_pcl_files(tmp_path):
+    # The CLI reads patches, fibers and point collections from an object
+    # store; the conventional dataset layout no longer names them.
+    paths = conventional_input_paths(
+        tmp_path, ScrollSpec(name="test", voxel_size_um=1.0,
+                             spiral_outward_sense="CW"))
+    assert paths.verified_patches == ""
+    assert paths.fibers == ""
+    assert paths.pcls == ()
+    assert paths.umbilicus == f"{tmp_path}/umbilicus.json"
 
 
 def test_empty_patch_sets_have_no_sampling_distribution():

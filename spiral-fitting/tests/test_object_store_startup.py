@@ -494,7 +494,6 @@ def test_fit_context_loads_frozen_inputs_from_its_configuration(store_path, tmp_
     with pytest.raises(ValueError, match='object-store inputs are frozen'):
         context.apply_config({'pcl_link_distance_tolerance': 3.0},
                              current_iteration=0)
-    context._maybe_relink_fibers_for_direction(10 ** 6)
 
 
 # ---------------------------------------------------------------------------

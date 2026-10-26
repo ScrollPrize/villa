@@ -327,7 +327,7 @@ the relationship graph alone cannot supply seam corrections.
 
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
-Steps 1–10 are implemented; steps 11–12 remain. Upstream
+Steps 1–11 are implemented; step 12 remains. Upstream
 through `affe83f75` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
@@ -511,9 +511,26 @@ Notes from steps 5–8 that the remaining steps build on:
   attachments and 809 overlap pairs were materialized, most attachments
   lying outside the 100-slice window's sampled quads; ~18 s.
 - `tests/data/object_store_reference.json` is the file loader's output for the
-  synthetic fixture in `tests/object_store_reference.py`. Delete
-  `tests/test_object_store_reference.py` with the file loader in step 11; the
-  adapter tests keep comparing against the reference file.
+  synthetic fixture in `tests/object_store_reference.py`, frozen when step 11
+  removed that loader; the adapter tests keep comparing against it.
+- Step 11 removed, with their tests and options: the file patch/PCL/fiber
+  loaders (`point_collection.py`, the `spiral_helpers` fiber/patch loaders,
+  tifxyz payload transport and z prefilter), proximity linking and its native
+  `vc_spiral.surface_index`, fiber side rules and the model-direction
+  relinker, Run-boundary relinking/reloading, FitContext's live input
+  editing (`prepare_input_changes` and its workspace bindings), filename
+  branch resolution, `connect_overlapping_patches.py` (superseded by the
+  store's overlap detector) and its plotter. Removed options:
+  `patch_uuid_filter_regex`, `pcl_use_pending_fiber_links` and
+  `pcl_fiber_link_side_{filter,margin_voxels}`/`_model_direction_step`
+  (checkpoints holding them load with a note). Settings that shape the frozen
+  inputs (`config.OBJECT_STORE_PCL_KEYS` and the relative/same-winding role
+  toggles) are now rebuild-scoped. Every fiber keeps its strip (the
+  `strip_every_fiber` switch is gone). The CLI's conventional paths name no
+  patch, fiber or PCL files. `find_inconsistent_windings.py` reads the object
+  store (`--object-store`, no refresh) and walks multi-patch fiber contacts.
+  The interactive service still constructs FitContext with workspace
+  bindings and file inputs, and is broken until it is ported (accepted).
 
 Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the

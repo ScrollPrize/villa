@@ -2,28 +2,23 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest import mock
 
 import numpy as np
 from PIL import Image
-import torch
 
-from config import Config, FitConfig
+from config import Config
 from spiral_helpers import (
     _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX,
     _resolve_shell_outer_winding_idx,
     _structurally_disabled_dense_weight_keys,
-    load_fiber_point_collection,
     resolve_outer_winding_idx_and_notes,
 )
 from fit_spiral import (
-    FitContext,
-    _UnattachedPclStripList,
     get_dt_loss_eligibility,
     get_unattached_pcl_dt_start,
     get_run_dt_resume_iteration,
-    materialize_fiber_fit_inputs,
 )
+from pcl_views import fiber_training_views, prepare_fiber_catalog
 from tifxyz import load_tifxyz
 
 
@@ -76,234 +71,82 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
 
 
-class FiberPointCollectionTests(unittest.TestCase):
-    def _write_fiber(self, directory, data):
-        path = Path(directory) / "fiber.json"
-        path.write_text(json.dumps(data))
-        return path
-
-    def test_loads_line_points_trimmed_to_the_control_point_span(self):
-        # The tracer extends line_points past the first and last control point;
-        # those dangling ends must not become constraints.
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self._write_fiber(temporary, {
-                "control_points": [[4, 8, 12], [20, 24, 28]],
-                "line_points": [
-                    [0, 0, 0],            # dangling start: dropped
-                    [4, 8, 12],           # first control point
-                    [12, 16, 20],         # dense in-between point: kept
-                    [20, 24, 28],         # last control point
-                    [100, 100, 100],      # dangling end: dropped
-                ],
-            })
-
-            collection = load_fiber_point_collection(
-                path, collection_id=7, min_point_spacing=0)
-
-            points = [point["p"] for point in collection["points"].values()]
-            np.testing.assert_array_equal(
-                points, [[1, 2, 3], [3, 4, 5], [5, 6, 7]])
-            np.testing.assert_array_equal(
-                collection["control_line_indices"], [0, 2])
-
-    def test_falls_back_to_control_points_without_a_dense_polyline(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self._write_fiber(temporary, {
-                "control_points": [[4, 8, 12], [20, 24, 28]],
-                "line_points": [[400, 800, 1200]],
-            })
-
-            collection = load_fiber_point_collection(
-                path, collection_id=7, min_point_spacing=0)
-
-            points = [point["p"] for point in collection["points"].values()]
-            np.testing.assert_array_equal(points, [[1, 2, 3], [5, 6, 7]])
-
-    def test_ignores_adjacent_links_unsupported_by_spiral_fitting(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self._write_fiber(temporary, {
-                "control_points": [[4, 8, 12], [20, 24, 28]],
-                "line_points": [[4, 8, 12], [20, 24, 28]],
-                "adjacent_branches": [{
-                    "branch_file": "peer.json",
-                    "control_point_index": 0,
-                    "branch_control_point_index": 1,
-                }],
-            })
-
-            collection = load_fiber_point_collection(
-                path, collection_id=7, min_point_spacing=0)
-
-            self.assertEqual(collection["branches"], [])
-
-    def test_declared_coordinate_domain_overrides_legacy_scale(self):
-        for shape, expected_scale in (([101, 201, 301], 1),
-                                      ([100, 200, 300], 1),
-                                      ([202, 402, 602], .5),
-                                      ([403, 803, 1203], .25),
-                                      ([405, 805, 1205], .25),
-                                      ([51, 101, 151], 2)):
-            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as directory:
-                path = self._write_fiber(directory, {
-                    "control_points": [[4, 8, 12], [20, 24, 28]],
-                    "line_points": [],
-                    "coordinate_base_shape_zyx": shape,
-                })
-                pcl = load_fiber_point_collection(
-                    path, 7, min_point_spacing=0,
-                    base_shape_zyx=[101, 201, 301])
-                np.testing.assert_array_equal(
-                    [point['p'] for point in pcl['points'].values()],
-                    np.array([[4, 8, 12], [20, 24, 28]]) * expected_scale)
-
-    def test_declared_coordinate_domain_requires_compatible_dataset(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._write_fiber(directory, {
-                "control_points": [[4, 8, 12], [20, 24, 28]],
-                "coordinate_base_shape_zyx": [100, 200, 300],
-            })
-            for shape in (None, [100, 100, 300], [0, 200, 300]):
-                with self.subTest(shape=shape), self.assertRaises(ValueError):
-                    load_fiber_point_collection(path, 7, base_shape_zyx=shape)
-
-    def test_skips_fibers_without_control_points(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = self._write_fiber(temporary, {
-                "line_points": [[4, 8, 12]],
-            })
-
-            collection = load_fiber_point_collection(path, collection_id=7)
-
-            self.assertIsNone(collection)
+class FiberLinkViewTests(unittest.TestCase):
+    """Fiber training views over store-resolved same-winding branch links."""
 
     @staticmethod
-    def _linked_member(collection_id, logical_id, targets, x_offset,
-                       attached=True):
+    def _fiber(collection_id, x_offset, attached=True):
         points = {
             point_id: {
                 "id": point_id,
                 "collectionId": collection_id,
                 "p": [x_offset + point_id, 0.0, 0.0],
                 "zyx": np.asarray([0.0, 0.0, x_offset + point_id],
-                              dtype=np.float32),
+                                  dtype=np.float32),
                 "winding_annotation": float("nan"),
-                **({"on_patch": {"id": f"patch-{logical_id}"}}
+                **({"attachments": [{"id": f"patch-{collection_id}",
+                                     "ij": [0.0, float(point_id)]}]}
                    if attached else {}),
             }
             for point_id in range(2)
         }
-        return {
-            "id": collection_id,
-            "file_basename": f"{logical_id}.json",
-            "sampling_group": "fibers",
-            "metadata": {
-                "logical_input_id": logical_id,
-                "logical_input_kind": "fiber",
-                "winding_is_absolute": False,
-            },
-            "points": points,
-            "kept_orig_indices": np.asarray([0, 1]),
-            "control_line_indices": np.asarray([0, 1]),
-            "branches": [
-                {
-                    "local_index": local_index,
-                    "branch_file": f"{target_id}.json",
-                    "branch_index": target_index,
-                    "pending": False,
-                }
-                for local_index, target_id, target_index in targets
-            ],
-        }
+        return {"id": collection_id, "metadata": {}, "points": points}
 
-    def _materialize(self, catalog, spacing=0):
-        patches = {
-            f"patch-{logical_id}": object() for logical_id in catalog
-        }
-        return materialize_fiber_fit_inputs(
-            catalog, patches, z_begin=-10, z_end=10, z_margin=0,
+    @staticmethod
+    def _link(a_coll, a_point, b_coll, b_point):
+        return {"a_coll": a_coll, "a_point": a_point,
+                "b_coll": b_coll, "b_point": b_point, "pending": False}
+
+    def _views(self, catalog, links, spacing=0):
+        fibers = prepare_fiber_catalog(catalog)
+        patches = {f"patch-{cid}": object() for cid in fibers}
+        return fiber_training_views(
+            fibers, links, patches, z_begin=-10, z_end=10, z_margin=0,
             min_point_spacing=spacing)
 
-    def test_catalog_materializes_branching_and_loop_closing_graphs(self):
-        catalog = {
-            "a": self._linked_member(
-                10, "a", [(0, "b", 0), (1, "c", 0)], 0),
-            "b": self._linked_member(
-                11, "b", [(0, "a", 0), (1, "c", 1)], 10),
-            "c": self._linked_member(
-                12, "c", [(0, "a", 1), (1, "b", 1)], 20),
-        }
+    def _catalog(self):
+        return {"a": self._fiber(10, 0), "b": self._fiber(11, 10),
+                "c": self._fiber(12, 20)}
 
-        cross, strips, groups, links, components = self._materialize(catalog)
+    def test_branching_and_loop_closing_links_merge_one_component(self):
+        links = [self._link(10, 0, 11, 0), self._link(10, 1, 12, 0),
+                 self._link(11, 1, 12, 1)]
+
+        cross, strips, groups, components = self._views(self._catalog(), links)
 
         self.assertEqual(len(cross), 1)
         self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
                          ["a", "b", "c"])
-        self.assertEqual(len(links), 3)
         self.assertEqual(len(components), 1)
         self.assertEqual(len(strips), 3)
         self.assertEqual(groups, ["fibers"] * 3)
         self.assertEqual(len(cross[0]["chain"].extra_edges), 1)
 
-    def test_revision_replaces_one_catalog_value_and_rebuilds_all_views(self):
-        a = self._linked_member(10, "a", [(0, "b", 0)], 0)
-        b = self._linked_member(
-            11, "b", [(0, "a", 0), (1, "c", 0)], 10)
-        c = self._linked_member(12, "c", [(0, "b", 1)], 20)
-        catalog = {"a": a, "b": b, "c": c}
-        self._materialize(catalog)
+    def test_link_endpoints_survive_strip_decimation(self):
+        links = [self._link(10, 0, 11, 0), self._link(11, 1, 12, 0)]
 
-        revised_a = self._linked_member(10, "a", [], 100)
-        candidate = dict(catalog)
-        candidate["a"] = revised_a
-        cross, strips, _, links, _ = self._materialize(candidate, spacing=1000)
+        _, strips, _, _ = self._views(self._catalog(), links, spacing=1000)
 
-        self.assertEqual(revised_a["id"], a["id"])
-        self.assertEqual(list(candidate), ["a", "b", "c"])
-        self.assertEqual(len(cross), 1)
-        self.assertEqual(cross[0]["metadata"]["logical_input_ids"],
-                         ["a", "b", "c"])
-        merged_points = list(cross[0]["points"].values())
-        self.assertTrue(any(point is revised_a["points"][0]
-                            for point in merged_points))
-        self.assertFalse(any(point is a["points"][0]
-                             for point in merged_points))
-        self.assertTrue(any(point is b["points"][0]
-                            for point in merged_points))
-        self.assertTrue(any(point is c["points"][0]
-                            for point in merged_points))
-        # B's authoritative reciprocal record keeps A-B active, and junction
-        # points survive even though the strip spacing exceeds its full length.
-        self.assertEqual(len(links), 2)
         strips_by_id = {strip["id"]: strip for strip in strips}
         self.assertIn(0, strips_by_id[10]["link_points"])
-        self.assertIn(0, strips_by_id[11]["link_points"])
-        self.assertEqual(sum(
-            strip["logical_input_id"] == "a" for strip in strips), 1)
+        self.assertEqual(set(strips_by_id[11]["link_points"]), {0, 1})
+        self.assertIn(0, strips_by_id[12]["link_points"])
 
-    def test_batched_reciprocal_removal_separates_component(self):
-        catalog = {
-            "a": self._linked_member(10, "a", [], 0),
-            "b": self._linked_member(11, "b", [], 10),
-        }
+    def test_unlinked_fibers_stay_separate_and_keep_their_strips(self):
+        cross, strips, _, components = self._views(self._catalog(), [])
 
-        cross, strips, _, links, components = self._materialize(catalog)
-
-        self.assertEqual(links, [])
         self.assertEqual(components, [])
-        self.assertEqual(len(cross), 2)
-        self.assertEqual(strips, [])
+        self.assertEqual(len(cross), 3)
+        # Every fiber keeps its strip, attached or not.
+        self.assertEqual(sorted(strip["id"] for strip in strips), [10, 11, 12])
 
-    def test_new_fiber_links_to_resident_and_materialization_is_deterministic(self):
-        resident = self._linked_member(10, "a", [], 0)
-        added = self._linked_member(11, "b", [(0, "a", 0)], 10)
-        catalog = {"a": resident, "b": added}
+    def test_views_are_deterministic(self):
+        links = [self._link(11, 0, 10, 0)]
 
-        first = self._materialize(catalog)
-        second = self._materialize(catalog)
+        first = self._views(self._catalog(), links)
+        second = self._views(self._catalog(), links)
 
-        self.assertEqual(len(first[3]), 1)
         self.assertEqual(first[3], second[3])
-        self.assertEqual(first[4], second[4])
         self.assertEqual(
             [pcl["metadata"] for pcl in first[0]],
             [pcl["metadata"] for pcl in second[0]])
@@ -311,29 +154,6 @@ class FiberPointCollectionTests(unittest.TestCase):
             self.assertEqual(left["id"], right["id"])
             self.assertEqual(left["link_points"], right["link_points"])
             np.testing.assert_array_equal(left["zyxs"], right["zyxs"])
-
-    def _editable_context(self, cross_patch, strips, groups):
-        context = FitContext.__new__(FitContext)
-        context.config = FitConfig(Config({
-            "z_begin": 0, "z_end": 200,
-        }).as_dict())
-        context.fiber_catalog = {}
-        context.next_id = 30
-        context.verified_patches = {}
-        context.verified_patches_list = []
-        context.cross_patch_pcls = list(cross_patch)
-        context.unattached_pcl_strips = _UnattachedPclStripList(list(strips))
-        context.unattached_strip_sampling_groups = list(groups)
-        context.resolved_links = []
-        context.link_components = []
-        context.link_distance_tolerance = 2.5
-        context.dt_target_cache_manager = mock.Mock()
-        context._rebuild_pcl_sampling_strata = mock.Mock()
-        context._build_theta_crossing_map = mock.Mock(return_value=[])
-        context._trusted_geometry_from_active_inputs = mock.Mock(
-            return_value=torch.empty((0, 3)))
-        context.run_dt_resume_iteration = None
-        return context
 
 
 class TifxyzMetadataTests(unittest.TestCase):
@@ -364,34 +184,6 @@ class TifxyzMetadataTests(unittest.TestCase):
             patch = load_tifxyz(root)
 
             self.assertEqual(patch.erosion_cells(7), 7)
-
-    def test_z_prefilter_skips_x_and_y_decode_for_out_of_roi_patch(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "meta.json").write_text(json.dumps({
-                "format": "tifxyz", "scale": [1.0, 1.0],
-            }))
-            Image.fromarray(np.full((3, 4), 20, dtype=np.float32)).save(
-                root / "z.tif")
-            # x.tif and y.tif deliberately do not exist: returning None proves
-            # the expensive coordinate planes were never opened.
-            self.assertIsNone(load_tifxyz(root, z_range=(100, 200)))
-
-    def test_z_prefilter_respects_mask_and_half_open_interval(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "meta.json").write_text(json.dumps({
-                "format": "tifxyz", "scale": [1.0, 1.0],
-            }))
-            z = np.full((2, 2), 100, dtype=np.float32)
-            z[0, 0] = 150
-            Image.fromarray(z).save(root / "z.tif")
-            mask = np.ones((2, 2), dtype=np.uint8)
-            mask[0, 0] = 0
-            Image.fromarray(mask).save(root / "mask.tif")
-            self.assertIsNone(load_tifxyz(root, z_range=(150, 151)))
-            # z == end is excluded.
-            self.assertIsNone(load_tifxyz(root, z_range=(99, 100)))
 
 
 class ShellOuterWindingIdxResolutionTests(unittest.TestCase):

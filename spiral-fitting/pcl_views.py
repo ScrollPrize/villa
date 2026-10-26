@@ -3,14 +3,13 @@
 These helpers turn point collections whose points already carry their patch
 attachments (``point['on_patch']``) into the views the losses consume:
 cross-patch collections grouped by patch, unattached strips, and fiber-link
-components. They do not read files or link points to patches, so every input
-source shares them.
+components. They never link points to patches: object_store_inputs
+materializes the store's attachments onto the points first.
 """
 import copy
 
 import numpy as np
 
-from point_collection import normalise_pcl_winding_annotations
 from spiral_helpers import (
     SequenceChain,
     _decimate_ordered_points_min_spacing,
@@ -18,7 +17,6 @@ from spiral_helpers import (
     classify_fiber_hv,
     merge_linked_point_collections,
     point_attachments,
-    resolve_fiber_links,
 )
 
 
@@ -28,12 +26,30 @@ class _UnattachedPclStripList(list):
     pass
 
 
-def catalog_copy_of_pcl(pcl):
-    """Copy a regular PCL without derived chain and patch-view state."""
-    return copy.deepcopy({
-        key: value for key, value in pcl.items()
-        if key not in ('chain', 'points_by_patch')
-    })
+def normalise_pcl_winding_annotations(point_collections):
+    # Per-pcl: if every point has a winding annotation, leave alone; if none has one, set them all to 0;
+    # if mixed, print a warning and strip the unannotated points.
+    for pcl_id, pcl in point_collections.items():
+        points = pcl['points']
+        annotated = [pid for pid, p in points.items() if np.isfinite(p['winding_annotation'])]
+        unannotated = [pid for pid, p in points.items() if not np.isfinite(p['winding_annotation'])]
+        # Record whether the pcl carried any winding annotation in the source json,
+        # *before* the all-unannotated case below 0-fills it. This is the only signal
+        # that distinguishes a "same-winding" pcl (fiber / new_same_wind: no wind_a) from
+        # a deliberate relative-winding pcl once both have finite annotations loaded.
+        pcl['has_winding_annotations'] = bool(annotated)
+        if not unannotated:
+            continue
+        if not annotated:
+            for p in points.values():
+                p['winding_annotation'] = 0.0
+            continue
+        print(
+            f'WARNING: pcl {pcl_id} ({pcl.get("name", "?")}) has mixed winding-number annotations: '
+            f'{len(annotated)} annotated, {len(unannotated)} missing — stripping unannotated points'
+        )
+        for pid in unannotated:
+            del points[pid]
 
 
 def longest_run_in_z_window(sorted_items, z_begin, z_end, z_margin):
@@ -207,8 +223,8 @@ def vertical_fiber_radial_offset(config):
 def prepare_fiber_catalog(fiber_catalog):
     """Stamp fiber identity, chains and ZYX on the resident fiber catalog.
 
-    ``fiber_catalog`` is ordered by logical input id and owns the canonical
-    fiber containers. Returns them keyed by resident collection id.
+    ``fiber_catalog`` is ordered by fiber UUID and owns the canonical fiber
+    containers. Returns them keyed by resident collection id.
     """
     point_collections = {}
     for logical_id, pcl in fiber_catalog.items():
@@ -218,7 +234,6 @@ def prepare_fiber_catalog(fiber_catalog):
         metadata['logical_input_id'] = logical_id
         metadata['winding_is_absolute'] = False
         metadata.setdefault('input_role', 'fiber')
-        pcl.setdefault('file_basename', f'{logical_id}.json')
         pcl['sampling_group'] = 'fibers'
         pcl['chain'] = SequenceChain(pcl)
         for point in pcl['points'].values():
@@ -300,16 +315,29 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
                          *, z_begin, z_end, z_margin, min_point_spacing,
                          vertical_min_z_fraction=0.8,
                          vertical_min_auto_certainty=0.5,
-                         vertical_radial_offset=0.0, strip_every_fiber=False):
+                         vertical_radial_offset=0.0):
     """Derive the fiber training views from prepared fibers and resolved links.
 
     ``point_collections`` are the prepared catalog fibers (prepare_fiber_catalog)
     in catalog order; ``resolved_links`` are same-winding links
     ``{'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}`` between them.
     A fiber with two or more patch attachments is a cross-patch view (linked
-    fibers merge into one component). Strips come from fibers with an
-    unattached point or a link, or from every fiber with
-    ``strip_every_fiber``; each needs two points in the z window.
+    fibers merge into one component). Every fiber with two points in the z
+    window also keeps its strip, attached or not: a representative patch
+    contact says nothing about how much of the fiber the patches cover.
+
+    Each strip carries ``hv_tag`` ('V', 'H', or None; see
+    spiral_helpers.classify_fiber_hv) and ``is_vertical`` for radial-offset
+    updates. ``radial_offsets`` holds the per-point radial target offset in
+    scroll voxels along the sheet normal, positive in the increasing-winding
+    direction of the fitted spiral (the scan-space winding gradient, not the
+    line to the umbilicus): ``vertical_radial_offset`` on vertical strips
+    (their back-face position relative to the fitted sheet, away from the
+    umbilicus), zero everywhere else. ``radial_offset_bake_scale`` carries
+    each point's accumulated normal stretch through the frozen
+    constraint-bake stack (1 before any bake), read from the catalog point
+    dicts (see fit_spiral.accumulate_radial_offset_bake_scale).
+
     Returns ``(cross_patch, strips, sampling_groups, link_components)``.
     """
     link_components = build_link_components(resolved_links)
@@ -323,21 +351,12 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
     link_components.sort(
         key=lambda component: min(
             catalog_position[cid] for cid in component[0]))
-    linked_cids = {
-        cid for member_cids, _ in link_components for cid in member_cids
-    }
-
     cross_patch = {}
-    strip_sources = []
     for cid, pcl in point_collections.items():
         num_attached = sum(
             len(point_attachments(point)) for point in pcl['points'].values())
-        num_unattached = sum(
-            1 for point in pcl['points'].values() if not point_attachments(point))
         if num_attached >= 2:
             cross_patch[cid] = pcl
-        if strip_every_fiber or num_unattached >= 1 or cid in linked_cids:
-            strip_sources.append((cid, pcl))
 
     if link_components:
         cross_patch, _ = merge_linked_point_collections(
@@ -364,7 +383,7 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
 
     strips = _UnattachedPclStripList()
     sampling_groups = []
-    for cid, pcl in strip_sources:
+    for cid, pcl in point_collections.items():
         strip = fiber_strip(
             cid, pcl, link_point_ids_by_coll.get(cid, ()),
             z_begin=z_begin, z_end=z_end, z_margin=z_margin,
@@ -379,47 +398,3 @@ def fiber_training_views(point_collections, resolved_links, verified_patches,
 
     return list(cross_patch.values()), strips, sampling_groups, link_components
 
-
-def materialize_fiber_fit_inputs(
-        fiber_catalog, verified_patches, *, z_begin, z_end, z_margin,
-        min_point_spacing, use_links=True, use_pending_links=False,
-        vertical_min_z_fraction=0.8, vertical_min_auto_certainty=0.5,
-        vertical_radial_offset=0.0):
-    """Derive every CPU training view from the resident fiber catalog.
-
-    ``fiber_catalog`` is ordered by logical input id and owns the canonical
-    fiber containers. The returned cross-patch PCLs and strips refer to their
-    geometry, but trimming and decimation never mutate the catalog's point
-    membership. Re-running this function over the same catalog therefore
-    produces the same graph and ordered training views.
-
-    Each strip carries ``hv_tag`` ('V', 'H', or None; see
-    spiral_helpers.classify_fiber_hv) and ``is_vertical`` for radial-offset updates.
-    ``radial_offsets`` holds the
-    per-point radial target offset in scroll voxels along the sheet normal,
-    positive in the increasing-winding direction of the fitted spiral (the
-    scan-space winding gradient, not the line to the umbilicus):
-    ``vertical_radial_offset`` on vertical strips (their back-face position
-    relative to the fitted sheet, away from the umbilicus), zero everywhere
-    else.
-    ``radial_offset_bake_scale`` carries each point's accumulated normal
-    stretch through the frozen constraint-bake stack (1 before any bake),
-    read from the catalog point dicts (see accumulate_radial_offset_bake_scale)
-    so the physical offset can be expressed in the resident frame.
-    """
-    point_collections = prepare_fiber_catalog(fiber_catalog)
-    resolved_links = []
-    if use_links:
-        resolved_links = resolve_fiber_links(
-            point_collections, include_pending=use_pending_links,
-            assume_unannotated=True)
-    cross_patch, strips, sampling_groups, link_components = \
-        fiber_training_views(
-            point_collections, resolved_links, verified_patches,
-            z_begin=z_begin, z_end=z_end, z_margin=z_margin,
-            min_point_spacing=min_point_spacing,
-            vertical_min_z_fraction=vertical_min_z_fraction,
-            vertical_min_auto_certainty=vertical_min_auto_certainty,
-            vertical_radial_offset=vertical_radial_offset)
-    return (cross_patch, strips, sampling_groups,
-            resolved_links, link_components)

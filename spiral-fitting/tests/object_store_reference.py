@@ -8,10 +8,10 @@ attachments do not depend on linker tie-breaks.
 
 ``constraint_summary`` and ``loss_summary`` reduce a loaded FitContext to
 JSON-comparable values. tests/data/object_store_reference.json holds them as
-produced by the file loader and its proximity linker; the object-store adapter
-must reproduce them from identical attachments.
-
-    python tests/object_store_reference.py   # rewrite the reference file
+produced by the former file loader and its proximity linker, captured before
+that path was removed; the object-store adapter must reproduce them from
+identical attachments. The reference cannot be regenerated: change it only
+for a deliberate change to the constraints or losses.
 """
 import json
 import math
@@ -193,77 +193,6 @@ def write_umbilicus(path):
             stream)
 
 
-def write_file_dataset(root):
-    """Write FIXTURE as a conventional file dataset; return SpiralInputPaths."""
-    from PIL import Image
-    from fit_session import PclInputSpec, PclRole, SpiralInputPaths
-
-    patches_root = os.path.join(root, 'verified_patches')
-    for patch in PATCHES:
-        path = os.path.join(patches_root, patch['name'])
-        os.makedirs(path)
-        for axis, name in enumerate('zyx'):
-            Image.fromarray(np.ascontiguousarray(
-                patch['zyxs'][..., axis])).save(os.path.join(path, f'{name}.tif'))
-        with open(os.path.join(path, 'meta.json'), 'w') as stream:
-            json.dump({'uuid': patch['name'], 'scale': patch['scale']}, stream)
-
-    roles = {'absolute': PclRole.ABSOLUTE, 'relative': PclRole.RELATIVE,
-             'same_winding': PclRole.SAME_WINDING}
-    pcl_specs = []
-    for document in PCL_DOCUMENTS:
-        collections = {}
-        for index, collection in enumerate(document['collections']):
-            collections[str(index)] = {'name': collection['name'], 'points': {
-                str(point_id): {'p': point['zyx'][::-1],
-                                **({} if point['wind'] is None
-                                   else {'wind_a': point['wind']})}
-                for point_id, point in collection['points'].items()}}
-        path = os.path.join(root, f'{document["stem"]}.json')
-        with open(path, 'w') as stream:
-            json.dump({'vc_pointcollections_json_version': '1',
-                       'collections': collections}, stream)
-        pcl_specs.append(PclInputSpec(path, roles[document['role']]))
-
-    fibers_root = os.path.join(root, 'fibers')
-    os.makedirs(fibers_root)
-    branches = {fiber['name']: [] for fiber in FIBERS}
-    for a, a_control, b, b_control in FIBER_BRANCHES:
-        branches[a].append({'control_point_index': a_control,
-                            'branch_file': f'{b}.json',
-                            'branch_control_point_index': b_control})
-        branches[b].append({'control_point_index': b_control,
-                            'branch_file': f'{a}.json',
-                            'branch_control_point_index': a_control})
-    for fiber in FIBERS:
-        line_xyz = [zyx[::-1] for zyx in fiber['line']]
-        with open(os.path.join(fibers_root, f'{fiber["name"]}.json'), 'w') as stream:
-            json.dump({
-                'type': 'vc3d_fiber', 'version': 1, 'name': fiber['name'],
-                'coordinate_base_shape_zyx': list(BASE_SHAPE_ZYX),
-                'control_points': [line_xyz[i] for i in fiber['controls']],
-                'line_points': line_xyz,
-                'branches': branches[fiber['name']],
-            }, stream)
-
-    umbilicus = os.path.join(root, 'umbilicus.json')
-    write_umbilicus(umbilicus)
-    return SpiralInputPaths(
-        dataset_root=root, umbilicus=umbilicus, pcls=tuple(pcl_specs),
-        fibers=fibers_root, verified_patches=patches_root)
-
-
-def file_context(root):
-    """A FitContext whose host inputs came from the file loader."""
-    from config import FitConfig
-    from fit_spiral import FitContext
-    paths = write_file_dataset(root)
-    context = FitContext(FitConfig(fit_config()), scroll=scroll_spec(),
-                         paths=paths, cache_dir=os.path.join(root, 'cache'))
-    context.load_host_inputs()
-    return context
-
-
 def _r(values, digits=4):
     return np.round(np.asarray(values, dtype=np.float64), digits).tolist()
 
@@ -411,13 +340,10 @@ def load_reference():
         return json.load(stream)
 
 
-if __name__ == '__main__':
-    import tempfile
-    os.environ.setdefault('FIT_SPIRAL_DEVICE', 'cpu')
-    with tempfile.TemporaryDirectory() as root:
-        summary = reference_summary(file_context(root))
-    os.makedirs(os.path.dirname(REFERENCE_PATH), exist_ok=True)
-    with open(REFERENCE_PATH, 'w') as stream:
-        json.dump(summary, stream, indent=1, sort_keys=True)
-        stream.write('\n')
-    print(f'wrote {REFERENCE_PATH}')
+def assert_matches_reference(summary):
+    """Assert ``summary`` (reference_summary) reproduces the reference."""
+    import pytest
+    expected = load_reference()
+    assert summary['constraints'] == expected['constraints']
+    for name, values in expected['losses'].items():
+        assert summary['losses'][name] == pytest.approx(values, abs=2e-5), name

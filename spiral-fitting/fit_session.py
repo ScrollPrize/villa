@@ -176,13 +176,6 @@ EDITABLE_PCL_ROLES: tuple[PclRole, ...] = (PclRole.SAME_WINDING, PclRole.RELATIV
 EDITABLE_PCL_ROLE_VALUES: frozenset[str] = frozenset(
     role.value for role in EDITABLE_PCL_ROLES)
 
-# Roles whose participation toggle a resident session applies at a Run
-# boundary (config._RUN_MUTABLE_INPUT_KEYS classifies the keys). These are
-# exactly the editable roles: the live add/replace/delete machinery that
-# makes their collections editable is what lets a toggle load or drop a whole
-# role without rebuilding the fit.
-RUN_MUTABLE_PCL_ROLES: tuple[PclRole, ...] = EDITABLE_PCL_ROLES
-
 
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
@@ -411,10 +404,9 @@ def fit_input(key: str) -> FitInputSpec | None:
 # PCL point-collection inputs: (role, conventional filename). One filename
 # per role serves both directions: dataset resolution probes for it, and
 # committing an uploaded collection of that role merges into it. Every role
-# is discovered by resolve_dataset_root and listed by
-# conventional_input_paths; an absent file is simply skipped at load time
-# (load_point_collection warns and continues), since all of these are
-# optional annotations.
+# is discovered by resolve_dataset_root; all of these are optional
+# annotations. The fitter itself reads point collections from an object
+# store, never from these files.
 PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str], ...] = (
     (PclRole.ABSOLUTE, "abs_winding.json"),
     (PclRole.RELATIVE, "relative_windings.json"),
@@ -585,9 +577,6 @@ _CONVENTIONAL_INPUT_RELATIVES = {
     for spec in FIT_INPUT_CATALOG
     if spec.conventional_relative and spec.kind != "pcl-set"
 }
-
-_CONVENTIONAL_PCL_INPUTS = tuple(
-    (filename, role) for role, filename in PCL_ROLE_CONVENTIONS)
 
 
 def conventional_pcl_document_path(dataset_root: str, role: PclRole | str) -> str:
@@ -831,6 +820,9 @@ def conventional_input_paths(
     """Resolve the conventional dataset layout (plus spec overrides) for the
     headless CLI, mirroring the historical fit_spiral module-global defaults.
 
+    Patches, fibers and point collections are left unset: the CLI reads them
+    from an object store (config object_store_path), never from the dataset.
+
     Unlike resolve_dataset_root() this performs no existence probing: the CLI
     fails on the specific missing input during loading, exactly as the module
     globals did. The dataset root is kept verbatim (no symlink resolution) so
@@ -846,18 +838,11 @@ def conventional_input_paths(
         relative = _CONVENTIONAL_INPUT_RELATIVES.get(key)
         return f"{root}/{relative}" if relative else ""
 
-    pcls = tuple(
-        PclInputSpec(path=f"{root}/{relative}", role=role)
-        for relative, role in _CONVENTIONAL_PCL_INPUTS
-    )
     return SpiralInputPaths(
         dataset_root=str(root),
         umbilicus=resolve("umbilicus"),
-        pcls=pcls,
-        fibers=resolve("fibers"),
         fiber_directions=resolve("fiber_directions"),
         tracks_dbm=resolve("tracks_dbm"),
-        verified_patches=resolve("verified_patches"),
         outer_shell=resolve("outer_shell"),
         normal_x=resolve("normal_x"),
         normal_y=resolve("normal_y"),

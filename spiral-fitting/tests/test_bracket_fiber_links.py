@@ -173,7 +173,6 @@ def test_dry_run_writes_nothing_and_apply_writes_valid_reciprocal_links(dataset)
 
     out = _run(dataset, '--apply', '--backup-dir', str(dataset / 'bak'))
     assert 'wrote 3 files' in out
-    assert 'fitter link resolution after write: 2 links' in out
     assert sorted(os.listdir(dataset / 'bak')) == ['horizontal.json', 'other.json', 'test_20260101T000000000_000007.json']
     # The numeric duplicate copy of the vertical is left untouched.
     assert json.load(open(dataset / 'fibers' / '12.json'))['branches'] == []

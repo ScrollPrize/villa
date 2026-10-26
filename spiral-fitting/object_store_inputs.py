@@ -995,8 +995,6 @@ class PointViews:
     cross_patch: list
     strips: list
     strip_groups: list
-    fiber_catalog: dict
-    regular_pcl_catalog: dict
     resolved_links: list
     link_components: list
 
@@ -1040,14 +1038,12 @@ def derive_point_views(inputs, patches, config):
     configuration. Raises the runtime validation errors (e.g. unannotated
     absolute points).
     """
-    from pcl_views import (catalog_copy_of_pcl, fiber_training_views,
-                           group_points_by_patch, prepare_fiber_catalog,
-                           regular_pcl_views, vertical_fiber_radial_offset)
+    from pcl_views import (fiber_training_views, group_points_by_patch,
+                           prepare_fiber_catalog, regular_pcl_views,
+                           vertical_fiber_radial_offset)
     from spiral_helpers import SequenceChain
 
     point_collections = inputs.point_collections
-    regular_pcl_catalog = {
-        cid: catalog_copy_of_pcl(pcl) for cid, pcl in point_collections.items()}
     for pcl in point_collections.values():
         pcl['chain'] = SequenceChain(pcl)
     cross_patch, strips, strip_groups = regular_pcl_views(
@@ -1066,8 +1062,7 @@ def derive_point_views(inputs, patches, config):
             min_point_spacing=config['pcl_unattached_pcl_min_point_spacing'],
             vertical_min_z_fraction=config['pcl_vertical_fiber_min_z_fraction'],
             vertical_min_auto_certainty=config['pcl_vertical_fiber_min_auto_certainty'],
-            vertical_radial_offset=vertical_fiber_radial_offset(config),
-            strip_every_fiber=True)
+            vertical_radial_offset=vertical_fiber_radial_offset(config))
     strips.extend(fiber_strips)
     strip_groups.extend(fiber_groups)
     overlaps = []
@@ -1078,8 +1073,7 @@ def derive_point_views(inputs, patches, config):
             overlaps.append(pcl)
     return PointViews(
         list(cross_patch.values()) + fiber_cross_patch + overlaps, strips,
-        strip_groups, inputs.fibers, regular_pcl_catalog, resolved_links,
-        link_components)
+        strip_groups, resolved_links, link_components)
 
 
 # ---------------------------------------------------------------------------

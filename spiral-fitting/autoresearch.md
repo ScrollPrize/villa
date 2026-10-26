@@ -10,7 +10,7 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current HEAD (any working copy changes should be left intact, assuming they are not in `fit_spiral.py` or its helper modules).
 3. **Read the in-scope files**: Only this 'spiral' subfolder of the repo is relevant. Read these for full context before you start:
    - `fit_spiral.py` — the main file you modify. Losses, optimization, flow model, config, etc.
-   - `point_collection.py` — helper for loading sets of annotated points, and linking them to nearby patches.
+   - `object_store_inputs.py`, `pcl_views.py` — read patches, point collections and fibers (and their links to patches) from the object store, and turn them into the training views the losses consume.
    - `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py` — fitting-side helper modules on the fit path (`flow_fields.py` is used via `transforms.py`) and NOT used by the metric/render pipeline. These are also fair game to edit (see scope below).
    - `tifxyz.py` — helper for loading/saving grid-topo quad-mesh patches. Read it for context, but it is **frozen** (see scope): it is shared with `render_ink.py`, so editing it changes the metric.
    - `runners/run_single.py` — the pipeline runner you launch (fit → render ink → score ink). You do NOT edit this or the scoring scripts; just understand what it does.
@@ -34,7 +34,7 @@ We also track **`overall_fg_fraction`** (foreground pixels ÷ total strip pixels
 ## Scope — what you can and cannot change
 
 **What you CAN do:**
-- Modify `fit_spiral.py` **and the fitting-side helper modules on the fit path that the metric/render pipeline does not use** — namely `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py`, `point_collection.py` (and, if you need them, the other fit-only imports: `sample_spiral.py`, `tracks.py`, `umbilicus.py`, `ddp_helpers.py`, `lasagna_data.py`). Everything about the *fit* is fair game: losses, optimizer, hyperparameters, flow field, diffeomorphism, initialization, sampling, etc.
+- Modify `fit_spiral.py` **and the fitting-side helper modules on the fit path that the metric/render pipeline does not use** — namely `losses.py`, `spiral_helpers.py`, `geom_utils.py`, `transforms.py`, `flow_fields.py`, `pcl_views.py` (and, if you need them, the other fit-only imports: `sample_spiral.py`, `tracks.py`, `umbilicus.py`, `ddp_helpers.py`, `lasagna_data.py`). Everything about the *fit* is fair game: losses, optimizer, hyperparameters, flow field, diffeomorphism, initialization, sampling, etc.
 - Create/modify your own helper *shell/python scripts* for driving the loop (batch launchers, summarizers, etc.).
 
 **What you CANNOT do:**

@@ -11,7 +11,6 @@ from object_store_fixture import (  # noqa: E402
     branch, fiber_patch_edge, put_fiber, put_patch, write_reference_store)
 from object_store_reference import spiral_zyx  # noqa: E402
 from test_object_store_materialize import adapter_context, materialize  # noqa: E402
-from test_object_store_reference import assert_matches_reference  # noqa: E402
 
 
 @pytest.fixture()
@@ -31,7 +30,7 @@ def test_identical_attachments_reproduce_the_reference(db, tmp_path):
     uuids = write_reference_store(db, expected)
     context = adapter_context(db, tmp_path)
     names = {uuid: name for name, uuid in uuids.items()}
-    assert_matches_reference(reference.reference_summary(context, names))
+    reference.assert_matches_reference(reference.reference_summary(context, names))
     [link] = context.resolved_links
     assert link['edge_uuid'] == context.object_store_inputs.fiber_links[0]['edge_uuid']
 

@@ -4,8 +4,9 @@ reach its patch -- both directly-attached absolute-winding pcls and, by a
 backwards BFS over patches, absolute-winding pcls on *other* patches that are
 linked to the seed patch through a chain of relative-winding pcls.
 
-It reuses fit_spiral's patch/point-collection loading phase and its spiral
-transform, but does no fitting/training.
+It reuses fit_spiral's object-store input loading (patches, point collections,
+fibers and the store's links to patches, read without a link refresh) and its
+spiral transform, but does no fitting/training.
 
 Two kinds of winding information feed the votes:
 
@@ -64,8 +65,7 @@ edges' intra-patch deltas.
 
 Each within-patch winding delta is measured along a strip that follows a
 fringe-avoiding shortest path through the patch's *valid quads only* (a weighted
-Dijkstra on the quad grid, exactly like connect_overlapping_patches.py but within
-one patch), then transforms that path to spiral space and theta=0-unwraps its
+Dijkstra on the quad grid, see build_patch_graph), then transforms that path to spiral space and theta=0-unwraps its
 shifted radii. Sampling only valid quads keeps theta continuous so seam-crossing
 counts reflect real branch transport (and whole windings on multi-winding patches)
 instead of being thrown off by the wild theta swings of invalid regions. The
@@ -87,10 +87,9 @@ Run from the spiral/ directory, e.g.
 
     python find_inconsistent_windings.py \
         --checkpoint out/.../checkpoint_fitted.ckpt \
-        --patches-dir /path/to/dataset/patches \
-        --patch-id <patch-folder-name> \
-        --pcl /path/to/abs_windings.json \
-        --pcl /path/to/rel_windings.json \
+        --object-store /path/to/store.vcobj \
+        --umbilicus /path/to/dataset/umbilicus.json \
+        --patch-id <patch-uuid> \
         --z-range 10000,13000
 """
 
@@ -98,10 +97,13 @@ import os
 import sys
 import json
 from collections import deque
+from dataclasses import dataclass
 
 import click
 import numpy as np
+import scipy.sparse as sp
 import torch
+from scipy.ndimage import distance_transform_edt
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra, connected_components
 from scipy.optimize import milp, LinearConstraint, Bounds
@@ -114,55 +116,106 @@ from sample_spiral import (
     get_theta_crossing_step_adjustments,
     unwrap_shifted_radii,
 )
-# Reuse connect_overlapping_patches' valid-quad graph + path reconstruction so a
-# within-patch strip follows a fringe-avoiding path through valid quads only
-# (never slicing through invalid regions, where theta would jump and the unwrap
-# would miscount whole windings).
-import connect_overlapping_patches as cop
+from spiral_helpers import point_attachments
+from tifxyz import Patch
 
 
-def resolve_umbilicus_path(patches_dir, explicit_path=None):
-    """Resolve the umbilicus used to rebuild a checkpoint transform.
+# ---------------------------------------------------------------------------
+# Valid-quad graph of one patch, so a within-patch strip follows a
+# fringe-avoiding path through valid quads only (never slicing through invalid
+# regions, where theta would jump and the unwrap would miscount whole windings).
+# Edge weights penalise being near a boundary (low distance-transform value),
+# so the path hugs the perpendicular middle of the valid region.
+# ---------------------------------------------------------------------------
 
-    Checkpoints do not carry the source umbilicus samples, and fit_spiral's module
-    default may point at the machine where the checkpoint was trained. Prefer an
-    explicit path, then the dataset root inferred from --patches-dir, then the
-    fit_spiral default if it exists.
+# 8-connectivity on the quad grid. Diagonal moves stay on valid quads because
+# the segment between two diagonally-adjacent quad centres only ever passes
+# through those two quads (it crosses their shared corner, nothing else).
+_DIRS8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+
+@dataclass
+class PatchGraph:
+    """Cached per-patch structures for path finding on the quad grid."""
+    patch: Patch
+    valid_quad: np.ndarray       # (Hq, Wq) bool
+    dt: np.ndarray               # (Hq, Wq) float32, distance to nearest invalid/border quad
+    ids: np.ndarray              # (Hq, Wq) int64, local node id per valid quad else -1
+    node_qi: np.ndarray          # (N,) int64, quad row per node
+    node_qj: np.ndarray          # (N,) int64, quad col per node
+    csr: sp.csr_matrix           # (N, N) directed weighted adjacency among valid quads
+    n: int
+
+
+def build_patch_graph(patch, medial_weight):
+    """Build (and weight) the quad-grid graph for one patch.
+
+    Nodes are valid quads (cells with four valid corners); the node's position
+    in patch (i, j) space is the quad centre (qi + 0.5, qj + 0.5). Directed edge
+    u -> v carries weight ``base_len * (1 + medial_weight / max(dt_v, 1))`` where
+    base_len is 1 (orthogonal) or sqrt(2) (diagonal): steps into shallow,
+    near-the-boundary quads cost more, so shortest paths drift to the middle.
     """
-    if explicit_path:
-        return os.path.abspath(os.path.expanduser(explicit_path))
+    vq = patch.valid_quad_mask.detach().cpu().numpy()
+    hq, wq = vq.shape
 
-    patches_dir = os.path.abspath(os.path.expanduser(patches_dir))
-    inferred = os.path.join(os.path.dirname(patches_dir), 'umbilicus.json')
-    if os.path.exists(inferred):
-        return inferred
+    # Distance transform of the valid-quad region; pad with a False border so
+    # quads at the very edge of the grid are correctly treated as boundary.
+    padded = np.pad(vq, 1, mode='constant', constant_values=False)
+    dt = distance_transform_edt(padded)[1:-1, 1:-1].astype(np.float32)
 
-    default_dataset_path = getattr(fs, 'dataset_path', None)
-    if default_dataset_path:
-        default_path = os.path.join(os.path.expanduser(default_dataset_path), 'umbilicus.json')
-        if os.path.exists(default_path):
-            return os.path.abspath(default_path)
+    n = int(vq.sum())
+    ids = np.full((hq, wq), -1, dtype=np.int64)
+    ids[vq] = np.arange(n)
+    node_qi, node_qj = (a.astype(np.int64) for a in np.nonzero(vq))
 
-    raise SystemExit(
-        f'could not find umbilicus.json next to --patches-dir ({inferred}); '
-        'pass --umbilicus /path/to/umbilicus.json'
-    )
+    rows, cols, data = [], [], []
+    for di, dj in _DIRS8:
+        base = float(np.hypot(di, dj))
+        si0, si1 = max(0, -di), hq - max(0, di)
+        sj0, sj1 = max(0, -dj), wq - max(0, dj)
+        if si1 <= si0 or sj1 <= sj0:
+            continue
+        src = vq[si0:si1, sj0:sj1]
+        dst = vq[si0 + di:si1 + di, sj0 + dj:sj1 + dj]
+        both = src & dst
+        if not both.any():
+            continue
+        su = ids[si0:si1, sj0:sj1][both]
+        sv = ids[si0 + di:si1 + di, sj0 + dj:sj1 + dj][both]
+        dtv = dt[si0 + di:si1 + di, sj0 + dj:sj1 + dj][both]
+        w = base * (1.0 + medial_weight / np.maximum(dtv, 1.0))
+        rows.append(su)
+        cols.append(sv)
+        data.append(w.astype(np.float64))
 
-
-def resolve_fibers_path(patches_dir, fibers_flag):
-    """Resolve the fibers directory for --fibers.
-
-    --fibers may be given a path (used verbatim), or passed as a bare flag with no
-    value (sentinel ''), in which case we infer the dataset's `fibers/` dir next to
-    --patches-dir. Returns None when fibers are not requested."""
-    if fibers_flag is None:
-        return None
-    if fibers_flag:
-        path = os.path.abspath(os.path.expanduser(fibers_flag))
+    if rows:
+        rows = np.concatenate(rows)
+        cols = np.concatenate(cols)
+        data = np.concatenate(data)
     else:
-        path = os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(patches_dir))), 'fibers')
-    if not os.path.isdir(path):
-        raise SystemExit(f'--fibers directory not found: {path}')
+        rows = cols = np.empty(0, dtype=np.int64)
+        data = np.empty(0, dtype=np.float64)
+    csr = sp.coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
+
+    return PatchGraph(patch, vq, dt, ids, node_qi, node_qj, csr, n)
+
+
+def _reconstruct(pred, start, end):
+    """Walk scipy's predecessor array back from ``end`` to ``start``."""
+    if end == start:
+        return [start]
+    path = [end]
+    cur = end
+    while True:
+        p = int(pred[cur])
+        if p < 0:  # -9999 == no predecessor (unreachable)
+            return None
+        path.append(p)
+        if p == start:
+            break
+        cur = p
+    path.reverse()
     return path
 
 
@@ -177,26 +230,40 @@ def _to_py(x):
     return x
 
 
-def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path,
-                     fibers_path=None):
-    """Build the explicit FitConfig / ScrollSpec / SpiralInputPaths pointing
-    fit_spiral's loaders at the user-supplied patches/pcls/filter-z-range so
-    they behave identically to a fit.
+def build_fit_inputs(checkpoint, object_store, volume_uuid, filter_z_begin, filter_z_end,
+                     umbilicus_path, use_fibers=False):
+    """Build the explicit FitConfig / ScrollSpec / SpiralInputPaths that make
+    fit_spiral read patches and point collections from ``object_store`` over
+    the filtering z-range, so they behave identically to a fit.
+
+    The store is read as it is (no link refresh, read-only), with the
+    checkpoint's object selection unless its configuration predates one.
     Returns (fit_config, scroll, paths, model_z_begin, model_z_end); the model
     z-range shapes the transform's flow field independently of the filtering
     z-range."""
-    from fit_session import PclInputSpec, ScrollSpec, SpiralInputPaths
+    from fit_session import ScrollSpec, SpiralInputPaths
 
     cfg = fs.Config().as_dict()
-    cfg.update(checkpoint['cfg'])
+    # Keys the schema no longer has (an older checkpoint) are ignored.
+    cfg.update({key: value for key, value in checkpoint['cfg'].items() if key in cfg})
+    cfg['object_store_path'] = object_store
+    cfg['object_store_refresh_links'] = False
+    cfg['object_store_allow_changed_inputs'] = True
+    if volume_uuid is not None:
+        cfg['fit_volume_uuid'] = volume_uuid
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
     cfg['input_disable_patches'] = False
+    cfg['input_use_verified_patches'] = True
+    for role in ('absolute', 'relative', 'same_winding'):
+        cfg[f'input_use_pcl_{role}'] = True
+    # Fibers are same-winding annotations: they classify as 'neither' pcls
+    # (delta-0 cross-patch edges), exactly like same-winding collections.
+    cfg['input_use_fibers'] = bool(use_fibers)
     # We compute no shell losses; zero the weight so the context's
     # shell_losses_enabled() gate stops load_host_inputs() from loading the
-    # shell (replacing the old fs.shell_losses_enabled = lambda: False
-    # override). Nothing else in the host-loading path reads this weight.
+    # shell. Nothing else in the host-loading path reads this weight.
     cfg['loss_weight_shell_outer'] = 0.0
     # The filtering z-range is the optimisation window this analysis uses.
     cfg['z_begin'] = int(filter_z_begin)
@@ -209,18 +276,8 @@ def build_fit_inputs(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_
     )
     # This analysis needs no scroll volume, track store, or outer shell:
     # leaving those paths empty keeps load_host_inputs() from touching the
-    # training-only inputs. Legacy role-less PCL specs (role=None) retain the
-    # historical abs_winding.json basename inference.
-    # Fibers are same-winding annotations: when loaded they classify as 'neither'
-    # pcls (delta-0 cross-patch edges), exactly like same_windings.json. Off
-    # unless a fibers dir is passed.
-    paths = SpiralInputPaths(
-        umbilicus=umbilicus_path,
-        pcls=tuple(PclInputSpec(path=str(path), role=None)
-                   for path in pcl_paths),
-        fibers=fibers_path or '',
-        verified_patches=patches_dir,
-    )
+    # training-only inputs.
+    paths = SpiralInputPaths(umbilicus=umbilicus_path)
     return fit_config, scroll, paths, int(checkpoint['z_begin']), int(checkpoint['z_end'])
 
 
@@ -304,7 +361,7 @@ def _valid_quad_path_centres(graph, start_node, end_node):
         _dist, pred = csgraph_dijkstra(graph.csr, directed=True, indices=start_node,
                                        return_predecessors=True)
         graph._dij_cache[start_node] = pred
-    path = cop._reconstruct(pred, start_node, end_node)
+    path = _reconstruct(pred, start_node, end_node)
     if path is None:
         return None
     return [(graph.node_qi[k] + 0.5, graph.node_qj[k] + 0.5) for k in path]
@@ -331,7 +388,7 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
     fringe-avoiding path through valid quads only.
 
     Routes from `from_ij` to `to_ij` via a weighted Dijkstra on the patch's
-    valid-quad grid (connect_overlapping_patches' medial-axis weighting, so the
+    valid-quad grid (build_patch_graph's medial-axis weighting, so the
     path hugs the middle of valid strips), splices the true endpoints onto the
     path's ends, samples the polyline at <= `step_size` (grid/vertex units),
     transforms to spiral space, counts theta=0 seam crossings and returns the
@@ -493,6 +550,7 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     used, so the edge set stays a chain through the pcl's points; more distant
     patches are reached transitively by BFS."""
     adjacency = {}
+    views = {}
     for pid, pcl in cross_patch_pcls.items():
         kind = classify_pcl(pcl)
         if kind == 'absolute':
@@ -503,7 +561,10 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
             return (on_patch is not None and on_patch['id'] in patches
                     and np.isfinite(float(p['winding_annotation'])))
 
-        tour = list(pcl['chain'].iter_chain())
+        # A fiber point touching several patches lists them in 'attachments';
+        # walk it once per attachment, so its patches join by delta-0 edges.
+        tour = [view for p in pcl['chain'].iter_chain()
+                for view in _attachment_views(p, views)]
         tour_adjustments = _tour_unwrap_adjustments(
             transform, dr, [_strip_end_zyx(patches, p) if attached(p) else p['zyx'] for p in tour])
         attached_tour = [(k, p) for k, p in enumerate(tour) if attached(p)]
@@ -555,6 +616,22 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
                 'pcl_branch_delta': -branch_delta,
             })
     return adjacency
+
+
+def _attachment_views(point, cache):
+    """``point`` once per patch attachment, as dicts with one ``on_patch``.
+
+    Points with a single attachment already carry it as ``on_patch`` and are
+    returned as they are; views of a multi-attachment point are cached by the
+    point's identity so repeated chain visits yield the same view objects.
+    """
+    if 'attachments' not in point:
+        return [point]
+    key = id(point)
+    if key not in cache:
+        cache[key] = [{**point, 'on_patch': attachment}
+                      for attachment in point['attachments']] or [point]
+    return cache[key]
 
 
 def build_loop_cycles(loops, tree_edge_by_child, strip_delta_fn):
@@ -909,20 +986,21 @@ def parse_z_range(z_range):
 @click.command()
 @click.option('--checkpoint', required=True, type=click.Path(exists=True, dir_okay=False),
               help='Path to a checkpoint_*.ckpt saved by fit_spiral.')
-@click.option('--patches-dir', required=True, type=click.Path(exists=True, file_okay=False),
-              help='Directory of patch tifxyz folders (the full set, for attachment).')
-@click.option('--umbilicus', default=None, type=click.Path(exists=True, dir_okay=False),
-              help='Path to umbilicus.json. Defaults to umbilicus.json next to --patches-dir.')
-@click.option('--fibers', 'fibers_flag', is_flag=False, flag_value='', default=None,
-              help='Include fibers as same-winding (delta-0) edges, like same_windings.json. '
-                   'Pass a directory, or use the bare flag to infer the dataset\'s fibers/ dir '
-                   'next to --patches-dir. Fibers add same-winding constraints (participating in '
-                   'loop/holonomy detection) but contribute no winding votes.')
-@click.option('--patch-id', required=True, help='Folder name (within --patches-dir) of the seed patch to debug.')
-@click.option('--pcl', 'pcl_paths', required=True, multiple=True, type=click.Path(exists=True, dir_okay=False),
-              help='Point-collection json file(s). Repeat --pcl for several. Both absolute- and '
-                   'relative-winding pcls are used (absolute supply votes, relative supply the '
-                   'long-range graph edges).')
+@click.option('--object-store', required=True, type=click.Path(exists=True),
+              help='Object store holding the patches, point collections and fibers, with their '
+                   'links to patches. Read as it is (no link refresh), with the checkpoint\'s '
+                   'object selection. Absolute PCLs supply votes, relative ones the long-range '
+                   'graph edges.')
+@click.option('--volume', 'volume_uuid', default=None,
+              help='Reference volume UUID; default: the checkpoint\'s, else inferred from the '
+                   'selected objects.')
+@click.option('--umbilicus', required=True, type=click.Path(exists=True, dir_okay=False),
+              help='Path to the dataset\'s umbilicus.json (checkpoints do not carry it).')
+@click.option('--fibers/--no-fibers', default=False,
+              help='Include fibers as same-winding (delta-0) edges, like same-winding PCLs. '
+                   'Fibers add same-winding constraints (participating in loop/holonomy '
+                   'detection) but contribute no winding votes.')
+@click.option('--patch-id', required=True, help='Object-store UUID of the seed patch to debug.')
 @click.option('--z-range', required=True,
               help='Patch/pcl filtering z-range as "zlo,zhi". Must lie within the checkpoint z-range.')
 @click.option('--step-size', default=1.0, type=float,
@@ -931,8 +1009,7 @@ def parse_z_range(z_range):
 @click.option('--medial-weight', default=4.0, type=float,
               help='How strongly within-patch strips are pulled toward the perpendicular middle of '
                    'valid regions (0 = shortest valid path; larger keeps the path away from '
-                   'valid-region boundaries, where theta is noisy). Same meaning as in '
-                   'connect_overlapping_patches.py.')
+                   'valid-region boundaries, where theta is noisy).')
 @click.option('--max-hops', default=None, type=int,
               help='Maximum number of relative-pcl edges to traverse from the seed patch (BFS depth). '
                    '0 = direct absolute anchors on the seed patch only (original behaviour); '
@@ -968,7 +1045,7 @@ def parse_z_range(z_range):
 @click.option('--plot-output', default=None, type=click.Path(dir_okay=False),
               help='Output image path for --plot (default: winding_votes_<patch>_graph.png next to '
                    'the json). Ignored without --plot.')
-def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z_range, step_size, medial_weight,
+def main(checkpoint, object_store, volume_uuid, umbilicus, fibers, patch_id, z_range, step_size, medial_weight,
          max_hops, detect_loops, min_fix, min_fix_time_limit, max_subgraphs, top_patches_per_subgraph, output,
          plot, plot_output):
     torch.set_grad_enabled(False)
@@ -984,18 +1061,16 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     z_lo_raw, z_hi_raw = parse_z_range(z_range)
     filter_z_begin, filter_z_end = z_lo_raw, z_hi_raw
 
-    umbilicus_path = resolve_umbilicus_path(patches_dir, umbilicus)
+    umbilicus_path = os.path.abspath(umbilicus)
     print(f'using umbilicus {umbilicus_path}')
-
-    fibers_path = resolve_fibers_path(patches_dir, fibers_flag)
-    if fibers_path:
-        print(f'including fibers from {fibers_path} (same-winding edges)')
+    if fibers:
+        print('including fibers (same-winding edges)')
 
     print(f'loading checkpoint {checkpoint}')
     from checkpoint_io import load_checkpoint_cpu
     ckpt = load_checkpoint_cpu(checkpoint)
     fit_config, scroll, input_paths, model_z_begin, model_z_end = build_fit_inputs(
-        ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path, fibers_path
+        ckpt, object_store, volume_uuid, filter_z_begin, filter_z_end, umbilicus_path, fibers
     )
     print(f'checkpoint (model) z-range: [{model_z_begin}, {model_z_end}); '
           f'filtering z-range: [{filter_z_begin}, {filter_z_end})')
@@ -1010,8 +1085,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     context.load_host_inputs()
     patches = context.verified_patches
     # fit_spiral holds the cross-patch pcls as a list; this tool's
-    # vote/edge builders key their reports by pcl id. Per-file collection
-    # ids collide across json files, so key by list position instead.
+    # vote/edge builders key their reports by pcl id, here its list position.
     # Cross-fiber links arrive here as merged 'fibercomp:*' component pcls
     # (load_host_inputs folds link-connected fibers together); build_rel_adjacency
     # walks each component's fiber graph to emit delta-0 edges that hop fibers
@@ -1055,7 +1129,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     # same-winding (delta-0) edges only.
     pcl_summary = []
     for pid, pcl in sorted(cross_patch_pcls.items()):
-        num_attached = sum(1 for p in pcl['points'].values() if 'on_patch' in p)
+        num_attached = sum(len(point_attachments(p)) for p in pcl['points'].values())
         pcl_summary.append({
             'id': int(pid),
             'name': pcl.get('name'),
@@ -1080,7 +1154,7 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
     def graph_for(pid):
         g = graph_cache.get(pid)
         if g is None:
-            g = cop.build_patch_graph(patches[pid], medial_weight)
+            g = build_patch_graph(patches[pid], medial_weight)
             g._dij_cache = {}
             graph_cache[pid] = g
         return g
@@ -1358,10 +1432,11 @@ def main(checkpoint, patches_dir, umbilicus, fibers_flag, patch_id, pcl_paths, z
 
     out = {
         'checkpoint': os.path.abspath(checkpoint),
-        'patches_dir': os.path.abspath(patches_dir),
+        'object_store': os.path.abspath(object_store),
+        'volume_uuid': context.object_store_inputs.snapshot.volume_uuid,
+        'fibers': bool(fibers),
         'umbilicus': os.path.abspath(umbilicus_path),
         'patch_id': patch_id,
-        'pcl_paths': [os.path.abspath(p) for p in pcl_paths],
         'model_z_range': [model_z_begin, model_z_end],
         'filter_z_range': [filter_z_begin, filter_z_end],
         'step_size': step_size,

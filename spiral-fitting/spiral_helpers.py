@@ -1,6 +1,3 @@
-import concurrent.futures
-import json
-import glob
 import os
 import time
 
@@ -12,18 +9,7 @@ from tqdm import tqdm
 from devices import float_hi, scatter_reduce_
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from surface_orientation import GridLayout, export_metadata
-from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
-                    save_combined_tifxyz)
-from vc3d_fiber_format_adapter import (
-    parse_vc3d_fiber_format,
-)
-
-
-def scale_patch(patch, downsample_factor):
-    patch.scale *= downsample_factor
-    patch.zyxs /= downsample_factor
-    patch.area /= downsample_factor ** 2
-    patch.release_derived_caches()
+from tifxyz import save_tifxyz, save_combined_tifxyz
 
 
 def patch_intersects_z_roi(patch, z_begin, z_end):
@@ -88,40 +74,6 @@ def prepare_patch_for_fit(patch, z_begin, z_end, erode_cells_default):
         return 'z ROI after erosion'
     patch.release_derived_caches()
     return None
-
-
-def load_patch_payload_chunk(path, entries, z_begin, z_end,
-                             erode_cells_default, io_threads=1):
-    """Load, erode, and z-filter a chunk of patch directories.
-
-    Runs inside patch-loader worker processes (must stay a picklable
-    module-level function). Returns one (entry, payload, error, drop_reason)
-    tuple per entry, where payload is patch_to_payload() output for kept
-    patches and exactly one of payload/error/drop_reason is set otherwise.
-    io_threads > 1 overlaps per-file latency (e.g. NFS round trips) within
-    the chunk; the per-entry work itself is unchanged and per-entry results
-    stay in a fixed order, so the outcome is identical either way.
-    """
-    def load_one(entry):
-        segment_path = os.path.join(path, entry)
-        try:
-            patch = load_tifxyz(segment_path, z_range=(z_begin, z_end))
-            if patch is None:
-                return entry, None, None, 'z ROI prefilter'
-            reason = prepare_patch_for_fit(
-                patch, z_begin, z_end, erode_cells_default)
-            if reason is not None:
-                return entry, None, None, reason
-            return entry, patch_to_payload(patch), None, None
-        except Exception as error:
-            return entry, None, str(error), None
-
-    if io_threads <= 1 or len(entries) <= 1:
-        return [load_one(entry) for entry in entries]
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(io_threads, len(entries)),
-            thread_name_prefix='patch-io') as executor:
-        return list(executor.map(load_one, entries))
 
 
 def scale_counts_for_z_range(
@@ -210,144 +162,6 @@ def fiber_control_span(control_xyz, line_xyz):
     return control_xyz, 0, np.arange(num_control_points)
 
 
-def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0, *, base_shape_zyx=None):
-    # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points and
-    # line_points are x/y/z coordinates at 4x the scale used by the regular PCL
-    # JSONs unless coordinate_base_shape_zyx declares their domain. line_points
-    # is the dense traced polyline; the control points lie exactly on it, and the tracer extends it ~150 points past the first and
-    # last control point. We fit against the dense polyline, trimmed to the
-    # first-to-last control point span so the dangling ends don't act as
-    # constraints.
-    with open(path, 'r') as f:
-        data = json.load(f)
-
-    source_shape = data.get('coordinate_base_shape_zyx')
-    if source_shape is not None:
-        for name, shape in (('coordinate_base_shape_zyx', source_shape),
-                            ('base_shape_zyx', base_shape_zyx)):
-            if (not isinstance(shape, (list, tuple)) or len(shape) != 3
-                    or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
-                           or v <= 0 for v in shape)):
-                raise ValueError(f'{name} must contain three positive integers')
-        # Match VC3D's published domains: pyramids may round extents up or
-        # down, and same-level shapes may use inclusive maximum coordinates.
-        # Use the dyadic scale, not a ratio of rounded dimensions.
-        scales = []
-        for exponent in range(-5, 6):
-            factor = 2 ** abs(exponent)
-            large, small = ((source_shape, base_shape_zyx) if exponent <= 0
-                            else (base_shape_zyx, source_shape))
-            if all((abs(a - b) <= 1 if exponent == 0 else
-                    b in ((a + factor - 1) // factor, max(1, a // factor)))
-                   for a, b in zip(large, small)):
-                scales.append(2.0 ** exponent)
-        if len(scales) != 1:
-            raise ValueError('Fiber and dataset coordinate domains are incompatible or ambiguous')
-        coordinate_scale = scales[0]
-
-    if data.get('version', 1) == 1 and not data.get('control_points'):
-        print(f'WARNING: fiber {path} has no control_points; skipping')
-        return None
-    parsed = parse_vc3d_fiber_format(data, path=path)
-
-    control_xyz = np.asarray(parsed.control_points_xyz, dtype=np.float32)
-    if control_xyz.ndim != 2 or control_xyz.shape[1] != 3:
-        print(f'WARNING: fiber {path} control points have shape {control_xyz.shape}; expected (N, 3); skipping')
-        return None
-    num_control_points = len(control_xyz)
-
-    line_xyz = np.asarray(parsed.line_points_xyz, dtype=np.float32)
-    points_xyz, span_begin, control_line_indices = fiber_control_span(
-        control_xyz, line_xyz)
-    control_line_indices = control_line_indices - span_begin
-
-    points_xyz = points_xyz * coordinate_scale
-    original_num_points = len(points_xyz)
-    # Force-keep this fiber's link endpoint control points through decimation so
-    # cross-fiber links (which reference control_point indices) resolve to the
-    # exact point rather than a surviving neighbour.
-    link_endpoint_indices = set()
-    for br in (data.get('branches') or []):
-        control_index = int(br.get('control_point_index', -1))
-        if 0 <= control_index < num_control_points:
-            link_endpoint_indices.add(int(control_line_indices[control_index]))
-    # Keep the surviving points' pre-decimation (trimmed line) indices so
-    # cross-fiber links resolve exactly after decimation.
-    points_xyz, kept_orig_indices = _decimate_ordered_points_min_spacing(
-        points_xyz, min_point_spacing, return_indices=True,
-        force_keep=link_endpoint_indices)
-    name = data.get('name') or os.path.splitext(os.path.basename(path))[0]
-    thing = data.get('webknossos', {}).get('thing', {})
-    wk_color = thing.get('color', {})
-    color = [
-        float(wk_color.get('r', 0.0)),
-        float(wk_color.get('g', 0.0)),
-        float(wk_color.get('b', 0.0)),
-    ]
-
-    collection = {
-        'id': collection_id,
-        'name': name,
-        'points': {},
-        'metadata': {
-            'source_format': data.get('type', 'vc3d_fiber'),
-            'fiber_version': parsed.version,
-            'fiber_generation': parsed.generation,
-            'fiber_sequence': data.get('sequence'),
-            'fiber_started_at': data.get('started_at'),
-            'fiber_tags': data.get('tags', []),
-            'hv_classification': data.get('hv_classification', {}),
-            'input_coordinate_scale': coordinate_scale,
-            'pcl_fiber_min_point_spacing': min_point_spacing,
-            'fiber_original_num_points': original_num_points,
-            'fiber_num_control_points': num_control_points,
-        },
-        'color': color,
-    }
-    # Two-step index mapping for cross-fiber links (which reference control_point
-    # indices): control_line_indices maps a control_point index to its trimmed
-    # line-point index, kept_orig_indices maps that to the retained point id
-    # (0..k-1 in kept order, i.e. the position within kept_orig_indices).
-    collection['kept_orig_indices'] = kept_orig_indices
-    collection['control_line_indices'] = control_line_indices
-    for point_id, (p, orig_index) in enumerate(zip(points_xyz, kept_orig_indices)):
-        collection['points'][point_id] = {
-            'id': point_id,
-            'collectionId': collection_id,
-            'p': p.tolist(),
-            'winding_annotation': float('nan'),
-            'creation_time': 0,
-            'orig_index': int(orig_index),
-        }
-
-    # Cross-fiber links ("branches"): each entry connects one of this fiber's
-    # control points to a control point on another fiber (by explicit original
-    # control_point index), expressing a same-winding continuation across the
-    # junction (delta 0). Stored reciprocally in both fibers' JSONs (see VC3D
-    # LineAnnotationController). Resolved to retained point ids downstream via
-    # kept_orig_indices (see resolve_fiber_links).
-    adjacent_branches = data.get('adjacent_branches') or []
-    if adjacent_branches:
-        print(f'WARNING: ignoring {len(adjacent_branches)} adjacent fiber link(s) '
-              f'in {path}: spiral fitting only supports same-winding links')
-    branches = []
-    for br in (data.get('branches') or []):
-        branch_file = br.get('branch_file')
-        local_index = int(br.get('control_point_index', -1))
-        branch_index = int(br.get('branch_control_point_index', -1))
-        if not branch_file or local_index < 0 or branch_index < 0:
-            continue
-        branches.append({
-            'local_index': local_index,
-            'branch_file': os.path.basename(branch_file),
-            'branch_index': branch_index,
-            'pending': bool(br.get('pending', False)),
-        })
-    collection['branches'] = branches
-    collection['file_basename'] = os.path.basename(path)
-    return collection
-
-
 def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
                       min_auto_certainty):
     """Return 'V', 'H', or None for one fiber polyline.
@@ -357,7 +171,7 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
     fallback on the polyline itself: the strip is vertical when its z extent
     covers at least ``min_z_fraction`` of its path length, horizontal when the
     z extent covers at most ``1 - min_z_fraction`` of it, and untagged
-    otherwise. These tags drive radial offsets and patch-side linking.
+    otherwise. These tags drive radial offsets.
     """
     hv = hv_classification if isinstance(hv_classification, dict) else {}
     manual = str(hv.get('manual_tag') or '').strip().upper()
@@ -383,154 +197,6 @@ def classify_fiber_hv(hv_classification, zyxs, *, min_z_fraction,
     if z_fraction <= 1.0 - min_z_fraction:
         return 'H'
     return None
-
-
-def fiber_collection_hv_tag(pcl, *, min_z_fraction, min_auto_certainty):
-    """'V', 'H', or None for a resident fiber collection.
-
-    Applies classify_fiber_hv to the collection's VC3D ``hv_classification``
-    metadata and its id-ordered points (the geometric fallback runs on the
-    load-time decimated polyline rather than the fit strip, so the fallback
-    can differ marginally from the strip's tag). Collections that are not
-    fibers (``metadata.logical_input_kind != 'fiber'``) are untagged.
-    """
-    metadata = pcl.get('metadata') or {}
-    if metadata.get('logical_input_kind') != 'fiber':
-        return None
-    points = pcl.get('points') or {}
-    ordered = sorted(points.items(), key=lambda kv: int(kv[0]))
-    zyxs = np.asarray(
-        [np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float64)
-         for _, point in ordered],
-        dtype=np.float64).reshape(-1, 3)
-    return classify_fiber_hv(
-        metadata.get('hv_classification'), zyxs,
-        min_z_fraction=min_z_fraction,
-        min_auto_certainty=min_auto_certainty)
-
-
-def load_fiber_point_collections(path, next_id, min_point_spacing=20.0, *, base_shape_zyx=None):
-    if not path:
-        return {}, next_id
-    fiber_paths = sorted(glob.glob(os.path.join(path, '*.json')))
-    if not fiber_paths:
-        print(f'no fiber point collections found in {path}')
-        return {}, next_id
-
-    point_collections = {}
-    total_points = 0
-    skipped = 0
-    for fiber_path in fiber_paths:
-        try:
-            pcl = load_fiber_point_collection(
-                fiber_path, next_id, min_point_spacing=min_point_spacing,
-                base_shape_zyx=base_shape_zyx)
-        except Exception as e:
-            print(f'WARNING: failed to load fiber {fiber_path}: {e}')
-            skipped += 1
-            continue
-        if pcl is None:
-            skipped += 1
-            continue
-        pcl['source_file'] = fiber_path
-        point_collections[next_id] = pcl
-        total_points += len(pcl['points'])
-        next_id += 1
-
-    print(
-        f'Loaded {len(point_collections)} fiber point collections '
-        f'({total_points} points, min spacing {min_point_spacing:g} vx) from {path}'
-        + (f'; skipped {skipped}' if skipped else '')
-    )
-    return point_collections, next_id
-
-
-def _point_id_for_orig_index(pcl, orig_index):
-    """Map an original control_point index to the retained point id.
-
-    Fiber collections hold decimated line points, so this is a two-step map:
-    control_point index -> trimmed line-point index (control_line_indices),
-    then to the position of the nearest kept index within kept_orig_indices
-    (exact when that index survived decimation; its nearest surviving
-    neighbour otherwise).
-    """
-    if orig_index < 0:
-        return None
-    control_line = pcl.get('control_line_indices')
-    if control_line is not None and len(control_line):
-        if orig_index >= len(control_line):
-            return None
-        orig_index = int(control_line[orig_index])
-    kept = pcl.get('kept_orig_indices')
-    if kept is None or len(kept) == 0:
-        return None
-    return int(np.argmin(np.abs(np.asarray(kept) - orig_index)))
-
-
-def resolve_fiber_links(point_collections, include_pending=False,
-                        assume_unannotated=False):
-    """Resolve stored branch metadata into concrete point-to-point links.
-
-    Fibers/PCLs carry raw 'branches' (see load_fiber_point_collection), each
-    naming the linked collection by 'branch_file' and the two endpoints by their
-    explicit original control_point indices. We map those indices to retained
-    point ids (via kept_orig_indices) and dedupe the reciprocal entries so each
-    undirected link appears once.
-
-    Returns a list of dicts:
-        {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
-
-    ``assume_unannotated`` is for the canonical fiber catalog: its shared
-    point dictionaries are zero-normalized after their first materialization,
-    but source fiber documents are intrinsically unannotated.
-    """
-    by_basename = {}
-    for cid, pcl in point_collections.items():
-        basename = pcl.get('file_basename')
-        if basename is not None:
-            by_basename.setdefault(basename, cid)
-
-    # Links are same-winding statements between unannotated collections; adjacent
-    # links are intentionally excluded by load_fiber_point_collection because this
-    # resolver has no winding-offset representation. Drop any
-    # link touching an explicitly-annotated collection here, before the component
-    # decomposition, so every consumer of the link graph (the cross-patch merge,
-    # the unattached walk sampling) agrees on membership. Must run before
-    # normalise_pcl_winding_annotations 0-fills unannotated pcls.
-    annotated_cids = set() if assume_unannotated else {
-        cid for cid, pcl in point_collections.items()
-        if any(np.isfinite(p['winding_annotation']) for p in pcl['points'].values())
-    }
-
-    links = []
-    seen = set()
-    for cid, pcl in point_collections.items():
-        for br in pcl.get('branches', []):
-            if br.get('pending') and not include_pending:
-                continue
-            target_cid = by_basename.get(br['branch_file'])
-            if target_cid is None or target_cid == cid:
-                continue
-            if cid in annotated_cids or target_cid in annotated_cids:
-                print(f'WARNING: dropping fiber link {pcl.get("name")} -> '
-                      f'{br["branch_file"]}: links must join unannotated '
-                      f'(same-winding) collections')
-                continue
-            a_point = _point_id_for_orig_index(pcl, br['local_index'])
-            b_point = _point_id_for_orig_index(
-                point_collections[target_cid], br['branch_index'])
-            if a_point is None or b_point is None:
-                continue
-            key = tuple(sorted([(cid, a_point), (target_cid, b_point)]))
-            if key in seen:
-                continue
-            seen.add(key)
-            links.append({
-                'a_coll': cid, 'a_point': a_point,
-                'b_coll': target_cid, 'b_point': b_point,
-                'pending': bool(br.get('pending')),
-            })
-    return links
 
 
 def point_attachments(point):
@@ -826,7 +492,7 @@ def merge_linked_point_collections(point_collections, link_components,
     """Fold link-connected collections into merged cross-patch component pcls.
 
     link_components is the shared decomposition from build_link_components
-    (annotated collections never appear: resolve_fiber_links drops their links).
+    over fiber branch links (fibers carry no winding annotations).
     For each link component, removes the member collections from the cross-patch
     pool and (when the union holds >= 2 attached points) adds one merged pcl
     whose points are the union of all member points, renumbered member-major.
@@ -1793,33 +1459,6 @@ def save_combined_preview(
         base_shape_zyx=base_shape_zyx,
     )
     return manifest
-
-
-def load_patches(patches_path, segment_id_filter=lambda s: True):
-    patches = {}
-    failed_count = 0
-    for entry in sorted(os.listdir(patches_path)):
-        segment_path = os.path.join(patches_path, entry)
-        meta_path = os.path.join(segment_path, 'meta.json')
-        if not os.path.isdir(segment_path) or not os.path.exists(meta_path):
-            continue
-        try:
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-        except Exception as e:
-            print(f'Warning: failed to read {meta_path}: {e}')
-            continue
-        if meta.get('format') != 'tifxyz' or not segment_id_filter(entry):
-            continue
-        try:
-            patches[entry] = load_tifxyz(segment_path)
-        except Exception as e:
-            print(f'Failed to load segment {entry}: {e}')
-            failed_count += 1
-    if not patches:
-        raise RuntimeError('No patches could be loaded')
-    print(f'Loaded {len(patches)} patches, {failed_count} failed')
-    return patches
 
 
 def erode_patch_valid_region(patch, num_cells):

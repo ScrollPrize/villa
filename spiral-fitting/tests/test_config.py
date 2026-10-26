@@ -66,18 +66,15 @@ def test_input_participation_toggles_are_rebuild_scoped_booleans():
     default_off = {
         "input_use_fiber_directions", "input_use_tracks",
     }
-    # The editable point-collection roles (same-winding, relative) have a
-    # live add/replace/delete path, so their toggles apply at a Run boundary;
-    # every other participation toggle is a rebuild.
-    run_boundary = {"input_use_pcl_relative", "input_use_pcl_same_winding"}
+    # Every participation toggle selects frozen object-store inputs, so
+    # each is a rebuild.
     for key in expected:
         assert catalog["defaults"][key] is (key not in default_off)
         assert catalog["schema"]["fields"][key]["type"] == "boolean"
-        assert catalog["schema"]["fields"][key]["runtime_impact"] == (
-            "run_boundary" if key in run_boundary else "new_fit"), key
+        assert catalog["schema"]["fields"][key]["runtime_impact"] == "new_fit", key
         assert catalog["schema"]["fields"][key]["description"]
     assert rebuild_stage(["model_num_flow_stages",
-                          "input_use_pcl_same_winding"]) == "model"
+                          "input_use_pcl_same_winding"]) == "all"
     assert rebuild_stage(["input_use_pcl_absolute"]) == "all"
 
 
@@ -99,7 +96,7 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
         if key.startswith("patch_"):
             expected = (
                 "new_fit"
-                if key in {"patch_erode_patches", "patch_uuid_filter_regex"}
+                if key == "patch_erode_patches"
                 else "run_boundary")
             assert field["runtime_impact"] == expected
         if key.startswith("dense_"):
@@ -135,30 +132,21 @@ def test_interactive_runtime_impacts_match_resident_capabilities():
                    "track_crossing_precompute_max",
                    "track_exclusion_radius",
                })
+    # Settings that shape the frozen object-store inputs (link refresh,
+    # materialization, point views) are a rebuild; these only reweight or
+    # re-target the retained views.
     run_mutable_pcl = {
         "pcl_vertical_fiber_radial_offset_enabled", "pcl_vertical_fiber_radial_offset_voxels",
-        "pcl_link_distance_tolerance", "pcl_link_window_points", "pcl_link_window_min_points",
-        "pcl_fiber_link_side_filter", "pcl_fiber_link_side_margin_voxels", "pcl_fiber_link_model_direction_step",
-
         "pcl_rel_winding_adjacent_patches_only",
         "pcl_stratified_pcl_sampling", "pcl_sampling_weights",
-        "pcl_use_fiber_links", "pcl_use_pending_fiber_links",
-        "pcl_unattached_pcl_min_point_spacing",
-        "pcl_fiber_min_point_spacing",
     }
     for key, field in fields.items():
         if key.startswith("pcl_"):
             expected = "run_boundary" if key in run_mutable_pcl else "new_fit"
             assert field["runtime_impact"] == expected, key
-        # input_ keys are participation gates and a rebuild, except the
-        # editable point-collection roles, whose live add/replace/delete
-        # path lets apply_config load or drop the whole role.
+        # input_ keys are participation gates and a rebuild.
         if key.startswith("input_"):
-            expected = (
-                "run_boundary"
-                if key in {"input_use_pcl_same_winding",
-                           "input_use_pcl_relative"} else "new_fit")
-            assert field["runtime_impact"] == expected, key
+            assert field["runtime_impact"] == "new_fit", key
     assert unaudited_prefixed_keys(fields) == []
 
     # The vertical-fiber radial offset is refilled onto retained strips at a
@@ -201,13 +189,18 @@ def test_no_allowlisted_key_is_named_while_loading_host_inputs():
     # model_flow_bounds_z_margin (the host-side ShellPolarMap) and
     # optimizer_random_seed (the host RNG seeding) would have introduced.
     import fit_spiral
+    import object_store_inputs
 
     context = fit_spiral.FitContext
     source = "".join(inspect.getsource(member) for member in (
         context.load_host_inputs,
-        context._load_patches_from_dir,
+        context._load_object_store_inputs,
+        context._derive_object_store_point_inputs,
         context._prepare_patch_sampling_cache,
         context._rebuild_pcl_sampling_strata,
+        object_store_inputs.load_fit_inputs,
+        object_store_inputs.materialize_from_config,
+        object_store_inputs.derive_point_views,
     ))
     # The positive control: both keys the audit disqualified are named here,
     # so a scan that stops matching fails rather than silently passing.

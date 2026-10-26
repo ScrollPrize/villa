@@ -409,7 +409,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
                          ['first', 'second'])
         self.assertEqual(atlas.patch_ids_for_theta_nodes([10, 999]), [])
 
-    def test_fit_context_gate_excludes_patch_and_writes_source_path(self):
+    def test_fit_context_gate_excludes_patch_and_writes_its_uuid(self):
         from fit_spiral import FitContext, _UnattachedPclStripList
 
         # Construct a 2x2 quad-centre field whose theta values make the
@@ -435,7 +435,6 @@ class DevicePatchAtlasTests(unittest.TestCase):
             _sampling_2d_path=None,
             _sampling_area=4.0,
             area=4.0,
-            _source_path='/inputs/non-liftable-patch.tifxyz',
         )
 
         with tempfile.TemporaryDirectory() as out_path:
@@ -448,17 +447,14 @@ class DevicePatchAtlasTests(unittest.TestCase):
             context.slice_to_spiral_transform = lambda value: value
             context.dist = types.SimpleNamespace(is_main_process=True)
             context.out_path = out_path
-            context.non_liftable_patch_paths = set()
-            context.verified_patches_path = '/inputs'
-            context.verified_patches = {'bad': patch}
+            context.non_liftable_patch_ids = set()
+            context.verified_patches = {'bad-patch-uuid': patch}
             context.verified_patches_list = [patch]
             context.patch_sampling_probabilities = np.ones(1)
             context.num_verified_patches = 1
             context.patch_atlas = self.PatchAtlas(
                 context.verified_patches, device='cpu').materialize()
             context.cross_patch_pcls = []
-            context.regular_pcl_catalog = {}
-            context.fiber_catalog = {}
             context.unattached_pcl_strips = _UnattachedPclStripList()
             context.unattached_component_edges = []
             context.interactive_driver = None
@@ -474,9 +470,7 @@ class DevicePatchAtlasTests(unittest.TestCase):
                     'inconsistent_edges'],
                 0)
             report = Path(out_path, 'non_liftable_patches.txt').read_text()
-            self.assertEqual(
-                report,
-                '/inputs/non-liftable-patch.tifxyz\n')
+            self.assertEqual(report, 'bad-patch-uuid\n')
 
     @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
     def test_sample_patch_batch_carries_pregathered_points(self):
