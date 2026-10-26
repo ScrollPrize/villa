@@ -56,7 +56,12 @@ public:
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
     // Prompts for a .vcobj (and a username unless a non-"anon" one is saved) and attaches it.
-    void attachObjectStore();
+    bool attachObjectStore();
+    // Prompts for a new .vcobj location, creates an empty store there and attaches it.
+    bool createObjectStore();
+    // With no store attached, explains that `purpose` needs one and offers to
+    // create or attach one. True once a store is attached.
+    bool requireObjectStore(const QString& purpose);
     // Author recorded on edits: the saved username, asked for until it is not "anon".
     // Empty means cancelled.
     QString objectStoreAuthor();
@@ -144,7 +149,7 @@ signals:
 
 private:
     // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
-    void attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
+    bool attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
     // remote: a replica of a hosted store.
     struct RecentObjectStore { QString path; bool readOnly{false}; bool remote{false}; };
     std::vector<RecentObjectStore> loadRecentObjectStores() const;

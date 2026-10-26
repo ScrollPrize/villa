@@ -74,6 +74,8 @@ public:
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
     [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
+    // Why a draft cannot start now, ignoring the object store, which the caller
+    // offers to create or attach.
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
     void startLineAnnotationDraft();
 

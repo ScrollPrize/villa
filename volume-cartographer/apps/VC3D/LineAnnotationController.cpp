@@ -2240,7 +2240,12 @@ void LineAnnotationController::setCurrentAtlasDirectory(std::optional<fs::path> 
 
 bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const
 {
-    if (!viewer || !_state || !_viewerManager || !_state->objectStoreSession()->attachment()) {
+    return _state && _state->objectStoreSession()->attachment() && viewerSupportsLaunch(viewer);
+}
+
+bool LineAnnotationController::viewerSupportsLaunch(const CChunkedVolumeViewer* viewer) const
+{
+    if (!viewer || !_state || !_viewerManager) {
         return false;
     }
     auto* surface = viewer->currentSurface();

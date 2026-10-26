@@ -235,6 +235,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachSegmentsAct);
     _objectStoreMenu = new QMenu(QObject::tr("Object &Store"), _fileMenu);
     _fileMenu->addMenu(_objectStoreMenu);
+    _objectStoreMenu->addAction(QObject::tr("New Object Store..."), this, &MenuActionController::createObjectStore);
     _objectStoreMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
     _objectStoreMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [this]() {
         const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Read-only Object Store"),
@@ -2364,24 +2365,67 @@ QString MenuActionController::objectStoreAuthor()
     return name;
 }
 
-void MenuActionController::attachObjectStore()
+bool MenuActionController::attachObjectStore()
 {
     const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Object Store"),
         {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
-    if (path.isEmpty()) return;
+    if (path.isEmpty()) return false;
     const auto author = objectStoreAuthor();
-    if (author.isEmpty()) return;
-    attachObjectStoreAt(path, author, false);
+    if (author.isEmpty()) return false;
+    return attachObjectStoreAt(path, author, false);
 }
 
-void MenuActionController::attachObjectStoreAt(const QString& path, const QString& author, bool readOnly)
+bool MenuActionController::createObjectStore()
+{
+    QString path = QFileDialog::getSaveFileName(_window, QObject::tr("New Object Store"),
+        QDir::home().filePath(QStringLiteral("objects.vcobj")), QObject::tr("Object store (*.vcobj)"),
+        nullptr, QFileDialog::DontConfirmOverwrite);
+    if (path.isEmpty()) return false;
+    if (QFileInfo(path).suffix().isEmpty()) path += QStringLiteral(".vcobj");
+    if (QFileInfo::exists(path)) {
+        QMessageBox::critical(_window, QObject::tr("Cannot create object store"),
+            QObject::tr("%1 already exists. Choose a new file name, or use Attach Object Store to open it.").arg(path));
+        return false;
+    }
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return false;
+    try {
+        vc::objects::OpenOptions options;
+        options.author = author.toStdString();
+        // Closed again at once: the session attaches it like any existing store.
+        vc::objects::ObjectStore::create(path.toStdString(), options);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot create object store"),
+            QString::fromUtf8(error.what()));
+        return false;
+    }
+    return attachObjectStoreAt(path, author, false);
+}
+
+bool MenuActionController::requireObjectStore(const QString& purpose)
+{
+    if (_window->_state->objectStoreSession()->attachment()) return true;
+    QMessageBox box(QMessageBox::Information, QObject::tr("Object Store Required"),
+        QObject::tr("%1 requires an object store, and none is attached.\n\n"
+                    "Create a new empty store (.vcobj), or attach an existing one.").arg(purpose),
+        QMessageBox::Cancel, _window);
+    auto* create = box.addButton(QObject::tr("Create New Store..."), QMessageBox::AcceptRole);
+    auto* attach = box.addButton(QObject::tr("Attach Existing..."), QMessageBox::AcceptRole);
+    box.setDefaultButton(create);
+    box.exec();
+    if (box.clickedButton() == create) return createObjectStore();
+    if (box.clickedButton() == attach) return attachObjectStore();
+    return false;
+}
+
+bool MenuActionController::attachObjectStoreAt(const QString& path, const QString& author, bool readOnly)
 {
     try {
         _window->_state->attachObjectStore(path, author, readOnly);
     } catch (const std::exception& error) {
         QMessageBox::critical(_window, QObject::tr("Cannot attach object store"),
             QString::fromUtf8(error.what()));
-        return;
+        return false;
     }
     // Only writable attachments reveal a hosted replica; a read-only reopen keeps the earlier tag.
     const QString absolute = QFileInfo(path).absoluteFilePath();
@@ -2396,6 +2440,7 @@ void MenuActionController::attachObjectStoreAt(const QString& path, const QStrin
     if (stores.size() > kMaxRecentObjectStores) stores.resize(kMaxRecentObjectStores);
     saveRecentObjectStores(stores);
     refreshRecentObjectStoreMenu();
+    return true;
 }
 
 std::vector<MenuActionController::RecentObjectStore> MenuActionController::loadRecentObjectStores() const

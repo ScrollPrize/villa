@@ -312,6 +312,9 @@ public:
                              QObject* parent = nullptr);
     ~LineAnnotationController() override;
 
+    // Whether a line annotation can start in this viewer, ignoring the object store.
+    bool viewerSupportsLaunch(const CChunkedVolumeViewer* viewer) const;
+    // viewerSupportsLaunch, with an object store attached.
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
