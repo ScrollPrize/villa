@@ -355,10 +355,15 @@ snapshot APIs rather than rebuilding them in the fitter.
    construction from filesystem ingestion without changing behavior. Capture
    fixed-seed reference constraints and losses before removing the old path;
    reuse the extracted helpers in the adapter rather than copying them.
+   Keep attachment and strip-eligibility behavior unchanged in this extraction;
+   introduce the accepted behavior changes in the later materialization steps.
 6. **Fitter: add snapshot input adapter.** Implement UUID/tag selection, aligned
    annotations, relationship filtering, frame conversion and provenance in
    `object_store_inputs.py`. Expose an inspectable constraints-only report without
    training, extending it as the following constraint families are implemented.
+   Resolve selectors before applying any volume filter: filtering by the requested
+   volume first would hide conflicting declarations that must fail validation.
+   Use `revision_read_view` for the closed selection and aligned annotation APIs.
 7. **Fitter: materialize patches and PCL constraints.** Build atlas inputs and
    stable-ID attachments; enforce metadata-based winding roles and preserve
    absolute/relative loss semantics, validity and raw-to-runtime grid mappings.
@@ -366,6 +371,12 @@ snapshot APIs rather than rebuilding them in the fitter.
    endpoints; share physical nodes across attachments, resolve stable branch IDs,
    exclude adjacent branches, and retain strip supervision, physical chain
    ordering and theta seam behavior.
+   Establish raw line/control-to-runtime mappings and consumed anchors before
+   trimming or decimation; the current file loader discards source points too
+   early for this adapter. Replace the single `on_patch` assumption with attachment
+   views sharing physical chain/theta nodes. Expose the existing C++
+   `fiberBranchControlIndex()` helper to Python in a separate store commit before
+   using it here; it is not yet bound.
 9. **Fitter: integrate overlap constraints and sampling.** Turn correspondence
    pairs into same-surface constraints using the existing relative loss and seam
    machinery. Introduce explicit overlap sampling weights and report counts by
