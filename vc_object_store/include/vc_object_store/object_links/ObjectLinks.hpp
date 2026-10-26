@@ -48,9 +48,10 @@ struct LinkCandidate {
 struct DetectorIssue {
     enum class Severity { Failure, Diagnostic };
     Severity severity = Severity::Failure;
-    std::string stage;                    // "load", "discover", "cache", "cancel" or "run"
+    std::string stage;                    // "validate", "load", "discover", "cache", "cancel" or "run"
     std::vector<std::string> objectUuids; // affected objects; empty for the whole run
     std::string reason;
+    std::string message;                 // human-readable context for this issue
     int64_t count = 1;                    // occurrences summarized, e.g. rejected pairs
 };
 
@@ -63,14 +64,12 @@ struct DetectorReport {
     int64_t staleRemoved = 0;        // own pending edges replaced on re-run
     bool committed = false;          // the edge counts above were committed
     std::vector<DetectorIssue> issues;
-    std::vector<std::string> problems; // human-readable text of every issue, in order
 
     bool failed() const;
-    // Record an issue together with its problems text.
-    void add(DetectorIssue issue, const std::string& text);
 };
-// Invalid parameters and coordinate frames throw before any work. Other errors
-// that abort a whole detector also throw; nothing is committed in that case.
+// Invalid parameters throw before any work. Invalid object frames are collected
+// as validation failures; discovery and writes are skipped for the whole run.
+// Other errors that abort a whole detector may throw; nothing is committed then.
 
 // Optional stale-edge scope for a partial detector run. Both endpoints
 // must be in objectUuids; empty sets deliberately remove nothing.

@@ -1,4 +1,7 @@
 """Structured detector outcomes: failures are distinct from ordinary diagnostics."""
+import pytest
+
+from test_coordinate_frames import VOLUME, frame, patch as framed_patch, collection as framed_collection
 from test_object_links import array, plane, put
 
 
@@ -65,3 +68,37 @@ def test_clean_run_reports_no_issues(db):
     report = db.link_patch_overlaps()
     assert report["committed"] and not report["failed"]
     assert report["issues"] == [] and report["problems"] == []
+
+
+@pytest.mark.parametrize("kind,detector", [
+    ("point_collection", "link_point_collections_to_patches"),
+    ("fiber", "link_fibers_to_patches"),
+    ("track", "link_tracks_to_patches"),
+    ("patch", "link_patch_overlaps"),
+])
+def test_frame_preflight_collects_all_failures_without_writes(db, kind, detector):
+    good_patch = framed_patch(db)
+    good_collection = framed_collection(db)
+    kept = detector_edge(db, good_collection, good_patch)
+    # No geometry: frame validation must finish before loading these objects.
+    bad = [db.upsert_object(dict(kind=k, meta={"coordinates": coordinates}))
+           for k, coordinates in ((kind, {}), (kind, frame(volume="other")),
+                                  ("patch", frame(5e-324)))]
+    before = db.journal_since()
+    options = dict(volume_uuid=VOLUME)
+    if kind in ("fiber", "track"):
+        options["ct_volume"] = "/missing-ct"
+    report = getattr(db, detector)(**options)
+    assert report["failed"] and not report["committed"]
+    issues = failures(report)
+    assert sorted(i["object_uuids"][0] for i in issues) == sorted(bad)
+    assert all(i["stage"] == "validate" and i["count"] == 1 for i in issues)
+    assert {i["reason"] for i in issues} == {
+        "unknown geometry coordinate frame",
+        "geometry volume_uuid does not match target volume",
+        "geometry coordinate conversion is not representable",
+    }
+    assert report["problems"] == [f'{i["object_uuids"][0]}: {i["reason"]}' for i in issues]
+    assert report["edges_created"] == report["edges_updated"] == report["stale_removed"] == 0
+    assert db.journal_since() == before
+    assert db.edge(kept)["uuid"] == kept

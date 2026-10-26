@@ -163,3 +163,25 @@ def test_unusable_edges_report_errors_independently(db):
         db.overlap_correspondences([edge["uuid"]], "")
     with pytest.raises(ValueError):
         db.overlap_correspondences([edge["uuid"]], VOLUME, max_pairs=0)
+
+
+@pytest.mark.parametrize("radius,accepted", [(6.0, True), (np.nextafter(6.0, 0.0), False)])
+def test_correspondence_agreement_boundary(db, radius, accepted):
+    patch(db, LOW, flat())
+    patch(db, HIGH, lambda rows, cols: (cols, rows, np.full_like(rows, 26)))
+    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
+    assert report["edges_created"] == 1
+    edge = db.edges_by_kind("same-surface")[0]
+    # Exact pose isolates the distance gate from fitting error: every pair is
+    # six voxels apart. Equality is accepted, a smaller radius rejects it.
+    fit = dict(edge["meta"]["fit"], pose=[1, 0, 0, 0, 1, 0], agreement_radius=float(radius))
+    whole = dict(whole_geometry=True)
+    uid = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="boundary", a_anchor=whole, b_anchor=whole,
+                           meta=dict(edge["meta"], fit=fit)))
+    [result] = db.overlap_correspondences([uid], VOLUME)
+    assert bool(result["pairs"]) == accepted
+    if accepted:
+        assert result["error"] is None
+        assert all(pair["distance"] == 6 for pair in result["pairs"])
+    else:
+        assert result["error"] == "no agreeing correspondences under the stored pose"

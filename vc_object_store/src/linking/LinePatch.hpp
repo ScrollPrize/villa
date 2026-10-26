@@ -22,5 +22,5 @@ void validateLinePatchParams(const LinePatchParams& params, double sourceScale);
 DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel);
+    const std::atomic_bool* cancel, DetectorReport report);
 } // namespace vc::object_links::detail

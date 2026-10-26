@@ -583,27 +583,40 @@ FitResult fitPair(const std::vector<Correspondence>& values, const PatchOverlapP
     return result;
 }
 
-// Dense 3D agreement of one patch against another under a pose mapping
-// target UV -> seed UV: {overlap samples, agreements, total samples}.
+// Dense 3D agreement counts: {overlap samples, agreements, total samples}.
 struct Consistency {
     std::size_t samples = 0, agreements = 0, total = 0;
 };
 
-Consistency overlapConsistency(const LoadedPatch& seed, const LoadedPatch& target, const Pose& targetToSeed,
-                               double agreementRadius)
+// Traverse seed UV -> target UV once, sharing validity and distance gates
+// between detector statistics and materialized correspondences.
+template <class Accept>
+Consistency visitOverlapAgreements(const LoadedPatch& seed, const LoadedPatch& target, const Pose& seedToTarget,
+                                   double agreementRadius, Accept accept)
 {
     Consistency result;
-    const Pose seedToTarget = targetToSeed.inverse();
     const double agreementSq = agreementRadius * agreementRadius;
     for (const auto& sample : seed.samples) {
         ++result.total;
-        const auto other = sampleXyz(target, seedToTarget.apply(sample.uv));
+        const Vec2 uv = seedToTarget.apply(sample.uv);
+        const auto other = sampleXyz(target, uv);
         if (!other) continue;
         ++result.samples;
         const cv::Vec3f d = *other - sample.xyz;
-        if (double(d.dot(d)) <= agreementSq) ++result.agreements;
+        const double distanceSq = double(d.dot(d));
+        if (distanceSq <= agreementSq) {
+            ++result.agreements;
+            accept(sample, uv, *other, distanceSq);
+        }
     }
     return result;
+}
+
+Consistency overlapConsistency(const LoadedPatch& seed, const LoadedPatch& target, const Pose& targetToSeed,
+                               double agreementRadius)
+{
+    return visitOverlapAgreements(seed, target, targetToSeed.inverse(), agreementRadius,
+        [](const SamplePoint&, Vec2, const cv::Vec3f&, double) {});
 }
 
 bool bboxOverlap(const LoadedPatch& a, const LoadedPatch& b, double pad)
@@ -653,7 +666,8 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
 
     detail::StoredGeometry inputs(db);
     const auto objects = inputs.select("patch", params.patchUuids);
-    const auto scales = detail::coordinateScales(objects, params);
+    const auto scales = detail::coordinateScales(objects, params, report);
+    if (report.failed()) return report;
 
     std::vector<LoadedPatch> patches;
     size_t loadedCount = 0;
@@ -824,8 +838,8 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
         const auto objects = inputs.select("patch", {uuid});
         DetectorReport report;
         auto loaded = loadPatch(inputs, objects.front(), loading, report,
-            detail::coordinateScales(objects, loading).at(objects.front().uuid));
-        if (!loaded) throw std::runtime_error(report.problems.empty() ? uuid + ": patch could not be loaded" : report.problems.front());
+            objects::geometryScaleToFrame(Json::parse(objects.front().meta), params.volumeUuid));
+        if (!loaded) throw std::runtime_error(report.issues.empty() ? uuid + ": patch could not be loaded" : report.issues.front().message);
         return patches.emplace(uuid, std::move(*loaded)).first->second;
     };
     std::vector<OverlapCorrespondences> result;
@@ -873,21 +887,16 @@ std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::O
             const Pose pose{values[0], values[1], values[3], values[4], values[2], values[5]};
             const Pose aToB = from == edge->aUuid ? pose : pose.inverse();
             std::vector<OverlapCorrespondence> agreeing;
-            for (const auto& sample : a.samples) {
-                const Vec2 uv = aToB.apply(sample.uv);
-                const auto other = sampleXyz(b, uv);
-                if (!other) continue;
-                const cv::Vec3f delta = *other - sample.xyz;
-                const double distance = std::sqrt(double(delta.dot(delta)));
-                if (distance > agreementRadius) continue;
-                OverlapCorrespondence pair;
-                pair.aGrid = {double(sample.row), double(sample.col)};
-                pair.bGrid = {uv.y * b.scale[1], uv.x * b.scale[0]};
-                pair.aXyz = {sample.xyz[0], sample.xyz[1], sample.xyz[2]};
-                pair.bXyz = {(*other)[0], (*other)[1], (*other)[2]};
-                pair.distance = distance;
-                agreeing.push_back(pair);
-            }
+            visitOverlapAgreements(a, b, aToB, agreementRadius,
+                [&](const SamplePoint& sample, Vec2 uv, const cv::Vec3f& other, double distanceSq) {
+                    OverlapCorrespondence pair;
+                    pair.aGrid = {double(sample.row), double(sample.col)};
+                    pair.bGrid = {uv.y * b.scale[1], uv.x * b.scale[0]};
+                    pair.aXyz = {sample.xyz[0], sample.xyz[1], sample.xyz[2]};
+                    pair.bXyz = {other[0], other[1], other[2]};
+                    pair.distance = std::sqrt(distanceSq);
+                    agreeing.push_back(pair);
+                });
             if (agreeing.empty()) throw std::runtime_error("no agreeing correspondences under the stored pose");
             const auto count = std::min(agreeing.size(), params.maxPairs);
             for (size_t i = 0; i < count; ++i) out.pairs.push_back(agreeing[i * agreeing.size() / count]);

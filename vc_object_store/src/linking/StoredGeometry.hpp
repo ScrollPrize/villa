@@ -29,16 +29,18 @@ DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeom
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
     const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
-// Record a DetectorIssue, keeping each detector's existing problems text. An
+// Record a DetectorIssue with a readable message. An
 // empty object names no object.
 void reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
     const std::string& reason, const std::string& text);
 void reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
     const std::string& reason, const std::string& text, int64_t count = 1);
 // Preflight the complete selection before expensive work or any writes.
+// Collect object frame failures in report; callers must check failed() before
+// using the scales or starting discovery. Invalid caller parameters throw.
 void validateCoordinateParams(const CoordinateParams& params, double explicitScale = 1.0);
 std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
-    const CoordinateParams& params, double explicitScale = 1.0);
+    const CoordinateParams& params, DetectorReport& report, double explicitScale = 1.0);
 nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const CoordinateParams& params);
 std::shared_ptr<PatchGrid> scaledPatchSurface(const std::shared_ptr<PatchGrid>& source, double scale,
     bool scaleParameterization);

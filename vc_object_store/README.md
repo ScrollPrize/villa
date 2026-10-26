@@ -88,20 +88,23 @@ its fixture data.
 
 Detector reports (`DetectorReport`; a dict in Python) separate failures from
 ordinary results. `issues` lists each outcome as `{severity, stage,
-object_uuids, reason, count}`, and `problems` keeps the same issues as text:
+object_uuids, reason, count}` in Python, and `problems` provides their messages:
 
 - `failure`: a selected object could not be loaded or validated (`load`),
   linking an object raised an error (`discover`), the run was cancelled
   (`cancel`), or a whole-run error was caught (`run`). A failed object is left
   out of the run and of stale-edge removal, so its existing edges are unchanged;
-  independent objects still commit.
+  independent objects still commit after successful frame preflight.
 - `diagnostic`: an ordinary result, such as rejected overlap pairs (`count`
   pairs per `reason`), an object too degenerate to link, or an unavailable strip
   cache. Diagnostics alone do not fail a run.
 
 `failed` is true when any issue is a failure, and `committed` says whether the
-reported edge counts were committed. Invalid parameters and coordinate frames,
-including unrepresentable scaled coordinates, still raise before any write.
+reported edge counts were committed. Invalid object frames are collected as
+`validate` failures across all selected input kinds; any such failure skips
+discovery and writes for that detector. Invalid caller parameters still raise.
+The native report stores readable messages on issues; Python derives the
+compatibility `problems` list from those messages.
 `vc_object_links` exits nonzero only for failures, printing them with `!` (to
 stderr) and diagnostics with `-`. Each detector commits on its own; a failure in
 one does not roll back another, and a rerun reconciles pending edges.

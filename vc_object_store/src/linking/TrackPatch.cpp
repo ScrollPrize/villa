@@ -11,7 +11,8 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
     try {
         detail::StoredGeometry inputs(db);
         const auto tracks = inputs.select("track", params.trackUuids);
-        const auto scales = detail::coordinateScales(tracks, params, params.trackScale);
+        DetectorReport validation;
+        const auto scales = detail::coordinateScales(tracks, params, validation, params.trackScale);
         auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
             const auto& object = tracks[index];
             try {
@@ -48,7 +49,7 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
             }
         };
         return detail::linkLinesToPatches(db, inputs, tracks.size(), load, ctVolume,
-            params, params.trackScale, kTrackPatchDetector, 1, cancel);
+            params, params.trackScale, kTrackPatchDetector, 1, cancel, std::move(validation));
     } catch (const std::exception& error) {
         DetectorReport report;
         detail::reportFailure(report, "run", "", error.what(),

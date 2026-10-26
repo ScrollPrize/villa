@@ -755,15 +755,15 @@ void validateLinePatchParams(const LinePatchParams& params, double sourceScale)
 DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
-    const std::atomic_bool* cancel)
+    const std::atomic_bool* cancel, DetectorReport report)
 {
     validateLinePatchParams(params, sourceScale);
     const bool tracks = std::string(detector) == kTrackPatchDetector;
-    DetectorReport report;
     try {
         checkCancelled(cancel);
         const auto objects = inputs.select("patch", params.patchUuids);
-        const auto patchScales = coordinateScales(objects, params, params.patchScale);
+        const auto patchScales = coordinateScales(objects, params, report, params.patchScale);
+        if (report.failed()) return report;
         std::map<std::string, nlohmann::json> patchFrames;
         for (const auto& object : objects) patchFrames[object.uuid] = coordinateProvenance(object, params);
         objects::util::reportProgress(params.progress, "opening normal source");

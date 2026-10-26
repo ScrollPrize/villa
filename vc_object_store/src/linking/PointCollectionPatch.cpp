@@ -170,9 +170,10 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "loading point collections");
     detail::StoredGeometry inputs(db);
-    const auto pointScales = detail::coordinateScales(inputs.select("point_collection", params.collectionUuids), params, params.pointScale);
-    const auto patchScales = detail::coordinateScales(inputs.select("patch", params.patchUuids), params, params.patchScale);
     DetectorReport loading;
+    const auto pointScales = detail::coordinateScales(inputs.select("point_collection", params.collectionUuids), params, loading, params.pointScale);
+    const auto patchScales = detail::coordinateScales(inputs.select("patch", params.patchUuids), params, loading, params.patchScale);
+    if (loading.failed()) return loading;
     auto collections = loadCollections(inputs, params, pointScales, loading, cancel);
     auto patches = loadPatches(inputs, params, patchScales, loading, cancel);
     std::map<std::string, size_t> byName;
@@ -268,7 +269,6 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     report.committed = true;
     report.objectsConsidered = int64_t(collections.size() + patches.size());
     report.issues = std::move(loading.issues);
-    report.problems = std::move(loading.problems);
     return report;
 }
 } // namespace vc::object_links

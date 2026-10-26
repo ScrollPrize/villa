@@ -97,8 +97,9 @@ def test_frame_provenance_and_preflight_no_writes(db):
     c = collection(db, 4)
     db.set_meta(c, "coordinates", {})
     before = db.journal_since()
-    with pytest.raises(ValueError, match="unknown"):
-        db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    report = db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    assert report["failed"] and not report["committed"]
+    assert "unknown" in report["issues"][0]["reason"]
     assert db.journal_since() == before
     # A missing frame is declared on the object itself, not per detector run.
     db.set_meta(c, "coordinates", frame(4))
@@ -150,8 +151,9 @@ def test_mixed_patch_overlap_parameterization_and_scope(db):
     assert len(db.edges_of(c)) == 2
     db.set_meta(b, "coordinates", frame(volume="other"))
     before = db.journal_since()
-    with pytest.raises(ValueError, match="does not match"):
-        db.link_patch_overlaps(volume_uuid=VOLUME)
+    report = db.link_patch_overlaps(volume_uuid=VOLUME)
+    assert report["failed"] and not report["committed"]
+    assert "does not match" in report["issues"][0]["reason"]
     assert db.journal_since() == before
 
 
@@ -167,8 +169,9 @@ def test_fiber_frame_preflight_precedes_ct_open(db):
     uid = fiber(db, 2)
     db.set_meta(uid, "coordinates", {})
     before = db.journal_since()
-    with pytest.raises(ValueError, match="unknown"):
-        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME)
+    report = db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME)
+    assert report["failed"] and not report["committed"]
+    assert "unknown" in report["issues"][0]["reason"]
     with pytest.raises(ValueError, match="identity"):
         db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME, fiber_scale=2)
     with pytest.raises(ValueError, match="working_to_base_scale"):

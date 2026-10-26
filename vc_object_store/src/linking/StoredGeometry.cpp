@@ -23,7 +23,7 @@ nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const C
     return {{"coordinates", objects::resolveGeometryCoordinates(nlohmann::json::parse(object.meta), *params.volumeUuid)}};
 }
 std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
-    const CoordinateParams& params, double explicitScale)
+    const CoordinateParams& params, DetectorReport& report, double explicitScale)
 {
     validateCoordinateParams(params, explicitScale);
     std::map<std::string, double> result;
@@ -33,7 +33,7 @@ std::map<std::string, double> coordinateScales(const std::vector<objects::Object
                 ? vc::objects::geometryScaleToFrame(coordinateProvenance(object, params), *params.volumeUuid)
                 : explicitScale;
         } catch (const std::exception& e) {
-            throw std::invalid_argument(object.uuid + ": " + e.what());
+            reportFailure(report, "validate", object.uuid, e.what(), object.uuid + ": " + e.what());
         }
     }
     return result;

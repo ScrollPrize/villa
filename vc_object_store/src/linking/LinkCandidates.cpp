@@ -46,24 +46,18 @@ bool DetectorReport::failed() const
         [](const DetectorIssue& issue) { return issue.severity == DetectorIssue::Severity::Failure; });
 }
 
-void DetectorReport::add(DetectorIssue issue, const std::string& text)
-{
-    issues.push_back(std::move(issue));
-    problems.push_back(text);
-}
-
 void detail::reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
     const std::string& reason, const std::string& text)
 {
-    report.add({DetectorIssue::Severity::Failure, stage,
-        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason}, text);
+    report.issues.push_back({DetectorIssue::Severity::Failure, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text});
 }
 
 void detail::reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
     const std::string& reason, const std::string& text, int64_t count)
 {
-    report.add({DetectorIssue::Severity::Diagnostic, stage,
-        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, count}, text);
+    report.issues.push_back({DetectorIssue::Severity::Diagnostic, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, text, count});
 }
 
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,

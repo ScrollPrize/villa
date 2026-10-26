@@ -187,9 +187,9 @@ try {
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed"
                   << (report.committed ? "" : " (nothing committed)") << "\n";
-        for (size_t i = 0; i < report.issues.size(); ++i) {
-            const bool failure = report.issues[i].severity == vc::object_links::DetectorIssue::Severity::Failure;
-            (failure ? std::cerr : std::cout) << (failure ? "  ! " : "  - ") << report.problems[i] << "\n";
+        for (const auto& issue : report.issues) {
+            const bool failure = issue.severity == vc::object_links::DetectorIssue::Severity::Failure;
+            (failure ? std::cerr : std::cout) << (failure ? "  ! " : "  - ") << issue.message << "\n";
         }
     };
     using namespace vc::object_links;

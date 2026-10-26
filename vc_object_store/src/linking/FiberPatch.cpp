@@ -80,7 +80,8 @@ DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesyst
     detail::validateLinePatchParams(params, params.fiberScale);
     detail::StoredGeometry inputs(db);
     const auto fibers = inputs.select("fiber", params.fiberUuids);
-    const auto scales = detail::coordinateScales(fibers, params, params.fiberScale);
+    DetectorReport validation;
+    const auto scales = detail::coordinateScales(fibers, params, validation, params.fiberScale);
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
         auto fiber = loadFiber(inputs, fibers[index], scales.at(fibers[index].uuid), report);
         if (fiber && !params.cacheDirectory.empty()) {
@@ -90,6 +91,6 @@ DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesyst
         return fiber;
     };
     return detail::linkLinesToPatches(db, inputs, fibers.size(), load, ctVolume,
-        params, params.fiberScale, kFiberPatchDetector, 3, cancel);
+        params, params.fiberScale, kFiberPatchDetector, 3, cancel, std::move(validation));
 }
 } // namespace vc::object_links
