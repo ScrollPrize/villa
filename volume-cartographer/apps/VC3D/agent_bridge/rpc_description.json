@@ -1,185 +1,5 @@
 {
   "methods": {
-    "atlas.open": {
-      "errors": [
-        -32602,
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "paramRenames": {
-          "atlasDir": "atlas_dir"
-        },
-        "tool": "vc3d_atlas_open"
-      },
-      "params": {
-        "properties": {
-          "atlasDir": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "atlasDir"
-        ],
-        "type": "object"
-      }
-    },
-    "atlas.open_result": {
-      "errors": [
-        -32602,
-        -32007,
-        -32005,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_open_result"
-      },
-      "params": {
-        "properties": {
-          "index": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "index"
-        ],
-        "type": "object"
-      }
-    },
-    "atlas.optimize_snap_candidates": {
-      "errors": [
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_optimize_snap_candidates"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.remap": {
-      "errors": [
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_remap"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.search_cancel": {
-      "errors": [
-        -32007
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_search_cancel"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "atlas.search_results": {
-      "errors": [
-        -32602,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_atlas_search_results"
-      },
-      "params": {
-        "properties": {
-          "limit": {
-            "default": 100,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "offset": {
-            "default": 0,
-            "maximum": 2147483647,
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      }
-    },
-    "atlas.search_start": {
-      "errors": [
-        -32602,
-        -32004,
-        -32007,
-        -32005,
-        -32000
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "excludedTags": "excluded_tags",
-          "maxDistance": "max_distance",
-          "requiredTags": "required_tags"
-        },
-        "tool": "vc3d_atlas_search_start"
-      },
-      "params": {
-        "properties": {
-          "excludedTags": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
-          "maxDistance": {
-            "minimum": 0,
-            "type": "number"
-          },
-          "mode": {
-            "default": "atlas_to_non_atlas",
-            "enum": [
-              "atlas_to_non_atlas",
-              "non_atlas_only"
-            ],
-            "type": "string"
-          },
-          "requiredTags": {
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      }
-    },
-    "atlas.status": {
-      "errors": [],
-      "mcp": {
-        "tool": "vc3d_atlas_status"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
     "canvas.click": {
       "errors": [
         -32602,
@@ -592,35 +412,6 @@
         },
         "required": [
           "sampleId"
-        ],
-        "type": "object"
-      }
-    },
-    "fiber.create_atlas": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32007,
-        -32005
-      ],
-      "mcp": {
-        "paramRenames": {
-          "fiberId": "fiber_id"
-        },
-        "tool": "vc3d_fiber_create_atlas"
-      },
-      "params": {
-        "properties": {
-          "fiberId": {
-            "type": [
-              "string",
-              "integer"
-            ]
-          }
-        },
-        "required": [
-          "fiberId"
         ],
         "type": "object"
       }
@@ -1268,29 +1059,20 @@
           "wait"
         ],
         "paramRenames": {
-          "atlasPath": "atlas_path",
-          "configPath": "config_path",
-          "initShellDir": "init_shell_dir"
+          "configPath": "config_path"
         },
         "tool": "vc3d_lasagna_start_optimization"
       },
       "params": {
         "properties": {
-          "atlasPath": {
-            "type": "string"
-          },
           "configPath": {
-            "type": "string"
-          },
-          "initShellDir": {
             "type": "string"
           },
           "mode": {
             "enum": [
               "reoptimize",
               "new_model",
-              "offset",
-              "atlas"
+              "offset"
             ],
             "type": "string"
           },

@@ -81,7 +81,6 @@ private:
     void registerWrapHandlers();
     void registerJobHandlers();
     void registerLasagnaHandlers();
-    void registerAtlasHandlers();
     void registerFiberHandlers();
     void registerPointsHandlers();
     void registerSeedingHandlers();
@@ -220,15 +219,6 @@ private:
     QJsonObject handleLasagnaSelectOutputSegment(const QJsonValue& params);
     QJsonObject handleLasagnaRepeatLast(const QJsonValue& params);
     QJsonObject handleWorkspaceSwitch(const QJsonValue& params);
-    // Atlas RPCs.
-    QJsonObject handleAtlasOpen(const QJsonValue& params);
-    QJsonObject handleAtlasStatus(const QJsonValue& params);
-    QJsonObject handleAtlasSearchStart(const QJsonValue& params);
-    QJsonObject handleAtlasSearchCancel(const QJsonValue& params);
-    QJsonObject handleAtlasSearchResults(const QJsonValue& params);
-    QJsonObject handleAtlasOpenResult(const QJsonValue& params);
-    QJsonObject handleAtlasRemap(const QJsonValue& params);
-    QJsonObject handleAtlasOptimizeSnapCandidates(const QJsonValue& params);
     // Line-annotation / fiber RPCs. fiberController() requires an
     // open volume package (-32000) and a live LineAnnotationController
     // (-32010); requireKnownFiber throws -32007 kind:"fiber" for an unknown
@@ -242,7 +232,6 @@ private:
     QJsonObject handleFiberSave(const QJsonValue& params);
     QJsonObject handleFiberDelete(const QJsonValue& params);
     QJsonObject handleFiberSetTag(const QJsonValue& params);
-    QJsonObject handleFiberCreateAtlas(const QJsonValue& params);
     QJsonObject handleFiberExport(const QJsonValue& params);
     QJsonObject handleFiberImport(const QJsonValue& params);
     // Tags, seeding, push/pull, and tracing.
@@ -366,17 +355,10 @@ private:
                                double loss, double overallProgress);
     void handleLasagnaFinished(bool success, const QString& message,
                                const QString& outputPath);
-    // Atlas fiber-search lifecycle -> source:"atlas" JobRecord.
-    // Only bridge-initiated searches are tracked as jobs: progress for
-    // an untracked (human-initiated) search is deliberately NOT auto-registered,
-    // because FinishResults progress also fires on pure UI re-population (the
-    // group-by-fiber checkbox), which would leak a never-finishing job.
-    void handleAtlasSearchProgress(int phase, double fraction);
-    void handleAtlasSearchFinished(bool success, int resultCount);
     // Batch seeding lifecycle -> source:"seeding" JobRecord. Wired
-    // from SeedingWidget::seedingBatchProgressChanged / seedingBatchFinished. Like
-    // the atlas search, only bridge-initiated batches are tracked (progress/
-    // finished for a human-initiated Run/Expand click are not auto-registered).
+    // from SeedingWidget::seedingBatchProgressChanged / seedingBatchFinished. Only
+    // bridge-initiated batches are tracked (progress/finished for a
+    // human-initiated Run/Expand click are not auto-registered).
     void handleSeedingBatchProgress(const QString& kind, int completed, int total);
     void handleSeedingBatchFinished(const QString& kind, bool success, bool canceled,
                                     int completed, int total, const QString& message);

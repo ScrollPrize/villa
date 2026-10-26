@@ -221,18 +221,6 @@ void AgentBridgeServer::subscribeJobSignals()
                 handleLasagnaFinished(false, message, QString());
             });
 
-    // Atlas fiber-search lifecycle -> source:"atlas" jobs.
-    if (_window) {
-        connect(_window, &CWindow::atlasSearchProgressChanged, this,
-                [this](int phase, double fraction) {
-                    handleAtlasSearchProgress(phase, fraction);
-                });
-        connect(_window, &CWindow::atlasSearchFinished, this,
-                [this](bool success, int resultCount) {
-                    handleAtlasSearchFinished(success, resultCount);
-                });
-    }
-
     // Batch seeding lifecycle -> source:"seeding" jobs. Emitted from
     // the SeedingWidget QProcess finished callbacks (run/expand). Only
     // bridge-initiated batches become tracked jobs (see handleSeedingBatch*).
@@ -261,11 +249,6 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
             return true;
         if (source == QLatin1String("growth") &&
             _window->_segmentationGrower && _window->_segmentationGrower->running())
-            return true;
-        // Lifecycle authority for atlas searches: the cancel flag is created
-        // when a search launches and reset in its finished handler, so a
-        // non-null flag means a search (bridge- or human-initiated) is live.
-        if (source == QLatin1String("atlas") && _window->_atlasSearchCancelFlag)
             return true;
         // Lifecycle authority for seeding batches: seedingBatchActive() is true
         // only while a run/expand batch is draining (not a neural trace, which
@@ -628,56 +611,13 @@ void AgentBridgeServer::handleLasagnaFinished(bool success, const QString& messa
         finishJob(QStringLiteral("lasagna"), success, message, outputPath);
 }
 
-
-// --- Atlas fiber-search lifecycle ---
-
-void AgentBridgeServer::handleAtlasSearchProgress(int phase, double fraction)
-{
-    // Only bridge-initiated searches are tracked: do NOT
-    // auto-register an external job here — FinishResults progress also fires
-    // on pure UI re-population (group-by-fiber checkbox), which would leak a
-    // job that never finishes.
-    auto it = _activeJobs.find(QStringLiteral("atlas"));
-    if (it == _activeJobs.end())
-        return;
-    JobRecord& job = it.value();
-
-    const double clamped = std::clamp(fraction, 0.0, 1.0);
-    const QString label = QStringLiteral("phase %1/5 (%2%)")
-                              .arg(phase)
-                              .arg(qRound(clamped * 100.0));
-    job.message = label;
-
-    // Rate-limit job.progress "output" to <=10/sec.
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now - _lastConsoleBroadcastMs < 100)
-        return;
-    _lastConsoleBroadcastMs = now;
-    broadcastJobProgress(job, QStringLiteral("output"), label);
-}
-
-
-void AgentBridgeServer::handleAtlasSearchFinished(bool success, int resultCount)
-{
-    // finishJob is a no-op when no atlas job is active (e.g. a human-initiated
-    // search, or an early-return failure before the bridge registered a job).
-    if (!_activeJobs.contains(QStringLiteral("atlas")))
-        return;
-    finishJob(QStringLiteral("atlas"), success,
-              success
-                  ? QStringLiteral("Atlas fiber search finished: %1 result(s)").arg(resultCount)
-                  : QStringLiteral("Atlas fiber search canceled or failed"),
-              QString());
-}
-
-
 // --- Batch seeding lifecycle ---
 
 void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int completed,
                                                    int total)
 {
-    // Only bridge-initiated batches are tracked (mirroring the atlas search): a
-    // human-clicked Run/Expand is deliberately NOT auto-registered as a job.
+    // Only bridge-initiated batches are tracked: a human-clicked Run/Expand is
+    // deliberately NOT auto-registered as a job.
     auto it = _activeJobs.find(QStringLiteral("seeding"));
     if (it == _activeJobs.end())
         return;
@@ -777,12 +717,7 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
     const QString externalId = rec->externalId;
 
     // Dispatch on the job's source to its per-source cancel authority.
-    if (outSource == QLatin1String("atlas")) {
-        if (!_window)
-            throw AgentBridgeError{-32010, "Window unavailable", {}};
-        // Dialog-free: sets cancel flags; the job terminates via atlasSearchFinished.
-        _window->cancelAtlasFiberIntersectionSearch();
-    } else if (outSource == QLatin1String("seeding")) {
+    if (outSource == QLatin1String("seeding")) {
         SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
         if (!widget) {
             QJsonObject data;

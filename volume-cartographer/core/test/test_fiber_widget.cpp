@@ -301,7 +301,6 @@ int main(int argc, char** argv)
     require(exportButton != nullptr, "Fiber export button was not found");
     require(!deleteButton->isEnabled(), "Delete button should start disabled");
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
-    require(!widget.canCreateAtlasFromSelection(), "Empty selection should not allow atlas creation");
     require(!widget.canShowFiberSlice(), "Empty selection should not allow fiber slice");
     require(!widget.canRenameFiberFile(), "Empty selection should not allow JSON rename");
 
@@ -310,7 +309,6 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {2}), "Single selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for a single selection");
     require(widget.canDeleteSelection(), "Single selection should allow delete");
-    require(widget.canCreateAtlasFromSelection(), "Single selection should allow atlas creation");
     require(widget.canShowFiberSlice(), "Single selection should allow fiber slice");
     require(widget.canRenameFiberFile(), "Single selection should allow JSON rename");
 
@@ -398,7 +396,6 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {1, 3}), "Multi-selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for multi-selection");
     require(widget.canDeleteSelection(), "Multi-selection should allow delete");
-    require(!widget.canCreateAtlasFromSelection(), "Multi-selection should gray out atlas creation");
     require(!widget.canShowFiberSlice(), "Multi-selection should gray out fiber slice");
     require(!widget.canRenameFiberFile(), "Multi-selection should gray out JSON rename");
     auto* multiShowSliceAction = widget.createShowFiberSliceAction(&widget);

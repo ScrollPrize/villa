@@ -18,7 +18,6 @@
 #include "ui_VCMain.h"
 
 #include "vc/ui/VCCollection.hpp"
-#include "vc/atlas/FiberIntersections.hpp"
 
 #include <filesystem>
 #include <QShortcut>
@@ -44,8 +43,6 @@
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
-#include "overlays/AtlasOverlayController.hpp"
-#include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 
 class CChunkedVolumeViewer;
@@ -77,24 +74,6 @@ struct RenderBenchOptions {
     bool debugDownloadQueue = false;
 };
 
-struct AtlasSearchFiberSnapshot {
-    std::filesystem::path fiberPath;
-    vc::atlas::FiberPolyline fiber;
-    uint64_t storedFiberId = 0;
-    vc3d::line_annotation::FiberHvClassification hvClassification;
-    std::string manualHvTag;
-    std::vector<std::string> tags;
-};
-
-// Parameters for an atlas fiber-intersection search. The GUI slot builds the
-// same value from its widgets.
-struct AtlasFiberSearchParams {
-    int searchMode{0};                 // ATLAS_SEARCH_MODE_* (CWindow.cpp)
-    QStringList requiredTags;
-    QStringList excludedTags;
-    std::optional<double> maxDistance; // -> FiberIntersectionBroadPhaseOptions::maxDistance
-};
-
 #define MAX_RECENT_VOLPKG 10
 
 // Project JSON schema version required by this app.
@@ -124,7 +103,6 @@ class SegmentationCommandHandler;
 class LineAnnotationController;
 class FiberCollectionController;
 class WrapAnnotationWidget;
-class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
@@ -143,21 +121,6 @@ class CWindow : public QMainWindow
 
 public:
     void attachObjectStore(const QString& path);
-    // Starts an atlas fiber-intersection search without opening a dialog.
-    // Progress and completion use the atlasSearch signals below.
-    // Distinct name (not an overload): the slot is used as a member-function
-    // pointer in new-style connect(), which an overload would make ambiguous.
-    bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
-                                                   QString* errorMessage = nullptr);
-
-
-signals:
-    // Atlas search progress. phase is in [1, ATLAS_SEARCH_PHASE_COUNT] and
-    // fraction is in [0, 1] within that phase.
-    void atlasSearchProgressChanged(int phase, double fraction);
-    // Terminal atlas-search notification. success is false for cancellation
-    // and error; resultCount equals _atlasSearchResults.size().
-    void atlasSearchFinished(bool success, int resultCount);
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
@@ -214,51 +177,6 @@ private:
     // open in the active Line Annotation tab; hidden for any other tab.
     void updateLineAnnotationLengthLabel();
     void populateDockToggleMenu(QMenu* menu) const;
-    void createAtlasWorkspace();
-    void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
-    // Dialog-free core of displayAtlasFromDirectory: loads/displays the atlas,
-    // letting std::exception propagate (no QMessageBox). Shared by the interactive
-    // method and the headless variant below.
-    void loadAndDisplayAtlas(const std::filesystem::path& atlasDir);
-    // Opens an atlas without dialogs or the rebuild prompt. The distinct name
-    // avoids ambiguity where displayAtlasFromDirectory is used in connect().
-    bool displayAtlasFromDirectoryHeadless(const std::filesystem::path& atlasDir,
-                                           QString* errorMessage = nullptr);
-    void refreshAtlasOverviewDocks();
-    void updateAtlasFiberDocks();
-    // Whether the attached object store holds any active fiber.
-    [[nodiscard]] bool storeHasFibers() const;
-    void updateAtlasSearchDocks();
-    // Coalesced entry point: fiberSaved fires once per saved fiber and a
-    // single edit saves the session plus its linked peers, so refreshes fold
-    // into one dock rebuild per burst instead of one per signal.
-    void scheduleAtlasSearchDockRefresh();
-    bool _atlasSearchDockRefreshQueued = false;
-    void remapCurrentAtlas();
-    // Starts atlas remapping without dialogs. The interactive caller can add
-    // its completion UI through onFinished.
-    bool startAtlasRemapHeadless(QString* errorMessage = nullptr,
-                                 std::function<void(bool success, const QString& detail)> onFinished = {});
-    void optimizeAtlasSnapCandidates();
-    // Starts snap-candidate optimization without dialogs. Async failures go to
-    // the status bar and stderr, plus onAsyncError when provided.
-    bool optimizeAtlasSnapCandidatesHeadless(QString* errorMessage = nullptr,
-                                             std::function<void(const QString& detail)> onAsyncError = {});
-    void startAtlasFiberIntersectionSearch();
-    void cancelAtlasFiberIntersectionSearch();
-    void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
-                                   std::size_t completed,
-                                   std::size_t total);
-    void populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
-                                    std::vector<double> signedWindings = {});
-    void openAtlasSearchResult(int sortedResultIndex);
-    void clearAtlasSearchPreviewState();
-    void updateAtlasSearchPreviewCandidates();
-    void setAtlasSearchHoverResult(std::optional<int> sortedResultIndex);
-    void updateAtlasSearchSelectionFromTree(QTreeWidget* sourceTree);
-    void syncAtlasSearchTreeSelection(QTreeWidget* sourceTree);
-    void updateAtlasSearchPreviewRequests();
-    void requestAtlasSearchPreviewLine(int sortedResultIndex);
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
     void switchToFiberSliceWorkspace();
@@ -415,42 +333,14 @@ private:
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
-    QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
-    QMainWindow* _intersectionsWorkspaceWindow{nullptr};
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
     FiberMapWorkspace* _fiberMapWorkspace{nullptr};
-    QDockWidget* _atlasOverviewDock{nullptr};
-    QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
-    AtlasControlPointsDock* _atlasControlDock{nullptr};
-    QDockWidget* _atlasWorkspaceOverviewDock{nullptr};
-    QDockWidget* _atlasWorkspaceFiberDock{nullptr};
-    QDockWidget* _atlasWorkspaceSearchDock{nullptr};
-    VolumeViewerBase* _atlasViewer{nullptr};
-    std::optional<std::filesystem::path> _currentAtlasDir;
-    std::string _currentAtlasName;
-    vc::atlas::FiberIntersectionCache _fiberIntersectionCache;
-    std::vector<vc::atlas::FiberIntersectionResult> _atlasSearchResults;
-    std::vector<double> _atlasSearchSignedWindings;
-    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> _atlasSearchFiberSnapshotsByRuntimeId;
-    std::optional<std::filesystem::path> _atlasSearchLasagnaManifestPath;
-    double _atlasSearchLasagnaWorkingToBaseScale = 1.0;
-    int _atlasSearchPreviewGeneration{0};
-    std::optional<int> _atlasSearchHoveredResult;
-    std::set<int> _atlasSearchSelectedResults;
-    std::set<int> _atlasSearchPreviewRequestedResults;
-    bool _atlasSearchCancelRequested{false};
-    std::shared_ptr<std::atomic_bool> _atlasSearchCancelFlag;
-    vc::atlas::AtlasSearchProgressPhase _atlasSearchProgressPhase{
-        vc::atlas::AtlasSearchProgressPhase::PrepareInputs};
-    std::size_t _atlasSearchPhaseCompleted{0};
-    std::size_t _atlasSearchPhaseTotal{0};
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
-    QMdiArea* _intersectionsMdiArea{nullptr};
 
     bool can_change_volume_();
 
@@ -476,8 +366,6 @@ private:
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
     std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
-    std::unique_ptr<AtlasOverlayController> _atlasOverlay;
-    std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfaceCatalog> _surfaceCatalog;

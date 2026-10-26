@@ -130,8 +130,8 @@ public:
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
-        // The whole stored line, open tails included: what the atlas search
-        // and the agent bridge measure arclengths against.
+        // The whole stored line, open tails included: what the agent bridge
+        // measures arclengths against.
         double lengthVx = 0.0;
         // The line between the outermost control points (the sum of the
         // spans; nothing when they all sit on one line point), what the
@@ -248,15 +248,6 @@ public:
     struct UmbilicusStatus {
         bool available = false;
         QString text;
-    };
-
-    struct FiberSnapshotWithPath {
-        std::filesystem::path fiberPath;
-        vc::atlas::FiberPolyline fiber;
-        uint64_t storedFiberId = 0;
-        vc3d::line_annotation::FiberHvClassification hvClassification;
-        std::string manualHvTag;
-        std::vector<std::string> tags;
     };
 
     // Persisted branch-link metadata. Live branch refs are coupled to
@@ -391,19 +382,9 @@ public:
     void recalculateFiberHvClassification(uint64_t fiberId);
     void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
     void requestFiberAlignmentMetrics(uint64_t fiberId);
-    void createAtlasFromFiber(uint64_t fiberId);
     void addFiberToPointCollection(uint64_t fiberId);
     void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
     void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
-    void showIntersectionInspection(const vc::atlas::FiberIntersectionResult& result,
-                                    QMdiArea* targetArea,
-                                    std::optional<std::filesystem::path> atlasDir = std::nullopt);
-    // Shows an intersection inspection without a dialog, reporting failures
-    // through errorMessage.
-    bool showIntersectionInspectionHeadless(const vc::atlas::FiberIntersectionResult& result,
-                                            QMdiArea* targetArea,
-                                            std::optional<std::filesystem::path> atlasDir,
-                                            QString* errorMessage = nullptr);
     void saveOpenFibers();
     using FiberSaveCompletion = std::function<void(bool, const QString&)>;
     void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
@@ -475,10 +456,6 @@ public:
     [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
     // 'reviewed' first, then every tag on an active store fiber.
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
-    // Every active store fiber, in full (whole-store tools such as the atlas search).
-    [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths();
-    [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
-        const std::filesystem::path& atlasFiberPath) const;
 
     // Dialog-free operation entry points. Distinct names avoid ambiguity where
     // their interactive counterparts are used in connect().
@@ -490,10 +467,6 @@ public:
     bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
-    // Creates an atlas without dialogs. It does not emit atlasCreated because
-    // that signal is connected to the interactive display path.
-    bool createAtlasFromFiberHeadless(uint64_t fiberId, QString* errorMessage = nullptr,
-                                      std::filesystem::path* atlasDirOut = nullptr);
     // Most recently opened live line-annotation workspace, or nullptr.
     [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
     // Short-lived presentation guard for direct operations. Sessions created
@@ -518,7 +491,6 @@ public:
             vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
-    void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
     // Temporary native transport artifact from a pinned committed revision.
     [[nodiscard]] std::map<std::string, std::filesystem::path> fiberTransportPaths(const std::vector<uint64_t>& fiberIds) const;
@@ -559,7 +531,6 @@ signals:
     void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fiberRetired(const QString& objectUuid);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
-    void atlasCreated(std::filesystem::path atlasDir);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -586,7 +557,6 @@ private:
     // state private prevents external code from mutating controlPoints/branches
     // without the branch metadata synchronization hook.
     struct LineAnnotationSession;
-    struct IntersectionInspectionSession;
     struct FiberMetricsTaskResult;
     struct ControlSpanRecord {
         int spanIndex = 0;
@@ -742,8 +712,6 @@ private:
                                                   const cv::Vec3d& seedPoint,
                                                   const cv::Vec3d& requestedLinkDirection,
                                                   const LineAnnotationSession& templateSession);
-    void handleGeneratedPredSnapPoint(const std::string& surfaceName,
-                                      cv::Vec3f volumePoint);
     // Debouncing entry point (signal-connected): one placement triggers
     // several overlay rebuilds, each re-requesting intersections; they
     // coalesce into one dispatch per quiet window so the all-fiber snapshot
@@ -1228,13 +1196,6 @@ private:
     void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
-    [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
-    [[nodiscard]] std::optional<std::filesystem::path> resolveAtlasFiberPath(
-        const StoredFiber& fiber,
-        const std::filesystem::path& atlasDir) const;
-    void attachAtlasPredSnaps(const StoredFiber& fiber,
-                              LineAnnotationSession& session,
-                              const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
@@ -1436,10 +1397,6 @@ private:
         const vc::lasagna::NormalSampler& sampler);
     void finishFiberAlignmentMetrics(QFutureWatcher<FiberMetricsTaskResult>* watcher);
     void showError(const QString& message, bool suppressDialog = false) const;
-    // Shared core of createAtlasFromFiber / createAtlasFromFiberHeadless.
-    // Returns the created atlas directory; throws std::exception on failure.
-    // Does not emit atlasCreated (callers decide).
-    std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
     // Shared worker and write barrier for saveOpenFibers /
     // saveOpenFibersHeadless.
     [[nodiscard]] StoredFiber fiberInVolumeCoordinates(const StoredFiber& fiber) const;
@@ -1448,31 +1405,11 @@ private:
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
         const std::vector<FiberBranchRef>& branches) const;
     void saveOpenFibersCore();
-    void cleanupIntersectionInspectionSurfaces();
-    // Tears down the intersection-inspection workspace when one of its
-    // editing sessions holds a fiber that was just retired (split/merge);
-    // otherwise the pane would stay open and editable with all saves
-    // suppressed.
-    void closeIntersectionInspectionForRetiredFibers(
-        const std::vector<uint64_t>& fiberIds);
     // Closes every dialog pane whose session holds one of the fibers. The
     // single-dialog invariant means at most the invoking pane matches
     // today; sweeping by fiber id keeps split/merge retirement correct by
     // construction rather than by that invariant.
     void closeDialogPanesForFibers(const std::vector<uint64_t>& fiberIds);
-    // Returns false on failure; with a non-null `errorMessage` the failure is
-    // reported there (dialog-free), otherwise via showError (interactive).
-    bool rebuildIntersectionInspection(QString* errorMessage = nullptr);
-    bool updateIntersectionFollowSlice(bool sourceSideFlag,
-                                       double linePosition,
-                                       const char* reason);
-    void toggleIntersectionFollowSlice(bool sourceSideFlag);
-    bool handleIntersectionFollowKeyPress(int key, Qt::KeyboardModifiers modifiers);
-    bool eventFilter(QObject* watched, QEvent* event) override;
-    void refreshIntersectionInspectionAfterEdit(uint64_t editedFiberId,
-                                                double oldSourceArclength,
-                                                double oldTargetArclength);
-    bool acceptIntersectionSameWindingChoice();
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,
@@ -1495,7 +1432,6 @@ private:
     uint64_t _nextFiberAlignmentMetricToken = 0;
     uint64_t _fiberMetricsGeneration = 0;
     bool _fiberMetricsPending = false;
-    std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     // Scroll-center reference for orienting generated-view normals: the stored
     // umbilicus of the current volume, scaled into the annotation frame. nullopt
@@ -1610,7 +1546,6 @@ private:
         _pendingSideStripIntersectionRequests;
     // Surfaces with a debounced side-strip dispatch scheduled.
     std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
-    std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
     std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>

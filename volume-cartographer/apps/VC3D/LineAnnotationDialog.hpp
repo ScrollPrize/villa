@@ -193,7 +193,6 @@ public:
                                                    size_t total);
     void setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers = 0);
     void setGeneratedSideStripIntersectionError();
-    void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
         std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics);
     // blockInput=true covers the panes with the input-swallowing overlay
@@ -321,8 +320,6 @@ signals:
     void generatedControlPointBreakChangeRequested(const std::string& surfaceName,
                                                    size_t controlPointIndex,
                                                    bool enabled);
-    void generatedPredSnapPointRequested(const std::string& surfaceName,
-                                         cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();

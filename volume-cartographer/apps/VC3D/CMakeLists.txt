@@ -83,9 +83,6 @@ set(srcs
     VolumeRegistrations.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
-    AtlasControlPointsDock.cpp
-    AtlasControlPointsDock.hpp
-    AtlasControlPointsTypes.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp
@@ -192,10 +189,6 @@ set(srcs
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
     overlays/SurfaceRotationTransform.hpp
-    overlays/AtlasOverlayController.cpp
-    overlays/AtlasOverlayController.hpp
-    overlays/AtlasControlPointsOverlayController.cpp
-    overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
     overlays/OverlayBatchItem.cpp
@@ -310,7 +303,6 @@ set(srcs
     agent_bridge/AgentBridgeServer.hpp
     agent_bridge/AgentBridgeMethod.cpp
     agent_bridge/AgentBridgeMethod.hpp
-    agent_bridge/AgentBridgeMethods_atlas.cpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
     agent_bridge/AgentBridgeMethods_editing.cpp
     agent_bridge/AgentBridgeMethods_fiber.cpp
@@ -330,7 +322,6 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
-    agent_bridge/AgentBridgeHandlers_atlas.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
     agent_bridge/AgentBridgeHandlers_seeding.cpp
     agent_bridge/AgentBridgeHandlers_lasagna.cpp

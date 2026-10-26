@@ -43,7 +43,6 @@ class LasagnaServiceManager : public QObject
 public:
     // Roles of the result documents a fit attaches to its surfaces.
     static constexpr const char* kCorrResultsRole = "lasagna_corr_points_results";
-    static constexpr const char* kAtlasResultsRole = "lasagna_atlas_control_points_results";
 
     static LasagnaServiceManager& instance();
     /**
@@ -118,16 +117,6 @@ public:
     /** Fetch available datasets from the connected service (GET /datasets). */
     void fetchDatasets();
 
-    /**
-     * Queue Laplace snap-ranking jobs through the fit service.
-     * Completion callbacks are invoked on the Qt event thread.
-     */
-    void rankLaplaceSnapPairs(
-        const QJsonObject& request,
-        std::function<void(const QJsonObject&)> onSuccess,
-        std::function<void(const QString&)> onError,
-        std::function<void(int, const QJsonObject&)> onPartialResult = {});
-
 signals:
     void serviceStarted();
     void serviceStopped();
@@ -174,27 +163,14 @@ private:
     void pollStatus();
     void handleStatusReply(QNetworkReply* reply);
     void handleJobsReply(QNetworkReply* reply);
-    void handleOptimizeReply(QNetworkReply* reply, const QString& localUploadJobId = QString());
+    void handleOptimizeReply(QNetworkReply* reply);
     bool validateApiVersion(QNetworkReply* reply, const QString& context);
-    void postOptimizationRequest(const QJsonObject& requestConfig,
-                                 const QString& localUploadJobId = QString());
-    void enqueueArtifactUpload(const QJsonObject& requestConfig,
-                               const QJsonArray& objects,
-                               const QString& source);
+    void postOptimizationRequest(const QJsonObject& requestConfig);
     /** Run `then` once the store's hub has this replica's edits (an external
      *  service reads the hub); right away for the internal service. */
     void afterStoreSync(std::function<void()> then);
     QString storeError() const;
-    void processNextArtifactUpload();
-    void finishActiveArtifactUpload();
-    bool cancelLocalUploadJob(const QString& jobId);
-    void clearLocalUploadJobs();
-    void upsertLocalUploadJob(const QJsonObject& job);
-    void updateLocalUploadJob(const QString& jobId, const QJsonObject& updates);
-    void removeLocalUploadJob(const QString& jobId);
     void updateCachedJobFromStatus(const QJsonObject& status);
-    QJsonArray jobsWithLocalUploads(const QJsonArray& serviceJobs) const;
-    void emitJobsUpdatedOverlay();
 
     QString localSourceName() const;
 
@@ -205,14 +181,6 @@ private:
 #ifdef Q_OS_WIN
     void* _processJob{nullptr};
 #endif
-
-    struct ArtifactUploadJob
-    {
-        QString jobId;
-        QJsonObject requestConfig;
-        QJsonArray objects;
-        QString source;
-    };
 
     QString _host{"127.0.0.1"};
     int _port{0};
@@ -234,15 +202,6 @@ private:
     QSet<QString> _startedJobIds;
     QSet<QString> _completedJobIds;
     QJsonArray _lastJobs;
-    QList<ArtifactUploadJob> _artifactUploadQueue;
-    ArtifactUploadJob _activeArtifactUpload;
-    bool _hasActiveArtifactUpload{false};
-    QNetworkReply* _activeArtifactReply{nullptr};
-    QString _activeArtifactReplyJobId;
-    QSet<QString> _cancelledLocalUploadJobs;
-    QHash<QString, QJsonObject> _localUploadJobs;
-    QStringList _localUploadOrder;
-    quint64 _nextLocalUploadId{1};
     qint64 _lastQueueGeneration{-1};
     qint64 _fetchedQueueGeneration{-1};
     quint64 _requestGeneration{0};

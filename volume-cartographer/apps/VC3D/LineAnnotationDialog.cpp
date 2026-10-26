@@ -1758,16 +1758,6 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionError()
     _sideStripIntersectionProgress->setFormat(tr("strip intersections: error"));
 }
 
-void LineAnnotationDialog::setGeneratedPredSnapPoints(
-    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
-{
-    if (_closing || !_hasGeneratedViews) {
-        return;
-    }
-    _generatedViews.predSnapPoints = std::move(predSnapPoints);
-    rebuildGeneratedOverlays();
-}
-
 void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
 {
@@ -3109,13 +3099,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                    Qt::MouseButton button,
                    Qt::KeyboardModifiers modifiers,
                    QPointF) {
-                if (button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
-                    // Unlike a plain click this leaves follow untouched, so it
-                    // must stop a keyboard pan itself.
-                    cancelArrowPan();
-                    emit generatedPredSnapPointRequested(_generatedViews.sideCutName,
-                                                         volumePoint);
-                } else if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+                if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
                     if (!controlPointPlacementAllowedAt(_currentLinePosition)) {
                         return;
                     }
@@ -3252,27 +3236,22 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers,
                                             QPointF scenePoint) {
-                    if (button != Qt::LeftButton ||
-                        (modifiers != Qt::NoModifier && modifiers != Qt::ShiftModifier)) {
+                    if (button != Qt::LeftButton || modifiers != Qt::NoModifier) {
                         return;
                     }
                     const double position = linePositionFromStripScene(viewer, scenePoint);
                     if (std::isfinite(position)) {
                         setCurrentCutFollowsStripMouse(true);
                         setCurrentLinePosition(position);
-                        if (modifiers == Qt::ShiftModifier) {
-                            emit generatedPredSnapPointRequested(surfaceName, volumePoint);
-                        } else {
-                            if (!controlPointPlacementAllowedAt(position)) {
-                                return;
-                            }
-                            const uint64_t token = recordPendingPlacement(volumePoint, position);
-                            emit generatedControlPointRequested(surfaceName,
-                                                                volumePoint,
-                                                                position,
-                                                                interpolatedLinePoint(position));
-                            retirePendingPlacement(token);
+                        if (!controlPointPlacementAllowedAt(position)) {
+                            return;
                         }
+                        const uint64_t token = recordPendingPlacement(volumePoint, position);
+                        emit generatedControlPointRequested(surfaceName,
+                                                            volumePoint,
+                                                            position,
+                                                            interpolatedLinePoint(position));
+                        retirePendingPlacement(token);
                     }
                 });
         stripSplitter->addWidget(viewer);

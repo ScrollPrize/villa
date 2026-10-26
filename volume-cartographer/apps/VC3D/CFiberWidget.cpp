@@ -725,11 +725,6 @@ bool CFiberWidget::canDeleteSelection() const
     return !selectedFiberIds().empty();
 }
 
-bool CFiberWidget::canCreateAtlasFromSelection() const
-{
-    return selectedFiberIds().size() == 1;
-}
-
 bool CFiberWidget::canShowFiberSlice() const
 {
     return selectedFiberIds().size() == 1;
@@ -1590,13 +1585,6 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
     auto* showFiberSliceAction = createShowFiberSliceAction(&menu);
     menu.addAction(showFiberSliceAction);
     menu.addSeparator();
-    auto* newAtlasAction = menu.addAction(tr("New atlas from line"));
-    newAtlasAction->setEnabled(canCreateAtlasFromSelection());
-    connect(newAtlasAction, &QAction::triggered, this, [this]() {
-        if (_selectedFiberId != 0) {
-            emit newAtlasFromFiberRequested(_selectedFiberId);
-        }
-    });
     const auto selectedForCollection = selectedFiberIds();
     auto* addToCollectionAction = menu.addAction(
         selectedForCollection.size() > 1

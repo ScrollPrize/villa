@@ -184,10 +184,8 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
         mode = SegmentationLasagnaPanel::ReOptimize;
     else if (modeStr == QLatin1String("new_model"))
         mode = SegmentationLasagnaPanel::NewModel;
-    else if (modeStr == QLatin1String("offset"))
-        mode = SegmentationLasagnaPanel::Offset;
     else
-        mode = SegmentationLasagnaPanel::Atlas;
+        mode = SegmentationLasagnaPanel::Offset;
 
     requireSourceIdle(QStringLiteral("lasagna"));
 
@@ -200,8 +198,6 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
     }
 
     const QString configPath = p.value("configPath").toString();
-    const QString atlasPath = p.value("atlasPath").toString();
-    const QString initShellDir = p.value("initShellDir").toString();
     std::optional<cv::Vec3i> seed;
     if (p.contains("seed")) {
         const cv::Vec3f v = jsonToVec3(p.value("seed"), "seed");
@@ -210,17 +206,13 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
 
     QString errorMessage;
     const bool started = panel->startOptimizationHeadless(
-        state, mode, configPath, seed, atlasPath, initShellDir, &errorMessage);
+        state, mode, configPath, seed, &errorMessage);
     if (!started) {
         QJsonObject data;
         data["detail"] = errorMessage;
         if (errorMessage.contains(QLatin1String("config"), Qt::CaseInsensitive)) {
             data["kind"] = "config";
             throw AgentBridgeError{-32007, "Lasagna config not found", data};
-        }
-        if (errorMessage.contains(QLatin1String("atlas"), Qt::CaseInsensitive)) {
-            data["kind"] = "atlas";
-            throw AgentBridgeError{-32007, "No atlas selected", data};
         }
         throw AgentBridgeError{-32005, "Lasagna optimization failed to start", data};
     }

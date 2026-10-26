@@ -4123,29 +4123,6 @@ TEST_CASE("branch overlay replacement retains supplied native span diagnostics")
     CHECK(views.fiberIntersections.empty());
 }
 
-TEST_CASE("line annotation generated overlays include pred-snap connector endpoints")
-{
-    vc3d::line_annotation::GeneratedViews views;
-    views.linePoints = {
-        {0.0f, 0.0f, 0.0f},
-        {1.0f, 0.0f, 0.0f},
-        {2.0f, 0.0f, 0.0f},
-    };
-    views.controlPoints = {
-        {{1.0f, 0.0f, 0.0f}, 1.0, false},
-    };
-    views.predSnapPoints = {
-        {{1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 1.0f}, 1.0, 0, true},
-    };
-
-    const auto overlay = vc3d::line_annotation::makeGeneratedStripOverlay(views, 1.0, {});
-
-    REQUIRE(overlay.predSnapPoints.size() == 1);
-    CHECK(overlay.predSnapPoints[0].controlIndex == 0);
-    CHECK(overlay.predSnapPoints[0].controlPoint[0] == doctest::Approx(1.0f));
-    CHECK(overlay.predSnapPoints[0].snapPoint[2] == doctest::Approx(1.0f));
-}
-
 TEST_CASE("line annotation generated strip static and dynamic overlays split ownership")
 {
     vc3d::line_annotation::GeneratedViews views;

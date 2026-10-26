@@ -47,7 +47,7 @@ public:
     explicit SegmentationLasagnaPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
-    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Offset = 3, Atlas = 4 };
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Offset = 3 };
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
@@ -65,7 +65,6 @@ public:
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
-    void setSelectedAtlasPath(const QString& path);
     void setState(CState* state);
     // The stored surfaces jobs read and name their outputs among.
     void setSurfaceCatalog(SurfaceCatalog* catalog);
@@ -86,21 +85,15 @@ public:
     /// errorMessage. Returns true when the optimization was submitted.
     ///   configPath: empty => selectedLasagnaConfigPathForMode(mode)
     ///   seed:       nullopt => panel seed / focus (no seed override)
-    ///   atlasPath:  empty => panel selection; applied via setSelectedAtlasPath
-    ///   initShellDir: path visible to the fit-service host; empty => manifest
     bool startOptimizationHeadless(CState* state,
                                    LasagnaMode mode,
                                    const QString& configPath,
                                    std::optional<cv::Vec3i> seed,
-                                   const QString& atlasPath,
-                                   const QString& initShellDir,
                                    QString* errorMessage = nullptr);
     /// Repeats the last action without entering the interactive signal chain.
     bool repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage = nullptr);
     [[nodiscard]] QString selectedLasagnaConfigPathForMode(LasagnaMode mode) const;
     [[nodiscard]] QStringList lasagnaConfigPathsForMode(LasagnaMode mode) const;
-    [[nodiscard]] QString selectedAtlasPath() const { return _atlasDirPath; }
-    [[nodiscard]] QString selectedAtlasConfigPath() const { return _atlasConfigFilePath; }
 
 public slots:
     void setSeedFromFocus(int x, int y, int z);
@@ -144,11 +137,6 @@ private:
     void updateConnectionWidgets();
     void triggerOptimization();
     void launchLasagnaMode(LasagnaMode mode);
-    void launchAtlasOptimization();
-    [[nodiscard]] SubmissionResult startAtlasOptimization(
-        CState* state,
-        QStatusBar* statusBar,
-        Presentation presentation = Presentation::Interactive);
     void syncCompactConfigCombos();
     void syncCompactStatusFromFull();
     void updateCompactLinkedSurfaceTable(const QStringList& names);
@@ -162,12 +150,6 @@ private:
                                                  QStatusBar* statusBar,
                                                  Presentation presentation =
                                                      Presentation::Interactive);
-    [[nodiscard]] bool validateAtlasDirPath(const QString& atlasDir,
-                                            QStatusBar* statusBar,
-                                            Presentation presentation =
-                                                Presentation::Interactive);
-    void populateAtlasCombo(const QString& volpkgRoot, const QString& selectPath);
-    void refreshAtlasComboFromState();
     [[nodiscard]] SubmissionResult startOptimizationWithOverrides(
         CState* state,
         QStatusBar* statusBar,
@@ -177,15 +159,13 @@ private:
         int seedX,
         int seedY,
         int seedZ,
-        Presentation presentation = Presentation::Interactive,
-        const QString& initShellDirOverride = QString());
+        Presentation presentation = Presentation::Interactive);
 
     // -- Sections --
     CollapsibleSettingsGroup* _connectionGroup{nullptr};
     CollapsibleSettingsGroup* _newModelGroup{nullptr};
     CollapsibleSettingsGroup* _reoptGroup{nullptr};
     CollapsibleSettingsGroup* _offsetGroup{nullptr};
-    CollapsibleSettingsGroup* _atlasGroup{nullptr};
 
     // Connection mode
     QComboBox* _connectionCombo{nullptr};
@@ -221,15 +201,11 @@ private:
     QComboBox* _offsetConfigCombo{nullptr};
     QToolButton* _offsetConfigBrowse{nullptr};
     QDoubleSpinBox* _offsetValueSpin{nullptr};
-    QComboBox* _atlasCombo{nullptr};
-    QComboBox* _atlasConfigCombo{nullptr};
-    QToolButton* _atlasConfigBrowse{nullptr};
 
     // Action buttons
     QPushButton* _newModelBtn{nullptr};
     QPushButton* _reoptBtn{nullptr};
     QPushButton* _offsetBtn{nullptr};
-    QPushButton* _atlasBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
 
@@ -240,11 +216,8 @@ private:
     QWidget* _compactView{nullptr};
     QComboBox* _compactNewModelConfigCombo{nullptr};
     QComboBox* _compactReoptConfigCombo{nullptr};
-    QComboBox* _compactAtlasCombo{nullptr};
-    QComboBox* _compactAtlasConfigCombo{nullptr};
     QPushButton* _compactNewModelBtn{nullptr};
     QPushButton* _compactReoptBtn{nullptr};
-    QPushButton* _compactAtlasBtn{nullptr};
     QPushButton* _compactStopBtn{nullptr};
     QPushButton* _compactStopServiceBtn{nullptr};
     QProgressBar* _compactProgressBar{nullptr};
@@ -256,8 +229,6 @@ private:
     QString _newModelConfigFilePath;
     QString _reoptConfigFilePath;
     QString _offsetConfigFilePath;
-    QString _atlasConfigFilePath;
-    QString _atlasDirPath;
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
     LasagnaMode _lastLasagnaMode{LasagnaMode::ReOptimize};
@@ -270,7 +241,6 @@ private:
     const QString _settingsGroup;
     CState* _state{nullptr};
     SurfaceCatalog* _surfaceCatalog{nullptr};
-    QMetaObject::Connection _stateVpkgChangedConnection;
     QMetaObject::Connection _stateSurfaceChangedConnection;
     QSet<QString> _submittedOutputNames;
 };

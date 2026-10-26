@@ -457,36 +457,6 @@ QJsonObject AgentBridgeServer::handleFiberSetTag(const QJsonValue& params)
 }
 
 
-QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-
-    const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    requireKnownFiber(ctrl, fiberId);
-
-    // createAtlasFromFiber is synchronous, but its error and rebuild dialogs are
-    // unsafe for remote calls. Run the dialog-free split and display the result
-    // through displayAtlasFromDirectoryHeadless.
-    QString err;
-    std::filesystem::path atlasDir;
-    if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Atlas creation failed", data};
-    }
-
-    QString displayErr;
-    const bool displayed = _window->displayAtlasFromDirectoryHeadless(atlasDir, &displayErr);
-
-    QJsonObject result;
-    result["atlasDir"] = QString::fromStdString(atlasDir.string());
-    result["displayed"] = displayed;
-    if (!displayed && !displayErr.isEmpty())
-        result["displayDetail"] = displayErr;
-    return result;
-}
-
 
 QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
 {

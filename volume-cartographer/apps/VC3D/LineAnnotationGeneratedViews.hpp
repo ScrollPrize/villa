@@ -155,18 +155,6 @@ struct GeneratedOverlay {
         double displayedLinePosition = std::numeric_limits<double>::quiet_NaN();
     };
 
-    struct PredSnapMarker {
-        cv::Vec3f controlPoint{std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f snapPoint{std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN()};
-        double linePosition = std::numeric_limits<double>::quiet_NaN();
-        size_t controlIndex = std::numeric_limits<size_t>::max();
-        bool manual = false;
-    };
-
     struct BranchLinkMarker {
         uint64_t linkedFiberId = 0;
         cv::Vec3f localControlPoint{std::numeric_limits<float>::quiet_NaN(),
@@ -232,7 +220,6 @@ struct GeneratedOverlay {
     int seedLineIndex = -1;
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
-    std::vector<PredSnapMarker> predSnapPoints;
     std::vector<BranchLinkMarker> branchLinks;
     std::vector<FiberIntersectionMarker> fiberIntersections;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
@@ -331,7 +318,6 @@ struct GeneratedViews {
     bool initialFitWholeLine = false;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
-    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks;
     std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
@@ -1825,7 +1811,6 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
     overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
         views.controlPoints, overlay.gapLineRanges, currentLinePosition);
-    overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1842,7 +1827,6 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.controlPoints = views.controlPoints;
     overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
     overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
-    overlay.predSnapPoints = views.predSnapPoints;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
@@ -1912,12 +1896,6 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
         const float distance = pointDistance(control.point);
         if (std::isfinite(distance) && std::abs(distance) <= *controlDistanceThreshold) {
             overlay.controlPoints.push_back(control);
-            for (const auto& predSnap : views.predSnapPoints) {
-                if (predSnap.controlIndex == controlIndexValue &&
-                    finiteGeneratedPoint(predSnap.snapPoint)) {
-                    overlay.predSnapPoints.push_back(predSnap);
-                }
-            }
         }
     }
 

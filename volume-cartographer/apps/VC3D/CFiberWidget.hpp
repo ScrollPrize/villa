@@ -90,7 +90,6 @@ public:
     uint64_t selectedFiberId() const { return _selectedFiberId; }
     std::vector<uint64_t> selectedFiberIds() const;
     bool canDeleteSelection() const;
-    bool canCreateAtlasFromSelection() const;
     bool canShowFiberSlice() const;
     bool canRenameFiberFile() const;
     std::vector<uint64_t> orderedFiberIds() const;
@@ -138,7 +137,6 @@ signals:
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
-    void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
