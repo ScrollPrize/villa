@@ -9211,6 +9211,13 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
         linkedSeedRecord->optimizationState = SessionOptimizationState::Optimized;
 
         StoredFiber linkedFiber = storedFiberFromSession(*linkedSeedRecord);
+        // The seed session is never a pane, so makeFiberSaveSnapshot cannot
+        // bind it; it was created in the template session's frame.
+        const auto volume = _state ? _state->currentVolume() : nullptr;
+        const double scale = linkedSeedRecord->fiberBaseToVolumeScale;
+        if (!volume || !(scale > 0) || !std::isfinite(scale))
+            throw std::runtime_error("Unknown fiber creation frame");
+        linkedFiber.coordinateIdentity.update(coordinateBindingForVolume(*volume, 1.0 / scale));
         const uint64_t linkedFiberId = linkedFiber.id;
         commitFibers({&parentFiber, &linkedFiber});
         return linkedFiberId;
