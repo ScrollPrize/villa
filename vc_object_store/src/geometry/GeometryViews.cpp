@@ -97,9 +97,20 @@ TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& u
 
 TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
     state_->read->require();
-    auto result=GeometrySnapshot(*state_->read->db,*state_->read->txn).viewTransformedAt(state_->revision.objectUuid,target,scale);
-    if(result.revision().uuid!=state_->revision.uuid)throw std::invalid_argument("transform a current object view; historical geometry needs its coordinate metadata");
-    return result;
+    const auto& db=*state_->read->db;
+    const auto& txn=*state_->read->txn;
+    const auto& id=state_->revision.objectUuid;
+    const GeometrySnapshot snapshot(db,txn);
+    const auto current=db.currentGeometry(txn,id);
+    if(current&&current->uuid==state_->revision.uuid)return snapshot.viewTransformedAt(id,target,scale);
+    // Older geometry is in the frame of the latest object revision that held it.
+    std::optional<ObjectRecord> record;
+    for(const auto& revision:db.objectHistory(txn,id))
+        if(revision.geometryRevision==state_->revision.uuid&&revision.metadataComplete)record=revision.record;
+    if(!record)throw std::invalid_argument("geometry revision has no recorded coordinate metadata");
+    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(record->meta),target,scale);
+    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
+    return TransformedGeometryView(snapshot.geometry(id,state_->revision.uuid),*mapping,target,scale);
 }
 
 std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {

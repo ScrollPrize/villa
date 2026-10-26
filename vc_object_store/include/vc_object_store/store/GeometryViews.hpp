@@ -11,6 +11,8 @@ namespace detail { struct GeometryReadState; struct GeometryViewState; }
 // views; otherwise they keep the snapshot alive. Thread-confined, like Txn.
 class GeometryView {
 public:
+    // This revision in `targetVolume`'s voxels; an older revision maps with the
+    // coordinates of the latest object revision that held it.
     TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
     std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
@@ -126,6 +128,7 @@ public:
         const std::vector<geometry::Point>& desired) const;
 private:
     friend class GeometrySnapshot;
+    friend class GeometryView;
     TransformedGeometryView(TypedGeometryView source,VolumeAffine mapping,std::string target,double targetScale)
         :source_(std::move(source)),mapping_(mapping),target_(std::move(target)),targetScale_(targetScale){}
     TypedGeometryView source_;

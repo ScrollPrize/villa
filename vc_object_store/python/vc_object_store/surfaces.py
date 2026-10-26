@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import getpass
 import uuid as uuidlib
+from typing import NamedTuple
 
 import numpy as np
 
@@ -17,23 +18,36 @@ INVALID = -1.0
 _TIFXYZ_FILE_KEYS = ("uuid", "name", "format", "type", "scale", "bbox")
 
 
-def read_surface(store, surface_uuid, *, volume, geometry_revision=None, target_scale=1.0):
-    """(points, valid, scale, record): the surface (its current geometry, or ``geometry_revision``) in voxels of
-    ``volume`` at ``target_scale``, through the store's mapping to it (its binding, or a registration). ``points``
-    is (rows, columns, 3) float32 xyz with -1 at missing vertices, ``valid`` a bool mask, ``scale`` the grid
-    scale in those voxels. Raises when the surface does not map to ``volume``."""
+class SurfaceGrid(NamedTuple):
+    points: np.ndarray  # (rows, columns, 3) float32 xyz, -1 at missing vertices
+    valid: np.ndarray  # (rows, columns) bool
+    scale: tuple  # grid scale in the read volume's voxels
+    record: dict
+    geometry_revision: str
+    channels: frozenset  # names of the per-vertex channels (not points or valid)
+
+
+def read_surface(store, surface_uuid, *, volume, geometry_revision=None, target_scale=1.0) -> SurfaceGrid:
+    """The surface (its current geometry, or ``geometry_revision``) in voxels of ``volume`` at ``target_scale``,
+    through the store's mapping to it (its binding, or a registration). Raises ValueError when the surface does
+    not map to ``volume``."""
     with ObjectStore.open(str(store), read_only=True, reader_pool_size=1) as db:
         record = db.object(surface_uuid)
         if record is None or record["kind"] != "surface":
             raise ValueError(f"no surface {surface_uuid} in {store}")
         with db.geometry_snapshot() as snapshot:
             canonical = snapshot.surface(surface_uuid, geometry_revision)
-            tile = canonical.view_transformed_at(volume, target_scale).read_tile(
-                0, 0, canonical.rows, canonical.columns)
+            try:
+                view = canonical.view_transformed_at(volume, target_scale)
+            except RuntimeError as error:
+                raise ValueError(f"surface {surface_uuid} does not map to volume {volume}: {error}") from error
+            tile = view.read_tile(0, 0, canonical.rows, canonical.columns)
+            revision = canonical.revision
     points = np.array(tile["points"], dtype=np.float32)
     valid = np.asarray(tile["validity"]).astype(bool)
     points[~valid] = INVALID
-    return points, valid, tuple(float(s) for s in tile["scale"]), record
+    channels = frozenset(array["name"] for array in revision["arrays"]) - {"points", "valid"}
+    return SurfaceGrid(points, valid, tuple(float(s) for s in tile["scale"]), record, revision["uuid"], channels)
 
 
 def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, sources=(), meta=None,
