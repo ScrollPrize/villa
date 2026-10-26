@@ -177,7 +177,10 @@ collection, a dense local region and a long fiber crossing storage blocks:
    region/length filters, palette changes, orbit, detach and redock.
 2. Open a fiber in Line Annotation. Compare ribbon orientation with its flattened
    surface and move the current position from both views. Toggle the ribbon and
-   confirm that CT pixels actually appear in 3D.
+   confirm that CT pixels actually appear in 3D. Reselect the current CT volume:
+   the fiber, camera and position marker must remain visible and navigable.
+   Enable annotation markers and gap styles on a tagged fiber; compare its gap
+   and damaged spans, breaks and kollesis terminations with the flattened view.
 3. Display one CT slice, then its volumetric slab. Move the linked CT view and
    confirm the 3D plane follows it.
 4. Load a registered public surface; check proximity on both sides and with the

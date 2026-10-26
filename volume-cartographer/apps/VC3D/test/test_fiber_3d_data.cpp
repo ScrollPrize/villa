@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DData.hpp"
 #include "LineAnnotationPolylineIndices.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "../../../core/test/FiberCollectionFixture.hpp"
 
 #include <QtTest/QtTest>
@@ -41,6 +42,94 @@ class Fiber3DDataTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void generatedSpansUseDisplayedLinePositionsAndGapPrecedence()
+    {
+        vc3d::line_annotation::GeneratedViews views;
+        for (int i = 0; i < 9; ++i)
+            views.linePoints.emplace_back(float(i), 0, 0);
+        std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker> controls(4);
+        const int positions[] = {0, 2, 4, 8};
+        for (int i = 0; i < 4; ++i) {
+            controls[i].point = views.linePoints[positions[i]];
+            controls[i].linePosition = (i + 1) * 100;
+            controls[i].displayedLinePosition = positions[i];
+        }
+        controls[0].hasGapToNext = true;
+        controls[0].hasDamagedToNext = true;
+        controls[1].hasDamagedToNext = true;
+        // Storage order and live line positions need not match the displayed line.
+        views.controlPoints = {controls[2], controls[0], controls[3], controls[1]};
+        const auto fiber = generatedAnnotationFiber(views);
+        QCOMPARE(fiber.runs.size(), size_t(1));
+        QCOMPARE(fiber.runs[0].styles, std::vector<SpanStyle>({SpanStyle::Gap, SpanStyle::Gap, SpanStyle::Damaged, SpanStyle::Damaged, SpanStyle::Solid, SpanStyle::Solid, SpanStyle::Solid, SpanStyle::Solid}));
+        QCOMPARE(fiber.runs[0].points.size(), views.linePoints.size());
+        for (size_t i = 0; i < views.linePoints.size(); ++i)
+            QCOMPARE(fiber.runs[0].points[i], (Point{double(i), 0, 0}));
+    }
+
+    void generatedMarkersPreserveIndependentTags()
+    {
+        vc3d::line_annotation::GeneratedViews views;
+        vc3d::line_annotation::GeneratedOverlay::ControlPointMarker control;
+        control.point = {1, 2, 3};
+        control.isBreak = true;
+        control.isKollesisTermination = true;
+        views.controlPoints.push_back(control);
+        control.point = {4, 5, 6};
+        control.isBreak = false;
+        views.controlPoints.push_back(control);
+        control.point = {7, 8, 9};
+        control.isKollesisTermination = false;
+        views.controlPoints.push_back(control);
+        control.point[0] = std::numeric_limits<float>::quiet_NaN();
+        views.controlPoints.push_back(control);
+        const auto fiber = generatedAnnotationFiber(views);
+        const std::vector<MarkerKind> kinds{MarkerKind::ControlPoint, MarkerKind::Break, MarkerKind::KollesisTermination, MarkerKind::ControlPoint, MarkerKind::KollesisTermination, MarkerKind::ControlPoint};
+        QCOMPARE(fiber.markers.size(), kinds.size());
+        for (size_t i = 0; i < kinds.size(); ++i)
+            QCOMPARE(fiber.markers[i].kind, kinds[i]);
+        QCOMPARE(fiber.markers[1].point, (Point{1, 2, 3}));
+        QCOMPARE(fiber.markers[4].point, (Point{4, 5, 6}));
+    }
+
+    void generatedInvalidPointsSplitRunsWithoutLosingSpanIndices()
+    {
+        vc3d::line_annotation::GeneratedViews views;
+        for (int i = 0; i < 9; ++i)
+            views.linePoints.emplace_back(float(i), 0, 0);
+        views.linePoints[0][0] = views.linePoints[3][0] = views.linePoints[4][0] = std::numeric_limits<float>::quiet_NaN();
+        vc3d::line_annotation::GeneratedOverlay::ControlPointMarker a, b;
+        a.point = views.linePoints[1];
+        a.linePosition = 1;
+        a.hasGapToNext = true;
+        b.point = views.linePoints[7];
+        b.linePosition = 7;
+        views.controlPoints = {a, b};
+        const auto fiber = generatedAnnotationFiber(views);
+        QCOMPARE(fiber.runs.size(), size_t(2));
+        QCOMPARE(fiber.runs[0].firstPoint, int64_t(1));
+        QCOMPARE(fiber.runs[1].firstPoint, int64_t(5));
+        QCOMPARE(fiber.runs[0].styles, std::vector<SpanStyle>({SpanStyle::Gap}));
+        QCOMPARE(fiber.runs[1].styles, std::vector<SpanStyle>({SpanStyle::Gap, SpanStyle::Gap, SpanStyle::Solid}));
+    }
+
+    void generatedBreakMarkersDoNotInventGapSpans()
+    {
+        vc3d::line_annotation::GeneratedViews views;
+        views.linePoints = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        for (int i : {0, 2}) {
+            vc3d::line_annotation::GeneratedOverlay::ControlPointMarker control;
+            control.point = views.linePoints[i];
+            control.linePosition = i;
+            control.isBreak = true;
+            views.controlPoints.push_back(control);
+        }
+        const auto fiber = generatedAnnotationFiber(views);
+        QCOMPARE(fiber.runs.size(), size_t(1));
+        QVERIFY(fiber.runs[0].styles.empty());
+        QCOMPARE(fiber.markers.size(), size_t(4));
+    }
+
     void nativeRegionsKeepDisjointRunsAndFullSourceLength()
     {
         auto snapshot = annotated();

@@ -2,6 +2,7 @@
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "LineAnnotationPolylineIndices.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "vc/core/types/FiberCollection.hpp"
 
 #include <algorithm>
@@ -449,5 +450,42 @@ Scene loadAnnotations(
     }
     checkCancelled(cancelled);
     return scene;
+}
+Fiber generatedAnnotationFiber(const line_annotation::GeneratedViews& views)
+{
+    Fiber fiber;
+    const auto gaps = line_annotation::generatedGapLineRanges(views.controlPoints);
+    const auto damaged = line_annotation::generatedDamagedLineRanges(views.controlPoints);
+    Run run;
+    for (size_t i = 0; i < views.linePoints.size(); ++i) {
+        const auto& p = views.linePoints[i];
+        if (!line_annotation::finiteGeneratedPoint(p)) {
+            if (run.points.size() > 1)
+                fiber.runs.push_back(std::move(run));
+            run = {};
+            run.firstPoint = int64_t(i + 1);
+        } else {
+            if (!run.points.empty() && (!gaps.empty() || !damaged.empty())) {
+                const auto style = line_annotation::generatedLineSegmentInGap(double(i - 1), double(i), gaps)      ? SpanStyle::Gap
+                                   : line_annotation::generatedLineSegmentInGap(double(i - 1), double(i), damaged) ? SpanStyle::Damaged
+                                                                                                                   : SpanStyle::Solid;
+                run.styles.push_back(style);
+            }
+            run.points.push_back({p[0], p[1], p[2]});
+        }
+    }
+    if (run.points.size() > 1)
+        fiber.runs.push_back(std::move(run));
+    for (const auto& cp : views.controlPoints) {
+        if (!line_annotation::finiteGeneratedPoint(cp.point))
+            continue;
+        const Point point{cp.point[0], cp.point[1], cp.point[2]};
+        fiber.markers.push_back({point, MarkerKind::ControlPoint});
+        if (cp.isBreak)
+            fiber.markers.push_back({point, MarkerKind::Break});
+        if (cp.isKollesisTermination)
+            fiber.markers.push_back({point, MarkerKind::KollesisTermination});
+    }
+    return fiber;
 }
 }  // namespace vc3d::fibers3d

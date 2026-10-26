@@ -5,6 +5,11 @@
 
 #include <atomic>
 
+namespace vc3d::line_annotation
+{
+struct GeneratedViews;
+}
+
 namespace vc3d::fibers3d
 {
 
@@ -34,5 +39,9 @@ Scene loadAnnotations(
     const std::vector<LineAnnotationController::FiberSummary>& summaries,
     const QueryOptions& options,
     const std::atomic_bool* cancelled = nullptr);
+
+// Snapshot the live Line Annotation geometry in its displayed CT coordinates.
+// Preserve original line indices, span styles and control-point markers.
+Fiber generatedAnnotationFiber(const line_annotation::GeneratedViews& views);
 
 }  // namespace vc3d::fibers3d

@@ -267,7 +267,14 @@ struct Fiber3DPanel::Impl {
             fitted = false;
             request(true);
         };
-        QObject::connect(state, &CState::volumeChanged, q, reset);
+        QObject::connect(state, &CState::volumeChanged, q, [this, reset, previous = std::weak_ptr<Volume>(state->currentVolume())](const std::shared_ptr<Volume>& volume) mutable {
+            // CState also emits on reselection; Line Annotation does not
+            // regenerate its views when the active volume is unchanged.
+            if (lineAnnotation && previous.lock() == volume)
+                return;
+            previous = volume;
+            reset();
+        });
         QObject::connect(state, &CState::vpkgChanged, q, reset);
         QObject::connect(state, &CState::volumeClosing, q, reset);
         QObject::connect(state, &CState::poiChanged, q, [this](const std::string& name, POI*) {
@@ -1009,26 +1016,11 @@ void Fiber3DPanel::setLineAnnotationViews(const vc3d::line_annotation::Generated
     auto scene = std::make_shared<Scene>();
     if (const auto volume = d->state->currentVolume())
         scene->voxelSizeMm = volume->voxelSize() / 1000.;
-    Fiber fiber;
+    Fiber fiber = generatedAnnotationFiber(views);
     fiber.key = QStringLiteral("line-annotation:current");
     fiber.label = name;
     fiber.family = family == QStringLiteral("H") ? 'H' : family == QStringLiteral("V") ? 'V' : '?';
     fiber.lengthMm = d->lineArcs.empty() ? 0 : d->lineArcs.back() * scene->voxelSizeMm;
-    Run run;
-    for (size_t i = 0; i < d->linePoints.size(); ++i) {
-        const auto& p = d->linePoints[i];
-        if (!vc3d::line_annotation::finiteGeneratedPoint(p)) {
-            if (run.points.size() > 1)
-                fiber.runs.push_back(std::move(run));
-            run = {};
-            run.firstPoint = int64_t(i + 1);
-        } else
-            run.points.push_back({p[0], p[1], p[2]});
-    }
-    if (run.points.size() > 1)
-        fiber.runs.push_back(std::move(run));
-    for (const auto& cp : views.controlPoints)
-        fiber.markers.push_back({{cp.point[0], cp.point[1], cp.point[2]}, MarkerKind::ControlPoint});
     d->selectedKey = fiber.key;
     scene->fibers.push_back(std::move(fiber));
     d->scene = scene;
