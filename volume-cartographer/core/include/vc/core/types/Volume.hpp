@@ -45,6 +45,13 @@ public:
 
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
+    // Open an existing local volume and apply project-entry metadata (see
+    // vc::project::volumeMetadataFromEntryTags) over its meta.json, as
+    // NewFromUrl does for a remote volume. A catalog volume ID gives a local
+    // copy of a catalog volume the same identity as the streamed volume.
+    static std::shared_ptr<Volume> New(std::filesystem::path path,
+                                       const utils::Json& metadata);
+
     struct PyramidPolicy {
         enum class Reduction {
             Mean,
