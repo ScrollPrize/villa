@@ -2134,7 +2134,12 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold,
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None, track_graph=None, progress=None):
+        crossing_cache=None, track_graph=None, progress=None,
+        rediscover_crossings=True):
+    # rediscover_crossings=False forbids finding exact crossings from these
+    # coordinates: tracks converted out of their stored integer frame take
+    # crossings only from the stored-frame cache, and a cache that cannot
+    # serve them is an error rather than a rebuild.
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2165,6 +2170,10 @@ def prepare_main_phase_tracks(
     if crossing_cache is not None and track_graph is not None:
         raise ValueError('pass either crossing_cache or track_graph, not both')
     if crossing_cache is not None and exclusion_radius > 0:
+        if not rediscover_crossings:
+            raise ValueError(
+                'point-level track exclusion would rediscover crossings from '
+                'converted coordinates; set track_exclusion_radius to 0')
         print(
             'WARNING: track crossing cache cannot be used after point-level '
             'track exclusion; rebuilding crossings from the clipped tracks')
@@ -2262,10 +2271,20 @@ def prepare_main_phase_tracks(
                         f'track crossings: used cached CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
                 except (ValueError, RuntimeError) as error:
+                    if not rediscover_crossings:
+                        raise ValueError(
+                            'the track crossing cache does not cover the '
+                            'selected tracks, and crossings cannot be '
+                            'rediscovered from converted coordinates; rebuild '
+                            f'it for this z range: {error}') from error
                     print(
                         'WARNING: track crossing cache could not be remapped; '
                         f'rebuilding exact crossings: {error}')
             needs_rebuild = crossing_index is None and restricted_csr is None
+            if needs_rebuild and not rediscover_crossings:
+                raise ValueError(
+                    'no track crossing cache for converted coordinates; '
+                    'crossings cannot be rediscovered from them')
             if needs_rebuild and working_families is not None:
                 eligible_families = [
                     working_families[index] for index in surviving_indices]

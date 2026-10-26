@@ -455,8 +455,11 @@ Notes from steps 5–8 that the remaining steps build on:
 - Step 9: each retained overlap pair is a two-point collection (one point on
   each patch, stored endpoint order, zero relative winding) whose chain is just
   that pair, so the relative-winding loss never routes between pairs. Pairs
-  carry `sampling_member_weight` 1/(retained pairs of their edge), honoured by
-  `FitContext._rebuild_pcl_sampling_strata`; the default group is
+  carry `sampling_member_weight` 1/(retained pairs of their edge) and their
+  edge as `sampling_unit`; `build_pcl_sampling_strata` draws units (without
+  replacement, by summed weight) and then one member, so an edge's expected
+  share of a whole batch, not just of its first draw, is independent of its
+  pair count. The default group is
   `patch_overlaps` (`meta.sampling_group` on the edge overrides it), so an
   explicit `pcl_sampling_weights` must name it. `pcl_patch_overlap_pair_spacing`
   and `pcl_patch_overlap_max_pairs` pass through to `overlap_correspondences`;
@@ -469,7 +472,12 @@ Notes from steps 5–8 that the remaining steps build on:
   `object_store_{patch,pcl,fiber}_{uuids,tags}` (a new nullable `strings`
   type) and `normal_ct` is `object_store_normal_ct_{path,level,downsampling,
   volume_uuid}`; `object_store_allow_changed_inputs` is the explicit resume
-  policy. Input toggles off select no patches/fibers; the PCL role toggles
+  policy. Each rank's read and materialization results are gathered before
+  digests are compared, so a failure on any rank fails every rank. Lasagna
+  normals are used for refresh whenever `input_use_normals` and the normal
+  stores are configured, even with the dense-normal loss off; a
+  centerline-only fallback with fibers selected is warned. Input toggles off
+  select no patches/fibers; the PCL role toggles
   must agree, since roles are read from metadata. Detector parameters are
   the store's defaults except the PCL linker's tolerance/window, taken from
   `pcl_link_*`. The manifest (`input_manifest()`) is the snapshot manifest
@@ -484,7 +492,10 @@ Notes from steps 5–8 that the remaining steps build on:
   crossing positions/clearances) by `track_scale_factor`, required for an
   object-store fit with tracks. A non-unit scale with crossings needs the
   stored-frame crossing cache and `track_exclusion_radius` 0, because exact
-  crossing discovery runs only on stored integer coordinates. The umbilicus
+  crossing discovery runs only on stored integer coordinates;
+  `prepare_main_phase_tracks(rediscover_crossings=False)` makes a cache that
+  does not cover the selected tracks an error instead of a rebuild from the
+  converted coordinates. The umbilicus
   (scroll-spec coordinate scale) and lasagna (group downsampling) keep their
   existing declarations; the shell, fiber directions and winding inference
   are recorded as fit-volume voxels under their existing contracts, without

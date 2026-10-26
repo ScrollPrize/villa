@@ -53,7 +53,43 @@ def pcl_sampling_group_weight(group, cfg):
         )
 
 
-def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
+def _sampling_units(indices, member_units, member_weights):
+    # Group pool indices sharing a sampling unit (member_units[index], None =
+    # its own unit) into (units, unit_probs), units being arrays of pool
+    # indices and unit_probs their summed member weights, normalised; None
+    # when every unit is a single member, so those pools draw as before.
+    if member_units is None:
+        return None
+    units = {}
+    for index in indices:
+        unit = member_units[index]
+        units.setdefault(('index', int(index)) if unit is None else ('unit', unit),
+                         []).append(int(index))
+    if all(len(members) == 1 for members in units.values()):
+        return None
+    units = [np.asarray(members, dtype=np.int64) for members in units.values()]
+    weights = np.asarray([
+        1.0 * len(members) if member_weights is None
+        else member_weights[members].sum() for members in units])
+    return units, weights / weights.sum()
+
+
+def _draw_pool(indices, count, probs, units):
+    # count pool indices from one pool. A pool with multi-member units draws
+    # units (without replacement while it can) by summed weight, then one
+    # member of each, so a unit's expected share of a batch follows its
+    # weight however many members it has.
+    if units is None:
+        return np.random.choice(indices, count, replace=count > len(indices), p=probs)
+    unit_arrays, unit_probs = units
+    chosen = np.random.choice(len(unit_arrays), count,
+                              replace=count > len(unit_arrays), p=unit_probs)
+    return np.asarray([unit_arrays[u][np.random.randint(len(unit_arrays[u]))]
+                       for u in chosen], dtype=np.int64)
+
+
+def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None,
+                              member_units=None):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
     # member's sampling group (source json file; all fibers share one 'fibers'
     # group). Members whose group is None are ineligible and excluded. When
@@ -64,12 +100,16 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
     # member_weights (parallel to sampling_groups) sets each member's relative draw
     # probability within its stratum (and within the combined pool); used to give a
     # fiber-link component the sampling pressure of its member count rather than a
-    # single strip's. None means uniform.
+    # single strip's. None means uniform. member_units (parallel, None entries
+    # for members of their own) groups members drawn as one unit: units are
+    # drawn by summed member weight, then one member uniformly (patch-overlap
+    # pairs of one edge, so an edge's share does not grow with its pairs).
     # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
     # per stratum], 'weights': float weight per stratum, 'member_probs': [per-stratum
-    # draw probabilities or None], 'all': all eligible indices, 'all_probs': draw
-    # probabilities over 'all' or None, 'effective_size': eligible member count
-    # after expanding component multiplicities}.
+    # draw probabilities or None], 'member_units': [per-stratum units or None],
+    # 'all': all eligible indices, 'all_probs': draw probabilities over 'all' or
+    # None, 'all_units', 'effective_size': eligible member count after expanding
+    # component multiplicities}.
     sampling_groups = list(sampling_groups)
     if member_weights is not None:
         member_weights = np.asarray(list(member_weights), dtype=np.float64)
@@ -80,13 +120,14 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
             continue
         group_to_indices.setdefault(group, []).append(idx)
     weighted = cfg['pcl_sampling_weights'] is not None
-    strata, groups, weights, member_probs = [], [], [], []
+    strata, groups, weights, member_probs, units = [], [], [], [], []
     for group, indices in group_to_indices.items():
         weight = pcl_sampling_group_weight(group, cfg) if weighted else 1.0
         if weighted and weight <= 0:
             continue  # switched off
         indices = np.asarray(indices, dtype=np.int64)
         strata.append(indices)
+        units.append(_sampling_units(indices, member_units, member_weights))
         groups.append(group)
         weights.append(weight)
         if member_weights is None:
@@ -107,8 +148,10 @@ def build_pcl_sampling_strata(sampling_groups, cfg, member_weights=None):
         'groups': groups,
         'weights': np.asarray(weights, dtype=np.float64),
         'member_probs': member_probs,
+        'member_units': units,
         'all': all_indices,
         'all_probs': all_probs,
+        'all_units': _sampling_units(all_indices, member_units, member_weights),
         'effective_size': effective_size,
     }
 
@@ -121,9 +164,9 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
     # the bundle carries them, skew the within-pool draws.
     weighted = cfg['pcl_sampling_weights'] is not None
     if not weighted and not cfg['pcl_stratified_pcl_sampling']:
-        return np.random.choice(sampling_strata['all'], num_to_sample,
-                                replace=num_to_sample > len(sampling_strata['all']),
-                                p=sampling_strata['all_probs'])
+        return _draw_pool(sampling_strata['all'], num_to_sample,
+                          sampling_strata['all_probs'],
+                          sampling_strata.get('all_units'))
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
         len(strata), dtype=np.float64)
@@ -134,9 +177,11 @@ def _choose_pcl_indices(sampling_strata, num_to_sample, cfg):
         frac = shares - quotas
         probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
         quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
+    units = sampling_strata.get('member_units') or [None] * len(strata)
     chosen = [
-        np.random.choice(stratum, quota, replace=quota > len(stratum), p=probs)
-        for stratum, quota, probs in zip(strata, quotas, sampling_strata['member_probs'])
+        _draw_pool(stratum, quota, probs, stratum_units)
+        for stratum, quota, probs, stratum_units in zip(
+            strata, quotas, sampling_strata['member_probs'], units)
         if quota > 0
     ]
     return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)

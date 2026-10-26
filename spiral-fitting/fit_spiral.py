@@ -1381,7 +1381,8 @@ class FitContext:
         # patch pairs regardless of pcl size, so without this a component would
         # get ~1/N the pair-sampling pressure its N members had before merging.
         # A collection's explicit sampling_member_weight (patch-overlap pairs,
-        # which share one edge's weight) takes precedence.
+        # which share one edge's weight) takes precedence, and pairs sharing a
+        # sampling_unit (their edge) are drawn edge first, then pair.
         self.pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
             [pcl['sampling_group'] if len(pcl['points']) > 1 else None
              for pcl in self.cross_patch_pcls],
@@ -1389,6 +1390,8 @@ class FitContext:
             member_weights=[pcl.get('sampling_member_weight')
                             or len(pcl.get('link_member_cids', ())) or 1
                             for pcl in self.cross_patch_pcls],
+            member_units=[pcl.get('sampling_unit')
+                          for pcl in self.cross_patch_pcls],
         )
         self._rebuild_unattached_components()
         # Weight each component by its member count so a linked component keeps
@@ -1806,6 +1809,9 @@ class FitContext:
         track_reload_source = None
         track_reload_families = None
         track_reload_source_ids = None
+        # Stored track ZYX = fit ZYX x this; crossings are rediscovered from
+        # the loaded coordinates only while it is 1 (prepare_main_phase_tracks).
+        self.track_frame_scale = 1
         if self.tracks_dbm_path is not None:
             progress.begin(
                 'loading', 'Resolving track store',
@@ -1815,6 +1821,7 @@ class FitContext:
             # their stored frame (ROI included) and convert to fit voxels.
             track_scale = (self._object_store_track_scale()
                            if self.object_store_inputs is not None else 1)
+            self.track_frame_scale = track_scale
             track_z_lo, track_z_hi = track_store_z_range(
                 self.z_begin, self.z_end, track_scale)
             if track_scale != 1:
@@ -3232,6 +3239,7 @@ class FitContext:
                 crossing_cache=self.track_crossing_cache,
                 track_graph=self.track_graph,
                 progress=self.progress,
+                rediscover_crossings=getattr(self, 'track_frame_scale', 1) == 1,
             )
             # The sidecar CSR is setup-only. The prepared bundle now owns only its
             # fixed-width training tables, so release the whole-DB graph promptly.
@@ -4252,7 +4260,8 @@ class FitContext:
                         sampling_config=validate_track_sampling_config(self.config),
                         track_families=self.track_families,
                         track_source_ids=self.track_source_ids, crossing_cache=self.track_crossing_cache,
-                        track_graph=self.track_graph, progress=self.progress)
+                        track_graph=self.track_graph, progress=self.progress,
+                        rediscover_crossings=getattr(self, 'track_frame_scale', 1) == 1)
                 before_verified = set(candidate.verified_patches)
                 candidate._input_warnings.extend(candidate._build_theta_crossing_map())
                 rejected_verified = before_verified - set(candidate.verified_patches)
@@ -4701,7 +4710,8 @@ class FitContext:
                     track_source_ids=self.track_source_ids,
                     crossing_cache=self.track_crossing_cache,
                     track_graph=self.track_graph,
-                    progress=self.progress)
+                    progress=self.progress,
+                    rediscover_crossings=getattr(self, 'track_frame_scale', 1) == 1)
                 replace_prepared_tracks = True
 
             target_tracks = (

@@ -240,6 +240,8 @@ def test_fiber_refresh_records_the_chosen_normal_source(tmp_path):
     log = []
     inputs = load(path, log)
     assert 'fiber-patch normals: none (centerline-only linking)' in log
+    assert any(line.startswith('WARNING: fiber-patch links are refreshed '
+                               'centerline-only') for line in log)
     assert inputs.manifest['link_refresh']['fiber_patch_normals'] == {
         'kind': 'none', 'ct_volume': None}
     with ObjectStore.open(path, read_only=True) as db:
@@ -293,6 +295,15 @@ def _two_ranks(tmp_path, configs):
     return outcome
 
 
+def test_a_rank_local_read_failure_reaches_every_rank(store_path, tmp_path):
+    # Rank 1 alone cannot open its store, after rank 0 refreshed.
+    configs = [fit_config(store_path),
+               fit_config(str(tmp_path / 'absent.vcobj'))]
+    first, second = _two_ranks(tmp_path, configs)
+    assert 'error' in first and first == second
+    assert all(line.startswith('rank 1: ') for line in first['error'])
+
+
 def test_two_ranks_refresh_once_and_agree(store_path, tmp_path):
     config = fit_config(store_path)
     first, second = _two_ranks(tmp_path, [config, config])
@@ -342,6 +353,43 @@ def test_track_scale_converts_positions_roi_and_crossing_distances():
     assert converted['positions'].tolist() == [2.0, 4.0]
     assert converted['clearances'].tolist() == [1.0, 0.5]
     assert converted['self_local'] is cache['self_local']
+
+
+def test_converted_tracks_never_rediscover_crossings(tmp_path):
+    """A cache that cannot serve the selected tracks is an error once the
+    coordinates left their stored integer frame, not a rebuild from them."""
+    from build_track_crossings import build_cache
+    from test_track_crossing_cache import TrackCrossingCacheTests
+    from tracks import (load_track_crossing_cache, load_tracks_from_dbm,
+                        prepare_main_phase_tracks, tracks_in_fit_frame)
+    path = TrackCrossingCacheTests.make_db(None, tmp_path)
+    build_cache(path, show_progress=False)
+    cache = load_track_crossing_cache(path)
+    tracks, families, source_ids = load_tracks_from_dbm(
+        path, 0, 20, return_families=True, return_source_ids=True,
+        show_progress=False)
+    policy = {'track_crossing_precompute_max': 1,
+              'track_max_track_crossing_per_step': 1}
+
+    def prepare(crossing_cache, ids, **options):
+        return prepare_main_phase_tracks(
+            tracks_in_fit_frame(tracks, 2.0), None, 0.0, 'cpu',
+            sampling_config=policy, track_families=families,
+            track_source_ids=ids, crossing_cache=crossing_cache, **options)
+
+    # The cache serves its own tracks either way.
+    assert 'crossing_index' in prepare(cache, source_ids, rediscover_crossings=False)
+    # Tracks the cache does not cover (here: ids it never saw).
+    foreign = np.asarray(source_ids, dtype=np.uint64) + np.uint64(1 << 40)
+    with pytest.raises(ValueError, match='does not cover the selected tracks'):
+        prepare(cache, foreign, rediscover_crossings=False)
+    with pytest.raises(ValueError, match='no track crossing cache'):
+        prepare(None, source_ids, rediscover_crossings=False)
+    with pytest.raises(ValueError, match='track_exclusion_radius'):
+        prepare_main_phase_tracks(
+            tracks, None, 4.0, 'cpu', sampling_config=policy,
+            track_families=families, track_source_ids=source_ids,
+            crossing_cache=cache, rediscover_crossings=False)
 
 
 def test_attached_tracks_need_a_declared_scale(tmp_path):

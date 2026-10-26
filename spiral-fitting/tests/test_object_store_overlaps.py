@@ -129,7 +129,7 @@ def test_pairs_off_sampled_quads_are_dropped(db):
     assert_pairs_lie_on_their_patches(inputs)
     assert inputs.dropped_attachments == []
     assert all(pcl['sampling_member_weight'] == pytest.approx(1 / len(kept))
-               for pcl in kept)
+               and pcl['sampling_unit'] == edge['uuid'] for pcl in kept)
     assert inputs.counts['patch overlaps'] == 1
     assert inputs.counts['overlap pairs'] == len(kept)
     assert a in inputs.patches
@@ -198,15 +198,18 @@ def test_edges_weigh_the_same_whatever_their_pair_count(db, tmp_path):
     counts = {edge['uuid']: len([p for p in pairs if p['metadata']['edge_uuid'] == edge['uuid']])
               for edge in edges}
     assert len(set(counts.values())) == 2 and min(counts.values()) >= 1
-    strata = context.pcl_sampling_strata['cross_patch']
-    [stratum] = [i for i, group in enumerate(strata['groups'])
-                 if group == osi.PATCH_OVERLAP_GROUP]
-    probabilities = {}
-    for index, probability in zip(strata['strata'][stratum],
-                                  strata['member_probs'][stratum]):
-        edge = context.cross_patch_pcls[index]['metadata']['edge_uuid']
-        probabilities[edge] = probabilities.get(edge, 0.0) + probability
-    assert probabilities == pytest.approx({edge: 0.5 for edge in counts})
+    # Every draw of a batch, not just the first, picks the two edges equally,
+    # stratified or from the combined pool.
+    import losses
+    for stratified in (True, False):
+        cfg = dict(context.config, pcl_stratified_pcl_sampling=stratified)
+        np.random.seed(0)
+        drawn = {edge: 0 for edge in counts}
+        for _ in range(2000):
+            for index in losses._choose_pcl_indices(
+                    context.pcl_sampling_strata['cross_patch'], 2, cfg):
+                drawn[context.cross_patch_pcls[index]['metadata']['edge_uuid']] += 1
+        assert min(drawn.values()) / max(drawn.values()) > 0.97, drawn
     # Each pair is its own two-node chain on two patches.
     for pcl in pairs:
         assert len(pcl['chain'].iter_chain()) == 2
@@ -240,3 +243,29 @@ def test_an_overlap_across_the_seam_is_satisfied_by_the_same_sheet(db, tmp_path)
     # Without the seam corrections the patches would be a winding (12 voxels) apart.
     assert max(losses['rel_winding']) < 0.5
     assert max(losses['rel_winding']) >= 0.0
+
+
+def test_sampling_units_draw_units_then_members():
+    """The reviewer's case: edges of 1 and 16 pairs, two draws per step."""
+    import losses
+    cfg = {'pcl_sampling_weights': None, 'pcl_stratified_pcl_sampling': True}
+    groups = [osi.PATCH_OVERLAP_GROUP] * 17
+    weights = [1.0] + [1 / 16] * 16
+    units = ['small'] + ['large'] * 16
+    strata = losses.build_pcl_sampling_strata(groups, cfg, weights, units)
+    assert strata['effective_size'] == 2
+    np.random.seed(1)
+    drawn = {'small': 0, 'large': 0}
+    for _ in range(5000):
+        for index in losses._choose_pcl_indices(strata, 2, cfg):
+            drawn[units[index]] += 1
+    assert drawn == {'small': 5000, 'large': 5000}
+    # Pools without multi-member units draw exactly as before.
+    plain = losses.build_pcl_sampling_strata(groups, cfg, weights,
+                                             [None] * 17)
+    assert plain['member_units'] == [None] and plain['all_units'] is None
+    np.random.seed(2)
+    expected = np.random.choice(plain['strata'][0], 3, replace=False,
+                                p=plain['member_probs'][0])
+    np.random.seed(2)
+    np.testing.assert_array_equal(losses._choose_pcl_indices(plain, 3, cfg), expected)

@@ -205,10 +205,7 @@ class InputSnapshot:
 
     def digest(self):
         """SHA-256 of the manifest without the store's local path."""
-        manifest = self.manifest()
-        manifest['store'] = {'uuid': self.store_uuid}
-        text = json.dumps(manifest, sort_keys=True, separators=(',', ':'))
-        return hashlib.sha256(text.encode()).hexdigest()
+        return manifest_digest(self.manifest())
 
 
 def resolve_selector(store, kind, selector):
@@ -865,8 +862,9 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     collection of two points, the pair's point on either patch, with zero
     relative winding: the relative-winding loss then compares exactly that
     correspondence along its own two-node chain. Every pair of an edge
-    carries ``sampling_member_weight`` 1 / (its retained pairs), so an edge
-    weighs the same however many pairs it produces.
+    carries ``sampling_member_weight`` 1 / (its retained pairs) and the
+    edge's UUID as ``sampling_unit``: the sampler draws edges, then one pair
+    of each, so an edge weighs the same however many pairs it produces.
 
     A pair on a quad either patch's losses do not sample is dropped; an edge
     losing every pair is appended to ``dropped``. Edge errors, and pairs
@@ -924,6 +922,7 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
                 'color': [0.0, 0.0, 0.0], 'source_file': None,
                 'sampling_group': group,
                 'sampling_member_weight': 1.0 / len(kept),
+                'sampling_unit': rel.uuid,
                 'metadata': {
                     'winding_is_absolute': False,
                     'input_role': 'patch_overlap',
@@ -1209,7 +1208,9 @@ class NormalSource:
 def fiber_normal_source(config, lasagna=None, volume_uuid=None):
     """The fiber-patch normal source: lasagna, else normal CT, else none.
 
-    ``lasagna`` describes the fit's lasagna normals when it loads them:
+    ``lasagna`` describes the fit's lasagna normals when they are configured
+    (input_use_normals with normal stores, whether or not the dense-normal
+    loss is on):
     ``{'normal_x', 'normal_y', 'group', 'scale'}``, ``scale`` being the
     group's downsampling relative to the fit volume. The store decodes them
     as the fitter does. Lasagna and CT normals are exclusive; a configured
@@ -1372,6 +1373,11 @@ def _startup_phase(config, request, lasagna, cache_directory, log):
         log(normal.describe())
         if normal.note:
             log(normal.note)
+        if (normal.kind == 'none' and snapshot.objects_of('fiber')
+                and snapshot.objects_of('patch')):
+            log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
+                'loads no lasagna normals (input_use_normals with normal_x/normal_y '
+                'stores) and object_store_normal_ct_path is unset')
         outcomes = refresh_links(store, snapshot, config, normal, cache_directory)
     lines, problems = refresh_report(outcomes)
     if problems:
@@ -1508,14 +1514,30 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
         for line in status['lines']:
             log(line)
 
-    request = request_from_config(config)
-    with ObjectStore.open(config['object_store_path'], read_only=True) as store:
-        snapshot = read_snapshot(store, request, status['uuids'])
-        normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
-        inputs = materialize_from_config(store, snapshot, config)
-    inputs.manifest = input_manifest(snapshot, config, normal, external_frames)
-    inputs.digest = manifest_digest(inputs.manifest)
-    digests = _all_gather(inputs.digest, dist)
+    # Every rank reads and materializes on its own; a failure on any rank is
+    # gathered with the others' results, so all ranks fail together instead
+    # of some entering a collective the failed rank never joins.
+    inputs, outcome = None, None
+    try:
+        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+            snapshot = read_snapshot(store, request_from_config(config), status['uuids'])
+            normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+            inputs = materialize_from_config(store, snapshot, config)
+        inputs.manifest = input_manifest(snapshot, config, normal, external_frames)
+        inputs.digest = manifest_digest(inputs.manifest)
+        outcome = {'digest': inputs.digest}
+    except ObjectStoreInputError as error:
+        outcome = {'problems': error.problems}
+    except Exception as error:  # noqa: BLE001 - other ranks must hear of it
+        outcome = {'problems': [f'{type(error).__name__}: {error}']}
+    outcomes = _all_gather(outcome, dist)
+    failed = [(rank, result['problems']) for rank, result in enumerate(outcomes)
+              if 'problems' in result]
+    if failed:
+        raise ObjectStoreInputError([
+            (f'rank {rank}: {problem}' if len(outcomes) > 1 else problem)
+            for rank, problems in failed for problem in problems])
+    digests = [result['digest'] for result in outcomes]
     if len(set(digests)) > 1:
         raise ObjectStoreInputError([
             'ranks read different object-store inputs: '
