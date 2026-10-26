@@ -136,6 +136,7 @@ class StoredObject:
     object_revision: str
     geometry_revision: str
     frame: ObjectFrame = None
+    fiber: dict = None
 
     def provenance(self):
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
@@ -396,7 +397,8 @@ def read_snapshot(store, request, uuids=None):
             uuid=record['uuid'], kind=record['kind'], name=record['name'],
             meta=record['meta'] or {}, tags=list(record.get('tags') or ()),
             object_revision=revision['uuid'],
-            geometry_revision=revision['geometry_revision'], frame=frame)
+            geometry_revision=revision['geometry_revision'], frame=frame,
+            fiber=record.get('fiber'))
     if problems:
         raise ObjectStoreInputError(problems)
 
@@ -721,7 +723,7 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
     ``links`` are resolved branch links keyed by resident collection id and
     raw line index.
     """
-    from vc_object_store import fiber_branch_control_index
+    from vc_object_store import fiber_branch_control_index, fiber_hv_classification
     from spiral_helpers import (_decimate_ordered_points_min_spacing,
                                 fiber_control_span)
 
@@ -817,11 +819,15 @@ def materialize_fibers(store, snapshot, patches, *, min_point_spacing,
                 counts['fiber attachments'] += len(own_contacts[raw])
             points[raw] = point
         source = obj.meta.get('source') or {}
+        hv = source.get('hv_classification') or {}
+        if obj.fiber is not None:
+            hv = fiber_hv_classification(
+                hv, obj.fiber['family'], obj.fiber['manual_family'])
         catalog[obj.uuid] = {
             'id': cid, 'name': obj.name, 'points': points,
             'color': [0.0, 0.0, 0.0], 'source_file': None,
             'metadata': {
-                'hv_classification': source.get('hv_classification') or {},
+                'hv_classification': hv,
                 'logical_input_revision': obj.object_revision,
                 'object_uuid': obj.uuid,
                 'geometry_revision': obj.geometry_revision,

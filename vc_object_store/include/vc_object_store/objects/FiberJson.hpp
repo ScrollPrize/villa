@@ -6,6 +6,11 @@ namespace vc::objects {
 // remain ObjectStore operations. Source annotations contain no coordinate arrays.
 size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor&);
 
+// Restore H/V tags from authoritative typed fields, retaining source confidence
+// and scores. This only assembles metadata; it does not classify geometry.
+nlohmann::json fiberHvClassification(nlohmann::json sourceClassification,
+                                   const std::string& family, bool manualFamily);
+
 GeometrySource decodeFiberJson(const std::string& json);
 // The fibers outside a prepared fiber batch that its branches link to: the
 // existing endpoints a checked ingestGeometryBatch caller must pin.

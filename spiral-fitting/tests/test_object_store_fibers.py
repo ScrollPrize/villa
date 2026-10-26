@@ -146,3 +146,49 @@ def test_fiber_across_the_seam_links_consecutive_windings(db, tmp_path):
     # Without the seam correction the pair would be a winding (12 voxels) off.
     assert max(losses['rel_winding']) < 0.5
     assert len(context.cross_patch_pcls) == 1
+
+
+@pytest.mark.parametrize('manual,certainty,expected', [
+    (True, 0.1, 'V'), (False, 0.9, 'V'), (False, 0.1, 'H'),
+])
+def test_hv_metadata_uses_pinned_typed_fields(db, tmp_path, manual, certainty, expected):
+    import json
+    from spiral_helpers import classify_fiber_hv
+
+    source_hv = {'automatic_certainty': certainty, 'automatic_score': 0.7,
+                 'manual_tag': 'H', 'automatic_tag': 'H'}
+    uid = put_fiber(db, _dense_line(10), [0, 9],
+                    meta={'source': {'hv_classification': source_hv}},
+                    fiber={'family': 'V', 'manual_family': manual})
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    revision = snapshot.objects[uid].object_revision
+
+    # Change the moving head after capture; materialization must use the pin.
+    record = db.object(uid)
+    record['fiber']['family'] = 'H'
+    db.upsert_object(record)
+    catalog, _, _ = osi.materialize_fibers(db, snapshot, {}, min_point_spacing=0.0)
+    hv = catalog[uid]['metadata']['hv_classification']
+    assert hv['automatic_certainty'] == certainty
+    assert hv['automatic_score'] == 0.7
+    assert hv['manual_tag'] == ('V' if manual else '')
+    assert hv['automatic_tag'] == ('H' if manual else 'V')
+    assert classify_fiber_hv(hv, _dense_line(10), min_z_fraction=0.8,
+                             min_auto_certainty=0.5) == expected
+
+    from pcl_views import fiber_strip
+    strip = fiber_strip(0, catalog[uid], set(), z_begin=0, z_end=100,
+                        z_margin=0, min_point_spacing=0,
+                        vertical_min_z_fraction=0.8,
+                        vertical_min_auto_certainty=0.5,
+                        vertical_radial_offset=3.0)
+    assert strip['hv_tag'] == expected
+    np.testing.assert_array_equal(
+        strip['radial_offsets'], np.full(10, 3.0 if expected == 'V' else 0.0))
+
+    output = tmp_path / 'fiber.json'
+    db.export_geometry(uid, output, object_revision_uuid=revision)
+    assert json.loads(output.read_text())['hv_classification'] == hv
+    fresh, _, _ = osi.materialize_fibers(
+        db, osi.read_snapshot(db, osi.InputRequest()), {}, min_point_spacing=0.0)
+    assert fresh[uid]['metadata']['hv_classification'] != hv

@@ -311,6 +311,11 @@ NB_MODULE(_native, m)
         return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume);
     }, nb::arg("metadata"), nb::arg("volume_uuid"));
 
+    m.def("fiber_hv_classification", [](const nb::dict& source, const std::string& family, bool manualFamily) {
+        return jsonLoads(vo::fiberHvClassification(
+            nlohmann::json::parse(jsonDumps(source)), family, manualFamily).dump());
+    }, nb::arg("source_classification"), nb::arg("family"), nb::arg("manual_family"));
+
     m.def("fiber_branch_control_index", [](const std::vector<int64_t>& controlIds, const nb::dict& anchor) {
         return vo::fiberBranchControlIndex(controlIds, anchorFromPy(anchor));
     }, nb::arg("control_point_ids"), nb::arg("anchor"),

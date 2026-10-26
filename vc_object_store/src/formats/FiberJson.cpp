@@ -170,6 +170,13 @@ std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::st
                           detail::fiberMetadata(db, txn, revision->record, *geometry).dump());
 }
 
+Json fiberHvClassification(Json sourceClassification, const std::string& family, bool manualFamily)
+{
+    sourceClassification["manual_tag"] = manualFamily ? family : "";
+    if (!manualFamily) sourceClassification["automatic_tag"] = family;
+    return sourceClassification;
+}
+
 namespace detail {
 Json fiberMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& record, const GeometryRevision& geometry)
 {
@@ -190,8 +197,8 @@ Json fiberMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& re
         source["width"] = fiber.width; source["width_gap_fraction"] = fiber.widthGapFraction;
         if (!fiber.optimizationMode.empty()) source["optimization_mode"] = fiber.optimizationMode;
         else source.erase("optimization_mode");
-        source["hv_classification"]["manual_tag"] = fiber.manualFamily ? fiber.family : "";
-        if (!fiber.manualFamily) source["hv_classification"]["automatic_tag"] = fiber.family;
+        source["hv_classification"] = fiberHvClassification(
+            source.value("hv_classification", Json()), fiber.family, fiber.manualFamily);
     }
     return source;
 }
