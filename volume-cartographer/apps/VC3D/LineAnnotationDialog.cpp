@@ -996,6 +996,23 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         settings.setValue(vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES, checked);
         applyLinkedCursorMirroringToPanes();
     });
+    auto* openEditableAction = annotationMenu->addAction(tr("Open fibers editable"));
+    openEditableAction->setCheckable(true);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        openEditableAction->setChecked(
+            settings
+                .value(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE,
+                       vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE_DEFAULT)
+                .toBool());
+    }
+    openEditableAction->setToolTip(
+        tr("Checked: stored fibers open with editing enabled.\n"
+           "Unchecked: they open read-only until Enable editing is clicked."));
+    connect(openEditableAction, &QAction::toggled, this, [](bool checked) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE, checked);
+    });
     _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
     _resetViewsAction->setEnabled(false);
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
@@ -1168,7 +1185,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _enableEditingButton->setObjectName(QStringLiteral("lineAnnotationEnableEditingButton"));
     _enableEditingButton->setToolTip(
         tr("Stored fibers open read-only, so opening one never re-solves or rewrites it. "
-           "Enable editing to change it."));
+           "Enable editing to change it, or check \"Open fibers editable\" in the menu."));
     _enableEditingButton->hide();
     buttonLayout->addWidget(_enableEditingButton);
     connect(_enableEditingButton, &QPushButton::clicked, this, &LineAnnotationDialog::editingRequested);

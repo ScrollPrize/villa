@@ -311,6 +311,9 @@ public:
                              QObject* parent = nullptr);
     ~LineAnnotationController() override;
 
+    // Whether a line annotation can start in this viewer, ignoring the object store.
+    bool viewerSupportsLaunch(const CChunkedVolumeViewer* viewer) const;
+    // viewerSupportsLaunch, with an object store attached.
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
@@ -373,8 +376,9 @@ public:
     // points against.
     [[nodiscard]] std::optional<std::vector<cv::Vec3d>> fiberMapLinePoints(uint64_t fiberId) const;
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
-    // Stored fibers open read-only. Enables editing in the most recent pane of
-    // this fiber (as its Enable editing button does); false when it cannot.
+    // Stored fibers open read-only unless the user's Open fibers editable
+    // setting is on. Enables editing in the most recent pane of this fiber
+    // (as its Enable editing button does); false when it cannot.
     bool enableFiberEditing(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
@@ -1184,6 +1188,11 @@ private:
     [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
         const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
     [[nodiscard]] std::optional<StoredFiber> readStoredFiber(uint64_t id, bool lines = false) const;
+    // readStoredFibers() for hot UI paths: reuses decoded fibers whose object
+    // generation is unchanged. Cleared on every store commit and attachment,
+    // and when the open volume changes.
+    [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
+        const std::vector<std::string>& uuids, bool lines = false) const;
     // Active fibers bound to the current volume whose bounds overlap a box in
     // volume voxels.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
@@ -1579,6 +1588,10 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
+    // See readStoredFibersCached: decoded fibers keyed by uuid.
+    mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
+    // The volume id _storedFiberDecodeCache was decoded in.
+    mutable std::string _storedFiberDecodeVolume;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {
@@ -1607,6 +1620,8 @@ private:
         vc3d::line_annotation::FiberOptimizationMode)>
         _mergeModePicker;
     bool _errorDialogsSuppressed = false;
+    // Off while changed store fibers reopen: each keeps the editing state it had.
+    bool _applyOpenFibersEditable = true;
     // A merge or split from its menu callback to the end of its commit; the
     // second one refuses, and deletes/renames/imports refuse meanwhile.
     bool _structuralEditInProgress = false;

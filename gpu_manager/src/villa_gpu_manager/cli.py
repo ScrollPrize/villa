@@ -23,6 +23,9 @@ def main(argv=None):
     serve.add_argument("--controller-uid", type=int, action="append", default=[])
     serve.add_argument("--shared-group", action="store_true")
     sub.add_parser("status")
+    constraints = sub.add_parser("constraints", help="show/write service-owner auto-reloaded constraints")
+    constraints.add_argument("--gpu-uuids", nargs="*", default=None,
+                             help="allowed physical UUIDs; empty list disables grants")
     for name in ("pause", "resume"):
         sub.add_parser(name).add_argument("task")
     request = sub.add_parser("request")
@@ -34,6 +37,26 @@ def main(argv=None):
     setting.add_argument("--until-task")
     overrides.add_parser("clear")
     args = parser.parse_args(argv)
+    if args.command == "constraints":
+        from .constraints import config_path
+        path = config_path()
+        if args.gpu_uuids is not None:
+            if len(set(args.gpu_uuids)) != len(args.gpu_uuids) or any(
+                    not g.startswith("GPU-") for g in args.gpu_uuids):
+                parser.error("supply unique physical GPU UUIDs")
+            import tempfile
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+                temporary = Path(out.name)
+                json.dump({"allowed_gpu_uuids": args.gpu_uuids}, out, indent=2)
+                out.write("\n")
+            try:
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print(f"Constraints file: {path}")
+        print(path.read_text() if path.exists() else "No file; service uses journaled/default constraints.")
+        return 0
     if args.socket is None:
         args.socket = default_socket_path()
     if args.command == "serve":

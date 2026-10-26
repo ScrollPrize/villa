@@ -10,6 +10,8 @@
 #include <sqlite3.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +63,24 @@ int fakeSsh(int argc, char** argv)
     }
     if (const char* mask = std::getenv("VC_SFTP_TEST_UMASK")) umask(mode_t(std::stoi(mask, nullptr, 8)));
     const char* server = std::getenv("VC_SFTP_TEST_SERVER");
+    if (const char* latency = std::getenv("VC_SFTP_TEST_LATENCY_MS")) {
+        // A slow link: every server response waits before it is relayed.
+        int out[2];
+        if (pipe(out)) return 44;
+        if (fork() == 0) {
+            dup2(out[1], 1); close(out[0]); close(out[1]);
+            execl(server, server, "-e", static_cast<char*>(nullptr));
+            _exit(43);
+        }
+        close(out[1]);
+        std::array<char, 65536> buffer;
+        for (ssize_t n; (n = read(out[0], buffer.data(), buffer.size())) > 0;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::stoi(latency)));
+            for (ssize_t done = 0, w; done < n; done += w)
+                if ((w = write(1, buffer.data() + done, size_t(n - done))) <= 0) return 0;
+        }
+        return 0;
+    }
     execl(server, server, "-e", static_cast<char*>(nullptr));
     return 43;
 }
@@ -246,6 +266,52 @@ void hosting(const std::filesystem::path& root)
     hubPull(alice);
     hubPull(bob);
     require(meta(alice, a) == meta(bob, a) && meta(alice, b) == meta(bob, b), "concurrent syncs converge");
+
+    // A pull reads hub geometry before it locks the replica, so local edits
+    // during a pull over a slow link wait only for the local install.
+    {
+        setenv("VC_SFTP_TEST_LATENCY_MS", "20", 1);
+        const auto carolPath = root / "carol.vcobj";
+        cloneHub("sftp://slow@test-host" + sftp::encodePath(hubPath.string()), carolPath, as("carol"));
+        const auto d = util::newUuid();
+        vc::geometry::Fiber long_;
+        for (int i = 0; i < 2000; ++i) {
+            long_.controlPoints.push_back({double(i), 0, 0});
+            long_.controlPointIds.push_back(i + 1);
+        }
+        {
+            auto txn = bob.write();
+            ObjectRecord record; record.uuid = d; record.kind = "fiber";
+            bob.upsertObject(txn, record);
+            bob.putGeometry(txn, d, vc::geometry::encode(long_));
+            txn.commit();
+        }
+        hubSync(bob);
+        auto carol = ObjectStore::open(carolPath, as("carol"));
+        const auto e = util::newUuid();
+        {
+            auto txn = carol.write();
+            ObjectRecord record; record.uuid = e; record.kind = "fiber";
+            carol.upsertObject(txn, record);
+            txn.commit();
+        }
+        auto impatient = as("carol"); impatient.busyTimeoutMs = 500;
+        auto editor = ObjectStore::open(carolPath, impatient);
+        std::atomic<bool> pulling = true;
+        std::exception_ptr pullFailure;
+        int edits = 0;
+        {
+            std::jthread pull([&] {
+                try { hubPull(carol); } catch (...) { pullFailure = std::current_exception(); }
+                pulling = false;
+            });
+            while (pulling) setNote(editor, e, std::to_string(edits++));
+        }
+        unsetenv("VC_SFTP_TEST_LATENCY_MS");
+        if (pullFailure) std::rethrow_exception(pullFailure);
+        auto txn = carol.read();
+        require(edits > 1 && carol.currentGeometry(txn, d), "local edits proceed during a slow pull");
+    }
 
     // A journal takes the hub's permission bits, whatever the server's umask, so
     // every user who may write the hub can also roll back a journal left behind.

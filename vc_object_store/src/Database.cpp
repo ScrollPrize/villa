@@ -6,6 +6,7 @@
 #include "hub/HubRules.hpp"
 
 namespace vc::objects {
+thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 using namespace detail;
 ObjectStore::ObjectStore(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ObjectStore::~ObjectStore() = default;

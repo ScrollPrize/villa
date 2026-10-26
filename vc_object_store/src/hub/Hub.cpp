@@ -105,9 +105,22 @@ std::vector<HubConflict> conflicts(ObjectStore& replica, const Txn& txn)
     return result;
 }
 
+// Read the hub geometry of objects whose local record differs, before the
+// replica write begins: over SSH that takes seconds, and every local edit
+// waits on the replica's write lock meanwhile.
+void stageHubGeometry(GeometryStage& geometry, ObjectStore& replica, const ReadTxn& hubTxn,
+                      const std::map<std::string, Json>& hubRecords, int64_t afterRow)
+{
+    auto local = replica.read();
+    for (const auto& [id, record] : hubRecords)
+        if (!record.is_null() && isObjectRecord(record) && syncRecord(replica, local, id) != record)
+            geometry.read(conn(hubTxn), conn(local), id, afterRow);
+}
+
 // Install hub records for ids in one replica write. hubRecords holds the hub's
-// sync JSON (null for absent records); geometry is copied from afterRow.
-void installHubRecords(ObjectStore& replica, WriteTxn& txn, ObjectStore& hub, const ReadTxn& hubTxn,
+// sync JSON (null for absent records); geometry is copied from afterRow, from
+// the stage when stageHubGeometry read it.
+void installHubRecords(ObjectStore& replica, WriteTxn& txn, GeometryStage& geometry, const ReadTxn& hubTxn,
                        const std::map<std::string, Json>& hubRecords, int64_t afterRow)
 {
     auto before = Json::object(), merged = Json::object();
@@ -117,8 +130,12 @@ void installHubRecords(ObjectStore& replica, WriteTxn& txn, ObjectStore& hub, co
         if (!record.is_null()) merged[id] = record;
     }
     applyObjects(replica, txn, before, merged);
-    for (const auto& [id, record] : merged.items())
-        if (isObjectRecord(record)) transferGeometry(conn(hubTxn), conn(txn), id, afterRow);
+    for (const auto& [id, record] : merged.items()) {
+        if (!isObjectRecord(record)) continue;
+        // A record changed locally since staging is read under the lock.
+        if (!geometry.contains(id)) geometry.read(conn(hubTxn), conn(txn), id, afterRow);
+        geometry.install(conn(txn), id);
+    }
     applyHeadsAndEdges(replica, txn, before, merged);
     for (const auto& [id, record] : hubRecords)
         if (syncRecord(replica, txn, id) != record) throw std::runtime_error("hub: installed state differs from the hub for " + id);
@@ -377,6 +394,8 @@ HubSyncReport hubPull(ObjectStore& replica)
         versions[id] = hubVersion(conn(hubTxn), id);
     }
     const auto leases = readLeases(conn(hubTxn));
+    GeometryStage geometry;
+    stageHubGeometry(geometry, replica, hubTxn, hubRecords, up.cursor.geometry);
 
     auto txn = replica.write();
     pool(txn).hubApply = true;
@@ -399,7 +418,7 @@ HubSyncReport hubPull(ObjectStore& replica)
         install[id] = record;
         version.run(id, versions.at(id));
     }
-    installHubRecords(replica, txn, *hub, hubTxn, install, up.cursor.geometry);
+    installHubRecords(replica, txn, geometry, hubTxn, install, up.cursor.geometry);
     execute(db, "UPDATE hub_upstream SET journal_cursor=?,geometry_cursor=?", cursor.journal, cursor.geometry);
     exec(db, "DELETE FROM hub_leases;");
     writeLeases(db, leases);
@@ -628,11 +647,13 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     auto hubTxn = hub->read();
     const auto record = syncRecord(*hub, hubTxn, id);
     const auto version = hubVersion(conn(hubTxn), id);
+    GeometryStage geometry;
+    if (keep == "hub") stageHubGeometry(geometry, replica, hubTxn, {{id, record}}, 0);
     auto txn = replica.write();
     pool(txn).hubApply = true;
     if (keep == "hub") {
         // Earlier hub geometry may have been skipped while the conflict stood.
-        installHubRecords(replica, txn, *hub, hubTxn, {{id, record}}, 0);
+        installHubRecords(replica, txn, geometry, hubTxn, {{id, record}}, 0);
         execute(conn(txn), "DELETE FROM hub_pending WHERE record_uuid=?", id);
     }
     // Keeping local: the next push compares against the version seen now.

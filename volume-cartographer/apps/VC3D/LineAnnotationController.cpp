@@ -1996,6 +1996,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 !vc3d::store::touches(event, {"fiber", "fiber_branch", vc::objects::kAttachmentEdgeKind, "volume_transform", "volume_transform_choice"})) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
+            _storedFiberDecodeCache.clear();
             refreshChangedStoreFibers();
             emit fibersChanged();
         });
@@ -2193,7 +2194,12 @@ void LineAnnotationController::setCurrentAtlasDirectory(std::optional<fs::path> 
 
 bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const
 {
-    if (!viewer || !_state || !_viewerManager || !_state->objectStoreAttachment()) {
+    return _state && _state->objectStoreAttachment() && viewerSupportsLaunch(viewer);
+}
+
+bool LineAnnotationController::viewerSupportsLaunch(const CChunkedVolumeViewer* viewer) const
+{
+    if (!viewer || !_state || !_viewerManager) {
         return false;
     }
     auto* surface = viewer->currentSurface();
@@ -4374,6 +4380,9 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     };
     if (!readFiber()) return;
     if (!ensureFiberInVolume(fiberId, true)) return;
+    // Closing the open dialogs saves them, and saving a link revises this
+    // fiber too: pin the revision that is current after the close.
+    if (!prepareForUserFacingLineAnnotationOpen()) return;
     // Binding the coordinates publishes a new revision; open the current one.
     auto stored = readFiber();
     if (!stored) return;
@@ -4413,6 +4422,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->readOnly = true;
     session->suppressFiberSave = true;
     session->editingAvailable = !fiber.readOnly;
+    // The user's opens may start editable; agent-driven (suppressed) opens
+    // and collection inspections stay read-only until editing is requested.
+    const bool openEditable = [&] {
+        if (fiber.readOnly || collectionInspection || _errorDialogsSuppressed || !_applyOpenFibersEditable) {
+            return false;
+        }
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        return settings.value(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE,
+                              vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE_DEFAULT).toBool();
+    }();
 
     if (seedOnlyPoint) {
         // A single-point fiber has no line yet; enabling editing traces it.
@@ -4433,12 +4452,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         auto sourcePlane = std::make_shared<PlaneSurface>(
             toVec3f(seedPoint),
             toVec3f(sourceSliceNormal));
-        (void)launchSession(SourceKind::Plane,
-                            nextSurfaceName(),
-                            std::move(sourcePlane),
-                            camera,
-                            sourceSliceNormal,
-                            session);
+        const std::string surfaceName = nextSurfaceName();
+        if (launchSession(SourceKind::Plane,
+                          surfaceName,
+                          std::move(sourcePlane),
+                          camera,
+                          sourceSliceNormal,
+                          session) &&
+            openEditable) {
+            enableSessionEditing(surfaceName);
+        }
         return;
     }
 
@@ -4598,12 +4621,16 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                   static_cast<float>(displayOrigin[1]),
                   static_cast<float>(displayOrigin[2])},
         cv::Vec3f{0.0f, 0.0f, 1.0f});
-    (void)launchSession(SourceKind::Plane,
-                        nextSurfaceName(),
-                        sourcePlane,
-                        camera,
-                        {0.0, 0.0, 1.0},
-                        std::move(session));
+    const std::string surfaceName = nextSurfaceName();
+    if (launchSession(SourceKind::Plane,
+                      surfaceName,
+                      sourcePlane,
+                      camera,
+                      {0.0, 0.0, 1.0},
+                      std::move(session)) &&
+        openEditable) {
+        enableSessionEditing(surfaceName);
+    }
 }
 
 void LineAnnotationController::deleteFiber(uint64_t fiberId)
@@ -4880,7 +4907,12 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
 
 QString LineAnnotationController::fiberHvDirectionTag(uint64_t fiberId) const
 {
-    const auto fiber = readStoredFiber(fiberId);
+    const auto uuid = fiberUuidForId(fiberId);
+    if (uuid.empty()) {
+        return {};
+    }
+    const auto fibers = readStoredFibersCached(std::vector<std::string>{uuid});
+    const auto* fiber = fibers.empty() ? nullptr : &fibers.front();
     if (!fiber) {
         return {};
     }
@@ -8089,6 +8121,7 @@ void LineAnnotationController::refreshChangedStoreFibers()
         }
     });
     if (!changed.empty()) discardFiberPanes(changed);
+    QScopedValueRollback<bool> keepEditingState(_applyOpenFibersEditable, false);
     for (const auto& [uuid, state] : reopen) {
         const auto id = fiberIdForUuid(uuid);
         if (!id || !ensureFiberInVolume(id, false)) continue;
@@ -8848,6 +8881,12 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
         linkedSeedRecord->optimizationState = SessionOptimizationState::Optimized;
 
         StoredFiber linkedFiber = storedFiberFromSession(*linkedSeedRecord);
+        // The seed session is never a pane, so makeFiberSaveSnapshot cannot
+        // bind it; like the template session it is in the volume's voxels.
+        const auto volume = _state ? _state->currentVolume() : nullptr;
+        if (!volume)
+            throw std::runtime_error("An active volume is required to bind a new fiber");
+        linkedFiber.coordinateIdentity.update(coordinateBindingForVolume(*volume, 1.0));
         const uint64_t linkedFiberId = linkedFiber.id;
         commitFibers({&parentFiber, &linkedFiber});
         return linkedFiberId;
@@ -10531,7 +10570,8 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
     const std::vector<FiberBranchRef> branchRemapBranches = session.branches;
     vc3d::line_annotation::invalidateSegmentsAdjacentToControl(
         session.controlPoints, static_cast<size_t>(deletedControlIndex));
-    session.controlPoints.erase(selected);
+    vc3d::line_annotation::eraseControlPoint(
+        session.controlPoints, static_cast<size_t>(deletedControlIndex));
     // Deleting a point can part two breaks or make two others neighbours.
     vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
     // The session's geometry changed (no solve is in flight - this handler
@@ -15584,7 +15624,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     });
     std::sort(selected.begin(),selected.end());
     selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
-    const auto stored=readStoredFibers(selected,true);
+    const auto stored=readStoredFibersCached(selected,true);
     std::unordered_set<uint64_t> inVolume;
     for(const auto& fiber:stored) if(fiberInVolume(fiber)) inVolume.insert(fiber.id);
     for(const auto& open:_panes) if(open.session && open.session->fiberId!=0) inVolume.insert(open.session->fiberId);
@@ -17562,6 +17602,49 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     return readStoredFibers(uuids, lines);
 }
 
+std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersCached(
+    const std::vector<std::string>& uuids, bool lines) const
+{
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    if (!attachment || uuids.empty()) return readStoredFibers(uuids, lines);
+    // Bound fibers decode in the open volume's voxels.
+    const auto volume = _state->currentVolume();
+    const auto volumeId = volume ? volume->id() : std::string{};
+    if (volumeId != _storedFiberDecodeVolume) {
+        _storedFiberDecodeCache.clear();
+        _storedFiberDecodeVolume = volumeId;
+    }
+    // Same filter and order as readStoredFibers: requested order, first
+    // occurrence, live fibers only.
+    std::vector<std::pair<std::string, uint64_t>> live;
+    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        std::set<std::string> seen;
+        for (const auto& uuid : uuids) if (auto object = db.objectByUuid(txn, uuid)) {
+            if (object->kind == "fiber" && !object->retired && seen.insert(object->uuid).second)
+                live.emplace_back(object->uuid, object->generation);
+        }
+    });
+    std::vector<std::string> missing;
+    for (const auto& [uuid, generation] : live) {
+        const auto cached = _storedFiberDecodeCache.find(uuid);
+        if (cached == _storedFiberDecodeCache.end() || cached->second.generation != generation ||
+            (lines && !cached->second.linePointsLoaded))
+            missing.push_back(uuid);
+    }
+    if (!missing.empty())
+        for (auto& fiber : readStoredFibers(missing, lines)) {
+            auto uuid = fiber.uuid;
+            _storedFiberDecodeCache.insert_or_assign(std::move(uuid), std::move(fiber));
+        }
+    std::vector<StoredFiber> result;
+    result.reserve(live.size());
+    for (const auto& [uuid, generation] : live)
+        if (const auto cached = _storedFiberDecodeCache.find(uuid); cached != _storedFiberDecodeCache.end())
+            result.push_back(cached->second);
+    return result;
+}
+
 std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFiber(
     uint64_t id, bool lines) const
 {
@@ -17578,6 +17661,7 @@ void LineAnnotationController::resetStoreDerivedState()
     _linkCandidate.reset();
     _controlSpanCache.clear();
     _sideStripStoredSnapshotCache.clear(); _sideStripSessionSnapshotCache.clear();
+    _storedFiberDecodeCache.clear();
     _fiberAlignmentMetrics.clear(); _pendingFiberAlignmentMetrics.clear();
     _pendingFiberAlignmentMetricTokens.clear(); ++_nextFiberAlignmentMetricToken;
     ++_fiberDataGeneration; ++_fiberMetricsGeneration; _fiberMetricsPending = false;

@@ -269,5 +269,41 @@ int main() try {
         active = &reopened;
         require(vertex(full, 0, 0)[2] == 7.0f && vertex(first, 10, 0)[2] == 6 + 0.001f * float(10 * 300), "revisions survive reopening");
     }
+    {
+        // A linked seed fiber is reoptimized: its linked control point gets a new
+        // ID and the line is resampled. Once the control-point edit keeps the
+        // edge as recorded, the line-point edit must not ask about it again.
+        const auto seed = util::newUuid(), parent = util::newUuid();
+        const vc::geometry::Fiber single{{{5,5,5}},{{5,5,5}},{0}};
+        std::string seedHead;
+        auto linked = session.act(attachment, {{seed,{}},{parent,{}}}, [&](auto& db, auto& txn) {
+            for (const auto& id : {seed, parent}) {
+                ObjectRecord object; object.uuid = id; object.kind = "fiber"; db.upsertObject(txn, object);
+                const auto head = db.putGeometry(txn, id, vc::geometry::encode(single));
+                if (id == seed) seedHead = head;
+            }
+            EdgeRecord edge; edge.kind = "fiber_branch"; edge.aUuid = seed; edge.bUuid = parent;
+            edge.aAnchor.points = {{"control_point_ids", {0}}}; edge.bAnchor.points = {{"control_point_ids", {0}}};
+            db.addEdge(txn, edge);
+        });
+        int asked = 0;
+        session.act(attachment, linked, [&](auto& db, auto& txn) {
+            const auto head = updateGeometryArrays(db, txn, seed,
+                vc::geometry::encode(vc::geometry::Fiber{{{4,5,5},{5,5,6},{6,5,5}},{{4,5,5},{6,5,5}},{1,3,2}}), seedHead, {},
+                [&](const std::vector<EdgeRecord>& affected) {
+                    std::vector<GeometryEdgeEdit> result;
+                    for (const auto& edge : affected) {
+                        GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedGeneration = edge.generation;
+                        edit.action = "keep_recorded";
+                        edit.aRevision = db.currentGeometry(txn, edge.aUuid)->uuid;
+                        edit.bRevision = db.currentGeometry(txn, edge.bUuid)->uuid;
+                        result.push_back(std::move(edit)); ++asked;
+                    }
+                    return result;
+                });
+            require(db.readGeometryData(txn, head).arrays.size() == 3, "reoptimized seed is published");
+        });
+        require(asked == 1, "the replaced linked point asks once");
+    }
     std::cout << "generic geometry editing and coordinates passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -132,9 +132,9 @@ SharedJson unpackAnnotation(sqlite3* db,const SharedJson& value) {
     if(bytes.size()!=value.at("byte_length").get<size_t>())throw std::runtime_error("invalid annotation length");
     return SharedJson::parse(bytes);
 }
-void transferMetadata(sqlite3* source,sqlite3* destination,const SharedJson& root) {
+void metadataPayloads(sqlite3* source,const SharedJson& root,const std::function<void(const std::vector<uint8_t>&)>& visit) {
     if(root.is_null())return;
-    const auto transfer=[&](const std::string& hash){const auto bytes=readSharedPayload(source,"@metadata",hash);storeSharedPayload(destination,"@metadata",bytes);};
+    const auto transfer=[&](const std::string& hash){visit(readSharedPayload(source,"@metadata",hash));};
     const auto buckets=load(source,root);
     for(const auto& hash:buckets) {
         const auto bucket=load(source,hash);

@@ -27,6 +27,7 @@ import numcodecs
 import torch
 import torch.nn.functional as F
 import zarr
+from lasagna.cooperative_inference import cooperative_signals
 
 try:
 	from omezarr_pyramid import (
@@ -1339,6 +1340,14 @@ class OmeZarrOutputAdapter:
 
 	def update_metadata(self, products: Sequence[OutputProductSpec]) -> None:
 		_ = products
+
+	def write_products_chunk(self, items, *, chunk_origin_zyx):
+		if getattr(self, "blank_invalid", False):
+			from lasagna.compact_zarr import blank_fiber_channels
+			values = blank_fiber_channels({name: a for _, data in items for name, a in data.items()})
+			items = [(p, {c.name: values[c.name] for c in p.channels}) for p, _ in items]
+		for product, data in items:
+			self.write_product_chunk(product, chunk_origin_zyx=chunk_origin_zyx, data=data)
 
 
 def _format_eta(seconds: float) -> str:
@@ -2833,6 +2842,7 @@ def _execute_flush_process_task(
 			np.maximum(denom, 1.0e-7, out=denom)
 			products = {product.name: product for product in task.products}
 			accumulators = dict(task.accumulators)
+			finalized = []
 			for name in task.dirty_products:
 				product = products[name]
 				raw = np.stack([
@@ -2850,12 +2860,14 @@ def _execute_flush_process_task(
 					}
 				else:
 					persisted = finalizer(product, raw)
-				output_adapter.write_product_chunk(
-					product, chunk_origin_zyx=task.origin,
-					data={channel.name: persisted[channel.name] for channel in product.channels},
-				)
+				finalized.append((product, {channel.name: persisted[channel.name] for channel in product.channels}))
 				written += 1
 				del raw, persisted
+			if hasattr(output_adapter, "write_products_chunk"):
+				output_adapter.write_products_chunk(finalized, chunk_origin_zyx=task.origin)
+			else:
+				for product, persisted in finalized:
+					output_adapter.write_product_chunk(product, chunk_origin_zyx=task.origin, data=persisted)
 		del denom
 	return task.batch_id, task.task_id, written, time.perf_counter() - started
 
@@ -3202,6 +3214,7 @@ def _lock_selected_level_reader(function):
 	return wrapped
 
 
+@cooperative_signals
 @_lock_selected_level_reader
 def run_tiled_inference_3d(
 	model,
@@ -3236,6 +3249,7 @@ def run_tiled_inference_3d(
 	product_accumulator_dtype: str | np.dtype = "float16",
 	accumulator_workers: int = 0,
 	live_cache: LiveOmeZarrCache | None = None,
+	cooperative_factory=None,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -3247,7 +3261,9 @@ def run_tiled_inference_3d(
 	pad = max(0, int(border))
 	stride = max(1, int(tile_size) - int(overlap))
 	resolved_devices = tuple(devices or (device,))
-	parallel = len(resolved_devices) > 1
+	from lasagna.cooperative_inference import enabled as cooperative_enabled, IncrementalWorkers, gpu_worker
+	managed = cooperative_factory is not None or cooperative_enabled(resolved_devices)
+	parallel = len(resolved_devices) > 1 or managed
 	if parallel and model is not None:
 		raise ValueError("parallel tiled inference loads models in workers; pass model=None")
 	if not parallel and model is None:
@@ -4281,23 +4297,33 @@ def run_tiled_inference_3d(
 					shared_value = value.detach().cpu().contiguous()
 					shared_value.share_memory_()
 					worker_state[key] = shared_value
-			workers = [
-				ctx.Process(
-					target=_multi_gpu_worker_main,
-					args=(
-						index, str(worker_device), model_adapter, worker_state, tile_size, r,
-						scales, native_output_stride, input_specs, result_specs,
-						work_queues[index], result_queue,
-						bool(profile_pipeline),
-					),
+			def make_worker(index, worker_device, uuid=None, budget=None):
+				args = (
+					index, str(worker_device), model_adapter, worker_state, tile_size, r,
+					scales, native_output_stride, input_specs, result_specs,
+					work_queues[index], result_queue, bool(profile_pipeline),
+				)
+				gate = ctx.Event() if uuid is not None else None
+				worker = ctx.Process(
+					target=gpu_worker if uuid is not None else _multi_gpu_worker_main,
+					args=(uuid, budget, args, gate, os.getpid()) if uuid is not None else args,
 					name=f"predict3d-{worker_device}", daemon=True,
 				)
-				for index, worker_device in enumerate(resolved_devices)
-			]
+				worker._cooperative_gate = gate
+				return worker
+			workers = [None if managed else make_worker(i, d) for i, d in enumerate(resolved_devices)]
+			cooperative = None
+			def start_managed_worker(index, uuid, budget):
+				worker = make_worker(index, resolved_devices[index], uuid, budget)
+				with _single_threaded_native_runtime():
+					worker.start()
+				return worker
 			started_workers = []
 			try:
 				with _single_threaded_native_runtime():
 					for worker in workers:
+						if worker is None:
+							continue
 						worker.start()
 						started_workers.append(worker)
 			except BaseException:
@@ -4368,6 +4394,8 @@ def run_tiled_inference_3d(
 					except queue.Full:
 						pass
 				for worker in workers:
+					if worker is None:
+						continue
 					worker.join(timeout=5.0)
 					if worker.is_alive():
 						worker.terminate()
@@ -4722,7 +4750,12 @@ def run_tiled_inference_3d(
 					)
 
 			try:
+				if managed:
+					factory = cooperative_factory or IncrementalWorkers.connect_local
+					cooperative = factory(resolved_devices, workers, work_queues, start_managed_worker,
+						max(1, reader_count + int(accumulator_workers) + int(flush_workers)))
 				while not source_done or events:
+					active_workers = cooperative.tick(gpu_outstanding) if cooperative else set(range(len(workers)))
 					_pump_pending_flush(block=False)
 					made_progress = _pump_accumulator_results()
 					if band_source_done and not events:
@@ -4872,7 +4905,7 @@ def run_tiled_inference_3d(
 						worker_index = None
 						for attempt in range(len(workers)):
 							candidate = (next_worker + attempt) % len(workers)
-							if len(gpu_outstanding[candidate]) < int(slots_per_gpu):
+							if candidate in active_workers and len(gpu_outstanding[candidate]) < int(slots_per_gpu):
 								worker_index = candidate
 								break
 						if worker_index is None:
@@ -4982,7 +5015,7 @@ def run_tiled_inference_3d(
 						made_progress = True
 					commit_time += time.perf_counter() - commit_started
 					can_accept_input = bool(free_inputs and free_results) and any(
-						len(outstanding) < int(slots_per_gpu) for outstanding in gpu_outstanding
+						len(gpu_outstanding[i]) < int(slots_per_gpu) for i in active_workers
 					)
 					has_ready_input = any(event["status"] == "ready" for event in events.values())
 					has_pending_input = any(
@@ -4997,6 +5030,8 @@ def run_tiled_inference_3d(
 						starve_started = None
 					_validate_worker_ownership()
 					for index, worker in enumerate(workers):
+						if worker is None or (cooperative and index in cooperative.stopping):
+							continue
 						if not worker.is_alive() and worker.exitcode is not None:
 							raise RuntimeError(
 								f"multi-GPU worker {index} exited unexpectedly with code "
@@ -5009,6 +5044,11 @@ def run_tiled_inference_3d(
 								f"{process.exitcode}; outstanding={accum_outstanding[index]}"
 							)
 					if not made_progress:
+						if cooperative and not active_workers:
+							# A paused GPU queue is not a pipeline deadlock. Readers
+							# and accumulators have already been pumped above.
+							time.sleep(0.01)
+							continue
 						statuses: dict[str, int] = {}
 						for event in events.values():
 							status = str(event.get("status", "unknown"))
@@ -5035,7 +5075,7 @@ def run_tiled_inference_3d(
 							}
 							worker_state = [
 								(index, worker.pid, worker.is_alive(), worker.exitcode)
-								for index, worker in enumerate(workers)
+								for index, worker in enumerate(workers) if worker is not None
 							]
 							raise RuntimeError(
 								f"{exc}; band={active_band} next_commit={next_commit} "
@@ -5143,10 +5183,14 @@ def run_tiled_inference_3d(
 					except queue.Full:
 						pass
 				for worker in workers:
+					if worker is None:
+						continue
 					worker.join(timeout=5.0)
 					if worker.is_alive():
 						worker.terminate()
 						worker.join(timeout=5.0)
+				if cooperative is not None:
+					cooperative.close()
 				for work_queue in work_queues:
 					work_queue.close()
 					work_queue.join_thread()

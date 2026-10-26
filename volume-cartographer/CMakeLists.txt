@@ -798,8 +798,14 @@ endif()
 if(VC_BUILD_FLATBOI)
     list(APPEND _vc_install_dirs libs/flatboi)
 endif()
+if(TARGET vc_objects)
+    # The sibling object store builds DLLs on Windows (cmake/ObjectStore.cmake).
+    get_target_property(_vc_object_store_dir vc_objects SOURCE_DIR)
+    list(APPEND _vc_install_dirs "${_vc_object_store_dir}")
+endif()
 foreach(_dir IN LISTS _vc_install_dirs)
-    get_property(_dir_targets DIRECTORY "${CMAKE_SOURCE_DIR}/${_dir}"
+    get_filename_component(_dir "${_dir}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    get_property(_dir_targets DIRECTORY "${_dir}"
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)

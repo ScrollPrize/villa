@@ -7,8 +7,18 @@
 #include <tuple>
 namespace vc::objects::formats {
 namespace {
-Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& path)
+// A fiber file without a UUID (as VC3D wrote before fibers had identities) is
+// named from its file name, so every import of that file, and every branch
+// that names it by file, resolves to the same fiber.
+std::string fileUuid(const nlohmann::json& root, const std::filesystem::path& path)
 {
+    if (root.contains("uuid")) return util::canonicalUuid(root.at("uuid").get<std::string>());
+    return util::nameUuid("vc3d_fiber/" + path.filename().string());
+}
+
+Prepared fiberDocument(nlohmann::json root, const std::filesystem::path& path)
+{
+    root["uuid"] = fileUuid(root, path);
     auto result = decodeFiberJson(root.dump());
     if (result.object.name.empty()) result.object.name = path.stem().string();
     result.object.storageKind = "file";
@@ -51,11 +61,11 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
         }
     } else read(path);
     if (batch.empty()) throw std::runtime_error("no fibers were found");
-    // Version 3 names branch targets only by file, and declares each link from both ends with
+    // Versions 1 and 3 name branch targets only by file, and declare each link from both ends with
     // separately computed directions. Targets resolve through the peer file's UUID; the second
     // declaration of a link must match the first and is dropped.
     std::map<fs::path, std::string> fileUuids;
-    std::map<std::tuple<std::string, int64_t, std::string, int64_t>, Json> version3Links;
+    std::map<std::tuple<std::string, int64_t, std::string, int64_t>, Json> fileLinks;
     const auto sameDirection = [](const Json& left, const Json& right) {
         if (left.is_null() || right.is_null()) return left.is_null() && right.is_null();
         for (size_t axis = 0; axis < 3; ++axis)
@@ -67,39 +77,39 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
         const auto self = batch[i].object.uuid;
         // Copy before appending peers, which can reallocate the batch.
         const auto metadata = batch[i].source;
-        const bool version3 = metadata.value("version", 0) == 3;
+        const bool byFile = metadata.value("version", 0) < 4;
         for (const auto* key : {"branches", "adjacent_branches"}) {
             auto kept = Json::array();
             for (auto branch : metadata.value(key, Json::array())) {
                 const auto peerPath = [&] {
                     return source.parent_path() / fs::path(branch.at("branch_file").get<std::string>()).filename();
                 };
-                if (version3) {
+                if (byFile) {
                     const auto peer = peerPath();
                     if (!fileUuids.contains(peer))
-                        fileUuids[peer] = util::canonicalUuid(readJson(peer).at("uuid").get<std::string>());
+                        fileUuids[peer] = fileUuid(readJson(peer), peer);
                     branch["target_uuid"] = fileUuids.at(peer);
                 }
                 const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
-                if (version3) {
+                if (byFile) {
                     const auto own = branch.at("control_point_index").get<int64_t>();
                     const auto other = branch.at("branch_control_point_index").get<int64_t>();
-                    if (const auto first = version3Links.find({target, other, self, own}); first != version3Links.end()) {
+                    if (const auto first = fileLinks.find({target, other, self, own}); first != fileLinks.end()) {
                         if (!sameDirection(first->second.value("control_point_direction", Json()), branch.value("branch_control_point_direction", Json())) ||
                             !sameDirection(first->second.value("branch_control_point_direction", Json()), branch.value("control_point_direction", Json())))
                             throw std::runtime_error("conflicting reciprocal fiber branch declarations: " + self + " <-> " + target);
                         continue;
                     }
-                    version3Links.emplace(std::tuple{self, own, target, other}, branch);
+                    fileLinks.emplace(std::tuple{self, own, target, other}, branch);
                 }
                 kept.push_back(branch);
                 if (existing.contains(target) || incoming.contains(target)) continue;
                 const auto peer = readJson(peerPath());
-                if (util::canonicalUuid(peer.at("uuid").get<std::string>()) != target)
+                if (fileUuid(peer, peerPath()) != target)
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }
-            if (version3 && metadata.contains(key)) batch[i].source[key] = std::move(kept);
+            if (byFile && metadata.contains(key)) batch[i].source[key] = std::move(kept);
         }
     }
     return batch;

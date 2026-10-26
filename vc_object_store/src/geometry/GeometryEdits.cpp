@@ -3,6 +3,7 @@
 #include "geometry/SequenceIdentity.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "geometry/SharedGeometry.hpp"
 #include "internal/History.hpp"
 #include <nlohmann/json.hpp>
 #include <limits>
@@ -119,7 +120,13 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                         GeometrySequencePart part; part.count = count; part.bytes = target.bytes;
                         edit.parts.push_back(std::move(part));
                     }
-                    const auto affected = db.affectedGeometryEdges(txn, uuid, proposed);
+                    std::optional<std::pair<std::string, std::vector<int64_t>>> changedIds;
+                    if (!idsName.empty()) {
+                        // Every erased and every resulting ID, as the structural edit records them.
+                        changedIds.emplace(idsName, oldIds);
+                        changedIds->second.insert(changedIds->second.end(), newIds.begin(), newIds.end());
+                    }
+                    const auto affected = detail::structuralSnapshotEdges(db, txn, uuid, proposed, changedIds);
                     head = db.editGeometrySequence(txn, uuid, edit, head, decisions(affected));
                     whole.reset();
                 }

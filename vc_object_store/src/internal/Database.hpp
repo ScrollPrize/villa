@@ -49,7 +49,9 @@ struct StatementPool {
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;
     ~StatementPool() { for (auto& [sql, stmt] : idle) sqlite3_finalize(stmt); }
 };
-inline thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
+// Defined in Database.cpp: MinGW GCC emits a non-COMDAT TLS init function for
+// a dynamically initialized inline thread_local, so each TU would define it.
+extern thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
 namespace detail {
 // Called only after a read connection has pinned its new SQLite snapshot.
 void beginReadCaches(sqlite3*, StatementPool&, size_t geometryBudget, size_t spatialBudget);

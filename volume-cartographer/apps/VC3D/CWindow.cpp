@@ -3061,16 +3061,18 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             spiralLineAction->setToolTip(reason);
                             connect(spiralLineAction, &QAction::triggered, this,
                                     [this]() {
-                                        if (_spiralWorkspace)
+                                        if (_spiralWorkspace && _menuController &&
+                                            _menuController->requireObjectStore(tr("Creating a fiber")))
                                             _spiralWorkspace->startLineAnnotationDraft();
                                     });
                             menu.addSeparator();
                         }
 
+                        // Enabled without a store: choosing it offers to create or attach one.
                         QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
                         newLineAnnotationAction->setEnabled(
                             _lineAnnotationController &&
-                            _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                            _lineAnnotationController->viewerSupportsLaunch(viewer) &&
                             viewer->sampleSceneVolume(scenePoint).has_value());
 
                         QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
@@ -3282,13 +3284,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == newLineAnnotationAction &&
-                            newLineAnnotationAction->isEnabled() &&
-                            _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
-                        } else if (selected == modelLineAnnotationAction &&
-                                   modelLineAnnotationAction->isEnabled() && _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint, true, true);
+                        const bool launch = (selected == newLineAnnotationAction ||
+                                             selected == modelLineAnnotationAction) &&
+                                            selected->isEnabled() && _lineAnnotationController &&
+                                            _menuController &&
+                                            _menuController->requireObjectStore(tr("Creating a fiber"));
+                        if (launch) {
+                            _lineAnnotationController->launchFromViewerAtPoint(
+                                viewer, scenePoint, true, selected == modelLineAnnotationAction);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);
@@ -8263,8 +8266,10 @@ bool CWindow::OpenVolume(const QString& path,
 
 void CWindow::attachObjectStore(const QString& path)
 {
+    const auto author = _menuController ? _menuController->objectStoreAuthor() : QString();
+    if (author.isEmpty()) return;
     try {
-        _state->attachObjectStore(path, qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d")));
+        _state->attachObjectStore(path, author);
     } catch (const std::exception& error) {
         const auto message = tr("Cannot attach object store %1: %2").arg(path, QString::fromUtf8(error.what()));
         qWarning().noquote() << message;

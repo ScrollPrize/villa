@@ -13,6 +13,7 @@ option(VC_OBJECT_STORE_BUILD_LINKING "Build relationship detectors" ${VC_OBJECT_
 option(VC_OBJECT_STORE_BUILD_TOOLS "Build command-line tools" ON)
 option(VC_OBJECT_STORE_BUILD_PYTHON "Build Python package" OFF)
 option(VC_OBJECT_STORE_BUILD_TESTS "Build object-store C++ regression tests" ${PROJECT_IS_TOP_LEVEL})
+option(VC_OBJECT_STORE_SHARED "Build the runtime libraries as shared libraries" OFF)
 find_package(SQLite3 REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -69,7 +70,8 @@ if(VC_OBJECT_STORE_BUILD_LINKING)
     list(APPEND _vc_store_targets vc_object_links vc_track_crossings)
 endif()
 install(TARGETS ${_vc_store_targets} EXPORT vc_object_storeTargets
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT vc_object_storeTargets NAMESPACE vc_object_store:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vc_object_store)
 configure_package_config_file(cmake/vc_object_storeConfig.cmake.in

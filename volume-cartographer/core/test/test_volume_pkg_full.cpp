@@ -394,3 +394,21 @@ TEST_CASE("Only native catalog source entries use the catalog volume ID")
     }
 }
 
+TEST_CASE("Local volume entries take the catalog volume ID from their tags")
+{
+    auto d = tmpDir("localcatalogid");
+    makeLocalVolume(d);
+    auto p = VolumePkg::newEmpty();
+    p->addVolumeEntry((d / "volumes").string(),
+                      {"vc-open-data-volume-id:20251211183505",
+                       "vc-open-data-preferred-source"});
+    CHECK(p->volume("vol1") == nullptr);
+    auto v = p->volume("20251211183505");
+    REQUIRE(v != nullptr);
+    CHECK(v->name() == "vol1");
+    // The identity survives a reload from disk.
+    CHECK(p->reloadSingleVolume("20251211183505"));
+    CHECK(p->volume("20251211183505") != nullptr);
+    CHECK(p->volume("vol1") == nullptr);
+    fs::remove_all(d);
+}

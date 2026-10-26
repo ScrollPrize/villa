@@ -144,6 +144,17 @@ void validateChunk(const vc::render::ChunkResult& result)
             throw std::runtime_error("Lasagna uint8 Zarr has an invalid fill_value: " + binding.path.string());
         return static_cast<uint8_t>(*fill);
     }
+    if (chunk.dtype == vc::render::ChunkDtype::Float32 && chunk.bytes) {
+        const auto at = chunk.byteOffset + offset * sizeof(float);
+        if (at + sizeof(float) > chunk.bytes->size())
+            throw std::runtime_error("packed float channel payload too small");
+        float value;
+        std::memcpy(&value, chunk.bytes->data() + at, sizeof(value));
+        if (!std::isfinite(value) || value < 0 || value > 255)
+            throw std::runtime_error("invalid packed encoded byte value");
+        return static_cast<uint8_t>(std::lround(value));
+    }
+    offset += chunk.byteOffset;
     if (chunk.dtype != vc::render::ChunkDtype::UInt8 || !chunk.bytes || offset >= chunk.bytes->size())
         throw std::runtime_error("Lasagna decoded chunk has invalid dtype/size: " + binding.path.string());
     return std::to_integer<uint8_t>((*chunk.bytes)[offset]);
@@ -182,10 +193,10 @@ void validateChunk(const vc::render::ChunkResult& result)
         if (chunk.status == vc::render::ChunkStatus::Missing || chunk.status == vc::render::ChunkStatus::AllFill)
             return binding.array->metadata().fill_value;
         if (chunk.dtype != vc::render::ChunkDtype::Float32 || !chunk.bytes ||
-            (offset + 1) * sizeof(float) > chunk.bytes->size())
+            chunk.byteOffset + (offset + 1) * sizeof(float) > chunk.bytes->size())
             throw std::runtime_error("invalid float32 Lasagna chunk: " + binding.path.string());
         float value;
-        std::memcpy(&value, chunk.bytes->data() + offset * sizeof(float), sizeof(value));
+        std::memcpy(&value, chunk.bytes->data() + chunk.byteOffset + offset * sizeof(float), sizeof(value));
         return value;
     }
     const auto value = chunkByte(binding, chunk, offset);
@@ -242,7 +253,7 @@ bool readSingleChunkCube(const LasagnaChannelBinding& binding,
     const bool floats=binding.array->metadata().dtype==utils::ZarrDtype::float32;
     if constexpr(std::is_same_v<Output,uint8_t>) {if(floats)return false;}
     if(chunk.dtype!=(floats?vc::render::ChunkDtype::Float32:vc::render::ChunkDtype::UInt8)) return false;
-    const size_t offset=originalChunkOffset(binding,request.z0%binding.chunksZYX[0],request.y0%binding.chunksZYX[1],request.x0%binding.chunksZYX[2]);
+    const size_t offset=chunk.byteOffset/(floats?sizeof(float):1)+originalChunkOffset(binding,request.z0%binding.chunksZYX[0],request.y0%binding.chunksZYX[1],request.x0%binding.chunksZYX[2]);
     const size_t sx=request.x0+1<binding.shapeZYX[2]?1:0;
     const size_t sy=request.y0+1<binding.shapeZYX[1]?binding.chunksZYX[2]:0;
     const size_t sz=request.z0+1<binding.shapeZYX[0]?binding.chunksZYX[1]*binding.chunksZYX[2]:0;
@@ -629,7 +640,7 @@ public:
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
-    std::shared_ptr<vc::render::ChunkCache> cache_;
+    std::shared_ptr<vc::render::IChunkedArray> cache_;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
@@ -1186,17 +1197,21 @@ LasagnaChannelBinding bindLasagnaChannel(
                       manifest.sourceToBase / manifest.workingToBaseScale;
 
     const auto meta = binding.array->metadata();
-    if (allowFloat32 && meta.dtype == utils::ZarrDtype::float32) {
+    if ((allowFloat32 || meta.shape.size() == 4) && meta.dtype == utils::ZarrDtype::float32) {
         binding.array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, *group, 4));
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' must be uint8");
     }
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
+    const bool packed = meta.shape.size() == 4 && meta.chunks.size() == 4;
+    if ((packed && manifest.version != 3 && !manifest.raw.value("packed_channel_view", false)) ||
+        (!packed && (meta.shape.size() != 3 || meta.chunks.size() != 3)) ||
+        (packed && (meta.shape[0] != group->channels.size() || meta.chunks[0] != meta.shape[0]))) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
                                  "' must reference a 3D (Z,Y,X) zarr");
     }
-    binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
-    binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    const size_t first = packed ? 1 : 0;
+    binding.shapeZYX = {meta.shape[first], meta.shape[first+1], meta.shape[first+2]};
+    binding.chunksZYX = {meta.chunks[first], meta.chunks[first+1], meta.chunks[first+2]};
 
     if (binding.spacing <= 0.0 || !std::isfinite(binding.spacing)) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has invalid spacing");
@@ -1223,10 +1238,10 @@ LasagnaChannelBinding bindLasagnaChannel(
     cacheOptions.decodedEvictionPreferSelf = true;
     // Without an explicit fill, a stored all-zero chunk is still valid data.
     cacheOptions.detectAllFillChunks = binding.array->metadata().fill_value.has_value();
-    binding.chunkSource = vc::render::acquireProcessChunkCache(
-        "lasagna-channel|" + sourcePath.lexically_normal().string() +
-            "|channel=" + std::to_string(binding.channelIndex),
+    binding.chunkSource = vc::render::acquireProcessZarrChannel(
+        "lasagna-channel|" + sourcePath.lexically_normal().string(),
         binding.array,
+        binding.channelIndex,
         std::move(cacheOptions));
     return binding;
 }

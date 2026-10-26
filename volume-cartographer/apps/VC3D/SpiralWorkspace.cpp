@@ -1129,13 +1129,14 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
         return _previewCoordinateError.isEmpty()
             ? tr("Spiral preview and fiber coordinates have not been paired")
             : _previewCoordinateError;
-    if (!_state->objectStoreAttachment()) return tr("Attach an object store before creating fibers");
     return {};
 }
 
 void SpiralWorkspace::startLineAnnotationDraft()
 {
-    const QString reason = lineAnnotationDraftUnavailableReason();
+    QString reason = lineAnnotationDraftUnavailableReason();
+    if (reason.isEmpty() && !_state->objectStoreAttachment())
+        reason = tr("Attach an object store before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
         return;

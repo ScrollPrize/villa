@@ -314,11 +314,16 @@ class DemandStore:
         return _MmapHandle(tuple(str(member) for member in paths), tuple(int(v) for v in sizes), str(dtype))
 
     def _chunk_files(self, origin):
+        if hasattr(self.output_adapter, "chunk_paths"):
+            yield from self.output_adapter.chunk_paths(origin)
+            return
         for channel, product, sep in self._channel_metadata:
             index = tuple(v // product.chunk_size for v in origin)
             yield Path(tiled._zarr_chunk_path(str(Path(channel.relative_path) / str(product.level)), sep, *index))
 
     def _cached_chunk_complete(self, origin, *, read_arrays=None):
+        if hasattr(self.output_adapter, "validate_chunk"):
+            return self.output_adapter.validate_chunk(origin, read_arrays=read_arrays)
         # Existing shared completeness checks require actual files, including
         # explicit zero chunks. A missing sibling must never become Zarr fill.
         if not all(self.output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
@@ -588,6 +593,7 @@ class DemandStore:
                                dtype=np.float32).copy()
             if np.any(denom > 0.0):
                 np.maximum(denom, 1.0e-7, out=denom)
+                finalized = []
                 for product in self.products:
                     raw = np.stack([np.asarray(tiled._record_array(
                         record, layouts[f"product:{product.name}:{channel}"])[region],
@@ -599,9 +605,12 @@ class DemandStore:
                                      for i, channel in enumerate(product.channels)}
                     else:
                         persisted = finalizer(product, raw)
-                    self.output_adapter.write_product_chunk(
-                        product, chunk_origin_zyx=origin,
-                        data={channel.name: persisted[channel.name] for channel in product.channels})
+                    finalized.append((product, {channel.name: persisted[channel.name] for channel in product.channels}))
+                if hasattr(self.output_adapter, "write_products_chunk"):
+                    self.output_adapter.write_products_chunk(finalized, chunk_origin_zyx=origin)
+                else:
+                    for product, persisted in finalized:
+                        self.output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data=persisted)
             return self._sync_published(origin)
         finally:
             shm.close()

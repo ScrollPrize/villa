@@ -896,6 +896,43 @@ TEST_CASE("Fiber display metadata validates and survives CP roundtrip and revers
     CHECK(cv::norm(*collapsed.controlPoints[0].displayNormal - *cp.displayNormal) < 1e-6);
 }
 
+TEST_CASE("deleting the final control point leaves a savable fiber")
+{
+    using vc3d::line_annotation::LineControlPoint;
+    std::vector<LineControlPoint> controls(3);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        controls[i].linePosition = static_cast<double>(i);
+        controls[i].volumePoint = cv::Vec3d(static_cast<double>(i), 0, 0);
+    }
+    controls[0].segmentToNext.emplace();
+    controls[1].segmentToNext.emplace();
+    const auto saved = [](const std::vector<LineControlPoint>& live) {
+        std::vector<vc3d::line_annotation::StoredControlPoint> stored;
+        for (const auto& control : live) {
+            stored.push_back(vc3d::line_annotation::StoredControlPoint{control.volumePoint});
+            stored.back().segmentToNext = control.segmentToNext;
+        }
+        vc3d::line_annotation::validateStoredControlPoints(stored);
+    };
+
+    auto interior = controls;
+    vc3d::line_annotation::eraseControlPoint(interior, 1);
+    CHECK(interior[0].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(interior));
+
+    auto tail = controls;
+    vc3d::line_annotation::eraseControlPoint(tail, 2);
+    REQUIRE(tail.size() == 2);
+    CHECK(tail[0].segmentToNext.has_value());
+    CHECK_FALSE(tail[1].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(tail));
+
+    auto head = controls;
+    vc3d::line_annotation::eraseControlPoint(head, 0);
+    CHECK(head[0].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(head));
+}
+
 TEST_CASE("Fiber width tolerance guides bracket the full width by twenty percent")
 {
     const auto offsets = vc::fiber_tracer::fiberWidthEdgeOffsets(40);
@@ -3869,6 +3906,11 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("  alice  ") == "alice");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("A User/Name") == "A_User_Name");
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(""));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(" ANON "));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername("//"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("anonymous"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("alice"));
     CHECK(vc3d::line_annotation::fiberFileName("alice", "20260605T123456789", 42) ==
           "alice_20260605T123456789_000042.json");
 }
@@ -6473,7 +6515,7 @@ TEST_CASE("Open tail policy: lone end breaks and kollesis ends are ray sides")
     SUBCASE("stored controls read index order") {
         std::vector<vc3d::line_annotation::StoredControlPoint> stored;
         for (const auto& control : controls) {
-            stored.emplace_back(control.volumePoint);
+            stored.push_back(vc3d::line_annotation::StoredControlPoint{control.volumePoint});
             stored.back().segmentToNext = control.segmentToNext;
         }
         CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{false, false});

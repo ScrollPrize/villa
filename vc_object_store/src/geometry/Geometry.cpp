@@ -377,6 +377,29 @@ std::vector<EdgeRecord> ObjectStore::affectedGeometryEditEdges(const Txn& txn, c
     return affectedEdges(*this, txn, objectUuid, currentGeometry(txn, objectUuid), plan->after);
 }
 
+namespace {
+// Structural snapshots compare by array fingerprint: an edge whose arrays are
+// untouched is unaffected, even when it records a point that no longer exists.
+detail::DependencyGeometry structuralAfter(const GeometryData& data, const nlohmann::json& manifest)
+{
+    auto after=detail::dependencyGeometry(data);
+    after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
+    for(const auto& [name,a]:manifest.at("arrays").items())after.fingerprints[name]=a.dump();
+    return after;
+}
+}
+
+std::vector<EdgeRecord> detail::structuralSnapshotEdges(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+    const GeometryData& data, const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds)
+{
+    DependencyScope scope;
+    const auto current=store.currentGeometry(txn,objectUuid);
+    if (!current) throw std::invalid_argument("structural edits require existing geometry");
+    auto manifest=geometryManifest(data,revisionSurfaceTileSize(txn,*current));
+    manifest["grid_origin"]=current->gridOrigin;
+    return affectedEdges(store,txn,objectUuid,current,structuralAfter(data,manifest),changedIds);
+}
+
 std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid,
     const GeometryData& data, nlohmann::json previous, const std::string& expected, const std::vector<GeometryEdgeEdit>& edgeEdits,
     const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds)
@@ -388,9 +411,7 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     if (!current || current->uuid != formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
     auto manifest=geometryManifest(data,revisionSurfaceTileSize(txn,*current));
     for(const auto* field:{"sequences","grid_origin"})if(previous.contains(field))manifest[field]=previous.at(field);
-    auto after=dependencyGeometry(data);
-    after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
-    for(const auto& [name,a]:manifest.at("arrays").items())after.fingerprints[name]=a.dump();
+    auto after=structuralAfter(data,manifest);
     bindSequenceIdentities(after,db,manifest);
     const auto affected=affectedEdges(store,txn,objectUuid,current,after,changedIds);
     const auto decisions=validateEdgeEdits(store,txn,db,objectUuid,after,affected,edgeEdits);
