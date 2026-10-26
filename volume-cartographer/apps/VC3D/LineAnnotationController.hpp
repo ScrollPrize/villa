@@ -1205,6 +1205,10 @@ private:
     [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
         const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
     [[nodiscard]] std::optional<StoredFiber> readStoredFiber(uint64_t id, bool lines = false) const;
+    // readStoredFibers() for hot UI paths: reuses decoded fibers whose object
+    // generation is unchanged. Cleared on every store commit and attachment.
+    [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
+        const std::vector<std::string>& uuids, bool lines = false) const;
     // Active fibers bound to the current volume whose bounds overlap a box in
     // volume voxels.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
@@ -1610,6 +1614,8 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
+    // See readStoredFibersCached: decoded fibers keyed by uuid.
+    mutable std::unordered_map<std::string, StoredFiber> _storedFiberDecodeCache;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {
