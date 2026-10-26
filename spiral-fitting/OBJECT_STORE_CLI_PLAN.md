@@ -327,7 +327,7 @@ the relationship graph alone cannot supply seam corrections.
 
 The following 12 steps were originally planned as one commit each, based on
 `origin/fibers-to-obj-store` at `259a3548ab5b4813e40def010a816d392d674559`.
-Steps 1–11 are implemented; step 12 remains. Upstream
+All twelve steps are implemented. Upstream
 through `affe83f75` is now integrated. Keep store
 changes separate from fitter changes, and include focused regression tests
 with each functional commit. Use the integrated volume-targeted selection and
@@ -509,7 +509,8 @@ Notes from steps 5–8 that the remaining steps build on:
   --scale-factor 1`): refresh created 553 PCL-patch and 447 overlap links
   and no fiber-patch links (centerline-only); 173 patches, 28 PCL
   attachments and 809 overlap pairs were materialized, most attachments
-  lying outside the 100-slice window's sampled quads; ~18 s.
+  lying outside the 100-slice window's sampled quads; ~18 s. That ingest
+  gave the fibers the wrong frame (step 12 below): they are at 4x.
 - `tests/data/object_store_reference.json` is the file loader's output for the
   synthetic fixture in `tests/object_store_reference.py`, frozen when step 11
   removed that loader; the adapter tests keep comparing against it.
@@ -531,6 +532,73 @@ Notes from steps 5–8 that the remaining steps build on:
   store (`--object-store`, no refresh) and walks multi-patch fiber contacts.
   The interactive service still constructs FitContext with workspace
   bindings and file inputs, and is broken until it is ported (accepted).
+- Step 12 (2026-10-26) documented configuration, ingest, frames and test
+  commands in README.md ("Object-store inputs") and ran the acceptance:
+  - The full spiral-fitting suite passes except 19 tests that fail on the
+    pre-step-11 tree too (B-spline Triton equivalence and track-crossing
+    cache/CPU track storage), unrelated to inputs.
+  - Ingest, as documented: the same 181 patches and three PCL documents
+    with `vc_object_ingest --derive-uuids NS --volume-uuid s1-reference
+    --scale-factor 1 --renumber-point-ids` (202 same-winding collections
+    renumbered), then `--fiber dataset/fibers --scale-factor 4
+    --drop-dangling-branches` (111 fibers, 100 branches; the 47 dangling
+    declarations dropped). The dataset's version-3 fibers declare no domain
+    and sit at 4x the patch frame (the removed loader's legacy 0.25 scale);
+    ingesting them at scale 1 is why the step-10 smoke linked no fibers.
+  - CLI smoke fit (one RTX 3090), from `spiral-fitting/`:
+    `WANDB_MODE=disabled FIT_SPIRAL_SKIP_SAVE_MESH=1
+    FIT_SPIRAL_CONFIG_OVERRIDES='{"object_store_path": STORE,
+    "object_store_author": "smoke-step12", "z_begin": 9000, "z_end": 9100,
+    "optimizer_num_training_steps": 1000, "dense_spacing_mode": "grad_mag",
+    "loss_weight_dense_spacing_density": 0, "loss_weight_dense_normals": 0,
+    "loss_weight_dense_spacing": 0}' python fit_spiral.py --dataset DIR`,
+    where DIR holds only `spiral-scroll.json`, `umbilicus.json`,
+    `lasagna_inputs/`, `outer_shell/` and `fiber_directions.npz` (no patch
+    directories, fiber JSONs or PCL JSONs; the dataset has no winding
+    inference store, hence `grad_mag` as in the headless A/B spec). It first
+    failed fiber-patch refresh with lasagna normals ("CT level missing"),
+    reported with the two committed detectors and no training; the store's
+    CT reader indexes multiscales levels, so the fitter now passes the
+    lasagna group's index (commit "address lasagna normals by the store's
+    level"). Then: refresh (lasagna group 4 = store level 0) created 553
+    PCL-patch, 6 fiber-patch and 447 overlap links; 173 patches; 6
+    absolute and 656 relative/same-winding collections, 28 PCL attachments
+    (523 off sampled quads, 2 on unfitted patches), 6 fiber attachments,
+    100 branches in 11 components (1 merged cross-patch component), 327
+    overlap edges as 809 pairs; views 822 cross-patch (abs_winding 6, fibers
+    1, patch_overlaps 809, relative_windings 1, same_windings 5) and 52
+    strips (fibers 24, relative_windings 1, same_windings 27). Total loss
+    2591 -> 491 -> 83 -> 136 -> 35 at steps 0/200/400/600/800, all finite;
+    satisfied patches 56/173, satisfied area 64.1%, unattached PCLs 18/52.
+    `object_store_inputs.json` and the checkpoint's
+    `input_manifest.object_store[_digest]` hold the store, selection, every
+    object's revisions and scale, every consumed relationship's revision,
+    fit volume (inferred), external frames, materialization settings and
+    refresh mode with its normal source. A rerun with
+    `object_store_refresh_links: false` read the same relationships
+    read-only and produced the same digest and constraint counts (48 s
+    warm; the first run's 4 min was mostly cold kernel compilation, e.g.
+    60 s vs 0.6 s for the theta topology). A rerun of the refresh over the
+    failed run's partial commit reported every link unchanged.
+  - Old/new comparison on the same data and settings (the pre-step-11 tree,
+    its CLI's store requirement disabled, reading the same 181 patch
+    directories, PCL documents and fibers): the file linker attached 530
+    regular-PCL points (the store detector made 553 links), of which 28 lie
+    on quads the patch losses sample, the same 28 the adapter keeps; it
+    built 41 cross-patch views (abs_winding 6, relative_windings 19,
+    same_windings 15, fibers 1) and the same 52 strips. The new path has 34
+    fewer regular cross-patch views because step 7 drops attachments off
+    the sampled quads (here mostly outside the 100-slice window, which the
+    file path still used), gains 809 overlap pairs, and attaches fibers by 6
+    representative contacts instead of 13 linked points. Old total loss
+    1290 -> 224 -> 202 -> 43 -> 44; satisfied patches 31/173, satisfied area
+    46.4%, unattached PCLs 17/52. Both decrease to the same scale; the new
+    run satisfies more patch area. These are expected consequences of the
+    changed link semantics and the new overlap constraints, not asserted
+    equal.
+  - Not run on real data: a two-rank fit (one GPU here; the two-rank
+    startup tests run on CPU ranks) and a resume against changed inputs
+    (covered by the startup tests).
 
 Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the

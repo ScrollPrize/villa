@@ -172,6 +172,144 @@ specifically):
 }
 ```
 
+## Object-store inputs
+
+`fit_spiral.py` reads patches, fibers and point collections (PCLs), and the
+relationships between them, from a `vc_object_store` database
+(`object_store_inputs.py`). It never reads patch directories, fiber JSONs or
+PCL documents, and never links points to patches itself: the store's
+detectors do. The other inputs (umbilicus, lasagna normal/gradient stores,
+outer shell, fiber directions, winding inference, tracks) still come from the
+dataset's conventional layout and `spiral-scroll.json`.
+
+### One-time dataset ingest
+
+Ingest the dataset's files into a store once, with the store's
+`vc_object_ingest` (built with `vc_object_store`; see its `docs/README.md`).
+Every object needs a coordinate frame (`--volume-uuid`, `--scale-factor`: stored
+coordinates = reference-volume voxels × the scale factor), and VC3D-era files
+need identities derived from one UUID namespace per dataset
+(`--derive-uuids`; generate it once, record it with the dataset, and reuse
+it, so the same files always map to the same objects). For the conventional
+Spiral layout, where patches and PCLs are in fit-volume voxels and version-3
+fibers without `coordinate_base_shape_zyx` are at 4× that scale, that is two
+runs, one per frame:
+
+```sh
+NS=<dataset uuid namespace>   # e.g. python3 -c 'import uuid; print(uuid.uuid4())', once
+ingest="vc_object_ingest --db dataset.vcobj --author $USER --derive-uuids $NS --volume-uuid VOLUME"
+patches=(); for p in dataset/verified_patches/*/; do patches+=(--patch "$p"); done
+$ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
+    --point-collections dataset/abs_winding.json \
+    --point-collections dataset/relative_windings.json \
+    --point-collections dataset/same_windings.json
+$ingest --scale-factor 4 --drop-dangling-branches --fiber dataset/fibers
+```
+
+`VOLUME` names the reference volume (its catalog `metadata.json` id, or any
+stable name such as `s1-reference`); the fit infers it from the objects. Fibers
+declaring `coordinate_base_shape_zyx` need the scale that domain implies
+instead of 4. The two repair flags handle the 2026-10 Spiral dataset's defects
+(branches to fiber files that do not exist; `same_windings.json` collections
+that each number their points from 0) and are recorded on the objects.
+
+What the ingest covers: tifxyz patches (`--patch`, one directory each), the
+PCL role documents, and the fiber directory with its same-winding branches
+(which become `fiber_branch` relationships; adjacent branches are kept but
+never used by the fit). A collection is absolute-winding when its
+`meta.source.winding_is_absolute` is true, which the ingest sets for a
+document named `abs_winding.json`; otherwise its points' `wind_a` annotations
+make it relative, and none make it same-winding. `patch-overlap-pcls.json` is
+not ingested: the store's overlap detector replaces it. Ingest is not repeated
+to update a store; edit objects through the store's API instead.
+
+### Running a fit
+
+The command-line fit requires `object_store_path`:
+
+```sh
+FIT_SPIRAL_CONFIG_OVERRIDES='{"object_store_path": "dataset.vcobj",
+  "object_store_author": "me", "z_begin": 9000, "z_end": 9100}' \
+  python fit_spiral.py --dataset dataset/
+```
+
+At startup rank 0 resolves the selection (`object_store_{patch,pcl,fiber}_{uuids,tags}`;
+unset selects every active object, an empty list none; `input_use_*` toggles
+off select none), validates every selected object's frame, then refreshes the
+PCL-patch, fiber-patch and patch-overlap links as `object_store_author`,
+writing them back to the store. Detectors whose object kinds are not all
+selected are skipped. Every detector failure is reported together and stops
+the fit before training (detectors that already committed are named; a rerun
+reconciles them). `object_store_refresh_links: false` reads the store's
+current relationships read-only. Pending and approved relationships are used
+and rejected ones never; `object_store_approved_links_only` uses approved ones
+only (refresh still runs, so new links stay pending and unused).
+
+Fiber-patch refresh uses the fit's lasagna normals when `input_use_normals` is
+on and the normal stores exist (whatever the dense-normal loss weight), else
+`object_store_normal_ct_*` structure-tensor normals, else the fiber centerline
+alone (with a warning). The log names the source.
+
+After refresh every rank reads the same frozen snapshot and materializes it:
+patch grids, PCL points by stable ID with their `wind_a`, fibers trimmed and
+decimated with every patch contact and branch endpoint kept, branch links,
+and patch overlaps as same-surface point pairs (`pcl_patch_overlap_*`, sampling
+group `patch_overlaps`). Attachments on patch quads the losses do not sample
+are dropped and reported. The ranks' input digests must agree. The log prints
+the selection, consumed relationships and constraint counts; `python
+object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
+report without training.
+
+The inputs are frozen for the fit: settings that would relink or re-derive
+them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
+frame settings) need a new fit. Each run writes `object_store_inputs.json`
+(store, selection, the revision and scale of every object and the revision of
+every consumed relationship, the fit volume, external-input frames,
+materialization settings, and the refresh mode with its fiber-patch normal
+source) and checkpoints carry the same manifest and digest; a resume whose
+inputs differ is refused unless `object_store_allow_changed_inputs`.
+
+### Frames and units
+
+The fit's unit is the reference-volume voxel (ZYX), whatever the stored
+scale: each object's stored XYZ is divided by its own scale factor once, at
+materialization, and patch grid indices are unchanged. Loss thresholds, ROI
+bounds, spacings and radial offsets are all in reference-volume voxels. An
+object without a declared frame, or frames naming different volumes, is an
+error; nothing is assumed to be at scale 1. The umbilicus keeps its
+`spiral-scroll.json` coordinate scale and lasagna stores their
+`lasagna_scale`; the outer shell, fiber directions and winding inference are
+in fit-volume voxels. A track store declares `track_scale_factor` (stored
+track coordinates = fit voxels × it); it is never inferred.
+
+### Tests and smoke checks
+
+From the repository root, with `vc_object_store`'s Python module on the path
+(its build directory's `python/`):
+
+```sh
+PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_object_store_inputs.py \
+  spiral-fitting/tests/test_object_store_materialize.py \
+  spiral-fitting/tests/test_object_store_fibers.py \
+  spiral-fitting/tests/test_object_store_overlaps.py \
+  spiral-fitting/tests/test_object_store_startup.py
+```
+
+These build small stores and cover selection, frames and scales, refresh and
+its idempotency, aggregated failures, read-only and approved-only modes,
+two-rank startup (success, failure, manifest mismatch), resume refusal, track
+scales, and the runtime constraints against
+`tests/data/object_store_reference.json`, which the removed file loader
+produced from the same fixture. An opt-in startup test refreshes and
+materializes a real store (give it a scratch copy: it writes links):
+
+```sh
+OBJECT_STORE_SMOKE_STORE=/scratch/dataset.vcobj OBJECT_STORE_SMOKE_Z=9000:9100 \
+  PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python \
+  -m pytest -s -q spiral-fitting/tests/test_object_store_startup.py -k real_data
+```
+
 ## Lasagna inputs must be packed first
 
 `fit_spiral.py` reads `normal_x`, `normal_y` and `gradient_magnitude` only
