@@ -367,6 +367,14 @@ a product's native-only policy.
 ## Writer defaults and compatibility options
 
 Both full-volume inference entrypoints default to `--output-format compact`.
+Fiber inference defaults to the checkpoint's native output resolution: input
+spacing multiplied by the model's `output_stride`, with no extra pooling.
+For example, input at base/2 and model stride 2 produce native `sd2/2`
+(base/4), not `sd3/3`. `--inference-scaledown-power` explicitly overrides the
+total reduction relative to input, including the model stride; `1` means
+factor 2, not another factor 2 on top of the model's reduction. Coarser pyramid
+levels do not replace or reduce this native level. Provenance records both
+`native_output_stride` and `additional_downsample_factor` (1 by default).
 An explicitly requested `--output-format legacy` writes the old per-channel
 stores and `.lasagna.json`. Existing sidecar outputs retain legacy handling;
 new `.lasagna.json` output arguments are normalized to a `.zarr` store when

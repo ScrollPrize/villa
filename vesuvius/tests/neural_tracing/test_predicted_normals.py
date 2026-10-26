@@ -10,7 +10,8 @@ from lasagna.normal_encoding import encode_normal_nxny_u8
 
 
 @pytest.mark.parametrize('normal', [False, True])
-def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal):
+@pytest.mark.parametrize('input_scale', [1, 2])
+def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal, input_scale):
     from vesuvius.neural_tracing.fiber_trace_3d import infer
     from lasagna.lasagna_volume import LasagnaVolume
 
@@ -28,12 +29,18 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal)
     except TypeError:  # Zarr 2 uses v2 by default.
         array = zarr.open_array(str(source), **kwargs)
     array[:] = 100
+    base = tmp_path / 'base.zarr'
+    base_kwargs = dict(kwargs, shape=(16*input_scale,)*3)
+    try:
+        zarr.open_array(str(base), zarr_format=2, **base_kwargs)
+    except TypeError:
+        zarr.open_array(str(base), **base_kwargs)
     for fmt in ('compact', 'legacy'):
         output = tmp_path / fmt / 'prediction.lasagna.json'
         infer.run_fiber_trace_3d_inference(
             input_path=str(source), output_path=output, checkpoint=checkpoint,
-            output_format=fmt, device='cpu', no_download=True, base_ref=str(source), base_scale=0,
-            tile_size=16, overlap=0, border=0, inference_scaledown_power=1,
+            output_format=fmt, device='cpu', no_download=True, base_ref=str(base), base_scale=0,
+            tile_size=16, overlap=0, border=0,
             levels=3, ome_chunk=4, flush_workers=0, accumulator_workers=0,
             inference_precision='off',
         )
@@ -47,8 +54,13 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal)
         schema = provenance['checkpoint']['output_schema']
         assert schema['annotations'] == cfg['annotations']
         assert 'annotation_products_exported' not in schema
+        assert provenance['inference']['effective_base_factor'] == input_scale * 2
+        assert provenance['inference']['additional_downsample_factor'] == 1
+        assert provenance['inference']['native_output_stride'] == 2
     if normal:
-        array = zarr.open_array(str(tmp_path / 'compact/prediction.zarr/sd1/1'), mode='r')
+        level = 1 if input_scale == 1 else 2
+        array = zarr.open_array(str(tmp_path / f'compact/prediction.zarr/sd{level}/{level}'), mode='r')
+        assert array.shape[1:] == (8,8,8)
         assert array.shape[0] == array.chunks[0] == 7
         assert np.any(array[-1] == 255)
         values = array[:]
