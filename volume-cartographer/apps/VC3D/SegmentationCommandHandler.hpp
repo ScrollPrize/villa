@@ -328,11 +328,15 @@ private:
         QString store;       // the store file (a hosted replica's local file)
         QString volumeUuid;  // the current volume, which outputs are bound to
     };
-    // The listed surface `id` stored at the current volume's scale (tools read
-    // stored coordinates) in a writable store; nullopt with `error` set otherwise.
-    std::optional<StoredSurface> storedSurface(const std::string& id, CommandLaunchError* error) const;
+    // The listed surface `id` in a writable store, stored in the current volume's
+    // voxels (tools read stored coordinates) or, for a tool that reads through
+    // the store's view, just opening in the current volume; nullopt with
+    // `error` set otherwise.
+    std::optional<StoredSurface> storedSurface(const std::string& id, CommandLaunchError* error,
+                                               bool throughView = false) const;
     // Same, reporting failures in a dialog; `checkRunner` also needs an idle runner.
-    std::optional<StoredSurface> requireStoredSurface(const std::string& id, bool checkRunner);
+    std::optional<StoredSurface> requireStoredSurface(const std::string& id, bool checkRunner,
+                                                      bool throughView = false);
     // The listed surfaces stored in the current volume's voxels (tool inputs).
     std::vector<const SurfaceCatalog::Row*> toolSurfaces() const;
     // The attached store's file and the current volume, for tools that read no surface.

@@ -118,9 +118,6 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     spCropY_ = new QSpinBox(this); spCropY_->setRange(0, 1000000);
     spCropW_ = new QSpinBox(this); spCropW_->setRange(0, 1000000); spCropW_->setValue(0);
     spCropH_ = new QSpinBox(this); spCropH_->setRange(0, 1000000); spCropH_->setValue(0);
-    QWidget* affPick = pathPicker(this, edtAffine_, "Select affine JSON", false);
-    chkInvert_ = new QCheckBox("Invert affine", this);
-    spScaleSeg_ = new QDoubleSpinBox(this); spScaleSeg_->setDecimals(3); spScaleSeg_->setRange(0.0001, 1000.0); spScaleSeg_->setValue(1.0);
     spRotate_ = new QDoubleSpinBox(this); spRotate_->setDecimals(2); spRotate_->setRange(-360.0, 360.0); spRotate_->setValue(0.0);
     cmbFlip_ = new QComboBox(this);
     cmbFlip_->addItem("None", -1);
@@ -132,9 +129,6 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     adv->addRow("Crop Y:", spCropY_);
     adv->addRow("Crop Width:", spCropW_);
     adv->addRow("Crop Height:", spCropH_);
-    adv->addRow("Affine transform:", affPick);
-    adv->addRow("Invert affine:", chkInvert_);
-    adv->addRow("Scale segmentation:", spScaleSeg_);
     adv->addRow("Rotate (deg):", spRotate_);
     adv->addRow("Flip:", cmbFlip_);
 
@@ -177,7 +171,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     updateIncludeTifsEnabled();
     connect(edtOutput_, &QLineEdit::textChanged, this, [updateIncludeTifsEnabled](const QString&){ updateIncludeTifsEnabled(); });
 
-    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtOutput_, edtAffine_ });
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtOutput_ });
 
     // Apply saved defaults to optional controls, then session overrides
     applySavedDefaults();
@@ -207,9 +201,6 @@ int RenderParamsDialog::cropX() const { return spCropX_->value(); }
 int RenderParamsDialog::cropY() const { return spCropY_->value(); }
 int RenderParamsDialog::cropWidth() const { return spCropW_->value(); }
 int RenderParamsDialog::cropHeight() const { return spCropH_->value(); }
-QString RenderParamsDialog::affinePath() const { return edtAffine_->text(); }
-bool RenderParamsDialog::invertAffine() const { return chkInvert_->isChecked(); }
-double RenderParamsDialog::scaleSegmentation() const { return spScaleSeg_->value(); }
 double RenderParamsDialog::rotateDegrees() const { return spRotate_->value(); }
 int RenderParamsDialog::flipAxis() const { return cmbFlip_->currentData().toInt(); }
 bool RenderParamsDialog::includeTifs() const { return chkIncludeTifs_->isChecked(); }
@@ -224,8 +215,6 @@ int  RenderParamsDialog::s_cropX = 0;
 int  RenderParamsDialog::s_cropY = 0;
 int  RenderParamsDialog::s_cropW = 0;
 int  RenderParamsDialog::s_cropH = 0;
-bool RenderParamsDialog::s_invertAffine = false;
-double RenderParamsDialog::s_scaleSeg = 1.0;
 double RenderParamsDialog::s_rotateDeg = 0.0;
 int  RenderParamsDialog::s_flipAxis = -1;
 int  RenderParamsDialog::s_ompThreads = -1;
@@ -239,8 +228,6 @@ void RenderParamsDialog::applyCodeDefaults() {
     spCropY_->setValue(0);
     spCropW_->setValue(0);
     spCropH_->setValue(0);
-    chkInvert_->setChecked(false);
-    spScaleSeg_->setValue(1.0);
     spRotate_->setValue(0.0);
     // Flip index: 0 None, 1 Vertical, 2 Horizontal, 3 Both; but we stored data -1/0/1/2
     // Set by data match
@@ -260,8 +247,6 @@ void RenderParamsDialog::applySavedDefaults() {
     spCropY_->setValue(s.value("crop_y", spCropY_->value()).toInt());
     spCropW_->setValue(s.value("crop_w", spCropW_->value()).toInt());
     spCropH_->setValue(s.value("crop_h", spCropH_->value()).toInt());
-    chkInvert_->setChecked(s.value("invert_affine", chkInvert_->isChecked()).toBool());
-    spScaleSeg_->setValue(s.value("scale_segmentation", spScaleSeg_->value()).toDouble());
     spRotate_->setValue(s.value("rotate_deg", spRotate_->value()).toDouble());
     // flip axis stored as int data
     const int flip = s.value("flip_axis", cmbFlip_->currentData().toInt()).toInt();
@@ -282,8 +267,6 @@ void RenderParamsDialog::applySessionDefaults() {
     spCropY_->setValue(s_cropY);
     spCropW_->setValue(s_cropW);
     spCropH_->setValue(s_cropH);
-    chkInvert_->setChecked(s_invertAffine);
-    spScaleSeg_->setValue(s_scaleSeg);
     spRotate_->setValue(s_rotateDeg);
     int idx = cmbFlip_->findData(s_flipAxis);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
@@ -301,8 +284,6 @@ void RenderParamsDialog::saveDefaults() const {
     s.setValue("crop_y", spCropY_->value());
     s.setValue("crop_w", spCropW_->value());
     s.setValue("crop_h", spCropH_->value());
-    s.setValue("invert_affine", chkInvert_->isChecked());
-    s.setValue("scale_segmentation", spScaleSeg_->value());
     s.setValue("rotate_deg", spRotate_->value());
     s.setValue("flip_axis", cmbFlip_->currentData().toInt());
     s.setValue("omp_threads", ompThreads());
@@ -319,8 +300,6 @@ void RenderParamsDialog::updateSessionFromUI() {
     s_cropY = spCropY_->value();
     s_cropW = spCropW_->value();
     s_cropH = spCropH_->value();
-    s_invertAffine = chkInvert_->isChecked();
-    s_scaleSeg = spScaleSeg_->value();
     s_rotateDeg = spRotate_->value();
     s_flipAxis = cmbFlip_->currentData().toInt();
     s_ompThreads = ompThreads();

@@ -199,14 +199,16 @@ void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
     _optAlignGrid = alignGrid;
 }
 
+void CommandLineToolRunner::setRenderVolume(const QString& volumeUuid)
+{
+    _renderVolumeUuid = volumeUuid;
+}
+
 void CommandLineToolRunner::setRenderAdvanced(
     int cropX,
     int cropY,
     int cropWidth,
     int cropHeight,
-    const QString& affinePath,
-    bool invertAffine,
-    float scaleSegmentation,
     double rotateDegrees,
     int flipAxis)
 {
@@ -214,9 +216,6 @@ void CommandLineToolRunner::setRenderAdvanced(
     _cropY = cropY;
     _cropWidth = cropWidth;
     _cropHeight = cropHeight;
-    _affinePath = affinePath;
-    _invertAffine = invertAffine;
-    _scaleSeg = scaleSegmentation;
     _rotateDeg = rotateDegrees;
     _flipAxis = flipAxis;
 }
@@ -686,6 +685,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << _outputPattern
                  << "--store" << _storePath
                  << "--surface" << _surfaceUuid
+                 << "--volume-uuid" << _renderVolumeUuid
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
@@ -702,13 +702,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                      << "--crop-y" << QString::number(_cropY)
                      << "--crop-width" << QString::number(_cropWidth)
                      << "--crop-height" << QString::number(_cropHeight);
-            }
-            if (!_affinePath.isEmpty()) {
-                args << "--affine-transform" << _affinePath;
-                if (_invertAffine) args << "--invert-affine";
-            }
-            if (std::abs(_scaleSeg - 1.0f) > 1e-6f) {
-                args << "--scale-segmentation" << QString::number(_scaleSeg);
             }
             if (std::abs(_rotateDeg) > 1e-6) {
                 args << "--rotate" << QString::number(_rotateDeg);

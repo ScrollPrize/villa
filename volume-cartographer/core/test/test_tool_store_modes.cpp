@@ -11,7 +11,9 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -114,6 +116,58 @@ TEST_CASE("vc_render_tifxyz renders a stored surface like its tifxyz")
         if (entry.is_regular_file()) files.push_back(fs::relative(entry.path(), f.dir / "file"));
     REQUIRE_FALSE(files.empty());
     for (const auto& file : files) CHECK(readFile(f.dir / "store" / file) == readFile(f.dir / "file" / file));
+}
+
+TEST_CASE("vc_render_tifxyz reads a stored surface through a registered volume like --affine on its tifxyz")
+{
+    Fixture f;
+    writeRampVolume(f.dir / "volume.zarr");
+    // An 8 degree turn about z with a shift, from "vol" to the rendered volume.
+    VolumeAffine registration;
+    const double c = std::cos(8 * M_PI / 180), s = std::sin(8 * M_PI / 180);
+    registration(0, 0) = c; registration(0, 1) = -s; registration(1, 0) = s; registration(1, 1) = c;
+    registration(0, 3) = 12.5; registration(1, 3) = -9.25; registration(2, 3) = 3;
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        const auto uuid = util::newUuid();
+        auto txn = db.write({{uuid, std::nullopt}});
+        db.registerVolumeTransform(txn, "vol", "rendered", registration, "test registration", uuid);
+        txn.commit();
+    }
+    std::ofstream(f.dir / "transform.json") << nlohmann::json{{"transformation_matrix", registration.json()}}.dump();
+    const auto bin = tool("VC_RENDER_TIFXYZ_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
+        "\" --scale 1 --group-idx 0 --num-slices 5";
+    run(bin + " --segmentation \"" + f.tifxyz.string() + "\" --affine \"" + (f.dir / "transform.json").string() +
+        "\" --tif-output \"" + (f.dir / "file").string() + "\"", f.dir / "file.log");
+    run(bin + " " + f.storeArgs() + " --volume-uuid rendered --tif-output \"" + (f.dir / "store").string() + "\"", f.dir / "store.log");
+    // The view maps the grid before sampling and derives normals from it; the
+    // file mode maps sampled points and normals. Both are the same affine
+    // image of the surface, up to rounding.
+    size_t files = 0, pixels = 0, differing = 0;
+    double worst = 0;
+    for (const auto& entry : fs::directory_iterator(f.dir / "file")) {
+        const auto file = cv::imread(entry.path().string(), cv::IMREAD_UNCHANGED);
+        const auto store = cv::imread((f.dir / "store" / entry.path().filename()).string(), cv::IMREAD_UNCHANGED);
+        REQUIRE(file.size() == store.size());
+        cv::Mat diff;
+        cv::absdiff(file, store, diff);
+        double max = 0;
+        cv::minMaxLoc(diff, nullptr, &max);
+        worst = std::max(worst, max);
+        differing += size_t(cv::countNonZero(diff));
+        pixels += diff.total();
+        ++files;
+    }
+    CHECK(files == 5);
+    CHECK(worst <= 1);
+    CHECK(differing * 100 <= pixels);
+
+    // The registration is the store's: render refuses a second one on top.
+    const auto refused = std::system((bin + " " + f.storeArgs() + " --volume-uuid rendered --affine \"" +
+        (f.dir / "transform.json").string() + "\" --tif-output \"" + (f.dir / "both").string() + "\" > \"" +
+        (f.dir / "both.log").string() + "\" 2>&1").c_str());
+    CHECK(refused != 0);
 }
 
 namespace {

@@ -1263,6 +1263,7 @@ int main(int argc, char *argv[])
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("store", po::value<std::string>(), "Object store holding the surface to render (with --surface)")
         ("surface", po::value<std::string>(), "Stored surface UUID to render (with --store)")
+        ("volume-uuid", po::value<std::string>(), "Read the stored surface in this volume's voxels through the store's view of it (its binding or a registration); replaces --affine and --scale-segmentation")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch the chunks this render reads into the shared remote cache before rendering instead of streaming them during the render")
         ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
@@ -1280,8 +1281,6 @@ int main(int argc, char *argv[])
         ("auto-crop", po::bool_switch()->default_value(false), "Auto-crop to valid surface bbox")
         ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(), "Affine JSON files (append :inv to invert)")
         ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(), "0-based indices to invert")
-        ("affine-transform", po::value<std::string>(), "[DEPRECATED] Single affine JSON")
-        ("invert-affine", po::bool_switch()->default_value(false), "[DEPRECATED] Invert single affine")
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
         ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
         ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
@@ -1444,6 +1443,14 @@ int main(int argc, char *argv[])
         logPrintf(stderr, "Error: give --segmentation, or --store with --surface\n");
         return EXIT_FAILURE;
     }
+    std::optional<std::string> view_volume;
+    if (parsed.count("volume-uuid")) {
+        if (!store_mode || parsed.count("affine") || parsed.count("affine-invert") || !parsed["scale-segmentation"].defaulted()) {
+            logPrintf(stderr, "Error: --volume-uuid needs --store and replaces --affine and --scale-segmentation\n");
+            return EXIT_FAILURE;
+        }
+        view_volume = parsed["volume-uuid"].as<std::string>();
+    }
     std::filesystem::path seg_path = store_mode ? parsed["surface"].as<std::string>() : parsed["segmentation"].as<std::string>();
 
     float tgt_scale = parsed["scale"].as<float>();
@@ -1549,10 +1556,6 @@ int main(int argc, char *argv[])
     if (parsed.count("affine"))
         for (const auto& s : parsed["affine"].as<std::vector<std::string>>())
             affineSpecs.push_back(parseAffineSpec(s));
-    if (parsed.count("affine-transform")) {
-        affineSpecs.emplace_back(parsed["affine-transform"].as<std::string>(), parsed["invert-affine"].as<bool>());
-        logPrintf(stdout, "[deprecated] Using --affine-transform; prefer --affine.\n");
-    }
     if (parsed.count("affine-invert") && !affineSpecs.empty()) {
         std::set<int> inv;
         for (int idx : parsed["affine-invert"].as<std::vector<int>>()) {
@@ -1796,7 +1799,7 @@ int main(int argc, char *argv[])
 
         std::unique_ptr<QuadSurface> surf;
         try {
-            surf = store_mode ? StoreSurfaces(parsed["store"].as<std::string>(), "vc_render_tifxyz").load(seg_folder.string())
+            surf = store_mode ? StoreSurfaces(parsed["store"].as<std::string>(), "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
                               : load_quad_from_tifxyz(seg_folder);
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }

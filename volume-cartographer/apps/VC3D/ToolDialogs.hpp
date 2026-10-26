@@ -47,9 +47,6 @@ public:
     int cropY() const;
     int cropWidth() const;
     int cropHeight() const;
-    QString affinePath() const;
-    bool invertAffine() const;
-    double scaleSegmentation() const;
     double rotateDegrees() const;
     int flipAxis() const; // -1 none, 0 vertical, 1 horizontal, 2 both
     bool includeTifs() const; // when output is .zarr
@@ -62,8 +59,6 @@ private:
     static bool s_haveSession;
     static bool s_includeTifs;
     static int  s_cropX, s_cropY, s_cropW, s_cropH;
-    static bool s_invertAffine;
-    static double s_scaleSeg;
     static double s_rotateDeg;
     static int  s_flipAxis;
     static int  s_ompThreads;
@@ -88,9 +83,6 @@ private:
     QSpinBox* spCropY_{nullptr};
     QSpinBox* spCropW_{nullptr};
     QSpinBox* spCropH_{nullptr};
-    QLineEdit* edtAffine_{nullptr};
-    QCheckBox* chkInvert_{nullptr};
-    QDoubleSpinBox* spScaleSeg_{nullptr};
     QDoubleSpinBox* spRotate_{nullptr};
     QComboBox* cmbFlip_{nullptr};
     QCheckBox* chkIncludeTifs_{nullptr};

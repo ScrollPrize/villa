@@ -93,9 +93,10 @@ public:
     // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run (default
     // TifStack; interactive re-asserts TifStack to avoid leaking a prior Zarr choice).
     void setRenderOutputFormat(RenderOutputFormat format);
+    // The volume a render reads the surface in, through the store's view of it.
+    void setRenderVolume(const QString& volumeUuid);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
-                           const QString& affinePath, bool invertAffine,
-                           float scaleSegmentation, double rotateDegrees, int flipAxis);
+                           double rotateDegrees, int flipAxis);
     // vc_grow_seg_from_segments: grow `srcSurface` along the surfaces of `volumeUuid`
     // tagged `sourceTag` into new surfaces tagged `outputTag` and bound to the volume.
     void setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
@@ -231,9 +232,7 @@ private:
     int _cropY{0};
     int _cropWidth{0};
     int _cropHeight{0};
-    QString _affinePath;
-    bool _invertAffine{false};
-    float _scaleSeg{1.0f};
+    QString _renderVolumeUuid;
     double _rotateDeg{0.0};
     int _flipAxis{-1};
     bool _includeTifs{false};

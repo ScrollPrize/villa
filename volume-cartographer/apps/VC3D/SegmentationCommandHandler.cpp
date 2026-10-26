@@ -1455,7 +1455,7 @@ SegmentationCommandHandler::storeForTools(CommandLaunchError* error) const
 }
 
 std::optional<SegmentationCommandHandler::StoredSurface>
-SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchError* error) const
+SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchError* error, bool throughView) const
 {
     const CommandLaunchErrorSetter setErr{error};
     auto stored = storeForTools(error);
@@ -1472,8 +1472,9 @@ SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchEr
                CommandLaunchError::InvalidState);
         return std::nullopt;
     }
-    if (!row->toolInput()) {
-        setErr(tr("Surface %1 is not stored in the current volume's voxels; tools read stored coordinates.")
+    if (throughView ? !row->bound() : !row->toolInput()) {
+        setErr((throughView ? tr("Surface %1 does not open in the current volume.")
+                            : tr("Surface %1 is not stored in the current volume's voxels; tools read stored coordinates."))
                    .arg(QString::fromStdString(id)),
                CommandLaunchError::InvalidState);
         return std::nullopt;
@@ -1484,10 +1485,10 @@ SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchEr
 }
 
 std::optional<SegmentationCommandHandler::StoredSurface>
-SegmentationCommandHandler::requireStoredSurface(const std::string& id, bool checkRunner)
+SegmentationCommandHandler::requireStoredSurface(const std::string& id, bool checkRunner, bool throughView)
 {
     CommandLaunchError error;
-    auto stored = storedSurface(id, &error);
+    auto stored = storedSurface(id, &error, throughView);
     if (!stored) {
         QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return std::nullopt;
@@ -1575,7 +1576,7 @@ void SegmentationCommandHandler::configureCommandRunnerRemoteAuthForVolumePath(c
 
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 {
-    const auto stored = requireStoredSurface(segmentId, false);
+    const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
     auto renderVolume = _state ? _state->currentVolume() : nullptr;
@@ -1631,6 +1632,16 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
         renderVolume &&
             (renderVolume->baseScaleLevel() > 0 ||
              renderVolume->hasExplicitVoxelSizeOverride()));
+    // The surface is read in the rendered volume's voxels through the store.
+    std::string renderVolumeId;
+    if (_state && _state->vpkg())
+        for (const auto& id : _state->vpkg()->volumeIDs())
+            if (commandPathForVolume(_state->vpkg()->volume(id)) == dlg.volumePath()) renderVolumeId = id;
+    if (renderVolumeId.empty()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Render a volume of the open package: %1").arg(dlg.volumePath()));
+        return;
+    }
+    _cmdRunner->setRenderVolume(QString::fromStdString(renderVolumeId));
     _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
     const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
@@ -1645,9 +1656,7 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
         _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
     }
     _cmdRunner->setRenderAdvanced(
-        dlg.cropX(), dlg.cropY(), dlg.cropWidth(), dlg.cropHeight(),
-        dlg.affinePath(), dlg.invertAffine(),
-        static_cast<float>(dlg.scaleSegmentation()), dlg.rotateDegrees(), dlg.flipAxis());
+        dlg.cropX(), dlg.cropY(), dlg.cropWidth(), dlg.cropHeight(), dlg.rotateDegrees(), dlg.flipAxis());
     _cmdRunner->setIncludeTifs(dlg.includeTifs());
     _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations(), dlg.flattenDownsample());
 
@@ -1893,7 +1902,7 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         setErr(tr("No volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
-    const auto stored = storedSurface(segmentId, error);
+    const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
     if (!_cmdRunner) {
         setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
@@ -1976,7 +1985,8 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     _cmdRunner->setVolumePath(volumePath);
     configureCommandRunnerRemoteAuthForVolumePath(volumePath);
 
-    _cmdRunner->setRenderAdvanced(0, 0, 0, 0, QString(), false, 1.0f, 0.0, -1);
+    _cmdRunner->setRenderVolume(QString::fromStdString(renderVolume->id()));
+    _cmdRunner->setRenderAdvanced(0, 0, 0, 0, 0.0, -1);
     _cmdRunner->setIncludeTifs(false);
     _cmdRunner->setFlattenOptions(false, 10, 1);
     if (!_cmdRunner->execute(

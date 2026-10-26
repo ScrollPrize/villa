@@ -44,7 +44,8 @@ async def vc3d_render_tifxyz(
     (30-minute cap) and return the terminal job.status inline.
 
     Returns {"jobId", "kind": "render.tifxyz", "source": "tool", "outputDir",
-    "outputFormat", "volumeId"}. Advanced render options (crop/affine/rotate/
+    "outputFormat", "volumeId"}. The surface is read in that volume through the
+    object store (its binding or a registration). Advanced render options (crop/rotate/
     flip/in-render flatten/composite/alpha) are GUI-only and not exposed here.
     """
     result = await _call(

@@ -69,6 +69,9 @@ def main():
             'vc-open-data-coordinate-space:smp/catvol@L0'])])))
         with ObjectStore.open(str(database), author='bridge-fixture') as store:
             user_surface = add_surface(store, 'smoke surface', 'vol1', invalid_rows=2)
+            # A surface of another scan, registered to vol1 by a shift.
+            registered_surface = add_surface(store, 'registered surface', 'scanb')
+            store.register_volume_transform('scanb', 'vol1', [[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 0]], 'smoke registration')
         catalog_store = root / 'remote-cache' / 'open_data' / 'stores' / 'smp.vcobj'
         catalog_store.parent.mkdir(parents=True)
         with ObjectStore.create(str(catalog_store), author='vc3d-open-data') as store:
@@ -132,6 +135,7 @@ def main():
                 assert tag + '_external' in edited[0]['tags'], 'Edit after external commit must persist'
             client.call('fiber.save', {}, timeout=120)
             print(f'Attached {count} fibers; immediate edit, external journal refresh and Save barrier passed', flush=True)
+            render(client, root, user_surface, registered_surface)
             surfaces(client, database, user_surface, catalog_surface)
         finally:
             client.close()
@@ -225,6 +229,25 @@ def surfaces(client, database, user_surface, catalog_surface):
     client.call('segmentation.enable_editing', {'enabled': False}, timeout=120)
     print('Surfaces: list, activate, tags, rename, review and crop edit the store; a catalog surface '
           'is read-only and its editable copy edits', flush=True)
+
+
+def render(client, root, *surface_ids):
+    """Surfaces render in the open volume's voxels: one bound to it, and one of
+    another scan through the store's registration."""
+    for surface in surface_ids:
+        out = root / ('render-' + surface)
+        started, _ = client.call('render.tifxyz', {'segmentId': surface, 'outputFormat': 'tif_stack',
+                                                   'outputDir': str(out), 'numSlices': 1}, timeout=120)
+        deadline = time.monotonic() + 120
+        while True:
+            status, _ = client.call('job.status', {'jobId': started['jobId']}, timeout=30)
+            if status['state'] in ('succeeded', 'failed'):
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(.2)
+        assert status['state'] == 'succeeded', status
+        assert list((out / 'layers').glob('*.tif')), list(out.rglob('*'))
+    print('Render: a bound surface and a registered one render through the store', flush=True)
 
 
 def hosted(root, database, launch, tag, surface):
