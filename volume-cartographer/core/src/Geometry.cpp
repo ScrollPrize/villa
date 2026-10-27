@@ -227,25 +227,6 @@ bool loc_valid_xy(const cv::Mat_<float> &m, const cv::Vec2d &l) {
     return loc_valid_xy_scalar(m, l);
 }
 
-float tdist(const cv::Vec3f &a, const cv::Vec3f &b, float t_dist)
-{
-    cv::Vec3f d = a-b;
-    float l = sqrtf(d.dot(d));
-
-    return std::abs(l-t_dist);
-}
-
-float tdist_sum(const cv::Vec3f &v, const std::vector<cv::Vec3f> &tgts, const std::vector<float> &tds)
-{
-    float sum = 0;
-    for(int i=0;i<tgts.size();i++) {
-        float d = tdist(v, tgts[i], tds[i]);
-        sum += d*d;
-    }
-
-    return sum;
-}
-
 // Helper: remove spatial outliers based on robust neighbor-distance stats
 cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, float distance_threshold, bool print_stats)
 {

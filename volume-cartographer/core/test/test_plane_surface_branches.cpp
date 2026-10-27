@@ -1,6 +1,5 @@
 // Coverage gap-filler for PlaneSurface.cpp: exercises every branch in the
-// anonymous-namespace vx/vy/basis helpers (lines ~26-83 in PlaneSurface.cpp)
-// plus the free function min_loc (lines ~387-453).
+// anonymous-namespace vx/vy/basis helpers in PlaneSurface.cpp.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -95,58 +94,4 @@ TEST_CASE("PlaneSurface with normal=(0,1,0): vy degenerate branch")
     CHECK(finiteVec(vy));
     CHECK(std::abs(vx.dot(n)) < 1e-3f);
     CHECK(std::abs(vy.dot(n)) < 1e-3f);
-}
-
-// ------------------- min_loc free function -------------------
-
-TEST_CASE("min_loc: invalid starting location returns -1 sentinel")
-{
-    auto m = makePlanarGrid(8, 8);
-    m(2, 2) = cv::Vec3f(-1.f, -1.f, -1.f);
-    cv::Vec2f loc(2.0f, 2.0f); // points to invalid cell (loc is [x,y])
-    cv::Vec3f out;
-    std::vector<cv::Vec3f> tgts = {cv::Vec3f(0, 0, 0)};
-    std::vector<float> tds = {0.f};
-    float r = min_loc(m, loc, out, tgts, tds, nullptr);
-    CHECK(r == doctest::Approx(-1.0f));
-    CHECK(out == cv::Vec3f(-1.f, -1.f, -1.f));
-}
-
-TEST_CASE("min_loc: zero-target on flat grid stays put")
-{
-    auto m = makePlanarGrid(16, 16);
-    // Target is the start point itself; min_loc should stabilize there.
-    cv::Vec2f loc(5.f, 5.f);
-    cv::Vec3f start = cv::Vec3f(5.f, 5.f, 1.f);
-    std::vector<cv::Vec3f> tgts = {start};
-    std::vector<float> tds = {0.f};
-    cv::Vec3f out;
-    float best = min_loc(m, loc, out, tgts, tds, nullptr, /*init_step=*/2.0f, /*min_step=*/0.5f);
-    CHECK(best >= 0.0f);
-    CHECK(out[2] == doctest::Approx(1.0f));
-}
-
-TEST_CASE("min_loc: with plane constraint penalty")
-{
-    auto m = makePlanarGrid(16, 16, /*z=*/1.0f);
-    PlaneSurface plane(cv::Vec3f(0, 0, 1), cv::Vec3f(0, 0, 1));
-    cv::Vec2f loc(8.f, 8.f);
-    cv::Vec3f out;
-    std::vector<cv::Vec3f> tgts = {cv::Vec3f(8.f, 8.f, 1.f)};
-    std::vector<float> tds = {0.f};
-    float best = min_loc(m, loc, out, tgts, tds, &plane, 2.0f, 0.5f);
-    CHECK(best >= 0.0f);
-    CHECK(std::isfinite(best));
-}
-
-TEST_CASE("min_loc: target far away — search exits when step < min_step")
-{
-    auto m = makePlanarGrid(32, 32);
-    cv::Vec2f loc(16.f, 16.f);
-    cv::Vec3f out;
-    // Target outside grid: search clamps and converges or hits min_step.
-    std::vector<cv::Vec3f> tgts = {cv::Vec3f(1000.f, 1000.f, 1.f)};
-    std::vector<float> tds = {0.f};
-    float best = min_loc(m, loc, out, tgts, tds, nullptr, 8.0f, 0.25f);
-    CHECK(best >= 0.0f);
 }

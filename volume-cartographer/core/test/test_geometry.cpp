@@ -214,31 +214,6 @@ TEST_CASE("loc_valid_xy swaps axis order vs loc_valid")
     CHECK(loc_valid_xy(md, cv::Vec2d(2.0, 2.0)));
 }
 
-TEST_CASE("tdist returns |distance - target|")
-{
-    cv::Vec3f a(0, 0, 0), b(3, 4, 0);
-    CHECK(tdist(a, b, 5.0f) == doctest::Approx(0.0f));
-    CHECK(tdist(a, b, 4.0f) == doctest::Approx(1.0f));
-    CHECK(tdist(a, b, 7.0f) == doctest::Approx(2.0f));
-}
-
-TEST_CASE("tdist_sum aggregates squared per-target residuals")
-{
-    cv::Vec3f v(0, 0, 0);
-    std::vector<cv::Vec3f> tgts{ cv::Vec3f(3, 4, 0), cv::Vec3f(0, 0, 0) };
-    std::vector<float> tds{ 4.0f, 1.0f };
-    // residuals: |5-4|=1, |0-1|=1; sum of squares = 2
-    CHECK(tdist_sum(v, tgts, tds) == doctest::Approx(2.0f));
-}
-
-TEST_CASE("tdist_sum empty inputs is zero")
-{
-    cv::Vec3f v(1, 2, 3);
-    std::vector<cv::Vec3f> tgts;
-    std::vector<float> tds;
-    CHECK(tdist_sum(v, tgts, tds) == doctest::Approx(0.0f));
-}
-
 TEST_CASE("clean_surface_outliers preserves a uniform grid")
 {
     auto m = makePlanarGrid(8, 8);

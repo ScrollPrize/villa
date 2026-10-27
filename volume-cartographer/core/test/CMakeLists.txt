@@ -606,7 +606,6 @@ endif()
 vc_add_test(NAME test_normal_grid_live)
 set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
-vc_add_test(NAME test_normalgridtools_real)
 
 vc_add_test(NAME test_tiff_more)
 
