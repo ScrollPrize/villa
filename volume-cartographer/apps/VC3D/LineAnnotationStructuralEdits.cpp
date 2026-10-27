@@ -189,7 +189,6 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
     merged.hvClassification =
         vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(merged.controlPoints));
-    merged.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
     merged.coordinateIdentity = clicked.coordinateIdentity;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
@@ -243,7 +242,6 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
-        half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
         half.coordinateIdentity = parent.coordinateIdentity;
     };
     StoredFiber& prefix = result.prefix;

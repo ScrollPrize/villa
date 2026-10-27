@@ -1182,7 +1182,6 @@ private:
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
     void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
-    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
     [[nodiscard]] uint64_t nextFiberId() const;
@@ -1388,7 +1387,6 @@ private:
     void showError(const QString& message, bool suppressDialog = false) const;
     // Shared worker and write barrier for saveOpenFibers /
     // saveOpenFibersHeadless.
-    [[nodiscard]] StoredFiber fiberInVolumeCoordinates(const StoredFiber& fiber) const;
     void refreshChangedStoreFibers();
     void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(

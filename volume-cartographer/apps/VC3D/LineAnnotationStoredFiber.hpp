@@ -101,10 +101,6 @@ struct StoredFiber {
     std::vector<std::string> tags;
     FiberOptimizationMode optimizationMode = FiberOptimizationMode::Lasagna;
     bool modelOnly = false;
-    // Coordinate domain in which control_points and line_points are
-    // stored. New Spiral-created fibers record the fiber manifest's L0
-    // shape so a downsampled active volume can display them correctly.
-    std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
     // Inspection of a read-only object-store attachment.
     bool readOnly = false;
     std::string editorError;

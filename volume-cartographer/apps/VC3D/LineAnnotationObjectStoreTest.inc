@@ -246,7 +246,6 @@ int runObjectStoreControllerTests()
         Controller::StoredFiber a;
         a.id = controller.nextFiberId(); a.fileName = "same_name.json";
         a.username = "test"; a.startedAt = "20260101"; a.sequence = 1;
-        a.coordinateBaseShapeZYX = std::array<size_t,3>{100,100,100};
         for (int x : {0,10,20}) { a.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1}); a.linePoints.emplace_back(x*1.,0,1); }
         auto b = a; b.uuid = vc::objects::util::newUuid(); b.id = controller.nextFiberId();
         std::vector<Controller::FiberSaveSnapshot> batch{controller.makeFiberSaveSnapshot(a),controller.makeFiberSaveSnapshot(b)};
@@ -560,7 +559,6 @@ int runObjectStoreControllerTests()
         Controller::StoredFiber parent;
         parent.id=controller.nextFiberId(); parent.fileName="parent.json";
         parent.username="test"; parent.startedAt="20260101"; parent.sequence=3;
-        parent.coordinateBaseShapeZYX=std::array<size_t,3>{100,100,100};
         for(int x:{30,40,50,60}) {parent.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1});parent.linePoints.emplace_back(x*1.,0,1);}
         batch={controller.makeFiberSaveSnapshot(parent)};
         const auto frame=nlohmann::json{{"volume_uuid",vc::objects::util::newUuid()},{"scale_factor",4.0}};
@@ -594,7 +592,7 @@ int runObjectStoreControllerTests()
             live->surfaceName="store-test-interaction";live->fiberId=merged.id;live->fiberUuid=merged.uuid;
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
-            live->storePin=merged.storePin;live->coordinateBaseShapeZYX=merged.coordinateBaseShapeZYX;
+            live->storePin=merged.storePin;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {
                 la::LineControlPoint control(double(i),merged.controlPoints[i],i==0,int(i));
