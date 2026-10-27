@@ -1244,12 +1244,6 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->setChannel("generations", generations);
         }
 
-        // Copy preserved approval mask from result surface
-        cv::Mat approval = result.surface->channel("approval", SURF_CHANNEL_NORESIZE);
-        if (!approval.empty()) {
-            targetSurface->setChannel("approval", approval);
-        }
-
         // Refresh intersection index for this surface so renderIntersections() has up-to-date data
         if (_context.viewerManager) {
             if (!changedBounds.empty()) {
@@ -1337,11 +1331,6 @@ void SegmentationGrower::onFutureFinished()
     }
     if (!currentSegSurface) {
         currentSegSurface = request.segmentationSurface.get();
-    }
-
-    // Update approval tool after surface replacement (handles case with no active editing session)
-    if (_context.module) {
-        _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
     }
 
 

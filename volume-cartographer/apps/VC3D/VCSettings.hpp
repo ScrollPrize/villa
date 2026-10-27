@@ -396,14 +396,12 @@ namespace segmentation {
     constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
     constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
-    constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
     constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
 
     constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
 
     // Drag tool (note: these are stored in a QSettings group)
@@ -411,8 +409,6 @@ namespace segmentation {
     constexpr auto DRAG_SIGMA_STEPS = "drag_sigma_steps";
     constexpr auto RADIUS_STEPS = "radius_steps";  // Legacy key
     constexpr auto SIGMA_STEPS = "sigma_steps";    // Legacy key
-
-    // Line tool
 
     // Push/Pull tool
     constexpr auto PUSH_PULL_RADIUS_STEPS = "push_pull_radius_steps";
@@ -456,20 +452,9 @@ namespace segmentation {
     // Hover marker
     constexpr auto SHOW_HOVER_MARKER = "show_hover_marker";
 
-    // Approval brush
-    constexpr auto APPROVAL_BRUSH_RADIUS = "approval_brush_radius";
-    constexpr auto APPROVAL_BRUSH_DEPTH = "approval_brush_depth";
-    constexpr auto APPROVAL_MASK_OPACITY = "approval_mask_opacity";
-    constexpr auto APPROVAL_BRUSH_COLOR = "approval_brush_color";
-    constexpr auto SHOW_APPROVAL_MASK = "show_approval_mask";
-    constexpr auto APPROVAL_AUTO_APPROVE_EDITS = "approval_auto_approve_edits";
-
-    // Auto-approval settings
-    constexpr auto AUTO_APPROVAL_ENABLED = "auto_approval_enabled";
-    constexpr auto AUTO_APPROVAL_RADIUS = "auto_approval_radius";
-    constexpr auto AUTO_APPROVAL_THRESHOLD = "auto_approval_threshold";
-    constexpr auto AUTO_APPROVAL_MAX_DISTANCE = "auto_approval_max_distance";
-
+    // Draw mask brush radius (voxels)
+    constexpr auto MASK_BRUSH_RADIUS = "mask_brush_radius";
+    constexpr float MASK_BRUSH_RADIUS_DEFAULT = 50.0f;
 
     constexpr bool CORRECTIONS_ENABLED_DEFAULT = false;
     constexpr bool CORRECTIONS_Z_RANGE_ENABLED_DEFAULT = false;

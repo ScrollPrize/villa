@@ -248,7 +248,7 @@ static cv::Mat downsample_channel_for_growth(const cv::Mat& channel, const cv::S
         return {};
     }
     cv::Mat result;
-    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+    const int interpolation = (name == "generations" || name == "mask")
         ? cv::INTER_NEAREST
         : cv::INTER_AREA;
     cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
@@ -261,7 +261,7 @@ static cv::Mat upsample_channel_from_growth(const cv::Mat& channel, const cv::Si
         return {};
     }
     cv::Mat result;
-    const int interpolation = (name == "generations" || name == "mask" || name == "approval")
+    const int interpolation = (name == "generations" || name == "mask")
         ? cv::INTER_NEAREST
         : cv::INTER_LINEAR;
     cv::resize(channel, result, dst_size, 0.0, 0.0, interpolation);
@@ -3493,10 +3493,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         surf->setDpi(voxelSizeToDpi(voxelsize));
         surf->setChannel("generations", resume_generations.clone());
 
-        cv::Mat approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
-        if (!approval.empty()) {
-            surf->setChannel("approval", approval);
-        }
         if (!mask.empty()) {
             surf->setChannel("mask", mask);
         }
@@ -3651,44 +3647,6 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     exact_growth_output_size_for_fill(surf));
             }
             const cv::Size raw_size = new_points->size();
-
-            // Preserve approval channel (3-channel BGR image)
-            cv::Mat old_approval = resume_surf->channel("approval", SURF_CHANNEL_NORESIZE);
-            if (!old_approval.empty()) {
-                // Create new approval mask matching old format at raw points resolution
-                cv::Mat new_approval;
-                if (old_approval.channels() == 3) {
-                    new_approval = cv::Mat_<cv::Vec3b>(raw_size, cv::Vec3b(0, 0, 0));
-                    for (int r = 0; r < old_approval.rows; ++r) {
-                        for (int c = 0; c < old_approval.cols; ++c) {
-                            int new_r = r + offset_row;
-                            int new_c = c + offset_col;
-                            if (new_r >= 0 && new_r < new_approval.rows &&
-                                new_c >= 0 && new_c < new_approval.cols) {
-                                new_approval.at<cv::Vec3b>(new_r, new_c) = old_approval.at<cv::Vec3b>(r, c);
-                            }
-                        }
-                    }
-                } else {
-                    // Single channel fallback
-                    new_approval = cv::Mat_<uint8_t>(raw_size, static_cast<uint8_t>(0));
-                    for (int r = 0; r < old_approval.rows; ++r) {
-                        for (int c = 0; c < old_approval.cols; ++c) {
-                            int new_r = r + offset_row;
-                            int new_c = c + offset_col;
-                            if (new_r >= 0 && new_r < new_approval.rows &&
-                                new_c >= 0 && new_c < new_approval.cols) {
-                                new_approval.at<uint8_t>(new_r, new_c) = old_approval.at<uint8_t>(r, c);
-                            }
-                        }
-                    }
-                }
-                surf->setChannel("approval", new_approval);
-                std::cout << "Preserved approval mask (" << old_approval.channels() << " channels, "
-                          << old_approval.cols << "x" << old_approval.rows << " -> "
-                          << new_approval.cols << "x" << new_approval.rows
-                          << ") with offset (" << offset_row << ", " << offset_col << ")" << std::endl;
-            }
 
             // Preserve mask channel (single channel uint8)
             // Layer 0 of mask.tif is the validity mask - it can mask out points that have

@@ -4,7 +4,6 @@
 #include "../../ViewerManager.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../SegmentationWidget.hpp"
-#include "../../overlays/SegmentationOverlayController.hpp"
 #include "../../CState.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -401,12 +400,10 @@ std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
 SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
                                                    SegmentationEditManager* editManager,
                                                    SegmentationWidget* widget,
-                                                   SegmentationOverlayController* overlay,
                                                    CState* state)
     : _module(module)
     , _editManager(editManager)
     , _widget(widget)
-    , _overlay(overlay)
     , _state(state)
 {
     ensureTimer();
@@ -428,12 +425,10 @@ SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
 
 void SegmentationPushPullTool::setDependencies(SegmentationEditManager* editManager,
                                                SegmentationWidget* widget,
-                                               SegmentationOverlayController* overlay,
                                                CState* state)
 {
     _editManager = editManager;
     _widget = widget;
-    _overlay = overlay;
     _state = state;
 }
 
@@ -616,19 +611,6 @@ void SegmentationPushPullTool::stopAll()
 
         // Capture delta for undo before applyPreview() clears edited vertices
         (void)_module.captureUndoDelta();
-
-        // Auto-approve edited regions before applyPreview() clears them
-        if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
-            if (!editedVerts.empty()) {
-                // Get drag center from the cached row/col if available
-                std::optional<std::pair<int, int>> dragCenter;
-                if (_cachedRow >= 0 && _cachedCol >= 0) {
-                    dragCenter = std::make_pair(_cachedRow, _cachedCol);
-                }
-                const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, dragCenter);
-                _module.performAutoApproval(filteredVerts);
-            }
-        }
 
         _editManager->applyPreview();
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);

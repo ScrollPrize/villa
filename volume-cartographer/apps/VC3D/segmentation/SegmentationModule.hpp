@@ -58,7 +58,6 @@ class ViewerManager;
 class QKeyEvent;
 class QTimer;
 class SegmentationPushPullTool;
-class ApprovalMaskBrushTool;
 class SurfaceMaskBrushTool;
 
 class SegmentationModule : public QObject
@@ -93,39 +92,13 @@ public:
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
     void setHoverPreviewEnabled(bool enabled);
 
-    void setShowApprovalMask(bool enabled);
-    void setEditApprovedMask(bool enabled);
-    void setEditUnapprovedMask(bool enabled);
     void setDrawMaskEnabled(bool enabled);
+    // Radius of the "Draw mask" brush, in voxels.
+    void setMaskBrushRadius(float radius);
     void onActiveSegmentChanged(QuadSurface* newSurface);
-    [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
-    [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
-    [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
     [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
-    [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
-    [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
-    [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
-    [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
-
-    [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
-    void setAutoApprovalEnabled(bool enabled);
-    void setAutoApprovalRadius(float radius);
-    void setAutoApprovalThreshold(float threshold);
-    void setAutoApprovalMaxDistance(float distance);
-    std::vector<std::pair<int, int>> filterVerticesForAutoApproval(
-        const std::vector<SegmentationEditManager::VertexEdit>& edits,
-        const std::optional<std::pair<int, int>>& dragCenter) const;
-
-    void performAutoApproval(const std::vector<std::pair<int, int>>& vertices);
-    void setApprovalMaskBrushRadius(float radiusSteps);
-    void setApprovalBrushDepth(float depth);
-    void setApprovalBrushColor(const QColor& color);
-    [[nodiscard]] SegmentationOverlayController* overlay() const { return _overlay; }
+    [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
     [[nodiscard]] ViewerManager* viewerManager() const { return _viewerManager; }
-    [[nodiscard]] float approvalMaskBrushRadius() const { return _approvalMaskBrushRadius; }
-    [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
-    [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
-    void undoApprovalStroke();
 
     void applyEdits();
     void resetEdits();
@@ -156,7 +129,6 @@ public:
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
-    void updateApprovalToolAfterGrowth(QuadSurface* surface);
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
@@ -257,7 +229,6 @@ signals:
 
 private:
     friend class SegmentationPushPullTool;
-    friend class ApprovalMaskBrushTool;
     friend class SurfaceMaskBrushTool;
     friend class segmentation::CorrectionsState;
 
@@ -435,7 +406,6 @@ private:
     void performAutosave();
     void ensureAutosaveTimer();
     void updateAutosaveState();
-    void saveApprovalMask();
     void queueAutosaveVertexUpdates(const std::vector<SegmentationEditManager::VertexEdit>& edits);
 
     SegmentationWidget* _widget{nullptr};
@@ -478,7 +448,6 @@ private:
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
-    std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
@@ -486,19 +455,9 @@ private:
     cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
-    bool _showApprovalMask{false};
-    bool _editApprovedMask{false};
-    bool _editUnapprovedMask{false};
     bool _drawMaskEnabled{false};
     bool _shiftDrawMaskActive{false};
-    bool _autoApprovalEnabled{true};
-    float _autoApprovalRadius{0.5f};
-    float _autoApprovalThreshold{0.0f};
-    float _autoApprovalMaxDistance{0.0f};
-
-    float _approvalMaskBrushRadius{50.0f};  // Mask pixels in flattened view; native voxels in plane views
-    float _approvalBrushDepth{15.0f};       // Cylinder depth
-    QColor _approvalBrushColor{0, 255, 0};  // RGB color for approval painting
+    float _maskBrushRadius{50.0f};
 
     segmentation::UndoHistory _undoHistory;
     bool _suppressUndoCapture{false};

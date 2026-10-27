@@ -21,7 +21,6 @@ class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
-class SegmentationApprovalMaskPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
@@ -111,33 +110,8 @@ public:
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
-    // Approval mask getters — delegated to panel
-    [[nodiscard]] bool showApprovalMask() const;
-    [[nodiscard]] bool editApprovedMask() const;
-    [[nodiscard]] bool editUnapprovedMask() const;
-    [[nodiscard]] bool autoApprovalEnabled() const;
-    [[nodiscard]] float autoApprovalRadius() const;
-    [[nodiscard]] float autoApprovalThreshold() const;
-    [[nodiscard]] float autoApprovalMaxDistance() const;
-
-    [[nodiscard]] float approvalBrushRadius() const;
-    [[nodiscard]] float approvalBrushDepth() const;
-    [[nodiscard]] int approvalMaskOpacity() const;
-    [[nodiscard]] QColor approvalBrushColor() const;
-
-    // Approval mask setters
-    void setShowApprovalMask(bool enabled);
-    void setEditApprovedMask(bool enabled);
-    void setEditUnapprovedMask(bool enabled);
-    void setAutoApprovalEnabled(bool enabled);
-    void setAutoApprovalRadius(float radius);
-    void setAutoApprovalThreshold(float threshold);
-    void setAutoApprovalMaxDistance(float distance);
-
-    void setApprovalBrushRadius(float radius);
-    void setApprovalBrushDepth(float depth);
-    void setApprovalMaskOpacity(int opacity);
-    void setApprovalBrushColor(const QColor& color);
+    // "Draw mask" brush radius in voxels.
+    [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
 
     // Neural tracer setters
     void setNeuralTracerEnabled(bool enabled);
@@ -204,19 +178,7 @@ signals:
     void correctionsCollectionSelectionCleared();
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
-    void showApprovalMaskChanged(bool enabled);
-    void editApprovedMaskChanged(bool enabled);
-    void editUnapprovedMaskChanged(bool enabled);
-    void autoApprovalEnabledChanged(bool enabled);
-    void autoApprovalRadiusChanged(float radius);
-    void autoApprovalThresholdChanged(float threshold);
-    void autoApprovalMaxDistanceChanged(float distance);
-
-    void approvalBrushRadiusChanged(float radius);
-    void approvalBrushDepthChanged(float depth);
-    void approvalMaskOpacityChanged(int opacity);
-    void approvalBrushColorChanged(QColor color);
-    void approvalStrokesUndoRequested();
+    void maskBrushRadiusChanged(float radius);
 
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);
@@ -245,6 +207,7 @@ private:
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
+    float _maskBrushRadius{50.0f};
     bool _pending{false};
     bool _growthInProgress{false};
     bool _restoringSettings{false};
@@ -254,7 +217,6 @@ private:
     SegmentationEditingPanel* _editingPanel{nullptr};
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
-    SegmentationApprovalMaskPanel* _approvalMaskPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};

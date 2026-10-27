@@ -612,18 +612,6 @@ struct Flatboi {
         throw std::runtime_error("Failed to write OBJ with UVs");
     }
     std::cout << "Wrote: " << out << "\n";
-
-    // Flattening preserves vertex order (V/F written unchanged), so a grid-UV
-    // sidecar next to the input applies to the output too. Copy it through.
-    const fs::path in_griduv = fs::path(input_obj + ".griduv");
-    if (fs::exists(in_griduv)) {
-      std::error_code ec;
-      fs::copy_file(in_griduv, fs::path(out.string() + ".griduv"),
-                    fs::copy_options::overwrite_existing, ec);
-      if (ec) {
-        std::cerr << "warning: failed to copy grid-UV sidecar: " << ec.message() << "\n";
-      }
-    }
   }
 
   // === UV heatmaps (OpenCV PNG write; no clipping; V increases downward) ===
@@ -1053,19 +1041,10 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   // Rasterized at the source's sampling density, as vc_obj2tifxyz --tifxyz-source does.
   vc::meshing::UvGridRasterizer rasterizer;
   if (scale[0] > 0.f && scale[1] > 0.f) rasterizer.setSrcScale(scale);
-  std::vector<cv::Vec2f> cells;
-  cells.reserve(fine_mesh.cells.size());
-  for (const auto& cell : fine_mesh.cells) cells.emplace_back(float(cell[1]), float(cell[0]));
   rasterizer.setMesh(fine_mesh.positions, std::move(uvs), std::move(faces));
-  const cv::Mat approval = surface.channel("approval", SURF_CHANNEL_NORESIZE);
-  if (!approval.empty()) {
-    rasterizer.setGridUV(std::move(cells));
-    rasterizer.setSrcApproval(approval);
-  }
   rasterizer.determineGridDimensions(1.0f);
   std::unique_ptr<QuadSurface> flat(rasterizer.createQuadSurface(1.0f));
   flat->meta = surface.meta;
-  if (rasterizer.hasApproval()) flat->setChannel("approval", rasterizer.outApproval());
   return flat;
 }
 

@@ -4098,12 +4098,6 @@ void CWindow::closeEvent(QCloseEvent* event)
     if (_viewerManager) {
         _viewerManager->beginShutdown();
     }
-    // Flush any pending debounced approval-mask save before teardown so the
-    // last few seconds of approvals aren't lost on exit. No-op if nothing
-    // is pending.
-    if (_segmentationModule && _segmentationModule->overlay()) {
-        _segmentationModule->overlay()->flushPendingApprovalMaskSave();
-    }
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
     }

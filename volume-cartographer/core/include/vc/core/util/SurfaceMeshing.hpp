@@ -78,17 +78,8 @@ public:
     // Grid cells per UV unit of the source surface: the output grid gets the
     // source's sampling density and scale.
     void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
-    // The source's approval channel, resampled through setGridUV's cells.
-    void setSrcApproval(const cv::Mat& m) { src_approval = m; }
 
     void setMesh(std::vector<cv::Vec3f> vertices, std::vector<cv::Vec2f> uvs, std::vector<UvFace> faces);
-    // Per-vertex (col, row) in the source grid; returns false (and keeps none)
-    // when the count does not match the vertices.
-    bool setGridUV(std::vector<cv::Vec2f> cells);
-
-    bool hasGridUV() const { return !grid_uv.empty(); }
-    bool hasApproval() const { return !src_approval.empty() && !grid_uv.empty(); }
-    const cv::Mat_<cv::Vec3b>& outApproval() const { return out_approval; }
 
     void determineGridDimensions(float stretch_factor = 1.0f);
     QuadSurface* createQuadSurface(float mesh_units = 1.0f);
@@ -96,12 +87,10 @@ public:
 private:
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f);
     void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face);
-    cv::Vec3b sampleSrcApproval(float colf, float rowf) const;
 
     std::vector<cv::Vec3f> vertices;
     std::vector<cv::Vec2f> uvs;
     std::vector<UvFace> faces;
-    std::vector<cv::Vec2f> grid_uv;  // per-vertex source (col,row); empty if none
 
     cv::Vec2f uv_min, uv_max;
     cv::Vec2i grid_size;
@@ -112,9 +101,6 @@ private:
     // UV decimation / capping
     float uv_downsample = 1.0f;            // user-specified uniform decimation
     uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
-    // Approval resampling: original mask (BGR or 1-ch) + output accumulator.
-    cv::Mat src_approval;                  // empty if not resampling approval
-    cv::Mat_<cv::Vec3b> out_approval;      // sized to grid_size when active
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
 };
 

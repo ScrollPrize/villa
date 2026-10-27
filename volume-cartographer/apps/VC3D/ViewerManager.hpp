@@ -77,7 +77,6 @@ public:
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
-    SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);

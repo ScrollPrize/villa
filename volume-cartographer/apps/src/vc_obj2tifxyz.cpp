@@ -22,18 +22,6 @@ static bool starts_with(const std::string& s, const std::string& p) {
     return s.size() >= p.size() && std::equal(p.begin(), p.end(), s.begin());
 }
 
-// The per-vertex grid-UV sidecar (<obj>.griduv: "col row" per line, in OBJ
-// vertex order) written by vc_tifxyz2obj; empty if absent.
-static std::vector<cv::Vec2f> loadGridUV(const std::string& obj_filename) {
-    std::vector<cv::Vec2f> grid_uv;
-    std::ifstream file(obj_filename + ".griduv");
-    float col = 0, row = 0;
-    while (file >> col >> row) {
-        grid_uv.emplace_back(col, row);
-    }
-    return grid_uv;
-}
-
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
@@ -58,8 +46,7 @@ int main(int argc, char *argv[])
         std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to a fresh random UUID." << std::endl;
         std::cout << "  --tifxyz-source=<dir>: Original tifxyz being flattened. Its meta.json scale sizes the" << std::endl;
         std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
-        std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
-        std::cout << "                        grid via the <input.obj>.griduv sidecar. Absent: legacy metric sizing." << std::endl;
+        std::cout << "                        scale). Absent: legacy metric sizing." << std::endl;
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
@@ -81,7 +68,7 @@ int main(int argc, char *argv[])
     float uv_to_obj = 1.0f;       // OBJ units per UV unit (only when uv_metric)
     float uv_downsample = 1.0f;
     uint64_t grid_cap = 0;
-    std::string tifxyz_source;  // original tifxyz dir: provides scale + approval mask
+    std::string tifxyz_source;  // original tifxyz dir: provides the scale
     std::string uuid_override;
 
     // Backward-compatible parsing:
@@ -208,12 +195,10 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to load OBJ file" << std::endl;
         return EXIT_FAILURE;
     }
-    const std::size_t vertex_count = mesh.vertices.size();
     converter.setMesh(std::move(mesh.vertices), std::move(mesh.uvs), std::move(mesh.faces));
 
     // Source tifxyz (optional): provides the scale that sizes the output grid
-    // to the input sampling density, and (if present) the approval mask to
-    // resample. Absent -> legacy metric sizing, no approval channel.
+    // to the input sampling density. Absent -> legacy metric sizing.
     utils::Json sourceMeta = utils::Json::object();
     if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
@@ -230,29 +215,6 @@ int main(int argc, char *argv[])
             } else {
                 std::cerr << "warning: source scale invalid; falling back to metric sizing\n";
             }
-            // Approval resample: needs both the source mask and the per-vertex
-            // grid-UV sidecar emitted by vc_tifxyz2obj. Skip cleanly if either
-            // is missing.
-            cv::Mat ap = src->channel("approval", SURF_CHANNEL_NORESIZE);
-            if (ap.empty()) {
-                std::cout << "note: source has no approval channel; nothing to resample\n";
-            } else {
-                auto grid_uv = loadGridUV(obj_path.string());
-                const std::size_t entries = grid_uv.size();
-                if (!grid_uv.empty() && !converter.setGridUV(std::move(grid_uv))) {
-                    std::cerr << "warning: grid-UV sidecar has " << entries
-                              << " entries but OBJ has " << vertex_count
-                              << " vertices; skipping approval resample\n";
-                }
-                if (!converter.hasGridUV()) {
-                    std::cerr << "note: no usable grid-UV sidecar; approval will not be resampled\n";
-                } else {
-                    std::cout << "Loaded grid-UV sidecar: " << entries << " entries\n";
-                    converter.setSrcApproval(ap);
-                    std::cout << "Resampling approval (" << ap.cols << "x" << ap.rows
-                              << ", " << ap.channels() << "ch)\n";
-                }
-            }
         } catch (...) {
             std::cerr << "warning: could not load tifxyz source: " << tifxyz_source << "\n";
         }
@@ -268,13 +230,6 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
-
-    // Attach the resampled approval mask so save() writes approval.tif at the
-    // new grid size alongside x/y/z.tif.
-    if (converter.hasApproval()) {
-        surf->setChannel("approval", converter.outApproval());
-        std::cout << "Attached resampled approval channel\n";
-    }
     
     if (!store_output.store.empty()) {
         try {

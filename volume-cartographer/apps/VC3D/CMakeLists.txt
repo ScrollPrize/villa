@@ -131,8 +131,6 @@ set(srcs
     segmentation/panels/SegmentationCorrectionsPanel.hpp
     segmentation/panels/SegmentationCustomParamsPanel.cpp
     segmentation/panels/SegmentationCustomParamsPanel.hpp
-    segmentation/panels/SegmentationApprovalMaskPanel.cpp
-    segmentation/panels/SegmentationApprovalMaskPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
@@ -144,8 +142,6 @@ set(srcs
     segmentation/growth/SegmentationGrower.hpp
     segmentation/tools/SegmentationEditManager.cpp
     segmentation/tools/SegmentationEditManager.hpp
-    segmentation/tools/ApprovalMaskBrushTool.cpp
-    segmentation/tools/ApprovalMaskBrushTool.hpp
     segmentation/tools/SurfaceMaskBrushTool.cpp
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp

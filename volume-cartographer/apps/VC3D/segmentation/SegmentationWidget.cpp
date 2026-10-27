@@ -6,7 +6,6 @@
 #include "panels/SegmentationHeaderRow.hpp"
 #include "panels/SegmentationCorrectionsPanel.hpp"
 #include "panels/SegmentationCustomParamsPanel.hpp"
-#include "panels/SegmentationApprovalMaskPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
 #include "panels/SegmentationLasagnaPanel.hpp"
@@ -16,6 +15,8 @@
 #include <QSettings>
 #include <QVBoxLayout>
 #include <QVariant>
+
+#include <algorithm>
 
 #include "utils/Json.hpp"
 
@@ -47,9 +48,6 @@ void SegmentationWidget::buildUi()
     _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_editingPanel);
 
-    _approvalMaskPanel = new SegmentationApprovalMaskPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_approvalMaskPanel);
-
     _directionFieldPanel = new SegmentationDirectionFieldPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_directionFieldPanel);
 
@@ -74,6 +72,13 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::annotateToggled);
     connect(_headerRow, &SegmentationHeaderRow::drawMaskToggled, this, [this](bool enabled) {
         setDrawMaskEnabled(enabled);
+    });
+    connect(_headerRow, &SegmentationHeaderRow::maskBrushRadiusChanged, this, [this](float radius) {
+        _maskBrushRadius = radius;
+        if (!_restoringSettings) {
+            writeSetting(QString::fromLatin1(vc3d::settings::segmentation::MASK_BRUSH_RADIUS), _maskBrushRadius);
+        }
+        emit maskBrushRadiusChanged(_maskBrushRadius);
     });
 
     // Forward editing panel signals
@@ -103,35 +108,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::resetRequested);
     connect(_editingPanel, &SegmentationEditingPanel::stopToolsRequested,
             this, &SegmentationWidget::stopToolsRequested);
-
-    // Forward approval mask panel signals
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
-            this, &SegmentationWidget::showApprovalMaskChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::showApprovalMaskChanged,
-            this, &SegmentationWidget::syncUiState);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editApprovedMaskChanged,
-            this, &SegmentationWidget::editApprovedMaskChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editUnapprovedMaskChanged,
-            this, &SegmentationWidget::editUnapprovedMaskChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalEnabledChanged,
-            this, &SegmentationWidget::autoApprovalEnabledChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalRadiusChanged,
-            this, &SegmentationWidget::autoApprovalRadiusChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalThresholdChanged,
-            this, &SegmentationWidget::autoApprovalThresholdChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalMaxDistanceChanged,
-            this, &SegmentationWidget::autoApprovalMaxDistanceChanged);
-
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushRadiusChanged,
-            this, &SegmentationWidget::approvalBrushRadiusChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushDepthChanged,
-            this, &SegmentationWidget::approvalBrushDepthChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalMaskOpacityChanged,
-            this, &SegmentationWidget::approvalMaskOpacityChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalBrushColorChanged,
-            this, &SegmentationWidget::approvalBrushColorChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested,
-            this, &SegmentationWidget::approvalStrokesUndoRequested);
 
     // Forward growth panel signals
     connect(_growthPanel, &SegmentationGrowthPanel::growSurfaceRequested,
@@ -190,6 +166,7 @@ void SegmentationWidget::syncUiState()
     if (_headerRow) {
         _headerRow->setEditingChecked(_editingEnabled);
         _headerRow->setDrawMaskChecked(_drawMaskEnabled);
+        _headerRow->setMaskBrushRadius(_maskBrushRadius);
         if (_editingEnabled) {
             _headerRow->setStatusText(_pending ? tr("Editing enabled – pending changes")
                                                : tr("Editing enabled"));
@@ -206,7 +183,6 @@ void SegmentationWidget::syncUiState()
 
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->setVisible(true);
-    _approvalMaskPanel->setVisible(!manualAddVisible);
     _directionFieldPanel->setVisible(!manualAddVisible);
     _neuralTracerPanel->setVisible(!manualAddVisible);
     _correctionsPanel->setVisible(!manualAddVisible);
@@ -215,7 +191,6 @@ void SegmentationWidget::syncUiState()
     _customParamsPanel->syncUiState(_editingEnabled);
     _directionFieldPanel->syncUiState(_editingEnabled);
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
-    _approvalMaskPanel->syncUiState();
     _neuralTracerPanel->syncUiState();
     _lasagnaPanel->syncUiState(_editingEnabled, false);
 }
@@ -234,7 +209,9 @@ void SegmentationWidget::restoreSettings()
     _directionFieldPanel->restoreSettings(settings);
     _correctionsPanel->restoreSettings(settings);
     _customParamsPanel->restoreSettings(settings);
-    _approvalMaskPanel->restoreSettings(settings);
+    _maskBrushRadius = std::clamp(settings.value(segmentation::MASK_BRUSH_RADIUS,
+                                                 segmentation::MASK_BRUSH_RADIUS_DEFAULT).toFloat(),
+                                  1.0f, 1000.0f);
     _neuralTracerPanel->restoreSettings(settings);
     _lasagnaPanel->restoreSettings(settings);
 
@@ -295,34 +272,6 @@ void SegmentationWidget::setEditScale(float value) { _editingPanel->setEditScale
 void SegmentationWidget::setSmoothingStrength(float value) { _editingPanel->setSmoothingStrength(value); }
 void SegmentationWidget::setSmoothingIterations(int value) { _editingPanel->setSmoothingIterations(value); }
 void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setShowHoverMarker(enabled); }
-
-// --- Approval mask delegations ---
-
-bool SegmentationWidget::showApprovalMask() const { return _approvalMaskPanel->showApprovalMask(); }
-bool SegmentationWidget::editApprovedMask() const { return _approvalMaskPanel->editApprovedMask(); }
-bool SegmentationWidget::editUnapprovedMask() const { return _approvalMaskPanel->editUnapprovedMask(); }
-bool SegmentationWidget::autoApprovalEnabled() const { return _approvalMaskPanel->autoApprovalEnabled(); }
-float SegmentationWidget::autoApprovalRadius() const { return _approvalMaskPanel->autoApprovalRadius(); }
-float SegmentationWidget::autoApprovalThreshold() const { return _approvalMaskPanel->autoApprovalThreshold(); }
-float SegmentationWidget::autoApprovalMaxDistance() const { return _approvalMaskPanel->autoApprovalMaxDistance(); }
-
-float SegmentationWidget::approvalBrushRadius() const { return _approvalMaskPanel->approvalBrushRadius(); }
-float SegmentationWidget::approvalBrushDepth() const { return _approvalMaskPanel->approvalBrushDepth(); }
-int SegmentationWidget::approvalMaskOpacity() const { return _approvalMaskPanel->approvalMaskOpacity(); }
-QColor SegmentationWidget::approvalBrushColor() const { return _approvalMaskPanel->approvalBrushColor(); }
-
-void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel->setShowApprovalMask(enabled); syncUiState(); }
-void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
-void SegmentationWidget::setEditUnapprovedMask(bool enabled) { _approvalMaskPanel->setEditUnapprovedMask(enabled); }
-void SegmentationWidget::setAutoApprovalEnabled(bool enabled) { _approvalMaskPanel->setAutoApprovalEnabled(enabled); }
-void SegmentationWidget::setAutoApprovalRadius(float radius) { _approvalMaskPanel->setAutoApprovalRadius(radius); }
-void SegmentationWidget::setAutoApprovalThreshold(float threshold) { _approvalMaskPanel->setAutoApprovalThreshold(threshold); }
-void SegmentationWidget::setAutoApprovalMaxDistance(float distance) { _approvalMaskPanel->setAutoApprovalMaxDistance(distance); }
-
-void SegmentationWidget::setApprovalBrushRadius(float radius) { _approvalMaskPanel->setApprovalBrushRadius(radius); }
-void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel->setApprovalBrushDepth(depth); }
-void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }
-void SegmentationWidget::setApprovalBrushColor(const QColor& color) { _approvalMaskPanel->setApprovalBrushColor(color); }
 
 void SegmentationWidget::setPendingChanges(bool pending)
 {

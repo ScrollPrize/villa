@@ -50,9 +50,8 @@ static inline cv::Vec3f fd_fallback_normal(const cv::Mat_<cv::Vec3f>& P, int y, 
 // ---------------------------------------------------------------------------
 
 // Writes the OBJ lines of one mesh vertex: v, vt (grid position scaled, or
-// normalized) and vn, plus its grid-UV sidecar line.
+// normalized) and vn.
 static void write_vertex(std::ofstream& out,
-                         std::ofstream* griduv,
                          const cv::Mat_<cv::Vec3f>& points,
                          const cv::Mat_<cv::Vec3f>& normals,
                          cv::Vec2i loc,
@@ -62,13 +61,6 @@ static void write_vertex(std::ofstream& out,
 {
     const cv::Vec3f p = points(loc);
     out << "v " << p[0] << " " << p[1] << " " << p[2] << '\n';
-
-    // Grid-UV sidecar: raw (col,row) of this vertex in source-grid space,
-    // one line per OBJ vertex in emit order. Carries the original grid
-    // cell through flatten so approval can be resampled. See vc_obj2tifxyz.
-    if (griduv) {
-        (*griduv) << loc[1] << ' ' << loc[0] << '\n';
-    }
 
     // UVs: scaled by SCALE = 20
     const float u = normalize_uv ? float(loc[1]) / float(points.cols - 1) : float(loc[1]) * uv_fac_x;
@@ -206,20 +198,6 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     }
     out << std::fixed << std::setprecision(6);
 
-    // Emit a grid-UV sidecar only when the source carries an approval mask;
-    // it lets the flatten pipeline resample approval onto the new grid.
-    std::ofstream griduv;
-    std::ofstream* griduv_ptr = nullptr;
-    if (!surf->channel("approval", SURF_CHANNEL_NORESIZE).empty()) {
-        const std::filesystem::path griduv_fn = out_fn.string() + ".griduv";
-        griduv.open(griduv_fn);
-        if (griduv) {
-            griduv_ptr = &griduv;
-        } else {
-            std::cerr << "warning: could not write grid-UV sidecar: " << griduv_fn << "\n";
-        }
-    }
-
     cv::Mat_<cv::Vec3f> normals = build_vertex_normals_from_faces(points);
 
     std::cout << "Point dims: " << points.size()
@@ -251,7 +229,7 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         const cv::Vec3i& b = mesh.faces[f + 1];
         const std::size_t last = std::max({a[0], a[1], a[2], b[2]});
         for (; written <= last; ++written)
-            write_vertex(out, griduv_ptr, points, normals, mesh.cells[written], normalize_uv, uv_fac_x, uv_fac_y);
+            write_vertex(out, points, normals, mesh.cells[written], normalize_uv, uv_fac_x, uv_fac_y);
         // faces unchanged: use same index for v/vt/vn (1-based)
         out << "f " << a[0] + 1 << "/" << a[0] + 1 << "/" << a[0] + 1 << " "
                    << a[1] + 1 << "/" << a[1] + 1 << "/" << a[1] + 1 << " "

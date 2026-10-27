@@ -194,14 +194,6 @@ void UvGridRasterizer::setMesh(std::vector<cv::Vec3f> vertices_, std::vector<cv:
     faces = std::move(faces_);
 }
 
-bool UvGridRasterizer::setGridUV(std::vector<cv::Vec2f> cells)
-{
-    grid_uv.clear();
-    if (cells.size() != vertices.size()) return false;
-    grid_uv = std::move(cells);
-    return true;
-}
-
 void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
     // Find UV bounds from all UVs used in faces
     uv_min = cv::Vec2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
@@ -330,11 +322,6 @@ QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
     // Create points matrix initialized with invalid values
     cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
 
-    // Approval accumulator (unapproved = black) when resampling is active.
-    if (hasApproval()) {
-        out_approval = cv::Mat_<cv::Vec3b>(grid_size[1], grid_size[0], cv::Vec3b(0, 0, 0));
-    }
-
     // Rasterize triangles onto the grid
     for (const auto& face : faces) {
         rasterizeTriangle(*points, face);
@@ -448,7 +435,6 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
     cv::Vec3f pos[3] = { vertices[face.v[0]],
                          vertices[face.v[1]],
                          vertices[face.v[2]] };
-    int vidx[3] = { face.v[0], face.v[1], face.v[2] }; // for approval grid_uv lookup
 
     // Map UVs into grid space in double, then snap each vertex to a
     // fixed-point sub-pixel grid. Integer edge functions then make the
@@ -476,7 +462,7 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
     }
     if (area2 < 0) {
         std::swap(X[1], X[2]); std::swap(Y[1], Y[2]);
-        std::swap(pos[1], pos[2]); std::swap(vidx[1], vidx[2]);
+        std::swap(pos[1], pos[2]);
         area2 = -area2;
     }
 
@@ -511,29 +497,8 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
             const float b1 = static_cast<float>(w1 * inv_area);
             const float b2 = static_cast<float>(w2 * inv_area);
             points(y, x) = b0 * pos[0] + b1 * pos[1] + b2 * pos[2];
-            if (hasApproval()) {
-                const cv::Vec2f cr = b0 * grid_uv[vidx[0]]
-                                   + b1 * grid_uv[vidx[1]]
-                                   + b2 * grid_uv[vidx[2]];
-                out_approval(y, x) = sampleSrcApproval(cr[0], cr[1]);
-            }
         }
     }
-}
-
-
-// Nearest-neighbor sample of the source approval mask at original grid
-// (col,row). Returns BGR; 1-channel legacy masks map nonzero -> white.
-cv::Vec3b UvGridRasterizer::sampleSrcApproval(float colf, float rowf) const {
-    int col = static_cast<int>(std::lround(colf));
-    int row = static_cast<int>(std::lround(rowf));
-    col = std::clamp(col, 0, src_approval.cols - 1);
-    row = std::clamp(row, 0, src_approval.rows - 1);
-    if (src_approval.channels() == 1) {
-        return src_approval.at<uint8_t>(row, col) > 0 ? cv::Vec3b(255, 255, 255)
-                                                      : cv::Vec3b(0, 0, 0);
-    }
-    return src_approval.at<cv::Vec3b>(row, col);
 }
 
 

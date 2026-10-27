@@ -1,6 +1,5 @@
 #include "SegmentationModule.hpp"
 
-#include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "tools/SegmentationEditManager.hpp"
@@ -9,7 +8,6 @@
 #include "../overlays/SegmentationOverlayController.hpp"
 #include "../Keybinds.hpp"
 
-#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QKeyEvent>
@@ -21,41 +19,6 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
-
-namespace
-{
-std::optional<std::pair<int, int>> flattenedApprovalGridIndex(VolumeViewerBase* viewer,
-                                                              const QPointF& scenePos,
-                                                              const std::pair<int, int>& maskDims)
-{
-    const auto [rows, cols] = maskDims;
-    if (!viewer || rows <= 0 || cols <= 0) {
-        return std::nullopt;
-    }
-
-    const cv::Vec2f surfaceCoords = viewer->sceneToSurfaceCoords(scenePos);
-    int row = 0;
-    int col = 0;
-
-    if (auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface())) {
-        const cv::Vec2f scale = quad->scale();
-        const cv::Vec3f center = quad->center();
-        if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
-            return std::nullopt;
-        }
-        col = static_cast<int>(std::lround((surfaceCoords[0] + center[0]) * scale[0]));
-        row = static_cast<int>(std::lround((surfaceCoords[1] + center[1]) * scale[1]));
-    } else {
-        col = static_cast<int>(std::lround(surfaceCoords[0]));
-        row = static_cast<int>(std::lround(surfaceCoords[1]));
-    }
-
-    if (row < 0 || row >= rows || col < 0 || col >= cols) {
-        return std::nullopt;
-    }
-    return std::make_pair(row, col);
-}
-}
 
 bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 {
@@ -136,50 +99,6 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             return true;
         }
         return false;
-    }
-
-    // B: Toggle edit approved mask (only if show approval mask is enabled)
-    if (event->key() == vc3d::keybinds::keypress::ApprovalPaintToggle.key &&
-        !event->isAutoRepeat() &&
-        event->modifiers() == vc3d::keybinds::keypress::ApprovalPaintToggle.modifiers) {
-        if (_showApprovalMask) {
-            setEditApprovedMask(!_editApprovedMask);
-            if (_widget) {
-                _widget->setEditApprovedMask(_editApprovedMask);
-            }
-            emit statusMessageRequested(
-                _editApprovedMask ? tr("Approval painting enabled.") : tr("Approval painting disabled."),
-                kStatusShort);
-            event->accept();
-            return true;
-        }
-    }
-
-    // N: Toggle edit unapproved mask (only if show approval mask is enabled)
-    if (event->key() == vc3d::keybinds::keypress::UnapprovalPaintToggle.key &&
-        !event->isAutoRepeat() &&
-        event->modifiers() == vc3d::keybinds::keypress::UnapprovalPaintToggle.modifiers) {
-        if (_showApprovalMask) {
-            setEditUnapprovedMask(!_editUnapprovedMask);
-            if (_widget) {
-                _widget->setEditUnapprovedMask(_editUnapprovedMask);
-            }
-            emit statusMessageRequested(
-                _editUnapprovedMask ? tr("Unapproval painting enabled.") : tr("Unapproval painting disabled."),
-                kStatusShort);
-            event->accept();
-            return true;
-        }
-    }
-
-    // Ctrl+B: Undo approval mask stroke (only when editing approval mask)
-    if (event->key() == vc3d::keybinds::keypress::ApprovalUndo.key && !event->isAutoRepeat() &&
-        event->modifiers() == vc3d::keybinds::keypress::ApprovalUndo.modifiers) {
-        if (isEditingApprovalMask() && _overlay && _overlay->canUndoApprovalMaskPaint()) {
-            undoApprovalStroke();
-            event->accept();
-            return true;
-        }
     }
 
     if (!event->isAutoRepeat()) {
@@ -434,34 +353,6 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         return;
     }
 
-    // Handle approval mask editing mode - works independently of surface editing
-    if (isEditingApprovalMask() && isLeftButton) {
-        if (modifiers.testFlag(Qt::ControlModifier) || modifiers.testFlag(Qt::AltModifier)) {
-            return;
-        }
-        if (_approvalTool) {
-            // Check if this is a plane viewer (XY/XZ/YZ) or segmentation view
-            Surface* viewerSurf = viewer->currentSurface();
-            auto* planeSurf = dynamic_cast<PlaneSurface*>(viewerSurf);
-
-            if (planeSurf) {
-                // For plane viewers, use cylinder-based painting
-                const float brushRadiusSteps = _approvalMaskBrushRadius;
-                const float worldRadius = brushRadiusSteps * 1.0f;
-                const cv::Vec3f planeNormal = planeSurf->normal({0, 0, 0});
-                _approvalTool->startStrokeFromPlane(worldPos, planeNormal, worldRadius);
-            } else {
-                // Flattened view - convert scene coordinates to surface coordinates
-                const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                const auto gridIdx = _overlay
-                    ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
-                    : std::nullopt;
-                _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), gridIdx);
-            }
-        }
-        return;
-    }
-
     if (_correctionDragKeyActive && isLeftButton && !modifiers.testFlag(Qt::ControlModifier) &&
         !modifiers.testFlag(Qt::AltModifier) && !modifiers.testFlag(Qt::ShiftModifier)) {
         if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
@@ -581,70 +472,6 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
         return;
     }
 
-    // Handle approval mask mode
-    const bool approvalStrokeActive = _approvalTool && _approvalTool->strokeActive();
-    if (approvalStrokeActive) {
-        if (buttons.testFlag(Qt::LeftButton)) {
-            if (_approvalTool) {
-                // Check if this is a plane viewer (XY/XZ/YZ) or segmentation view
-                Surface* viewerSurf = viewer->currentSurface();
-                auto* planeSurf = dynamic_cast<PlaneSurface*>(viewerSurf);
-
-                if (planeSurf) {
-                    // For plane viewers, use cylinder-based painting
-                    const float brushRadiusSteps = _approvalMaskBrushRadius;
-                    const float worldRadius = brushRadiusSteps * 1.0f;
-                    const cv::Vec3f planeNormal = planeSurf->normal({0, 0, 0});
-                    _approvalTool->extendStrokeFromPlane(worldPos, planeNormal, worldRadius, false);
-                } else {
-                    // Convert scene coordinates to surface coordinates for grid mapping
-                    const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                    const auto gridIdx = _overlay
-                        ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
-                        : std::nullopt;
-                    _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), false, gridIdx);
-                }
-            }
-        } else {
-            if (_approvalTool) {
-                // Check viewer type to call appropriate finish method
-                Surface* viewerSurf = viewer->currentSurface();
-                auto* planeSurf = dynamic_cast<PlaneSurface*>(viewerSurf);
-                if (planeSurf) {
-                    _approvalTool->finishStrokeFromPlane();
-                } else {
-                    _approvalTool->finishStroke();
-                }
-            }
-        }
-        return;
-    }
-
-    // Update hover position for approval brush circle when in edit approval mode but not stroking
-    // Only update if position changed significantly to avoid expensive refreshOverlay on every mouse move
-    if (isEditingApprovalMask() && _approvalTool && !buttons.testFlag(Qt::LeftButton)) {
-        const auto lastHover = _approvalTool->hoverWorldPos();
-        const float minMoveThreshold = 2.0f;  // Native voxels
-        bool shouldUpdate = !lastHover.has_value();
-        if (lastHover) {
-            const cv::Vec3f delta = worldPos - *lastHover;
-            shouldUpdate = delta.dot(delta) >= minMoveThreshold * minMoveThreshold;
-        }
-        if (shouldUpdate) {
-            const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-
-            // Get plane normal if this is a plane viewer (XY/XZ/YZ)
-            std::optional<cv::Vec3f> planeNormal;
-            Surface* viewerSurf = viewer->currentSurface();
-            if (auto* planeSurf = dynamic_cast<PlaneSurface*>(viewerSurf)) {
-                planeNormal = planeSurf->normal({0, 0, 0});
-            }
-
-            _approvalTool->setHoverWorldPos(worldPos, _approvalMaskBrushRadius, QPointF(surfCoords[0], surfCoords[1]), planeNormal);
-            refreshOverlay();
-        }
-    }
-
     if (_pointMoveDrag.active) {
         updatePointMoveDrag(worldPos);
         return;
@@ -700,35 +527,6 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
             } else {
                 _surfaceMaskTool->finishStroke();
             }
-        }
-        return;
-    }
-
-    // Handle approval mask mode
-    const bool approvalStrokeActive = _approvalTool && _approvalTool->strokeActive();
-    if (approvalStrokeActive && button == Qt::LeftButton) {
-        if (_approvalTool && viewer) {
-            // Check if this is a plane viewer (XY/XZ/YZ) or segmentation view
-            Surface* viewerSurf = viewer->currentSurface();
-            auto* planeSurf = dynamic_cast<PlaneSurface*>(viewerSurf);
-
-            if (planeSurf) {
-                // For plane viewers, use cylinder-based painting
-                const float brushRadiusSteps = _approvalMaskBrushRadius;
-                const float worldRadius = brushRadiusSteps * 1.0f;
-                const cv::Vec3f planeNormal = planeSurf->normal({0, 0, 0});
-                _approvalTool->extendStrokeFromPlane(worldPos, planeNormal, worldRadius, true);
-                _approvalTool->finishStrokeFromPlane();
-            } else {
-                // Convert scene coordinates to surface coordinates for grid mapping
-                const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
-                const auto gridIdx = _overlay
-                    ? flattenedApprovalGridIndex(viewer, scenePos, _overlay->approvalMaskDimensions())
-                    : std::nullopt;
-                _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), true, gridIdx);
-                _approvalTool->finishStroke();
-            }
-            // Don't apply immediately - wait for user to press Apply button
         }
         return;
     }

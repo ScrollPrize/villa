@@ -55,9 +55,6 @@ extern const KeyPressDef RecenterFocus;
 extern const KeyPressDef SliceStepDecrease;
 extern const KeyPressDef SliceStepIncrease;
 
-extern const KeyPressDef ApprovalPaintToggle;
-extern const KeyPressDef UnapprovalPaintToggle;
-extern const KeyPressDef ApprovalUndo;
 extern const KeyPressDef SegmentationUndo;
 extern const KeyPressDef ManualAddToggle;
 extern const KeyPressDef GrowSegmentation;

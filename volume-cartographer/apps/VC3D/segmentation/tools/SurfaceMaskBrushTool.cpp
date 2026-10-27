@@ -153,7 +153,7 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
         const float avg = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
         return avg > 1e-4f ? avg : 1.0f;
     }();
-    const float radius = std::max(1.0f, _module.approvalMaskBrushRadius() * avgScale);
+    const float radius = std::max(1.0f, _module.maskBrushRadius() * avgScale);
     const float sampleSpacing = std::max(1.0f, radius / 3.0f);
 
     if (_lastGridPosition) {
@@ -320,7 +320,7 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
         return;
     }
     const float avgScale = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
-    const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.approvalMaskBrushRadius() *
+    const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.maskBrushRadius() *
                                                                  (avgScale > 1e-4f ? avgScale : 1.0f))));
     const float radiusSq = static_cast<float>(radius * radius);
     if (_strokeGridPoints.empty() ||

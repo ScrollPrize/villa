@@ -25,8 +25,8 @@
 //         (rotating 8-slot ring, same convention as grow / brush /
 //         rotation edits) and then atomically swaps the new
 //         x/y/z/mask/meta into place. Cells outside the footprint are
-//         written verbatim; aux files in the parent dir (approval.tif,
-//         generations.tif, etc.) are preserved.
+//         written verbatim; aux files in the parent dir
+//         (generations.tif, etc.) are preserved.
 //
 // Hard-coded fitting params (kThresholds, kRidgeLambda, kAnchorBinSize)
 // match vc_merge_tifxyz; the per-run CLI knobs cover RANSAC, border
@@ -1164,8 +1164,8 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces*
     //      failures are logged via the QuadSurface logger but never block
     //      the actual save.
     //   2. save(force_overwrite=true) -- writes new x/y/z/meta to a
-    //      sibling temp dir, carries forward aux files (approval.tif,
-    //      generations.tif, etc.) into that temp dir, then atomically
+    //      sibling temp dir, carries forward aux files
+    //      (generations.tif, etc.) into that temp dir, then atomically
     //      swaps temp <-> parent (renameat2 RENAME_EXCHANGE on Linux,
     //      remove+rename fallback elsewhere). Cells we didn't touch
     //      retain their parent values bit-identical to the input.
@@ -1273,8 +1273,7 @@ int main(int argc, char** argv)
             "Parent tifxyz directory (explicit override). When both "
             "--parent and --child are set, auto-detection is skipped. "
             "Overwritten in place: x/y/z/mask/meta are replaced atomically; "
-            "aux files in the parent dir (approval.tif, generations.tif, "
-            "...) are preserved.")
+            "aux files in the parent dir (generations.tif, ...) are preserved.")
         ("child,c", po::value<std::string>(),
             "Child tifxyz directory (explicit override). Its border should "
             "already overlap parent geometry; alignment refines the seam, "
