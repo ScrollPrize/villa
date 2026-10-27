@@ -7,6 +7,7 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <vc_reader/catalog.hpp>
 #include <vc_reader/s3_listing.hpp>
 
 #include <QApplication>
@@ -106,11 +107,12 @@ QString fileUriToPath(QString uri)
     return QDir::fromNativeSeparators(uri);
 }
 
+// A browsable s3:// location: its bucket's URI ("s3://bucket/",
+// "s3+REGION://bucket/") and the listing of the key prefix below it, at the
+// endpoint the remote transport resolves (vc::resolveRemoteUrl).
 struct S3Location {
-    QString scheme;
-    QString bucket;
-    QString prefix;
-    QString region;
+    QString bucketUri;
+    vcr::s3::Prefix listing;  // key is empty at the bucket root, else ends with '/'
 };
 
 struct RemoteEntry {
@@ -125,57 +127,24 @@ struct RemoteListResult {
     QString error;
 };
 
-QString withoutLeadingSlash(QString s)
-{
-    while (s.startsWith('/')) s.remove(0, 1);
-    return s;
-}
-
-QString ensurePrefixDirectory(QString prefix)
-{
-    prefix = withoutLeadingSlash(prefix);
-    if (!prefix.isEmpty() && !prefix.endsWith('/')) prefix += '/';
-    return prefix;
-}
-
 std::optional<S3Location> parseS3Url(const QString& input)
 {
-    const QString trimmed = input.trimmed();
-    const int schemeEnd = trimmed.indexOf(QStringLiteral("://"));
+    QString uri = input.trimmed();
+    const int schemeEnd = uri.indexOf(QStringLiteral("://"));
     if (schemeEnd < 0) return std::nullopt;
-
-    const QString scheme = trimmed.left(schemeEnd).toLower();
+    const QString scheme = uri.left(schemeEnd).toLower();
     if (scheme != QLatin1String("s3") && !scheme.startsWith(QLatin1String("s3+"))) {
         return std::nullopt;
     }
+    uri = scheme + uri.mid(schemeEnd);
+    if (const int queryStart = uri.indexOf('?'); queryStart >= 0) uri = uri.left(queryStart);
 
-    QString rest = trimmed.mid(schemeEnd + 3);
-    const int queryStart = rest.indexOf('?');
-    if (queryStart >= 0) rest = rest.left(queryStart);
-
-    const int slash = rest.indexOf('/');
-    S3Location loc;
-    loc.scheme = scheme;
-    loc.bucket = slash >= 0 ? rest.left(slash) : rest;
-    loc.prefix = slash >= 0 ? rest.mid(slash + 1) : QString();
-    loc.prefix = ensurePrefixDirectory(loc.prefix);
-    loc.region = scheme.startsWith(QLatin1String("s3+")) ? scheme.mid(3) : QStringLiteral("us-east-1");
-    if (loc.bucket.isEmpty()) return std::nullopt;
-    return loc;
-}
-
-QString s3UriFor(const S3Location& loc, const QString& prefix)
-{
-    QString uri = loc.scheme + QStringLiteral("://") + loc.bucket + QStringLiteral("/");
-    uri += withoutLeadingSlash(prefix);
-    return withTrailingSlash(uri);
-}
-
-// The bucket's virtual-hosted endpoint and the prefix a listing covers.
-vcr::s3::Prefix s3ListPrefix(const S3Location& loc)
-{
-    return {"https://" + loc.bucket.toStdString() + ".s3." + loc.region.toStdString() + ".amazonaws.com",
-            loc.prefix.toStdString()};
+    const int bucketEnd = uri.indexOf('/', schemeEnd + 3);
+    const QString bucketUri = bucketEnd >= 0 ? uri.left(bucketEnd) : uri;
+    if (bucketUri.size() == schemeEnd + 3) return std::nullopt;
+    const auto listing = vcr::s3::splitPrefixUrl(vc::resolveRemoteUrl(uri.toStdString()).httpsUrl);
+    if (!listing) return std::nullopt;
+    return S3Location{withTrailingSlash(bucketUri), *listing};
 }
 
 QString displayNameForPrefix(QString name, const QString& parent)
@@ -187,20 +156,16 @@ QString displayNameForPrefix(QString name, const QString& parent)
     return name + QStringLiteral("/");
 }
 
-bool isVesuviusOpenDataRoot(const S3Location& loc)
+// The Open Data catalog's root, whose site files (the manifest, index page,
+// licence and thumbnails) are not data to browse.
+bool shouldHideCatalogRootEntry(const S3Location& loc, const std::string& keyOrPrefix)
 {
-    return loc.bucket.compare(QStringLiteral("vesuvius-challenge-open-data"), Qt::CaseInsensitive) == 0
-        && loc.prefix.isEmpty();
-}
-
-bool shouldHideVesuviusRootEntry(const S3Location& loc, const QString& decodedKeyOrPrefix)
-{
-    if (!isVesuviusOpenDataRoot(loc)) return false;
-
-    QString name = decodedKeyOrPrefix;
-    while (name.startsWith('/')) name.remove(0, 1);
+    if (vcr::s3::objectUrl(loc.listing.origin, loc.listing.key + "metadata.json") !=
+        vcr::catalog::kDefaultManifestUrl) {
+        return false;
+    }
+    QString name = QString::fromStdString(keyOrPrefix).mid(int(loc.listing.key.size()));
     if (name.endsWith('/')) name.chop(1);
-
     return name.compare(QStringLiteral("_thumbnails"), Qt::CaseInsensitive) == 0
         || name.compare(QStringLiteral("index.html"), Qt::CaseInsensitive) == 0
         || name.compare(QStringLiteral("license.txt"), Qt::CaseInsensitive) == 0
@@ -218,34 +183,29 @@ RemoteListResult listS3Prefix(const QString& urlPrefix,
         return result;
     }
 
-    const std::string body = vc::httpGetString(
-        vcr::s3::listUrl(s3ListPrefix(*loc), "/", continuationToken.toStdString()), auth);
-    if (body.empty()) {
-        result.error = QObject::tr("No response while listing bucket.");
-        return result;
-    }
     vcr::s3::ListPage page;
     try {
-        page = vcr::s3::parseListPage(body);
+        page = vcr::s3::parseListPage(vc::httpGetString(
+            vcr::s3::listUrl(loc->listing, "/", continuationToken.toStdString()), auth));
     } catch (const std::exception& e) {
-        result.error = QObject::tr("Could not parse S3 listing: %1").arg(QString::fromUtf8(e.what()));
+        result.error = QObject::tr("Could not list bucket: %1").arg(QString::fromUtf8(e.what()));
         return result;
     }
 
+    const QString parent = QString::fromStdString(loc->listing.key);
     for (const auto& listedPrefix : page.commonPrefixes) {
+        if (shouldHideCatalogRootEntry(*loc, listedPrefix)) continue;
         const QString prefix = QString::fromStdString(listedPrefix);
-        if (shouldHideVesuviusRootEntry(*loc, prefix)) continue;
-        result.entries.push_back({displayNameForPrefix(prefix, loc->prefix), s3UriFor(*loc, prefix), true});
+        result.entries.push_back({displayNameForPrefix(prefix, parent), loc->bucketUri + prefix, true});
     }
     for (const auto& object : page.objects) {
+        if (shouldHideCatalogRootEntry(*loc, object.key)) continue;
         const QString key = QString::fromStdString(object.key);
-        if (shouldHideVesuviusRootEntry(*loc, key)) continue;
-        if (key == loc->prefix) continue;
+        if (key == parent) continue;
         QString name = key;
-        if (!loc->prefix.isEmpty() && name.startsWith(loc->prefix)) name = name.mid(loc->prefix.size());
+        if (!parent.isEmpty() && name.startsWith(parent)) name = name.mid(parent.size());
         if (name.contains('/')) continue;
-        result.entries.push_back(
-            {name, loc->scheme + QStringLiteral("://") + loc->bucket + QStringLiteral("/") + key, false});
+        result.entries.push_back({name, loc->bucketUri + key, false});
     }
     result.nextToken = QString::fromStdString(page.nextContinuationToken);
 
@@ -343,7 +303,10 @@ UnifiedBrowserDialog::UnifiedBrowserDialog(QWidget* parent)
 
     // Default to local home
     _currentLocalDir = QDir::homePath();
-    _currentRemoteUrl = QStringLiteral("s3://vesuvius-challenge-open-data/");
+    // The bucket the Open Data catalog is published in.
+    const std::string_view manifest = vcr::catalog::kDefaultManifestUrl;
+    _currentRemoteUrl = QString::fromStdString(
+        vcr::catalog::openDataS3Url(std::string(manifest.substr(0, manifest.rfind('/') + 1))).value());
     navigateLocal(_currentLocalDir);
 }
 
