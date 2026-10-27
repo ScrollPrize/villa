@@ -55,4 +55,13 @@ std::vector<AttachedCollection> attachedCollections(ObjectStoreSession&, const A
 void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
                                 const std::string& role, const std::vector<AttachedCollection>& collections,
                                 const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame = std::nullopt);
+
+// A volume's point collections: the live point_collection objects whose
+// coordinates map to `volume` (bound to it, or through a registration) and
+// that are no object's attached data (no meta.role), in its voxels.
+std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume);
+// In one commit: `changed` (in `volume`'s voxels) are created, bound to its
+// voxels, or revised keeping their points' identity; `removed` are retired.
+void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume,
+                            const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed);
 }

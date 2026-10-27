@@ -4,6 +4,7 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/objects/UmbilicusFile.hpp"
+#include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include <fstream>
 #include "vc_object_store/Uuid.hpp"
@@ -254,6 +255,40 @@ int main() try {
         require(umbilicusBinding(malformed,half,std::nullopt).refusal.has_value(),"malformed frame metadata is refused");
         require(umbilicusBinding(stamped,{{150,150,600},std::nullopt},std::nullopt).refusal.has_value(),
                 "a stamped grid that is no rescale of the volume is refused");
+    }
+    {
+        // A volume's point collections: written in its voxels, revised keeping
+        // point identity, retired; read through views (here a registration).
+        const auto storePath=directory.path/"collections.vcobj";
+        {auto created=ObjectStore::create(storePath,options);
+         auto txn=created.write();(void)created.registerVolumeTransform(txn,"w","w2",VolumeAffine::scale(2),"twice");txn.commit();}
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        AttachedCollection collection;collection.uuid=vc::objects::util::newUuid();collection.name="seeds";
+        collection.points.ids={4,9};collection.points.points={{1,2,3},{4,5,6}};
+        collection.annotations=nlohmann::json::array({{{"wind_a",1}},{{"wind_a",2}}});
+        collection.source={{"color",{1,0,0}}};
+        writeVolumeCollections(session,attachment,"w",{collection},{});
+        auto found=volumeCollections(session,attachment,"w");
+        require(found.size()==1&&found[0].name=="seeds"&&found[0].points.ids==std::vector<vc::geometry::PointId>{4,9}&&
+                found[0].points.points[1]==std::array<double,3>{4,5,6}&&found[0].annotations[1]["wind_a"]==2&&
+                found[0].source["color"]==nlohmann::json({1,0,0}),"a volume's collection reads back as written");
+        const auto registered=volumeCollections(session,attachment,"w2");
+        require(registered.size()==1&&registered[0].points.points[0]==std::array<double,3>{2,4,6},
+                "collections are read through a registration");
+        collection.points.points[0]={7,8,9};
+        writeVolumeCollections(session,attachment,"w",{collection},{});
+        found=volumeCollections(session,attachment,"w");
+        require(found.size()==1&&found[0].points.points[0]==std::array<double,3>{7,8,9}&&found[0].points.ids[1]==9,
+                "a revision keeps point identity");
+        // Attached data (a surface's corrections) is no volume collection.
+        ObjectRecord surface;surface.kind="surface";surface.uuid=vc::objects::util::newUuid();
+        surface.meta=R"({"coordinates":{"volume_uuid":"w","scale_factor":1}})";
+        session.act(attachment,{{surface.uuid,std::nullopt}},[&](auto& db,auto& txn){db.upsertObject(txn,surface);});
+        AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
+        replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
+        require(volumeCollections(session,attachment,"w").size()==1,"attached collections are not the volume's");
+        writeVolumeCollections(session,attachment,"w",{},{collection.uuid});
+        require(volumeCollections(session,attachment,"w").empty(),"a removed collection is retired");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
