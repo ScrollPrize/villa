@@ -7,7 +7,15 @@ from unittest.mock import Mock
 import pytest
 
 from fit_session import SessionState
-from spiral_runtime import _SessionShutdown, _apply_input_changes_at_boundary
+from spiral_runtime import (INPUT_BATCH_TIMEOUT_S, InputsFrozenError,
+                            _SessionShutdown, _apply_input_changes_at_boundary)
+
+
+def apply_batch(session, batch_id, records, timeout=INPUT_BATCH_TIMEOUT_S):
+    """The input-batch protocol, which resident sessions no longer expose:
+    their object-store inputs are frozen (see the refusal test below)."""
+    return _apply_input_changes_at_boundary(
+        session, batch_id, records, timeout=timeout, distributed=False)
 
 
 @pytest.fixture
@@ -61,16 +69,25 @@ def resident():
     assert not errors
 
 
+def test_a_resident_session_refuses_input_changes(resident):
+    session, active, _, _ = resident
+    with pytest.raises(InputsFrozenError, match="inputs are frozen"):
+        session.apply_input_changes("batch", [{"revision": 2}], timeout=2)
+    assert session._live_reservation_epoch == 0
+    assert not session._context.prepare_input_changes.called
+    assert active["revision"] == 1
+
+
 def test_idle_batch_applies_without_run_and_replays_once(resident):
     session, active, _, _ = resident
-    result = session.apply_input_changes("batch", [{"revision": 2}], timeout=2)
+    result = apply_batch(session, "batch", [{"revision": 2}], timeout=2)
     assert result["applied"]
     assert active["revision"] == 2
     assert session._completed == session._target == 7
-    assert session.apply_input_changes("batch", [{"revision": 2}]) == result
+    assert apply_batch(session, "batch", [{"revision": 2}]) == result
     assert session._context.install_input_changes.call_count == 1
     with pytest.raises(ValueError, match="different content"):
-        session.apply_input_changes("batch", [{"revision": 3}])
+        apply_batch(session, "batch", [{"revision": 3}])
 
 
 @pytest.mark.parametrize('running', [False, True])
@@ -123,11 +140,11 @@ def test_input_batch_restores_progress_after_preparation(running, outcome):
 
 def test_preparation_failure_leaves_active_state_and_allows_next_batch(resident):
     session, active, _, _ = resident
-    result = session.apply_input_changes("invalid", [{"invalid": True}], timeout=2)
+    result = apply_batch(session, "invalid", [{"invalid": True}], timeout=2)
     assert not result["applied"]
     assert active == {"revision": 1}
     session._context.install_input_changes.assert_not_called()
-    assert session.apply_input_changes("repaired", [{"revision": 3}], timeout=2)["applied"]
+    assert apply_batch(session, "repaired", [{"revision": 3}], timeout=2)["applied"]
     assert active["revision"] == 3
 
 
@@ -151,17 +168,17 @@ def test_timeout_preserves_captured_batch_and_boundary_for_retry(resident):
     release.clear()
     records = [{"revision": 2}]
     with pytest.raises(TimeoutError, match="unknown"):
-        session.apply_input_changes("batch", records, timeout=.02)
+        apply_batch(session, "batch", records, timeout=.02)
     assert entered.wait(2)
     records[0]["revision"] = 3
     assert active["revision"] == 1
     with pytest.raises(ValueError, match="outstanding"):
-        session.apply_input_changes("newer", records, timeout=.02)
+        apply_batch(session, "newer", records, timeout=.02)
     release.set()
-    assert session.apply_input_changes("batch", [{"revision": 2}], timeout=2)["applied"]
+    assert apply_batch(session, "batch", [{"revision": 2}], timeout=2)["applied"]
     assert active["revision"] == 2
     assert session._context.prepare_input_changes.call_count == 1
-    assert session.apply_input_changes("newer", records, timeout=2)["applied"]
+    assert apply_batch(session, "newer", records, timeout=2)["applied"]
     assert active["revision"] == 3
 
 

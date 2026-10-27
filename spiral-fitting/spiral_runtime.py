@@ -107,6 +107,11 @@ COMMAND_ACK_TIMEOUT_S = 30.0
 # close) before the parent calls the worker wedged.
 COMMAND_ACK_GRACE_S = 5.0
 
+# Object-store adapter report lines a session keeps for its status; a
+# selection's report is a few dozen lines, so this only bounds a pathological
+# one.
+MAX_INPUT_REPORT_LINES = 500
+
 # Input application rebuilds resident catalogs, indices and fiber views.
 # Its acknowledgement is the result of that whole operation,
 # not the quick queue-admission acknowledgement covered above.
@@ -307,6 +312,19 @@ class RendezvousEndpoint:
     """The picklable half of a rendezvous: where the ranks meet."""
 
     store_path: str
+
+
+class InputsFrozenError(RuntimeError):
+    """A resident session's object-store inputs never change."""
+
+
+def raise_inputs_frozen():
+    """Refuse an input change before any boundary is reserved: the inputs a
+    resident session loaded from its object store are frozen, and only a
+    full-input rebuild reads the store again."""
+    raise InputsFrozenError(
+        "fit inputs are frozen for the resident session; rebuild with inputs "
+        "reloaded to read the object store again")
 
 
 def _apply_input_changes_at_boundary(session, batch_id, records, *,
@@ -584,7 +602,7 @@ class InteractiveFitSession:
                  preview: SpiralPreviewConfig, scroll: ScrollSpec,
                  status_callback=None, publishes_outputs=True,
                  event_callback=None, rank=0, world_size=1, local_rank=0,
-                 rendezvous=None, input_bindings=None) -> None:
+                 rendezvous=None) -> None:
         # Who this session is in the job, passed in explicitly by whoever
         # spawned it. Nothing here reads RANK/WORLD_SIZE from the
         # environment; the DistributedContext is built from these values on
@@ -598,9 +616,6 @@ class InteractiveFitSession:
         # exists; until then nothing resolves a configuration.
         self._dist_world_size = self.world_size
         self.paths = paths
-        # Editing-workspace adoption records bound before the first
-        # derivation; the service skips replaying them after the build.
-        self.input_bindings = tuple(input_bindings or ())
         self.run_config = run
         self.scroll = scroll
         self.preview_config = preview
@@ -619,6 +634,10 @@ class InteractiveFitSession:
         self._phase = "Importing fitter"
         self._error = None
         self._warnings = []
+        # What the object-store adapter reported while loading the inputs,
+        # and the problems that refused them (ObjectStoreInputError).
+        self._input_report = []
+        self._input_problems = None
         self._completed = 0
         self._target = 0
         self._pending = 0
@@ -701,6 +720,9 @@ class InteractiveFitSession:
                 "session_horizon": None,
                 "latest_metrics": copy.deepcopy(self._latest_metrics),
                 "warnings": list(self._warnings), "error": self._error,
+                "input_report": list(getattr(self, "_input_report", ())),
+                "input_problems": copy.deepcopy(
+                    getattr(self, "_input_problems", None)),
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
                 "preview_source_iteration": getattr(
@@ -875,19 +897,24 @@ class InteractiveFitSession:
                 storage_backend=self.run_config.storage_backend,
                 render_volume_scale=self.run_config.render_volume_scale,
                 dist_context=dist_context,
-                input_bindings=self.input_bindings)
+                input_log=self._input_line)
             context.check_cuda_ready()
             context.load_host_inputs()
-            context.resolve_output_path()
+            context.prepare_output()
             context.build_device_state()
             context.release_setup_only_tracks()
             self._session_ready(context)
             self._optimize(context)
         except BaseException as exc:
+            from object_store_inputs import ObjectStoreInputError
             with self._condition:
                 if self._shutdown and isinstance(exc, _SessionShutdown):
                     self._transition_locked(SessionState.Closing, "Stopped")
                 else:
+                    if isinstance(exc, ObjectStoreInputError):
+                        # Every refused input and refresh failure, including
+                        # what detectors committed before failing.
+                        self._input_problems = list(exc.problems)
                     self._error = f"{type(exc).__name__}: {exc}"
                     self._warnings.append(traceback.format_exc(limit=12))
                     self._transition_locked(SessionState.Error, "Error")
@@ -910,6 +937,16 @@ class InteractiveFitSession:
             if dist_context is not None:
                 maybe_destroy_distributed(dist_context)
             self._progress_reporter().close()
+
+    def _input_line(self, line):
+        """One line of the object-store adapter's report: printed as the CLI
+        prints it, kept in the status and shown as loading progress."""
+        print(line, flush=True)
+        with self._condition:
+            if len(self._input_report) < MAX_INPUT_REPORT_LINES:
+                self._input_report.append(str(line))
+        self._progress_reporter().pulse(detail=str(line))
+        self._publish_status()
 
     def _resolve_session_config(self, world_size):
         """Resolve this session's fitter configuration and publish it.
@@ -2062,8 +2099,7 @@ class InteractiveFitSession:
 
     def apply_input_changes(self, batch_id, records, *,
                             timeout=INPUT_BATCH_TIMEOUT_S):
-        return _apply_input_changes_at_boundary(
-            self, batch_id, records, timeout=timeout, distributed=False)
+        raise_inputs_frozen()
 
     def stop(self, barrier=None):
         with self._condition:
@@ -2249,8 +2285,7 @@ class InteractiveFitSession:
 
 
 def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
-                                preview, scroll, commands, events,
-                                input_bindings=None):
+                                preview, scroll, commands, events):
     """Own one CUDA rank and adapt queue commands to InteractiveFitSession.
 
     ``context`` is the (rank, world_size, local_rank) identity assigned by the
@@ -2274,8 +2309,7 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
             paths, run, preview, scroll, publish_status,
             publishes_outputs=(rank == 0),
             rank=rank, world_size=context.world_size,
-            local_rank=context.local_rank, rendezvous=rendezvous,
-            input_bindings=input_bindings)
+            local_rank=context.local_rank, rendezvous=rendezvous)
         while True:
             barrier, command_id, name, arguments = commands.get()
             try:
@@ -2375,8 +2409,7 @@ class DistributedInteractiveFitSession:
     """
 
     def __init__(self, paths, run, preview, scroll, gpu_ids,
-                 status_callback=None, event_callback=None,
-                 input_bindings=None):
+                 status_callback=None, event_callback=None):
         from ddp_helpers import DistributedContext
 
         self._init_coordinator_state(gpu_ids, status_callback, event_callback)
@@ -2396,8 +2429,7 @@ class DistributedInteractiveFitSession:
                                          local_rank=0),
                       gpu_id, self._rendezvous.endpoint,
                       paths, run, preview, scroll,
-                      self._commands[rank], self._events,
-                      tuple(input_bindings or ())),
+                      self._commands[rank], self._events),
                 name=f"spiral-gpu-{gpu_id}",
             )
             for rank, gpu_id in enumerate(self._gpu_ids)
@@ -2757,8 +2789,7 @@ class DistributedInteractiveFitSession:
 
     def apply_input_changes(self, batch_id, records, *,
                             timeout=INPUT_BATCH_TIMEOUT_S):
-        return _apply_input_changes_at_boundary(
-            self, batch_id, records, timeout=timeout, distributed=True)
+        raise_inputs_frozen()
 
     def stop(self):
         state = self.status()["state"]
@@ -2874,13 +2905,12 @@ class DistributedInteractiveFitSession:
 
 
 def create_session(paths, run, preview, scroll, status_callback=None,
-                   gpu_ids=(0,), event_callback=None, input_bindings=None):
+                   gpu_ids=(0,), event_callback=None):
     gpu_ids = tuple(gpu_ids)
     if len(gpu_ids) == 1:
         return InteractiveFitSession(paths, run, preview, scroll,
                                      status_callback,
-                                     event_callback=event_callback,
-                                     input_bindings=input_bindings)
+                                     event_callback=event_callback)
     return DistributedInteractiveFitSession(
         paths, run, preview, scroll, gpu_ids, status_callback,
-        event_callback=event_callback, input_bindings=input_bindings)
+        event_callback=event_callback)

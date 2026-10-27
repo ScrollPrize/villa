@@ -573,6 +573,7 @@ class ServiceState:
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
+        self._event_input_lines = {}
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
         self.checkpoint_uploads = UploadManager(self._upload_environment())
@@ -1380,6 +1381,7 @@ class ServiceState:
         self._event_progress_signatures = {}
         self._event_metric_iterations = {}
         self._event_errors = {}
+        self._event_input_lines = {}
         self.pcl_artifacts = {}
         stale_raw = self._preview.reset_session_scope()
         for manifest in stale_raw:
@@ -1545,6 +1547,20 @@ class ServiceState:
                     payload={key: value for key, value in progress.items()
                              if key != "eta_seconds"},
                     coalesce_key=("progress", rank), force=finished)
+        report = status.get("input_report")
+        if isinstance(report, list):
+            # The object-store adapter's report while it loads the inputs:
+            # selection, refresh outcomes, constraint counts and warnings.
+            with self.lock:
+                published = self._event_input_lines.get(rank, 0)
+                self._event_input_lines[rank] = max(published, len(report))
+            for line in report[published:]:
+                self.events.append(
+                    "inputs", str(line),
+                    severity=("warning" if str(line).startswith("WARNING")
+                              else "info"),
+                    source="fitter", rank=rank, session_generation=generation,
+                    operation="loading_inputs")
         metrics = status.get("latest_metrics")
         iteration = status.get("current_iteration")
         if metrics and isinstance(iteration, int):
@@ -1567,9 +1583,11 @@ class ServiceState:
                 if emit:
                     self._event_errors[rank] = error
             if emit:
+                problems = status.get("input_problems")
                 self.events.append(
                     "error", str(error), severity="error", source="fitter",
-                    rank=rank, session_generation=generation)
+                    rank=rank, session_generation=generation,
+                    payload={"input_problems": problems} if problems else None)
 
     def _maybe_register_artifacts(self, status):
         """Offer a raw snapshot to the bounded background publisher.

@@ -955,7 +955,7 @@ class FitContext:
                  out_base_dir=None, run_dir=None, run_tag=None, run_name=None,
                  cache_dir=None, storage_backend='sparse_cuda',
                  render_volume_scale=16, dist_context=None,
-                 object_store_inputs=None):
+                 object_store_inputs=None, input_log=None):
         # config is the explicit FitConfig (or any dict-style mapping of
         # fully resolved values) this fit reads; there is no module-global
         # fallback. The optimisation z window is Config's z_begin/z_end.
@@ -1008,6 +1008,11 @@ class FitContext:
         # None, load_host_inputs refreshes and reads the store the config
         # names (object_store_path).
         self.object_store_inputs = object_store_inputs
+        # Receives each line the object-store adapter reports while it
+        # refreshes, freezes and derives the inputs (selection, refresh
+        # outcomes, constraint counts); the CLI prints them, a resident
+        # session also publishes them.
+        self.input_log = input_log or print
         self.progress = progress
         self.resume_path = resume_path or None
         self.out_base_dir = out_base_dir if out_base_dir is not None else './out'
@@ -1696,7 +1701,7 @@ class FitContext:
         return load_fit_inputs(
             self.config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
-            cache_directory=cache)
+            cache_directory=cache, log=self.input_log)
 
     def _derive_object_store_point_inputs(self, verified_patches, inputs):
         """Install point views derived from object-store attachments.
@@ -1706,8 +1711,9 @@ class FitContext:
         """
         from object_store_inputs import derive_point_views
         views = derive_point_views(inputs, verified_patches, self.config)
-        for line in inputs.report() + views.report():
-            print(line)
+        if self.dist.is_main_process:
+            for line in inputs.report() + views.report():
+                self.input_log(line)
         self._install_point_views(
             views.cross_patch, views.strips, views.strip_groups,
             resolved_links=views.resolved_links,
@@ -3901,6 +3907,14 @@ class FitContext:
         os.makedirs(self.out_path, exist_ok=True)
         return self.out_path
 
+    def prepare_output(self):
+        """Resolve the run's output directory and record the frozen inputs
+        in it: the step every driver takes between loading the inputs and
+        building device state."""
+        self.resolve_output_path()
+        self._write_object_store_manifest()
+        return self.out_path
+
     def _write_object_store_manifest(self):
         """Record the frozen object-store inputs' manifest beside the run's
         outputs (rank zero); checkpoints carry it too."""
@@ -3986,8 +4000,7 @@ class FitContext:
 
         self.check_cuda_ready()
         self.load_host_inputs()
-        self.resolve_output_path()
-        self._write_object_store_manifest()
+        self.prepare_output()
         self.build_device_state()
 
         # ==========================================================================
