@@ -28,6 +28,12 @@ Socket protocol is unchanged — text-based, newline-delimited:
 2. Client sends one command: ``pause\\n``, ``resume\\n``, or ``status\\n``
 3. Server replies with one line and closes the connection.
 
+Opting out
+----------
+Set ``GPU_PAUSE_DISABLE=1`` to run a ``gpu_pause_context`` that neither
+pauses the current owner nor registers itself, for example when two jobs
+are meant to share one GPU or run on different GPUs of one machine.
+
 CLI
 ---
 ::
@@ -352,6 +358,10 @@ def gpu_pause_client(
     return reply.decode().strip()
 
 
+def _pause_disabled() -> bool:
+    return os.environ.get("GPU_PAUSE_DISABLE", "").strip().lower() not in ("", "0", "false", "no")
+
+
 def _find_owner_socket() -> str | None:
     """Find the socket of the current GPU owner.
 
@@ -404,6 +414,11 @@ class gpu_pause_context:
         self._server: GpuPauseServer | None = None
 
     def __enter__(self):
+        if _pause_disabled():
+            print("[gpu_pause] GPU_PAUSE_DISABLE is set: not pausing other GPU owners",
+                  flush=True)
+            return self
+
         # Find and pause the current GPU owner.
         owner_sock = _find_owner_socket()
         if owner_sock is not None:

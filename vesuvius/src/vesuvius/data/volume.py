@@ -288,6 +288,18 @@ class Volume:
                         assert isinstance(segment_id, int), "segment_id must be an int when type is 'segment'"
                         self.segment_id = segment_id
                         self.scroll_id = scroll_id
+                        if scroll_id is None or energy is None or resolution is None:
+                            # Fill what was not given from the catalog, as the
+                            # timestamp form Volume(type="20230827161847") does.
+                            s_id, e, res, _ = self.find_segment_details(str(segment_id))
+                            if s_id is None:
+                                raise ValueError(
+                                    f"Segment {segment_id} is not in the packaged catalog. "
+                                    f"Segments it lists: {', '.join(self._catalog_segments()) or 'none'}. "
+                                    "For other data, pass type='zarr' and path=URL.")
+                            self.scroll_id = scroll_id if scroll_id is not None else s_id
+                            energy = energy if energy is not None else e
+                            resolution = resolution if resolution is not None else res
                     else:  # type == "scroll"
                         self.segment_id = None
                         self.scroll_id = scroll_id
@@ -335,7 +347,8 @@ class Volume:
             self.resolution = resolution if resolution is not None else self.grab_canonical_resolution()
             if self.energy is None or self.resolution is None:
                 raise ValueError(
-                    f"Could not determine energy/resolution for scroll {self.scroll_id}. Please provide them explicitly.")
+                    f"Could not determine energy/resolution for scroll {self.scroll_id}. Please provide them explicitly."
+                    + self._catalog_hint())
 
             # --- Get URL and Load Data ---
             self.url = self.get_url_from_yaml()  # This sets self.url based on type, scroll, energy, res
@@ -418,11 +431,8 @@ class Volume:
             elif isinstance(self.data, zarr.Group):
                 # Group case (e.g., OME-Zarr with multiscales)
                 # Find the first array in the group - typically '0' for highest resolution
-                first_key = None
-                for key in self.data.keys():
-                    if isinstance(self.data[key], zarr.Array):
-                        first_key = key
-                        break
+                level_keys = self._group_level_keys()
+                first_key = level_keys[0] if level_keys else None
                 if first_key is None:
                     raise ValueError(f"No arrays found in zarr Group at {self.path}")
                 first_array = self.data[first_key]
@@ -541,6 +551,30 @@ class Volume:
 
         return None, None, None, None
 
+    def _catalog_segments(self) -> List[str]:
+        """Segment ids listed anywhere in the packaged catalog."""
+        found: List[str] = []
+        stack = [list_files()]
+        while stack:
+            node = stack.pop()
+            for key, value in node.items():
+                if key == "segments" and isinstance(value, dict):
+                    found.extend(str(k) for k in value)
+                elif isinstance(value, dict):
+                    stack.append(value)
+        return sorted(found)
+
+    def _catalog_hint(self) -> str:
+        """What the packaged catalog does hold, for errors about what it does not."""
+        catalog = list_files()
+        scroll = catalog.get(str(self.scroll_id)) if self.scroll_id is not None else None
+        if not isinstance(scroll, dict):
+            return (f" Scroll {self.scroll_id!r} is not in the packaged catalog; it lists scrolls "
+                    f"{', '.join(repr(k) for k in catalog)}. For other data, pass type='zarr' and path=URL.")
+        scans = [f"energy={e}, resolution={r}" for e, by_res in scroll.items()
+                 if isinstance(by_res, dict) for r in by_res]
+        return f" Scroll {self.scroll_id!r} is available at: {'; '.join(scans)}."
+
     def get_url_from_yaml(self) -> str:
         """Retrieves the data URL/path from the YAML config file."""
         # This method is primarily for scroll/segment types, not direct Zarr paths
@@ -570,7 +604,8 @@ class Volume:
                 url = res_data.get("volume")
                 if url is None:
                     raise ValueError(
-                        f"URL not found in config for scroll={self.scroll_id}, energy={self.energy}, resolution={self.resolution}")
+                        f"URL not found in config for scroll={self.scroll_id}, energy={self.energy}, resolution={self.resolution}"
+                        + self._catalog_hint())
             elif self.type == 'segment':
                 url = res_data.get("segments", {}).get(str(self.segment_id))
                 if url is None:
@@ -591,6 +626,35 @@ class Volume:
             print(f"Error reading or parsing config file {self.configs}: {e}")
             raise
 
+    def __repr__(self) -> str:
+        what = {"scroll": f"scroll {self.scroll_id}", "segment": f"segment {self.segment_id}"}.get(
+            self.type, self.type)
+        scan = ", ".join(p for p in (f"{self.energy} keV" if getattr(self, "energy", None) else "",
+                                     f"{self.resolution} um" if getattr(self, "resolution", None) else "") if p)
+        try:
+            levels = f"{self._num_levels()} level(s), level 0 {self.shape(0)} {self._level(0).dtype}"
+        except Exception as exc:  # repr must not raise; say what could not be read
+            levels = f"levels unreadable ({type(exc).__name__})"
+        return f"<Volume {what}{', ' + scan if scan else ''}: {levels}; {getattr(self, 'url', None)}>"
+
+    def preview(self, axis: str = "z", at=None, crop: Optional[str] = None, level: Optional[int] = None,
+                max_size: int = 1024, **options):
+        """A slice of the volume as a PIL image, which Jupyter shows inline.
+
+        ``at`` is a voxel index or a fraction such as ``0.3`` (default: the middle), ``crop`` is
+        ``"Z0:Z1,Y0:Y1,X0:X1"`` in full-resolution voxels, and ``options`` takes any other
+        ``vesuvius.preview`` option, for example ``views="zyx"`` or ``mip=True``. Only the
+        chunks drawn are read.
+        """
+        from vesuvius.tools import preview as pv
+
+        source = pv.Source(name=str(self.segment_id or self.scroll_id or self.url),
+                           levels=[self._level(i) for i in range(self._num_levels())])
+        args = pv.options(axis=axis, at=None if at is None else str(at), crop=crop, level=level,
+                          max_size=max_size, **options)
+        images = pv.make_images(args, [source])
+        return images[0] if len(images) == 1 else images
+
     def _num_levels(self) -> int:
         """Number of multiscale levels, memoized.
 
@@ -602,8 +666,33 @@ class Volume:
             return 1
         n = getattr(self, "_num_levels_memo", None)
         if n is None:
-            n = self._num_levels_memo = len(self.data)
+            if isinstance(self.data, zarr.Group):
+                n = len(self._group_level_keys())
+            else:
+                n = len(self.data)
+            self._num_levels_memo = n
         return n
+
+    def _group_level_keys(self) -> List[str]:
+        """Level array names of an OME-Zarr group, level 0 first.
+
+        Read from the multiscales metadata when the group has it: an HTTPS store
+        such as the open-data S3 bucket cannot list its members, so a group opened
+        from it looks empty to ``keys()``. Groups without that metadata fall back to
+        listing their arrays.
+        """
+        keys = getattr(self, "_level_keys_memo", None)
+        if keys is not None:
+            return keys
+        attrs = self.data.attrs.asdict() if hasattr(self.data.attrs, "asdict") else dict(self.data.attrs)
+        multiscales = attrs.get("multiscales") or attrs.get("ome", {}).get("multiscales")
+        if multiscales:
+            keys = [str(d["path"]) for d in multiscales[0].get("datasets", [])]
+        else:
+            keys = [k for k in self.data.keys() if isinstance(self.data[k], zarr.Array)]
+            keys.sort(key=lambda k: (not k.isdigit(), int(k) if k.isdigit() else 0, k))
+        self._level_keys_memo = keys
+        return keys
 
     def _level(self, idx: int = 0):
         """Return multiscale level ``idx`` of ``self.data``.

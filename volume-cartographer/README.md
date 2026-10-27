@@ -132,6 +132,12 @@ After dependencies are installed, rebuilds can use:
 scripts/build_macos.sh
 ```
 
+To build one tool, or to pass CMake options such as the unit tests:
+
+```bash
+scripts/build_macos.sh --target vc_render_tifxyz -- -DVC_TESTING=ON
+```
+
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)
@@ -374,7 +380,7 @@ _Keybinds:_
 
 **Segmentation**
 
-_Primary entry point for interacting with the segmentation, more info in the [segmentation docs](docs/segmentation.md)_
+_Primary entry point for interacting with the segmentation, more info in [extending and modifying segmentations](docs/extending_and_modifying_segmentations.md)_
  
 <img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
 

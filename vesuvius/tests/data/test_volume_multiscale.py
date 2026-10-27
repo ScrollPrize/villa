@@ -57,3 +57,42 @@ def test_volume_level_accessors_memoize(multiscale_zarr2_group):
     vol = Volume(type="zarr", path=multiscale_zarr2_group, format="zarr", normalization_scheme="none")
     assert vol._level(0) is vol._level(0)
     assert vol._num_levels() == vol._num_levels()
+
+
+class _UnlistableGroup:
+    """A group whose store cannot list members, like an OME-Zarr read over HTTPS."""
+
+    def __init__(self, attrs):
+        self.attrs = attrs
+
+    def keys(self):
+        return iter(())
+
+
+def test_group_levels_come_from_multiscales_when_the_store_cannot_list():
+    from vesuvius.data.volume import Volume
+
+    vol = Volume.__new__(Volume)
+    vol.data = _UnlistableGroup({"multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}, {"path": "2"}]}]})
+    assert vol._group_level_keys() == ["0", "1", "2"]
+
+
+def test_group_levels_fall_back_to_listing_arrays(multiscale_zarr2_group):
+    from vesuvius.data.volume import Volume
+
+    vol = Volume.__new__(Volume)
+    group = zarr.open_group(multiscale_zarr2_group, mode="r")
+    vol.data = _NoMetadata(group)
+    assert vol._group_level_keys() == ["0", "1"]
+
+
+class _NoMetadata:
+    def __init__(self, group):
+        self._group = group
+        self.attrs = {}
+
+    def keys(self):
+        return self._group.keys()
+
+    def __getitem__(self, key):
+        return self._group[key]
