@@ -1324,7 +1324,9 @@ class BaseTrainer:
         steps_per_epoch = getattr(self, '_steps_per_epoch', None)
         max_steps = self.mgr.max_epoch
         if is_per_iteration and steps_per_epoch:
-            max_steps = self.mgr.max_epoch * steps_per_epoch
+            accumulation = getattr(self.mgr, 'gradient_accumulation', 1)
+            optimizer_steps_per_epoch = (steps_per_epoch + accumulation - 1) // accumulation
+            max_steps = self.mgr.max_epoch * optimizer_steps_per_epoch
 
         scheduler = get_scheduler(
             scheduler_type=scheduler_type,
