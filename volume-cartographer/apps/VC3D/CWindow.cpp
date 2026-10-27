@@ -159,7 +159,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
-#include "ObjectStoreAttachments.hpp"
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -2912,7 +2912,7 @@ void CWindow::loadLasagnaResults(Surface* surface)
     if (surface && _surfaceCatalog && _surfaceCatalog->attachment()) {
         try {
             auto& session = *_surfaceCatalog->session();
-            corr = vc3d::store::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+            corr = vc::objects::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
                                                  LasagnaServiceManager::kCorrResultsRole);
         } catch (const std::exception& error) {
             qWarning() << "Cannot read Lasagna results for" << QString::fromStdString(surface->id) << error.what();
