@@ -122,7 +122,7 @@ int main()
         require(vol1 && vol1->longId == "vol1-long" && vol1->scanId == "scan-a", "volume identity");
         require(vol1->pixelSizeUm == 7.91 && vol1->energyKeV == 88.0 && vol1->detectorDistanceMm == 12.5, "volume physics");
         require(vol1->shapeZYX == std::array<std::size_t, 3>{100, 200, 300} && vol1->dataFormat == "uint8", "volume shape");
-        require(vol1->zDirectionIsTopToBottom == true && vol1->leftHandedCoordinates == false &&
+        require(vol1->orientation.zTopToBottom == true && vol1->orientation.leftHandedCoordinates == false &&
                     vol1->textSide == "recto",
                 "orientation");
         require(vol1->supersededBy && vol1->supersededBy->volumeId == "vol3" && vol1->supersededBy->reason == "rescan",

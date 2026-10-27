@@ -339,8 +339,7 @@ OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
     volume.detectorDistanceMm = numberValue(p, "detector_distance_mm");
     volume.dataFormat = stringValue(p, "data_format").value_or("");
     volume.shapeZYX = shapeValue(p);
-    volume.zDirectionIsTopToBottom = boolValue(p, "z_direction_is_top_to_bottom");
-    volume.leftHandedCoordinates = boolValue(p, "left_handed_coordinates");
+    volume.orientation = {boolValue(p, "z_direction_is_top_to_bottom"), boolValue(p, "left_handed_coordinates")};
     volume.textSide = stringValue(p, "text_side").value_or("");
     if (const auto superseded = objectOrEmpty(p, "superseded_by"); auto target = stringValue(superseded, "volume_id"))
         volume.supersededBy = OpenDataSupersession{*target, stringValue(superseded, "date").value_or(""),

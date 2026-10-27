@@ -147,15 +147,21 @@ struct OpenDataLicense {
     std::string url;
 };
 
+// properties.z_direction_is_top_to_bottom / left_handed_coordinates: how the
+// volume's axes lie against the scroll (slice z = 0 is the top; the xy plane
+// is mirrored). Unset where the catalog does not say.
+struct OpenDataOrientation {
+    std::optional<bool> zTopToBottom;
+    std::optional<bool> leftHandedCoordinates;
+};
+
 struct OpenDataVolume {
     std::string id;
     std::string longId;
     std::string scanId;
     std::string suffix;
     OpenDataCreation creation;
-    // Orientation of the volume's axes against the scroll.
-    std::optional<bool> zDirectionIsTopToBottom;
-    std::optional<bool> leftHandedCoordinates;
+    OpenDataOrientation orientation;
     std::string textSide;
     std::optional<OpenDataSupersession> supersededBy;
     std::optional<OpenDataLicense> license;
