@@ -120,6 +120,8 @@ Render one of them with the steps above and compare the prediction with the publ
 
 A quicker visual check is PHerc1667 `w018`: it should show rows of letters in the forward direction and noise in reverse. It is part of the training labels, so it confirms orientation and scale, not generalisation. If either check fails, look at `--flip` and the mesh frame level before you scan new surfaces.
 
+**On 9.36 µm scans, expect lower sensitivity.** On the same held-out regions re-registered onto their 9.362 µm scans, the `ink_9um` ensemble's mean AUROC drops from 0.900 (2.4 µm level 2) to 0.854. A single model on a streamed render drops from 0.884 to 0.800. Real 9 µm text is faint, and blob or seam artifacts often cover more area. So a ranking by predicted ink area can put text below artifacts. Where a 2.4 µm scan exists, prefer it. On 9 µm-only scrolls, run the full ensemble before you call a region empty, and treat it as "screened" rather than "no text". The mac-first-letters repo's `bench/RESULTS9.md` has the numbers.
+
 ## 6. Spiral fitting
 
 `spiral-fitting` runs track-based fits on MPS with `FIT_SPIRAL_DEVICE=mps`. On a 1000-slice PHerc0846A band with 144k tracks, an M5 Pro reaches about 1.1 it/s (0.6 it/s while sharing the machine with other jobs). The same fit on CPU does 0.47 it/s. This needs the MPS fixes in ScrollPrize/villa PR "spiral-fitting: make weighted track sampling work on MPS". The fit holds about 4.5 GB between steps and peaks around 10 GB.
