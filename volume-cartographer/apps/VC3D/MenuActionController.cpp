@@ -589,9 +589,9 @@ void MenuActionController::showOpenDataCatalog()
             const auto report = vc::objects::refreshCatalog(*state.objectStoreSession(),
                                                             state.catalogAttachment(sample), sample);
             QApplication::restoreOverrideCursor();
-            return tr("%1: %2 surfaces, %3 new, %4 updated, %5 refetched.")
+            return tr("%1: %2 surfaces, %3 new, %4 updated, %5 refetched, %6 locally edited surfaces preserved.")
                 .arg(QString::fromStdString(sample.id)).arg(report.surfaces).arg(report.added)
-                .arg(report.updated).arg(report.stale);
+                .arg(report.updated).arg(report.stale).arg(report.preserved);
         } catch (const std::exception& e) {
             QApplication::restoreOverrideCursor();
             return tr("Refreshing %1 failed: %2").arg(QString::fromStdString(sample.id), QString::fromUtf8(e.what()));
@@ -1503,9 +1503,9 @@ void MenuActionController::beginRotateSurfaceTransform()
                                  QObject::tr("Select a segmentation surface before rotating."));
         return;
     }
-    // A catalog surface is rotated in the user's store.
+    // Rotation saves back to the store the surface was opened from.
     QString error;
-    if (_window->_surfacePanel && !_window->_surfacePanel->editInUserStore(activeSurface->id, &error)) {
+    if (_window->_surfacePanel && !_window->_surfacePanel->prepareSurfaceEditing(activeSurface->id, &error)) {
         QMessageBox::information(_window, QObject::tr("Rotate Surface"), error);
         return;
     }

@@ -452,7 +452,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_catalog_samples` | `catalog.list_samples` | List samples available to open from the Open Data catalog; use this for discovery when no volume package is loaded. |
 | `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package and the active workspace's selection. |
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
-| `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and read-only catalog stores) by UUID, with name, tags and active/catalog/bound flags. |
+| `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and Open Data sample stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |

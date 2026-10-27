@@ -3025,9 +3025,9 @@ void CWindow::CreateWidgets(void)
         _segmentationWidget->isEditingEnabled(),
         this);
     _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
-        // A catalog surface is edited in the user's store.
+        // Continue editing in the store the surface was opened from.
         QString error;
-        if (surface && _surfacePanel && !_surfacePanel->editInUserStore(surface->id, &error)) {
+        if (surface && _surfacePanel && !_surfacePanel->prepareSurfaceEditing(surface->id, &error)) {
             showStatusBarMessage(error, 15000);
             return false;
         }

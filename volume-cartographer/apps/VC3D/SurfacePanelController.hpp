@@ -119,12 +119,10 @@ public:
     // session is active on the connected service.
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
 
-    // Editing a catalog surface edits it in the user's store: the opened catalog
-    // surface is imported there (SurfaceCatalog::importCatalogSurface) and
-    // continues from there. True when `id` can be edited (also for the user's
-    // surfaces); false with a reason otherwise.
-    bool editInUserStore(const std::string& id, QString* errorMessage = nullptr);
-    // Make object revision `revision` of a surface of the user's store its
+    // Validate that the opened current revision can be edited in its own store,
+    // including an Open Data sample store; never import it into another store.
+    bool prepareSurfaceEditing(const std::string& id, QString* errorMessage = nullptr);
+    // Make object revision `revision` of a surface in a writable store its
     // current one (a new revision with its content); the open surface reopens
     // from the commit. False with a reason when it cannot.
     bool restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage = nullptr);

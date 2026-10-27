@@ -5,6 +5,7 @@
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/objects/CatalogStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -178,7 +179,7 @@ int main() try
     const auto catalog = attachCatalog(session, sample, cache, {}, std::nullopt, &report);
     require(report.added == 2 && report.surfaces == 2, "placeholders for every catalog surface");
     require(session.path(catalog) == catalogSampleStorePath(cache, "sample"), "store path");
-    require(!session.writable(catalog), "callers see the catalog read-only");
+    require(session.writable(catalog), "the sample store accepts local edits without another store");
     require(attachCatalog(session, sample, cache) == catalog, "an attached sample store is reused");
 
     // Placeholder metadata comes from the catalog, never the published meta.json.
@@ -289,6 +290,31 @@ int main() try
         require(nlohmann::json::parse(db.currentGeometry(txn, uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
                 "user store untouched by refresh");
     });
+    // Editing the fetched sample itself survives refresh and reopening.
+    session.editCurrent(catalog, {uuid}, [&](auto& db, auto& txn, const auto& id) {
+        auto geometry = db.currentGeometry(txn, id);
+        const auto view = GeometrySnapshot(db, txn).viewStored(id);
+        db.editGeometry(txn, id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), geometry->uuid);
+    });
+    std::string editedGeometry;
+    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
+        editedGeometry = db.currentGeometry(txn, uuid)->uuid;
+    });
+    const auto kept = refreshCatalog(session, catalog, sample);
+    require(kept.preserved == 1 && kept.stale == 0, "refresh preserves locally edited geometry");
+    session.detach(catalog);
+    const auto reopened = attachCatalog(session, sample, cache);
+    session.read(reopened, [&](const auto& db, const auto& txn, const auto&) {
+        require(db.currentGeometry(txn, uuid)->uuid == editedGeometry, "edits survive reopening the sample");
+        require(GeometrySnapshot(db, txn).surface(uuid).vertex(0, 0) == vc::geometry::SurfacePoint{42, 43, 44},
+                "saved coordinates survive refresh and reopening");
+    });
+    session.detach(reopened);
+    OpenOptions readOnly;
+    readOnly.readOnly = true;
+    const auto viewed = attachCatalog(session, sample, cache, readOnly);
+    require(!session.writable(viewed), "explicit read-only sample attachments remain read-only");
+    mustFail([&] { session.editRecords(viewed, {uuid}, [](auto& r) { r.name = "forbidden"; }); });
     std::cout << "ok\n";
     return 0;
 } catch (const std::exception& error) {

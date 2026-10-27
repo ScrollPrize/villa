@@ -400,8 +400,8 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         targets << segmentId;
     }
 
-    // Edits need a writable store; catalog surfaces are read-only. In-app edits
-    // read a bound surface through its view; external tools read stored
+    // These tool actions target the user's store. Interactive editing also
+    // supports sample stores through their views; external tools read stored
     // coordinates, so they take user surfaces stored in this volume's voxels.
     const bool storeWritable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
     const bool writable = storeWritable &&
@@ -678,7 +678,7 @@ void SurfacePanelController::showHistory(const std::string& id)
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
     auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
     auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
-    restore->setEnabled(!row->catalog && _catalog->session()->writable(attachment));
+    restore->setEnabled(_catalog->session()->writable(attachment));
     auto selected = [list]() {
         const auto* item = list->currentItem();
         return item ? item->data(0, Qt::UserRole).toString().toStdString() : std::string();
@@ -716,10 +716,10 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
 {
     try {
         const auto* row = _catalog->row(id);
-        if (!row || row->catalog || !_catalog->attachment()) {
-            throw std::runtime_error("Only surfaces of your object store can be restored");
+        if (!row || !_catalog->session()->writable(row->source)) {
+            throw std::runtime_error("The surface requires a writable object store to restore a revision");
         }
-        const auto attachment = *_catalog->attachment();
+        const auto attachment = row->source;
         std::optional<std::string> head;
         _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
             if (const auto current = db.currentObjectRevision(txn, id)) head = current->uuid;
@@ -752,12 +752,8 @@ bool SurfacePanelController::resetToCatalogVersion(const std::string& id, QStrin
     return true;
 }
 
-bool SurfacePanelController::editInUserStore(const std::string& id, QString* errorMessage)
+bool SurfacePanelController::prepareSurfaceEditing(const std::string& id, QString* errorMessage)
 {
-    const auto* row = _catalog->row(id);
-    if (!row || !row->catalog) {
-        return true;
-    }
     auto fail = [&](const QString& message) {
         if (errorMessage) *errorMessage = message;
         return false;
@@ -765,14 +761,9 @@ bool SurfacePanelController::editInUserStore(const std::string& id, QString* err
     if (!_opened || _opened->surface->id != id || !_opened->current) {
         return fail(tr("Open the surface's current version to edit it"));
     }
-    try {
-        // The same geometry through your store: the surface on screen continues.
-        _opened = _catalog->importCatalogSurface(*_opened);
-    } catch (const std::exception& error) {
-        return fail(tr("Cannot edit %1 in your object store: %2")
-                        .arg(QString::fromStdString(id), QString::fromUtf8(error.what())));
+    if (!_opened->editable || !_catalog->session()->writable(_opened->pin.attachment)) {
+        return fail(tr("The surface's object store is attached read-only"));
     }
-    updateTagCheckboxStates(_catalog->row(id));
     return true;
 }
 

@@ -1,6 +1,6 @@
 #pragma once
 // The surfaces of the current volume in the user's object store and in
-// read-only catalog stores (Open Data samples): one row per surface record,
+// catalog stores (Open Data samples): one row per surface record,
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
 // viewed or edited. Surfaces are identified by their store UUID and read in the
@@ -45,7 +45,7 @@ public:
         // Stored coordinates to the open volume's voxels; nullopt when the store
         // cannot map the surface into the volume.
         std::optional<vc::objects::VolumeAffine> mapping;
-        // The store it is in; catalog rows are read-only.
+        // The store it is in; catalog rows retain their sample store.
         vc::objects::AttachmentIdentity source;
         bool catalog = false;
         // A catalog surface imported into the user's store: its first revision
@@ -75,7 +75,7 @@ public:
 
     // List the surfaces of `volume` in `attachment` (nothing without both).
     void setSource(const std::optional<vc::objects::AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume);
-    // Also list these read-only catalog stores (while a volume is open).
+    // Also list these catalog stores (while a volume is open).
     void setCatalogSources(std::vector<vc::objects::AttachmentIdentity> sources);
     // The user's store (when attached) then the catalog stores: the order in
     // which the session reads a surface held by several (imported ones).

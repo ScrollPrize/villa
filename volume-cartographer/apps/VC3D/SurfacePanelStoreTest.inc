@@ -1,4 +1,6 @@
 #include <QApplication>
+#include "segmentation/SegmentationModule.hpp"
+#include "segmentation/SurfaceStoreEdit.hpp"
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QThread>
@@ -14,7 +16,7 @@
 // listing, filters, tags, activation and deletion through commit events; a
 // fetched catalog store (as an Open Data sample's) of a volume the open one
 // shows at pyramid level 1, listed beside it, fetched on activation and edited
-// in the user's store as the same surface.
+// directly in the sample store without a user store.
 int runSurfacePanelStoreTests()
 {
     using namespace vc::objects;
@@ -31,7 +33,7 @@ int runSurfacePanelStoreTests()
 
         CState state;
         state.attachObjectStore(QString::fromStdString(path.string()), "surface-panel-test");
-        const auto attachment = *state.objectStoreAttachment();
+        auto attachment = *state.objectStoreAttachment();
         cv::Mat_<cv::Vec3f> points(3, 3);
         for (int r = 0; r < 3; ++r)
             for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 2.f};
@@ -159,23 +161,62 @@ int runSurfacePanelStoreTests()
 
         require(panel.activateSurfaceById(shown, &error), "catalog surfaces open");
         require((*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "in the open volume's voxels");
-        require(!panel.opened()->editable, "catalog surfaces are read-only");
+        require(panel.opened()->editable, "catalog surfaces are directly editable");
         require(panel.activateSurfaceById(remote, &error) && fetchedNow() == std::vector<std::string>{remote},
                 "a remote catalog surface is fetched when activated headlessly");
 
-        // Editing a catalog surface edits it in the user's store as the same
-        // surface. The user's store relates the two volumes as the catalog does
-        // (VC3D gives every attachment the catalog's registrations).
+        // With only the sample store listed, enabling segmentation editing and
+        // saving must use that same store and preserve the view's scale.
+        state.detachObjectStore();
+        require(!state.objectStoreAttachment(), "no separate object store is attached");
+        catalog.setSource(std::nullopt, volume);
+        pump([&] { return tree.topLevelItemCount() == 2; }, "the sample is usable without a user store");
+        require(panel.activateSurfaceById(shown, &error), "the catalog surface opens without a user store");
+        const auto onScreen = panel.opened()->surface;
+        const auto publishedRevision = panel.opened()->pin.objectRevision;
+        require(panel.prepareSurfaceEditing(shown, &error) && panel.opened()->editable &&
+                    panel.opened()->pin.attachment == catalogAttachment && panel.opened()->surface == onScreen,
+                "editing keeps the sample's store and the surface on screen");
+        {
+            SegmentationEditManager edits;
+            SegmentationModule module(nullptr, &edits, nullptr, nullptr, &state, nullptr, false);
+            module.setEditingDestinationResolver([&](const auto& surface) {
+                return panel.prepareSurfaceEditing(surface->id, &error);
+            });
+            module.setStorePinResolver([&](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {
+                if (panel.opened() && panel.opened()->editable && panel.opened()->surface->id == surface->id)
+                    return SegmentationModule::StoreOrigin{panel.opened()->pin, panel.opened()->view};
+                return std::nullopt;
+            });
+            state.setSurface("segmentation", onScreen, false, false);
+            module.setEditingEnabled(true);
+            require(module.beginEditingSession(onScreen) && module.editingEnabled() && module.hasActiveSession(),
+                    "segmentation editing starts directly on a sample surface");
+            (*onScreen->rawPointsPtr())(1, 2) = {3, 4, 5};
+            require(module.saveSurface(onScreen.get()), "segmentation edits save to the sample store");
+            module.setEditingEnabled(false);
+            module.endEditingSession();
+        }
+        require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(3, 4, 5),
+                "reopening the sample surface retains the edit in volume coordinates");
+        require(panel.restoreRevision(shown, publishedRevision, &error), "sample surfaces can restore their history");
+        require((*catalog.open(shown).surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1),
+                "restoring history recovers the published geometry");
+
+        // Explicit imports remain available; they are not required for editing.
+        state.attachObjectStore(QString::fromStdString(path.string()), "surface-panel-test");
+        attachment = *state.objectStoreAttachment();
+        catalog.setSource(attachment, volume);
+        pump([&] { return tree.topLevelItemCount() == 4; }, "user surfaces can still be listed alongside the sample");
         vc::objects::registerVolumeTransform(*state.objectStoreSession(), attachment, "catalog-volume", "panel-volume",
                                              vc::objects::VolumeAffine::scale(0.5), "pyramid level 1");
-        require(panel.activateSurfaceById(shown, &error), "the catalog surface opens");
-        const auto onScreen = panel.opened()->surface;
-        require(panel.editInUserStore(shown, &error) && panel.opened()->editable &&
-                    panel.opened()->pin.attachment == attachment && panel.opened()->surface == onScreen,
-                "editing a catalog surface continues it, on screen, in the user's store");
+        require(panel.activateSurfaceById(shown, &error), "the catalog surface reopens");
+        const auto imported = catalog.importCatalogSurface(*panel.opened());
+        require(imported.editable && imported.pin.attachment == attachment,
+                "an explicit import still uses the user's store");
         require(!catalog.row(shown)->catalog && catalog.row(shown)->imported() &&
                     catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5),
-                "its row is the user's, as stored, with the catalog version as its original");
+                "an explicit import is listed from the user's store");
         require(tree.topLevelItemCount() == 4, "it is listed once");
         std::string catalogVersion;
         state.objectStoreSession()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {

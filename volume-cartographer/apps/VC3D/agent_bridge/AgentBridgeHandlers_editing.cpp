@@ -341,10 +341,10 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         throw AgentBridgeError{-32007, "No active segmentation surface", data};
     }
 
-    // A catalog surface is edited in the user's store.
+    // Continue editing in the store the surface was opened from.
     QString importError;
     if (enabled && _window->_surfacePanel &&
-        !_window->_surfacePanel->editInUserStore(state->activeSurfaceId(), &importError)) {
+        !_window->_surfacePanel->prepareSurfaceEditing(state->activeSurfaceId(), &importError)) {
         QJsonObject data;
         data["kind"] = "segment";
         data["id"] = QString::fromStdString(state->activeSurfaceId());

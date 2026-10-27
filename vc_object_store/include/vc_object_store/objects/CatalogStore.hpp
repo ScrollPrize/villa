@@ -47,11 +47,12 @@ struct CatalogStoreReport {
     int added = 0;     // placeholders created
     int updated = 0;   // records whose catalog metadata changed (refresh only)
     int stale = 0;     // fetched surfaces whose published geometry changed; fetched again
+    int preserved = 0; // locally edited surfaces left untouched by refresh
 };
 
 // The sample's store, created on first use at catalogSampleStorePath(cacheRoot,
 // sample.id) and attached to `session` (ObjectStoreSession::attachFetched;
-// callers see it read-only), with placeholders for the selected segments'
+// writable unless options.readOnly), with placeholders for the selected segments'
 // surfaces (all when nullopt; an attached store gains newly selected ones).
 AttachmentIdentity attachCatalog(ObjectStoreSession&, const vcr::catalog::OpenDataSample&,
                                  const std::filesystem::path& cacheRoot, const OpenOptions& = {},
@@ -60,7 +61,8 @@ AttachmentIdentity attachCatalog(ObjectStoreSession&, const vcr::catalog::OpenDa
 // Re-read the published catalog into an attached sample store: placeholder
 // metadata follows it, new surfaces are added, and fetched surfaces whose
 // published tifxyz changed are fetched again as a new revision. Only when
-// asked ("Refresh from Open Data"); user stores are untouched.
+// asked ("Refresh from Open Data"); locally edited geometry and user stores
+// are untouched.
 CatalogStoreReport refreshCatalog(ObjectStoreSession&, const AttachmentIdentity&, const vcr::catalog::OpenDataSample&,
                                   const std::optional<std::vector<std::string>>& segmentIds = std::nullopt);
 // A published file of a catalog surface (CatalogReference::files) in its

@@ -136,7 +136,8 @@ public:
     // cannot. Runs on the attachment's fetch thread; must only read `store`.
     using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
     // A store whose objects without geometry are published elsewhere (e.g. an
-    // Open Data sample, objects/CatalogStore.hpp). Callers see it read-only.
+    // Open Data sample, objects/CatalogStore.hpp). Local edits are allowed
+    // unless options.readOnly is set; fetching remains available in either mode.
     // Geometry regions and nearest-surface queries that reach such an object
     // queue its fetch (then the Committed write).
     AttachmentIdentity attachFetched(const std::filesystem::path&, const OpenOptions&, GeometryFetcher);

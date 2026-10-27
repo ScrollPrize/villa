@@ -759,7 +759,7 @@ void OpenDataCatalogWindow::buildUi()
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _refreshSampleButton = new QPushButton(tr("Refresh from Open Data"), this);
     _refreshSampleButton->setToolTip(tr("Re-read the published catalog into this sample's surface store: new and "
-                                        "republished surfaces. Your project's surfaces are untouched."));
+                                        "republished surfaces. Locally edited surfaces are preserved."));
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
     _createProjectButton = new QPushButton(tr("Create Project..."), this);
     _createProjectButton->setToolTip(tr("Choose resources for a new project"));

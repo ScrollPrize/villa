@@ -64,10 +64,22 @@ ObjectRecord placeholder(const vcr::catalog::OpenDataSample& sample, const vcr::
     return record;
 }
 
+// Fetches record their geometry head separately from user revisions. Old stores
+// without this marker are conservatively preserved once geometry has a parent.
+bool locallyEdited(const ObjectRecord& record, const GeometryRevision& geometry)
+{
+    const auto meta = Json::parse(record.meta);
+    const auto baseline = meta.find("catalog_geometry_revision");
+    return baseline != meta.end() ? *baseline != geometry.uuid : geometry.parentUuid.has_value();
+}
+
 bool sameCatalogRecord(const ObjectRecord& a, const ObjectRecord& b)
 {
     const auto bounds = [](const ObjectRecord& r) { return r.surface ? r.surface->bbox : std::nullopt; };
-    return a.name == b.name && Json::parse(a.meta) == Json::parse(b.meta) && bounds(a) == bounds(b);
+    auto left = Json::parse(a.meta), right = Json::parse(b.meta);
+    left.erase("catalog_geometry_revision");
+    right.erase("catalog_geometry_revision");
+    return a.name == b.name && left == right && bounds(a) == bounds(b);
 }
 } // namespace
 
@@ -124,8 +136,17 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
                 changed.push_back(std::move(record));
                 continue;
             }
-            if (!refresh || sameCatalogRecord(*existing, record)) continue;
-            if (const auto geometry = db.currentGeometry(read, record.uuid)) {
+            if (!refresh) continue;
+            const auto geometry = db.currentGeometry(read, record.uuid);
+            if (geometry && locallyEdited(*existing, *geometry)) {
+                ++report.preserved;
+                continue;
+            }
+            if (sameCatalogRecord(*existing, record)) continue;
+            if (geometry) {
+                auto meta = Json::parse(record.meta);
+                meta["catalog_geometry_revision"] = geometry->uuid;
+                record.meta = meta.dump();
                 // The fetched grid stays; a changed published tifxyz is fetched again.
                 if (existing->surface) {
                     record.surface->gridWidth = existing->surface->gridWidth;
@@ -172,7 +193,11 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     {
         auto read = db.read();
         record = db.objectByUuid(read, uuid);
-        if (const auto current = db.currentGeometry(read, uuid)) geometry = current->uuid;
+        if (const auto current = db.currentGeometry(read, uuid)) {
+            // A local edit may have landed after refresh queued this fetch.
+            if (record && locallyEdited(*record, *current)) return;
+            geometry = current->uuid;
+        }
         if (const auto current = db.currentObjectRevision(read, uuid)) revision = current->uuid;
     }
     const auto reference = record ? catalogReference(*record) : std::nullopt;
@@ -199,7 +224,8 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
     // refresh) fails this write, and the next read fetches again.
     write({{uuid, revision}}, [&](ObjectStore& store, WriteTxn& txn) {
         store.upsertObject(txn, updated);
-        store.putGeometry(txn, uuid, prepared.geometry, geometry);
+        const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
+        store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());
     });
 }
 

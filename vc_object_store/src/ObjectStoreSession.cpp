@@ -296,7 +296,7 @@ AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path
     auto* requests = queue.get();
     opened.remoteGeometryReached = [requests](const std::vector<std::string>& uuids) { requests->request(uuids); };
     auto next = std::make_shared<Attachment>(ObjectStore::open(path, opened));
-    next->writable = false;  // callers read; fetched geometry is written by the session
+    next->writable = !options.readOnly;  // fetching and local edits share the writer lock
     {
         auto txn = next->store.read();
         next->identity.storeUuid = next->store.uuid(txn);

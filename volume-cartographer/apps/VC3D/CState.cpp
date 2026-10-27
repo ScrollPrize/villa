@@ -269,8 +269,13 @@ vc::objects::AttachmentIdentity CState::catalogAttachment(const vcr::catalog::Op
     if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(sample);
     const auto found = _catalogAttachments.find(sample.id);
     if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
-    const auto attachment = vc::objects::attachCatalog(*_objectStoreSession, sample, vc3d::remoteCachePathFs(),
-                                                       viewerOpenOptions());
+    auto options = viewerOpenOptions();
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto author = settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
+    if (author.isEmpty() || author == QStringLiteral("anon"))
+        author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
+    options.author = author.toStdString();
+    const auto attachment = vc::objects::attachCatalog(*_objectStoreSession, sample, vc3d::remoteCachePathFs(), options);
     _catalogAttachments[sample.id] = attachment;
     pollObjectStoreChanges();
     return attachment;
