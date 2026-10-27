@@ -15,7 +15,10 @@ The result is a plain dict, written under the ``isometry`` key of ``meta.json`` 
 
 This is the Python half of ScrollPrize/villa issue #2279; the C++ writers
 (``GrowPatch`` / ``GrowSurface``) are the schema authority, so the metric
-definitions here are stated explicitly and mirror the issue's specification.
+definitions here are stated explicitly and mirror the issue's specification —
+and the reference implementation the issue links to (``kit tifxyz isometry``
+from ChaseHendrick/Scrolls), which this module matches field for field on real
+segments.
 """
 
 from __future__ import annotations
@@ -118,7 +121,7 @@ def _triangle_stretch_terms(
 def _weighted_median(data: NDArray[np.float64], weights: NDArray[np.float64]) -> float:
     if data.size == 0 or weights.sum() <= 0:
         return 0.0
-    order = np.argsort(data)
+    order = np.argsort(data, kind="stable")
     acc = np.cumsum(weights[order])
     k = int(np.searchsorted(acc, 0.5 * weights.sum()))
     return float(data[order[min(k, len(order) - 1)]])
@@ -174,13 +177,16 @@ def compute_grid_isometry(
     -------
     dict
         ``version``, ``step_vx``, ``edges``, ``within_10pct``, ``within_25pct``,
-        ``median_abs_log_ratio``, ``area_ratio``, ``angle_deg`` (p5/p50/p95),
-        ``stretched_nodes``, ``stretched_area_vx2`` and flatboi's ``l2_mean`` /
+        ``median_abs_log_ratio``, ``area_ratio``, ``angle_deg`` (a ``[p5, p50, p95]``
+        list), ``stretched_nodes``, ``stretched_area_vx2`` and flatboi's ``l2_mean`` /
         ``l2_median`` / ``linf`` / ``area_error``.
 
         ``within_10pct`` / ``within_25pct`` are the share of edges whose length ratio
         to the promised step is in the multiplicative band ``[1/1.1, 1.1]`` /
         ``[1/1.25, 1.25]`` — the issue's "within a factor 1.1 / 1.25 of step".
+
+        ``stretched_area_vx2`` is ``stretched_nodes`` times the promised cell area
+        (``step_u * step_v``), the issue's "their area at one grid cell per node".
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -200,7 +206,7 @@ def compute_grid_isometry(
         "within_25pct": 0.0,
         "median_abs_log_ratio": 0.0,
         "area_ratio": 0.0,
-        "angle_deg": {"p5": 0.0, "p50": 0.0, "p95": 0.0},
+        "angle_deg": [0.0, 0.0, 0.0],
         "stretched_nodes": 0,
         "stretched_area_vx2": 0.0,
         "l2_mean": 0.0,
@@ -244,6 +250,11 @@ def compute_grid_isometry(
             touched[1:, :] |= bad
         stretched |= touched
     block["stretched_nodes"] = int((stretched & ok).sum())
+    # Issue #2279 defines this as "their area at one grid cell per node": the stretched
+    # node count times the promised cell area. Summing the 3D area of every cell a
+    # stretched node touches instead would over-count, since one node can touch four
+    # cells (the reference implementation, kit tifxyz isometry, uses the count form).
+    block["stretched_area_vx2"] = float(block["stretched_nodes"] * step_u * step_v)
 
     valid_cell = ok[:-1, :-1] & ok[1:, :-1] & ok[:-1, 1:] & ok[1:, 1:]
     n_cells = int(valid_cell.sum())
@@ -259,11 +270,6 @@ def compute_grid_isometry(
         if step_u and step_v:
             block["area_ratio"] = float(cell_area.sum() / (step_u * step_v * n_cells))
 
-        cell_stretched = (
-            stretched[:-1, :-1] | stretched[1:, :-1] | stretched[:-1, 1:] | stretched[1:, 1:]
-        )[valid_cell]
-        block["stretched_area_vx2"] = float(cell_area[cell_stretched].sum())
-
         # Grid angle at each cell's (r, c) corner, between its u and v edges.
         e_u = p10 - p00
         e_v = p01 - p00
@@ -272,11 +278,9 @@ def compute_grid_isometry(
         if good.any():
             cos = np.clip(np.einsum("ij,ij->i", e_u[good], e_v[good]) / denom[good], -1.0, 1.0)
             angle = np.degrees(np.arccos(cos))
-            block["angle_deg"] = {
-                "p5": float(np.quantile(angle, 0.05)),
-                "p50": float(np.quantile(angle, 0.50)),
-                "p95": float(np.quantile(angle, 0.95)),
-            }
+            # A [p5, p50, p95] list, the shape the reference (kit tifxyz isometry) and
+            # issue #2279's block use, so a stored block reads the same either way.
+            block["angle_deg"] = [float(v) for v in np.percentile(angle, (5.0, 50.0, 95.0))]
 
         # flatboi's stretch metrics over the two triangles of every valid cell.
         height, width = points.shape[:2]

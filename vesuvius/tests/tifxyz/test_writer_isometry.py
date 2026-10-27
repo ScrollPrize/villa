@@ -45,7 +45,8 @@ def test_exact_grid_is_isometric() -> None:
     assert block["stretched_nodes"] == 0
     assert block["stretched_area_vx2"] == 0.0
     assert math.isclose(block["area_ratio"], 1.0, rel_tol=1e-6)
-    assert math.isclose(block["angle_deg"]["p50"], 90.0, abs_tol=1e-4)
+    assert isinstance(block["angle_deg"], list) and len(block["angle_deg"]) == 3
+    assert math.isclose(block["angle_deg"][1], 90.0, abs_tol=1e-4)
     assert math.isclose(block["l2_mean"], 1.0, rel_tol=1e-6)
     assert math.isclose(block["linf"], 1.0, rel_tol=1e-6)
     assert block["area_error"] == pytest.approx(0.0, abs=1e-9)
@@ -60,9 +61,23 @@ def test_stretched_grid_is_flagged() -> None:
     assert block["within_25pct"] == 0.0
     assert math.isclose(block["median_abs_log_ratio"], math.log(1.6), rel_tol=1e-3)
     assert block["stretched_nodes"] == 20 * 24
+    # Issue #2279: stretched_area_vx2 is the node count times ONE promised cell area
+    # (5 * 5 = 25), not the 3D area of every cell a stretched node touches (which here
+    # would be 19 * 23 cells * 64 voxels^2). Pins the convention against the reference.
+    assert block["stretched_area_vx2"] == 20 * 24 * 25.0
     assert math.isclose(block["area_ratio"], (8.0 * 8.0) / (5.0 * 5.0), rel_tol=1e-3)
     assert math.isclose(block["l2_mean"], 1.6, rel_tol=1e-3)
     assert math.isclose(block["linf"], 1.6, rel_tol=1e-3)
+
+
+def test_stretched_area_counts_one_cell_per_node() -> None:
+    """One pulled-out node: the flagged area is the node count times ONE cell area,
+    not the summed 3D area of every cell that node and its neighbours touch."""
+    x, y, z = _flat_grid(5, 5, du=5.0, dv=5.0)
+    x[2, 2] += 10.0
+    block = compute_grid_isometry(x, y, z, scale=(0.2, 0.2))
+    assert block["stretched_nodes"] > 0
+    assert block["stretched_area_vx2"] == block["stretched_nodes"] * 5.0 * 5.0
 
 
 def test_invalid_sentinel_corner_is_skipped() -> None:
