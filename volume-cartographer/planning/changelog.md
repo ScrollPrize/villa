@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-10-27
+
+Removals (planning/cleanup_removals_plan.md):
+
+- ABF++ flattening is gone: vc_flatten, vc_render_tifxyz --flatten*, the VC3D
+  action and render option, flatten.abf / vc3d_flatten_abf, and libs/OpenABF.
+  SLIM and straighten stay.
+- vc_diffuse_winding (apps/diffusion) is gone; vc_gen_normalgrids uses
+  populate_normal_grid from vc_core's normalgridtools.
+- Removed CLIs: vc_cut_windings, vc_project_tifxyz, vc_render_video,
+  vc_rgb2tifxyz, vc_tifxyz_inp_mask, vc_tifxyz_mmap_prepare,
+  vc_tifxyz_selfcross, vc_tifxyz_trim, vc_tifxyz_winding, vc_tifxyz2rgb,
+  vc_transform_geom, vc_visualize, vc_zarr_download_bench,
+  vc_zarr_download_region, vc_zarr_recompress, vc_zarr_to_tiff. The packaged
+  CLI smoke step launches vc_tifxyz2obj.
+- Removed the synthetic event-cost / thread-sync calibration fitters,
+  vc_sync.py, scripts/evaluation and other one-off scripts; stale planning and
+  spec documents.
+- VC3D: the Fiber Slice workspace is gone (FiberSliceGeometry is now
+  FiberLineGeometry, vc3d::fiber_line); an unknown saved workspace id opens main.
+- VC3D: Ctrl+T direction hints are gone.
+- VC3D: seeding has no Point mode or ray cast; "Draw paths" is a toggle and
+  Analyze Paths is synchronous. seeding.preview_rays / seeding.cast_rays are gone.
+- VC3D: the Patch Tracer growth method is gone (a stored method 3 reads as
+  Tracer); GrowSurface always builds its own patch index.
+- VC3D, GrowPatch: the normal3d zarr / normal3dline constraint, its fit-quality
+  weighting, vc_ngrids --align-normals and the "Robust" preset are gone.
+  Rasterize references the current volume.
+- VC3D: the line brush (hold S) is gone.
+- VC3D, core: approval masks are gone (panel, B / N / Ctrl+B, auto-approval,
+  overlay, .griduv sidecar, resampling in flatboi / vc_obj2tifxyz). "Draw
+  mask" has its own radius (mask_brush_radius) in the segmentation header.
+- GrowPatch: cell_reopt_mode and the surface-SDT loss are gone.
+
 ## 2026-09-29
 
 - Add selective catalog project creation with initially unchecked resources,
