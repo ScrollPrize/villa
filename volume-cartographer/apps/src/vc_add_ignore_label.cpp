@@ -1244,50 +1244,6 @@ static SliceMaskPair detectIgnoreMasks(const cv::Mat1b& labelSlice,
     return result;
 }
 
-static cv::Mat1b detectInnerRegion(const cv::Mat1b& labelSlice,
-                                   int nAngleBins,
-                                   double shrinkFactor,
-                                   int smoothingWindow,
-                                   bool useFastAtan2,
-                                   bool useSquaredDist,
-                                   AlgoMode algoMode)
-{
-    return detectIgnoreMasks(labelSlice,
-                             nAngleBins,
-                             kDefaultAlpha,
-                             kDefaultOuterSmoothing,
-                             shrinkFactor,
-                             smoothingWindow,
-                             false,
-                             true,
-                             useFastAtan2,
-                             useSquaredDist,
-                             algoMode)
-        .inner;
-}
-
-static cv::Mat1b detectOuterRegion(const cv::Mat1b& labelSlice,
-                                   int nAngleBins,
-                                   double alpha,
-                                   int smoothingWindow,
-                                   bool useFastAtan2,
-                                   bool useSquaredDist,
-                                   AlgoMode algoMode)
-{
-    return detectIgnoreMasks(labelSlice,
-                             nAngleBins,
-                             alpha,
-                             smoothingWindow,
-                             kDefaultShrink,
-                             kDefaultInnerSmoothing,
-                             true,
-                             false,
-                             useFastAtan2,
-                             useSquaredDist,
-                             algoMode)
-        .outer;
-}
-
 static cv::Mat1b upscaleMaskNearest(const cv::Mat1b& mask, int outH, int outW)
 {
     if (mask.rows == outH && mask.cols == outW) {

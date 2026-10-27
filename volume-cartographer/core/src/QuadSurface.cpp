@@ -420,66 +420,6 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
     return result;
 }
 
-cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
-    const cv::Mat_<cv::Vec3f>& points,
-    const cv::Size& newSize)
-{
-    cv::Mat_<cv::Vec3f> resampled(newSize.height, newSize.width,
-                                  cv::Vec3f(-1.0f, -1.0f, -1.0f));
-    if (points.empty()) {
-        return resampled;
-    }
-
-    const float xScale = static_cast<float>(points.cols) / static_cast<float>(newSize.width);
-    const float yScale = static_cast<float>(points.rows) / static_cast<float>(newSize.height);
-
-    // The source-x sample (x0,x1,fx) depends only on dstX, not dstY, so compute
-    // it once per column instead of once per pixel. Bit-identical to the
-    // per-pixel form (same float ops, same order); filled single-threaded before
-    // the parallel row loop, which then only reads these shared arrays.
-    std::vector<int> x0v(newSize.width), x1v(newSize.width);
-    std::vector<float> fxv(newSize.width);
-    for (int dstX = 0; dstX < newSize.width; ++dstX) {
-        float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
-        srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
-        const int x0 = static_cast<int>(std::floor(srcX));
-        x0v[dstX] = x0;
-        x1v[dstX] = std::min(x0 + 1, points.cols - 1);
-        fxv[dstX] = srcX - static_cast<float>(x0);
-    }
-
-    #pragma omp parallel for schedule(static)
-    for (int dstY = 0; dstY < newSize.height; ++dstY) {
-        float srcY = (static_cast<float>(dstY) + 0.5f) * yScale - 0.5f;
-        srcY = std::clamp(srcY, 0.0f, static_cast<float>(points.rows - 1));
-        const int y0 = static_cast<int>(std::floor(srcY));
-        const int y1 = std::min(y0 + 1, points.rows - 1);
-        const float fy = srcY - static_cast<float>(y0);
-        cv::Vec3f* dstRow = resampled[dstY];
-
-        for (int dstX = 0; dstX < newSize.width; ++dstX) {
-            const int x0 = x0v[dstX];
-            const int x1 = x1v[dstX];
-            const float fx = fxv[dstX];
-
-            const cv::Vec3f& p00 = points(y0, x0);
-            const cv::Vec3f& p01 = points(y0, x1);
-            const cv::Vec3f& p10 = points(y1, x0);
-            const cv::Vec3f& p11 = points(y1, x1);
-            if (!isValidPointSample(p00) || !isValidPointSample(p01)
-                || !isValidPointSample(p10) || !isValidPointSample(p11)) {
-                continue;
-            }
-
-            const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
-            const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
-            dstRow[dstX] = top * (1.0f - fy) + bottom * fy;
-        }
-    }
-
-    return resampled;
-}
-
 cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
     const cv::Mat_<cv::Vec3f>& points,
     const cv::Mat& srcToDst,

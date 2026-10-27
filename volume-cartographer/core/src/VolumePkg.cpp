@@ -190,16 +190,6 @@ std::string validateRemoteVolumeLocation(
     return {};
 }
 
-std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string_view prefix)
-{
-    for (const auto& tag : tags) {
-        if (tag.rfind(prefix, 0) == 0) {
-            return tag.substr(prefix.size());
-        }
-    }
-    return {};
-}
-
 // Note that this deliberately disagrees with sameAttachmentLocation() for
 // remote locators: two selector-free locators are deduped there when they
 // resolve to the same source URL, and kept distinct here unless the strings

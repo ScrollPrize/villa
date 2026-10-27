@@ -69,23 +69,6 @@ static cv::Rect scaled_rect_trunc(const cv::Rect& rect, float scale)
     };
 }
 
-static cv::Rect valid_points_bounds(const cv::Mat_<cv::Vec3d>& points)
-{
-    cv::Rect bounds;
-    bool have_valid = false;
-    for (int y = 0; y < points.rows; ++y) {
-        for (int x = 0; x < points.cols; ++x) {
-            if (points(y, x)[0] == -1) {
-                continue;
-            }
-            const cv::Rect cell(x, y, 1, 1);
-            bounds = have_valid ? (bounds | cell) : cell;
-            have_valid = true;
-        }
-    }
-    return bounds;
-}
-
 static std::string surface_name(const QuadSurface* surf)
 {
     if (!surf)
@@ -369,32 +352,6 @@ static int remove_components_disconnected_from_seed(SurfTrackerData& data,
                   << " points disconnected from seed " << seed << std::endl;
     }
     return removed;
-}
-
-static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surface_patch_index,
-                                                       const cv::Vec3d& coord,
-                                                       QuadSurface* exclude = nullptr)
-{
-    std::set<QuadSurface*> candidates;
-    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
-        return candidates;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = {
-        static_cast<float>(coord[0]),
-        static_cast<float>(coord[1]),
-        static_cast<float>(coord[2])
-    };
-    query.tolerance = same_surface_th;
-
-    for (const auto& surface : surface_patch_index->locateSurfaces(query)) {
-        QuadSurface* raw = surface.get();
-        if (raw && raw != exclude) {
-            candidates.insert(raw);
-        }
-    }
-    return candidates;
 }
 
 static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePatchIndex* surface_patch_index,

@@ -1223,22 +1223,6 @@ static cv::Vec2i lower_p(const cv::Vec2i &point, const cv::Vec2i &offset)
         return point;
 }
 
-// Order two points along the axis implied by their grid relation.
-// - For horizontal edges (same row), order by column.
-// - For vertical edges (same col), order by row.
-// Falls back to lexicographic (row,col) if neither axis matches.
-static inline std::pair<cv::Vec2i, cv::Vec2i> order_p(const cv::Vec2i& p, const cv::Vec2i& q)
-{
-    if (p[0] == q[0]) { // same row => horizontal edge
-        return (p[1] <= q[1]) ? std::make_pair(p, q) : std::make_pair(q, p);
-    }
-    if (p[1] == q[1]) { // same col => vertical edge
-        return (p[0] <= q[0]) ? std::make_pair(p, q) : std::make_pair(q, p);
-    }
-    // fallback
-    return (p[0] < q[0] || (p[0] == q[0] && p[1] <= q[1])) ? std::make_pair(p, q) : std::make_pair(q, p);
-}
-
 static bool loss_mask(int bit, const cv::Vec2i &p, const cv::Vec2i &off, cv::Mat_<uint16_t> &loss_status)
 {
     return loss_status(lower_p(p, off)) & (1 << bit);

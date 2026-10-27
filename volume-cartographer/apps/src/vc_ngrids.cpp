@@ -627,19 +627,6 @@ static bool clip_segment_to_crop(cv::Point3f& a, cv::Point3f& b, const CropBox3i
     return true;
 }
 
-static float dist_sq_point_segment(const cv::Point3f& p, const cv::Point3f& a, const cv::Point3f& b) {
-    const cv::Point3f ab = b - a;
-    const float ab2 = ab.dot(ab);
-    if (ab2 <= 1e-12f) {
-        const cv::Point3f d = p - a;
-        return d.dot(d);
-    }
-    const float t = std::max(0.f, std::min(1.f, (p - a).dot(ab) / ab2));
-    const cv::Point3f q = a + t * ab;
-    const cv::Point3f d = p - q;
-    return d.dot(d);
-}
-
 static inline float dist_sq_point_segment_appx(const cv::Point3f& p, const cv::Point3f& a, const cv::Point3f& b) {
     // Approximate distance: use the segment midpoint instead of true point-to-segment distance.
     const cv::Point3f m = 0.5f * (a + b);
@@ -848,17 +835,6 @@ static bool fit_normal_tiny(
         inout_init_n[2] = out_n.z;
     }
     return true;
-}
-
-static std::shared_ptr<const vc::core::util::GridStore> try_load_grid(
-    const fs::path& base,
-    const std::string& plane_dir,
-    int slice_idx) {
-    char filename[256];
-    snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
-    fs::path grid_path = base / plane_dir / filename;
-    if (!fs::exists(grid_path)) return nullptr;
-    return std::make_shared<vc::core::util::GridStore>(grid_path.string());
 }
 
 static cv::Point3f point_for_slice_query(const cv::Point3f& base, int plane_idx, int slice_idx) {
