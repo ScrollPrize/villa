@@ -3243,7 +3243,7 @@ void CWindow::CreateWidgets(void)
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
     _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
-        return _segmentationModule && _segmentationModule->saveSurfaceNow(surface);
+        return _segmentationModule && _segmentationModule->saveSurface(surface);
     });
     _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
@@ -3331,7 +3331,7 @@ void CWindow::CreateWidgets(void)
         return _segmentationModule->prepareEditingDestination(surface);
     });
     _segmentationCommandHandler->setSurfaceSaver([this](QuadSurface* surface) {
-        return _segmentationModule && _segmentationModule->saveSurfaceNow(surface);
+        return _segmentationModule && _segmentationModule->saveSurface(surface);
     });
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());

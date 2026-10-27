@@ -1159,7 +1159,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
     const auto autosave = _context.module->autosaveStatus();
-    if ((autosave.pending || autosave.saveInProgress) && !_context.module->saveSurfaceNow(segmentationSurface.get())) {
+    if ((autosave.pending || autosave.saveInProgress) && !_context.module->saveSurface(segmentationSurface.get())) {
         showStatus(tr("Save the surface's edits before using Copy with NT."), kStatusLong);
         return false;
     }
@@ -1495,7 +1495,7 @@ void SegmentationGrower::onFutureFinished()
 
     if (!sessionActive) {
         if (surfaceToPersist && _context.module) {
-            if (!_context.module->saveSurfaceNow(surfaceToPersist)) {
+            if (!_context.module->saveSurface(surfaceToPersist)) {
                 showStatus(tr("Failed to save the grown segmentation to the object store."), kStatusLong);
             }
         }
@@ -1573,7 +1573,7 @@ void SegmentationGrower::onFutureFinished()
     // Keep the growth's corrections with the revisions before and after it.
     auto* annotated = primarySurface ? primarySurface : request.segmentationSurface.get();
     if (request.usingCorrections && request.beforePin && request.correctionsBounds && _context.module && annotated &&
-        _context.state && _context.state->currentVolume() && _context.module->saveSurfaceNow(annotated)) {
+        _context.state && _context.state->currentVolume() && _context.module->saveSurface(annotated)) {
         if (const auto afterPin = _context.module->storePin(annotated)) {
             vc3d::corrections::GrowthAnnotation annotation;
             annotation.surfaceUuid = afterPin->object.objectUuid;

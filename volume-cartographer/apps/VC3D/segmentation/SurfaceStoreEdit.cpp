@@ -14,20 +14,6 @@ SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, 
     if (!_pin.geometryRevision) throw std::runtime_error("The surface has no geometry");
 }
 
-void SurfaceStoreEdit::hold()
-{
-    if (!_session->writable(_pin.attachment)) throw std::runtime_error("The object store is attached read-only");
-    auto lease = _session->holdForEditing(pin());
-    std::lock_guard lock(_mutex);
-    _lease = std::move(lease);
-}
-
-void SurfaceStoreEdit::release()
-{
-    std::lock_guard lock(_mutex);
-    _lease.reset();
-}
-
 PinnedObject SurfaceStoreEdit::pin() const
 {
     std::lock_guard lock(_mutex);

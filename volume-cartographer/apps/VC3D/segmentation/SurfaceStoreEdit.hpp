@@ -21,11 +21,6 @@ public:
     SurfaceStoreEdit(std::shared_ptr<vc::objects::ObjectStoreSession> session, vc::objects::PinnedObject pin,
                      std::optional<vc::objects::ViewFrame> view = std::nullopt);
 
-    // An editing session holds the object (ObjectStoreSession::holdForEditing) until
-    // release(); throws when the store is read-only or the pin is stale.
-    void hold();
-    void release();
-
     // Publish `surface`: with the stored grid size, the named channels ("mask"
     // is validity) and then the vertices of `rect` that changed; with another
     // grid size (growth), a new geometry of points, validity and channels.
@@ -43,6 +38,5 @@ private:
     mutable std::mutex _mutex;
     vc::objects::PinnedObject _pin;
     const vc::objects::PinnedObject _origin;
-    vc::objects::LeaseHold _lease;
     const std::optional<vc::objects::ViewFrame> _view;
 };

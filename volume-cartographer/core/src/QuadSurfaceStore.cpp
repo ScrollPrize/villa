@@ -78,11 +78,6 @@ std::vector<int64_t> pointsShape(const vc::objects::GeometryRevision& revision)
     throw std::runtime_error("stored surface has no points");
 }
 
-bool hasArray(const vc::objects::GeometryRevision& revision, const std::string& name)
-{
-    return std::any_of(revision.arrays.begin(), revision.arrays.end(), [&](const auto& a) { return a.name == name; });
-}
-
 vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
                                              const std::string& objectUuid, const std::string& expected)
 {
@@ -192,43 +187,20 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
     if (area.empty()) return revision.uuid;
-    if (transformed) {
-        std::vector<vc::geometry::SurfacePoint> desired;
-        desired.reserve(size_t(area.width)*area.height);
-        for(int r=area.y;r<area.y+area.height;++r)for(int c=area.x;c<area.x+area.width;++c) {
-            const auto p=points(r,c);
-            desired.push_back({p[0],p[1],p[2]});
-        }
-        const auto edits=transformed->surfaceEdits(area.y,area.x,area.height,area.width,desired);
-        return decide ? db.editGeometry(txn,objectUuid,edits,revision.uuid,vc::objects::ObjectStore::EdgeDecider(decide))
-                      : db.editGeometry(txn,objectUuid,edits,revision.uuid);
+    // Without a transformed view the surface holds stored coordinates.
+    std::optional<vc::objects::TransformedGeometryView> stored;
+    if (!transformed) {
+        stored.emplace(vc::objects::GeometrySnapshot(db, txn).viewStored(objectUuid, revision.uuid));
+        transformed = &*stored;
     }
-    auto stored = db.readGeometryRectangle(txn, revision.uuid, "points", area.y, area.x, area.height, area.width);
-    const bool hasValid = hasArray(revision, "valid");
-    auto valid = hasValid ? db.readGeometryRectangle(txn, revision.uuid, "valid", area.y, area.x, area.height, area.width)
-                          : std::vector<uint8_t>{};
-    bool validChanged = false;
-    for (int r = 0; r < area.height; ++r)
-        for (int c = 0; c < area.width; ++c) {
-            const size_t i = size_t(r) * size_t(area.width) + size_t(c);
-            cv::Vec3f old;
-            std::memcpy(old.val, stored.data() + i * 12, 12);
-            // What this vertex looked like when loaded: masked vertices are sentinels.
-            cv::Vec3f loaded = vc::geometry::validSurfacePoint(old) && (!hasValid || valid[i]) ? old : kInvalid;
-            cv::Vec3f now = points(area.y + r, area.x + c);
-            if (!vc::geometry::validSurfacePoint(now)) now=kInvalid;
-            if (std::memcmp(now.val, loaded.val, 12) == 0) continue;
-            std::memcpy(stored.data() + i * 12, now.val, 12);
-            if (hasValid && now != kInvalid && !valid[i]) { valid[i] = 255; validChanged = true; }
+    std::vector<vc::geometry::SurfacePoint> desired;
+    desired.reserve(size_t(area.width) * area.height);
+    for (int r = area.y; r < area.y + area.height; ++r)
+        for (int c = area.x; c < area.x + area.width; ++c) {
+            const auto p = points(r, c);
+            desired.push_back({p[0], p[1], p[2]});
         }
-    std::vector<vc::objects::GeometryArrayEdit> edits;
-    auto rows = [&](const std::string& name, const std::vector<uint8_t>& bytes, size_t pixel, int64_t components) {
-        for (int r = 0; r < area.height; ++r)
-            edits.push_back({name, ((area.y + r) * shape[1] + area.x) * components,
-                {bytes.begin() + r * area.width * pixel, bytes.begin() + (r + 1) * area.width * pixel}});
-    };
-    rows("points", stored, 12, 3);
-    if (validChanged) rows("valid", valid, 1, 1);
+    const auto edits = transformed->surfaceEdits(area.y, area.x, area.height, area.width, desired);
     // One plan decides the affected relationships and commits.
     return decide ? db.editGeometry(txn, objectUuid, edits, revision.uuid, vc::objects::ObjectStore::EdgeDecider(decide))
                   : db.editGeometry(txn, objectUuid, edits, revision.uuid);

@@ -158,6 +158,11 @@ public:
     void close();
     TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
         double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
+    // The object's geometry (current, or `geometryRevision`) in its stored
+    // coordinates: the identity view, so edits in stored units take the same
+    // path as edits through a transformed view.
+    TransformedGeometryView viewStored(const std::string& objectUuid,
+                                       const std::optional<std::string>& geometryRevision = std::nullopt) const;
     bool active() const;
     // The object's current geometry, or its pinned `geometryRevision`. A view of
     // a pinned revision has an empty objectRevision().

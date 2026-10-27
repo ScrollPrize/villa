@@ -433,7 +433,7 @@ void SurfaceMaskBrushTool::persistSurface()
     }
 
     // The mask is the surface's validity: masked vertices keep their stored coordinates.
-    if (_module.saveSurfaceChannels(_surface, {"mask"})) {
+    if (_module.saveSurface(_surface, false, {"mask"})) {
         Q_EMIT _module.statusMessageRequested(
             QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);

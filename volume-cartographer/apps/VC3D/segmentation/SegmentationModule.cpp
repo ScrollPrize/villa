@@ -184,7 +184,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_overlay) {
         _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
-        _overlay->setApprovalSaver([this](QuadSurface* surface) { saveSurfaceChannels(surface, {"approval"}); });
+        _overlay->setApprovalSaver([this](QuadSurface* surface) { saveSurface(surface, false, {"approval"}); });
         if (_widget) {
             _overlay->setApprovalMaskOpacity(_widget->approvalMaskOpacity());
         }
@@ -711,6 +711,7 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // The previous surface's pending saves are done: its store edit ends here.
     if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
         _storeEdit.reset();
+        _editLease = {};
     }
     if (_pointCollection) {
         loadCorrections(newSurface);
@@ -2953,24 +2954,14 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     return _storeEdit;
 }
 
-bool SegmentationModule::saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels)
+bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
 {
-    return saveNow(surface, false, channels);
-}
-
-bool SegmentationModule::saveSurfaceNow(QuadSurface* surface)
-{
-    return surface && saveNow(surface, true, surface->channelNames());
-}
-
-bool SegmentationModule::saveNow(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
-{
-    const auto storeEdit = storeEditFor(surface);
+    const auto storeEdit = surface ? storeEditFor(surface) : nullptr;
     if (!storeEdit) {
         return false;
     }
     std::vector<std::string> loaded;
-    for (const auto& name : channels) {
+    for (const auto& name : channels.empty() ? surface->channelNames() : channels) {
         if (surface->channelLoaded(name)) {
             loaded.push_back(name);
         }

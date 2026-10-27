@@ -147,10 +147,9 @@ public:
     };
     using StorePinResolver = std::function<std::optional<StoreOrigin>(const QuadSurface*)>;
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
-    // Synchronously publish the loaded `channels` of `surface` (approval flushes at boundaries).
-    bool saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels);
-    // Synchronously publish every changed vertex and loaded channel of `surface`.
-    bool saveSurfaceNow(QuadSurface* surface);
+    // Synchronously publish `surface` to its store object: its changed vertices
+    // (with `vertices`) and its loaded `channels` (every channel when empty).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
     // The store revisions the surface's edits continue from.
     std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
@@ -534,8 +533,9 @@ private:
     // The store edit of the active surface, kept across editing sessions so
     // saves continue from their own revisions.
     std::shared_ptr<SurfaceStoreEdit> _storeEdit;
+    // The edited object's hold (ObjectStoreSession::holdForEditing) while a session lasts.
+    vc::objects::LeaseHold _editLease;
     std::shared_ptr<SurfaceStoreEdit> storeEditFor(QuadSurface* surface);
-    bool saveNow(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels);
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 

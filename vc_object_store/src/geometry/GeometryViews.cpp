@@ -95,6 +95,12 @@ TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& u
     return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
 }
 
+TransformedGeometryView GeometrySnapshot::viewStored(const std::string& uuid,
+    const std::optional<std::string>& geometryRevision) const
+{
+    return TransformedGeometryView(geometry(uuid,geometryRevision),VolumeAffine::identity(),std::string{},1);
+}
+
 TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
     state_->read->require();
     const auto& db=*state_->read->db;
