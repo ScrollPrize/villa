@@ -1,6 +1,7 @@
 #include "segmentation/SurfaceCorrections.hpp"
 
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "vc/core/types/Volume.hpp"
 
 #include <vc_object_store/objects/GeometryEdits.hpp>
@@ -54,7 +55,7 @@ Stored toStore(uint64_t id, const Json& collection)
 }
 
 std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                        const std::string& surfaceUuid, const std::optional<vc3d::VolumeView>& view)
+                                                        const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
     std::map<uint64_t, utils::Json> result;
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -88,7 +89,7 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
 
 void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
                               const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
-                              const std::optional<vc3d::VolumeView>& view)
+                              const std::optional<vc::objects::ViewFrame>& view)
 {
     std::map<std::string, std::pair<uint64_t, Json>> desired;
     for (const auto& [id, json] : collections) {

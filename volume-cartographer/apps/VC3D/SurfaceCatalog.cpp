@@ -1,5 +1,6 @@
 #include "SurfaceCatalog.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreRegions.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -217,7 +218,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
         const auto view = current ? snapshot.viewTransformedAt(uuid, volume)
                                   : snapshot.surface(uuid, revision->geometryRevision).viewTransformedAt(volume);
         opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,&view);
-        opened.view = {volume, 1, view.mapping()};
+        opened.view = view.frame();
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
     });
     opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
@@ -233,16 +234,23 @@ SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
     return {session_->path(*attachment_), volume_->id()};
 }
 
-void SurfaceCatalog::importCatalogSurface(const std::string& uuid)
+SurfaceCatalog::Opened SurfaceCatalog::importCatalogSurface(const Opened& opened)
 {
+    const auto uuid = opened.surface->id;
     const auto* listed = row(uuid);
-    if (!listed || !listed->catalog) return;
+    if (!listed || !listed->catalog) throw std::runtime_error("not a catalog surface: " + uuid);
     if (!attachment_ || !session_->writable(*attachment_))
         throw std::runtime_error("Attach a writable object store to edit catalog surfaces");
     session_->importObject(listed->source, *attachment_, uuid);
     readNow({uuid});
     if (const auto* imported = row(uuid); !imported || imported->catalog || !imported->bound())
         throw std::runtime_error("Your object store does not place the surface in this volume");
+    auto reopened = open(uuid);
+    if (reopened.view.mapping != opened.view.mapping)
+        throw std::runtime_error("your object store places the surface differently in this volume; reopen it");
+    reopened.surface = opened.surface;
+    reopened.surface->setChannelLoader(store_channel_loader(session_, reopened.pin.attachment, *reopened.pin.geometryRevision));
+    return reopened;
 }
 
 std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const nlohmann::json& provenance,

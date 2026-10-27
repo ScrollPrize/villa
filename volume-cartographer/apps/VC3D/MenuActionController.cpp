@@ -33,7 +33,8 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
 #include "BindCoordinatesPrompt.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/CatalogStore.hpp>

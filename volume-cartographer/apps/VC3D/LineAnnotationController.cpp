@@ -3,7 +3,8 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "BindCoordinatesPrompt.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "ObjectStoreArtifacts.hpp"

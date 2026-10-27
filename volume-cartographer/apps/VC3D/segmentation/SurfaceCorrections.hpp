@@ -3,7 +3,8 @@
 // the surface) in the object store: point_collection objects with record meta
 // role "corrections", attached to the surface by "attachment" relationships
 // with the same role (data on the surface, never graph links).
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "utils/Json.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <cstdint>
@@ -22,7 +23,7 @@ namespace vc3d::corrections {
 std::map<uint64_t, utils::Json> read(vc::objects::ObjectStoreSession& session,
                                      const vc::objects::AttachmentIdentity& attachment,
                                      const std::string& surfaceUuid,
-                                     const std::optional<vc3d::VolumeView>& view = std::nullopt);
+                                     const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
 
 // Make the surface's corrections exactly `collections`: new ones become objects
 // bound to `volume` at its voxel scale, changed ones get new geometry (mapped
@@ -30,7 +31,7 @@ std::map<uint64_t, utils::Json> read(vc::objects::ObjectStoreSession& session,
 // retired. One checked action.
 void write(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
            const std::string& surfaceUuid, const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
-           const std::optional<vc3d::VolumeView>& view = std::nullopt);
+           const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
 
 // A growth that used corrections, kept for training: the surface's geometry
 // revisions before and after, the grid region and volume bounds the

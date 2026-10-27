@@ -90,10 +90,19 @@ struct TransformedSurfaceTile {
     std::vector<uint8_t> validity;
     std::array<double,2> scale{1,1};
 };
+// The frame a transformed view reads in: `volume`'s voxels at `scale`, mapped
+// by `mapping` from the object's stored coordinates. A value to keep with what
+// was read, so edits map back through the same frame.
+struct ViewFrame {
+    std::string volume;
+    double scale = 1;
+    VolumeAffine mapping;
+};
 // Uses the canonical view's transaction/lifetime, scalar types and stable IDs.
 // Transformed coordinates are never serialized without an explicit inverse edit.
 class TransformedGeometryView {
 public:
+    ViewFrame frame() const {return {target_, targetScale_, mapping_};}
     const GeometryRevision& revision() const;
     const std::string& objectRevision() const;
     const VolumeAffine& mapping() const {return mapping_;}

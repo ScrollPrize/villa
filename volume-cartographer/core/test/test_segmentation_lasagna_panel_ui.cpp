@@ -23,7 +23,8 @@
 
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "SurfaceCatalog.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"

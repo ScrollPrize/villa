@@ -9,7 +9,8 @@
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/render/ChunkCache.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStore.hpp>
 #include <vc_reader/catalog.hpp>
 

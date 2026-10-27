@@ -9,7 +9,8 @@
 #include "vc/core/PointCollections.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_reader/catalog.hpp>
 #include <vc_reader/registrations.hpp>
 #include "VolumeRegistrations.hpp"
@@ -188,7 +189,7 @@ int main(int argc, char** argv)
             {
                 // Through a view at half scale: points read halved, unchanged ones
                 // keep their stored values on save, moved ones map back.
-                const vc3d::VolumeView coarse{"vol1", 0.5, VolumeAffine::scale(0.5)};
+                const vc::objects::ViewFrame coarse{"vol1", 0.5, VolumeAffine::scale(0.5)};
                 auto shown = vc3d::corrections::read(*session, attachment, half, coarse);
                 const auto& ordered = points.getAllCollections().at(fix).points;
                 const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);

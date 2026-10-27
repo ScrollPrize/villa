@@ -4,7 +4,8 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreRegions.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
@@ -768,16 +769,8 @@ bool SurfacePanelController::editInUserStore(const std::string& id, QString* err
         return fail(tr("Open the surface's current version to edit it"));
     }
     try {
-        _catalog->importCatalogSurface(id);
         // The same geometry through your store: the surface on screen continues.
-        auto reopened = _catalog->open(id);
-        if (reopened.view.mapping != _opened->view.mapping) {
-            throw std::runtime_error("your object store places the surface differently in this volume; reopen it");
-        }
-        reopened.surface = _opened->surface;
-        reopened.surface->setChannelLoader(
-            store_channel_loader(_catalog->session(), reopened.pin.attachment, *reopened.pin.geometryRevision));
-        _opened = std::move(reopened);
+        _opened = _catalog->importCatalogSurface(*_opened);
     } catch (const std::exception& error) {
         return fail(tr("Cannot edit %1 in your object store: %2")
                         .arg(QString::fromStdString(id), QString::fromUtf8(error.what())));

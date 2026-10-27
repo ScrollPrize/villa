@@ -7,7 +7,7 @@
 using namespace vc::objects;
 
 SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, PinnedObject pin,
-                                 std::optional<vc3d::VolumeView> view)
+                                 std::optional<vc::objects::ViewFrame> view)
     : _session(std::move(session)), _uuid(pin.object.objectUuid), _pin(pin), _origin(std::move(pin)),
       _view(std::move(view))
 {

@@ -7,7 +7,8 @@
 // open volume's voxels, through the stores' registrations (an Open Data level
 // is a registered volume). A catalog surface is edited in the user's store as
 // the same surface (importCatalogSurface); the session then reads it from there.
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
 #include <nlohmann/json.hpp>
@@ -61,7 +62,7 @@ public:
         std::shared_ptr<QuadSurface> surface;
         vc::objects::PinnedObject pin;
         // The view it was read through; edits map back through it.
-        vc3d::VolumeView view;
+        vc::objects::ViewFrame view;
         // The surface's current revision, not a past one being viewed.
         bool current = true;
         // The current revision in a writable attachment.
@@ -123,8 +124,10 @@ public:
 
     // Edit a catalog surface in the user's store: imports it there as the same
     // surface (fetching it first), its catalog version the first revision, and
-    // reads its row from there.
-    void importCatalogSurface(const std::string& uuid);
+    // reads its row from there. `opened` (its current version, as on screen)
+    // continues as the user's: same surface object, pinned and reading
+    // channels there. Throws when the user's store places it differently.
+    Opened importCatalogSurface(const Opened& opened);
     // A new surface holding `surface` (in the volume's voxels), bound to the
     // volume; `provenance` records how it was made ({tool, parameters, sources}).
     // Sets surface.id and returns the UUID.
