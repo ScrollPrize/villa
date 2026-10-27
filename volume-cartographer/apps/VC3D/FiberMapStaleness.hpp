@@ -3,11 +3,10 @@
 #include <QObject>
 #include <QString>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <optional>
-
-
-#include "AnnotationFrame.hpp"
 
 namespace vc3d::fiber_map {
 
@@ -24,16 +23,23 @@ struct FiberMapDependencies {
     uint64_t umbilicusGeneration = 0;
     // The stored umbilicus (uuid@revision), or why there is none.
     QString umbilicusFingerprint;
-    vc3d::annotation::AnnotationFrame frame;
-    // Which catalog volume the current volume is (CatalogVolumeSense::volume:
-    // sample and volume, no pyramid level; empty for other volumes): the
-    // catalog entry the winding sense is read from, and an identity the grid
-    // comparison can miss (a same-grid store of another volume). And the
-    // orientation the catalog gives it (orientationText; empty for other
-    // volumes), from which the winding sense follows.
-    QString catalogVolume;
+    // The volume the map is laid out in (CState::annotationVolume: the catalog
+    // volume the current volume shows, every pyramid level alike, else the
+    // current volume) and its voxel size.
+    QString annotationVolume;
+    std::optional<double> voxelSizeUm;
+    // The orientation the catalog gives that volume (orientationText; empty
+    // for other volumes), from which the winding sense follows.
     QString catalogOrientation;
 };
+
+// Voxel sizes compare with a relative tolerance, so metadata that round-trips
+// 2.4 slightly differently is not mistaken for a new scale.
+inline bool sameVoxelSize(const std::optional<double>& a, const std::optional<double>& b)
+{
+    if (a.has_value() != b.has_value()) return false;
+    return !a || std::abs(*a - *b) <= 1e-6 * std::max(*a, *b);
+}
 
 // What a comparison concluded, separately from acting on it.
 struct StaleVerdict {
@@ -44,16 +50,13 @@ struct StaleVerdict {
     };
     // WHY, separately from the wording: the holder decides per cause whether
     // an automatic rebuild is appropriate. Fibers and Umbilicus are the two
-    // causes a rebuild genuinely fixes; Grid and VoxelSize commonly mean the
+    // causes a rebuild genuinely fixes; Volume and VoxelSize commonly mean the
     // user is merely looking at a different volume right now, and rebuilding
     // into that transient frame would replace the map with one for a grid
     // the fibers are not annotated in.
     enum class Cause {
         None,
         Package,
-        Grid,
-        // Same grid, another catalog volume (or none): like Grid, usually
-        // the user looking at another volume for now, so not auto-updated.
         Volume,
         VoxelSize,
         Latched,
@@ -74,9 +77,9 @@ struct StaleVerdict {
 //
 //  - A different package leaves the layout meaningless: different fibers
 //    entirely. Clearing is right.
-//  - A different *grid* means the map is showing geometry for another set of
-//    voxels - but the cause is usually the user LOOKING at a different
-//    volume (the annotation frame follows the current volume), and that
+//  - A different annotation volume means the map is showing geometry for
+//    another set of voxels - but the cause is usually the user LOOKING at a
+//    different volume (the annotation volume follows the current one), and that
 //    reverts when they switch back. So it marks stale like every other
 //    derived dependency rather than destroying a layout that becomes
 //    correct again the moment the volume returns; the gates refuse
@@ -114,7 +117,7 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
-    // Before the grid, because two projects can share one.
+    // Before the volume, because two projects can share one.
     if (current.packageGeneration != built.packageGeneration) {
         verdict.action = StaleVerdict::Action::ClearLayout;
         verdict.cause = StaleVerdict::Cause::Package;
@@ -122,33 +125,18 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
-    if (!vc3d::annotation::sameAnnotationGrid(current.frame, built.frame)) {
-        verdict.action = StaleVerdict::Action::MarkStale;
-        verdict.cause = StaleVerdict::Cause::Grid;
-        verdict.reason = QObject::tr(
-            "viewing another volume's grid — switch back, or press Update");
-        return verdict;
-    }
-
-    // Same grid, another catalog volume (a second store of a scan, or an
-    // untagged one): the winding sense is read per catalog volume, so the
-    // map may be laid out in the other's sense. Usually the user is looking
-    // at that volume for now, so it reads like Grid: stale, reverting when
-    // they switch back, never rebuilt into automatically.
-    if (current.catalogVolume != built.catalogVolume) {
+    if (current.annotationVolume != built.annotationVolume) {
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.cause = StaleVerdict::Cause::Volume;
         verdict.reason = QObject::tr(
-            "viewing another catalog volume — switch back, or press Update");
+            "viewing another volume — switch back, or press Update");
         return verdict;
     }
 
-    // Same voxels, different physical scale. Two stores of one scan can disagree
-    // here -- PHerc0139_ds2's raw and surf pair are byte-identical in voxel counts
-    // and 2.5% apart in recorded voxel size. Not meaningless, so this does not
-    // clear; out of date, because every physical tuning parameter the layout used
-    // was converted through that figure.
-    if (!vc3d::annotation::sameAnnotationFrame(current.frame, built.frame)) {
+    // Same voxels, different physical scale. Not meaningless, so this does not
+    // clear; out of date, because every physical tuning parameter the layout
+    // used was converted through that figure.
+    if (!sameVoxelSize(current.voxelSizeUm, built.voxelSizeUm)) {
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.cause = StaleVerdict::Cause::VoxelSize;
         verdict.reason = QObject::tr("voxel size changed — press Update");

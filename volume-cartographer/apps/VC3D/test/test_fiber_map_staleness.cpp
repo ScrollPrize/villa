@@ -12,44 +12,12 @@
 
 #include "FiberMapStaleness.hpp"
 
-using vc3d::annotation::AnnotationFrame;
 using vc3d::fiber_map::FiberMapDependencies;
 using vc3d::fiber_map::StaleVerdict;
 using vc3d::fiber_map::staleVerdictFor;
 
 namespace
 {
-    // PHerc0139_ds2.volpkg: two volumes of one scan, byte-identical voxel counts,
-    // recorded voxel sizes 2.5% apart. Measured from their meta.json.
-    AnnotationFrame frameAt(double voxelUm)
-    {
-        AnnotationFrame frame;
-        frame.voxelSizeUm = voxelUm;
-        frame.factor = 1.0;
-        frame.extentXyz = {6628.0, 6628.0, 19239.0};
-        return frame;
-    }
-
-    AnnotationFrame otherGrid()
-    {
-        AnnotationFrame frame;
-        frame.voxelSizeUm = 9.596;
-        frame.factor = 1.0;
-        frame.extentXyz = {8174.0, 8174.0, 18946.0};
-        return frame;
-    }
-
-    // An untagged level-0 store whose own voxel size is unreadable: since #1454's
-    // exact-factor derivation it still gets factor 1 and its full voxel counts —
-    // only the physical label is missing, not the grid.
-    AnnotationFrame frameWithUnknownVoxelSize()
-    {
-        AnnotationFrame frame;
-        frame.factor = 1.0;
-        frame.extentXyz = {6628.0, 6628.0, 19239.0};
-        return frame;
-    }
-
     FiberMapDependencies baseline()
     {
         FiberMapDependencies deps;
@@ -57,8 +25,8 @@ namespace
         deps.packageGeneration = 3;
         deps.umbilicusGeneration = 2;
         deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
-        deps.frame = frameAt(9.596);
-        deps.catalogVolume = QStringLiteral("PHerc0139/20260102150214");
+        deps.annotationVolume = QStringLiteral("20260102150214");
+        deps.voxelSizeUm = 9.596;
         deps.catalogOrientation = QStringLiteral("z-top-to-bottom 1, left-handed 0");
         return deps;
     }
@@ -87,7 +55,7 @@ private slots:
     }
 
     // Before a first build there is nothing to compare against. Comparing anyway
-    // would differ on every check — the recorded frame is default-constructed while
+    // would differ on every check — the recorded dependencies are default-constructed while
     // the current one is populated — and clear the layout indefinitely.
     void nothingBuiltIsNeverStale()
     {
@@ -115,9 +83,9 @@ private slots:
         QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
     }
 
-    // Checked before the grid, because two projects can share one and the fibers
+    // Checked before the volume, because two projects can share one and the fibers
     // are gone either way.
-    void aDifferentPackageOutranksAMatchingGrid()
+    void aDifferentPackageOutranksAMatchingVolume()
     {
         auto current = baseline();
         current.packageGeneration += 1;
@@ -126,19 +94,23 @@ private slots:
         QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
     }
 
-    // A different grid is usually the user LOOKING at another volume (the
-    // annotation frame follows the current volume), which reverts when they
-    // switch back - so it marks stale like every other derived dependency
-    // instead of destroying a layout that becomes correct again on return.
-    void differentVoxelCountsMarkStaleAndRevert()
+    // Another annotation volume is usually the user LOOKING at another volume
+    // (the annotation volume follows the current volume), which reverts when
+    // they switch back - so it marks stale like every other derived dependency
+    // instead of destroying a layout that becomes correct again on return. It
+    // outranks the auto-updatable causes, so a fiber save while looking at
+    // the other volume does not rebuild the map there.
+    void anotherAnnotationVolumeMarksStaleAndReverts()
     {
         auto current = baseline();
-        current.frame = otherGrid();
+        current.annotationVolume = QStringLiteral("20250728140407");
         const auto result = verdict(baseline(), current);
         QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
-        QCOMPARE(result.cause, StaleVerdict::Cause::Grid);
+        QCOMPARE(result.cause, StaleVerdict::Cause::Volume);
+        current.fiberGeneration += 1;
+        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Volume);
         // ...and switching back reads as current again with no rebuild.
-        current.frame = baseline().frame;
+        current = baseline();
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
     }
 
@@ -156,7 +128,7 @@ private slots:
                  StaleVerdict::Cause::Umbilicus);
 
         auto voxel = baseline();
-        voxel.frame = frameAt(9.362);
+        voxel.voxelSizeUm = 9.362;
         QCOMPARE(verdict(baseline(), voxel).cause, StaleVerdict::Cause::VoxelSize);
 
         const auto deps = baseline();
@@ -164,8 +136,8 @@ private slots:
                  StaleVerdict::Cause::Latched);
     }
 
-    // Same voxels, 2.5% different micrometre label. Not meaningless -- the counts
-    // are identical -- but not current either: the layout's smoothing sigma, resample
+    // Same volume, 2.5% different micrometre label (PHerc0139_ds2's raw and surf
+    // pair). Not meaningless, but not current either: the layout's smoothing sigma, resample
     // step, label pads, panel tick and minimum gap are all physical quantities
     // converted through that figure, so a rebuild would place things differently. An
     // earlier version of this treated the case as a relabel and reported the layout
@@ -173,8 +145,11 @@ private slots:
     void voxelSizeOnlyChangeMarksStaleRatherThanClearing()
     {
         auto current = baseline();
-        current.frame = frameAt(9.362);
+        current.voxelSizeUm = 9.362;
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
+        // Round-trip noise is not a change.
+        current.voxelSizeUm = 9.596 * (1 + 1e-9);
+        QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
     }
 
     void changedFibersMarkStale()
@@ -201,27 +176,6 @@ private slots:
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
     }
 
-    // A same-grid store of another catalog volume (or an untagged one) is a
-    // volume switch the grid check cannot see: stale like Grid, reverting
-    // when the user switches back, and it outranks the auto-updatable
-    // causes so a fiber save while looking at the other volume does not
-    // rebuild the map in that volume's winding sense.
-    void anotherCatalogVolumeOnTheSameGridMarksStale()
-    {
-        auto current = baseline();
-        current.catalogVolume = QStringLiteral("PHerc0139/20250728140407");
-        StaleVerdict changed = verdict(baseline(), current);
-        QCOMPARE(changed.action, StaleVerdict::Action::MarkStale);
-        QCOMPARE(changed.cause, StaleVerdict::Cause::Volume);
-        current.catalogVolume.clear();
-        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Volume);
-        current.fiberGeneration += 1;
-        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Volume);
-        current = baseline();
-        current.fiberGeneration += 1;
-        QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Fibers);
-    }
-
     // The catalog's orientation of the volume is a dependency like the
     // umbilicus: changed, the winding sense may read differently; the same
     // again is fresh. A volume the catalog does not publish has none.
@@ -235,7 +189,6 @@ private slots:
         current.catalogOrientation = baseline().catalogOrientation;
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
         auto untagged = baseline();
-        untagged.catalogVolume.clear();
         untagged.catalogOrientation.clear();
         QCOMPARE(verdict(untagged, untagged).action, StaleVerdict::Action::Fresh);
     }
@@ -252,20 +205,19 @@ private slots:
         QCOMPARE(result.reason, QStringLiteral("already stale"));
     }
 
-    // The unknown->known voxel-size transition: an untagged store derives
-    // factor 1 with full extents (no voxel size), so gaining one later is the
-    // same grid under a new physical label — out of date, never meaningless.
+    // The unknown->known voxel-size transition: gaining one later is the same
+    // volume under a new physical label — out of date, never meaningless.
     void gainingAVoxelSizeMarksStaleWithoutClearing()
     {
         auto built = baseline();
-        built.frame = frameWithUnknownVoxelSize();
+        built.voxelSizeUm.reset();
         const auto result = verdict(built, baseline());
         QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
         QVERIFY(result.reason.contains(QStringLiteral("voxel size")));
 
-        // And symmetrically: losing it is a relabel of the same grid too.
+        // And symmetrically: losing it is a relabel of the same volume too.
         auto current = baseline();
-        current.frame = frameWithUnknownVoxelSize();
+        current.voxelSizeUm.reset();
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::MarkStale);
     }
 
@@ -279,15 +231,15 @@ private slots:
         QCOMPARE(result.action, StaleVerdict::Action::ClearLayout);
     }
 
-    // A grid mismatch still outranks the latch for display: the frame reason
-    // shows while it holds, and the latch resurfaces when it reverts.
-    void gridMismatchDisplaysOverALatch()
+    // A volume mismatch still outranks the latch for display: the volume
+    // reason shows while it holds, and the latch resurfaces when it reverts.
+    void volumeMismatchDisplaysOverALatch()
     {
         auto current = baseline();
-        current.frame = otherGrid();
+        current.annotationVolume = QStringLiteral("20250728140407");
         const auto result = verdict(baseline(), current, true, /*latched=*/true);
         QCOMPARE(result.action, StaleVerdict::Action::MarkStale);
-        QCOMPARE(result.cause, StaleVerdict::Cause::Grid);
+        QCOMPARE(result.cause, StaleVerdict::Cause::Volume);
     }
 };
 

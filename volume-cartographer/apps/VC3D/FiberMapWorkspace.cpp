@@ -5,6 +5,7 @@
 #include "FiberMapRulerMath.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationController.hpp"
+#include "CState.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -760,12 +761,7 @@ QString withUmbilicusStatus(const QString& status, LineAnnotationController* con
     return status + QObject::tr(" · %1 — File > Import Umbilicus…").arg(umbilicus.text);
 }
 
-// FiberMapDependencies::catalogVolume and ::catalogOrientation.
-QString catalogVolumeKey(const std::optional<vc3d::opendata::CatalogVolumeSense>& catalog)
-{
-    return catalog ? QString::fromStdString(catalog->volume) : QString();
-}
-
+// FiberMapDependencies::catalogOrientation.
 QString catalogOrientationKey(const std::optional<vc3d::opendata::CatalogVolumeSense>& catalog)
 {
     return catalog ? QString::fromStdString(vc3d::opendata::orientationText(catalog->orientation)) : QString();
@@ -951,9 +947,10 @@ void FiberMapView::mouseReleaseEvent(QMouseEvent* event)
     }
 }
 
-FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
+FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* controller,
                                      QWidget* parent)
     : QMainWindow(parent)
+    , _state(state)
     , _controller(controller)
 {
     setObjectName(QStringLiteral("fiberMapWorkspace"));
@@ -1641,7 +1638,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _gapPublishedError.clear();
     _gapTiles.clear();
     _layoutGeneration = 0;
-    _layoutFrame = {};
+    _layoutAnnotationVolume.clear();
     _layoutUmbilicusFingerprint.clear();
     _layoutPackageGeneration = 0;
     _layoutUmbilicusGeneration = 0;
@@ -1693,10 +1690,11 @@ FiberMapWorkspace::currentDependencies() const
     deps.packageGeneration = _controller->packageGeneration();
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
-    deps.frame = _controller->annotationFrame();
-    const auto catalogVolume = _controller->fiberMapCatalogVolume();
-    deps.catalogVolume = catalogVolumeKey(catalogVolume);
-    deps.catalogOrientation = catalogOrientationKey(catalogVolume);
+    if (const auto& annotation = _state->annotationVolume()) {
+        deps.annotationVolume = QString::fromStdString(annotation->id);
+        deps.voxelSizeUm = annotation->voxelSizeUm;
+    }
+    deps.catalogOrientation = catalogOrientationKey(_controller->fiberMapCatalogVolume());
     return deps;
 }
 
@@ -1708,8 +1706,8 @@ FiberMapWorkspace::layoutDependencies() const
     deps.packageGeneration = _layoutPackageGeneration;
     deps.umbilicusGeneration = _layoutUmbilicusGeneration;
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
-    deps.frame = _layoutFrame;
-    deps.catalogVolume = _layoutCatalogVolume;
+    deps.annotationVolume = _layoutAnnotationVolume;
+    deps.voxelSizeUm = _voxelSizeUm;
     deps.catalogOrientation = _layoutCatalogOrientation;
     return deps;
 }
@@ -2293,33 +2291,19 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
         }
         return;
     }
-    // The full frame, not just the grid: parameters were converted through
-    // the snapshot's voxel size, so a same-grid volume with a different
-    // recorded voxel size (the reversible VoxelSize stale cause) would make
-    // this result stale on arrival - publishing it would destroy a layout
-    // that is still valid for the volume the user switched back to. The
+    // Another annotation volume, or the same one at another voxel size:
+    // parameters were converted through the snapshot's voxel size, so this
+    // result would be stale on arrival - publishing it would destroy a layout
+    // that is still valid for the volume the user switched back to. Another
+    // pyramid level of the same volume is the same annotation volume. The
     // cache IS kept: its slots are content-keyed (params included), so
-    // switching back to the built frame re-warms.
-    if (!vc3d::annotation::sameAnnotationFrame(_controller->annotationFrame(),
-                                               job->snapshot.frame)) {
+    // switching back re-warms.
+    const auto current = currentDependencies();
+    if (current.annotationVolume != QString::fromStdString(job->snapshot.annotationVolume) ||
+        !vc3d::fiber_map::sameVoxelSize(current.voxelSizeUm, job->snapshot.voxelSizeUm)) {
         _layoutCache = std::move(job->cache);
         if (!refreshStaleState()) {
-            showStale(tr(
-                "viewing another volume's grid — switch back, or press Update"));
-        }
-        return;
-    }
-    // The same policy for a same-grid switch to another catalog volume: the
-    // winding sense is read per catalog volume, and the user has usually
-    // only switched away for now. Another pyramid level of the same volume
-    // is the same catalog volume (the frame comparison above judged the
-    // grids).
-    const auto catalogVolume = _controller->fiberMapCatalogVolume();
-    if (catalogVolumeKey(catalogVolume) != catalogVolumeKey(job->snapshot.catalogVolume)) {
-        _layoutCache = std::move(job->cache);
-        if (!refreshStaleState()) {
-            showStale(tr(
-                "viewing another catalog volume — switch back, or press Update"));
+            showStale(tr("viewing another volume — switch back, or press Update"));
         }
         return;
     }
@@ -2332,7 +2316,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     if (_controller->fiberDataGeneration() != job->snapshot.generation ||
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
         _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
-        catalogOrientationKey(catalogVolume) != catalogOrientationKey(job->snapshot.catalogVolume)) {
+        current.catalogOrientation != catalogOrientationKey(job->snapshot.catalogVolume)) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
             (void)_rebuildQueue.request(job->fullRebuild, job->automatic);
@@ -2379,10 +2363,9 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
     _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
-    _layoutCatalogVolume = catalogVolumeKey(job.snapshot.catalogVolume);
     _layoutCatalogOrientation = catalogOrientationKey(job.snapshot.catalogVolume);
     _layoutGeneration = job.snapshot.generation;
-    _layoutFrame = job.snapshot.frame;
+    _layoutAnnotationVolume = QString::fromStdString(job.snapshot.annotationVolume);
     _layoutPackageGeneration = job.builtPackageGeneration;
     _layoutUmbilicusGeneration = job.builtUmbilicusGeneration;
     _layoutBuilt = true;
@@ -2645,7 +2628,7 @@ void FiberMapWorkspace::finishRebuild()
             return;
         }
         // Nor into a volume the user has only switched to for now: the
-        // manual causes (Grid, Volume, VoxelSize) keep the map for the
+        // manual causes (Volume, VoxelSize) keep the map for the
         // volume it was built in until they press Update, and a pending
         // AUTOMATIC Update armed before the switch must not do it for
         // them. One they asked for is honoured - in particular the retry
@@ -2653,8 +2636,7 @@ void FiberMapWorkspace::finishRebuild()
         // mid-flight and now reads as a manual cause only because the
         // published map is still the other volume's.
         if (automatic && verdict.action == StaleVerdict::Action::MarkStale &&
-            (verdict.cause == StaleVerdict::Cause::Grid ||
-             verdict.cause == StaleVerdict::Cause::Volume ||
+            (verdict.cause == StaleVerdict::Cause::Volume ||
              verdict.cause == StaleVerdict::Cause::VoxelSize)) {
             return;
         }

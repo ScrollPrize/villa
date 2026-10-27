@@ -136,7 +136,7 @@ int runObjectStoreControllerTests()
                     "the stored umbilicus is read in the volume's voxels");
             require(controller.umbilicusStatus().available && controller.umbilicusStatus().text == "scroll",
                     "the fiber map status names the stored umbilicus");
-            const auto snapshot = controller.umbilicusForSnapshot(controller.annotationFrame());
+            const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->id);
             require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
             const auto token = controller.umbilicusFingerprint();
             add("second");

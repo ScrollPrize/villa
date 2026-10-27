@@ -1,5 +1,6 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
+#include <vc_reader/affine.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,17 @@ std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::cat
 // catalog volume's level id and voxel size for its own zarr, the voxel size of
 // its grid for a dataset derived from it. Empty for other locations.
 utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest*, const std::string& location);
+
+// The volume annotations on an open volume are kept in: the catalog volume it
+// shows, at level 0, so its pyramid levels and derived datasets share them;
+// else the volume itself. With the map from the open volume's voxels into
+// that volume's (the catalog registration graph's route) and that volume's
+// voxel size.
+struct AnnotationVolume {
+    std::string id;
+    vcr::catalog::Affine fromVolume;
+    std::optional<double> voxelSizeUm;
+};
 
 }
 
@@ -215,3 +227,9 @@ private:
     [[nodiscard]] utils::Json toJson() const;
     void fromJson(const utils::Json& j);
 };
+
+namespace vc::project {
+// Where `volume`'s annotations are kept (AnnotationVolume), from `pkg`'s
+// catalog when it has one.
+AnnotationVolume annotationVolume(const VolumePkg* pkg, const Volume& volume);
+}

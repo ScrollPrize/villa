@@ -1060,7 +1060,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this](const QString& path) {
                 if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
             });
-    _fiberMapWorkspace = new FiberMapWorkspace(_lineAnnotationController.get(), this);
+    _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
     if (auto* tabBar = _workspaceTabs->tabBar()) {
@@ -5356,14 +5356,8 @@ void CWindow::onManualLocationChanged()
 void CWindow::refreshFocusBoundsUi()
 {
     if (_fiberMapWorkspace) {
-        auto bounds = _state ? _state->activeFocusBounds() : std::nullopt;
-        if (bounds && _state) {
-            // Viewer bounds index the current volume; map geometry indexes
-            // the annotation frame (which can be a different pyramid base).
-            bounds = vc3d::annotation::focusBoundsInAnnotationFrame(
-                bounds, _state->annotationFrame());
-        }
-        _fiberMapWorkspace->setFocusBounds(bounds);
+        // Map geometry indexes the annotation volume, as stored bounds do.
+        _fiberMapWorkspace->setFocusBounds(_state ? _state->activeAnnotationFocusBounds() : std::nullopt);
     }
     if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
         return;

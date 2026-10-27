@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <exception>
 #include <thread>
 #include <optional>
@@ -40,6 +41,23 @@ vc::objects::OpenOptions viewerOpenOptions()
     options.catalogTransforms = catalogTransformSnapshot();
     options.geometryCacheBytes = size_t(256) << 20;
     return options;
+}
+
+// The box spanned by `box`'s corners through `m`.
+Rect3D mappedBox(const Rect3D& box, const vcr::catalog::Affine& m)
+{
+    Rect3D result;
+    result.low = cv::Vec3f::all(std::numeric_limits<float>::infinity());
+    result.high = cv::Vec3f::all(-std::numeric_limits<float>::infinity());
+    for (int corner = 0; corner < 8; ++corner) {
+        const auto p = m.apply({(corner & 1 ? box.high : box.low)[0], (corner & 2 ? box.high : box.low)[1],
+                                (corner & 4 ? box.high : box.low)[2]});
+        for (int axis = 0; axis < 3; ++axis) {
+            result.low[axis] = std::min(result.low[axis], float(p[axis]));
+            result.high[axis] = std::max(result.high[axis], float(p[axis]));
+        }
+    }
+    return result;
 }
 
 struct SurfaceFocusPoint {
@@ -303,6 +321,7 @@ void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
     const bool changed = _vpkg != pkg;
     _vpkg = std::move(pkg);
+    updateAnnotationVolume();
     if (changed) {
         // Restore without invoking setters: switching projects must not persist
         // the previous project's bounds into either project.
@@ -337,40 +356,33 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
         return;
     }
     _currentVolume = std::move(vol);
+    updateAnnotationVolume();
     const auto volumeId = currentVolumeId();
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, volumeId);
     emit focusBoundsChanged();
 }
 
-vc3d::annotation::AnnotationFrame CState::annotationFrame() const
+void CState::updateAnnotationVolume()
 {
-    if (!_currentVolume)
-        return {};
-    // A catalog volume's level is exact and outranks rounded physical
-    // resolutions; its level-0 pixel size is the source resolution.
-    std::optional<double> exactFactor;
-    std::optional<double> stampedResolution;
-    if (const auto view = _vpkg ? _vpkg->catalogView(_currentVolume->id()) : std::nullopt) {
-        exactFactor = std::ldexp(1.0, view->level);
-        stampedResolution = _vpkg->catalog()->findSample(view->sampleId)->findVolume(view->volumeId)->pixelSizeUm;
-    }
-    return vc3d::annotation::deriveAnnotationFrame(
-        _currentVolume->voxelSize(), _currentVolume->baseScaleLevel(),
-        exactFactor, stampedResolution,
-        {static_cast<double>(_currentVolume->sliceWidth()),
-         static_cast<double>(_currentVolume->sliceHeight()),
-         static_cast<double>(_currentVolume->numSlices())});
+    _annotationVolume.reset();
+    if (_currentVolume) _annotationVolume = vc::project::annotationVolume(_vpkg.get(), *_currentVolume);
 }
 
 std::optional<Rect3D> CState::focusBounds() const
 {
-    return vc3d::annotation::focusBoundsInVolume(_focusBounds, annotationFrame());
+    if (!_focusBounds || !_annotationVolume) return std::nullopt;
+    return mappedBox(*_focusBounds, _annotationVolume->fromVolume.inverse());
 }
 
 std::optional<Rect3D> CState::activeFocusBounds() const
 {
     return _focusBoundsEnabled ? focusBounds() : std::nullopt;
+}
+
+std::optional<Rect3D> CState::activeAnnotationFocusBounds() const
+{
+    return _focusBoundsEnabled && _annotationVolume ? _focusBounds : std::nullopt;
 }
 
 bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
@@ -379,19 +391,12 @@ uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
 
 void CState::setFocusBounds(const Rect3D& bounds)
 {
-    const auto inAnnotationFrame =
-        vc3d::annotation::focusBoundsInAnnotationFrame(bounds, annotationFrame());
-    if (!inAnnotationFrame)
+    if (!_annotationVolume)
         return;
-    Rect3D normalized;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(inAnnotationFrame->low[axis]) ||
-            !std::isfinite(inAnnotationFrame->high[axis])) {
+    const auto normalized = mappedBox(bounds, _annotationVolume->fromVolume);
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(normalized.low[axis]) || !std::isfinite(normalized.high[axis]))
             return;
-        }
-        normalized.low[axis] = std::min(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
-        normalized.high[axis] = std::max(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
-    }
     if (_focusBounds && _focusBounds->low == normalized.low &&
         _focusBounds->high == normalized.high) {
         return;

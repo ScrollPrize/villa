@@ -16,7 +16,7 @@
 #include <vc_reader/catalog.hpp>
 
 #include "vc/core/util/Rect3D.hpp"
-#include "AnnotationFrame.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 
 Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
@@ -67,11 +67,15 @@ public:
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
     void setCurrentVolume(std::shared_ptr<Volume> vol);
-    vc3d::annotation::AnnotationFrame annotationFrame() const;
+    // The volume the current volume's annotations are kept in
+    // (vc::project::annotationVolume); nothing without a volume.
+    const std::optional<vc::project::AnnotationVolume>& annotationVolume() const { return _annotationVolume; }
 
-    // Public bounds use current-volume XYZ; storage uses annotation-frame XYZ.
+    // Public bounds use current-volume XYZ; storage uses annotation-volume XYZ.
     std::optional<Rect3D> focusBounds() const;
     std::optional<Rect3D> activeFocusBounds() const;
+    // The active bounds in the annotation volume's voxels.
+    std::optional<Rect3D> activeAnnotationFocusBounds() const;
     bool focusBoundsEnabled() const;
     uint64_t focusBoundsRevision() const;
     void setFocusBounds(const Rect3D& bounds);
@@ -134,6 +138,7 @@ signals:
     void poiChanged(std::string, POI*);
 
 private:
+    void updateAnnotationVolume();
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
@@ -142,7 +147,8 @@ private:
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
-    std::optional<Rect3D> _focusBounds; // Annotation frame, independent of pyramid level.
+    std::optional<vc::project::AnnotationVolume> _annotationVolume;
+    std::optional<Rect3D> _focusBounds; // In the annotation volume, independent of pyramid level.
     bool _focusBoundsEnabled = false;
     uint64_t _focusBoundsRevision = 0;
     std::string _segmentationGrowthVolumeId;

@@ -1,5 +1,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <vc_reader/registrations.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -1487,4 +1489,19 @@ std::string VolumePkg::getVolpkgDirectory() const
 {
     if (path_.empty()) return {};
     return path_.parent_path().string();
+}
+
+vc::project::AnnotationVolume vc::project::annotationVolume(const VolumePkg* pkg, const Volume& volume)
+{
+    const auto positive = [](std::optional<double> value) {
+        return value && std::isfinite(*value) && *value > 0 ? value : std::nullopt;
+    };
+    if (const auto view = pkg ? pkg->catalogView(volume.id()) : std::nullopt) {
+        const auto* sample = pkg->catalog()->findSample(view->sampleId);
+        vcr::catalog::RegistrationGraph graph;
+        graph.addSample(*sample);
+        return {view->volumeId, graph.resolve(view->frameId(), view->volumeId).resolved().forward,
+                positive(sample->findVolume(view->volumeId)->pixelSizeUm)};
+    }
+    return {volume.id(), {}, positive(volume.voxelSize())};
 }

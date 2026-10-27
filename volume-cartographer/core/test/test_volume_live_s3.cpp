@@ -133,6 +133,13 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
             CHECK(rebased->voxelSize() == doctest::Approx(4 * 2.399));
             CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
             CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
+            // Annotations on either level are kept in the level-0 catalog volume.
+            const auto annotation = vc::project::annotationVolume(project.get(), *rebased);
+            CHECK(annotation.id == "20260102150214");
+            CHECK(annotation.fromVolume.apply({1, 2, 3}) == std::array<double, 3>{4, 8, 12});
+            REQUIRE(annotation.voxelSizeUm);
+            CHECK(*annotation.voxelSizeUm == doctest::Approx(2.399));
+            CHECK(vc::project::annotationVolume(project.get(), *volume).id == "20260102150214");
         }
     }
 

@@ -29,7 +29,6 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/mat.hpp>
 
-#include "AnnotationFrame.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
@@ -206,27 +205,25 @@ public:
 
     struct FiberMapSnapshot {
         std::vector<FiberMapFiber> fibers;
-        // The frame this snapshot's geometry was derived in. Reported rather than
-        // left for a holder to re-derive: a second call to annotationFrame()
-        // reads live volume state and so could answer differently, which would
-        // tag a layout with a frame it was not built in.
-        vc3d::annotation::AnnotationFrame frame;
+        // The volume this snapshot's geometry is in (CState::annotationVolume).
+        // Reported rather than left for a holder to re-derive: live volume
+        // state could answer differently, which would tag a layout with a
+        // volume it was not built in.
+        std::string annotationVolume;
         // fiberDataGeneration() when this snapshot was taken; a holder compares
         // it to know whether what it built from this is still current.
         uint64_t generation = 0;
-        // Umbilicus control points scaled into the fibers' frame, sorted by z;
+        // Umbilicus control points in that volume, sorted by z;
         // empty when no plausible umbilicus was found.
         std::vector<cv::Vec3f> umbilicusCenters;
-        // Physical size of one voxel of the frame the fibers are annotated in,
-        // in µm. Unset when the package cannot say: no coordinate identity to
-        // read it from and no volume to fall back on. There is no default on
+        // Physical size of one voxel of that volume, in µm. Unset when nothing
+        // can say. There is no default on
         // purpose — a guessed voxel size turns every derived physical figure
         // (cm, reference radii, scroll height) silently wrong, so consumers
         // must handle the unset case and show voxels instead.
         std::optional<double> voxelSizeUm;
-        // Scroll z extent in the fibers' frame, i.e. the current volume's slice
-        // count scaled back to the annotation (level 0) resolution; 0 when the
-        // volume is unknown.
+        // Scroll z extent in that volume (the current volume's slice count
+        // mapped into it); 0 when the volume is unknown.
         int annotationZSlices = 0;
         // The catalog volume the current volume shows and its orientation;
         // nullopt for a volume the catalog does not publish.
@@ -414,7 +411,6 @@ public:
     // Default-constructed (no voxel size, zero extent) when no volume is loaded.
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
-    [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
     // The stored umbilicus of the current volume as uuid@revision, or why there
     // is none: changes whenever the umbilicus derived views depend on does.
     [[nodiscard]] QString umbilicusFingerprint() const;
@@ -1099,8 +1095,7 @@ private:
         QString label;                   // the umbilicus' name; empty when refused
         QString message;                 // why there is none; empty on success
     };
-    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(
-        const vc3d::annotation::AnnotationFrame& frame) const;
+    [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(const std::string& annotationVolume) const;
     void onActiveVolumeChanged();
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();

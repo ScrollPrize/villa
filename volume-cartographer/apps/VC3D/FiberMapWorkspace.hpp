@@ -21,7 +21,6 @@
 #include <vector>
 
 
-#include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"
 #include "FiberMapKollesis.hpp"
 #include "FiberMapRebuildQueue.hpp"
@@ -31,6 +30,7 @@
 #include "vc/core/util/Rect3D.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
+class CState;
 class LineAnnotationController;
 class QCheckBox;
 class QDockWidget;
@@ -115,8 +115,8 @@ class FiberMapWorkspace : public QMainWindow
     Q_OBJECT
 
 public:
-    explicit FiberMapWorkspace(LineAnnotationController* controller,
-                               QWidget* parent = nullptr);
+    FiberMapWorkspace(CState* state, LineAnnotationController* controller,
+                      QWidget* parent = nullptr);
     // Shuts the rebuild queue down (pending dropped, in-flight publication
     // refused) and waits out the private worker pool; the worker owns its
     // own data, so the wait is for clean pool teardown, not for safety of
@@ -425,6 +425,7 @@ private:
 
     // QPointer: the controller is owned elsewhere and dies before this widget
     // during CWindow teardown; guards keep late signals harmless.
+    CState* _state;
     QPointer<LineAnnotationController> _controller;
     FiberMapView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
@@ -597,9 +598,8 @@ private:
     // What the current layout was built from, and whether a change has been seen
     // since; a fresh workspace is stale until its first rebuild.
     uint64_t _layoutGeneration = 0;
-    vc3d::annotation::AnnotationFrame _layoutFrame;
+    QString _layoutAnnotationVolume;
     QString _layoutUmbilicusFingerprint;
-    QString _layoutCatalogVolume;
     QString _layoutCatalogOrientation;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.

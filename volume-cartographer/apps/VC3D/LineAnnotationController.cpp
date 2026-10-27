@@ -378,6 +378,13 @@ std::array<double, 6> boxAroundPoints(const std::vector<cv::Vec3d>& points, doub
     }
     return box;
 }
+
+// A point of the current volume in the volume its annotations are kept in.
+cv::Vec3d inAnnotationVolume(const vc::project::AnnotationVolume& annotation, const cv::Vec3d& point)
+{
+    const auto p = annotation.fromVolume.apply({point[0], point[1], point[2]});
+    return {p[0], p[1], p[2]};
+}
 }  // namespace
 
 using vc3d::line_annotation::branchDirectionsCompatible;
@@ -2887,11 +2894,10 @@ std::optional<std::vector<cv::Vec3d>> LineAnnotationController::fiberMapLinePoin
     if (!fiber || !fiber->editorError.empty() || !fiberInVolume(*fiber)) {
         return std::nullopt;
     }
+    const auto& annotation = _state->annotationVolume();
+    if (!annotation) return std::nullopt;
     auto points = fiberInVolumeCoordinates(*fiber).linePoints;
-    const double factor = annotationFrame().factor;
-    for (auto& point : points) {
-        point *= factor;
-    }
+    for (auto& point : points) point = inAnnotationVolume(*annotation, point);
     return points;
 }
 
@@ -5877,29 +5883,23 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     FiberMapSnapshot snapshot;
     snapshot.generation = _fiberDataGeneration;
 
-    // Fibers are annotated in a source frame the current volume may only
-    // describe indirectly, so the resolution and the voxel counts both come from
-    // one derivation — deriving them separately is what let a rebased store pair
-    // a level-0 resolution with level-N counts.
-    const auto frame = annotationFrame();
-    snapshot.frame = frame;
-    snapshot.voxelSizeUm = frame.voxelSizeUm;
+    // The map is laid out in the annotation volume (the catalog volume the
+    // current volume shows, every pyramid level alike), at its voxel size.
+    const auto annotation = _state ? _state->annotationVolume() : std::nullopt;
+    if (!annotation) return snapshot;
+    snapshot.annotationVolume = annotation->id;
+    snapshot.voxelSizeUm = annotation->voxelSizeUm;
     if (snapshot.voxelSizeUm) {
-        Logger()->info(
-            "Fiber map: annotation voxel size {:g} um, volume grid scaled by "
-            "x{:g} into the annotation frame",
-            *snapshot.voxelSizeUm,
-            frame.factor);
+        Logger()->info("Fiber map: laid out in volume {} at {:g} um per voxel", annotation->id, *snapshot.voxelSizeUm);
     } else {
         Logger()->info("Fiber map: no voxel size available; the map will report "
                        "lengths in voxels");
     }
 
-    // The scroll's z extent in that same frame, so it pairs with voxelSizeUm.
-    if (frame.extentXyz[2] > 0.0) {
-        snapshot.annotationZSlices =
-            static_cast<int>(std::llround(frame.extentXyz[2]));
-    }
+    // The scroll's z extent in that same volume, so it pairs with voxelSizeUm.
+    if (const auto volume = _state->currentVolume())
+        snapshot.annotationZSlices = static_cast<int>(std::llround(
+            annotation->fromVolume.apply({0.0, 0.0, double(volume->numSlices())}, true)[2]));
 
     // Which catalog volume this is, for the map's winding sense.
     snapshot.catalogVolume = fiberMapCatalogVolume();
@@ -5940,8 +5940,8 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         }
         entry.controlPoints.assign(display.controlPoints.begin(), display.controlPoints.end());
         entry.linePoints = display.linePoints;
-        for (auto& point : entry.controlPoints) point *= frame.factor;
-        for (auto& point : entry.linePoints) point *= frame.factor;
+        for (auto& point : entry.controlPoints) point = inAnnotationVolume(*annotation, point);
+        for (auto& point : entry.linePoints) point = inAnnotationVolume(*annotation, point);
         const size_t spanCount =
             fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
         entry.tracedSegments.reserve(spanCount);
@@ -5984,7 +5984,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // Which umbilicus resolves, which frame it is in, and what to say about it
     // are one question with several exits, answered by umbilicusForSnapshot()
     // so this function stays the data export it reads as.
-    SnapshotUmbilicus umbilicus = umbilicusForSnapshot(frame);
+    SnapshotUmbilicus umbilicus = umbilicusForSnapshot(annotation->id);
     snapshot.umbilicusMessage = std::move(umbilicus.message);
     snapshot.umbilicusLabel = std::move(umbilicus.label);
     snapshot.umbilicusCenters = std::move(umbilicus.centers);
@@ -5992,19 +5992,19 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
 }
 
 LineAnnotationController::SnapshotUmbilicus
-LineAnnotationController::umbilicusForSnapshot(
-    const vc3d::annotation::AnnotationFrame& frame) const
+LineAnnotationController::umbilicusForSnapshot(const std::string& annotationVolume) const
 {
     SnapshotUmbilicus result;
     const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
     std::optional<vc::objects::VolumeUmbilicus> umbilicus;
-    if (!attachment || _state->currentVolumeId().empty()) {
-        result.message = tr("no object store or volume");
+    if (!attachment) {
+        result.message = tr("no object store");
     } else {
         try {
-            umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, _state->currentVolumeId());
+            // Read in the annotation volume, the fibers' frame on the map.
+            umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, annotationVolume);
             if (!umbilicus) {
-                result.message = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(_state->currentVolumeId()));
+                result.message = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(annotationVolume));
             }
         } catch (const std::exception& error) {
             result.message = QString::fromUtf8(error.what());
@@ -6014,13 +6014,8 @@ LineAnnotationController::umbilicusForSnapshot(
         Logger()->warn("Fiber map: no usable umbilicus: {}", result.message.toStdString());
         return result;
     }
-    if (!vc3d::annotation::hasCoordinateFrame(frame)) {
-        result.message = tr("The current volume has no annotation frame.");
-        return result;
-    }
-    // Stored points are in the volume's voxels; fibers live in the annotation frame.
     for (const auto& p : umbilicus->points) {
-        result.centers.push_back(cv::Vec3f(float(p[0]), float(p[1]), float(p[2])) * static_cast<float>(frame.factor));
+        result.centers.push_back(cv::Vec3f(float(p[0]), float(p[1]), float(p[2])));
     }
     std::sort(result.centers.begin(), result.centers.end(),
               [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
@@ -11621,18 +11616,6 @@ void LineAnnotationController::publishUmbilicusNotice()
             }
             pane.dialog->setUmbilicusNotice(notice);
         }
-    }
-}
-
-vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() const
-{
-    if (!_state) {
-        return {};
-    }
-    try {
-        return _state->annotationFrame();
-    } catch (...) {
-        return {};
     }
 }
 
