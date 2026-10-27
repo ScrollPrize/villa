@@ -18,7 +18,7 @@
 #include <bit>
 #include <filesystem>
 
-#include "vc/core/util/MemMap.hpp"
+#include <vc_object_store/MemMap.hpp>
 
 namespace vc::core::util {
 
@@ -50,7 +50,7 @@ inline uint32_t read_be_u32_at(const char* base, size_t byte_offset) {
 }
 
 struct MmappedData {
-    vc::memmap::MappedFileRO map;
+    vc::objects::memmap::MappedFileRO map;
     const void* data = nullptr;
     size_t size = 0;
 };

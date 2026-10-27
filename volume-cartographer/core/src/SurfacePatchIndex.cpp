@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "vc/core/util/MemMap.hpp"
+#include <vc_object_store/MemMap.hpp>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -477,7 +477,7 @@ public:
     }
 
 private:
-    vc::memmap::MappedFileRO map_;
+    vc::objects::memmap::MappedFileRO map_;
 };
 
 class MappedTifBand {
