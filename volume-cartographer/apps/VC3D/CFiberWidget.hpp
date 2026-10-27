@@ -105,7 +105,6 @@ public:
     // the selected fiber's header line, the total at the top) read in
     // centimetres; unset, they stay in voxels and the column header says so.
     void setAnnotationVoxelSizeUm(std::optional<double> voxelSizeUm);
-    [[nodiscard]] std::optional<double> annotationVoxelSizeUm() const { return _voxelSizeUm; }
     // Sum of every listed fiber's lengthVx (finite values only).
     [[nodiscard]] double totalLengthVx() const;
     void updateAlignmentMetrics(uint64_t fiberId,
@@ -232,7 +231,6 @@ private:
     QSlider* _traceSlider = nullptr;
     QPushButton* _openInLineAnnotationButton = nullptr;
     QLabel* _annotationStatusLabel = nullptr;
-    bool _lineAnnotationActive = false;
     QLabel* _totalLengthLabel = nullptr;
     QCheckBox* _calcMetricsCheckBox;
     QTreeView* _treeView;

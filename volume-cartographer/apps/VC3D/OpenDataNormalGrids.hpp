@@ -32,7 +32,6 @@ struct OpenDataNormalGridsInfo {
     int sourceCoordinateLevel = 0;
 };
 
-[[nodiscard]] const vcr::catalog::OpenDataArtifact* normalGridsArtifact(const vcr::catalog::OpenDataVolume& volume);
 [[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
     const vcr::catalog::OpenDataVolume& volume);

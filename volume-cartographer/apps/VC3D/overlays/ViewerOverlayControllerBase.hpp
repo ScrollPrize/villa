@@ -124,7 +124,6 @@ public:
         qreal lineWidth{3.0};
         qreal opacity{1.0};
         bool isEraser{false};
-        int pathId{0};
         PathBrushShape brushShape{PathBrushShape::Circle};
         PathRenderMode renderMode{PathRenderMode::LineStrip};
         qreal pointRadius{3.0};
@@ -344,7 +343,6 @@ protected:
     // The slab of half depth `halfDepth` around a plane viewer's visible
     // rectangle (the region the store overlays query); nothing off a plane.
     std::optional<vc::fibers::ViewRegion> planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const;
-    bool isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
     Surface* viewerSurface(VolumeViewerBase* viewer) const;
 
     FilteredPoints filterPoints(VolumeViewerBase* viewer,

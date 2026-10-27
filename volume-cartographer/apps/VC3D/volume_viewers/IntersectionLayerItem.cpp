@@ -32,13 +32,6 @@ void IntersectionLayerItem::setEntries(std::vector<Entry> entries)
     update();
 }
 
-void IntersectionLayerItem::setMinCachedElements(int elements)
-{
-    _minCachedElements = std::max(0, elements);
-    dropCache();
-    update();
-}
-
 QRectF IntersectionLayerItem::boundingRect() const
 {
     return _bounds;
@@ -79,7 +72,7 @@ void IntersectionLayerItem::paint(QPainter* painter,
 
     // Without a target widget (QGraphicsScene::render into an image, printing)
     // there is no stable viewport to cache against.
-    if (!widget || _elementCount < _minCachedElements ||
+    if (!widget || _elementCount < kMinCachedElements ||
         painter->opacity() < 1.0) {
         dropCache();
         paintEntries(painter);

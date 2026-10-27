@@ -19,10 +19,6 @@ public:
     void addSeparator();
     void clearOptions();
     QList<QCheckBox*> options() const { return _options; }
-    int checkedCount() const;
-
-signals:
-    void optionToggled(QCheckBox* option, bool checked);
 
 private:
     QList<QCheckBox*> _options;

@@ -3,7 +3,6 @@
 #include "ui_VCSettings.h"
 #include <QStringList>
 #include <memory>
-#include <vector>
 
 class QCheckBox;
 class QSpinBox;
@@ -14,8 +13,6 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
 
     public:
         explicit SettingsDialog(QWidget* parent = nullptr);
-
-        static std::vector<int> expandSettingToIntRange(const QString& setting);
 
     protected slots:
         void accept() override;

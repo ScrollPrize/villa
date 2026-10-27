@@ -13,9 +13,6 @@
 namespace {
 using namespace vc::objects;
 
-const std::vector<std::string> kRowFields{"name", "tags", "meta", "surface", "created_by", "created_at",
-                                          "changed_by", "changed_at", "approval_state"};
-
 struct Listing {
     std::vector<SurfaceCatalog::Row> rows;
     // The surfaces read: those missing from rows left the listing.

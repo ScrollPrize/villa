@@ -723,11 +723,6 @@ QString UnifiedBrowserDialog::currentUri() const
         : _currentRemoteUrl;
 }
 
-QString UnifiedBrowserDialog::itemUri(const QListWidgetItem* item) const
-{
-    return item ? item->data(Qt::UserRole).toString() : QString();
-}
-
 bool UnifiedBrowserDialog::isAcceptableUri(const QString& uri, bool isFile) const
 {
     if (uri.isEmpty()) return false;

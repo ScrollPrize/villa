@@ -1147,11 +1147,6 @@ std::optional<vc::fibers::ViewRegion> ViewerOverlayControllerBase::planeViewRegi
     return vc3d::store::viewRegion(corner(rect.topLeft()), corner(rect.topRight()), corner(rect.bottomLeft()), halfDepth);
 }
 
-bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const
-{
-    return visibleSceneRect(viewer).contains(scenePoint);
-}
-
 Surface* ViewerOverlayControllerBase::viewerSurface(VolumeViewerBase* viewer) const
 {
     return viewer ? viewer->currentSurface() : nullptr;

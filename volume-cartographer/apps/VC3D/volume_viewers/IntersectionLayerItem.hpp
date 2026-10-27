@@ -35,15 +35,13 @@ public:
 
     // Path groups smaller than this (in QPainterPath elements) are drawn
     // directly; caching them would cost a viewport-sized image for no gain.
-    static constexpr int kDefaultMinCachedElements = 4096;
+    static constexpr int kMinCachedElements = 4096;
 
     explicit IntersectionLayerItem(QGraphicsItem* parent = nullptr);
 
     // Replaces the paths, drawn in order. Invalidates the cached raster.
     void setEntries(std::vector<Entry> entries);
     const std::vector<Entry>& entries() const { return _entries; }
-
-    void setMinCachedElements(int elements);
 
     QRectF boundingRect() const override;
     QPainterPath shape() const override;
@@ -62,7 +60,6 @@ private:
     std::vector<Entry> _entries;
     QRectF _bounds;
     qsizetype _elementCount = 0;
-    int _minCachedElements = kDefaultMinCachedElements;
 
     QImage _cache;
     QTransform _cacheTransform;

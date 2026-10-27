@@ -257,11 +257,6 @@ void writeCompleteMarker(const std::filesystem::path& dir,
 
 } // namespace
 
-const vcr::catalog::OpenDataArtifact* normalGridsArtifact(const vcr::catalog::OpenDataVolume& volume)
-{
-    return vcr::catalog::findArtifact(volume.artifacts, kNormalGridsArtifactType);
-}
-
 std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
     const vcr::catalog::OpenDataVolume& volume)

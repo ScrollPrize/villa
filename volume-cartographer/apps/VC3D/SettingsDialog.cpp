@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
-#include <vector>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QFileDialog>
@@ -205,33 +204,4 @@ void SettingsDialog::accept()
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
     QDialog::accept();
-}
-
-// Expand string that contains a range definition from the user settings into an integer vector
-std::vector<int> SettingsDialog::expandSettingToIntRange(const QString& setting)
-{
-    std::vector<int> res;
-    if (setting.isEmpty()) {
-        return res;
-    }
-
-    auto value = setting.simplified();
-    value.replace(" ", "");
-    auto commaSplit = value.split(",");
-    for(auto str : commaSplit) {
-        if (str.contains("-")) {
-            // Expand the range to distinct values
-            auto dashSplit = str.split("-");
-            // We need to have two split results (before and after the dash), otherwise skip
-            if (dashSplit.size() == 2) {
-                for(int i = dashSplit.at(0).toInt(); i <= dashSplit.at(1).toInt(); i++) {
-                    res.push_back(i);
-                }
-            }
-        } else {
-            res.push_back(str.toInt());
-        }
-    }
-
-    return res;
 }

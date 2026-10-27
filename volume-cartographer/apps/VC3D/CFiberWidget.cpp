@@ -655,7 +655,6 @@ void CFiberWidget::setAnnotationStatus(const QString& text)
 
 void CFiberWidget::setLineAnnotationActive(bool active)
 {
-    _lineAnnotationActive = active;
     _treeView->setToolTip(active
         ? tr("Click a fiber to select it; double-click to open it in Line Annotation.")
         : tr("Click a fiber to select it and focus the main views; "
