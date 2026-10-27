@@ -218,7 +218,7 @@ QString firstArtifactUrl(const std::vector<vcr::catalog::OpenDataArtifact>& arti
 
 QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
 {
-    const auto* artifact = vcr::catalog::findArtifact(volume.artifacts, "ome-zarr");
+    const auto* artifact = vcr::catalog::preferredVolumeArtifact(volume);
     QStringList filenames;
     if (artifact) {
         for (const auto& origin : artifact->origins) {

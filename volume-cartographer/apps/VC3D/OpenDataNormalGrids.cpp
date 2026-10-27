@@ -43,12 +43,7 @@ std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
         }
         vcr::s3::ListPage page;
         try {
-            const auto body = vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken));
-            if (body.empty()) {
-                if (errorOut) *errorOut = "listing returned no data for " + prefix.key;
-                return {};
-            }
-            page = vcr::s3::parseListPage(body);
+            page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken)));
         } catch (const std::exception& e) {
             if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
             return {};
@@ -131,33 +126,20 @@ void publishDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
-constexpr const char* kCompleteMarker = "normal-grids-complete.json";
-
-// Write the marker NormalGridVolume streams from. Idempotent.
-bool writeRemoteMarker(const std::filesystem::path& dir, const std::string& url)
+// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>/L<level>-<url hash>
+std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
+                                          const std::string& sampleId,
+                                          const std::string& volumeId,
+                                          int sourceCoordinateLevel,
+                                          std::string_view url)
 {
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        return false;
-    }
-    const auto markerPath = dir / vc::core::util::kNormalGridsRemoteMarker;
-    if (std::filesystem::is_regular_file(markerPath, ec)) {
-        try {
-            const auto existing = nlohmann::json::parse(std::ifstream(markerPath));
-            if (existing.value("url", std::string()) == url) {
-                return true;
-            }
-        } catch (...) {
-        }
-    }
-    nlohmann::json marker;
-    marker["url"] = url;
-    std::ofstream out(markerPath, std::ios::trunc);
-    out << marker.dump(2);
-    out.close();
-    return static_cast<bool>(out);
+    return remoteCacheRoot / "normal_grids" /
+           vcr::catalog::safePathComponent(sampleId.empty() ? "sample" : sampleId) /
+           vcr::catalog::safePathComponent(volumeId.empty() ? "volume" : volumeId) /
+           ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
 }
+
+constexpr const char* kCompleteMarker = "normal-grids-complete.json";
 
 void writeCompleteMarker(const std::filesystem::path& dir,
                          int files,
@@ -221,27 +203,6 @@ std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(const Vol
     return url ? pkg.catalog()->volumeAt(*url, 0) : std::nullopt;
 }
 
-std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
-                                          const std::string& sampleId,
-                                          const std::string& volumeId,
-                                          int sourceCoordinateLevel,
-                                          std::string_view url)
-{
-    return remoteCacheRoot / "normal_grids" /
-           vcr::catalog::safePathComponent(sampleId.empty() ? "sample" : sampleId) /
-           vcr::catalog::safePathComponent(volumeId.empty() ? "volume" : volumeId) /
-           ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
-}
-
-bool isCachedNormalGridsDir(const std::filesystem::path& dir)
-{
-    std::error_code ec;
-    return std::filesystem::is_directory(dir / "xy", ec) &&
-           std::filesystem::is_directory(dir / "xz", ec) &&
-           std::filesystem::is_directory(dir / "yz", ec) &&
-           std::filesystem::is_regular_file(dir / "metadata.json", ec);
-}
-
 namespace {
 
 // Create the streaming cache dir for this pairing (writing the remote-marker
@@ -256,7 +217,7 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     }
     const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
                                          info.sourceCoordinateLevel, info.url);
-    if (!writeRemoteMarker(dir, info.url)) {
+    if (!vc::core::util::writeNormalGridsRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
     }
@@ -491,7 +452,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    if (!isCachedNormalGridsDir(finalDir)) {
+    if (!vc::core::util::hasNormalGridFiles(finalDir)) {
         if (errorOut) {
             *errorOut = "downloaded data at " + finalDir.string() +
                         " is not a normal grid store (missing xy/xz/yz or metadata.json)";
@@ -501,7 +462,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
 
     // Keep the dir streamable (harmless once complete) and record completion
     // so the catalog can report "all downloaded" without a remote listing.
-    writeRemoteMarker(finalDir, info.url);
+    vc::core::util::writeNormalGridsRemoteMarker(finalDir, info.url);
     writeCompleteMarker(finalDir, static_cast<int>(objects.size()), state.totalBytes);
 
     Logger()->info("Downloaded normal grids for {}/{} to {}",

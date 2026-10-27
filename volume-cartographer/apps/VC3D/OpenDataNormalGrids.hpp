@@ -38,18 +38,6 @@ struct OpenDataNormalGridsInfo {
 [[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(
     const VolumePkg& pkg, const vc::project::Entry& entry);
 
-// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>/L<level>-<url hash>
-[[nodiscard]] std::filesystem::path normalGridsCacheDir(
-    const std::filesystem::path& remoteCacheRoot,
-    const std::string& sampleId,
-    const std::string& volumeId,
-    int sourceCoordinateLevel,
-    std::string_view artifactUrl);
-
-// True when the directory looks like a complete normal-grid store
-// (metadata.json plus xy/, xz/, yz/).
-[[nodiscard]] bool isCachedNormalGridsDir(const std::filesystem::path& dir);
-
 // Set up streaming normal grids for every volume of this sample that has a
 // normal-grids artifact. Returns the number of entries attached. selection
 // optionally restricts volumes and representations; nullptr attaches all.
@@ -85,7 +73,7 @@ using NormalGridsProgressCallback =
     std::function<void(const NormalGridsDownloadProgress&)>;
 
 // Enumerate the artifact's S3 prefix (anonymous ListObjectsV2) and download all
-// objects with `workers` threads into normalGridsCacheDir(...). The download
+// objects with `workers` threads into the volume's normal-grid cache. The download
 // lands in a temp dir and is published atomically. Returns the final cache dir,
 // or an empty path on failure/cancellation (errorOut explains why).
 [[nodiscard]] std::filesystem::path downloadOpenDataNormalGrids(

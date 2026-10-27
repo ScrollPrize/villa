@@ -773,4 +773,29 @@ std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir
     return url;
 }
 
+bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url)
+{
+    if (normalGridsRemoteUrl(dir) == url) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+    auto marker = utils::Json::object();
+    marker["url"] = url;
+    std::ofstream out(dir / kNormalGridsRemoteMarker, std::ios::trunc);
+    out << marker.dump(2);
+    out.close();
+    return static_cast<bool>(out);
+}
+
+bool hasNormalGridFiles(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    return fs::is_directory(dir / "xy", ec) && fs::is_directory(dir / "xz", ec) &&
+           fs::is_directory(dir / "yz", ec) && fs::is_regular_file(dir / "metadata.json", ec);
+}
+
 } // namespace vc::core::util

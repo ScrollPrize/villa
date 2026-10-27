@@ -134,10 +134,7 @@ bool isNormalGridDir(const fs::path& dir)
     // A streaming cache dir is a valid store even before any grid files have
     // been fetched — NormalGridVolume pulls them on demand via the marker URL.
     if (fs::is_regular_file(dir / vc::core::util::kNormalGridsRemoteMarker)) return true;
-    return fs::is_directory(dir / "xy")
-        && fs::is_directory(dir / "xz")
-        && fs::is_directory(dir / "yz")
-        && fs::exists(dir / "metadata.json");
+    return vc::core::util::hasNormalGridFiles(dir);
 }
 
 bool isDirectRemoteZarrLocation(std::string location)

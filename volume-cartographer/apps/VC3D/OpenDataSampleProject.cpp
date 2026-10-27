@@ -8,7 +8,6 @@
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -20,34 +19,10 @@
 namespace vc3d::opendata {
 namespace {
 
-std::string lowerCopy(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
-// A catalog Zarr VC3D opens remotely: over http(s) or s3.
+// A catalog Zarr VC3D opens remotely.
 bool isRemoteZarr(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    if (!vcr::catalog::isZarrArtifact(artifact) || artifact.url().empty()) {
-        return false;
-    }
-    std::string networkUrl;
-    try {
-        networkUrl = lowerCopy(vc::parseRemoteVolumeSpec(artifact.url()).sourceUrl);
-    } catch (...) {
-        return false;
-    }
-    return networkUrl.starts_with("http://") || networkUrl.starts_with("https://") ||
-           networkUrl.starts_with("s3://");
-}
-
-bool isPrediction(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return vcr::catalog::classifyDerivedRepresentation(artifact) ==
-           vcr::catalog::OpenDataRepresentationKind::Prediction;
+    return vcr::catalog::isZarrArtifact(artifact) && vc::project::isLocationRemote(artifact.url());
 }
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
@@ -397,10 +372,12 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             if (hasVolumeEntry(pkg, url))
                 attachedLocations.push_back(url);
 
-            if (isPrediction(artifact) && artifact.sourceCoordinateLevel) {
+            const bool prediction = vcr::catalog::classifyDerivedRepresentation(artifact) ==
+                                    vcr::catalog::OpenDataRepresentationKind::Prediction;
+            if (prediction && artifact.sourceCoordinateLevel) {
                 predictions.push_back(PredictionCandidate{
                     &volume, &artifact, url, preferredSourceUrl, *artifact.sourceCoordinateLevel});
-            } else if (isPrediction(artifact)) {
+            } else if (prediction) {
                 result.messages.push_back(
                     "Kept " + label +
                     " coordinate-unspecified: parameters.level is missing or invalid.");

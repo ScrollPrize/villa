@@ -21,6 +21,11 @@ namespace vc::core::util {
     // The URL a normal-grid directory's marker records (trailing slashes
     // trimmed); nullopt without a readable marker.
     [[nodiscard]] std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir);
+    // Make dir (created if needed) a streaming cache of `url`; a marker already
+    // naming it is kept. False when the marker cannot be written.
+    bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url);
+    // dir holds a whole normal-grid store: metadata.json and the xy, xz and yz grids.
+    [[nodiscard]] bool hasNormalGridFiles(const std::filesystem::path& dir);
 
     class NormalGridVolume {
     public:
