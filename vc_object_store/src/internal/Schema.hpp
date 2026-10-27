@@ -164,20 +164,6 @@ CREATE TABLE geometry_current_chunks(
 );
 
 CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
-CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
-    token TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), UNIQUE(peer,token));
-
-CREATE INDEX sync_baselines_peer_seq ON sync_baselines(peer,seq);
-CREATE TABLE sync_baseline_records(
-    peer TEXT NOT NULL, record_uuid TEXT NOT NULL,
-    baseline_seq INTEGER NOT NULL REFERENCES sync_baselines(seq) ON DELETE CASCADE,
-    state TEXT NOT NULL CHECK(json_valid(state)),
-    PRIMARY KEY(peer,record_uuid,baseline_seq)
-);
-CREATE TABLE sync_baseline_cursors(
-    baseline_seq INTEGER PRIMARY KEY REFERENCES sync_baselines(seq) ON DELETE CASCADE,
-    journal_seq INTEGER NOT NULL, geometry_seq INTEGER NOT NULL
-);
 )SQL");
     execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
     detail::createSpatialSchema(db);

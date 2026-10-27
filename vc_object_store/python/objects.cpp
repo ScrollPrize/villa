@@ -655,26 +655,6 @@ NB_MODULE(_native, m)
             if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
             return self.require().forkReplica();
         })
-        .def("synchronize", [](PyObjectStore& self, PyObjectStore& peer, bool dryRun,
-            const std::map<std::string, std::string>& resolutions, const std::optional<std::string>& expected) {
-            self.require(); peer.require();
-            if (self.db.use_count() != 1 || peer.db.use_count() != 1)
-                throw std::runtime_error("synchronize requires idle stores with no active transactions");
-            vo::SyncReport report;
-            { auto localLease = self.db, remoteLease = peer.db; nb::gil_scoped_release release;
-              report = localLease->synchronize(*remoteLease, {dryRun, resolutions, expected}); }
-            nb::dict result; result["applied"] = report.applied; result["plan_token"] = report.planToken;
-            result["local_replica"] = report.localReplica; result["remote_replica"] = report.remoteReplica;
-            result["local_changes"] = report.localChanges; result["remote_changes"] = report.remoteChanges;
-            nb::list conflicts;
-            for (const auto& c : report.conflicts) {
-                nb::dict item; item["uuid"] = c.uuid; item["reason"] = c.reason;
-                item["base"] = jsonLoads(c.base); item["local"] = jsonLoads(c.local); item["remote"] = jsonLoads(c.remote);
-                conflicts.append(item);
-            }
-            result["conflicts"] = conflicts; return result;
-        }, nb::arg("peer"), nb::arg("dry_run") = false,
-           nb::arg("resolutions") = std::map<std::string, std::string>{}, nb::arg("expected_plan") = std::nullopt)
         .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");

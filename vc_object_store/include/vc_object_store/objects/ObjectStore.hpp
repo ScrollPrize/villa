@@ -121,10 +121,10 @@ struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
-    // False for sync baselines whose original metadata history was not copied.
+    // False for baselines a hub pull installed without their original metadata history.
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
-    // increasing within this store. Missing only for untimed sync baselines.
+    // increasing within this store. Missing only for those untimed baselines.
     std::optional<int64_t> publishedAtUs;
     bool deleted = false;
     ObjectRecord record;
@@ -286,22 +286,6 @@ struct JsonExportOptions {
     std::vector<std::string> fields; // top-level record fields; UUIDs/endpoints always retained
 };
 
-struct SyncOptions {
-    bool dryRun = false;
-    std::map<std::string, std::string> resolutions; // record UUID -> "local" or "remote"
-    std::optional<std::string> expectedPlan; // preview token; required with resolutions
-};
-struct SyncConflict {
-    std::string uuid, reason;
-    std::string base, local, remote; // canonical record JSON, or "null" for absence/deletion
-};
-struct SyncReport {
-    bool applied = false;
-    std::string localReplica, remoteReplica, planToken;
-    int64_t localChanges = 0, remoteChanges = 0;
-    std::vector<SyncConflict> conflicts;
-};
-
 class ObjectStore;
 class GeometrySnapshot;
 struct ObjectStoreImplAccess;
@@ -434,13 +418,8 @@ public:
     // Stable store identity, independent of its filesystem location.
     std::string uuid(const Txn&) const;
 
-    // Two-store three-way merge. Conflicts/dry runs leave both stores untouched.
-    // Both stores must be writable, with no active caller write transactions.
-    // Commits are sequential; retained common baselines make interrupted sync retryable.
-    SyncReport synchronize(ObjectStore& peer, const SyncOptions& options = {});
     std::string replicaUuid(const Txn&) const;
-    // Assign a copied database its own replica identity before editing/synchronizing it.
-    // Clears sync history; synchronize with the original before editing either copy.
+    // Assign a copied database its own replica identity.
     std::string forkReplica();
 
     // Create/update by UUID (mint one if empty). Updates bump generation, stamp

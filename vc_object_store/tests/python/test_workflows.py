@@ -121,10 +121,6 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     extra[31:33, 31:34] = 65535
     assert db.read_geometry_array(changed, 'extra') == extra.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
-    with ObjectStore.create(db.path + '.peer', author='peer') as peer:
-        assert db.synchronize(peer)['applied']
-        assert peer.read_geometry_array(changed, 'extra') == extra.tobytes()
-        assert peer.read_geometry_array(first, 'points') == values.tobytes()
     with ObjectStore.open(db.path, read_only=True) as ro:
         assert ro.read_geometry_array(second, 'review') == channel.tobytes()
 
@@ -187,7 +183,7 @@ def test_remote_registered_surface_is_fetched_once(db, tmp_path):
     assert db.read_geometry_array(revision, 'valid') == valid.tobytes()
 
 
-def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
+def test_checked_relationships_lifecycle_and_graph(db):
     a, first = put(db, Track([[1, 2, 3], [4, 5, 6]]))
     b, _ = put(db, Track([[1, 2, 3]]))
     anchor = dict(points=[dict(array='points', index=[0])], metadata_keys=['coordinates'])
@@ -231,15 +227,6 @@ def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
     assert db.object_revision(selected[a])['geometry_revision'] == first
     at = db.object_revision(selected[a])['published_at_us']
     assert db.revision_read_view_at(at)['selection'] == selected
-    with ObjectStore.create(str(tmp_path / 'peer.vcobj'), author='peer') as peer:
-        assert db.synchronize(peer)['applied']
-        db.set_meta(a, 'note', 'local')
-        peer.set_meta(a, 'note', 'remote')
-        preview = db.synchronize(peer, dry_run=True)
-        assert preview['conflicts'] and not preview['applied']
-        assert db.synchronize(peer, resolutions={a: 'remote'}, expected_plan=preview['plan_token'])['applied']
-        assert db.object(a)['meta']['note'] == 'remote'
-        assert peer.read_geometry_array(first, 'points') == db.read_geometry_array(first, 'points')
 
 
 def test_stable_ids_annotations_splice_and_coordinates(db):
@@ -262,9 +249,6 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
                 data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
-    with ObjectStore.create(db.path + '.peer', author='peer') as peer:
-        assert db.synchronize(peer)['applied']
-        assert peer.geometry_point_annotations(third, 'points') == [label, {'label': 'C'}, {'label': 'B'}]
 
 
 @pytest.mark.parametrize('damage', ['payload', 'manifest', 'missing_chunk'])

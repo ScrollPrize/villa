@@ -66,7 +66,7 @@ add_library(vc_objects ${_vc_store_library_type}
     ToolObjects.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
-    sync/Synchronize.cpp
+    sync/Replica.cpp
     sync/GeometryTransfer.cpp
     sync/Apply.cpp
     hub/HubRules.cpp

@@ -214,7 +214,7 @@ Applicability queries require a read transaction.
 Graph views are thread-confined and must close before checkpointing. NumPy arrays
 are read-only and retain their buffers after closure, not the database transaction.
 
-## Retirement, restoration and synchronization
+## Retirement and restoration
 
 `retired` and `lifecycle_epoch` are library-managed revision fields. Use
 `tx.retire_object(uuid)` or `tx.restore_object(uuid, source_revision=None)` in a
@@ -238,17 +238,6 @@ explicit dependencies. Endpoint order is canonical, so put directional roles in
 metadata. Arbitrary UUID strings in JSON are not tracked references.
 `delete_object` retains history and still rejects managed geometry/current edge
 references. There is no history/payload purge API.
-
-Establish a shared baseline with `synchronize(peer)` before independent edits.
-Conflicts require a fresh `dry_run=True` preview and explicit `local`/`remote`
-resolutions with its `expected_plan` token. Handles must be idle and writable;
-call `fork_replica()` on a copied database before synchronizing it with its source.
-Sync transfers current records, lifecycle bindings and retained geometry history,
-not the peer's complete metadata/graph timeline. Use a database copy for that.
-Missing historical pins receive incomplete, untimed baselines, never fabricated
-history. A fresh retired replica may lack an active revision to restore: restore
-on the originating replica and sync, or copy its full database. Metadata-only
-JSON import rejects lifecycle-bearing exports.
 
 ## Hosted hub and replicas
 
@@ -304,8 +293,7 @@ VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
 atomic `mkdir`, which works on network filesystems where WAL's shared memory and
 byte-range locks do not. Only hub operations open the file, and each holds the
 lock briefly. An ordinary open of a hub is refused, so nothing can switch it back
-to WAL. Stores without the `hub_*` tables behave exactly as before. That includes
-two-store `synchronize`, which hub sync does not use.
+to WAL. Stores without the `hub_*` tables behave exactly as before.
 
 **Leases.** Changing the record or geometry of an object that exists on the hub
 requires this replica to hold that object's lease. The check runs at commit, in
@@ -329,7 +317,7 @@ journal sequence) of each record it installed, and its own unpushed changes.
 - `hubPush` publishes local changes in one hub transaction. Each record must
   still have the hub version it was edited from, and each changed hub object must
   be leased to this replica. The push copies geometry history, validates
-  relationship dependencies like `synchronize`, and verifies the result.
+  relationship dependencies, and verifies the result.
 - A retry after a push whose outcome was lost recognizes its own records.
 
 **Applications** do not drive sync themselves. When an `ObjectStoreSession`
@@ -368,7 +356,7 @@ with session.hold_leases(attachment, [surface_uuid]):
 Records changed both locally and on the hub become conflicts, and pushing stops
 until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
 record. `"local"` publishes this replica's record over it and requires the lease.
-Object revision UUIDs are per replica, as with `synchronize`. Geometry revision
+Object revision UUIDs are per replica. Geometry revision
 UUIDs and the store UUID are shared.
 
 **Operations.**

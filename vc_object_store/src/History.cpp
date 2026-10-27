@@ -291,7 +291,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}})
                 affected |= endpoint == object && dependencyMetadata(before, anchor) != dependencyMetadata(p.record, anchor);
             if (!affected) continue;
-            // Synchronization imports a previously published lifecycle decision.
+            // A hub pull imports a previously published lifecycle decision.
             // Preserve recorded pins; imported edge bindings below carry any
             // separate revalidation. It does not import the peer's timeline.
             if (importedBindings && lifecycleChanged) recordRelationshipValidation(db, edge, true);
@@ -420,7 +420,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             if (!epoch || metadata(db, s.text(0)).value("lifecycle_epoch", "") == *epoch) return s.text(0);
         if (!importedBindings)
             throw std::runtime_error("object history: relationship binding has no object revision");
-        // Current-state sync imports can supply older geometry
+        // Hub pulls can supply older geometry
         // without its object history. Preserve that binding with an explicitly
         // incomplete, untimed baseline, never fabricated historical metadata.
         const auto uuid = util::newUuid();

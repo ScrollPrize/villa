@@ -95,7 +95,7 @@ a replica, and Sync Hosted Object Store Now syncs it; initializing a hub is
 command-line only. See [hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
-edits, graph snapshots, spatial queries, and synchronization. Detector distances
+edits, graph snapshots, spatial queries, and hosted hubs. Detector distances
 and scale options use working voxels. CT normals use uint8 Zarr data with complete
 109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
