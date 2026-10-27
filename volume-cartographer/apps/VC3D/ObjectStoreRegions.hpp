@@ -3,7 +3,6 @@
 // (fibers, surfaces): background reads, session events filtered by record kind,
 // and the per-viewer scheduling of slab region queries.
 #include "vc/core/types/FiberView.hpp"
-#include "ObjectStoreEvents.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <QFutureWatcher>
 #include <QObject>
@@ -45,20 +44,6 @@ void background(QObject* parent, Work work, Done done)
         }
         return result;
     }));
-}
-
-// Editing an object starts from the revision on screen: lease it on a hosted
-// replica (leasing may first pull the hub's newer record), then check that the
-// pin is still its current revision. Throws when it is not.
-inline vc::objects::LeaseHold holdForEditing(vc::objects::ObjectStoreSession& session, const vc::objects::PinnedObject& pin)
-{
-    auto lease = session.holdLeases(pin.attachment, {pin.object.objectUuid});
-    session.read(pin.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto head = db.currentObjectRevision(txn, pin.object.objectUuid);
-        if (!head || head->uuid != pin.objectRevision)
-            throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
-    });
-    return lease;
 }
 
 // --- Slab regions --------------------------------------------------------------

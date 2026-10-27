@@ -5,7 +5,6 @@
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include "ObjectStoreCoordinates.hpp"
 #include "BindCoordinatesPrompt.hpp"
-#include "ObjectStoreEvents.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "ObjectStoreArtifacts.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -1796,7 +1795,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 return;
             }
             if (event.attachment != _state->objectStoreAttachment() ||
-                !vc3d::store::touches(event, {"fiber", "fiber_branch", vc::objects::kAttachmentEdgeKind, "volume_transform", "volume_transform_choice"})) return;
+                !event.touches({"fiber", "fiber_branch", vc::objects::kAttachmentEdgeKind, "volume_transform", "volume_transform_choice"})) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
             _storedFiberDecodeCache.clear();
@@ -2375,7 +2374,7 @@ bool LineAnnotationController::enableSessionEditing(const std::string& surfaceNa
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     if (connection && session->storePin && !session->storePin->objectRevision.empty()) {
         try {
-            session->editingLeases = vc3d::store::holdForEditing(*connection, *session->storePin);
+            session->editingLeases = connection->holdForEditing(*session->storePin);
         } catch (const std::exception& error) {
             showError(tr("This fiber cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
                       session->suppressErrorDialogs);

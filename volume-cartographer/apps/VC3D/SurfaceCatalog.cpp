@@ -1,6 +1,5 @@
 #include "SurfaceCatalog.hpp"
 #include "ObjectStoreCoordinates.hpp"
-#include "ObjectStoreEvents.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -144,7 +143,7 @@ void SurfaceCatalog::handle(const StoreSessionEvent& event)
         std::none_of(listed.begin(), listed.end(), [&](const Source& source) { return source.attachment == event.attachment; }))
         return;
     // A registration can bring any surface into (or out of) the volume.
-    if (vc3d::store::touches(event, {"volume_transform", "volume_transform_choice"})) {
+    if (event.touches({"volume_transform", "volume_transform_choice"})) {
         read(std::nullopt);
         return;
     }

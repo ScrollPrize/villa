@@ -230,7 +230,7 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         // The umbilicus is read through the store's volume mapping, so a
         // registration change moves it too.
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub ||
-            !vc3d::store::touches(event, {"umbilicus", "volume_transform", "volume_transform_choice"}))
+            !event.touches({"umbilicus", "volume_transform", "volume_transform_choice"}))
             return;
         emit umbilicusChanged();
     });

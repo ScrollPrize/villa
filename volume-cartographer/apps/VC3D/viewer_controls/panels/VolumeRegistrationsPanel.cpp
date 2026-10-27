@@ -1,7 +1,6 @@
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 
 #include "CState.hpp"
-#include "ObjectStoreEvents.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -75,7 +74,7 @@ VolumeRegistrationsPanel::VolumeRegistrationsPanel(CState* state, QWidget* paren
         connect(_state, &CState::volumeChanged, this, [this]() { refresh(); });
         connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
             if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
-            if (vc3d::store::touches(event, {"volume_transform", "volume_transform_choice"})) refresh();
+            if (event.touches({"volume_transform", "volume_transform_choice"})) refresh();
         });
     }
     refresh();

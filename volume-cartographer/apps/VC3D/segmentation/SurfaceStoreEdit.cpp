@@ -17,7 +17,7 @@ SurfaceStoreEdit::SurfaceStoreEdit(std::shared_ptr<ObjectStoreSession> session, 
 void SurfaceStoreEdit::hold()
 {
     if (!_session->writable(_pin.attachment)) throw std::runtime_error("The object store is attached read-only");
-    auto lease = vc3d::store::holdForEditing(*_session, pin());
+    auto lease = _session->holdForEditing(pin());
     std::lock_guard lock(_mutex);
     _lease = std::move(lease);
 }

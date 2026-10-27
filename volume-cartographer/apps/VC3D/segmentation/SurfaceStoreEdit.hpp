@@ -20,7 +20,7 @@ public:
     SurfaceStoreEdit(std::shared_ptr<vc::objects::ObjectStoreSession> session, vc::objects::PinnedObject pin,
                      std::optional<vc3d::VolumeView> view = std::nullopt);
 
-    // An editing session holds the object (vc3d::store::holdForEditing) until
+    // An editing session holds the object (ObjectStoreSession::holdForEditing) until
     // release(); throws when the store is read-only or the pin is stale.
     void hold();
     void release();
