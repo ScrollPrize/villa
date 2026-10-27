@@ -376,6 +376,11 @@ public:
     std::vector<vcr::catalog::TransformResolution> availableTransforms(const Txn&, const std::string& objectUuid) const;
     // Exact polyline length after mapping to target voxels; reads bounded chunks.
     double geometryLengthInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1) const;
+    // A surface's area (current geometry, or `geometryRevision`) in target voxels
+    // squared, mapped through its binding or a registration (geometry::surfaceGridArea);
+    // reads the grid in row bands.
+    double surfaceAreaInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1,
+                               const std::optional<std::string>& geometryRevision = std::nullopt) const;
     std::string registerVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
         const VolumeAffine&, const std::string& name, const std::optional<std::string>& uuid = std::nullopt);
     // The route from `source` to `target` (registration keys as a resolution's

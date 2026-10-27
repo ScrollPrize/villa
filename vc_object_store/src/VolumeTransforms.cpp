@@ -3,6 +3,8 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "internal/Database.hpp"
 #include "internal/TransformedLength.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
+#include <algorithm>
 #include <limits>
 namespace vc::objects {
 std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& metadata,const std::string& target,double targetScale) const {
@@ -66,6 +68,25 @@ double ObjectStore::geometryLengthInVolume(const Txn& txn,const std::string& uui
     const auto head=currentGeometry(txn,uuid);
     if(!head)throw std::invalid_argument("object has no geometry");
     return detail::transformedLength(static_cast<sqlite3*>(connection(txn)),head->uuid,*mapping,object->kind);
+}
+double ObjectStore::surfaceAreaInVolume(const Txn& txn,const std::string& uuid,const std::string& target,double scale,
+    const std::optional<std::string>& geometryRevision) const {
+    const auto object=objectByUuid(txn,uuid);
+    if(!object || object->kind!="surface")throw std::invalid_argument("area requires a surface");
+    const auto surface=GeometrySnapshot(*this,txn).surface(uuid,geometryRevision);
+    const auto view=surface.viewTransformedAt(target,scale);
+    const int64_t rows=surface.rows(),columns=surface.columns();
+    // Bands of about a million vertices, overlapping by a row.
+    const int64_t band=std::max<int64_t>(2,(int64_t(1)<<20)/std::max<int64_t>(columns,1));
+    double total=0;
+    for(int64_t row=0;row+1<rows;row+=band-1) {
+        const int64_t count=std::min(band,rows-row);
+        const auto tile=view.readTile(row,0,count,columns);
+        total=geometry::surfaceGridArea(count,columns,
+            [&](int64_t r,int64_t c)->const geometry::Point&{return tile.points[size_t(r*columns+c)];},
+            [&](int64_t r,int64_t c){return tile.validity[size_t(r*columns+c)]!=0;},total);
+    }
+    return total;
 }
 std::string ObjectStore::registerVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,
     const VolumeAffine& matrix,const std::string& name,const std::optional<std::string>& uuid) {

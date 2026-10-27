@@ -37,6 +37,8 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
+        require(db.surfaceAreaInVolume(txn,surface,"a")==4&&db.surfaceAreaInVolume(txn,surface,"b")==8&&
+                db.surfaceAreaInVolume(txn,surface,"b",.5)==2,"surface area in target voxels");
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");
@@ -191,6 +193,27 @@ int main() try {
         try{auto txn=db.write();db.bindGeometryCoordinates(txn,loose,"c",4);}
         catch(const std::invalid_argument&){conflict=true;}
         require(conflict,"a different frame is refused");
+    }
+    {
+        // Areas are read in row bands; they sum like the whole grid, and
+        // vertices without coordinates drop their triangles.
+        vc::geometry::Surface large;large.rows=1800;large.columns=640;
+        for(int64_t r=0;r<large.rows;++r)for(int64_t c=0;c<large.columns;++c)
+            large.points.push_back({float(c)*1.25f,float(r),1.f});
+        large.points[size_t(5*large.columns+7)]={-1,-1,-1};
+        std::string uuid;
+        {auto txn=db.write();ObjectRecord r;r.kind="surface";r.meta=R"({"coordinates":{"volume_uuid":"a","scale_factor":1}})";
+         uuid=db.upsertObject(txn,r);db.putGeometry(txn,uuid,vc::geometry::encode(large));txn.commit();}
+        const auto whole=vc::geometry::surfaceGridArea(large.rows,large.columns,
+            [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return large.vertex(r,c);},
+            [&](int64_t r,int64_t c){return vc::geometry::validSurfacePoint(large.vertex(r,c));});
+        auto read=db.read();
+        require(db.surfaceAreaInVolume(read,uuid,"a")==whole,"banded area equals the whole grid's");
+        auto restored=large;restored.points[size_t(5*large.columns+7)]={7*1.25f,5,1.f};
+        const auto complete=vc::geometry::surfaceGridArea(restored.rows,restored.columns,
+            [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return restored.vertex(r,c);},
+            [](int64_t,int64_t){return true;});
+        require(complete-whole==3.75,"a missing vertex drops its six triangles");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

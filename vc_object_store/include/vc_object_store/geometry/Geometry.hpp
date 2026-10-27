@@ -2,6 +2,7 @@
 
 #include "vc_object_store/objects/Geometry.hpp"
 #include <array>
+#include <cmath>
 #include <concepts>
 #include <optional>
 #include <span>
@@ -92,6 +93,40 @@ template <class Vector>
 bool validTifxyzPoint(const Vector& p)
 {
     return validTifxyzPoint(SurfacePoint{static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])});
+}
+
+// The area of triangle abc (any three-component vectors), in double precision.
+template <class Vector>
+double triangleArea(const Vector& a, const Vector& b, const Vector& c)
+{
+    const double ux = static_cast<double>(b[0]) - static_cast<double>(a[0]);
+    const double uy = static_cast<double>(b[1]) - static_cast<double>(a[1]);
+    const double uz = static_cast<double>(b[2]) - static_cast<double>(a[2]);
+    const double vx = static_cast<double>(c[0]) - static_cast<double>(a[0]);
+    const double vy = static_cast<double>(c[1]) - static_cast<double>(a[1]);
+    const double vz = static_cast<double>(c[2]) - static_cast<double>(a[2]);
+    const double cx = uy * vz - uz * vy;
+    const double cy = uz * vx - ux * vz;
+    const double cz = ux * vy - uy * vx;
+    return 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+}
+
+// The area of a surface grid in its vertices' units squared, added to `total`
+// cell by cell in row-major order (so a grid read in row bands sums the same).
+// Each cell is the triangles (p00,p10,p11) and (p00,p11,p01); a triangle counts
+// when its three vertices have coordinates. `at(row, column)` is the vertex,
+// `valid(row, column)` whether it has coordinates.
+template <class At, class Valid>
+double surfaceGridArea(int64_t rows, int64_t columns, At&& at, Valid&& valid, double total = 0)
+{
+    for (int64_t r = 0; r + 1 < rows; ++r)
+        for (int64_t c = 0; c + 1 < columns; ++c) {
+            const bool v00 = valid(r, c), v10 = valid(r, c + 1), v01 = valid(r + 1, c), v11 = valid(r + 1, c + 1);
+            const double first = v00 && v10 && v11 ? triangleArea(at(r, c), at(r, c + 1), at(r + 1, c + 1)) : 0.0;
+            const double second = v00 && v11 && v01 ? triangleArea(at(r, c), at(r + 1, c + 1), at(r + 1, c)) : 0.0;
+            total += first + second;
+        }
+    return total;
 }
 
 } // namespace vc::geometry
