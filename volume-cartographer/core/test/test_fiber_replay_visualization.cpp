@@ -8,6 +8,8 @@
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
+#include "vc/fiber_tracer/FiberletCropVisualization.hpp"
+#include "vc/core/util/SurfaceTexture.hpp"
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include <cstdlib>
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <atomic>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <opencv2/imgcodecs.hpp>
 #include <thread>
@@ -92,6 +95,12 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
         datasets[index]["coordinateTransformations"] = original;
     }
     vc::core::util::atomicWriteString(attrsPath, attrs.dump());
+    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+        {0,0,0}, {1,1,1}, directory / "box", 1));
+    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+        {0,0,0}, {0,1,1}, directory / "box"));
+    CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
+        {0,0,0}, {1,1,std::numeric_limits<double>::infinity()}, directory / "box"));
     attrs["multiscales"][0]["axes"][0]["name"] = "x";
     vc::core::util::atomicWriteString(attrsPath, attrs.dump());
     CHECK_THROWS(validateFiberReplayStripCtVolume(*volume, source.locator));

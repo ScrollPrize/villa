@@ -18,6 +18,15 @@
 namespace vc::fiber_tracer
 {
 
+// Frozen precomputed geometry; acquisition sees only the current seed/tangent.
+[[nodiscard]] FiberReplayTraceResult tracePrecomputedFiberReplay(
+    std::span<const PolylineArcGeometry> candidates,
+    const std::vector<cv::Vec3d>& referenceBaseXYZ,
+    const vc::lasagna::NormalSampler& normals,
+    double normalWorkingToBaseScale = 1.0,
+    double errorThresholdBaseVoxels = 20.0,
+    double matchRefineSteps = 2.0);
+
 struct FiberReferenceReplayCase {
     std::size_t sourceIndex = 0;
     std::size_t runIndex = 0;

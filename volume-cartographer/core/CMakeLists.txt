@@ -197,6 +197,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
     src/fiber_tracer/FiberAxisTensor.cpp
     src/fiber_tracer/FiberGraph.cpp
+    src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
     src/fiber_tracer/FiberReplayMetric.cpp
@@ -209,6 +211,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberLiveBridge.cpp
     src/fiber_tracer/FiberEvaluation.cpp
     src/fiber_tracer/FiberReplayVisualization.cpp
+    src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberCaseQueue.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberletStorage.cpp
