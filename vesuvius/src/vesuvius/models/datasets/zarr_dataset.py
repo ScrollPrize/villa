@@ -550,6 +550,10 @@ class ZarrDataset(Dataset):
                     safe_boundary=safe_boundary,
                 ))
 
+        # The trainer treats the first n_fg entries as labeled foreground.
+        # Stable grouping retains sample/tiling order within each pool.
+        self._patches.sort(key=lambda patch: patch.is_unlabeled_fg)
+
         # Update counts
         self._n_labeled_fg = sum(1 for p in self._patches if not p.is_unlabeled_fg)
         self._n_unlabeled_fg = sum(1 for p in self._patches if p.is_unlabeled_fg)
