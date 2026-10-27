@@ -1269,6 +1269,23 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 }
 
 std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
+                                    const utils::Json& metadata)
+{
+    auto volume = std::make_shared<Volume>(std::move(path));
+    if (metadata.is_object()) {
+        if (metadata.contains("voxelsize") && metadata["voxelsize"].is_number()) {
+            const double value = metadata["voxelsize"].get_double();
+            volume->hasExplicitVoxelSizeOverride_ = std::isfinite(value) && value > 0.0;
+        }
+        volume->metadata_.update(metadata);
+        volume->metadata_["width"] = volume->_width;
+        volume->metadata_["height"] = volume->_height;
+        volume->metadata_["slices"] = volume->_slices;
+    }
+    return volume;
+}
+
+std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
                                     const ZarrCreateOptions& options)
 {
     if (options.overwriteExisting || !hasAnyLocalZarrArray(path)) {
@@ -1356,6 +1373,16 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed to load remote volume metadata for '{}': {}", remoteUrl, e.what());
+    }
+
+    // Preserve the historical source cache name before project metadata can
+    // replace the annotation UUID (for example, with an open-data catalog ID).
+    // Upstream metadata UUIDs still name their existing caches; otherwise the
+    // name remains URL-derived. Rebased views keep their own cache namespace.
+    vol->remoteCacheId_ = vol->id();
+    if (spec.baseScaleLevel > 0) {
+        vol->remoteCacheId_ = deriveRebasedRemoteVolumeId(
+            vol->remoteCacheId_, remoteUrl, spec.baseScaleLevel);
     }
 
     if (metadata.is_object()) {
@@ -1505,7 +1532,7 @@ std::filesystem::path Volume::remotePersistentCachePath() const
 {
     if (!isRemote_ || remoteCacheRoot_.empty())
         return {};
-    return remoteCacheRoot_ / id();
+    return remoteCacheRoot_ / remoteCacheId_;
 }
 
 int Volume::sliceWidth() const noexcept { return _width; }

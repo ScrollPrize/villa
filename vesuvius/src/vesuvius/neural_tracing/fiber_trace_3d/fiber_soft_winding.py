@@ -325,12 +325,11 @@ def sample_arcs(arc, angle, start, end, step):
 
 
 def prepare_samples(config, d, existing=None):
-    """Reuse AFV reader and resolved curve geometry, not old three-node sampling."""
+    """Reuse the fiber store reader and resolved curve geometry, not old three-node sampling."""
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
-    with uv._ro(config['afv']) as db:
-        meta = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM metadata')}
-    axis = load_umbilicus_frame(config['umbilicus'], meta['root'])
+    from vesuvius.neural_tracing.tracers.shared.annotations import fiber_store
+    volume = fiber_store.fiber_volume(config['fibers'])
+    axis = load_umbilicus_frame(config['umbilicus'], volume)
     sources = np.unique(d['source_id'])
     spacing=config.get('arc_prior_spacing_vx')
     if spacing is not None and (not np.isfinite(spacing) or spacing<=0):
@@ -343,18 +342,19 @@ def prepare_samples(config, d, existing=None):
         from .fiber_v_endpoint_offsets import topology
         mask=(~np.asarray(d['parallel'],dtype=bool))&(d['family'][d['i']]!=d['family'][d['j']])
         top=topology(d,0.,event_mask=mask)
-        node_positions={int(source):np.empty(0) for source in sources}
+        node_positions={str(source):np.empty(0) for source in sources}
         ids,starts=np.unique(top['v_offset_source'],return_index=True)
-        node_positions.update(zip(map(int,ids),np.split(top['v_offset_arc'],starts[1:])))
+        node_positions.update(zip(map(str,ids),np.split(top['v_offset_arc'],starts[1:])))
     event_owner = np.r_[d['i'], d['j']]
     event_ds = np.r_[d['ds_a'], d['ds_b']]
     event_order = np.argsort(event_owner, kind='stable')
     offsets = np.searchsorted(event_owner[event_order], np.arange(len(d['family']) + 1))
     # Group once, avoiding a full piece scan for every source.
     order = np.argsort(d['source_id'], kind='stable')
-    grouped = np.split(order, np.flatnonzero(np.diff(d['source_id'][order])) + 1)
-    groups = dict(zip(sources, grouped))
-    for row, xyz in read_afv_polylines(config['afv'], sources):
+    ordered = d['source_id'][order]
+    grouped = np.split(order, np.flatnonzero(ordered[1:] != ordered[:-1]) + 1)
+    groups = dict(zip(sources.tolist(), grouped))
+    for row, xyz in fiber_store.read_polylines(config['fibers'], sources, volume=volume):
         ids = groups[row['id']]
         family = int(d['family'][ids[0]])
         arc, _, angle, _ = uv.fiber_geometry(xyz, family, axis)
@@ -364,7 +364,7 @@ def prepare_samples(config, d, existing=None):
             direction = np.sign(d['node_ds'][idx, -1])
             if direction not in (-1, 1):
                 raise ValueError('Soft model requires resolved signed-arc cache')
-            positions = (node_positions[int(row['id'])] if node_positions is not None else
+            positions = (node_positions[row['id']] if node_positions is not None else
                 (sample_arcs(arc, angle, start, end,
                 config.get('angular_sample_degrees', 45.) / 360.) if family == 0 else np.array([start, end])))
             if existing is not None:
@@ -436,7 +436,9 @@ def tensor_inputs(d, samples, config, device):
     if config.get('fixed_reference_events'):
         with np.load(config['fixed_reference_events']) as src:
             for key in src.files:
-                data['reference_'+key]=torch.as_tensor(src[key],device=device,
+                # Reference fiber UUIDs only group events: torch holds their positions in the sorted UUID set.
+                value=np.unique(src[key],return_inverse=True)[1].reshape(src[key].shape) if key=='source' else src[key]
+                data['reference_'+key]=torch.as_tensor(value,device=device,
                     dtype=torch.long if key in ('owner','family','source') else torch.bool if key=='parallel' else torch.float32)
         compatible=data['reference_parallel']==(data['family'][data['reference_owner']]==data['reference_family'])
         if not bool(compatible.all()): raise ValueError('Incompatible fixed reference families')
@@ -600,8 +602,9 @@ def _solve(config, device, pair_cost, model, diagnostics, extension_factory, par
         if extension is not None and hasattr(extension, 'update'):
             with torch.profiler.record_function('solver/window_and_cavity'):
                 extension.update(state, (torch.nn.functional.softplus(raw)+1e-4).detach(), data, iteration)
-        if config.get('indexing_audit'):
-            raise ValueError('The experimental indexing audit is not part of the reusable solver')
+        if config.get('indexing_audit') and iteration==5:
+            from .fiber_indexing_audit import audit
+            atomic_write(root/'indexing_audit.json',audit(state,raw,widths,data,nodes,config,pair_cost,extension),durable=False)
         iteration_config=(dict(config,_optimization_iteration=iteration)
                           if config.get('pair_weight_schedule') else config)
         plateau_action=None

@@ -98,12 +98,13 @@ def test_offsets_cannot_change_coarse_loss():
 
 def test_prepare_reads_true_arcs_and_serializes(tmp_path):
     import sqlite3
-    path=tmp_path/'events.sqlite'
+    path=tmp_path/'events.sqlite';f,g='00000000-0000-4000-8000-000000000010','00000000-0000-4000-8000-000000000020'
     with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a,fiber_b,arc_a,arc_b)')
-        db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(7,10,20,40.,90.),(8,10,20,60.,70.)])
+        db.execute('CREATE TABLE fibers(id TEXT PRIMARY KEY)')
+        db.execute('CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a TEXT,fiber_b TEXT,arc_a,arc_b)')
+        db.executemany('INSERT INTO constraints VALUES(?,?,?,?,?)',[(7,f,g,40.,90.),(8,f,g,60.,70.)])
     d=dict(event_ids=np.array([7,8]),i=np.array([0,1]),j=np.array([2,2]),
-           source_id=np.array([10,10,20]),family=np.array([0,0,1]),
+           source_id=np.array([f,f,g]),family=np.array([0,0,1]),
            start=np.array([0,50,0]),end=np.array([50,100,100]))
     m=eo.prepare(d,dict(database=str(path)))
     assert m['arc'].tolist()==[40,60,90,70]

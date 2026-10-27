@@ -31,6 +31,7 @@ namespace {
 
 struct Options {
     fs::path atlasDir;
+    fs::path objectStore;
     fs::path volpkgJson;
 };
 
@@ -70,6 +71,7 @@ struct RemapReport {
 void printUsage(const char* argv0)
 {
     std::cerr
+        << "Object store: --object-store PATH (required for mapped fibers)\n"
         << "Usage: " << argv0 << " <atlas_dir> [project.volpkg.json]\n"
         << "Loads a native VC3D atlas and reports control-anchor vectors from\n"
         << "the current base mesh point at each control atlas coordinate to the\n"
@@ -82,6 +84,8 @@ Options parseArgs(int argc, char** argv)
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--object-store" && i + 1 < argc) { options.objectStore = argv[++i]; continue; }
+        if (arg.starts_with("--object-store=")) { options.objectStore = arg.substr(15); continue; }
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             std::exit(0);
@@ -492,8 +496,12 @@ int main(int argc, char** argv)
     try {
         const Options options = parseArgs(argc, argv);
         const ProjectContext project = loadProjectContext(options.volpkgJson);
+        auto store = std::make_shared<vc::objects::ObjectStoreSession>();
+        vc::objects::OpenOptions storeOptions; storeOptions.readOnly = true;
+        if (options.objectStore.empty()) throw std::invalid_argument("missing --object-store");
+        store->attach(options.objectStore, storeOptions);
         const auto exportData = vc::atlas::loadLasagnaAtlasExport(options.atlasDir,
-                                                                  project.volpkgRoot);
+                                                                  project.volpkgRoot, store);
         const QuadSurface baseSurface(exportData.basePath);
         const SourceControlByObjectId sourceControls = loadSourceControlPoints(exportData);
 

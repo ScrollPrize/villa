@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <filesystem>
 #include <exception>
 #include <functional>
@@ -53,6 +54,8 @@ struct FiberMapping {
     int windingOffset = 0;
     std::vector<AtlasAnchor> lineAnchors;
     std::vector<AtlasAnchor> controlAnchors;
+    std::optional<vc::objects::PinnedObject> storePin;
+    double storeToAtlasScale = 1.0;
 };
 
 struct AtlasLinkEndpoint {
@@ -75,12 +78,8 @@ struct Atlas {
     std::vector<FiberMapping> fibers;
 
     void save(const std::filesystem::path& atlasDir) const;
-    static Atlas load(const std::filesystem::path& atlasDir);
     static Atlas load(const std::filesystem::path& atlasDir,
-                      const std::filesystem::path& volpkgRoot);
-    static Atlas load(const std::filesystem::path& atlasDir,
-                      const std::filesystem::path& volpkgRoot,
-                      const std::filesystem::path& fiberPathRoot);
+                      std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 };
 
 struct AtlasCoveredSize {
@@ -121,6 +120,8 @@ struct FiberInput {
     std::vector<cv::Vec3d> controlPoints;
     std::vector<cv::Vec3d> linePoints;
     std::vector<int> controlLineIndices;
+    std::optional<vc::objects::PinnedObject> storePin;
+    double storeToAtlasScale = 1.0;
 };
 
 struct SurfaceCandidate {
@@ -309,6 +310,7 @@ struct LasagnaAtlasObject {
 };
 
 struct LasagnaAtlasExport {
+    std::shared_ptr<std::filesystem::path> transportDirectory;
     Atlas atlas;
     std::filesystem::path atlasDir;
     std::filesystem::path volpkgRoot;
@@ -335,7 +337,7 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(
 LasagnaAtlasExport loadLasagnaAtlasExport(
     const std::filesystem::path& atlasDir,
     const std::filesystem::path& volpkgRoot = {},
-    const std::filesystem::path& fiberPathRoot = {});
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);
 std::filesystem::path initShellDirectoryFromManifest(
@@ -443,7 +445,8 @@ AtlasPredSnapSet setManualAtlasPredSnapPoint(
 AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
     const std::filesystem::path& atlasDir,
     const std::filesystem::path& volpkgRoot,
-    const vc::lasagna::LasagnaNormalSampler& sampler);
+    const vc::lasagna::LasagnaNormalSampler& sampler,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 std::filesystem::path atlasPredSnapRankCachePath(
     const std::filesystem::path& atlasDir);
 std::string atlasSnapRankTermCacheKey(
@@ -468,7 +471,8 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
     const std::filesystem::path& volpkgRoot,
     const std::filesystem::path& manifestPath,
     const vc::lasagna::LasagnaNormalSampler& sampler,
-    const AtlasSnapOptimizeOptions& options = {});
+    const AtlasSnapOptimizeOptions& options = {},
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 void cacheAtlasPredSnapRankResult(
     const AtlasSnapPreparedCandidates& prepared,
     size_t index,
@@ -486,13 +490,15 @@ AtlasBaseMappingContext loadAtlasBaseMappingContext(const std::filesystem::path&
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,
-                                   const LineMappingOptions& options = {});
+                                   const LineMappingOptions& options = {},
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const QuadSurface& baseSurface,
                                    SurfacePatchIndex& baseIndex,
                                    const vc::lasagna::NormalSampler& normalSampler,
-                                   const LineMappingOptions& options = {});
+                                   const LineMappingOptions& options = {},
+                                   std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 
 FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const QuadSurface& baseSurface,

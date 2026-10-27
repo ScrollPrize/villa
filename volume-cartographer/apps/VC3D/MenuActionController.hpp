@@ -42,6 +42,7 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
+    static constexpr size_t kMaxRecentObjectStores = 10;
 
     explicit MenuActionController(CWindow* window);
     ~MenuActionController() override;
@@ -55,6 +56,18 @@ public:
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
+    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved) and attaches it.
+    bool attachObjectStore();
+    // Prompts for a new .vcobj location, creates an empty store there and attaches it.
+    bool createObjectStore();
+    // With no store attached, explains that `purpose` needs one and offers to
+    // create or attach one. True once a store is attached.
+    bool requireObjectStore(const QString& purpose);
+    // Author recorded on edits: the saved username, asked for until it is not "anon".
+    // Empty means cancelled.
+    QString objectStoreAuthor();
+    void cloneHostedStore();
+    void detachObjectStore();
     // Resolves sampleId against the cached manifest and opens it. When
     // interactive is false, prompts, progress dialogs, and message boxes are
     // suppressed.
@@ -146,6 +159,14 @@ private:
     void applyTheme(const QString& id);
     void importThemeFrom(const QString& path);
 
+    // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
+    bool attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
+    // remote: a replica of a hosted store.
+    struct RecentObjectStore { QString path; bool readOnly{false}; bool remote{false}; };
+    std::vector<RecentObjectStore> loadRecentObjectStores() const;
+    void saveRecentObjectStores(const std::vector<RecentObjectStore>& stores);
+    void refreshRecentObjectStoreMenu();
+    void openRecentObjectStore(const RecentObjectStore& store);
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
@@ -208,12 +229,13 @@ private:
     QMenu* _recentMenu{nullptr};
     QMenu* _themeMenu{nullptr};
     QPointer<QActionGroup> _themeActions;
+    QMenu* _objectStoreMenu{nullptr};
+    QMenu* _recentObjectStoreMenu{nullptr};
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
-    QAction* _openFiberVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _attachUmbilicusAct{nullptr};
     QAction* _detachUmbilicusAct{nullptr};

@@ -685,7 +685,7 @@ endif()
 
 # VC-Delta3D is maintained as a standalone first-party codec. Prefer an
 # installed package (useful for distro builds and local development), then
-# fetch the reviewed 0.1.0 release for ordinary builds.
+# fetch the reviewed 0.2.0 release for ordinary builds.
 find_package(vc_delta3d CONFIG QUIET)
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -694,7 +694,7 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP OFF)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG v0.1.0
+        GIT_TAG v0.2.0
     )
     FetchContent_MakeAvailable(vc_delta3d)
 endif()
@@ -775,6 +775,8 @@ if(_san)
     add_link_options(${_san})
 endif()
 
+include(cmake/ObjectStore.cmake)
+
 add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)
@@ -800,8 +802,14 @@ endif()
 if(VC_BUILD_FLATBOI)
     list(APPEND _vc_install_dirs libs/flatboi)
 endif()
+if(TARGET vc_objects)
+    # The sibling object store builds DLLs on Windows (cmake/ObjectStore.cmake).
+    get_target_property(_vc_object_store_dir vc_objects SOURCE_DIR)
+    list(APPEND _vc_install_dirs "${_vc_object_store_dir}")
+endif()
 foreach(_dir IN LISTS _vc_install_dirs)
-    get_property(_dir_targets DIRECTORY "${CMAKE_SOURCE_DIR}/${_dir}"
+    get_filename_component(_dir "${_dir}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    get_property(_dir_targets DIRECTORY "${_dir}"
                  PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_tgt IN LISTS _dir_targets)
         get_target_property(_tgt_type ${_tgt} TYPE)

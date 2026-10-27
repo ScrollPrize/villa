@@ -65,6 +65,8 @@ function(vc_add_test)
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
+vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
+vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
 vc_add_test(NAME test_sampling_wait_profile)
 add_test(NAME test_sampling_wait_profile_enabled
@@ -72,7 +74,6 @@ add_test(NAME test_sampling_wait_profile_enabled
         $<TARGET_FILE:test_sampling_wait_profile>)
 vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
 
-vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
@@ -127,18 +128,16 @@ vc_add_test(NAME test_ink_detection_overlay
             ${viewer_manager_overlay_test_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
-    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
-qt6_wrap_cpp(fiber_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.hpp)
 qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)
 qt6_wrap_cpp(vccollection_surface_primitives_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/OverlayBatchItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
@@ -149,7 +148,6 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
-            ${fiber_overlay_surface_primitives_moc}
             ${points_overlay_surface_primitives_moc}
             ${vccollection_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
@@ -221,7 +219,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${collapsible_settings_group_moc}
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
+    LIBS vc_object_store::vc_objects Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
@@ -262,8 +260,6 @@ vc_add_test(NAME test_line_annotation_structural_edits
 
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
@@ -273,7 +269,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry
@@ -299,6 +295,7 @@ vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
@@ -819,8 +816,9 @@ vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: opens the PHerc 0172 volume and reads small chunks.
-vc_add_test(NAME test_volume_live_s3)
+# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+vc_add_test(NAME test_volume_live_s3
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)

@@ -31,6 +31,9 @@ public:
     // does, putting a closed button back in the bar first. Null when dock is
     // not in the host.
     QAction* openAction(QDockWidget* dock) const;
+    // Expands the dock's panel (or raises it when detached), restoring its bar
+    // button first if the user closed it.
+    void showDock(QDockWidget* dock);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

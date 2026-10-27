@@ -23,6 +23,7 @@ set(srcs
     CWindow.cpp
     FiberCollectionController.cpp
     FiberCollectionController.hpp
+    FiberDisplayOptions.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -36,8 +37,6 @@ set(srcs
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
     LineAnnotationFiberDeletion.hpp
-    LineAnnotationFiberSaveJob.cpp
-    LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
@@ -51,6 +50,7 @@ set(srcs
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
+    FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp
@@ -211,8 +211,6 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
-    overlays/FiberOverlayController.cpp
-    overlays/FiberOverlayController.hpp
     overlays/OverlayBatchItem.cpp
     overlays/OverlayBatchItem.hpp
     overlays/ScreenSpacePointIndex.hpp
@@ -228,6 +226,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    SshPrompts.cpp
+    SshPrompts.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
@@ -307,8 +307,6 @@ set(srcs
     CPointCollectionWidget.cpp
     CFiberWidget.cpp
     CFiberWidget.hpp
-    FiberAnnotationController.cpp
-    FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
@@ -400,7 +398,8 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
-    vc_fiber_collection
+    vc_object_store::vc_object_geometry
+    vc_fiber_view
     vc_atlas
     vc_lasagna
     vc_fiber_tracer
@@ -495,4 +494,8 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
         FILES_MATCHING
             PATTERN "*.py"
             PATTERN "__pycache__" EXCLUDE)
+endif()
+
+if(VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
 endif()

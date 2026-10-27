@@ -3,6 +3,7 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -726,13 +727,20 @@ private:
 
 class SearchFiberPointIndex {
 public:
-    explicit SearchFiberPointIndex(double maxSampleSpacing)
-        : maxSampleSpacing_(sanitizedSampleSpacing(maxSampleSpacing))
+    explicit SearchFiberPointIndex(double maxSampleSpacing, std::shared_ptr<vc::objects::ObjectStoreSession> store)
+        : maxSampleSpacing_(sanitizedSampleSpacing(maxSampleSpacing)), store_(std::move(store))
     {
     }
 
     void insertFiber(const FiberPolyline& fiber)
     {
+        if (store_) {
+            if (!fiber.storePin) throw std::runtime_error("Store search requires pinned fibers");
+            if (!fiber.coordinateKnown || !(fiber.storeToQueryScale > 0) || !std::isfinite(fiber.storeToQueryScale))
+                throw std::runtime_error("Bind every participating fiber's volume and scale before an exhaustive search");
+            pins_.emplace(fiber.id, *fiber.storePin);
+            scales_.emplace(fiber.id, fiber.storeToQueryScale);
+        }
         auto samples = denseSamplesForFiber(fiber, maxSampleSpacing_);
         auto values = pointValuesForFiber(fiber, samples);
         samplesByFiberId_[fiber.id] = std::move(samples);
@@ -743,7 +751,7 @@ public:
 
     void finalize()
     {
-        tree_ = PointTree(values_.begin(), values_.end());
+        if (!store_) tree_ = PointTree(values_.begin(), values_.end());
     }
 
     [[nodiscard]] std::vector<FiberIntersectionCandidate> candidatesForFiber(
@@ -765,6 +773,32 @@ public:
             return {};
         }
 
+        std::unordered_set<uint64_t> selected;
+        if (store_) {
+            const auto pin = pins_.at(source.id);
+            std::array<double, 6> bounds{INFINITY,INFINITY,INFINITY,-INFINITY,-INFINITY,-INFINITY};
+            for (const auto& sample : sourceSamples) for(int axis=0;axis<3;++axis) {
+                bounds[axis]=std::min(bounds[axis],sample.position[axis]-maxDistance);
+                bounds[axis+3]=std::max(bounds[axis+3],sample.position[axis]+maxDistance);
+            }
+            store_->read(pin.attachment, [&](const auto& db,const auto& txn,const auto& canceled) {
+                std::map<double,std::vector<std::string>> groups;
+                for(const auto& [id, target]:pins_) {
+                    if(canceled || (cancelCallback && cancelCallback())) throw std::runtime_error("Fiber search canceled");
+                    const auto head=db.currentObjectRevision(txn,target.object.objectUuid);
+                    if(target.attachment!=pin.attachment || !head || head->uuid!=target.objectRevision)
+                        throw std::runtime_error("Fiber search superseded by a committed edit");
+                    groups[scales_.at(id)].push_back(target.object.objectUuid);
+                }
+                std::unordered_set<std::string> matches;
+                for (const auto& [scale,uuids] : groups) {
+                    vc::objects::ObjectSelection selection;selection.kind="fiber";selection.uuids=uuids;
+                    auto nativeBounds=bounds;for(auto& value:nativeBounds)value/=scale;selection.bbox=nativeBounds;
+                    for(const auto& region:db.spatialRegions(txn,selection)) matches.insert(region.objectUuid);
+                }
+                for(const auto& [id,target]:pins_) if(matches.contains(target.object.objectUuid)) selected.insert(id);
+            });
+        }
         std::vector<FiberIntersectionCandidate> candidates;
         const double maxDistanceSq = maxDistance * maxDistance;
         std::unordered_map<uint64_t, std::vector<int>> coverageByTarget;
@@ -861,8 +895,14 @@ public:
             const auto& sourceSample = sourceSamples[static_cast<size_t>(sourceIndex)];
             pointHits.clear();
             hits.clear();
-            tree_.query(bgi::intersects(pointQueryBox(sourceSample.position, maxDistance)),
-                        std::back_inserter(pointHits));
+            const auto box = pointQueryBox(sourceSample.position, maxDistance);
+            if (store_) {
+                for(const auto& value:values_) {
+                    if(selected.contains(value.second.fiberId) && bg::intersects(value.first,box)) pointHits.push_back(value);
+                }
+            } else {
+                tree_.query(bgi::intersects(box), std::back_inserter(pointHits));
+            }
             for (const auto& pointHit : pointHits) {
                 const auto& target = pointHit.second;
                 if (target.fiberId == source.id) {
@@ -940,6 +980,9 @@ public:
     }
 
 private:
+    std::shared_ptr<vc::objects::ObjectStoreSession> store_;
+    std::unordered_map<uint64_t, vc::objects::PinnedObject> pins_;
+    std::map<uint64_t,double> scales_;
     double maxSampleSpacing_ = kDefaultMaxSampleSpacing;
     std::unordered_map<uint64_t, std::vector<FiberDenseSample>> samplesByFiberId_;
     std::vector<PointRTreeValue> values_;
@@ -1366,6 +1409,16 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
     FiberSideStripProgressCallback progressCallback,
     FiberIntersectionCancelCallback cancelCallback) const
 {
+    auto query = options;
+    if(query.queryFibers.empty() && impl_) query.queryFibers=impl_->currentFibers();
+    return fiberSideStripIntersections(query, std::move(progressCallback), std::move(cancelCallback));
+}
+
+std::vector<FiberSideStripIntersection> fiberSideStripIntersections(
+    const FiberSideStripQueryOptions& options,
+    FiberSideStripProgressCallback progressCallback,
+    FiberIntersectionCancelCallback cancelCallback)
+{
     if (progressCallback) {
         progressCallback(FiberSideStripProgressPhase::BuildStripTriangles, 0, 0);
     }
@@ -1533,8 +1586,6 @@ std::vector<FiberSideStripIntersection> FiberSpatialIndex::sideStripIntersection
                 fibers.push_back(fiber);
             }
         }
-    } else if (impl_) {
-        fibers = impl_->currentFibers();
     }
 
     if (!fibers.empty()) {
@@ -2029,19 +2080,23 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     const FiberIntersectionCeresOptions& ceres,
     const vc::lasagna::LasagnaNormalSampler* windingSampler,
     FiberIntersectionProgressCallback progressCallback,
-    FiberIntersectionCancelCallback cancelCallback)
+    FiberIntersectionCancelCallback cancelCallback,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
-    if (windingSampler) {
-        cache = nullptr;
-    }
+    // Store snapshots already carry revisions; the legacy cache is keyed only
+    // by runtime generations and cannot represent attachment or frame changes.
+    if (windingSampler || store) cache = nullptr;
 
     std::unordered_map<uint64_t, const FiberPolyline*> byId;
-    SearchFiberPointIndex index(broad.maxSampleSpacing);
+    SearchFiberPointIndex index(broad.maxSampleSpacing, std::move(store));
     if (progressCallback) {
         progressCallback(AtlasSearchProgressPhase::BuildSpatialIndex, 0, fibers.size());
     }
     size_t indexedFibers = 0;
+    const std::unordered_set<uint64_t> sourceSelection(sourceFiberIds.begin(),sourceFiberIds.end());
+    const std::unordered_set<uint64_t> targetSelection(targetFiberIds.begin(),targetFiberIds.end());
     for (const auto& fiber : fibers) {
+        if (!sourceSelection.contains(fiber.id) && !targetSelection.contains(fiber.id)) continue;
         if (cancelCallback && cancelCallback()) {
             return {};
         }
@@ -2137,6 +2192,8 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     }
 
     std::vector<std::vector<FiberIntersectionCandidate>> candidateResults(candidateFiberIds.size());
+    std::exception_ptr candidateError;
+    std::mutex candidateErrorMutex;
     std::atomic_size_t nextCandidate{0};
     std::atomic_bool canceled{false};
     const unsigned hardwareThreads = std::thread::hardware_concurrency();
@@ -2162,8 +2219,14 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
             if (fiberIt == byId.end()) {
                 continue;
             }
-            candidateResults[candidateIndex] =
-                index.candidatesForFiber(*fiberIt->second, broad, cancelCallback);
+            try {
+                candidateResults[candidateIndex] = index.candidatesForFiber(*fiberIt->second, broad, cancelCallback);
+            } catch (...) {
+                std::lock_guard lock(candidateErrorMutex);
+                if(!candidateError) candidateError=std::current_exception();
+                canceled=true;
+                return;
+            }
             reportSearchWorkFinished();
             if (cancelCallback && cancelCallback()) {
                 canceled.store(true, std::memory_order_relaxed);
@@ -2180,6 +2243,7 @@ std::vector<FiberIntersectionResult> searchFiberIntersections(
     for (auto& worker : candidateWorkers) {
         worker.join();
     }
+    if(candidateError) std::rethrow_exception(candidateError);
     if (canceled.load(std::memory_order_relaxed)) {
         return {};
     }

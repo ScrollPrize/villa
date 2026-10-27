@@ -4,12 +4,16 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_error_breakdown import (
     event_features, summarize, interval_masks, tables)
 
 
+def U(n):
+    return f'00000000-0000-4000-8000-{n:012d}'
+
+
 def fixture():
-    solution = dict(source_id=np.array([10,11]), start=np.zeros(2),
+    solution = dict(source_id=np.array([U(10),U(11)]), start=np.zeros(2),
         end=np.array([500.,2000.]), family=np.array([0,1]),
         state=np.array([[2.,.2,0.,4.],[3.,.2,0.,4.]],dtype=np.float32),
         winding_sigma=np.array([.2,2.],dtype=np.float32))
-    events = [dict(test_piece=i%2, test_source=10+i%2, gt_source=1,
+    events = [dict(test_piece=i%2, test_source=U(10+i%2), gt_source=U(1),
         residual=r, parallel=i%2==0, enabled=True, normal_cosine=1)
         for i,r in enumerate([-.5,.5,.2,1.])]
     return solution,events,dict(cavity_winding_sigma=True,sigma_max=8)
@@ -31,10 +35,10 @@ def test_saved_sigma_correctness_boundary_and_weighted_rows():
 
 def test_source_join_and_unsplit_checks():
     s,e,c=fixture()
-    e[0]['test_source']=99
+    e[0]['test_source']=U(99)
     with pytest.raises(ValueError,match='identity'):
         event_features(e,s,c,np.zeros(4))
-    s['source_id'][1]=10
+    s['source_id'][1]=U(10)
     with pytest.raises(ValueError,match='unsplit'):
         event_features(e,s,c,np.zeros(4))
 

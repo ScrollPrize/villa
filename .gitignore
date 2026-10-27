@@ -1,4 +1,8 @@
 # Python venvs, IDE files, build artifacts
+/local/
+/task.md
+/experiments/
+/global-fiber-sgd
 **/.venv*/
 **/.idea/*
 **/__pycache__/

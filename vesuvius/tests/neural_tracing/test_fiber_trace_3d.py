@@ -4392,7 +4392,8 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
     )
 
 
-def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) -> None:
+@pytest.mark.parametrize("output_format", ["legacy", "compact"])
+def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path, output_format) -> None:
     input_path = tmp_path / "input.zarr"
     arr = create_v2_array(
         input_path,
@@ -4426,6 +4427,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
 
     run_fiber_trace_3d_inference(
         config_path=config_path,
+        output_format=output_format,
         input_path=str(input_path),
         output_path=output_path,
         checkpoint=None,
@@ -4445,6 +4447,19 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         accumulator_workers=0,
     )
 
+    if output_format == "compact":
+        from lasagna.lasagna_volume import LasagnaVolume
+        manifest = LasagnaVolume.load(tmp_path / "fiber_out.zarr")
+        assert manifest.validity_channel == "presence"
+        assert manifest.base_shape_zyx == (8, 8, 8)
+        data = zarr.open_array(str(tmp_path / "fiber_out.zarr/sd0/0"), mode="r")
+        assert data.shape == (3,8,8,8)
+        assert data.chunks == (3,4,4,4)
+        assert (tmp_path / "fiber_out.zarr/sd0/1/.zarray").exists()
+        provenance = json.loads((tmp_path / "inference.json").read_text())
+        assert provenance["status"] == "completed"
+        assert provenance["artifacts"][0]["attribute"] == "lasagna"
+        return
     for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
         channel_level = tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "0"
         assert (channel_level / ".zarray").is_file()

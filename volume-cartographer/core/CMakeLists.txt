@@ -1,17 +1,10 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
-# Independent read-only collection reader: usable by the GUI and small tools
-# without linking the CT/tracing stack. R*Tree support is verified on open.
-find_package(SQLite3 REQUIRED)
-add_library(vc_fiber_collection STATIC src/FiberCollection.cpp)
-target_include_directories(vc_fiber_collection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-if(TARGET SQLite3::SQLite3)
-    target_link_libraries(vc_fiber_collection PUBLIC SQLite3::SQLite3)
-else()
-    target_link_libraries(vc_fiber_collection PUBLIC SQLite::SQLite3)
-endif()
-target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
-set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(vc_fiber_view STATIC src/FiberView.cpp)
+target_include_directories(vc_fiber_view PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(vc_fiber_view PUBLIC cxx_std_20)
+target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
+set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
         src/PolylineObj.cpp
@@ -78,6 +71,7 @@ add_library(vc_core
 target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
 
 target_link_libraries(vc_core
+    PUBLIC vc_object_store::vc_objects
         PUBLIC
         opencv_core
         opencv_imgproc
@@ -178,6 +172,7 @@ target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 add_library(vc_lasagna
     src/lasagna/ChannelSampler.cpp
     src/lasagna/Dataset.cpp
+    src/lasagna/PredictionPooling.cpp
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp
     src/lasagna/LaplaceAmgx.cpp
@@ -208,6 +203,12 @@ if(VC_ENABLE_AMGX)
     target_link_libraries(vc_lasagna PRIVATE AMGX::amgx)
 endif()
 target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
+find_package(LAPACK QUIET)
+target_link_libraries(vc_lasagna PRIVATE Eigen3::Eigen)
+if(LAPACK_FOUND AND UNIX AND NOT APPLE)
+    target_link_libraries(vc_lasagna PRIVATE ${LAPACK_LIBRARIES})
+    target_compile_definitions(vc_lasagna PRIVATE VC_POOLING_LAPACK)
+endif()
 
 add_library(vc_atlas
     src/Atlas.cpp
@@ -239,6 +240,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberReverseConsistency.cpp
     src/fiber_tracer/FiberReferenceReplayCore.cpp
     src/fiber_tracer/FiberChunkTrace.cpp
+    src/fiber_tracer/FiberChunkFilter.cpp
+    src/fiber_tracer/FiberChunkGpuBridge.cpp
     src/fiber_tracer/FiberChunkRoute.cpp
     src/fiber_tracer/FiberLiveBridge.cpp
     src/fiber_tracer/FiberEvaluation.cpp
@@ -254,6 +257,22 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberTrace.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
+
+# Optional backend; CPU builds do not need a CUDA toolkit.
+option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
+if(VC_BUILD_FIBER_CHUNK_CUDA)
+    enable_language(CUDA)
+    add_library(vc_fiber_chunk_cuda SHARED src/fiber_tracer/FiberChunkGpu.cu)
+    target_compile_definitions(vc_fiber_chunk_cuda PRIVATE VC_CHUNK_GPU_LIBRARY)
+    add_executable(benchmark_fiber_chunk_cuda src/fiber_tracer/FiberChunkGpu.cu)
+    foreach(target vc_fiber_chunk_cuda benchmark_fiber_chunk_cuda)
+        target_include_directories(${target} PRIVATE include)
+        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json)
+        set_target_properties(${target} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--expt-relaxed-constexpr>)
+    endforeach()
+endif()
 if(VC_TESTING)
     target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
 endif()

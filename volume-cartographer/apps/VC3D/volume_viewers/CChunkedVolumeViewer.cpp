@@ -205,22 +205,6 @@ int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
     return axis;
 }
 
-uint32_t alphaBlendArgb(uint32_t base, uint32_t overlay, float alpha)
-{
-    const float a = std::clamp(alpha, 0.0f, 1.0f);
-    const auto mix = [a](uint32_t b, uint32_t o) -> uint32_t {
-        return static_cast<uint32_t>(
-            std::clamp(std::lround((1.0f - a) * float(b) + a * float(o)), 0L, 255L));
-    };
-    const uint32_t br = (base >> 16) & 0xFFu;
-    const uint32_t bg = (base >> 8) & 0xFFu;
-    const uint32_t bb = base & 0xFFu;
-    const uint32_t or_ = (overlay >> 16) & 0xFFu;
-    const uint32_t og = (overlay >> 8) & 0xFFu;
-    const uint32_t ob = overlay & 0xFFu;
-    return 0xFF000000u | (mix(br, or_) << 16) | (mix(bg, og) << 8) | mix(bb, ob);
-}
-
 QColor activeSegmentationColorForView(const std::string& surfName)
 {
     if (surfName == "seg yz" || surfName == "yz plane")
@@ -2067,6 +2051,7 @@ struct CChunkedVolumeViewer::RenderContext {
     std::string overlayColormapId;
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
+    bool overlayIntensityAsAlpha = false;
     OverlayCompositeSettings overlayComposite;
     std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
     std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
@@ -3301,8 +3286,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
     if (hasOverlay) {
-        vc::buildWindowLevelColormapLut(
-            overlayLut, ctx.overlayWindowLow, ctx.overlayWindowHigh, ctx.overlayColormapId);
+        vc::buildOverlayLut(overlayLut, ctx.overlayWindowLow, ctx.overlayWindowHigh,
+                            ctx.overlayColormapId, ctx.overlayIntensityAsAlpha);
     }
     auto* fbBits = reinterpret_cast<uint32_t*>(result.framebuffer.bits());
     const int fbStride = result.framebuffer.bytesPerLine() / 4;
@@ -3327,9 +3312,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                     ? (0xFF000000u | (uint32_t(colorSrc[x][0]) << 16) |
                        (uint32_t(colorSrc[x][1]) << 8) | uint32_t(colorSrc[x][2]))
                     : lut[src[x]];
-            if (hasOverlay && overlayCov[x] &&
-                overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
-                pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+            if (hasOverlay && overlayCov[x]) {
+                pixel = vc::blendOverlayArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
             }
             if (focusInside && !focusInside[x]) {
                 pixel = (pixel & 0xFF000000u) |
@@ -3393,6 +3377,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayColormapId = _overlayColormapId;
     job.overlayWindowLow = _overlayWindowLow;
     job.overlayWindowHigh = _overlayWindowHigh;
+    job.overlayIntensityAsAlpha = _overlayIntensityAsAlpha;
     job.overlayComposite = _overlayComposite;
     job.chunkContentEpoch = _chunkContentEpoch;
     job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
@@ -3462,6 +3447,7 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.overlayColormapId == b.overlayColormapId &&
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
+           a.overlayIntensityAsAlpha == b.overlayIntensityAsAlpha &&
            a.overlayComposite == b.overlayComposite &&
            a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
            a.surfaceCache.get() == b.surfaceCache.get() &&
@@ -3535,6 +3521,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.overlayColormapId = job.overlayColormapId;
     ctx.overlayWindowLow = job.overlayWindowLow;
     ctx.overlayWindowHigh = job.overlayWindowHigh;
+    ctx.overlayIntensityAsAlpha = job.overlayIntensityAsAlpha;
     ctx.overlayComposite = job.overlayComposite;
     ctx.surfaceCache = job.surfaceCache;
     ctx.overlaySurfaceCache = job.overlaySurfaceCache;
@@ -3919,12 +3906,13 @@ void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
     submitRender("overlay sampling changed");
 }
 
-void CChunkedVolumeViewer::setOverlayThreshold(float threshold)
+void CChunkedVolumeViewer::setOverlayIntensityAsAlpha(bool enabled)
 {
-    if (_closing) {
+    if (_closing || _overlayIntensityAsAlpha == enabled) {
         return;
     }
-    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+    _overlayIntensityAsAlpha = enabled;
+    submitRender("overlay alpha mode changed");
 }
 
 void CChunkedVolumeViewer::setOverlayWindow(float low, float high)

@@ -26,6 +26,24 @@ The object store can be used in place of tifxyz files, fiber jsons, track crossi
 
 The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
+The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-only
+sessions reject actions before invoking their callbacks. VC3D calls the database's
+object, geometry, relationship and retirement APIs directly inside `act`, with
+explicit revision expectations. A split creates two objects and retires the
+original in one transaction. `updateGeometryArrays` shares sparse array/sequence
+updates across geometry kinds; `ingestGeometryBatch` shares one-time ingestion
+of decoded geometry and native topology. Both run inside the caller’s transaction
+and retain the database’s existing revision and relationship checks.
+
+Fiber JSON version 4 is the transfer format; typed database geometry exports
+in it, including control-only fibers. File import also reads VC3D version 1
+and 3 fibers and stores them as version 4: a level-0 coordinate space becomes
+the volume binding, `branch_file` links resolve to the named file's UUID, and a
+link declared from both ends is imported once. Version 1 control points are
+bare XYZ arrays, and a missing `optimization_mode` reads as `lasagna`. A fiber
+file without a `uuid` is given a name-based (version 5) UUID derived from its
+file name, so separate imports of the same file agree on its identity.
+
 ## Use
 
 ```python
@@ -35,12 +53,44 @@ with ObjectStore.create("objects.vcobj", author="reviewer") as store:
     report = store.ingest_geometry_source("patch", "/data/patch")
 ```
 
+`vc_object_ingest` creates the store when `--db` does not exist yet. To start
+a store from a folder of fiber JSONs:
+
+```sh
+build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --fiber /data/fibers
+```
+
+VC3D can also create an empty store (File → Object Store → New Object Store...).
+
 ```sh
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --patch /data/patch
 build/bin/vc_object_links --db objects.vcobj --author "$USER" --link-patch-overlaps
 build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-fiber-patches --ct /data/ct.zarr
 ```
+
+A team can share a store as a hub file on a network share or on any SSH server.
+Initialize the hub from a local store that nothing else has open, then copy it
+into place (to a server, use `scp`):
+
+```sh
+vc_object_hub init objects.vcobj
+cp objects.vcobj /mnt/share/hub.vcobj
+```
+
+Nobody opens the hub directly. Each client clones it into a local replica,
+works there, and syncs; editing an object that already exists on the hub needs
+that object's lease (`vc_object_hub lease acquire REPLICA UUID`):
+
+```sh
+vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj
+vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj   # no mount needed
+vc_object_hub sync ~/replica.vcobj
+```
+
+In VC3D, File → Object Store → Clone Hosted Object Store... clones and attaches
+a replica, and Sync Hosted Object Store Now syncs it; initializing a hub is
+command-line only. See [hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
 edits, graph snapshots, spatial queries, and synchronization. Detector distances

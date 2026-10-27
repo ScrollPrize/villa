@@ -13,7 +13,7 @@ class Pieces:
         self.bounds = {}
         self.first = {}
         parents, starts, ends = [], [], []
-        protected = set(map(int, protected_sources))
+        protected = set(map(str, protected_sources))
         for parent, source in enumerate(data['source_id']):
             direction = np.sign(data['node_ds'][parent, -1])
             if direction not in (-1, 1):
@@ -28,13 +28,13 @@ class Pieces:
                     if event not in seen:
                         arcs.append(start+direction*data['ds_'+side][row])
                         seen.add(event)
-            if minimum_length == 0 or int(source) in protected:
+            if minimum_length == 0 or str(source) in protected:
                 bounds = np.array([start, end])
             else:
                 bounds = start+split_bounds(end-start, np.asarray(arcs)-start,
                                             minimum_length, minimum_perpendicular)
-            self.bounds[int(source)] = bounds
-            self.first[int(source)] = len(parents)
+            self.bounds[str(source)] = bounds
+            self.first[str(source)] = len(parents)
             parents.extend([parent]*(len(bounds)-1))
             starts.extend(bounds[:-1]); ends.extend(bounds[1:])
         self.parent = np.asarray(parents, np.int64)
@@ -42,7 +42,7 @@ class Pieces:
         self.source_id = data['source_id'][self.parent]
 
     def locate(self, source, arc):
-        source = int(source)
+        source = str(source)
         bounds = self.bounds[source]
         tolerance = max(1e-4, 2e-7*bounds[-1])
         if arc < bounds[0]-tolerance or arc > bounds[-1]+tolerance:

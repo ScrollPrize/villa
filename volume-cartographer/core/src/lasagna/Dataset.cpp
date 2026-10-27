@@ -1,4 +1,5 @@
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/PredictionPooling.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
@@ -716,6 +717,8 @@ utils::ZarrArray openLasagnaChannelArray(
 {
     (void)manifest;
     auto registry = vc::buildZarrCodecRegistry(dtypeSize);
+    if(!group.isRemote() && std::filesystem::exists(group.zarrPath/".native_pool.json"))
+        return utils::ZarrArray::open(openPooledPredictionStore(group.zarrPath), "", std::move(registry));
     if (group.isRemote()) {
         auto store = std::make_shared<PersistentHttpStore>(
             group.remoteZarrBaseUrl, group.remoteCacheRoot, group.remoteAuth,

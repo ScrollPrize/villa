@@ -7,10 +7,10 @@
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
-#include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
@@ -676,7 +676,7 @@ TEST_CASE("Display normal provenance survives storage replacement and reversal")
     using namespace vc3d::line_annotation;
     const nlohmann::json input{{"position",{1,2,3}}, {"display_normal",{0,1,0}},
                                {"display_normal_source","interpolated"}};
-    const auto stored=storedControlPointFromJson(input,3);
+    const auto stored=storedControlPointFromJson(input,4);
     CHECK(stored.displayNormalSource == "interpolated");
     CHECK(storedControlPointToJson(stored).at("display_normal_source") == "interpolated");
     CHECK(reversedStoredControlPoints({stored}).front().displayNormalSource == "interpolated");
@@ -686,11 +686,11 @@ TEST_CASE("Display normal provenance survives storage replacement and reversal")
     const auto replacement=collapseControlPointsAtClick({cp},{0},0,{2,2,3});
     CHECK(replacement.controlPoints.front().displayNormalSource == "interpolated");
     auto legacy=input; legacy.erase("display_normal_source");
-    CHECK(storedControlPointFromJson(legacy,3).displayNormalSource == "unknown");
+    CHECK(storedControlPointFromJson(legacy,4).displayNormalSource == "unknown");
     auto manual=input; manual["display_normal_source"]="manual";
-    CHECK(storedControlPointFromJson(manual,3).displayNormalSource == "manual");
+    CHECK(storedControlPointFromJson(manual,4).displayNormalSource == "manual");
     manual.erase("display_normal");
-    CHECK_THROWS(storedControlPointFromJson(manual,3));
+    CHECK_THROWS(storedControlPointFromJson(manual,4));
 }
 
 TEST_CASE("Cross section center drag translates without changing width or orientation")
@@ -804,7 +804,7 @@ TEST_CASE("New control points inherit the existing interpolated display correcti
         stored.displayNormal = created.displayNormal;
         stored.displayNormalSource = created.displayNormalSource;
         stored.direction = created.direction;
-        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 3);
+        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 4);
         REQUIRE(restored.direction);
         REQUIRE(restored.displayNormal);
         CHECK(cv::norm(*restored.direction - *created.direction) < 1e-9);
@@ -878,7 +878,7 @@ TEST_CASE("Fiber display metadata validates and survives CP roundtrip and revers
     vc3d::line_annotation::StoredControlPoint cp;
     cp.displayNormal = cv::Vec3d(0, 1, 0);
     const auto json = vc3d::line_annotation::storedControlPointToJson(cp);
-    const auto restored = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    const auto restored = vc3d::line_annotation::storedControlPointFromJson(json, 4);
     REQUIRE(restored.displayNormal.has_value());
     CHECK(cv::norm(*restored.displayNormal - *cp.displayNormal) < 1e-6);
     const auto reversed = vc3d::line_annotation::reversedStoredControlPoints({cp, cp});
@@ -894,6 +894,43 @@ TEST_CASE("Fiber display metadata validates and survives CP roundtrip and revers
         {live}, {0}, 0.0, cv::Vec3d(1, 2, 3));
     REQUIRE(collapsed.controlPoints[0].displayNormal.has_value());
     CHECK(cv::norm(*collapsed.controlPoints[0].displayNormal - *cp.displayNormal) < 1e-6);
+}
+
+TEST_CASE("deleting the final control point leaves a savable fiber")
+{
+    using vc3d::line_annotation::LineControlPoint;
+    std::vector<LineControlPoint> controls(3);
+    for (size_t i = 0; i < controls.size(); ++i) {
+        controls[i].linePosition = static_cast<double>(i);
+        controls[i].volumePoint = cv::Vec3d(static_cast<double>(i), 0, 0);
+    }
+    controls[0].segmentToNext.emplace();
+    controls[1].segmentToNext.emplace();
+    const auto saved = [](const std::vector<LineControlPoint>& live) {
+        std::vector<vc3d::line_annotation::StoredControlPoint> stored;
+        for (const auto& control : live) {
+            stored.push_back(vc3d::line_annotation::StoredControlPoint{control.volumePoint});
+            stored.back().segmentToNext = control.segmentToNext;
+        }
+        vc3d::line_annotation::validateStoredControlPoints(stored);
+    };
+
+    auto interior = controls;
+    vc3d::line_annotation::eraseControlPoint(interior, 1);
+    CHECK(interior[0].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(interior));
+
+    auto tail = controls;
+    vc3d::line_annotation::eraseControlPoint(tail, 2);
+    REQUIRE(tail.size() == 2);
+    CHECK(tail[0].segmentToNext.has_value());
+    CHECK_FALSE(tail[1].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(tail));
+
+    auto head = controls;
+    vc3d::line_annotation::eraseControlPoint(head, 0);
+    CHECK(head[0].segmentToNext.has_value());
+    CHECK_NOTHROW(saved(head));
 }
 
 TEST_CASE("Fiber width tolerance guides bracket the full width by twenty percent")
@@ -1057,41 +1094,6 @@ std::vector<std::filesystem::path> recoveryFilesIn(const std::filesystem::path& 
 }
 
 } // namespace
-
-TEST_CASE("fiber file name identity parsing round-trips canonical names")
-{
-    using vc3d::line_annotation::fiberFileName;
-    using vc3d::line_annotation::parsedFiberFileNameIdentity;
-
-    const auto simple = parsedFiberFileNameIdentity(
-        fiberFileName("kb", "20260719T194751553", 553));
-    REQUIRE(simple.has_value());
-    CHECK(simple->username == "kb");
-    CHECK(simple->startedAt == "20260719T194751553");
-    CHECK(simple->sequence == 553);
-
-    // Usernames may contain underscores; the stem parses from the right.
-    const auto underscored = parsedFiberFileNameIdentity(
-        fiberFileName("team_alpha", "20260101T000000000", 7));
-    REQUIRE(underscored.has_value());
-    CHECK(underscored->username == "team_alpha");
-    CHECK(underscored->sequence == 7);
-
-    // Sequences above the padded width still round-trip.
-    const auto wide = parsedFiberFileNameIdentity(
-        fiberFileName("dj", "20260101T000000000", 1234567));
-    REQUIRE(wide.has_value());
-    CHECK(wide->sequence == 1234567);
-
-    // Non-canonical names carry no identity.
-    CHECK_FALSE(parsedFiberFileNameIdentity("horizontal_bundle_03.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_000553"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_2026071?T194751553_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("_20260719T194751553_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
-}
 
 TEST_CASE("generated display tangent sign is independent of stored point order")
 {
@@ -1261,14 +1263,14 @@ TEST_CASE("CP direction editing preserves the unedited component and round trips
     vc3d::line_annotation::StoredControlPoint cp;
     cp.direction=*edited;
     auto json=vc3d::line_annotation::storedControlPointToJson(cp);
-    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,3);
+    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,4);
     REQUIRE(loaded.direction);
     CHECK(cv::norm(*loaded.direction-*edited)<1e-9);
     const auto reversedControls=vc3d::line_annotation::reversedStoredControlPoints({cp});
     REQUIRE(reversedControls.front().direction);
     CHECK(cv::norm(*reversedControls.front().direction+*edited)<1e-9);
     json["direction"]={0,0,0};
-    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,3));
+    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,4));
 }
 
 TEST_CASE("Spline uses signed annotated interior tangents")
@@ -3904,6 +3906,11 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
     CHECK(vc3d::line_annotation::normalizedFiberUsername("") == "anon");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("  alice  ") == "alice");
     CHECK(vc3d::line_annotation::normalizedFiberUsername("A User/Name") == "A_User_Name");
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(""));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername(" ANON "));
+    CHECK(vc3d::line_annotation::isAnonymousFiberUsername("//"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("anonymous"));
+    CHECK_FALSE(vc3d::line_annotation::isAnonymousFiberUsername("alice"));
     CHECK(vc3d::line_annotation::fiberFileName("alice", "20260605T123456789", 42) ==
           "alice_20260605T123456789_000042.json");
 }
@@ -4022,296 +4029,6 @@ TEST_CASE("line annotation branch metadata json field set is a compatibility bou
     CHECK(stableFields.size() == 8);
     CHECK(stableFields.front() == "control_point_index");
     CHECK(stableFields.back() == "branch_file");
-}
-
-TEST_CASE("line annotation single fiber save does not create recovery backup")
-{
-    const auto dir = makeTempSaveDir("single");
-    const auto path = dir / "fiber_a.json";
-    writeText(path, "{\"old\":true}\n");
-
-    vc3d::line_annotation::FiberSavePayload payload;
-    payload.fiberId = 1;
-    payload.generation = 2;
-    payload.path = path;
-    payload.json = nlohmann::json{{"new", true}};
-
-    const auto result = vc3d::line_annotation::runFiberSaveJob(10, {payload});
-
-    CHECK(result.ok);
-    CHECK(result.recoveryFiles.empty());
-    CHECK(recoveryFilesIn(dir).empty());
-    CHECK(readText(path).find("\"new\": true") != std::string::npos);
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation successful multi fiber save deletes recovery backups")
-{
-    const auto dir = makeTempSaveDir("multi_success");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    writeText(first, "{\"old\":\"a\"}\n");
-    writeText(second, "{\"old\":\"b\"}\n");
-
-    std::vector<vc3d::line_annotation::FiberSavePayload> payloads{
-        {1, 2, first, nlohmann::json{{"new", "a"}}},
-        {2, 3, second, nlohmann::json{{"new", "b"}}},
-    };
-
-    const auto result = vc3d::line_annotation::runFiberSaveJob(11, std::move(payloads));
-
-    CHECK(result.ok);
-    CHECK(result.recoveryFiles.empty());
-    CHECK(recoveryFilesIn(dir).empty());
-    CHECK(readText(first).find("\"new\": \"a\"") != std::string::npos);
-    CHECK(readText(second).find("\"new\": \"b\"") != std::string::npos);
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation failed multi fiber save restores overwritten targets")
-{
-    const auto dir = makeTempSaveDir("multi_failure");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    writeText(first, "{\"old\":\"a\"}\n");
-    writeText(second, "{\"old\":\"b\"}\n");
-
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
-    std::vector<vc3d::line_annotation::FiberSavePayload> payloads{
-        {1, 2, first, nlohmann::json{{"new", "a"}}},
-        {2, 3, second, nlohmann::json{{"new", "b"}}},
-    };
-
-    const auto result = vc3d::line_annotation::runFiberSaveJob(12, std::move(payloads));
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
-
-    CHECK_FALSE(result.ok);
-    CHECK(result.error.find("Injected failure") != std::string::npos);
-    // The overwritten first target is restored from its recovery copy, the
-    // second was never replaced, and no artifact of the undo survives.
-    CHECK(result.recoveryFiles.empty());
-    CHECK(readText(first) == "{\"old\":\"a\"}\n");
-    CHECK(readText(second) == "{\"old\":\"b\"}\n");
-    CHECK(recoveryFilesIn(dir).empty());
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation failed save restores an overwritten peer after a later payload fails")
-{
-    const auto dir = makeTempSaveDir("peer_restore");
-    const auto merged = dir / "fiber_merged.json";
-    const auto peerA = dir / "fiber_peer_a.json";
-    const auto peerB = dir / "fiber_peer_b.json";
-    const auto original = dir / "fiber_original.json";
-    writeText(peerA, "{\"peer\":\"a\"}\n");
-    writeText(peerB, "{\"peer\":\"b\"}\n");
-    writeText(original, "{\"original\":true}\n");
-
-    // Payload order: new fiber, peer A (overwritten), peer B; fail right after
-    // peer A landed, with the original already retired.
-    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "replace:1", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        17,
-        {{1, 1, merged, nlohmann::json{{"merged", true}}},
-         {2, 5, peerA, nlohmann::json{{"peer", "a-redirected"}}},
-         {3, 5, peerB, nlohmann::json{{"peer", "b-redirected"}}}},
-        {original});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
-
-    CHECK_FALSE(result.ok);
-    CHECK(result.recoveryFiles.empty());
-    CHECK_FALSE(std::filesystem::exists(merged));
-    CHECK(readText(peerA) == "{\"peer\":\"a\"}\n");
-    CHECK(readText(peerB) == "{\"peer\":\"b\"}\n");
-    CHECK(readText(original) == "{\"original\":true}\n");
-    CHECK(recoveryFilesIn(dir).empty());
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
-    }
-    const auto retiredDir = dir / ".retired";
-    if (std::filesystem::exists(retiredDir)) {
-        CHECK(std::filesystem::is_empty(retiredDir));
-    }
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation write-stage failure leaves no temp file and no change")
-{
-    const auto dir = makeTempSaveDir("write_failure");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    writeText(first, "{\"old\":\"a\"}\n");
-
-    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "write:1", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        18,
-        {{1, 1, first, nlohmann::json{{"new", "a"}}},
-         {2, 1, second, nlohmann::json{{"new", "b"}}}});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
-
-    CHECK_FALSE(result.ok);
-    CHECK(result.recoveryFiles.empty());
-    CHECK(readText(first) == "{\"old\":\"a\"}\n");
-    CHECK_FALSE(std::filesystem::exists(second));
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        CHECK(entry.path().filename().string().find(".tmp.") == std::string::npos);
-    }
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation retire-stage failure restores the earlier retirement")
-{
-    const auto dir = makeTempSaveDir("retire_stage");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    const auto target = dir / "fiber_new.json";
-    writeText(first, "{\"a\":true}\n");
-    writeText(second, "{\"b\":true}\n");
-
-    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "retire:1", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        19, {{1, 1, target, nlohmann::json{{"new", true}}}}, {first, second});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
-
-    CHECK_FALSE(result.ok);
-    CHECK(result.recoveryFiles.empty());
-    CHECK(readText(first) == "{\"a\":true}\n");
-    CHECK(readText(second) == "{\"b\":true}\n");
-    CHECK_FALSE(std::filesystem::exists(target));
-    const auto retiredDir = dir / ".retired";
-    if (std::filesystem::exists(retiredDir)) {
-        CHECK(std::filesystem::is_empty(retiredDir));
-    }
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation failed restore is reported as recovery required")
-{
-    const auto dir = makeTempSaveDir("restore_failure");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    writeText(first, "{\"old\":\"a\"}\n");
-    writeText(second, "{\"old\":\"b\"}\n");
-
-    // Both replaced, then the restore of the first is made to fail.
-    setenv("VC3D_FIBER_SAVE_FAIL_STAGE", "restore:0", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        20,
-        {{1, 1, first, nlohmann::json{{"new", "a"}}},
-         {2, 1, second, nlohmann::json{{"new", "b"}}}});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_STAGE");
-
-    CHECK_FALSE(result.ok);
-    CHECK(result.error.find("could not restore") != std::string::npos);
-    // The second target was restored; the first keeps the new content and
-    // its recovery copy is reported so the caller can ask for recovery.
-    CHECK(readText(second) == "{\"old\":\"b\"}\n");
-    CHECK(readText(first).find("\"new\": \"a\"") != std::string::npos);
-    REQUIRE(result.recoveryFiles.size() == 1);
-    CHECK(std::filesystem::exists(result.recoveryFiles.front()));
-    CHECK(readText(result.recoveryFiles.front()) == "{\"old\":\"a\"}\n");
-    CHECK(recoveryFilesIn(dir).size() == 1);
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation save retires originals only after renames succeed")
-{
-    const auto dir = makeTempSaveDir("retire_success");
-    const auto original = dir / "fiber_old.json";
-    const auto target = dir / "fiber_new.json";
-    writeText(original, "{\"old\":true}\n");
-
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        13,
-        {{1, 1, target, nlohmann::json{{"new", true}}}},
-        {original});
-
-    CHECK(result.ok);
-    CHECK(readText(target).find("\"new\": true") != std::string::npos);
-    CHECK_FALSE(std::filesystem::exists(original));
-    // The backup is removed after success; only the empty dot-directory
-    // may remain, which every fiber scanner ignores.
-    const auto retiredDir = dir / ".retired";
-    if (std::filesystem::exists(retiredDir)) {
-        CHECK(std::filesystem::is_empty(retiredDir));
-    }
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation retire-only job is all-or-nothing")
-{
-    const auto dir = makeTempSaveDir("retire_only");
-    const auto first = dir / "fiber_a.json";
-    const auto second = dir / "fiber_b.json";
-    const auto missing = dir / "fiber_gone.json";
-    writeText(first, "{\"a\":true}\n");
-    writeText(second, "{\"b\":true}\n");
-
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        14, {}, {first, second, missing});
-
-    CHECK(result.ok);
-    CHECK_FALSE(std::filesystem::exists(first));
-    CHECK_FALSE(std::filesystem::exists(second));
-    const auto retiredDir = dir / ".retired";
-    if (std::filesystem::exists(retiredDir)) {
-        CHECK(std::filesystem::is_empty(retiredDir));
-    }
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation failed save restores retired originals")
-{
-    const auto dir = makeTempSaveDir("retire_failure");
-    const auto original = dir / "fiber_old.json";
-    const auto firstTarget = dir / "fiber_a.json";
-    const auto secondTarget = dir / "fiber_b.json";
-    writeText(original, "{\"old\":true}\n");
-
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        15,
-        {{1, 1, firstTarget, nlohmann::json{{"new", "a"}}},
-         {2, 1, secondTarget, nlohmann::json{{"new", "b"}}}},
-        {original});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
-
-    CHECK_FALSE(result.ok);
-    // The retired original is renamed straight back into place.
-    CHECK(std::filesystem::exists(original));
-    CHECK(readText(original).find("\"old\": true") != std::string::npos ||
-          readText(original).find("\"old\":true") != std::string::npos);
-    const auto retiredDir = dir / ".retired";
-    if (std::filesystem::exists(retiredDir)) {
-        CHECK(std::filesystem::is_empty(retiredDir));
-    }
-    // The renamed-in brand-new target is removed too: no orphan half of an
-    // aborted batch survives.
-    CHECK_FALSE(std::filesystem::exists(firstTarget));
-    CHECK_FALSE(std::filesystem::exists(secondTarget));
-    std::filesystem::remove_all(dir);
-}
-
-TEST_CASE("line annotation failed multi fiber save removes orphan new targets")
-{
-    const auto dir = makeTempSaveDir("orphan_targets");
-    const auto first = dir / "fiber_new_a.json";
-    const auto second = dir / "fiber_new_b.json";
-
-    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
-    const auto result = vc3d::line_annotation::runFiberSaveJob(
-        16,
-        {{1, 1, first, nlohmann::json{{"new", "a"}}},
-         {2, 1, second, nlohmann::json{{"new", "b"}}}});
-    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
-
-    CHECK_FALSE(result.ok);
-    // Neither brand-new target survives the aborted batch (a pre-existing
-    // target is restored from its recovery copy instead).
-    CHECK_FALSE(std::filesystem::exists(first));
-    CHECK_FALSE(std::filesystem::exists(second));
-    CHECK(recoveryFilesIn(dir).empty());
-    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
@@ -5035,7 +4752,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     control.segmentToNext = metadata;
 
     const auto json = vc3d::line_annotation::storedControlPointToJson(control);
-    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 4);
     REQUIRE(parsed.segmentToNext.has_value());
     CHECK(parsed[0] == doctest::Approx(1.0));
     CHECK(parsed.segmentToNext->normalManifestLocation ==
@@ -5052,7 +4769,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     auto obsoleteMetadataJson = json;
     obsoleteMetadataJson["segment_to_next"]["metadata_version"] = 2;
     CHECK_THROWS_AS(
-        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 3),
+        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 4),
         std::runtime_error);
     CHECK_THROWS_AS(
         vc3d::line_annotation::storedControlPointFromJson(json, 2),
@@ -5076,17 +4793,17 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
              nlohmann::json{{"position", {4.0, 5.0, 6.0}}},
          })}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        sharedReaderRoot, "control_points", 3, "test fiber"));
+        sharedReaderRoot, "control_points", 4, "test fiber"));
     CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
         sharedReaderRoot, "control_points", 2, "test fiber"),
         std::runtime_error);
 
     nlohmann::json strictRoot = sharedReaderRoot;
     strictRoot["type"] = "vc3d_fiber";
-    strictRoot["version"] = 3;
+    strictRoot["version"] = 4;
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
-    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"), std::runtime_error);
     strictRoot["uuid"] = vc::util::newUuid();
     CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
           strictRoot.at("uuid").get<std::string>());
@@ -5097,14 +4814,20 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
         std::runtime_error);
     auto missingMode = strictRoot;
     missingMode.erase("optimization_mode");
-    CHECK_THROWS_AS(
-        vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"),
-        std::runtime_error);
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"));
     auto missingDescriptor = strictRoot;
     missingDescriptor["control_points"][0].erase("segment_to_next");
-    CHECK_THROWS_AS(
-        vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"),
-        std::runtime_error);
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"));
+    for (int version : {1, 2, 3}) {
+        auto old = strictRoot; old["version"] = version;
+        CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(old, "old fiber"), std::runtime_error);
+    }
+    auto versionless = strictRoot; versionless.erase("version");
+    CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(versionless, "old fiber"), std::runtime_error);
+    missingDescriptor["line_points"] = nlohmann::json::array();
+    const auto controlsOnly = vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "control-only fiber");
+    CHECK(controlsOnly.controlPoints.size() == 2);
+    CHECK(controlsOnly.linePoints.empty());
     const auto regeneratedLasagna =
         vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
             "trace",
@@ -5931,7 +5654,7 @@ TEST_CASE("controlled span keeps only the line between the outer control points"
 TEST_CASE("Generated markers map every position into the downsampled viewer")
 {
     using namespace vc3d::line_annotation;
-    for (const double scale : {1.0, 0.25}) {
+    for (const double scale : {1.0, 0.25}) for (const double linkedScale : {scale, scale * 2}) {
         GeneratedOverlay::BranchLinkMarker branch;
         branch.localControlPoint = {120, 240, 360};
         branch.linkedControlPoint = {160, 280, 400};
@@ -5939,9 +5662,9 @@ TEST_CASE("Generated markers map every position into the downsampled viewer")
         branch.localDirection = {1, 0, 0};
         branch.linkedDirection = {0, 1, 0};
         branch.linkedFiberId = 42;
-        scaleGeneratedMarkerForVolume(branch, scale);
+        scaleGeneratedMarkerForVolume(branch, scale, linkedScale);
         CHECK(branch.localControlPoint == cv::Vec3f(120, 240, 360) * scale);
-        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * scale);
+        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * linkedScale);
         CHECK(branch.planePoint == branch.linkedControlPoint);
         CHECK(branch.localDirection == cv::Vec3f(1, 0, 0));
         CHECK(branch.linkedDirection == cv::Vec3f(0, 1, 0));
@@ -6007,7 +5730,7 @@ TEST_CASE("control point tags round trip and travel with the point")
     const auto json = storedControlPointToJson(tagged);
     REQUIRE(json.contains("tags"));
     CHECK(json["tags"] == nlohmann::json::array({"kollesis_termination"}));
-    const auto parsed = storedControlPointFromJson(json, 3);
+    const auto parsed = storedControlPointFromJson(json, 4);
     CHECK(parsed.tags == tagged.tags);
     CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
     CHECK(tagged.tags.empty());
@@ -6016,23 +5739,23 @@ TEST_CASE("control point tags round trip and travel with the point")
     // Normalised on read: trimmed, blanks dropped, unique, sorted.
     const nlohmann::json messy{{"position", {1.0, 2.0, 3.0}},
                                {"tags", {" b ", "a", "", "a"}}};
-    CHECK(storedControlPointFromJson(messy, 3).tags ==
+    CHECK(storedControlPointFromJson(messy, 4).tags ==
           std::vector<std::string>{"a", "b"});
     const nlohmann::json notArray{{"position", {1.0, 2.0, 3.0}},
                                   {"tags", "kollesis_termination"}};
-    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 4), std::runtime_error);
     const nlohmann::json notStrings{{"position", {1.0, 2.0, 3.0}}, {"tags", {1}}};
-    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 4), std::runtime_error);
     // Any other per-point field is still rejected.
     const nlohmann::json unknown{{"position", {1.0, 2.0, 3.0}},
                                  {"kollesis_termination", true}};
-    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 4), std::runtime_error);
 
     // The shared core reader (atlas, tracer CLI, inspect tools) accepts the
     // field and rejects the same malformed shapes.
     const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        root, "control_points", 3, "test fiber"));
+        root, "control_points", 4, "test fiber"));
     const nlohmann::json badTags = {{"control_points", nlohmann::json::array({notStrings})}};
     CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
                         badTags, "control_points", 3, "test fiber"),
@@ -6152,10 +5875,10 @@ TEST_CASE("break tags make gap spans between consecutive tagged points")
     const auto json = storedControlPointToJson(stored);
     REQUIRE(json.contains("tags"));
     CHECK(json["tags"] == nlohmann::json::array({"break"}));
-    CHECK(storedControlPointFromJson(json, 3).tags == std::vector<std::string>{"break"});
+    CHECK(storedControlPointFromJson(json, 4).tags == std::vector<std::string>{"break"});
     const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        root, "control_points", 3, "test fiber"));
+        root, "control_points", 4, "test fiber"));
     CHECK(!controlPointTagsConflict(stored.tags));
     CHECK(controlPointTagsConflict(
         mergedControlPointTags(stored.tags, {kKollesisTerminationTag})));
@@ -6879,7 +6602,7 @@ TEST_CASE("Open tail policy: lone end breaks and kollesis ends are ray sides")
     SUBCASE("stored controls read index order") {
         std::vector<vc3d::line_annotation::StoredControlPoint> stored;
         for (const auto& control : controls) {
-            stored.emplace_back(control.volumePoint);
+            stored.push_back(vc3d::line_annotation::StoredControlPoint{control.volumePoint});
             stored.back().segmentToNext = control.segmentToNext;
         }
         CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{false, false});
@@ -7762,3 +7485,110 @@ TEST_CASE("Mirrored control edits report tail-policy and goal changes per list")
         CHECK(!outcome.changed);
     }
 }
+
+TEST_CASE("Nearest drawn line position: the foot on the nearest drawn, non-tail segment")
+{
+    using vc3d::line_annotation::nearestDrawnLinePosition;
+    constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
+    const double kNan = std::numeric_limits<double>::quiet_NaN();
+    const auto scene = [](const std::vector<cv::Vec3f>& points) {
+        std::vector<QPointF> out;
+        for (const auto& p : points) {
+            out.emplace_back(std::isfinite(p[0]) ? p[0] : std::numeric_limits<double>::quiet_NaN(),
+                             std::isfinite(p[1]) ? p[1] : std::numeric_limits<double>::quiet_NaN());
+        }
+        return out;
+    };
+    SUBCASE("exact fractional foot")
+    {
+        const std::vector<cv::Vec3f> line{{0, 0, 0}, {10, 0, 0}, {20, 0, 0}};
+        const auto position = nearestDrawnLinePosition(line, scene(line), std::nullopt, QPointF(5, 3));
+        REQUIRE(position.has_value());
+        CHECK(*position == doctest::Approx(0.5));
+        const auto later = nearestDrawnLinePosition(line, scene(line), std::nullopt, QPointF(17.5, -2));
+        REQUIRE(later.has_value());
+        CHECK(*later == doctest::Approx(1.75));
+    }
+    SUBCASE("a blanked prefix is never chosen; a blanked interior vertex is bridged")
+    {
+        const std::vector<cv::Vec3f> prefixBlank{{kNanF, kNanF, kNanF}, {10, 0, 0}, {20, 0, 0}};
+        const auto p = nearestDrawnLinePosition(prefixBlank, scene(prefixBlank), std::nullopt, QPointF(0, 1));
+        REQUIRE(p.has_value());
+        CHECK(*p == doctest::Approx(1.0));  // clamped to the first drawn vertex
+        const std::vector<cv::Vec3f> interiorBlank{{0, 0, 0}, {kNanF, kNanF, kNanF}, {20, 0, 0}};
+        const auto bridged = nearestDrawnLinePosition(interiorBlank, scene(interiorBlank), std::nullopt, QPointF(10, 3));
+        REQUIRE(bridged.has_value());
+        CHECK(*bridged == doctest::Approx(1.0));  // the bridge's midpoint, as the renderer draws it
+        const std::vector<cv::Vec3f> suffixBlank{{0, 0, 0}, {10, 0, 0}, {kNanF, kNanF, kNanF}};
+        const auto s = nearestDrawnLinePosition(suffixBlank, scene(suffixBlank), std::nullopt, QPointF(30, 0));
+        REQUIRE(s.has_value());
+        CHECK(*s == doctest::Approx(1.0));
+    }
+    SUBCASE("a tail segment is excluded")
+    {
+        const std::vector<cv::Vec3f> line{{0, 0, 0}, {10, 0, 0}, {20, 0, 0}};
+        // Controls at 1 and 2: the segment 0-1 (midpoint 0.5) is a tail.
+        const std::optional<std::pair<double, double>> range{{1.0, 2.0}};
+        const auto p = nearestDrawnLinePosition(line, scene(line), range, QPointF(2, 1));
+        REQUIRE(p.has_value());
+        CHECK(*p == doctest::Approx(1.0));
+    }
+    SUBCASE("ties take the lower position; nothing drawn gives nullopt")
+    {
+        const std::vector<cv::Vec3f> square{{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}};
+        const auto tie = nearestDrawnLinePosition(square, scene(square), std::nullopt, QPointF(5, 5));
+        REQUIRE(tie.has_value());
+        CHECK(*tie == doctest::Approx(0.5));
+        const std::vector<cv::Vec3f> blank{{kNanF, kNanF, kNanF}, {kNanF, kNanF, kNanF}};
+        CHECK_FALSE(nearestDrawnLinePosition(blank, scene(blank), std::nullopt, QPointF(0, 0)).has_value());
+        const std::vector<cv::Vec3f> one{{0, 0, 0}};
+        CHECK_FALSE(nearestDrawnLinePosition(one, scene(one), std::nullopt, QPointF(0, 0)).has_value());
+        CHECK_FALSE(nearestDrawnLinePosition(square, scene(square), std::nullopt, QPointF(kNan, 0)).has_value());
+    }
+}
+
+TEST_CASE("Auto-link choice facts: a stored record and a session-shaped view of the same fiber agree")
+{
+    using vc3d::line_annotation::autoLinkChoiceFacts;
+    using vc3d::line_annotation::autoLinkChoiceFactsFromStoredFiber;
+    using vc3d::line_annotation::FiberBranchRef;
+    using vc3d::line_annotation::StoredFiber;
+    // Three controls: the middle one linked to another fiber, the last one a
+    // kollesis termination, a gap span between the middle and the last.
+    StoredFiber fiber;
+    fiber.id = 7;
+    fiber.fileName = "a.json";
+    for (int i = 0; i < 3; ++i) {
+        fiber.controlPoints.emplace_back(cv::Vec3d(10.0 * i, 1.0, 2.0));
+    }
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[2].tags,
+                                              vc3d::line_annotation::kKollesisTerminationTag, true);
+    fiber.controlPoints[1].segmentToNext = vc3d::line_annotation::FiberTraceSegmentMetadata{};
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[1].segmentToNext->tags,
+                                              vc3d::line_annotation::kGapSpanTag, true);
+    FiberBranchRef link;
+    link.controlPointIndex = 1;
+    link.branchFiberId = 9;
+    link.branchFileName = "b.json";
+    link.branchControlPointIndex = 0;
+    fiber.branches.push_back(link);
+
+    const auto stored = autoLinkChoiceFactsFromStoredFiber(fiber);
+    // The session-shaped view: positions, the same refs, per-control tags,
+    // per-span gap flags - what choiceSourceFromSession hands the builder.
+    const std::vector<cv::Vec3d> positions{{0, 1, 2}, {10, 1, 2}, {20, 1, 2}};
+    const std::vector<std::vector<std::string>> tags{
+        {}, {}, {std::string(vc3d::line_annotation::kKollesisTerminationTag)}};
+    const std::vector<bool> gaps{false, true, false};
+    const auto session = autoLinkChoiceFacts(positions, fiber.branches, tags, gaps);
+    CHECK(stored == session);
+    REQUIRE(stored.controls.size() == 3);
+    CHECK(stored.linked == std::vector<bool>{false, true, false});
+    CHECK(stored.kollesisTerminations == std::vector<bool>{false, false, true});
+    REQUIRE(stored.gapSpans.size() == 1);
+    CHECK(stored.gapSpans[0] == std::pair<std::size_t, std::size_t>{1, 2});
+    // The control index the chooser reports is the index in this order: the
+    // session's own index for a session.
+    CHECK(stored.controls[1] == cv::Vec3d(10, 1, 2));
+}
+

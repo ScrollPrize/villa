@@ -15,6 +15,7 @@ import numcodecs
 from threadpoolctl import threadpool_limits
 import zarr
 
+from vesuvius.neural_tracing.normals import decode_normals as _decode_normals
 
 _NATIVE_THREAD_ENV = (
 	"OPENBLAS_NUM_THREADS",
@@ -220,17 +221,15 @@ def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
 	return acc / np.maximum(cnt, 1.0)
 
 
-def _decode_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-	nx = (nx_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	ny = (ny_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny)).astype(np.float32, copy=False)
-	return nx, ny, nz
-
-
-def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray, *, validity: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
 	if nx_u8.shape != ny_u8.shape:
 		raise ValueError(f"normal channel shape mismatch: nx={nx_u8.shape} ny={ny_u8.shape}")
 	nx, ny, nz = _decode_normals(nx_u8, ny_u8)
+	if validity is not None:
+		if validity.shape != nx.shape:
+			raise ValueError("normal validity shape mismatch")
+		valid = validity != 0
+		nx, ny, nz = (v * valid for v in (nx, ny, nz))
 	xx = _mean_pool2x_f32(nx * nx)
 	xy = _mean_pool2x_f32(nx * ny)
 	xz = _mean_pool2x_f32(nx * nz)

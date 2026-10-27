@@ -13,6 +13,7 @@
 #include <QImageReader>
 
 #include "CWindow.hpp"
+#include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "themes/ThemeManager.hpp"
@@ -314,6 +315,15 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
+#ifdef VC_TESTING
+    if (hasCliFlag(argc, argv, "--test-object-store")) {
+        extern int runObjectStoreControllerTests();
+        const int result=runObjectStoreControllerTests();
+        std::cout.flush(); std::cerr.flush();
+        // Match normal vc3d shutdown after controller/state cleanup.
+        std::_Exit(result);
+    }
+#endif
     // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
     // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
     // after QApplication construction because Qt may cache the environment
@@ -334,6 +344,7 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+    vc3d::installSshPrompts();
 
     // Handle this before constructing the main window. QCommandLineParser's
     // built-in version option normally exits from process(), but keeping the
@@ -381,7 +392,7 @@ auto main(int argc, char* argv[]) -> int
         "path");
     parser.addOption(volumePackageOption);
     QCommandLineOption fiberCollectionOption(
-        "fiber-collection", "Attach a read-only Automated Fiber Volume (.afv) to the opened CT volume.", "path");
+        "object-store", "Attach an existing writable object store (.vcobj) for this session.", "path");
     parser.addOption(fiberCollectionOption);
 
     QCommandLineOption debugOption(
@@ -603,7 +614,7 @@ auto main(int argc, char* argv[]) -> int
         }
 
         if (parser.isSet(fiberCollectionOption)) {
-            aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
+            aWin.attachObjectStore(parser.value(fiberCollectionOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

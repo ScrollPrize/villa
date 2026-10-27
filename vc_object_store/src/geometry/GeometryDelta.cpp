@@ -69,8 +69,8 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     if (readRequest) {
         Statement size(db, "SELECT length(data) FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
         if (!size.row()) throw std::runtime_error("geometry delta: missing payload");
-        requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
-        requestBytes(rawSize, &FiberRegionStats::reconstructedBytes);
+        requestBytes(size.i64(0), &RegionStats::payloadBytes);
+        requestBytes(rawSize, &RegionStats::reconstructedBytes);
     }
     Statement payload(db, "SELECT data FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!payload.row()) throw std::runtime_error("geometry delta: missing payload");
@@ -118,7 +118,7 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     return result;
 }
 void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& c, bool reverse) {
-    requestBytes(bytes.size(), &FiberRegionStats::reconstructedBytes);
+    requestBytes(bytes.size(), &RegionStats::reconstructedBytes);
     if (geometryPayloadHash(c.key.first, bytes) != (reverse ? c.afterHash : c.beforeHash))
         throw std::runtime_error("geometry delta: parent chunk mismatch");
     for (const auto& edit : c.changes) {

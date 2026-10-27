@@ -6,7 +6,6 @@
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataSegmentCache.hpp"
@@ -1205,17 +1204,6 @@ TEST_CASE("Project creation defaults to the shared autosave directory")
     std::filesystem::remove_all(root);
 }
 
-TEST_CASE("Project fiber paths share annotation filename sanitization")
-{
-    CHECK(vc3d::projectFiberDirectory("projects/My Project.volpkg.json") ==
-          std::filesystem::path("projects/fibers/My_Project.volpkg.json"));
-    CHECK(vc3d::projectFiberDirectory("local.volpkg.json") ==
-          std::filesystem::path("fibers/local.volpkg.json"));
-    CHECK(vc3d::projectFiberDirectory({}, "legacy") ==
-          std::filesystem::path("legacy/fibers/legacy"));
-    CHECK(vc3d::projectFiberDirectory({}).empty());
-}
-
 TEST_CASE("Catalog source selection is independent of derived representations")
 {
     OpenDataSample sample;
@@ -1337,13 +1325,7 @@ TEST_CASE("Selective catalog projects isolate cached projects and individual seg
     CHECK(empty->selectedLasagnaDataset().empty());
     CHECK(empty->name() == destination.name);
     CHECK(empty->path() == destination.path);
-    const auto fiberDir = vc3d::projectFiberDirectory(destination.path);
-    CHECK(fiberDir == root / "fibers" / "empty.volpkg.json");
-    CHECK(std::filesystem::is_directory(fiberDir));
-    CHECK(std::filesystem::is_empty(fiberDir));
-    writeFile(fiberDir / "existing.json", "{}");
-    const auto recreated = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
-    CHECK(std::filesystem::is_regular_file(fiberDir / "existing.json"));
+    CHECK_FALSE(std::filesystem::exists(root / "fibers"));
 
     selection.segmentIds->push_back(sample.segments.front().id);
     destination = {root / "selected.volpkg.json", "Only selected"};
