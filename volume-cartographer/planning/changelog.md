@@ -13,7 +13,8 @@ Removals (planning/cleanup_removals_plan.md):
   vc_rgb2tifxyz, vc_tifxyz_inp_mask, vc_tifxyz_mmap_prepare,
   vc_tifxyz_selfcross, vc_tifxyz_trim, vc_tifxyz_winding, vc_tifxyz2rgb,
   vc_transform_geom, vc_visualize, vc_zarr_download_bench,
-  vc_zarr_download_region, vc_zarr_recompress, vc_zarr_to_tiff. The packaged
+  vc_zarr_download_region, vc_zarr_recompress, vc_zarr_to_tiff, and
+  vc_calc_surface_metrics with core surface_metrics. The packaged
   CLI smoke step launches vc_tifxyz2obj.
 - Removed the synthetic event-cost / thread-sync calibration fitters,
   vc_sync.py, scripts/evaluation and other one-off scripts; stale planning and
