@@ -1,12 +1,12 @@
 #include "InkDetectionOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ObjectStoreRegions.hpp"
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
+#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/imgcodecs.hpp>
@@ -452,9 +452,9 @@ QImage InkDetectionOverlayController::renderSingleChannelImage(
         return image;
     }
 
-    volume_viewer_cmaps::makeColors(
+    vc::makeColors(
         scalar,
-        volume_viewer_cmaps::resolve(colormapId),
+        vc::resolve(colormapId),
         reinterpret_cast<uint32_t*>(image.bits()),
         image.bytesPerLine() / 4);
 

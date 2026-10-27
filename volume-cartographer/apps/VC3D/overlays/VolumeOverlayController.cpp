@@ -3,10 +3,10 @@
 #include "../VolumeDisplayNames.hpp"
 
 #include "../ViewerManager.hpp"
-#include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../VCSettings.hpp"
 
+#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -112,8 +112,7 @@ vc::Sampling samplingMethodFromName(const QString& name)
 
 std::string defaultOverlayColormap()
 {
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     return entries.empty() ? std::string{} : entries.front().id;
 }
 
@@ -622,8 +621,7 @@ void VolumeOverlayController::populateColormapOptions()
         return;
     }
 
-    const auto& entries = volume_viewer_cmaps::entries(
-        volume_viewer_cmaps::EntryScope::OverlayCompatible);
+    const auto& entries = vc::entries(vc::EntryScope::OverlayCompatible);
     const QSignalBlocker blocker(_ui.colormapSelect);
     _ui.colormapSelect->clear();
     _ui.colormapSelect->addItem(tr("Grayscale"), QVariant(QString()));
@@ -633,7 +631,8 @@ void VolumeOverlayController::populateColormapOptions()
 
     for (const auto& entry : entries) {
         const int row = _ui.colormapSelect->count();
-        _ui.colormapSelect->addItem(entry.label, QVariant(QString::fromStdString(entry.id)));
+        _ui.colormapSelect->addItem(QString::fromStdString(entry.label),
+                                    QVariant(QString::fromStdString(entry.id)));
         if (entry.id == _overlayColormapName) {
             indexToSelect = row;
             found = true;

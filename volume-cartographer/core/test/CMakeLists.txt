@@ -109,7 +109,6 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp

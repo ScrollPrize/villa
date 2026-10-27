@@ -79,8 +79,6 @@ set(srcs
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.hpp
     volume_viewers/CVolumeViewerView.cpp
-    VolumeViewerCmaps.cpp
-    VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
     WindowRangeWidget.hpp
     WrapAnnotationWidget.cpp
