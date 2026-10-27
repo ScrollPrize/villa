@@ -3,7 +3,7 @@
 // SQLite object database with immutable geometry and relationship metadata.
 
 #include "vc_object_store/objects/Geometry.hpp"
-#include "vc_object_store/objects/FiberRegion.hpp"
+#include "vc_object_store/objects/GeometryRegion.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -138,6 +138,7 @@ struct SelectedRelationship {
 struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;
+    std::string kind; // the object or edge kind, recorded at the change
     int64_t generation = 0;
     std::string author, hostname, timestamp, changeKind;
     // Approval snapshot after this change; absent for deletion events.
@@ -157,6 +158,11 @@ struct OpenOptions {
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
+    // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
+    // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
+    // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
+    // opens of a hub are rejected so they cannot switch it back to WAL.
+    bool sharedFile = false;
 };
 
 struct ObjectSelection {
@@ -176,6 +182,20 @@ struct ObjectSelection {
     std::optional<std::string> afterUuid;
     std::optional<double> afterLength; // paired with afterUuid for length_desc
     bool includeRetired = false;
+    // Exact declared coordinate system (JSON volume_uuid/scale_factor).
+    // Missing declarations compare as null; absent filter matches all frames.
+    std::optional<std::string> coordinates;
+    // Volume target, exclusive with coordinates: matches objects declared in
+    // this volume ID with a scale factor, across every such frame. bbox,
+    // minLength, afterLength and length_desc then use that volume's voxels,
+    // where volume length = stored length * (1 / scale_factor), the factor of
+    // geometryScaleToVolume(). length_desc ties order by stored length, then
+    // UUID. Returned records and region bounds keep their stored coordinates.
+    std::optional<std::string> volume;
+    // With volume: also list objects not bound to it, after the bound ones in
+    // UUID order (a cursor into them has afterUuid without afterLength).
+    // Excluded when minLength is positive. Not valid for spatialRegions.
+    bool includeUnbound = false;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -263,6 +283,9 @@ public:
     ~Txn();
     void commit();
     bool active() const { return handle_ != nullptr; }
+    // Exact heads captured inside a successful checked commit, before releasing
+    // the writer. A later external commit cannot change this receipt.
+    const RevisionSelection& committedRevisions() const { return committedRevisions_; }
 
 protected:
     Txn(ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
@@ -274,6 +297,7 @@ private:
     ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
+    RevisionSelection expectedRevisions_, committedRevisions_;
 };
 
 class ReadTxn : public Txn {
@@ -372,7 +396,13 @@ public:
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
     int64_t objectCount(const Txn& txn, const std::string& kind, bool includeRetired = false) const;
+    // Active objects of kind that a volume selection lists as unbound (no
+    // finite positive scale declared for volume). Reads only the unbound index
+    // ranges, so a store bound to one volume is not scanned.
+    int64_t unboundObjectCount(const Txn&, const std::string& kind, const std::string& volume) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
+    // Distinct tags on active objects, optionally of one kind, sorted.
+    std::vector<std::string> objectTags(const Txn&, const std::optional<std::string>& kind = std::nullopt) const;
     // Require write(expected). Decisions use keepRecordedRelationship,
     // updateEdge/retainRelationship, or removeEdge before commit. UUID lookup
     // always includes retired objects. Restore copies content into a new revision;
@@ -382,9 +412,10 @@ public:
                        const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
-    // Savepoint-protected replacement; null expectedRevision expects no geometry.
-    // Stale writers fail; identical current content is a no-op. Every affected
-    // edge requires an explicit retain/update/remove decision.
+    // Create geometry, or replace a patch; sequences use structural/sparse edits.
+    // Creation consumes source point annotations into the immutable revision.
+    // Null expectedRevision expects no geometry; stale writers fail. Every
+    // affected edge requires an explicit retain/update/remove decision.
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
                             const std::optional<std::string>& expectedRevision = std::nullopt,
@@ -421,6 +452,11 @@ public:
     // Dtype and trailing dimensions must match. All chunks remain verified.
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
+
+    // Owned pinned payload with an explicit aggregate byte bound. Reads are
+    // chunked; callers needing larger objects should use ranges/rectangles.
+    GeometryData readGeometryData(const Txn&, const std::string& revisionUuid,
+        uint64_t byteBudget = 64 * 1024 * 1024) const;
 
     // Add/replace/remove channels with checked revisions and relationship decisions.
     // Never resize points or read/rehash unchanged arrays. "points" is reserved.
@@ -472,6 +508,7 @@ public:
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
+    int64_t journalPosition(const Txn& txn) const;
 
     EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
     // Atomically repair anchors/bindings, checking edge generation and endpoint heads.
@@ -525,9 +562,10 @@ public:
     // An empty fields vector requests identities only.
     std::vector<ObjectRecord> selectObjects(const Txn&, const ObjectSelection& = {},
         const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
-    // One read snapshot; owned partial runs, no continuation or coverage cache.
-    FiberRegionResult fiberRegion(const ReadTxn&, const FiberSlice&,
-        const FiberRegionOptions& = {}, const FiberRegionCancel& cancel = {}) const;
+    // Exact slab intersection of one object kind's geometry. One read snapshot;
+    // owned partial runs, no continuation or coverage cache.
+    RegionResult geometryRegion(const ReadTxn&, const RegionSlice&,
+        const RegionOptions& = {}, const RegionCancel& cancel = {}) const;
 
     // Requires selection.bbox. Same filters as selectObjects, but pagination
     // counts regions, ordered by object UUID, array name and start indices.

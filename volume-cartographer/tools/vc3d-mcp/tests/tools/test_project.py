@@ -28,12 +28,7 @@ class ProjectBridge(FakeBridgeServer):
         if method == "job.status":
             result = {"jobId": params.get("jobId"), "state": "succeeded",
                       "consoleTail": [], "result": {"attached": True}}
-        elif method == "project.attach" and params.get("location") == "/data/open.afv":
-            # The open fiber volume answers synchronously.
-            result = {"jobId": None, "attached": False, "alreadyAttached": True,
-                      "params": params}
-        elif method == "project.attach" and params.get("kind") in (
-                "lasagna_manifest", "afv"):
+        elif method == "project.attach" and params.get("kind") == "lasagna_manifest":
             result = {"jobId": "job-3", "source": "project", "params": params}
         else:
             result = {"params": params, "attached": True}
@@ -73,12 +68,6 @@ class ProjectToolsTest(unittest.IsolatedAsyncioTestCase):
             self.bridge.params_for("project.attach"),
             {"kind": "lasagna_manifest", "location": "s3://bucket/x.lasagna.json",
              "fiberInference": True})
-
-    async def test_open_fiber_volume_answers_without_a_job(self) -> None:
-        result = await vc3d_attach_to_project("afv", "/data/open.afv", wait=True)
-        self.assertTrue(result["alreadyAttached"])
-        self.assertFalse(any(m.get("method") == "job.status"
-                             for m in self.bridge.received))
 
     async def test_detach_and_save_map_params(self) -> None:
         await vc3d_detach_from_project("umbilicus", confirm=True)

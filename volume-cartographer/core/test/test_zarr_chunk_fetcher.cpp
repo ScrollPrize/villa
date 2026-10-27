@@ -5,6 +5,7 @@
 
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/ZarrDownloadBenchmark.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
@@ -202,6 +203,30 @@ TEST_CASE("openLocalZarrPyramid: opens a multi-level local zarr")
     CHECK_FALSE(opened.fetchers[0]->measuresRemoteTransfer());
     CHECK_FALSE(opened.shapes.empty());
     CHECK(opened.shapes[0][0] == 64);
+    fs::remove_all(d);
+}
+
+TEST_CASE("local pyramid source selection skips unfetched scale levels")
+{
+    auto d = tmpDir("sparse_lod");
+    makeLocalVolume(d, 6);
+    // A partial local download may contain only numeric array directories.
+    fs::remove(d / ".zattrs");
+    for (int level : {0, 1, 4})
+        fs::remove_all(d / std::to_string(level));
+
+    auto array = createChunkCache(openLocalZarrPyramid(d), 1024 * 1024, 1);
+    REQUIRE(array->numLevels() == 6);
+    using vc::render::ChunkedPlaneSampler;
+    for (const auto& [zoom, expected] :
+         std::vector<std::pair<float, int>>{{0.03125f, 5}, {0.0625f, 5},
+                                           {0.125f, 3}, {0.25f, 3},
+                                           {0.5f, 2}, {1.0f, 2}, {4.0f, 2}}) {
+        CAPTURE(zoom);
+        CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, zoom) == expected);
+    }
+    // The quality bias still controls the transition between present levels.
+    CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, 0.25f, 1.0f) == 2);
     fs::remove_all(d);
 }
 

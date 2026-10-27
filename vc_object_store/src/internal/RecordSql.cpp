@@ -1,6 +1,6 @@
 #include "internal/RecordSql.hpp"
 #include "internal/RecordFields.hpp"
-#include "internal/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -35,21 +35,25 @@ std::string projectedObjectColumns(const ObjectFields& fields)
 }
 
 void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
+                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind,
+                   const std::string& deletedKind)
 {
-    Statement state(db, "SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
-        "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
+    Statement state(db, "SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
+        "UNION ALL SELECT kind,approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?",
         uuid, uuid);
     const bool hasState = state.row();
-    Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        uuid, generation, author, hostname, nowIsoUtc(), std::string(changeKind));
+    // Deleted records no longer have a row; their caller read the kind first.
+    const std::string kind = hasState ? state.text(0) : deletedKind;
+    if (kind.empty()) throw std::logic_error("object store: journal entry without record kind");
+    Statement s(db, "INSERT INTO journal(record_uuid,record_kind,generation,author,hostname,timestamp,change_kind,"
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        uuid, kind, generation, author, hostname, nowIsoUtc(), std::string(changeKind));
     for (int i = 0; i < 4; ++i) {
-        if (hasState && !state.isNull(i)) s.bind(7 + i, state.text(i));
-        else s.bindNull(7 + i);
+        if (hasState && !state.isNull(1 + i)) s.bind(8 + i, state.text(1 + i));
+        else s.bindNull(8 + i);
     }
-    if (hasState && !state.isNull(4)) s.bind(11, state.i64(4));
-    else s.bindNull(11);
+    if (hasState && !state.isNull(5)) s.bind(12, state.i64(5));
+    else s.bindNull(12);
     s.stepDone();
 }
 
@@ -249,6 +253,13 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
         rec.approvedGeneration, parseUuid(rec.uuid));
 }
 
+void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
+{
+    for (const auto* key : {"point_attributes", "control_points_attributes", "line_points_attributes", "points_attributes"})
+        if (source.contains(key) && geometryHead(db, uuid))
+            throw std::invalid_argument("point annotations belong to geometry; use sequence editing");
+}
+
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
                              bool preserveRecord, const char* importOperation)
 {
@@ -272,6 +283,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             meta["coordinates"] = geometryCoordinates(meta["coordinates"]);
         else if (!preserveRecord && !objectIdByUuid(db, uuid))
             meta["coordinates"] = geometryCoordinates(nlohmann::json::object());
+        validateGeometrySourceMetadata(db, rec.uuid, meta.value("source", nlohmann::json::object()));
         rec.meta = meta.dump();
     }
     const auto bounds = detail::recordBounds(rec);

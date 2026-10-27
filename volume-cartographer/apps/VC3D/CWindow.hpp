@@ -103,7 +103,6 @@ static constexpr int VOLPKG_MIN_VERSION = 1;
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
-class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -124,7 +123,6 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
-class FiberOverlayController;
 class FiberCollectionController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
@@ -147,7 +145,7 @@ class CWindow : public QMainWindow
     friend class AgentBridgeServer;
 
 public:
-    void openFiberCollection(const QString& path);
+    void attachObjectStore(const QString& path);
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
@@ -182,6 +180,9 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
+    // Status bar and conflict prompt for an attached hosted replica.
+    void updateHubStatus();
+    void promptHubConflicts();
     enum class VolumeOpenError {
         None,
         PackageLoadFailed,
@@ -238,6 +239,8 @@ private:
                                            QString* errorMessage = nullptr);
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
+    // Whether the attached object store holds any active fiber.
+    [[nodiscard]] bool storeHasFibers() const;
     void updateAtlasSearchDocks();
     // Coalesced entry point: fiberSaved fires once per saved fiber and a
     // single edit saves the session plus its linked peers, so refreshes fold
@@ -381,10 +384,6 @@ private slots:
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(vc::PointRef point);
-    void onNewFiberRequested();
-    void onFiberCrosshairModeChanged(bool active);
-    void onFiberViewersRequested();
-    void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
     void refreshSegmentationDirectoryDropdown();
     void applySegmentFolderSelection(bool reloadSurfaces);
@@ -413,7 +412,6 @@ private:
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
     CFiberWidget* _fiberSliceWidget{nullptr};
-    std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
     QPushButton *btnReloadSurfaces;
@@ -431,11 +429,10 @@ private:
     // deletes) before the volume closes: a QPointer, so the late refreshes
     // that close triggers see it gone.
     QPointer<QLabel> _lineAnnotationLengthLabel;
-    // Line length (annotation-frame voxels) by runtime fiber id, as of the
-    // last fiber summaries; what the status bar readout is looked up in.
-    std::unordered_map<uint64_t, double> _fiberLengthVxById;
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
+    QLabel* _hubStatusLabel{nullptr};
+    std::vector<std::string> _hubPromptedConflicts;
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
     QTimer* _statusMessageTimer{nullptr};
@@ -528,7 +525,6 @@ private:
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
-    std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;

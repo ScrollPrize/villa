@@ -1,14 +1,35 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/Progress.hpp"
+#include <nlohmann/json.hpp>
 
 namespace vc::objects {
+// A decoded current-format object. Geometry, metadata and native relationships
+// are inserted together; relationship endpoints use explicit UUIDs.
+struct GeometrySource {
+    ObjectRecord object;
+    GeometryData geometry;
+    nlohmann::json source;
+};
+// Decode a native patch, point-collection file, or fiber file/collection/directory
+// before opening a write transaction. Linked documents are loaded recursively;
+// available UUIDs are existing endpoints whose stored contents remain authoritative.
+// Explicit roots and duplicate identities are never silently skipped.
+std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
+    const std::filesystem::path&, const std::vector<std::string>& availableUuids = {});
+
+// Create new identities atomically in the caller's transaction. Re-import and
+// retired identities are rejected. Checked callers must pin every relationship
+// endpoint. Returns the number of relationships imported; XYZ is unchanged.
+int64_t ingestGeometryBatch(ObjectStore&, WriteTxn&, std::vector<GeometrySource>,
+    const std::string& coordinateContext = "{}");
+
 struct GeometryIngestReport {
     int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
 };
 
-// Read/validate files outside write transactions, then publish the selected batch
+// Read/validate files outside write transactions, then insert the selected batch
 // atomically, including native topology. Only registered placeholders that have
 // never had geometry are eligible. Existing/retired imports are errors, even if
 // unchanged. Source data must be stable during ingestion; edit imported objects
@@ -18,10 +39,10 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
 
 // Create new objects and ingest one source: a tifxyz patch directory,
-// vc3d_fiber JSON or directory, vc_pointcollections JSON (all collections), or packed tracks
+// vc3d_fiber JSON, collection or directory, vc_pointcollections JSON (all collections), or packed tracks
 // (.vctracks directory or DBM path with an existing packed mirror). Track
 // identity is (dataset_ref, external_key), within the object store. Fiber/collection
-// sources publish atomically; packed tracks publish individually with partial reports.
+// sources are inserted atomically; packed tracks are inserted individually with partial reports.
 // Existing identities (including retired objects) and duplicate UUIDs within a
 // batch are errors. Use ingestRegisteredGeometry for an initial placeholder load.
 // coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind.

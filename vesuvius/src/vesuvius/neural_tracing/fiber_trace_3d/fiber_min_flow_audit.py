@@ -69,7 +69,7 @@ def sign_constrained(d, s, optimal_cost=None):
             if not graph.has_edge(q, p) or weight < graph[q][p]['weight']:
                 graph.add_edge(q, p, weight=weight, input_index=int(index))
         cycle = nx.find_negative_cycle(graph, n, weight='weight')
-        edges = [dict(from_node=int(x), to_node=int(y), from_source=int(s.get('source_id', d['source_id'])[x]), to_source=int(s.get('source_id', d['source_id'])[y]),
+        edges = [dict(from_node=int(x), to_node=int(y), from_source=str(s.get('source_id', d['source_id'])[x]), to_source=str(s.get('source_id', d['source_id'])[y]),
             input_index=graph[x][y]['input_index'], event_id=int(d['event_ids'][graph[x][y]['input_index']]),
             upper_bound=graph[x][y]['weight']) for x, y in zip(cycle[:-1], cycle[1:])]
         return dict(feasible=False, contradictory_cycle=edges,
@@ -105,7 +105,7 @@ def internal_details(d, s, config):
     for i in np.flatnonzero(bad):
         a, b = d['i'][i], d['j'][i]
         rows.append(dict(input_index=int(i), event_id=int(d['event_ids'][i]),
-            source_a=int(d['source_id'][a]), source_b=int(d['source_id'][b]),
+            source_a=str(d['source_id'][a]), source_b=str(d['source_id'][b]),
             piece_a=int(ea[i]), piece_b=int(eb[i]),
             family_a='HV'[d['family'][a]], family_b='HV'[d['family'][b]],
             parallel=bool(d['parallel'][i]), measured_distance=float(d['distance'][i]), sign=int(sign[i]),
@@ -131,7 +131,7 @@ def internal_details(d, s, config):
     result = dict(internal=counts, reversed_order=sum(r['kind']=='reversal' for r in rows),
         missing_next_winding=sum(r['kind']=='missing_next_winding' for r in rows),
         max_violation_steps=max((r['violation_steps'] for r in rows), default=0),
-        affected_fibers=len(freq), most_affected=[dict(source_id=int(k), incident_violations=int(v))
+        affected_fibers=len(freq), most_affected=[dict(source_id=str(k), incident_violations=int(v))
                                               for k, v in freq.most_common(10)],
         all_fiber_counts={str(k): v for k, v in sorted(freq.items())},
         violations_involving_any_seam_transport=sum(bool(r['fiber_a_crossings'] or r['fiber_b_crossings']
@@ -194,7 +194,7 @@ def compare_targets(baseline, trial, data, config):
     return dict(objectives=costs, fractional_expansion_checked=direct_checked,
         changed_nodes_after_component_mode_gauge=len(changed),
         changed_node_ids=trial['source_id'][changed].tolist(), changed_node_indices=changed.tolist(),
-        changed_pieces=[dict(source_id=int(trial['source_id'][i]), start=float(trial['start'][i]),
+        changed_pieces=[dict(source_id=str(trial['source_id'][i]), start=float(trial['start'][i]),
                             end=float(trial['end'][i])) for i in changed] if 'parent' in trial else [],
         max_node_change=int(np.max(abs(delta), initial=0)),
         rounded_arcs=len(baseline['a']), fractional_arcs=len(trial['a']))
@@ -225,14 +225,14 @@ def audit_measurements(config, data, sources):
     rows = [by_id[int(i)] for i in data['event_ids']]
     if not rows:
         return dict(source_afc_recomputation='verified', rows_verified=0)
-    ids = np.array([r[1:3] for r in rows], np.int64)
+    ids = np.array([r[1:3] for r in rows], dtype=str)
     expected = np.column_stack([data['source_id'][data['i']], data['source_id'][data['j']]])
     if not np.array_equal(ids, expected):
         raise ValueError('Source AFC endpoint identity differs from cache')
-    lookup = {int(s): i for i, s in enumerate(normal['ids'])}
-    if any(int(s) not in lookup for s in ids.flat):
+    lookup = {str(s): i for i, s in enumerate(normal['ids'])}
+    if any(str(s) not in lookup for s in ids.flat):
         raise ValueError('Source AFC fiber missing from normal solution')
-    ends = np.array([[lookup[int(s)] for s in pair] for pair in ids])
+    ends = np.array([[lookup[str(s)] for s in pair] for pair in ids])
     nums = np.array([r[3:13] for r in rows], float)
     par = nums[:, 6] > nums[:, 7]
     distance = np.where(par, nums[:, 9], nums[:, 8])
@@ -310,14 +310,14 @@ def audit_case(case, data, solution, folder, options, source_path=None):
         if 'parent' in solution:
             links = np.flatnonzero(np.diff(solution['parent']) == 0)
             jumps = solution['winding'][links+1]-solution['winding'][links]
-            boundaries = [dict(source_id=int(solution['source_id'][i]), left_piece=int(i),
+            boundaries = [dict(source_id=str(solution['source_id'][i]), left_piece=int(i),
                 right_piece=int(i+1), arc=float(solution['end'][i]), raw_jump=int(jump),
                 identifiable=bool(solution['component'][i] == solution['component'][i+1]))
                 for i, jump in zip(links, jumps)]
             export_rows(folder/'boundaries.csv', boundaries)
-            with sqlite3.connect(Path(case['dataset']['afv']).as_uri()+'?mode=ro', uri=True) as db:
-                row = db.execute("SELECT value FROM metadata WHERE key='gt_source_id_map'").fetchone()
-            gt_sources = list(map(int, json.loads(row[0]).values())) if row else []
+            # A joint-GT store's GT fibers are listed in the dataset.json written beside it.
+            record = Path(case['dataset']['fibers']).with_name('dataset.json')
+            gt_sources = json.loads(record.read_text()).get('gt_source_ids', []) if record.exists() else []
             report['split_details'] = dict(boundaries=len(links),
                 raw_nonzero_boundary_jumps=int(np.count_nonzero(jumps)),
                 raw_boundary_max_jump=int(np.max(abs(jumps), initial=0)),

@@ -140,6 +140,7 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";
@@ -192,6 +193,11 @@ struct ControlPointCollapseResult {
     double clickedLinePosition,
     const cv::Vec3d& clickedPoint);
 
+// Removes one control. Deleting the final control deletes the span that ended
+// at it, whose descriptor lives on the new final control: clearing it
+// restores the v3 final-CP contract.
+void eraseControlPoint(std::vector<LineControlPoint>& controls, size_t index);
+
 struct PreparedControlPointEdit {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPointsBeforeLineUpdate;
@@ -236,6 +242,7 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";
@@ -248,9 +255,8 @@ struct StoredControlPoint : cv::Vec3d {
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
 
-// Ordinary free-form fiber tag carrying the human review verdict; also the
-// default publish gate of scripts/vc_sync.py hfsync — keep the literal in
-// sync. A toolbar interpolation-mode switch strips it on the save after a
+// Ordinary free-form fiber tag carrying the human review verdict.
+// A toolbar interpolation-mode switch strips it on the save after a
 // successful re-optimization; nothing else touches it programmatically.
 inline constexpr const char* kReviewedTag = "reviewed";
 
@@ -551,8 +557,7 @@ struct FiberModeOptimizationResult {
     FiberModeOptimizationRequest request);
 
 [[nodiscard]] nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata);
-// fiberVersion: the file's vc3d_fiber version; span tags are accepted from
-// version 4 on and rejected as an unknown field before that.
+// Only the current fiber transfer format (version 4) is accepted.
 [[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json,
                                                                           int fiberVersion = kFiberFormatVersion);
 [[nodiscard]] nlohmann::json storedControlPointToJson(const StoredControlPoint& control);

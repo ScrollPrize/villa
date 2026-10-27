@@ -16,9 +16,14 @@ void createSchema(sqlite3* db) {
   format_version INTEGER NOT NULL DEFAULT 0,
   storage_kind TEXT NOT NULL DEFAULT '', storage_ref TEXT NOT NULL DEFAULT '',
   data_generation INTEGER NOT NULL DEFAULT 0, data_checksum TEXT,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object')
+  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
+  -- The geometry coordinate binding, exactly as json_extract reads it (no
+  -- affinity), so volume frames resolve by index instead of parsing meta.
+  coordinate_volume GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.volume_uuid')) VIRTUAL,
+  coordinate_scale GENERATED ALWAYS AS (json_extract(meta,'$.coordinates.scale_factor')) VIRTUAL
 );
 CREATE INDEX objects_kind ON objects(kind);
+CREATE INDEX objects_coordinates ON objects(kind,coordinate_volume,coordinate_scale);
 CREATE INDEX objects_approval ON objects(approval_state);
 CREATE TABLE fibers(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
@@ -48,7 +53,7 @@ CREATE TABLE object_tags(
 CREATE INDEX object_tags_tag ON object_tags(tag);
 CREATE TABLE journal(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  record_uuid BLOB NOT NULL, generation INTEGER NOT NULL,
+  record_uuid BLOB NOT NULL, record_kind TEXT NOT NULL, generation INTEGER NOT NULL,
   author TEXT NOT NULL, hostname TEXT NOT NULL, timestamp TEXT NOT NULL,
   change_kind TEXT NOT NULL,
   approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER

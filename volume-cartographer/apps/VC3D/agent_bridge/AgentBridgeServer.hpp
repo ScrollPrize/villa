@@ -427,7 +427,6 @@ private:
     QJsonObject handleProjectAttach(const QJsonValue& params);
     QJsonObject handleProjectDetach(const QJsonValue& params);
     QJsonObject handleProjectSaveAs(const QJsonValue& params);
-    QJsonObject attachFiberVolume(const QString& location);
     void completeProjectAttachmentJob(const QString& kind, const ProjectAttachmentOutcome& outcome);
     // Registers a "tool" job for a launch that `launch` performs (reporting
     // the job's output path) and, when `closingOperation` is non-empty, keeps

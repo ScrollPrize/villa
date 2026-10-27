@@ -80,7 +80,8 @@ def test_stored_track_crossings_selection_and_atomic_failure(db):
     assert edge["b_anchor"]["position"] == (15, 15, 20)
     assert db.link_tracks_to_tracks(track_uuids=[a.upper(), a])["stale_removed"] == 0
     gb["arrays"] = [array("points", [[50, y, 20] for y in range(31)], "<i4")]
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(b, gb)])
+    edits = [dict(array="points", element_offset=0, data=gb["arrays"][0]["data"])]
+    db.edit_geometry(b, edits, db.current_geometry(b)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(b, edits, db.current_geometry(b)["uuid"])])
     assert db.link_tracks_to_tracks(track_uuids=[a, b])["stale_removed"] == 0
     bad = db.upsert_object({"kind": "track", "track": {"dataset_ref": "missing", "external_key": "0"}})
     before = db.journal_since()
@@ -109,5 +110,6 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_updated"] == 2
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_skipped_existing"] == 2
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
-    db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(collection, geometry)])
+    edits = [dict(array="points", element_offset=0, data=geometry["arrays"][0]["data"])]
+    db.edit_geometry(collection, edits, db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edit_edges(collection, edits, db.current_geometry(collection)["uuid"])])
     assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 0

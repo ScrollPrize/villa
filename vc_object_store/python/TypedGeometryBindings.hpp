@@ -45,28 +45,9 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("vertex", &vg::Patch::vertex, nb::arg("row"), nb::arg("column"), nb::rv_policy::copy)
         .def("valid", &vg::Patch::valid, nb::arg("row"), nb::arg("column"));
 
-    nb::class_<vo::GeometryEdit>(m, "GeometryEdit")
-        .def("move_point", &vo::GeometryEdit::movePoint, nb::arg("point_id"), nb::arg("xyz"))
-        .def("move_control_point", &vo::GeometryEdit::moveControlPoint, nb::arg("index"), nb::arg("xyz"))
-        .def("move_line_point", &vo::GeometryEdit::moveLinePoint, nb::arg("index"), nb::arg("xyz"))
-        .def("move_track_point", &vo::GeometryEdit::moveTrackPoint, nb::arg("index"), nb::arg("xyz"))
-        .def("move_vertex", &vo::GeometryEdit::moveVertex, nb::arg("row"), nb::arg("column"), nb::arg("xyz"))
-        .def("affected_relationships", [](const vo::GeometryEdit& self) {
-            std::vector<vo::EdgeRecord> edges;
-            { nb::gil_scoped_release release; edges = self.affectedRelationships(); }
-            nb::list result;
-            for (const auto& edge : edges) result.append(edgeToPy(edge));
-            return result;
-        })
-        .def("commit", [](vo::GeometryEdit& self, const nb::list& input) {
-            auto decisions = edgeEditsFromPy(input);
-            nb::gil_scoped_release release;
-            return self.commit(decisions);
-        }, nb::arg("edge_edits") = nb::list());
     nb::class_<vo::GeometryView>(m, "GeometryView")
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
-        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy)
-        .def("edit", &vo::GeometryView::edit);
+        .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy);
     nb::class_<vo::PointCollectionView, vo::GeometryView>(m, "PointCollectionView")
         .def("__len__", &vo::PointCollectionView::size)
         .def("ids", &vo::PointCollectionView::ids, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())

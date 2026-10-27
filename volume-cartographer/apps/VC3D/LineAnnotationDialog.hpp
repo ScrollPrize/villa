@@ -30,6 +30,7 @@ class QGraphicsPathItem;
 class QGraphicsRectItem;
 class QGraphicsSimpleTextItem;
 class QLabel;
+class QPushButton;
 class QPlainTextEdit;
 class QMdiArea;
 class QMdiSubWindow;
@@ -190,7 +191,7 @@ public:
     void setGeneratedSideStripIntersectionProgress(const QString& stage,
                                                    size_t completed,
                                                    size_t total);
-    void setGeneratedSideStripIntersectionResult(size_t markerCount);
+    void setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers = 0);
     void setGeneratedSideStripIntersectionError();
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(
@@ -223,6 +224,9 @@ public:
                       const std::vector<std::string>& activeTags,
                       bool enabled);
     void setCloseAfterFinalizationAllowed(bool allowed);
+    // A stored fiber opens read-only with an Enable editing button (disabled
+    // when canEdit is false); the fiber settings are locked meanwhile.
+    void setReadOnly(bool readOnly, bool canEdit = true);
     // Menu texts and the Fiber model combo label from the fiber-follow settings.
     void updateFiberFollowMenu();
     void setModelOnlySession(bool enabled);
@@ -234,6 +238,7 @@ public:
 
 signals:
     void volumeOverlayToggleRequested();
+    void editingRequested();
     void fiberWidthChanged(double baseVoxels);
     void controlDisplayAngleChanged(size_t controlIndex, double degrees);
     void controlDirectionChanged(size_t controlIndex, cv::Vec3f direction);
@@ -662,6 +667,8 @@ private:
     int _appliedBreakExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
+    QPushButton* _enableEditingButton = nullptr;
+    bool _readOnly = false;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
     QWidget* _fiberTraceStatus = nullptr;

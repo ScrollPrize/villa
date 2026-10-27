@@ -16,7 +16,6 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
-#include "FiberCollectionController.hpp"
 #include "ProjectLocations.hpp"
 #include "VCSettings.hpp"
 #include "VolumeAttachmentController.hpp"
@@ -431,13 +430,6 @@ ProjectAttachmentOutcome ProjectAttachmentController::saveProjectAs(const QStrin
                                     .arg(QString::fromStdString(newDir.string()),
                                          relative.join(QStringLiteral(", ")));
         }
-    }
-
-    FiberCollectionController* collection = _window->_fiberCollection.get();
-    if (collection && !collection->collectionPath().isEmpty() &&
-        !collection->saveAttachmentRecord()) {
-        outcome.warnings << QObject::tr("The automated fiber volume's attachment could not "
-                                        "be saved beside the new project file.");
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);

@@ -14,7 +14,6 @@
 
 #include "CWindow.hpp"
 #include "CState.hpp"
-#include "FiberCollectionController.hpp"
 #include "MenuActionController.hpp"
 #include "ProjectAttachmentController.hpp"
 #include "ProjectLocations.hpp"
@@ -26,10 +25,9 @@
 // ===========================================================================
 // Project attachments and Save As. The umbilicus, normal grids, Lasagna
 // manifests, entry detach and Save As go through ProjectAttachmentController,
-// the controller behind the File menu's actions; automated fiber volumes go
-// through FiberCollectionController, which the File menu and the fiber dock
-// use. Umbilicus and normal-grid attachments are synchronous; Lasagna
-// manifests and fiber volumes load in the background as "project" jobs.
+// the controller behind the File menu's actions. Umbilicus and normal-grid
+// attachments are synchronous; Lasagna manifests load in the background as
+// "project" jobs.
 // ===========================================================================
 
 namespace {
@@ -141,9 +139,6 @@ QJsonObject AgentBridgeServer::handleProjectAttach(const QJsonValue& params)
                                QJsonObject{{"param", "location"}}};
     }
 
-    if (kind == QLatin1String("afv"))
-        return attachFiberVolume(location);
-
     ProjectAttachmentController* controller =
         requireController(_window->_projectAttachmentController.get());
 
@@ -188,102 +183,6 @@ QJsonObject AgentBridgeServer::handleProjectAttach(const QJsonValue& params)
     };
 }
 
-QJsonObject AgentBridgeServer::attachFiberVolume(const QString& location)
-{
-    const QString kind = QStringLiteral("afv");
-    FiberCollectionController* collection = _window->_fiberCollection.get();
-    if (!collection) {
-        throw AgentBridgeError{
-            -32009, "Automated fiber volumes unavailable",
-            QJsonObject{{"detail", "fiber collection controller is not available"}}};
-    }
-    const QString path = QFileInfo(vc3d::project_locations::storedLocalLocation(
-                                       location, _window->_state->vpkg()->path().parent_path()))
-                             .absoluteFilePath();
-    if (!QFileInfo(path).isFile()) {
-        throw AgentBridgeError{
-            -32007, "Invalid afv location",
-            QJsonObject{{"kind", kind}, {"id", path},
-                        {"detail", "automated fiber volume not found"}}};
-    }
-    switch (collection->openRefusal()) {
-    case FiberCollectionController::OpenRefusal::NoVolume:
-        throw AgentBridgeError{-32001, "No volume loaded",
-                               QJsonObject{{"detail", "open the CT volume first"}}};
-    case FiberCollectionController::OpenRefusal::NoCoordinateIdentity:
-        throw AgentBridgeError{
-            -32009, "The current volume has no verified coordinate identity",
-            QJsonObject{{"detail", "attach a volume with coordinate metadata first"}}};
-    case FiberCollectionController::OpenRefusal::None:
-        break;
-    }
-
-    // The open collection is the attachment: attaching it again changes
-    // nothing and does not reopen it.
-    const QString previous = collection->collectionPath();
-    if (!previous.isEmpty() &&
-        QFileInfo(previous).canonicalFilePath() == QFileInfo(path).canonicalFilePath()) {
-        ProjectAttachmentOutcome outcome;
-        outcome.success = true;
-        outcome.location = previous;
-        QJsonObject result = attachResultJson(kind, outcome);
-        result["jobId"] = QJsonValue::Null;
-        return result;
-    }
-
-    requireSourceIdle(QStringLiteral("project"));
-    const QString jobId = beginJob(
-        QStringLiteral("project"), QStringLiteral("project.attach"),
-        QStringLiteral("attach %1 %2").arg(kind, path),
-        /*broadcastStart=*/false);
-
-    // The collection reports every open once, carrying the id openCollection
-    // returns; a refusal can be reported from inside the call, before the id
-    // is known.
-    QPointer<AgentBridgeServer> self(this);
-    auto expectedId = std::make_shared<quint64>(0);
-    auto connection = std::make_shared<QMetaObject::Connection>();
-    *connection = connect(
-        collection, &FiberCollectionController::collectionOpened, this,
-        [self, connection, expectedId, path, previous, kind](
-            quint64 openId, const QString& openedPath, bool success,
-            const QString& message, bool attachmentSaved) {
-            if (*expectedId != 0 ? openId != *expectedId : openedPath != path)
-                return;
-            disconnect(*connection);
-            if (!self)
-                return;
-            ProjectAttachmentOutcome outcome;
-            outcome.location = path;
-            outcome.previousLocation = previous;
-            outcome.success = success && attachmentSaved;
-            outcome.changed = outcome.success;
-            if (!success) {
-                outcome.error = message;
-            } else if (!attachmentSaved) {
-                outcome.error = QObject::tr(
-                    "The automated fiber volume opened, but its attachment to the project "
-                    "could not be saved, so it will not reopen with the project.");
-            }
-            self->completeProjectAttachmentJob(kind, outcome);
-        });
-    const quint64 openId = collection->openCollection(path);
-    if (*connection)
-        *expectedId = openId;
-    if (auto it = _activeJobs.find(QStringLiteral("project"));
-        it != _activeJobs.end() && it->id == jobId) {
-        broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
-
-    return {
-        {"jobId", jobId},
-        {"kind", "project.attach"},
-        {"source", "project"},
-        {"attachmentKind", kind},
-        {"location", path},
-    };
-}
-
 void AgentBridgeServer::completeProjectAttachmentJob(const QString& kind,
                                                      const ProjectAttachmentOutcome& outcome)
 {
@@ -309,7 +208,7 @@ QJsonObject AgentBridgeServer::handleProjectDetach(const QJsonValue& params)
     const QString kind = p.value("kind").toString();
     const QString location = p.value("location").toString().trimmed();
 
-    const bool singleValued = kind == QLatin1String("umbilicus") || kind == QLatin1String("afv");
+    const bool singleValued = kind == QLatin1String("umbilicus");
     if (singleValued && p.contains("location")) {
         throw AgentBridgeError{
             -32602, QStringLiteral("%1 has no location to choose; omit location").arg(kind),
@@ -328,19 +227,6 @@ QJsonObject AgentBridgeServer::handleProjectDetach(const QJsonValue& params)
     if (!state || !state->vpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     auto pkg = state->vpkg();
-
-    if (kind == QLatin1String("afv")) {
-        FiberCollectionController* collection = _window->_fiberCollection.get();
-        if (!collection) {
-            throw AgentBridgeError{
-                -32009, "Automated fiber volumes unavailable",
-                QJsonObject{{"detail", "fiber collection controller is not available"}}};
-        }
-        requireSourceIdle(QStringLiteral("project"));
-        const QString open = collection->collectionPath();
-        const bool detached = collection->detachCollection();
-        return {{"detached", detached}, {"kind", kind}, {"location", nullableString(open)}};
-    }
 
     const bool entryOfData = kind == QLatin1String("volume") || kind == QLatin1String("segments");
     if (entryOfData) {

@@ -84,6 +84,7 @@ def launch(
     env = dict(OFFSCREEN_ENV)
     if config_home is not None:
         env["XDG_CONFIG_HOME"] = config_home
+        env["VC3D_CONFIG_DIR"] = config_home
     return VC3DProcess(
         binary,
         args,
@@ -2696,64 +2697,35 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         results.record(
             "volume_open_broken_fibers_is_headless",
             opened.get("opened") is True,
-            "broken branch metadata was kept without opening a repair dialog",
+            "project fiber files are not loaded or repaired",
         )
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_broken_fibers_is_headless", False,
                        f"unexpected {type(e).__name__}: {e}")
 
     try:
-        saved, _ = client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        results.record("fiber_save_completion_response", saved.get("saved") is True,
-                       f"saved={saved.get('saved')}")
-    except Exception as e:  # noqa: BLE001
-        results.record("fiber_save_completion_response", False,
-                       f"unexpected {type(e).__name__}: {e}")
-
-
-UUID_TEXT = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
-def check_legacy_fiber_uuid(client: BridgeClient, results: Results,
-                            fiber_volpkg: str, fiber_file: Path) -> None:
-    """Resolve missing legacy identity and shape after volume activation,
-    then preserve both across save and reopen."""
-    def stored_metadata() -> tuple:
-        data = json.loads(fiber_file.read_text())
-        return data.get("uuid"), data.get("coordinate_base_shape_zyx")
-
-    try:
-        original = json.loads(fiber_file.read_text())
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        first, first_shape = stored_metadata()
         client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        after_save, saved_shape = stored_metadata()
+        results.record("fiber_save_requires_attachment", False, "unexpected success without a store")
+    except BridgeError as error:
+        results.record("fiber_save_requires_attachment", error.code == -32000, str(error))
+
+
+def check_project_fiber_files_untouched(client: BridgeClient, results: Results,
+                                       fiber_volpkg: str, fiber_file: Path) -> None:
+    """Opening a project must neither load nor rewrite former fiber sources."""
+    try:
+        original = fiber_file.read_bytes()
         client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        after_reopen, reopened_shape = stored_metadata()
-        results.record(
-            "legacy_fiber_uuid_persisted",
-            isinstance(first, str) and UUID_TEXT.fullmatch(first) is not None
-            and first == after_save == after_reopen,
-            f"on_load={first} after_save={after_save} after_reopen={after_reopen}",
-        )
-        results.record(
-            "legacy_fiber_coordinate_shape_persisted",
-            first_shape == saved_shape == reopened_shape == [16, 16, 16],
-            f"on_load={first_shape} after_save={saved_shape} "
-            f"after_reopen={reopened_shape}",
-        )
-        reopened = json.loads(fiber_file.read_text())
-        results.record(
-            "legacy_fiber_geometry_preserved",
-            original["control_points"] == [
-                point["position"] for point in reopened["control_points"]]
-            and original["line_points"] == reopened["line_points"],
-            "metadata backfill preserves stored geometry",
-        )
-    except Exception as e:  # noqa: BLE001
-        results.record("legacy_fiber_uuid_persisted", False,
-                       f"unexpected {type(e).__name__}: {e}")
+        try:
+            client.call("fiber.list", {}, timeout=RPC_TIMEOUT)
+            results.record("fiber_list_requires_attachment", False, "unexpected success without a store")
+        except BridgeError as error:
+            results.record("fiber_list_requires_attachment", error.code == -32000, str(error))
+        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
+        results.record("project_fiber_files_untouched", fiber_file.read_bytes() == original,
+                       "project open/reopen preserves native source bytes")
+    except Exception as error:
+        results.record("project_fiber_files_untouched", False, str(error))
 
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
@@ -3036,7 +3008,7 @@ def main() -> int:
             check_segmentation_settings(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
-            check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
+            check_project_fiber_files_untouched(client, results, str(legacy_fiber_volpkg),
                                     legacy_fiber)
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

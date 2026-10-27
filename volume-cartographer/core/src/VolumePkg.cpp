@@ -522,6 +522,13 @@ utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags)
     const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
     if (!nameTag.empty())
         metadata["name"] = nameTag;
+    // Only the native source scan owns the catalog ID. Predictions and
+    // rebased source views also carry this tag, but have distinct identities
+    // and coordinate frames. Apply this on every open, including saved projects.
+    const auto catalogId = tagValueWithPrefix(tags, "vc-open-data-volume-id:");
+    if (!catalogId.empty() &&
+        std::find(tags.begin(), tags.end(), "vc-open-data-preferred-source") != tags.end())
+        metadata["uuid"] = catalogId;
     return metadata;
 }
 
@@ -1602,7 +1609,7 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
         const auto candidate = base / volumeDirName;
         if (!isSingleZarrVolumeDir(candidate)) continue;
         try {
-            auto v = Volume::New(candidate);
+            auto v = Volume::New(candidate, vc::project::volumeMetadataFromEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) return false;
             loadedVolumes_.emplace(id, v);
@@ -1638,11 +1645,15 @@ bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
     auto it = loadedVolumes_.find(volumeId);
     if (it == loadedVolumes_.end() || !it->second) return false;
     const auto vp = it->second->path();
+    std::vector<std::string> tags;
+    if (const auto t = volumeTagsByID_.find(volumeId); t != volumeTagsByID_.end()) tags = t->second;
     loadedVolumes_.erase(it);
     volumeTagsByID_.erase(volumeId);
     try {
-        auto v = Volume::New(vp);
-        loadedVolumes_.emplace(v->id(), v);
+        auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(tags));
+        const auto id = v->id();
+        loadedVolumes_.emplace(id, v);
+        if (!tags.empty()) volumeTagsByID_[id] = tags;
         return true;
     } catch (const std::exception& ex) {
         Logger()->warn("reloadSingleVolume('{}'): {}", volumeId, ex.what());
@@ -2040,7 +2051,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     }
     auto loadOne = [&](const fs::path& vp) {
         try {
-            auto v = Volume::New(vp);
+            auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());

@@ -954,6 +954,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "editable": {
+            "default": false,
+            "type": "boolean"
+          },
           "fiberId": {
             "type": [
               "string",
@@ -2155,8 +2159,7 @@
             "enum": [
               "umbilicus",
               "normal_grid",
-              "lasagna_manifest",
-              "afv"
+              "lasagna_manifest"
             ],
             "type": "string"
           },
@@ -2233,7 +2236,6 @@
               "umbilicus",
               "normal_grid",
               "lasagna_manifest",
-              "afv",
               "volume",
               "segments"
             ],
