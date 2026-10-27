@@ -40,7 +40,8 @@ int runSurfacePanelStoreTests()
             const auto uuid = util::newUuid();
             state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
                 create_quad_in_store(db, txn, uuid, grid, name, tags,
-                                     bound ? nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}}.dump() : std::string("{}"));
+                                     bound ? vc::objects::volumeCoordinates(volume->id(), 1) : nlohmann::json::object(),
+                                     {"surface-panel-test"});
             });
             return uuid;
         };
@@ -126,7 +127,10 @@ int runSurfacePanelStoreTests()
             shown = util::newUuid();
             remote = util::newUuid();
             auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
-            create_quad_in_store(db, txn, shown, grid, "shown", {}, binding);
+            QuadSurface published(points, {1.f, 1.f});
+            published.meta = utils::Json::parse(nlohmann::json{{"catalog", nlohmann::json::parse(binding).at("catalog")}}.dump());
+            create_quad_in_store(db, txn, shown, published, "shown", {}, nlohmann::json::parse(binding).at("coordinates"),
+                                 {"catalog-test"});
             ObjectRecord record;
             record.uuid = remote; record.kind = "surface"; record.name = "remote"; record.meta = binding;
             db.upsertObject(txn, record);

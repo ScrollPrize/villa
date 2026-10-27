@@ -3,6 +3,7 @@
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "GeometryRegionBindings.hpp"
 #include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
@@ -194,6 +195,23 @@ void bindMutations(nb::class_<T>& cls)
             nb::arg("list_key"), nb::arg("position_key"), nb::arg("name"), nb::arg("coordinates"),
             "Attach a document to owner as point collection collection_uuid (objects/AttachedDocument.hpp): one point "
             "per record of document[list_key], at record[position_key].")
+        .def(
+            "create_surface",
+            [](T& self, const std::string& uuid, const std::string& name, const std::vector<std::string>& tags,
+               const nb::object& coordinates, const std::string& tool, const nb::object& parameters,
+               const std::vector<std::string>& sources, const nb::object& meta, const nb::object& geometry) {
+                const auto data = geometryInputFromPy(geometry);
+                const vo::SurfaceProvenance provenance{tool, nlohmann::json::parse(jsonDumps(parameters)), sources};
+                const auto frame = nlohmann::json::parse(jsonDumps(coordinates));
+                const auto rest = nlohmann::json::parse(jsonDumps(meta));
+                self.template withWrite<true>([&](vo::ObjectStore& g, vo::WriteTxn& t) {
+                    vo::createSurface(g, t, uuid, name, tags, frame, provenance, rest, data);
+                });
+            },
+            nb::arg("uuid"), nb::arg("name"), nb::arg("tags"), nb::arg("coordinates"), nb::arg("tool"),
+            nb::arg("parameters"), nb::arg("sources"), nb::arg("meta"), nb::arg("geometry"),
+            "Create surface uuid holding geometry (objects/SurfaceCreate.hpp): bound by coordinates, with "
+            "meta.provenance {tool, parameters, sources} and the rest of meta without tifxyz file keys.")
         .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge, T>(),
              nb::arg("uuid"))
         .def("set_approval", writeMethod<&vo::ObjectStore::setApproval, T>(),

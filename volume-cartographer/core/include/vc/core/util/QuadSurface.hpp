@@ -19,6 +19,7 @@ namespace vc::objects { class TransformedGeometryView; }
 #include "Surface.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include "Rect3D.hpp"
 
 // Surface loading and channel flags
@@ -603,11 +604,11 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
 // Create surface object `uuid` holding `surface` (the caller's transaction
-// expects it absent). Its meta keeps the surface's meta except identity,
-// geometry and file-layout keys and status tags (`tags` are the record's), with
-// `meta` (e.g. coordinates, provenance) on top.
+// expects it absent) through the store's createSurface: bound by
+// `coordinates`, with `provenance`, keeping the surface's other meta.
 void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& uuid, QuadSurface&,
-    const std::string& name, const std::vector<std::string>& tags, const std::string& metaJson);
+    const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
+    const vc::objects::SurfaceProvenance& provenance);
 // Geometry for putGeometry: points, `valid` from the "mask" channel (reduced to the
 // grid: a vertex is valid only if every mask pixel it covers is 255) and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);

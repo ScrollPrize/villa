@@ -11,6 +11,7 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
+#include <vc_object_store/objects/SurfaceCreate.hpp>
 #include <nlohmann/json.hpp>
 #include <QObject>
 #include <QString>
@@ -129,9 +130,9 @@ public:
     // channels there. Throws when the user's store places it differently.
     Opened importCatalogSurface(const Opened& opened);
     // A new surface holding `surface` (in the volume's voxels), bound to the
-    // volume; `provenance` records how it was made ({tool, parameters, sources}).
-    // Sets surface.id and returns the UUID.
-    std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& provenance,
+    // volume; `provenance` records how it was made. Sets surface.id and returns
+    // the UUID.
+    std::string create(QuadSurface& surface, const std::string& name, const vc::objects::SurfaceProvenance& provenance,
                        const std::vector<std::string>& tags = {});
 
 signals:

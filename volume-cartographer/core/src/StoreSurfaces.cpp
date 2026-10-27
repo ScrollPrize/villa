@@ -50,7 +50,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
                                   const std::optional<std::string>& volume)
 {
-    auto meta = nlohmann::json::object();
+    auto coordinates = nlohmann::json::object();
     std::optional<std::string> loadedIn;
     {
         std::lock_guard lock(loadedMutex_);
@@ -60,19 +60,18 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
         if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
         if (!frames.empty()) loadedIn = *frames.begin();
     }
-    if (volume) meta["coordinates"] = vc::objects::volumeCoordinates(*volume, 1);
-    else if (loadedIn) meta["coordinates"] = vc::objects::volumeCoordinates(*loadedIn, 1);
+    if (volume) coordinates = vc::objects::volumeCoordinates(*volume, 1);
+    else if (loadedIn) coordinates = vc::objects::volumeCoordinates(*loadedIn, 1);
     else if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
             const auto source = db.objectByUuid(txn, sources.front());
             if (!source) throw std::runtime_error("source object not found: " + sources.front());
             const auto sourceMeta = nlohmann::json::parse(source->meta);
-            if (sourceMeta.contains("coordinates")) meta["coordinates"] = sourceMeta.at("coordinates");
+            if (sourceMeta.contains("coordinates")) coordinates = sourceMeta.at("coordinates");
         });
-    meta["provenance"] = {{"tool", tool_}, {"parameters", parameters}, {"sources", sources}};
     const auto uuid = vc::objects::util::newUuid();
     session_->act(attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());
+        create_quad_in_store(db, txn, uuid, surface, name, tags, coordinates, {tool_, parameters, sources});
     });
     wrote_ = true;
     surface.id = uuid;

@@ -15,8 +15,6 @@ import numpy as np
 from ._native import ObjectStore, Surface
 
 INVALID = -1.0
-# tifxyz meta.json keys that describe the file, not the surface.
-_TIFXYZ_FILE_KEYS = ("uuid", "name", "format", "type", "scale", "bbox")
 
 
 class SurfaceGrid(NamedTuple):
@@ -55,7 +53,8 @@ def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, so
                    channels=None, tags=(), author=None):
     """A new surface holding ``xyz`` ((rows, columns, 3) in voxels of ``volume``; vertices are missing by the
     store's validity rule) with grid ``scale`` (one number or a pair), bound to ``volume``, with per-vertex ``channels`` and
-    meta.provenance {tool, parameters, sources}. ``meta`` is kept except tifxyz file keys. Returns its UUID."""
+    meta.provenance {tool, parameters, sources}. ``meta`` is kept except tifxyz file keys (the store's
+    createSurface). Returns its UUID."""
     points = np.ascontiguousarray(np.asarray(xyz, dtype="<f4"))
     if points.ndim != 3 or points.shape[2] != 3:
         raise ValueError(f"expected a (rows, columns, 3) grid, got {points.shape}")
@@ -69,12 +68,8 @@ def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, so
         arrays.append(dict(name=channel_name, dtype=data.dtype.str, shape=list(data.shape), data=data.tobytes()))
     geometry.channels = arrays
     surface_uuid = str(uuidlib.uuid4())
-    record_meta = {key: value for key, value in (meta or {}).items() if key not in _TIFXYZ_FILE_KEYS}
-    record_meta["coordinates"] = dict(volume_uuid=str(volume), scale_factor=1)
-    record_meta["provenance"] = dict(tool=tool, parameters=parameters or {}, sources=list(sources))
-    record = dict(uuid=surface_uuid, kind="surface", name=name, tags=list(tags), meta=record_meta)
     with ObjectStore.open(str(store), author=author or getpass.getuser()) as db:
         with db.write(expected_revisions={surface_uuid: None}) as tx:
-            tx.upsert_object(record)
-            tx.put_geometry(surface_uuid, geometry)
+            tx.create_surface(surface_uuid, name, list(tags), dict(volume_uuid=str(volume), scale_factor=1), tool,
+                              parameters or {}, list(sources), meta or {}, geometry)
     return surface_uuid

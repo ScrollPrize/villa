@@ -253,14 +253,13 @@ SurfaceCatalog::Opened SurfaceCatalog::importCatalogSurface(const Opened& opened
     return reopened;
 }
 
-std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const nlohmann::json& provenance,
+std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const SurfaceProvenance& provenance,
                                    const std::vector<std::string>& tags)
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
-    const nlohmann::json meta{{"coordinates", volumeCoordinates(volume_->id(), 1)}, {"provenance", provenance}};
     const auto uuid = util::newUuid();
     session_->act(*attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());
+        create_quad_in_store(db, txn, uuid, surface, name, tags, volumeCoordinates(volume_->id(), 1), provenance);
     });
     surface.id = uuid;
     return uuid;

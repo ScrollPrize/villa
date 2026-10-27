@@ -1066,10 +1066,10 @@ private slots:
         if (result.success) {
             try {
                 if (!catalog_) throw std::runtime_error("the surface list is gone");
-                const nlohmann::json provenance{
-                    {"tool", "vc3d-abf-flatten"},
-                    {"parameters", {{"iterations", iterations_}, {"downsample_factor", downsampleFactor_}}},
-                    {"sources", {uuid_}}};
+                const vc::objects::SurfaceProvenance provenance{
+                    "vc3d-abf-flatten",
+                    {{"iterations", iterations_}, {"downsample_factor", downsampleFactor_}},
+                    {uuid_}};
                 created = QString::fromStdString(catalog_->create(*result.flattened, outputName_.toStdString(), provenance));
             } catch (const std::exception& e) {
                 result.success = false;

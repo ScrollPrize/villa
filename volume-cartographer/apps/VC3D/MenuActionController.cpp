@@ -1530,10 +1530,10 @@ void MenuActionController::surfaceFromSelection()
         }
 
         const std::string name = sourceName + "_sel_" + ts.toStdString() + "_" + std::to_string(idx++);
-        const nlohmann::json provenance{
-            {"tool", "vc3d-surface-from-selection"},
-            {"parameters", {{"scene_rect", {rect.x(), rect.y(), rect.width(), rect.height()}}}},
-            {"sources", {sourceUuid}}};
+        const vc::objects::SurfaceProvenance provenance{
+            "vc3d-surface-from-selection",
+            {{"scene_rect", {rect.x(), rect.y(), rect.width(), rect.height()}}},
+            {sourceUuid}};
         try {
             _window->_surfaceCatalog->create(*filtered, name, provenance);
             created++;

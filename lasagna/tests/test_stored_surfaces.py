@@ -81,7 +81,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 				tifxyz_io.load_tifxyz(ref)
 
 	def test_missing_vertices_follow_the_store_rule(self) -> None:
-		# Any -1 or non-finite coordinate is missing, read and written; z = 0 is a slice.
+		# Any -1 or non-finite coordinate, or z <= 0, is missing, read and written.
 		with tempfile.TemporaryDirectory() as td:
 			store = Path(td) / "objects.vcobj"
 			ObjectStore.create(str(store), author="test").close()
@@ -91,7 +91,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
 			surface = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
 			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
-			self.assertEqual(surface.xyz[0, 1].tolist(), [6.0, 7.0, 0.0])
+			self.assertEqual(surface.xyz[0, 1].tolist(), [-1.0, -1.0, -1.0])
 
 	def test_approval_surface_scales_in_memory(self) -> None:
 		with tempfile.TemporaryDirectory() as td:

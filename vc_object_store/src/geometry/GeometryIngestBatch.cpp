@@ -3,6 +3,7 @@
 #include "internal/Database.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/SurfaceCreate.hpp"
 #include <set>
 namespace vc::objects {
 namespace {
@@ -17,7 +18,7 @@ void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
     eraseSourceGeometryCoordinates(source);
     for (const auto* field : {"uuid", "name", "type", "version", "branches", "adjacent_branches", "windings_linked"}) source.erase(field);
     if (source.contains("tags") && source["tags"].is_array()) source.erase("tags");
-    if (p.object.kind == "surface") for (const auto* field : {"scale", "bbox", "tiff_dimensions", "format"}) source.erase(field);
+    if (p.object.kind == "surface") for (const auto& field : tifxyzFileKeys()) source.erase(field);
     if (p.object.kind == "fiber") for (const auto* field : {"width", "width_gap_fraction", "optimization_mode"}) source.erase(field);
     if (p.object.kind == "fiber" && source.contains("hv_classification")) {
         source["hv_classification"].erase("manual_tag");

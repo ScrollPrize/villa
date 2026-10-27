@@ -12222,10 +12222,9 @@ std::vector<std::string> LineAnnotationController::saveGeneratedQuadMeshes(LineA
         QuadSurface clone(surface->rawPoints().clone(), surface->scale());
         clone.meta = surface->meta;
         const std::string name = "line_annotation_" + timestamp + "_" + stem;
-        const nlohmann::json provenance{{"tool", "vc3d-line-annotation"},
-                                        {"parameters", {{"view", stem}}},
-                                        {"sources", session.fiberUuid.empty() ? nlohmann::json::array()
-                                                                              : nlohmann::json::array({session.fiberUuid})}};
+        const vc::objects::SurfaceProvenance provenance{
+            "vc3d-line-annotation", {{"view", stem}},
+            session.fiberUuid.empty() ? std::vector<std::string>{} : std::vector<std::string>{session.fiberUuid}};
         catalog->create(clone, name, provenance);
         names.push_back(name);
     }
