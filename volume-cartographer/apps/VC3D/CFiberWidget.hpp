@@ -90,10 +90,8 @@ public:
     uint64_t selectedFiberId() const { return _selectedFiberId; }
     std::vector<uint64_t> selectedFiberIds() const;
     bool canDeleteSelection() const;
-    bool canShowFiberSlice() const;
     bool canRenameFiberFile() const;
     std::vector<uint64_t> orderedFiberIds() const;
-    QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
     // The listed fibers: one store catalog page. Entries without details load
     // them through fiberDetailsRequested when selected or expanded.
@@ -138,7 +136,6 @@ signals:
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
     void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
-    void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void importFibersRequested();
     void exportFibersRequested();
@@ -202,7 +199,6 @@ private:
     void applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled);
     void requestFiberTagChange(const QString& tag, bool enabled);
     void requestDeleteSelectedFibers();
-    void requestShowFiberSlice();
     void requestRenameFiberFile();
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString displayNameForFiber(const FiberEntry& fiber);

@@ -30,7 +30,6 @@
 #include "VCSettings.hpp"
 #include "FiberFollowService.hpp"
 #include "ViewerManager.hpp"
-#include "overlays/FiberSliceOverlayController.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/core/types/Volume.hpp"
@@ -73,8 +72,6 @@
 #include <QMetaObject>
 #include <QMessageBox>
 #include <QScopedValueRollback>
-#include <QMdiArea>
-#include <QMdiSubWindow>
 #include <QPoint>
 #include <QTimer>
 #include <QPointF>
@@ -356,26 +353,6 @@ std::vector<vc::geometry::Point> storedFiberLinePoints(
 // Link predicates shared with the save/validation helpers and the
 // structural-edit planners (LineAnnotationFiberLinks.hpp).
 namespace {
-// Axis-aligned box (minx,miny,minz,maxx,maxy,maxz) around finite points,
-// grown by margin on every side.
-std::array<double, 6> boxAroundPoints(const std::vector<cv::Vec3d>& points, double margin)
-{
-    std::array<double, 6> box{INFINITY, INFINITY, INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    for (const auto& point : points) {
-        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) continue;
-        for (int axis = 0; axis < 3; ++axis) {
-            box[axis] = std::min(box[axis], point[axis]);
-            box[axis + 3] = std::max(box[axis + 3], point[axis]);
-        }
-    }
-    if (!(box[0] <= box[3])) return {0, 0, 0, -1, -1, -1};
-    for (int axis = 0; axis < 3; ++axis) {
-        box[axis] -= margin;
-        box[axis + 3] += margin;
-    }
-    return box;
-}
-
 // A point of the current volume in the volume its annotations are kept in.
 cv::Vec3d inAnnotationVolume(const vc::project::AnnotationVolume& annotation, const cv::Vec3d& point)
 {
@@ -1767,7 +1744,6 @@ LineAnnotationController::LineAnnotationController(CState* state,
     , _state(state)
     , _viewerManager(viewerManager)
     , _parentWidget(parentWidget)
-    , _fiberSliceOverlay(std::make_unique<FiberSliceOverlayController>())
     , _datasetPicker([this](QWidget* parent, const fs::path& startDir) {
         return pickDataset(parent, startDir);
     })
@@ -4776,133 +4752,6 @@ void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t>
 {
     for (uint64_t fiberId : fiberIds) {
         addFiberToPointCollection(fiberId);
-    }
-}
-
-void LineAnnotationController::showFiberSlice(uint64_t fiberId, QMdiArea* targetArea)
-{
-    namespace fslice = vc3d::fiber_slice;
-
-    try {
-        if (!_state || !_viewerManager || !targetArea) {
-            throw std::runtime_error("Fiber slice workspace is not available");
-        }
-        const auto stored = readStoredFiber(fiberId, true);
-        if (!stored) {
-            throw std::runtime_error("Selected fiber is not in the attached object store");
-        }
-        if (stored->linePoints.empty()) {
-            throw std::runtime_error("Selected fiber has no line points");
-        }
-
-        if (!stored->editorError.empty()) throw std::runtime_error(stored->editorError);
-        if (!fiberInVolume(*stored)) throw std::runtime_error("Bind the fiber to the active volume before using its geometry");
-        const StoredFiber& displayFiber = *stored;
-        const fslice::ControlSpanSelection span =
-            fslice::selectControlSpan(
-                displayFiber.linePoints,
-                vc3d::line_annotation::storedControlPointPositions(displayFiber.controlPoints));
-        if (!span.valid) {
-            throw std::runtime_error(span.error);
-        }
-        const fslice::PlaneFit fit = fslice::fitLeastSquaresPlane(span, displayFiber.linePoints);
-        if (!fit.valid) {
-            throw std::runtime_error(fit.error);
-        }
-
-        if (_fiberSliceOverlay) {
-            _fiberSliceOverlay->clearSlice();
-        }
-        for (QMdiSubWindow* subWindow : targetArea->subWindowList()) {
-            if (!subWindow) {
-                continue;
-            }
-            const QString oldSurface = subWindow->property("vc_fiber_slice_surface").toString();
-            if (!oldSurface.isEmpty()) {
-                _state->setSurface(oldSurface.toStdString(), nullptr);
-            }
-        }
-        targetArea->closeAllSubWindows();
-
-        const std::string surfaceName =
-            "fiber_slice_" + std::to_string(fiberId) + "_" + std::to_string(_nextPaneId++);
-        auto surface = std::make_shared<PlaneSurface>();
-        surface->setFromNormalAndUp(
-            cv::Vec3f{static_cast<float>(fit.origin[0]),
-                      static_cast<float>(fit.origin[1]),
-                      static_cast<float>(fit.origin[2])},
-            cv::Vec3f{static_cast<float>(fit.normal[0]),
-                      static_cast<float>(fit.normal[1]),
-                      static_cast<float>(fit.normal[2])},
-            cv::Vec3f{static_cast<float>(fit.upHint[0]),
-                      static_cast<float>(fit.upHint[1]),
-                      static_cast<float>(fit.upHint[2])});
-        surface->id = surfaceName;
-        _state->setSurface(surfaceName, surface);
-
-        VolumeViewerBase* viewer = _viewerManager->createViewer(
-            surfaceName,
-            tr("Fiber %1 Slice").arg(fiberId),
-            targetArea,
-            ViewerManager::ViewerRole::Annotation);
-        if (!viewer) {
-            _state->setSurface(surfaceName, nullptr);
-            throw std::runtime_error("Could not create fiber slice viewer");
-        }
-        if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
-            if (auto* subWindow = qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())) {
-                subWindow->setProperty("vc_fiber_slice_surface", QString::fromStdString(surfaceName));
-                subWindow->showMaximized();
-            } else {
-                viewerWidget->show();
-            }
-            connect(viewerWidget, &QObject::destroyed, this, [this, surfaceName]() {
-                if (_state) {
-                    _state->setSurface(surfaceName, nullptr);
-                }
-            });
-        }
-
-        const cv::Vec3f center{
-            static_cast<float>(span.centroid[0]),
-            static_cast<float>(span.centroid[1]),
-            static_cast<float>(span.centroid[2]),
-        };
-        viewer->fitSurfaceInView();
-        viewer->centerOnVolumePoint(center, true);
-
-        if (_fiberSliceOverlay) {
-            FiberSliceOverlayController::SliceData overlayData;
-            overlayData.surfaceName = surfaceName;
-            overlayData.selectedFiberId = fiberId;
-            overlayData.plane = fslice::Plane{fit.origin, fit.normal};
-            overlayData.fitSamples = span.samples;
-            // The slice shows the selected fiber's neighbourhood: every bound
-            // store fiber within one fiber extent of it.
-            const auto lineBox = boxAroundPoints(displayFiber.linePoints, 0.0);
-            const double extent = std::max({lineBox[3] - lineBox[0], lineBox[4] - lineBox[1], lineBox[5] - lineBox[2], 0.0});
-            const auto nearby = readStoredFibersInVolumeBox(boxAroundPoints(displayFiber.linePoints, extent), true);
-            overlayData.fibers.reserve(nearby.size());
-            for (const StoredFiber& fiber : nearby) {
-                if (!fiber.editorError.empty() || !fiberInVolume(fiber)) continue;
-                const StoredFiber& display = fiber;
-                overlayData.fibers.push_back(FiberSliceOverlayController::FiberData{
-                    fiber.id,
-                    display.linePoints,
-                    vc3d::line_annotation::storedControlPointPositions(display.controlPoints),
-                    FiberSliceOverlayController::sourceFiberStyle(),
-                });
-            }
-            _fiberSliceOverlay->setSlice(viewer, std::move(overlayData));
-        }
-
-        if (auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject())) {
-            viewerWidget->raise();
-            viewerWidget->setFocus(Qt::OtherFocusReason);
-        }
-    } catch (const std::exception& ex) {
-        showError(tr("Could not show fiber slice: %1")
-                      .arg(QString::fromStdString(ex.what())));
     }
 }
 
@@ -15335,25 +15184,6 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
         for (auto& fiber : decoded) if (requested.contains(fiber.uuid)) result.push_back(std::move(fiber));
     });
     return result;
-}
-
-std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersInVolumeBox(
-    const std::array<double, 6>& volumeBox, bool lines) const
-{
-    const auto volume = _state ? _state->currentVolume() : nullptr;
-    const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    if (!volume || !attachment) return {};
-    std::vector<std::string> uuids;
-    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::ObjectSelection selection;
-        selection.kind = "fiber";
-        selection.volume = volume->id();
-        selection.bbox = volumeBox;
-        for (auto& object : db.selectObjects(txn, selection, std::vector<std::string>{}))
-            uuids.push_back(std::move(object.uuid));
-    });
-    return readStoredFibers(uuids, lines);
 }
 
 std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::readStoredFibersCached(

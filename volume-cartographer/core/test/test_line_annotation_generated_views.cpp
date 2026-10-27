@@ -4601,121 +4601,6 @@ TEST_CASE("line annotation generated cross slice filters indexed candidates then
     CHECK(overlay.controlPoints[0].linePosition == doctest::Approx(1.0));
 }
 
-TEST_CASE("fiber slice control span uses nearest control line indices")
-{
-    using namespace vc3d::fiber_slice;
-    const std::vector<cv::Vec3d> linePoints{
-        {0.0, 0.0, 0.0},
-        {1.0, 0.0, 0.0},
-        {2.0, 0.0, 0.0},
-        {3.0, 0.0, 0.0},
-        {4.0, 0.0, 0.0},
-    };
-    const std::vector<cv::Vec3d> controls{
-        {3.1, 0.0, 0.0},
-        {1.1, 0.0, 0.0},
-    };
-
-    const auto span = selectControlSpan(linePoints, controls);
-    CHECK(span.valid);
-    CHECK(span.firstLineIndex == 1);
-    CHECK(span.lastLineIndex == 3);
-    CHECK(span.samples.size() == 3);
-    CHECK(span.centroid[0] == doctest::Approx(2.0));
-}
-
-TEST_CASE("fiber slice rejects insufficient controls or fit samples")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK_FALSE(selectControlSpan({{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0},
-                                   {2.0, 0.0, 0.0}},
-                                  {{0.0, 0.0, 0.0}}).valid);
-    CHECK_FALSE(selectControlSpan({{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0}},
-                                  {{0.0, 0.0, 0.0},
-                                   {1.0, 0.0, 0.0}}).valid);
-}
-
-TEST_CASE("fiber slice plane fit recovers synthetic plane")
-{
-    using namespace vc3d::fiber_slice;
-    std::vector<cv::Vec3d> linePoints;
-    for (int i = -3; i <= 3; ++i) {
-        const double x = static_cast<double>(i);
-        const double y = static_cast<double>(i * i - 2);
-        const double z = 2.0 * x + 3.0 * y + 5.0;
-        linePoints.push_back({x, y, z});
-    }
-    const auto span = selectControlSpan(linePoints, {linePoints.front(), linePoints.back()});
-    const auto fit = fitLeastSquaresPlane(span, linePoints);
-    CHECK(fit.valid);
-
-    const cv::Vec3d expected = normalizedOrZero({-2.0, -3.0, 1.0});
-    CHECK(std::abs(fit.normal.dot(expected)) == doctest::Approx(1.0).epsilon(1e-6));
-    for (const auto& point : linePoints) {
-        CHECK(std::abs(signedDistanceToPlane(point, {fit.origin, fit.normal})) <= 1.0e-6);
-    }
-}
-
-TEST_CASE("fiber slice distance scaling clamps at viewport thresholds")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(distanceScaledSize(0.5, 100.0, 10.0, 2.0) == doctest::Approx(10.0));
-    CHECK(distanceScaledSize(1.0, 100.0, 10.0, 2.0) == doctest::Approx(10.0));
-    CHECK(distanceScaledSize(10.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
-    CHECK(distanceScaledSize(20.0, 100.0, 10.0, 2.0) == doctest::Approx(2.0));
-    CHECK(distanceScaledSize(5.5, 100.0, 10.0, 2.0) == doctest::Approx(6.0));
-}
-
-TEST_CASE("fiber slice focused marker uses five percent viewport threshold")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(focusedIntersectionMarkerThreshold(100.0) == doctest::Approx(5.0));
-    CHECK(focusedIntersectionMarkerVisible(5.0, 100.0));
-    CHECK(focusedIntersectionMarkerVisible(-5.0, 100.0));
-    CHECK_FALSE(focusedIntersectionMarkerVisible(5.001, 100.0));
-    CHECK_FALSE(focusedIntersectionMarkerVisible(std::numeric_limits<double>::infinity(), 100.0));
-}
-
-TEST_CASE("fiber slice segment-plane intersection handles crossings")
-{
-    using namespace vc3d::fiber_slice;
-    const Plane plane{{0.0, 0.0, 0.0}, {0.0, 0.0, 1.0}};
-    const auto crossing = segmentPlaneIntersection({0.0, 0.0, -1.0},
-                                                   {2.0, 0.0, 1.0},
-                                                   plane);
-    REQUIRE(crossing.has_value());
-    CHECK(crossing->point[0] == doctest::Approx(1.0));
-    CHECK(crossing->point[1] == doctest::Approx(0.0));
-    CHECK(crossing->point[2] == doctest::Approx(0.0));
-
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 1.0},
-                                         {2.0, 0.0, 1.0},
-                                         plane).has_value());
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 1.0},
-                                         {2.0, 0.0, 2.0},
-                                         plane).has_value());
-    CHECK_FALSE(segmentPlaneIntersection({0.0, 0.0, 0.0},
-                                         {0.0, 0.0, 0.0},
-                                         plane).has_value());
-}
-
-TEST_CASE("fiber slice intersection opacity fades from 45 to 90 degrees")
-{
-    using namespace vc3d::fiber_slice;
-    CHECK(intersectionOpacityForAngle(20.0) == doctest::Approx(1.0));
-    CHECK(intersectionOpacityForAngle(45.0) == doctest::Approx(1.0));
-    CHECK(intersectionOpacityForAngle(67.5) == doctest::Approx(0.5));
-    CHECK(intersectionOpacityForAngle(90.0) == doctest::Approx(0.0));
-    CHECK(intersectionOpacityForAngle(100.0) == doctest::Approx(0.0));
-
-    const auto round = ellipseStyleForAngle(45.0, 3.0);
-    const auto flat = ellipseStyleForAngle(89.0, 3.0);
-    CHECK(flat.majorRadius > round.majorRadius);
-    CHECK(flat.minorRadius < round.minorRadius);
-}
-
 TEST_CASE("fiber segment metadata round trips with its owning control point")
 {
     vc3d::line_annotation::StoredControlPoint control{{1.0, 2.0, 3.0}};
@@ -5029,7 +4914,7 @@ TEST_CASE("fiber mode falls back only the failed native span")
     }
     REQUIRE(sharedDistance < 1.0e-9);
     REQUIRE(sharedIndex + 1 < points.size());
-    const cv::Vec3d fallbackDirection = vc3d::fiber_slice::normalizedOrZero(
+    const cv::Vec3d fallbackDirection = cv::normalize(
         points[sharedIndex + 1].position - points[sharedIndex].position);
     CHECK(fallbackDirection.dot(cv::Vec3d{1.0, 0.0, 0.0}) ==
           doctest::Approx(1.0).epsilon(1.0e-10));

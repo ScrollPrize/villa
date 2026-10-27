@@ -397,10 +397,8 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 
     if (name == QLatin1String("main")) {
         _window->switchToMainWorkspace();
-    } else if (name == QLatin1String("lasagna")) {
-        _window->switchToLasagnaWorkspace();
     } else {
-        _window->switchToFiberSliceWorkspace();
+        _window->switchToLasagnaWorkspace();
     }
 
     QJsonObject result;

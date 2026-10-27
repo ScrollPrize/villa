@@ -172,7 +172,6 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "FiberSliceGeometry.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include <utils/zarr.hpp>
@@ -882,10 +881,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _lasagnaWorkspaceWindow = new QMainWindow(this);
     _lasagnaWorkspaceWindow->setObjectName(QStringLiteral("lasagnaWorkspaceWindow"));
 
-    _fiberSliceWorkspaceWindow = new QMainWindow(this);
-    _fiberSliceWorkspaceWindow->setObjectName(QStringLiteral("fiberSliceWorkspaceWindow"));
-    _fiberSliceWorkspaceWindow->setDockOptions(dockOptions());
-
     // The real Spiral workspace is installed after Main's CState exists. Keep
     // an inert shell here so it can be appended without shifting legacy tabs.
     _spiralWorkspaceWindow = new QMainWindow(this);
@@ -902,11 +897,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
-    _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
     _workspaceTabs->addTab(_spiralWorkspaceWindow, tr("Spiral"));
     _segmentWorkspaceWindow->setProperty("workspaceId", QStringLiteral("main"));
     _lasagnaWorkspaceWindow->setProperty("workspaceId", QStringLiteral("lasagna"));
-    _fiberSliceWorkspaceWindow->setProperty("workspaceId", QStringLiteral("fiber-slice"));
     _spiralWorkspaceWindow->setProperty("workspaceId", QStringLiteral("spiral"));
     if (auto* tabBar = _workspaceTabs->tabBar()) {
         for (int i = 0; i < _workspaceTabs->count(); ++i) {
@@ -1069,9 +1062,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             this, [this](uint64_t fiberId, int controlPointIndex) {
                 if (_fiberWidget) {
                     _fiberWidget->selectFiber(fiberId);
-                }
-                if (_fiberSliceWidget) {
-                    _fiberSliceWidget->selectFiber(fiberId);
                 }
                 if (_lineAnnotationController) {
                     _lineAnnotationController->openFiberAtControlPoint(fiberId,
@@ -1398,8 +1388,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetOverlay,
                                _inkDetectionDock,
-                               _transformsDock,
-                               static_cast<QDockWidget*>(_fiberSliceWidget) }) {
+                               _transformsDock }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -1423,7 +1412,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
             }
         }
-        if (workspaceIndex < 0) workspaceIndex = geometry.value(WORKSPACE_TAB_SETTING, 0).toInt();
+        // An id from a workspace that no longer exists opens main; settings
+        // saved before workspace ids fall back to the tab index.
+        if (workspaceIndex < 0) {
+            workspaceIndex = workspaceId.isEmpty() ? geometry.value(WORKSPACE_TAB_SETTING, 0).toInt() : 0;
+        }
         if (workspaceIndex >= 0 && workspaceIndex < _workspaceTabs->count()) {
             _workspaceTabs->setCurrentIndex(workspaceIndex);
         }
@@ -1437,8 +1430,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                ui.dockWidgetViewerControls,
                                ui.dockWidgetOverlay,
                                 _inkDetectionDock,
-                               _transformsDock,
-                               static_cast<QDockWidget*>(_fiberSliceWidget)  }) {
+                               _transformsDock }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
         if (!dock) continue;
@@ -1472,7 +1464,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    ui.dockWidgetComposite,
                                         _inkDetectionDock,
                                    _transformsDock,
-                                   static_cast<QDockWidget*>(_fiberSliceWidget),
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
@@ -1801,10 +1792,9 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, _point_collection_widget);
     addDock(menu, _wrapAnnotationWidget);
 
-    if (_fiberWidget || _fiberSliceWidget) {
+    if (_fiberWidget) {
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
-        addDock(fiberMenu, _fiberSliceWidget);
     }
 }
 
@@ -1939,9 +1929,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                         [this, fiberId, controlIndex]() {
                                             if (_fiberWidget) {
                                                 _fiberWidget->selectFiber(fiberId);
-                                            }
-                                            if (_fiberSliceWidget) {
-                                                _fiberSliceWidget->selectFiber(fiberId);
                                             }
                                             if (_lineAnnotationController) {
                                                 _lineAnnotationController->openFiberAtControlPoint(
@@ -2397,8 +2384,8 @@ void CWindow::updateActiveWorkspaceViewerControls()
     if (_fiberCollection) {
         _fiberCollection->setLineAnnotationActive(lineAnnotationActive);
     }
-    for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
-        if (widget) widget->setLineAnnotationActive(lineAnnotationActive);
+    if (_fiberWidget) {
+        _fiberWidget->setLineAnnotationActive(lineAnnotationActive);
     }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
@@ -2709,19 +2696,6 @@ void CWindow::switchToMainWorkspace()
     }
 }
 
-void CWindow::switchToFiberSliceWorkspace()
-{
-    if (!_workspaceTabs || !_fiberSliceWorkspaceWindow) {
-        return;
-    }
-    const int index = _workspaceTabs->indexOf(_fiberSliceWorkspaceWindow);
-    if (index >= 0) {
-        _workspaceTabs->setCurrentIndex(index);
-        _fiberSliceWorkspaceWindow->raise();
-        _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
-    }
-}
-
 void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title)
 {
     if (!_workspaceTabs || !dialog) {
@@ -2907,21 +2881,6 @@ void CWindow::CreateWidgets(void)
         settings.setValue(MAIN_VIEWER_SPLIT_X_SETTING, viewerGrid->splitX());
         settings.setValue(MAIN_VIEWER_SPLIT_Y_SETTING, viewerGrid->splitY());
     };
-
-    if (_fiberSliceWorkspaceWindow) {
-        _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
-        _fiberSliceMdiArea->setObjectName(QStringLiteral("fiberSliceMdiArea"));
-        _fiberSliceWorkspaceWindow->setCentralWidget(_fiberSliceMdiArea);
-        connect(_fiberSliceMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-            if (subWindow) {
-                if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                    if (auto* graphicsView = viewer->graphicsView()) {
-                        graphicsView->setFocus();
-                    }
-                }
-            }
-        });
-    }
 
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
     treeWidgetSurfaces->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -3464,17 +3423,8 @@ void CWindow::CreateWidgets(void)
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
 
-    if (_fiberSliceWorkspaceWindow) {
-        _fiberSliceWidget = new CFiberWidget(_fiberSliceWorkspaceWindow);
-        _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
-        _fiberSliceWidget->setWindowTitle(tr("Fiber Slice Fibers"));
-        _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
-    }
-
-    auto forEachFiberWidget = [this](auto&& apply) {
-        for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
-            if (widget) apply(widget);
-        }
+    auto withFiberWidget = [this](auto&& apply) {
+        if (_fiberWidget) apply(_fiberWidget);
     };
 
     if (_lineAnnotationController && _fiberCollection) {
@@ -3560,7 +3510,7 @@ void CWindow::CreateWidgets(void)
         };
 
         connect(collection, &FiberCollectionController::catalogChanged, this,
-                [this, forEachFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                [this, withFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
                     std::vector<CFiberWidget::FiberEntry> entries;
                     entries.reserve(rows.size());
                     for (const auto& row : rows) {
@@ -3569,31 +3519,31 @@ void CWindow::CreateWidgets(void)
                     // Unit first, so the rebuilt rows below are texted once in it.
                     updateFiberLengthUnits();
                     const auto tags = _lineAnnotationController->knownFiberTags();
-                    forEachFiberWidget([&](CFiberWidget* widget) {
+                    withFiberWidget([&](CFiberWidget* widget) {
                         widget->setFibers(entries);
                         widget->setKnownTags(tags);
                         widget->setNextPageAvailable(morePages);
                     });
                 });
         connect(collection, &FiberCollectionController::fiberRevealed, this,
-                [forEachFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
+                [withFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
                     const auto entry = catalogEntry(row);
-                    forEachFiberWidget([&](CFiberWidget* widget) { widget->revealFiber(entry); });
+                    withFiberWidget([&](CFiberWidget* widget) { widget->revealFiber(entry); });
                 });
         connect(collection, &FiberCollectionController::statusChanged, this,
-                [forEachFiberWidget](bool attached, const QString& text) {
-                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setStoreStatus(attached, text); });
+                [withFiberWidget](bool attached, const QString& text) {
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setStoreStatus(attached, text); });
                 });
         connect(collection, &FiberCollectionController::selectionChanged, this,
-                [forEachFiberWidget](const FiberCollectionController::Selection& selection) {
-                    forEachFiberWidget([&](CFiberWidget* widget) {
+                [withFiberWidget](const FiberCollectionController::Selection& selection) {
+                    withFiberWidget([&](CFiberWidget* widget) {
                         widget->setTraceSelection(selection.text, selection.toolTip, selection.pointCount,
                                                   selection.index, selection.openable);
                     });
                 });
         connect(collection, &FiberCollectionController::annotationStatusChanged, this,
-                [forEachFiberWidget](const QString& text) {
-                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setAnnotationStatus(text); });
+                [withFiberWidget](const QString& text) {
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setAnnotationStatus(text); });
                 });
         connect(collection, &FiberCollectionController::panelRequested, this, [this]() {
             if (_statusDockPanelHost) {
@@ -3604,26 +3554,26 @@ void CWindow::CreateWidgets(void)
             }
         });
         connect(_lineAnnotationController.get(), &LineAnnotationController::fibersChanged, this,
-                [this, forEachFiberWidget]() {
+                [this, withFiberWidget]() {
                     const auto tags = _lineAnnotationController->knownFiberTags();
-                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
                     updateLineAnnotationLengthLabel();
                 });
 
-        forEachFiberWidget([&](CFiberWidget* widget) {
+        withFiberWidget([&](CFiberWidget* widget) {
             widget->setDisplayOptions(collection->options());
             connect(widget, &CFiberWidget::fiberDetailsRequested, this,
-                    [this, forEachFiberWidget, detailEntry](uint64_t fiberId) {
+                    [this, withFiberWidget, detailEntry](uint64_t fiberId) {
                         const auto summary = _lineAnnotationController->fiberSummary(fiberId);
                         if (!summary) return;
                         const auto entry = detailEntry(*summary);
-                        forEachFiberWidget([&](CFiberWidget* listed) { listed->updateFiberDetails(entry); });
+                        withFiberWidget([&](CFiberWidget* listed) { listed->updateFiberDetails(entry); });
                     },
                     Qt::QueuedConnection);
             connect(widget, &CFiberWidget::displayOptionsChanged, this,
-                    [collection, forEachFiberWidget](const FiberDisplayOptions& options) {
+                    [collection, withFiberWidget](const FiberDisplayOptions& options) {
                         collection->setOptions(options);
-                        forEachFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
+                        withFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
                     });
             connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
                 if (_menuController) _menuController->attachObjectStore();
@@ -3655,11 +3605,6 @@ void CWindow::CreateWidgets(void)
                     _fiberWidget->updateAlignmentMetrics(fiberId,
                                                          widgetAlignment,
                                                          widgetSpanAlignments);
-                }
-                if (_fiberSliceWidget) {
-                    _fiberSliceWidget->updateAlignmentMetrics(fiberId,
-                                                              widgetAlignment,
-                                                              widgetSpanAlignments);
                 }
             };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
@@ -3724,28 +3669,12 @@ void CWindow::CreateWidgets(void)
                         }
                         _spiralWorkspace->addFibersToCurrentFit(fiberIds);
                     });
-            connect(widget,
-                    &CFiberWidget::fiberSliceRequested,
-                    this,
-                    [this](uint64_t fiberId) {
-                        if (_fiberWidget) {
-                            _fiberWidget->selectFiber(fiberId);
-                        }
-                        if (_fiberSliceWidget) {
-                            _fiberSliceWidget->selectFiber(fiberId);
-                        }
-                        switchToFiberSliceWorkspace();
-                        if (_lineAnnotationController) {
-                            _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
-                        }
-                    });
         };
         connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fiberAlignmentMetricsUpdated,
                 this,
                 updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
-        connectFiberWidget(_fiberSliceWidget);
         // The annotation frame (and so the cm conversion) follows the
         // current volume; the lengths themselves do not change.
         connect(_state, &CState::volumeChanged, this,
@@ -3757,11 +3686,6 @@ void CWindow::CreateWidgets(void)
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
-    ensureDockWidgetFeatures(_fiberSliceWidget);
-    if (_fiberSliceWidget) {
-        connect(_fiberSliceWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
-        connect(_fiberSliceWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
-    }
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
@@ -4385,9 +4309,6 @@ void CWindow::updateFiberLengthUnits()
     }
     if (_fiberWidget) {
         _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
-    }
-    if (_fiberSliceWidget) {
-        _fiberSliceWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
     }
     updateLineAnnotationLengthLabel();
 }

@@ -295,7 +295,6 @@ int main(int argc, char** argv)
     require(exportButton != nullptr, "Fiber export button was not found");
     require(!deleteButton->isEnabled(), "Delete button should start disabled");
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
-    require(!widget.canShowFiberSlice(), "Empty selection should not allow fiber slice");
     require(!widget.canRenameFiberFile(), "Empty selection should not allow JSON rename");
 
     widget.selectFiber(2);
@@ -303,24 +302,14 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {2}), "Single selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for a single selection");
     require(widget.canDeleteSelection(), "Single selection should allow delete");
-    require(widget.canShowFiberSlice(), "Single selection should allow fiber slice");
     require(widget.canRenameFiberFile(), "Single selection should allow JSON rename");
 
-    int sliceRequests = 0;
     int renameRequests = 0;
     int tagRequests = 0;
-    uint64_t requestedSliceFiberId = 0;
     uint64_t requestedRenameFiberId = 0;
     uint64_t requestedTagFiberId = 0;
     QString requestedTag;
     bool requestedTagEnabled = false;
-    QObject::connect(&widget,
-                     &CFiberWidget::fiberSliceRequested,
-                     &widget,
-                     [&](uint64_t fiberId) {
-                         ++sliceRequests;
-                         requestedSliceFiberId = fiberId;
-                     });
     QObject::connect(&widget,
                      &CFiberWidget::renameFiberFileRequested,
                      &widget,
@@ -337,11 +326,6 @@ int main(int argc, char** argv)
                          requestedTag = tag;
                          requestedTagEnabled = enabled;
                      });
-    auto* showSliceAction = widget.createShowFiberSliceAction(&widget);
-    require(showSliceAction->isEnabled(), "Single selection should enable Show fiber slice action");
-    showSliceAction->trigger();
-    require(sliceRequests == 1, "Show fiber slice action did not emit one request");
-    require(requestedSliceFiberId == 2, "Show fiber slice emitted the wrong fiber ID");
     auto* renameAction = widget.createRenameFiberFileAction(&widget);
     require(renameAction->isEnabled(), "Single selection should enable Rename JSON file action");
     renameAction->trigger();
@@ -390,10 +374,7 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {1, 3}), "Multi-selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for multi-selection");
     require(widget.canDeleteSelection(), "Multi-selection should allow delete");
-    require(!widget.canShowFiberSlice(), "Multi-selection should gray out fiber slice");
     require(!widget.canRenameFiberFile(), "Multi-selection should gray out JSON rename");
-    auto* multiShowSliceAction = widget.createShowFiberSliceAction(&widget);
-    require(!multiShowSliceAction->isEnabled(), "Multi-selection should disable Show fiber slice action");
     auto* multiRenameAction = widget.createRenameFiberFileAction(&widget);
     require(!multiRenameAction->isEnabled(), "Multi-selection should disable Rename JSON file action");
     require(!newTagEdit->isEnabled(), "Multi-selection should disable new tag text field");

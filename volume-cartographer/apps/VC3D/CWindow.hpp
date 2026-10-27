@@ -178,7 +178,6 @@ private:
     void populateDockToggleMenu(QMenu* menu) const;
     void switchToLasagnaWorkspace();
     void switchToMainWorkspace();
-    void switchToFiberSliceWorkspace();
     void openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title);
     void repeatLastLasagnaAction();
     void selectLasagnaOutputSurface(const QString& surfaceUuid);
@@ -291,7 +290,6 @@ private:
     CPointCollectionWidget* _point_collection_widget;
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
-    CFiberWidget* _fiberSliceWidget{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
 
@@ -326,14 +324,12 @@ private:
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
-    QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
     FiberMapWorkspace* _fiberMapWorkspace{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
     QMdiArea *mdiArea;
-    QMdiArea* _fiberSliceMdiArea{nullptr};
 
     bool can_change_volume_();
 

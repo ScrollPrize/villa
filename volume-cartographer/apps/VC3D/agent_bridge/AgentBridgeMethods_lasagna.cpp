@@ -121,7 +121,6 @@ void AgentBridgeServer::registerLasagnaHandlers()
                     {
                         QStringLiteral("main"),
                         QStringLiteral("lasagna"),
-                        QStringLiteral("fiber_slice"),
                     }),
             },
             .errors = {-32602, -32000},

@@ -182,8 +182,6 @@ set(srcs
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
     overlays/SurfaceRotationTransform.hpp
-    overlays/FiberSliceOverlayController.cpp
-    overlays/FiberSliceOverlayController.hpp
     overlays/OverlayBatchItem.cpp
     overlays/OverlayBatchItem.hpp
     overlays/ScreenSpacePointIndex.hpp

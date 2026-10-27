@@ -415,7 +415,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             by_name["vc3d_switch_workspace"]["properties"]["name"]["enum"],
-            ["main", "lasagna", "fiber_slice"],
+            ["main", "lasagna"],
         )
         self.assertEqual(
             by_name["vc3d_render_tifxyz"]["properties"]["output_format"]["enum"],

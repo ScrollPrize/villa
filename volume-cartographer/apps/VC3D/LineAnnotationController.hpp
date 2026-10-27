@@ -47,9 +47,7 @@
 
 class CState;
 class FiberSaveBatchTracker;
-class FiberSliceOverlayController;
 class LineAnnotationDialog;
-class QMdiArea;
 class QEvent;
 class QPoint;
 class Surface;
@@ -379,7 +377,6 @@ public:
     void requestFiberAlignmentMetrics(uint64_t fiberId);
     void addFiberToPointCollection(uint64_t fiberId);
     void addFibersToPointCollections(std::vector<uint64_t> fiberIds);
-    void showFiberSlice(uint64_t fiberId, QMdiArea* targetArea);
     void saveOpenFibers();
     using FiberSaveCompletion = std::function<void(bool, const QString&)>;
     void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
@@ -1150,10 +1147,6 @@ private:
     // and when the open volume changes.
     [[nodiscard]] std::vector<StoredFiber> readStoredFibersCached(
         const std::vector<std::string>& uuids, bool lines = false) const;
-    // Active fibers bound to the current volume whose bounds overlap a box in
-    // volume voxels.
-    [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
-        const std::array<double, 6>& volumeBox, bool lines = false) const;
     [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
     // A fiber read from the store in the open volume's voxels.
     [[nodiscard]] bool fiberInVolume(const StoredFiber& fiber) const;
@@ -1419,7 +1412,6 @@ private:
     uint64_t _nextFiberAlignmentMetricToken = 0;
     uint64_t _fiberMetricsGeneration = 0;
     bool _fiberMetricsPending = false;
-    std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
     // The stored umbilicus of each volume asked about (by store and volume),
     // read once until the store announces an umbilicus or registration change.
     struct StoredUmbilicus {

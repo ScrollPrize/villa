@@ -3232,8 +3232,7 @@
           "name": {
             "enum": [
               "main",
-              "lasagna",
-              "fiber_slice"
+              "lasagna"
             ],
             "type": "string"
           }

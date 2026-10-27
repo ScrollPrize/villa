@@ -95,7 +95,7 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
 
         # 8. workspace.switch: both valid names, then an invalid one.
         call_checked("workspace.switch lasagna", "workspace.switch", {"name": "lasagna"})
-        call_checked("workspace.switch fiber_slice", "workspace.switch", {"name": "fiber_slice"})
+        call_checked("workspace.switch main", "workspace.switch", {"name": "main"})
         call_expect_error("workspace.switch (bad name)", "workspace.switch",
                            {"name": "not_a_real_workspace"}, -32602)
 
