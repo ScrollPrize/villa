@@ -187,8 +187,15 @@ def test_input_refusals_reach_status_and_events(state, store_path, device_stubs)
     assert any('pcl_patch: FAILED' in line for line in problems)
     assert any('the fit will not train' in line for line in problems)
     assert 'LinkRefreshError' in status['error']
-    [error] = [event for event in state.events.read_after(0)['events']
-               if event['kind'] == 'error']
+    # The state is readable before the fitter thread publishes it as events.
+    deadline = time.monotonic() + 10
+    while True:
+        errors = [event for event in state.events.read_after(0)['events']
+                  if event['kind'] == 'error']
+        if errors or time.monotonic() > deadline:
+            break
+        time.sleep(0.02)
+    [error] = errors
     assert error['payload'] == {'input_problems': problems}
 
 
@@ -367,3 +374,117 @@ def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stu
     assert refusal.payload['refused'] is True
     assert refusal.payload['inputs']['legacy'] is True
     assert 'object_store_allow_changed_inputs' in refusal.message
+
+
+# ---------------------------------------------------------------------------
+# The CLI and the service freeze the same inputs (step 12)
+# ---------------------------------------------------------------------------
+
+def _plane(y, scale=1):
+    import numpy as np
+    rows, cols = np.mgrid[:8, :8]
+    return np.stack([4.0 + rows * 4, np.full(rows.shape, y), 40.0 + cols * 4], -1)
+
+
+@pytest.fixture()
+def varied_store(tmp_path):
+    """Every case the selection must agree on: absolute, relative and
+    same-winding PCLs by metadata and annotations, a patch and a fiber at
+    non-unit scales, and approved, pending, rejected and stale links."""
+    import numpy as np
+    from object_store_fixture import (array, frame, pcl_patch_edge, put_fiber,
+                                      put_patch, put_pcl)
+    path = str(tmp_path / 'varied.vcobj')
+    with ObjectStore.create(path, author='ingest', hostname='host') as db:
+        near = put_patch(db, _plane(100.0), (0.25, 0.25), name='near')
+        far = put_patch(db, _plane(140.0), (0.25, 0.25), coordinates=frame(2),
+                        name='far')
+        absolute = put_pcl(db, {1: ([12.0, 100.0, 48.0], 4.0)}, absolute=True,
+                           name='absolute')
+        relative = put_pcl(db, {3: ([16.0, 100.0, 52.0], 1.0),
+                                9: ([20.0, 140.0, 56.0], 2.0)}, name='relative')
+        same = put_pcl(db, {5: ([24.0, 100.0, 60.0], None),
+                            6: ([28.0, 100.0, 64.0], None)}, name='same')
+        db.set_approval(pcl_patch_edge(db, absolute, 1, near, (2.0, 2.0)), 'approved')
+        pcl_patch_edge(db, relative, 3, near, (3.0, 3.0))
+        db.set_approval(pcl_patch_edge(db, same, 5, near, (5.0, 5.0)), 'rejected')
+        pcl_patch_edge(db, same, 6, near, (6.0, 6.0))
+        pcl_patch_edge(db, relative, 9, far, (4.0, 4.0))
+        put_fiber(db, [[10, 120, 40], [14, 120, 44], [18, 120, 48]], [0, 2],
+                  coordinates=frame(2), name='fiber')
+        # Moving the far patch while keeping its links bound to the recorded
+        # geometry leaves the link to it stale.
+        moved = {'kind': 'surface', 'attributes': {'scale': [0.125, 0.125]},
+                 'arrays': [array('points', _plane(141.0)[..., ::-1] * 2, '<f4')]}
+
+        def keep_recorded(edge):
+            edge = db.edge(edge['uuid'])
+            return {'edge_uuid': edge['uuid'],
+                    'expected_generation': edge['generation'],
+                    'action': 'keep_recorded',
+                    'a_revision': db.current_geometry(edge['a'])['uuid'],
+                    'b_revision': db.current_geometry(edge['b'])['uuid']}
+        db.put_geometry(far, moved, expected_revision=db.current_geometry(far)['uuid'],
+                        edge_edits=[keep_recorded(edge) for edge in
+                                    db.affected_geometry_edges(far, moved)])
+    return path
+
+
+def _cli_inputs(store, tmp_path, config):
+    from config import FitConfig
+    from fit_session import SpiralInputPaths
+    from fit_spiral import FitContext
+    umbilicus = str(tmp_path / 'cli-umbilicus.json')
+    reference.write_umbilicus(umbilicus)
+    context = FitContext(
+        FitConfig({**reference.fit_config(), **config}),
+        scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
+        cache_dir=str(tmp_path / 'cli-cache'), out_base_dir=str(tmp_path / 'cli-out'),
+        input_log=lambda line: None)
+    context.load_host_inputs()
+    return context
+
+
+@pytest.mark.parametrize('selection', [
+    {},
+    {'object_store_approved_links_only': True},
+    {'object_store_fiber_uuids': [], 'object_store_pcl_tags': []},
+])
+def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
+                                                        device_stubs, selection):
+    root = write_dataset(tmp_path / 'dataset')
+    resolution = spiral_service.bind_service_paths(
+        resolve_dataset_root(root), tmp_path / 'output', tmp_path / 'cache')
+    state = spiral_service.ServiceState(
+        dataset_root=str(root), dataset_resolution=resolution,
+        object_store=spiral_service.bind_object_store(varied_store, 'svc'))
+    config = {**RUN, 'object_store_refresh_links': False, **selection}
+    try:
+        state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': config}})
+        assert settle(state)['state'] == 'Idle', state.status()['error']
+        served = state.session._context
+        cli = _cli_inputs(varied_store, tmp_path, {
+            **config, 'object_store_path': varied_store, 'object_store_author': 'cli'})
+    finally:
+        state.close()
+    assert served.object_store_inputs.digest == cli.object_store_inputs.digest
+    assert served.object_store_inputs.counts == cli.object_store_inputs.counts
+    assert len(served.cross_patch_pcls) == len(cli.cross_patch_pcls)
+    assert len(served.unattached_pcl_strips) == len(cli.unattached_pcl_strips)
+    manifest = served.object_store_inputs.manifest
+    excluded = manifest['excluded_relationships']
+    scales = {entry['name']: entry['scale_factor'] for entry in manifest['objects']}
+    assert scales['far'] == 2.0
+    if 'object_store_fiber_uuids' in selection:
+        # Explicitly empty selectors select nothing, not everything.
+        assert 'fiber' not in scales and 'absolute' not in scales
+        assert manifest['selection']['fiber']['count'] == 0
+        assert manifest['relationships'] == []
+    else:
+        assert excluded['inapplicable'] == 1 and excluded['rejected'] == 1
+        if selection.get('object_store_approved_links_only'):
+            assert excluded['pending (approved-only)'] == 2
+        assert scales['fiber'] == 2.0
+        roles = {pcl['name']: pcl['metadata']['winding_is_absolute']
+                 for pcl in served.object_store_inputs.point_collections.values()}
+        assert roles == {'absolute': True, 'relative': False, 'same': False}
