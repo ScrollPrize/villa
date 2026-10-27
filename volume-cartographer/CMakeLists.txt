@@ -754,7 +754,6 @@ endif()
 # ---- Subdirectories ---------------------------------------------------------
 include_directories(core/include)
 
-add_subdirectory(libs/OpenABF)
 add_subdirectory(libs/c3d)
 add_subdirectory(libs/volcomp)
 # flatboi (SLIM) needs igl::core; fetch it here, before the sanitizer flags below.

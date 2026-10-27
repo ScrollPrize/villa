@@ -42,7 +42,7 @@ mkdir -p "$out"
 # Source roots we own. Anything outside (e.g. _deps, libs/libigl_changes,
 # vendored externals) is excluded from the "source" sets — we don't
 # care if vendored code has unused symbols.
-src_roots=(core utils apps libs/c3d libs/OpenABF/include)
+src_roots=(core utils apps libs/c3d)
 src_roots_existing=()
 for r in "${src_roots[@]}"; do
     [[ -d "$r" ]] && src_roots_existing+=("$r")
