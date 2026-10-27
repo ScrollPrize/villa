@@ -3388,4 +3388,32 @@ void clearGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const GeneratedControlPointContextMenuOptions& options);
 
+// One pane, as the stale-view refresh sees it.
+struct GeneratedViewsPaneState {
+    bool hasSession = false;
+    // Sessions that suppress ordinary generated views (intersection sides)
+    // are rebuilt through the inspection, never through the pane walk.
+    bool suppressesGeneratedViews = false;
+    // Nothing materialized means nothing stale on screen — and the builder
+    // rejects an empty model, which during initial tracing turned a successful
+    // attach into a modal complaint about views the user never asked for.
+    bool hasGeneratedSurfaces = false;
+    bool hasLinePoints = false;
+    // The controller's orientation epoch when the views were built.
+    int orientationEpoch = -1;
+};
+
+// Whether the refresh pass rebuilds this pane's generated views.
+inline bool paneNeedsOrientationRefresh(const GeneratedViewsPaneState& pane,
+                                        int currentEpoch)
+{
+    if (!pane.hasSession || pane.suppressesGeneratedViews) {
+        return false;
+    }
+    if (!pane.hasGeneratedSurfaces || !pane.hasLinePoints) {
+        return false;
+    }
+    return pane.orientationEpoch != currentEpoch;
+}
+
 } // namespace vc3d::line_annotation

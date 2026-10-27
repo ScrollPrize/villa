@@ -5477,50 +5477,13 @@ TEST_CASE("line spline honors hard endpoint directions")
 }
 
 // ---------------------------------------------------------------------------
-// Orientation freshness: the decisions behind the umbilicus cache and the
-// stale-view refresh, extracted so they are asserted rather than read.
-
-#include "UmbilicusOrientationFreshness.hpp"
-
-namespace {
-
-vc3d::annotation::UmbilicusCacheInputs cacheInputs()
-{
-    vc3d::annotation::UmbilicusCacheInputs inputs;
-    inputs.volumeId = "vol-a";
-    inputs.dependencyToken = "umbilicus-uuid@revision-1";
-    return inputs;
-}
-
-} // namespace
-
-TEST_CASE("umbilicus cache: reused only while every input it was built from holds")
-{
-    using vc3d::annotation::umbilicusReloadNeeded;
-
-    const auto cached = cacheInputs();
-
-    // Never attempted resolves regardless of the inputs matching.
-    CHECK(umbilicusReloadNeeded(false, cached, cached));
-    // Identical inputs reuse.
-    CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
-
-    // A volume switch reloads: the points are read in the volume's voxels and
-    // the volume-centre fallback belongs to the volume.
-    auto otherVolume = cached;
-    otherVolume.volumeId = "vol-b";
-    CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
-
-    // A new revision of the stored umbilicus (or a different one) lands in the token.
-    auto edited = cached;
-    edited.dependencyToken = "umbilicus-uuid@revision-2";
-    CHECK(umbilicusReloadNeeded(true, cached, edited));
-}
+// Orientation freshness: the stale-view refresh, extracted so it is asserted
+// rather than read.
 
 TEST_CASE("stale-view refresh: rebuilds exactly the panes built before the change")
 {
-    using vc3d::annotation::GeneratedViewsPaneState;
-    using vc3d::annotation::paneNeedsOrientationRefresh;
+    using vc3d::line_annotation::GeneratedViewsPaneState;
+    using vc3d::line_annotation::paneNeedsOrientationRefresh;
 
     constexpr int kEpoch = 3;
 

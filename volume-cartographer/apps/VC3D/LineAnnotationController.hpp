@@ -30,7 +30,6 @@
 #include <opencv2/core/mat.hpp>
 
 #include "OpenDataVolumeOrientation.hpp"
-#include "UmbilicusOrientationFreshness.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
@@ -42,6 +41,7 @@
 #include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -1420,19 +1420,20 @@ private:
     uint64_t _fiberMetricsGeneration = 0;
     bool _fiberMetricsPending = false;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    // The stored umbilicus of each volume asked about (by store and volume),
+    // read once until the store announces an umbilicus or registration change.
+    struct StoredUmbilicus {
+        std::optional<vc::objects::VolumeUmbilicus> umbilicus;
+        QString problem;  // why there is none
+    };
+    const StoredUmbilicus& storedUmbilicus(const std::string& volumeId) const;
+    mutable std::map<std::string, StoredUmbilicus> _storedUmbilici;
     // Scroll-center reference for orienting generated-view normals: the stored
-    // umbilicus of the current volume, scaled into the annotation frame. nullopt
-    // after a failed attempt (volume-center fallback is used instead).
+    // umbilicus of the current volume, in its voxels. nullopt after a failed
+    // attempt (volume-center fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
-    // The stored umbilicus token as of the cached load.
-    QString _scrollUmbilicusToken;
-    // The volume the cached umbilicus was read for. Deliberately conservative:
-    // the volume-centre fallback and the legacy reading depend on the volume's
-    // raw shape and its registration transform, not only on the annotation
-    // frame, so any volume switch re-resolves rather than proving the previous
-    // geometry equivalent. Re-resolution is a few stats and one JSON parse.
+    // The store and volume the cached reference was built for (empty: none built).
     std::string _scrollUmbilicusVolumeId;
-    bool _scrollUmbilicusLoadAttempted = false;
     // Bumped whenever the orientation inputs change out from under built views
     // (umbilicus attach/detach, active volume switch). Sessions record the
     // value their generated views were built at; refreshStaleGeneratedViews()

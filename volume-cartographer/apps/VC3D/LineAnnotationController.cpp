@@ -5823,40 +5823,44 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
     };
 }
 
+const LineAnnotationController::StoredUmbilicus&
+LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
+{
+    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto key = (attachment ? attachment->storeUuid : std::string{}) + "/" + volumeId;
+    const auto [found, inserted] = _storedUmbilici.try_emplace(key);
+    if (!inserted) return found->second;
+    auto& stored = found->second;
+    if (!attachment || volumeId.empty()) {
+        stored.problem = tr("no object store or volume");
+        return stored;
+    }
+    try {
+        stored.umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, volumeId);
+        if (!stored.umbilicus) stored.problem = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(volumeId));
+    } catch (const std::exception& error) {
+        stored.problem = QString::fromUtf8(error.what());
+    }
+    return stored;
+}
+
 QString LineAnnotationController::umbilicusFingerprint() const
 {
     // Changes whenever the answer does: uuid@revision, else why there is none.
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    if (!attachment || _state->currentVolumeId().empty()) {
+    if (!_state || !_state->objectStoreAttachment() || _state->currentVolumeId().empty()) {
         return {};
     }
-    try {
-        const auto umbilicus =
-            vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, _state->currentVolumeId());
-        return umbilicus ? QString::fromStdString(umbilicus->uuid + "@" + umbilicus->objectRevision)
-                         : QStringLiteral("none");
-    } catch (const std::exception& error) {
-        return QString::fromUtf8(error.what());
-    }
+    const auto& stored = storedUmbilicus(_state->currentVolumeId());
+    return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->objectRevision)
+                            : stored.problem;
 }
 
 LineAnnotationController::UmbilicusStatus
 LineAnnotationController::umbilicusStatus() const
 {
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    if (!attachment || _state->currentVolumeId().empty()) {
-        return {false, tr("no object store or volume")};
-    }
-    try {
-        const auto umbilicus =
-            vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, _state->currentVolumeId());
-        if (!umbilicus) {
-            return {false, tr("no umbilicus maps to volume %1").arg(QString::fromStdString(_state->currentVolumeId()))};
-        }
-        return {true, QString::fromStdString(umbilicus->name.empty() ? umbilicus->uuid : umbilicus->name)};
-    } catch (const std::exception& error) {
-        return {false, QString::fromUtf8(error.what())};
-    }
+    const auto& stored = storedUmbilicus(_state ? _state->currentVolumeId() : std::string{});
+    if (!stored.umbilicus) return {false, stored.problem};
+    return {true, QString::fromStdString(stored.umbilicus->name.empty() ? stored.umbilicus->uuid : stored.umbilicus->name)};
 }
 
 std::optional<vc3d::opendata::CatalogVolumeSense> LineAnnotationController::fiberMapCatalogVolume() const
@@ -5984,22 +5988,11 @@ LineAnnotationController::SnapshotUmbilicus
 LineAnnotationController::umbilicusForSnapshot(const std::string& annotationVolume) const
 {
     SnapshotUmbilicus result;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    std::optional<vc::objects::VolumeUmbilicus> umbilicus;
-    if (!attachment) {
-        result.message = tr("no object store");
-    } else {
-        try {
-            // Read in the annotation volume, the fibers' frame on the map.
-            umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, annotationVolume);
-            if (!umbilicus) {
-                result.message = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(annotationVolume));
-            }
-        } catch (const std::exception& error) {
-            result.message = QString::fromUtf8(error.what());
-        }
-    }
+    // Read in the annotation volume, the fibers' frame on the map.
+    const auto& stored = storedUmbilicus(annotationVolume);
+    const auto& umbilicus = stored.umbilicus;
     if (!umbilicus) {
+        result.message = stored.problem;
         Logger()->warn("Fiber map: no usable umbilicus: {}", result.message.toStdString());
         return result;
     }
@@ -11487,8 +11480,7 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
 
 void LineAnnotationController::invalidateScrollUmbilicus()
 {
-    _scrollUmbilicusLoadAttempted = false;
-    _scrollUmbilicusToken.clear();
+    _storedUmbilici.clear();
     _scrollUmbilicusVolumeId.clear();
     _scrollUmbilicus.reset();
     _umbilicusNotice.clear();
@@ -11548,17 +11540,17 @@ void LineAnnotationController::refreshStaleGeneratedViews()
     std::vector<Target> targets;
     targets.reserve(_panes.size());
     for (const auto& pane : _panes) {
-        // The selection rule lives in UmbilicusOrientationFreshness.hpp so it
+        // The selection rule lives in LineAnnotationGeneratedViews.hpp so it
         // is asserted rather than read; the skips it encodes are the ones this
         // path has been burned by (an empty model turning a successful attach
         // into a modal complaint, intersection sides double-rebuilt).
-        const vc3d::annotation::GeneratedViewsPaneState state{
+        const vc3d::line_annotation::GeneratedViewsPaneState state{
             pane.session != nullptr,
             pane.session && pane.session->suppressGeneratedViews,
             pane.session && !pane.session->generatedSurfaceNames.empty(),
             pane.session && !pane.session->optimizedLine.points.empty(),
             pane.session ? pane.session->orientationEpoch : -1};
-        if (!vc3d::annotation::paneNeedsOrientationRefresh(state,
+        if (!vc3d::line_annotation::paneNeedsOrientationRefresh(state,
                                                            _orientationEpoch)) {
             continue;
         }
@@ -11610,55 +11602,35 @@ void LineAnnotationController::publishUmbilicusNotice()
 const std::optional<vc::core::util::Umbilicus>&
 LineAnnotationController::ensureScrollUmbilicusLoaded()
 {
-    // Keyed by the volume (points in its voxels, centres sized to it) and the
-    // stored umbilicus revision.
-    const std::string currentVolumeId =
-        _state ? _state->currentVolumeId() : std::string{};
-    const QString currentUmbilicusToken = umbilicusFingerprint();
-    const vc3d::annotation::UmbilicusCacheInputs cachedInputs{
-        _scrollUmbilicusVolumeId,
-        _scrollUmbilicusToken.toStdString()};
-    const vc3d::annotation::UmbilicusCacheInputs currentInputs{
-        currentVolumeId,
-        currentUmbilicusToken.toStdString()};
-    if (vc3d::annotation::umbilicusReloadNeeded(
-            _scrollUmbilicusLoadAttempted, cachedInputs, currentInputs)) {
-        _scrollUmbilicusLoadAttempted = true;
-        _scrollUmbilicusToken = currentUmbilicusToken;
-        _scrollUmbilicusVolumeId = currentVolumeId;
-        // Cleared before the attempt: whatever is set below describes this
-        // attempt, and success has to be able to retract an earlier complaint.
+    // Built once per volume (points in its voxels, centres sized to it) from
+    // the stored umbilicus; an umbilicus change drops it.
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    if (!volume || !attachment) {
+        _scrollUmbilicusVolumeId.clear();
         _scrollUmbilicus.reset();
-        _umbilicusNotice.clear();
-        try {
-            // Line points and the stored umbilicus are both in the volume's voxels.
-            const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-            const auto volume = _state ? _state->currentVolume() : nullptr;
-            if (attachment && volume) {
-                std::optional<vc::objects::VolumeUmbilicus> umbilicus;
-                QString problem;
-                try {
-                    umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, volume->id());
-                    if (!umbilicus) problem = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(volume->id()));
-                } catch (const std::exception& error) {
-                    problem = QString::fromUtf8(error.what());
-                }
-                if (umbilicus) {
-                    std::vector<cv::Vec3f> points;
-                    for (const auto& p : umbilicus->points) points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
-                    const auto shape = volume->shape();
-                    _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(
-                        std::move(points), cv::Vec3i{shape[0], shape[1], shape[2]});
-                } else {
-                    Logger()->warn("Line annotation: no usable umbilicus: {}", problem.toStdString());
-                    _umbilicusNotice = tr("no usable umbilicus: %1").arg(problem);
-                }
-            }
-        } catch (...) {
-            _scrollUmbilicus.reset();
-        }
-        publishUmbilicusNotice();
+        return _scrollUmbilicus;
     }
+    const auto key = attachment->storeUuid + "/" + volume->id();
+    if (_scrollUmbilicusVolumeId == key) return _scrollUmbilicus;
+    _scrollUmbilicusVolumeId = key;
+    _scrollUmbilicus.reset();
+    _umbilicusNotice.clear();
+    const auto& stored = storedUmbilicus(volume->id());
+    if (stored.umbilicus) {
+        std::vector<cv::Vec3f> points;
+        for (const auto& p : stored.umbilicus->points) points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
+        const auto shape = volume->shape();
+        try {
+            _scrollUmbilicus = vc::core::util::Umbilicus::FromPoints(std::move(points), cv::Vec3i{shape[0], shape[1], shape[2]});
+        } catch (const std::exception& error) {
+            _umbilicusNotice = tr("no usable umbilicus: %1").arg(QString::fromUtf8(error.what()));
+        }
+    } else {
+        Logger()->warn("Line annotation: no usable umbilicus: {}", stored.problem.toStdString());
+        _umbilicusNotice = tr("no usable umbilicus: %1").arg(stored.problem);
+    }
+    publishUmbilicusNotice();
     return _scrollUmbilicus;
 }
 
