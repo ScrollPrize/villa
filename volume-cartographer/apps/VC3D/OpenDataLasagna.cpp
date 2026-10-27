@@ -40,41 +40,10 @@ void writeMarker(const std::filesystem::path& path, const std::string& text)
     }
 }
 
-std::string lowerCopy(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
 std::string trimSlashes(std::string value)
 {
     while (!value.empty() && value.back() == '/') value.pop_back();
     return value;
-}
-
-std::string safeComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') c = '_';
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_'))
-        value.erase(value.begin());
-    return value.empty() ? "unnamed" : value;
-}
-
-std::string identityHash(std::string_view value)
-{
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    std::ostringstream out;
-    out << std::hex << std::setfill('0') << std::setw(16) << hash;
-    return out.str();
 }
 
 bool splitPrefixUrl(const std::string& rawUrl,
@@ -380,9 +349,9 @@ std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     for (std::size_t artifactIndex = 0;
          artifactIndex < volume.artifacts.size(); ++artifactIndex) {
         const auto& artifact = volume.artifacts[artifactIndex];
-        if (lowerCopy(artifact.type) != kLasagnaArtifactType) continue;
-        const auto url = trimSlashes(
-            artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
+        if (vcr::catalog::classifyDerivedRepresentation(artifact) != vcr::catalog::OpenDataRepresentationKind::Lasagna)
+            continue;
+        const auto url = artifact.url();
         if (url.empty()) continue;
         OpenDataLasagnaInfo info;
         info.sampleId = sampleId;
@@ -421,8 +390,8 @@ std::filesystem::path lasagnaCacheDir(
         for (const auto extent : *info.baseShapeZYX) identity << '\n' << extent;
     }
     return remoteCacheRoot / "open_data" / "lasagna" /
-           safeComponent(info.sampleId) / safeComponent(info.volumeId) /
-           identityHash(identity.str());
+           safePathComponent(info.sampleId) / safePathComponent(info.volumeId) /
+           cacheKey(identity.str());
 }
 
 std::filesystem::path prepareOpenDataLasagna(
@@ -523,7 +492,8 @@ int attachOpenDataLasagna(VolumePkg& pkg,
         const auto infos = lasagnaArtifacts(sample.id, volume);
         const bool hasLasagnaArtifact = std::any_of(
             volume.artifacts.begin(), volume.artifacts.end(), [](const auto& artifact) {
-                return lowerCopy(artifact.type) == kLasagnaArtifactType;
+                return vcr::catalog::classifyDerivedRepresentation(artifact) ==
+                       vcr::catalog::OpenDataRepresentationKind::Lasagna;
             });
         if (infos.empty() && hasLasagnaArtifact) {
             if (messages) messages->push_back(

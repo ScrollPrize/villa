@@ -222,12 +222,7 @@ QString firstArtifactUrl(const std::vector<vcr::catalog::OpenDataArtifact>& arti
     if (!artifact) {
         return {};
     }
-    return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
-}
-
-QString artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
+    return qstr(artifact->url());
 }
 
 QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
@@ -303,7 +298,7 @@ QStringList representationCells(const vcr::catalog::OpenDataVolume& volume, cons
 {
     return {qstr(volume.id), predictionType(artifact), qstr(artifact.type),
             qstr(artifact.modelId.value_or(std::string{})), representationCoordinates(artifact, kind),
-            qstr(artifact.accessUsage), representationParameters(artifact), artifactUrl(artifact),
+            qstr(artifact.accessUsage), representationParameters(artifact), qstr(artifact.url()),
             artifact.sourceCoordinateLevel ? QString::number(*artifact.sourceCoordinateLevel)
                                            : QStringLiteral("—")};
 }
@@ -842,13 +837,13 @@ void OpenDataCatalogWindow::buildUi()
         if (_manifestRefreshPending || !artifact || !canAttachRepresentation(*artifact)) return;
         const auto kind = *vcr::catalog::classifyDerivedRepresentation(*artifact);
         if (kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
-            emit attachLasagnaRequested(artifactUrl(*artifact), predictionType(*artifact) == QStringLiteral("fibers"));
+            emit attachLasagnaRequested(qstr(artifact->url()), predictionType(*artifact) == QStringLiteral("fibers"));
         } else if (kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
             const auto* sample = selectedSample();
             const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
             const auto volumeIndex = item->data(kRepresentationVolumeIndexRole).toULongLong();
             emit attachNormalGridsRequested(qstr(sample->id), qstr(sample->volumes.at(volumeIndex).id),
-                artifactUrl(*artifact), *artifact->sourceCoordinateLevel);
+                qstr(artifact->url()), *artifact->sourceCoordinateLevel);
         } else if (_attachPredictionHandler) {
             // Preserve the complete catalog context for descriptor validation
             // and coordinate tags, but attach only the selected prediction.
@@ -1164,7 +1159,7 @@ void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample
         return;
     }
 
-    const QString url = artifactUrl(*artifact);
+    const QString url = qstr(artifact->url());
     if (url.isEmpty()) {
         if (_overviewPhotoLabel) {
             static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
@@ -1339,13 +1334,13 @@ QString OpenDataCatalogWindow::selectedVolumeUrl() const
     if (!artifact) {
         return {};
     }
-    return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
+    return qstr(artifact->url());
 }
 
 QString OpenDataCatalogWindow::selectedRepresentationUrl() const
 {
     const auto* artifact = selectedRepresentationArtifact();
-    return artifact ? artifactUrl(*artifact) : QString{};
+    return artifact ? qstr(artifact->url()) : QString{};
 }
 
 QString OpenDataCatalogWindow::selectedSegmentUrl() const
@@ -1360,7 +1355,7 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
     if (surfaces.empty()) {
         return firstArtifactUrl(segment->artifacts);
     }
-    return artifactUrl(*surfaces.front().artifact);
+    return qstr(surfaces.front().artifact->url());
 }
 
 void OpenDataCatalogWindow::updateActionButtons()

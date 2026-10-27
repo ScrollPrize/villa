@@ -22,7 +22,6 @@ namespace vc3d::opendata {
 namespace {
 
 constexpr const char* kMarkerVersion = "vc3d_open_data_prefill_v2";
-constexpr const char* kLegacyMarkerVersion = "vc3d_open_data_prefill_v1";
 constexpr std::size_t kProgressIntervalChunks = 32;
 constexpr std::size_t kMaximumPrefillWorkers = 8;
 
@@ -80,23 +79,6 @@ bool markerMatchesJson(const nlohmann::json& marker,
 {
     if (!marker.is_object()) {
         return false;
-    }
-    if (marker.value("version", std::string{}) == kLegacyMarkerVersion &&
-        info.level == info.physicalLevel && info.remoteLocator == info.remoteUrl) {
-        for (const char* key : {
-                 "remote_url", "volume_id", "level", "shape", "chunk_shape",
-                 "chunk_grid_shape", "chunk_count"}) {
-            const auto found = marker.find(key);
-            if (found == marker.end())
-                return false;
-        }
-        return marker.at("remote_url") == info.remoteUrl &&
-               marker.at("volume_id") == info.volumeId &&
-               marker.at("level") == info.level &&
-               marker.at("shape") == info.shape &&
-               marker.at("chunk_shape") == info.chunkShape &&
-               marker.at("chunk_grid_shape") == info.chunkGridShape &&
-               marker.at("chunk_count") == info.totalChunks;
     }
     const auto expected = markerJsonForInfo(info);
     for (const char* key : {

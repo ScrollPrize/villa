@@ -36,32 +36,6 @@ std::string trimTrailingSlashes(std::string value)
     return value;
 }
 
-std::string safePathComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') {
-            c = '_';
-        }
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_')) {
-        value.erase(value.begin());
-    }
-    return value.empty() ? std::string("unnamed") : value;
-}
-
-std::string shortArtifactHash(std::string_view value)
-{
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    std::ostringstream out;
-    out << std::hex << std::setfill('0') << std::setw(16) << hash;
-    return out.str();
-}
-
 // Split "https://host/some/key/prefix" into origin ("https://host") and the
 // key prefix ("some/key/prefix/").
 bool splitRemotePrefix(const std::string& url, std::string& origin, std::string& prefix)
@@ -343,7 +317,7 @@ std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCac
     return remoteCacheRoot / "normal_grids" /
            safePathComponent(sampleId.empty() ? "sample" : sampleId) /
            safePathComponent(volumeId.empty() ? "volume" : volumeId) /
-           ("L" + std::to_string(sourceCoordinateLevel) + "-" + shortArtifactHash(url));
+           ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
 }
 
 bool isCachedNormalGridsDir(const std::filesystem::path& dir)

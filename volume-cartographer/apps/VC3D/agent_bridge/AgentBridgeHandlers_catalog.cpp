@@ -396,9 +396,9 @@ QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& par
             o["volumeId"] = QString::fromStdString(volume.id);
             o["artifactType"] = QString::fromStdString(artifact.type);
             o["kind"] = representationKindToJson(ref.kind);
-            o["url"] = artifact.resolvedUrl.empty()
-                           ? QJsonValue(QJsonValue::Null)
-                           : QJsonValue(QString::fromStdString(artifact.resolvedUrl));
+            o["url"] = artifact.hasResolvedUrl()
+                           ? QJsonValue(QString::fromStdString(artifact.url()))
+                           : QJsonValue(QJsonValue::Null);
             o["targetVolumeId"] = artifact.targetVolumeId
                 ? QJsonValue(QString::fromStdString(*artifact.targetVolumeId))
                 : QJsonValue(QJsonValue::Null);

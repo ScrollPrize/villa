@@ -130,20 +130,6 @@ std::string volumeArtifactLabel(const vcr::catalog::OpenDataVolume& volume,
     return label;
 }
 
-std::string safePathComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') {
-            c = '_';
-        }
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_')) {
-        value.erase(value.begin());
-    }
-    return value.empty() ? std::string("unnamed") : value;
-}
-
 std::string segmentSourcePreferredVolumeId(
     const vcr::catalog::OpenDataSample& sample,
     const std::vector<std::string>& supportedVolumeIds)
@@ -364,7 +350,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
              artifactIndex < volume.artifacts.size(); ++artifactIndex) {
             const auto& artifact = volume.artifacts[artifactIndex];
             const std::string url = artifact.url();
-            if (lowerCopy(artifact.type) == kLasagnaArtifactType) {
+            if (vcr::catalog::classifyDerivedRepresentation(artifact) ==
+                vcr::catalog::OpenDataRepresentationKind::Lasagna) {
                 if (selection &&
                     !selection->allowsRepresentation(
                         volumeIndex, artifactIndex,

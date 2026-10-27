@@ -1,7 +1,13 @@
 #include "OpenDataManifest.hpp"
+#include "utils/hash.hpp"
+
 #include <QDir>
 #include <QStandardPaths>
 #include <QString>
+
+#include <cctype>
+#include <iomanip>
+#include <sstream>
 namespace vc3d::opendata {
 std::filesystem::path cachedOpenDataManifestPath()
 {
@@ -15,6 +21,27 @@ std::filesystem::path cachedOpenDataManifestPath()
 std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog()
 {
     return vcr::catalog::cachedManifest(cachedOpenDataManifestPath());
+}
+
+std::string safePathComponent(std::string value)
+{
+    for (char& c : value) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') {
+            c = '_';
+        }
+    }
+    while (!value.empty() && (value.front() == '.' || value.front() == '_')) {
+        value.erase(value.begin());
+    }
+    return value.empty() ? std::string("unnamed") : value;
+}
+
+std::string cacheKey(std::string_view identity)
+{
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << utils::fnv1a(identity);
+    return out.str();
 }
 
 bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const

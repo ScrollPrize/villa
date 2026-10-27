@@ -14,7 +14,6 @@ namespace vc::lasagna { struct LasagnaDatasetManifest; }
 
 namespace vc3d::opendata {
 
-inline constexpr std::string_view kLasagnaArtifactType = "lasagna";
 
 struct OpenDataLasagnaInfo {
     std::string sampleId;
