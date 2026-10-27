@@ -239,11 +239,9 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedDiagnosticsArtifact.clear();
     _fetchingDiagnosticsArtifact.clear();
-    for (const auto role : vc3d::spiral::kEditablePclRoles) {
-        _installedPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
-        _fetchingPclArtifact[vc3d::spiral::pclRoleIndex(role)].clear();
-        _lastPclLocalPath[vc3d::spiral::pclRoleIndex(role)].clear();
-    }
+    _installedInputManifest.clear();
+    _fetchingInputManifest.clear();
+    _lastInputManifestLocalPath.clear();
     _lastPreviewLocalPath.clear();
     _lastDiagnosticsLocalPath.clear();
     _synchronizedSessionId.clear();
@@ -1334,7 +1332,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedDiagnosticsArtifact.clear();
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 
@@ -1367,55 +1365,44 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastDiagnosticsLocalPath = entryPath;
                 emit previewDiagnosticsAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 
-    // Each editable PCL role publishes its own display-only snapshot.
-    for (const auto role : vc3d::spiral::kEditablePclRoles) {
-        const std::size_t slot = vc3d::spiral::pclRoleIndex(role);
-        const QJsonObject artifactRef =
-            status.value(vc3d::spiral::pclRoleStatusKey(role)).toObject();
-        const QString artifactId = artifactRef.value(QStringLiteral("id")).toString();
-        if (artifactId.isEmpty() || artifactId == _installedPclArtifact[slot]
-            || artifactId == _fetchingPclArtifact[slot])
-            continue;
-        _fetchingPclArtifact[slot] = artifactId;
-        const quint64 sequence = ++_pclSequence[slot];
+    // The frozen inputs' manifest: one immutable artifact per session, from
+    // which the workspace reads the fitted inputs at their pinned revisions.
+    const QJsonObject manifestRef =
+        status.value(QStringLiteral("input_manifest_artifact")).toObject();
+    const QString manifestId = manifestRef.value(QStringLiteral("id")).toString();
+    if (!manifestId.isEmpty() && manifestId != _installedInputManifest
+        && manifestId != _fetchingInputManifest) {
+        _fetchingInputManifest = manifestId;
+        const QString digest = manifestRef.value(QStringLiteral("input_digest")).toString();
         const quint64 generation = _connectionGeneration;
         _artifactCache->fetchArtifact(
-            sessionId, artifactId,
-            [this, sessionId, role, slot, artifactId, artifactRef, generation, sequence](
+            sessionId, manifestId,
+            [this, sessionId, manifestId, digest, generation](
                 const QString& entryPath, const QString& error, bool gone) {
                 if (generation != _connectionGeneration) return;
-                // A later snapshot of this role supersedes this download,
-                // including its errors and source revision.
-                if (sequence != _pclSequence[slot]) return;
-                if (_fetchingPclArtifact[slot] == artifactId)
-                    _fetchingPclArtifact[slot].clear();
+                if (_fetchingInputManifest == manifestId) _fetchingInputManifest.clear();
                 if (entryPath.isEmpty()) {
                     if (!gone) emit errorOccurred(error);
                     return;
                 }
-                _installedPclArtifact[slot] = artifactId;
-                _lastPclLocalPath[slot] = entryPath;
-                emit pclArtifactAvailable(role, entryPath, artifactRef);
-                // PCL-only edits republish this artifact without a new
-                // preview, and only the preview callbacks pruned the cache,
-                // so repeated commits left every superseded snapshot on disk
-                // until the next preview arrived. The active preview,
-                // diagnostics and PCL snapshots are pinned.
+                _installedInputManifest = manifestId;
+                _lastInputManifestLocalPath = entryPath;
+                emit inputManifestAvailable(entryPath, digest);
                 _artifactCache->pruneSession(
-                    sessionId, kPreviewCacheKept, pclArtifactCachePins());
+                    sessionId, kPreviewCacheKept, artifactCachePins());
             });
     }
 }
 
-QStringList SpiralServiceManager::pclArtifactCachePins() const
+QStringList SpiralServiceManager::artifactCachePins() const
 {
     return vc3d::spiralArtifactCachePins(
         _lastPreviewLocalPath, _lastDiagnosticsLocalPath,
-        QStringList(_lastPclLocalPath.begin(), _lastPclLocalPath.end()));
+        {_lastInputManifestLocalPath});
 }
 
 void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,

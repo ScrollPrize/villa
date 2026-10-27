@@ -16,8 +16,11 @@ compared on the same data:
     python display_geometry_dump.py compare A.json B.json
 
 File mode needs only numpy and tifffile, so it runs unchanged at any
-checkout. Patches are their TIFXYZ grids as stored (invalid vertices keep
--1); PCL points are their documents' ``p``; version-3 fiber JSONs carry no
+checkout. Patches are their TIFXYZ grids as the workspace displays them: a
+vertex is invalid (-1) when stored so, or when its ``mask.tif`` block holds a
+sample below 255, as VC3D's tifxyz load applies the mask; the store keeps that
+mask as its ``valid`` channel. PCL points are their documents' ``p``;
+version-3 fiber JSONs carry no
 frame, so ``--fiber-scale`` gives their stored-per-reference scale (the
 acceptance dataset's are at 4). Store mode divides stored XYZ by each
 object's declared ``scale_factor``, as the store's geometryScaleToVolume
@@ -55,12 +58,15 @@ def _summary(xyz, invalid=None):
     }
 
 
-def _surface(xyz, mask=None):
-    """A (rows, cols, 3) XYZ grid; a vertex is invalid when all of XYZ are -1."""
+def _surface(xyz, valid=None):
+    """A (rows, cols, 3) XYZ grid as displayed: a vertex is invalid when all
+    of XYZ are -1 or ``valid`` (per vertex) is false."""
     xyz = np.asarray(xyz, dtype=np.float32)
-    entry = {'kind': 'surface', 'shape': list(xyz.shape[:2]),
-             **_summary(xyz, np.all(xyz == -1, axis=-1))}
-    entry['masked'] = None if mask is None else int((np.asarray(mask) == 0).sum())
+    invalid = np.all(xyz == -1, axis=-1)
+    if valid is not None:
+        invalid |= ~np.asarray(valid, dtype=bool)
+    entry = {'kind': 'surface', 'shape': list(xyz.shape[:2]), **_summary(xyz, invalid)}
+    entry['masked'] = None if valid is None else int((~np.asarray(valid, dtype=bool)).sum())
     return entry
 
 
@@ -85,12 +91,17 @@ def _read_tifxyz(directory):
     xyz = np.stack([tifffile.imread(os.path.join(directory, f'{axis}.tif'))
                     for axis in 'xyz'], axis=-1)
     mask_path = os.path.join(directory, 'mask.tif')
-    mask = None
+    valid = None
     if os.path.isfile(mask_path):
         mask = tifffile.imread(mask_path)
         if mask.ndim == 3:
             mask = mask[..., 0]
-    return xyz, mask
+        # A mask may be a whole multiple of the grid; a vertex stays valid
+        # only when every sample of its block is at least 255.
+        rows, cols = xyz.shape[:2]
+        block = mask.reshape(rows, mask.shape[0] // rows, cols, mask.shape[1] // cols)
+        valid = (block >= 255).all(axis=(1, 3))
+    return xyz, valid
 
 
 def _patch_key(directory_name):
@@ -101,9 +112,9 @@ def _patch_key(directory_name):
 def dump_files(patches, pcls, fibers, fiber_scale):
     entries = {}
     for directory in patches:
-        xyz, mask = _read_tifxyz(directory)
+        xyz, valid = _read_tifxyz(directory)
         name = os.path.basename(os.path.normpath(directory))
-        entries[_patch_key(name)] = _surface(xyz, mask)
+        entries[_patch_key(name)] = _surface(xyz, valid)
     documents = {}
     for spec in pcls:
         path, _, collection = spec.rpartition('#')
@@ -161,7 +172,8 @@ def dump_store(path, objects):
                 invalid = np.all(points == -1, axis=-1)
                 xyz = points / scale
                 xyz[invalid] = -1
-                entry = _surface(xyz, _array(db, geometry, 'valid'))
+                valid = _array(db, geometry, 'valid')
+                entry = _surface(xyz, None if valid is None else valid != 0)
             elif kind == 'point_collection':
                 entry = _points(_array(db, geometry, 'point_ids'),
                                 _array(db, geometry, 'points') / scale)

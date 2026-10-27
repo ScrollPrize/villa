@@ -7,6 +7,7 @@
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
+#include "SpiralStoreInputs.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
@@ -751,8 +752,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::previewDiagnosticsAvailable, this,
             &SpiralWorkspace::installPreviewDiagnostics);
-    connect(_service, &SpiralServiceManager::pclArtifactAvailable, this,
-            &SpiralWorkspace::installPclArtifact);
+    connect(_service, &SpiralServiceManager::inputManifestAvailable, this,
+            [this](const QString& manifestPath, const QString& digest) {
+                _inputManifestPath = manifestPath;
+                _inputDigest = digest;
+                loadPinnedInputs();
+            });
+    // The inputs can be displayed only from the store the service read.
+    connect(_service, &SpiralServiceManager::storeBindingChanged, this,
+            [this]() { if (!_inputManifestPath.isEmpty()) loadPinnedInputs(); });
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
                 using CS = SpiralServiceManager::ConnectionState;
@@ -786,13 +794,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
             [this](bool active) {
                 emit spiralSessionActiveChanged(active);
-                if (active || !_service->sessionLeaseId().isEmpty()) return;
+                if (active) return;
+                _inputManifestPath.clear();
+                _inputDigest.clear();
+                clearPinnedInputs({});
+                if (!_service->sessionLeaseId().isEmpty()) return;
                 cancelLineAnnotationDraft();
-                for (auto& state : _pclOverlays) {
-                    state.manifestPath.clear();
-                    state.baseShapeZYX.reset();
-                }
-                refreshPclOverlays();
             });
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this,
             &SpiralWorkspace::updatePendingPatchIds);
@@ -865,7 +872,7 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
     // preview or geometry display.
     QJsonObject paths;
     QStringList unavailable;
-    for (const char* key : {"verified_patches", "outer_shell"}) {
+    for (const char* key : {"outer_shell"}) {
         const QString servicePath = servicePaths.value(QString::fromLatin1(key)).toString();
         if (servicePath.isEmpty()) continue;
         const QString local = mapServicePath(servicePath);
@@ -886,8 +893,10 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
             });
     watcher->setFuture(QtConcurrent::run([paths, generation]() {
         InputSurfaceLoadResult result;
+        // A new session drops the previous one's drafted surfaces too.
+        result.categories = {QStringLiteral("shell"), QStringLiteral("brush"),
+                             QStringLiteral("ephemeral")};
         const std::pair<const char*, const char*> inputs[] = {
-            {"verified", "verified_patches"},
             {"shell", "outer_shell"},
         };
         for (const auto& [categoryText, pathKey] : inputs) {
@@ -934,11 +943,10 @@ void SpiralWorkspace::loadInputSurfaces(const QJsonObject& servicePaths, quint64
 void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation)
 {
     if (_shuttingDown || generation != _inputSurfaceGeneration) return;
-    QHash<QString, QStringList> replacement;
-    for (const QString& category : {QStringLiteral("verified"), QStringLiteral("shell")})
-        replacement[category] = {};
-    QHash<QString, QString> replacementSourceIds;
-    std::map<std::string, cv::Vec3b> replacementColors;
+    QHash<QString, QStringList> replacement = _surfaceCategoryIds;
+    for (const QString& category : result.categories) replacement[category] = {};
+    QHash<QString, QString> replacementSourceIds = _surfaceSourceIds;
+    std::map<std::string, cv::Vec3b> replacementColors = _surfaceOverlayColors;
     std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaceUpdates;
     surfaceUpdates.reserve(result.surfaces.size());
     QSet<QString> replacementIds;
@@ -962,11 +970,12 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
         replacementColors.emplace(entry.id.toStdString(),
                                    vc3d::surfaceOverlayColorBgr(assignment->second));
     }
-    const auto retired = _surfaceCategoryIds;
-    for (auto it = retired.begin(); it != retired.end(); ++it) {
-        for (const QString& id : it.value()) {
+    for (const QString& category : result.categories) {
+        for (const QString& id : _surfaceCategoryIds.value(category)) {
             if (!replacementIds.contains(id)) {
                 surfaceUpdates.emplace_back(id.toStdString(), nullptr);
+                replacementSourceIds.remove(id);
+                replacementColors.erase(id.toStdString());
             }
         }
     }
@@ -2199,27 +2208,6 @@ void SpiralWorkspace::installPreviewDiagnostics(const QString& manifestPath,
     updateLossMapOverlay();
 }
 
-void SpiralWorkspace::installPclArtifact(
-    vc3d::spiral::PclRole role, const QString& manifestPath,
-    const QJsonObject& artifactRef)
-{
-    auto& state = pclOverlay(role);
-    state.manifestPath = manifestPath;
-    QString shapeError;
-    state.baseShapeZYX = parseBaseShapeZYX(
-        artifactRef.value(QStringLiteral("base_shape_zyx")), &shapeError);
-    if (!state.baseShapeZYX) {
-        QFile file(manifestPath);
-        if (file.open(QIODevice::ReadOnly)) {
-            const QJsonObject descriptor =
-                QJsonDocument::fromJson(file.readAll()).object();
-            state.baseShapeZYX = parseBaseShapeZYX(
-                descriptor.value(QStringLiteral("base_shape_zyx")), &shapeError);
-        }
-    }
-    refreshPclOverlay(role);
-}
-
 void SpiralWorkspace::refreshPclOverlays()
 {
     for (const auto role : vc3d::spiral::kEditablePclRoles) refreshPclOverlay(role);
@@ -2232,63 +2220,177 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
     const QString roleName = vc3d::spiral::pclRoleDisplayName(role);
     state.overlay->setVisible(false);
     state.collection->clearAll();
-    if (state.manifestPath.isEmpty()) {
+    if (state.documentPath.isEmpty()) {
         _brush->setPclSource(role, {}, 1.0, {}, false);
-        _panel->setPclOverlayAvailable(role, false);
+        _panel->setPclOverlayAvailable(
+            role, false, _pinnedInputs ? tr("The fit has no %1 point collections").arg(roleName)
+                                       : QString());
         return;
     }
-    if (!_previewBaseShapeZYX || !state.baseShapeZYX) {
+    // The pinned collections are in reference-volume voxels: the scroll's
+    // base shape, mapped onto the preview's coordinate domain.
+    QString shapeError;
+    const auto scrollShape = parseBaseShapeZYX(
+        _service->advertisedDataset().value(QStringLiteral("scroll_spec")).toObject()
+            .value(QStringLiteral("base_shape_zyx")), &shapeError);
+    if (!_previewBaseShapeZYX || !scrollShape) {
         _panel->setPclOverlayAvailable(
             role, false,
-            tr("The preview or %1 artifact has no coordinate-domain metadata")
-                .arg(roleName));
+            tr("The preview or the scroll specification has no coordinate-domain metadata"));
         return;
     }
     double scale = 1.0;
     try {
-        scale = vc::lasagna::dyadicCoordinateScaleBetweenShapes(
-            *state.baseShapeZYX, *_previewBaseShapeZYX);
+        scale = vc::lasagna::dyadicCoordinateScaleBetweenShapes(*scrollShape, *_previewBaseShapeZYX);
     } catch (const std::exception& error) {
         _panel->setPclOverlayAvailable(
             role, false, tr("The %1 PCL coordinate domain is incompatible: %2")
                              .arg(roleName, QString::fromUtf8(error.what())));
         return;
     }
-    QFile descriptorFile(state.manifestPath);
-    if (!descriptorFile.open(QIODevice::ReadOnly)) {
+    if (!state.collection->loadFromJSON(state.documentPath.toStdString())) {
         _panel->setPclOverlayAvailable(
-            role, false, tr("The downloaded %1 descriptor cannot be opened").arg(roleName));
+            role, false, tr("The pinned %1 point collections are invalid").arg(roleName));
         return;
     }
-    const QJsonObject descriptor =
-        QJsonDocument::fromJson(descriptorFile.readAll()).object();
-    const QString relative = descriptor.value(QStringLiteral("pcl_file")).toString();
-    const QString pclPath = QDir(QFileInfo(state.manifestPath).absolutePath())
-                                .filePath(relative);
-    QFile pclFile(pclPath);
-    if (relative.isEmpty() || !pclFile.open(QIODevice::ReadOnly)) {
-        _panel->setPclOverlayAvailable(
-            role, false, tr("The downloaded %1 PCL is invalid").arg(roleName));
-        return;
-    }
-    QJsonParseError parseError;
-    const QJsonDocument sourceDocument = QJsonDocument::fromJson(
-        pclFile.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !sourceDocument.isObject()
-        || !state.collection->loadFromJSON(pclPath.toStdString())) {
-        _panel->setPclOverlayAvailable(
-            role, false, tr("The downloaded %1 PCL is invalid").arg(roleName));
-        return;
-    }
-    _brush->setPclSource(
-        role, sourceDocument, scale,
-        descriptor.value(QStringLiteral("source_revision")).toString(),
-        descriptor.value(QStringLiteral("editable")).toBool(false),
-        descriptor.value(QStringLiteral("source")).toString());
+    // Fitted inputs are frozen: shown, never edited through the overlay.
+    _brush->setPclSource(role, QJsonDocument(state.document), scale, _inputDigest, false);
     _brush->setPclSourceVisible(role, state.visible);
     state.overlay->setCoordinateScale(scale);
     _panel->setPclOverlayAvailable(role, true);
     state.overlay->setVisible(state.visible);
+}
+
+void SpiralWorkspace::clearPinnedInputs(const QString& reason)
+{
+    ++_pinnedInputGeneration;
+    _pinnedInputs.reset();
+    for (auto& state : _pclOverlays) {
+        state.document = {};
+        state.documentPath.clear();
+    }
+    InputSurfaceLoadResult cleared;
+    cleared.categories = {QStringLiteral("verified")};
+    installInputSurfaces(cleared, _inputSurfaceGeneration);
+    refreshPclOverlays();
+    if (!reason.isEmpty()) statusBar()->showMessage(reason, 15000);
+}
+
+void SpiralWorkspace::loadPinnedInputs()
+{
+    if (_shuttingDown) return;
+    if (_inputManifestPath.isEmpty()) {
+        clearPinnedInputs({});
+        return;
+    }
+    const auto& binding = _service->storeBinding();
+    const auto session = _state->objectStoreSession();
+    const auto attachment = _state->objectStoreAttachment();
+    if (!binding.matches() || !session || !attachment) {
+        // Never substitute another store's objects, or current heads, for
+        // the fitted inputs.
+        clearPinnedInputs(binding.localUuid.isEmpty()
+            ? tr("Fit inputs are not displayed: no object store is attached")
+            : tr("Fit inputs are not displayed: the service read store %1, not the attached %2")
+                  .arg(binding.serviceUuid, binding.localUuid));
+        return;
+    }
+    QFile file(_inputManifestPath);
+    nlohmann::json document;
+    try {
+        if (!file.open(QIODevice::ReadOnly)) throw std::runtime_error("cannot open the manifest");
+        document = nlohmann::json::parse(file.readAll().toStdString());
+    } catch (const std::exception& error) {
+        clearPinnedInputs(tr("The fit's input manifest cannot be read: %1").arg(QString::fromUtf8(error.what())));
+        return;
+    }
+    const quint64 generation = ++_pinnedInputGeneration;
+    auto* watcher = new QFutureWatcher<std::shared_ptr<vc3d::spiral::PinnedStoreInputs>>(this);
+    connect(watcher, &QFutureWatcher<std::shared_ptr<vc3d::spiral::PinnedStoreInputs>>::finished, this,
+            [this, watcher, generation]() {
+                const auto inputs = watcher->result();
+                watcher->deleteLater();
+                if (!_shuttingDown && generation == _pinnedInputGeneration)
+                    installPinnedInputs(inputs, generation);
+            });
+    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, document]() {
+        auto inputs = std::make_shared<vc3d::spiral::PinnedStoreInputs>();
+        try {
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                *inputs = vc3d::spiral::readPinnedStoreInputs(db, txn, document);
+            });
+        } catch (const std::exception& error) {
+            inputs->problems.push_back(error.what());
+        }
+        return inputs;
+    }));
+}
+
+void SpiralWorkspace::installPinnedInputs(
+    const std::shared_ptr<vc3d::spiral::PinnedStoreInputs>& inputs, quint64 generation)
+{
+    if (generation != _pinnedInputGeneration) return;
+    _pinnedInputs = inputs;
+    using vc3d::spiral::PinState;
+    InputSurfaceLoadResult surfaces;
+    surfaces.categories = {QStringLiteral("verified")};
+    const QString digest = QString::fromStdString(inputs->digest).left(12);
+    for (const auto& entry : inputs->surfaces) {
+        if (!entry.surface) continue;
+        const QString uuid = QString::fromStdString(entry.pin.uuid);
+        // Keyed and coloured by object UUID, which survives renames.
+        const QString id = QStringLiteral("spiral/verified/%1/%2").arg(digest, uuid);
+        entry.surface->id = id.toStdString();
+        surfaces.surfaces.push_back({QStringLiteral("verified"), id, uuid, entry.surface});
+    }
+    installInputSurfaces(surfaces, _inputSurfaceGeneration);
+
+    // Absolute and relative collections carry windings and share the
+    // relative overlay; unannotated ones are same-winding collections.
+    std::map<vc3d::spiral::PclRole, QJsonObject> collections;
+    int collectionId = 0;
+    for (const auto& entry : inputs->pointCollections) {
+        if (entry.state == PinState::Missing) continue;
+        const bool annotated = entry.absolute
+            || std::any_of(entry.windings.begin(), entry.windings.end(),
+                           [](const auto& wind) { return wind.has_value(); });
+        QJsonObject points;
+        for (std::size_t i = 0; i < entry.ids.size(); ++i) {
+            QJsonObject point{
+                {QStringLiteral("p"), QJsonArray{entry.points[i][0], entry.points[i][1], entry.points[i][2]}},
+                {QStringLiteral("creation_time"), 0}};
+            point[QStringLiteral("wind_a")] = entry.windings[i] ? QJsonValue(*entry.windings[i]) : QJsonValue();
+            points[QString::number(entry.ids[i])] = point;
+        }
+        const auto role = annotated ? vc3d::spiral::PclRole::Relative : vc3d::spiral::PclRole::SameWinding;
+        collections[role][QString::number(++collectionId)] = QJsonObject{
+            {QStringLiteral("name"), QString::fromStdString(entry.pin.name)},
+            {QStringLiteral("points"), points},
+            {QStringLiteral("metadata"), QJsonObject{
+                {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
+                {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
+    }
+    for (const auto role : vc3d::spiral::kEditablePclRoles) {
+        auto& state = pclOverlay(role);
+        state.document = {};
+        state.documentPath.clear();
+        if (!collections.contains(role) || !_pinnedPclDocuments.isValid()) continue;
+        state.document = QJsonObject{{QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
+                                     {QStringLiteral("collections"), collections[role]}};
+        const QString path = _pinnedPclDocuments.filePath(
+            QStringLiteral("%1-%2.json").arg(digest, vc3d::spiral::pclRoleDisplayName(role)));
+        QSaveFile out(path);
+        const QByteArray bytes = QJsonDocument(state.document).toJson(QJsonDocument::Compact);
+        if (out.open(QIODevice::WriteOnly) && out.write(bytes) == bytes.size() && out.commit())
+            state.documentPath = path;
+    }
+    refreshPclOverlays();
+
+    QStringList notes;
+    for (const auto& problem : inputs->problems) notes << QString::fromStdString(problem);
+    if (const auto edited = inputs->count(PinState::Edited) + inputs->count(PinState::MetadataChanged))
+        notes << tr("%n fitted input(s) changed in the store since the fit; the fitted revisions are shown", "", int(edited));
+    if (!notes.isEmpty()) statusBar()->showMessage(notes.join(QStringLiteral("; ")), 15000);
 }
 
 void SpiralWorkspace::loadRunDiff()

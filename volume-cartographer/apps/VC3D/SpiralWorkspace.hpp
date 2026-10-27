@@ -11,6 +11,7 @@
 #include <QColor>
 #include <QSet>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <vc_reader/affine.hpp>
@@ -24,6 +25,10 @@
 #include <string>
 #include <vector>
 #include <functional>
+
+namespace vc3d::spiral {
+struct PinnedStoreInputs;
+}
 
 class AxisAlignedSliceController;
 class CState;
@@ -130,6 +135,8 @@ private:
         std::shared_ptr<QuadSurface> surface;
     };
     struct InputSurfaceLoadResult {
+        // The surface categories this result replaces; others are kept.
+        QStringList categories;
         std::vector<InputSurfaceEntry> surfaces;
         QStringList warnings;
     };
@@ -147,8 +154,12 @@ private:
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
-    void installPclArtifact(vc3d::spiral::PclRole role, const QString& manifestPath,
-                            const QJsonObject& artifactRef);
+    // The fit's frozen inputs read from the attached store at the revisions
+    // the session's input manifest pins (vc3d::spiral::readPinnedStoreInputs).
+    void loadPinnedInputs();
+    void installPinnedInputs(const std::shared_ptr<vc3d::spiral::PinnedStoreInputs>& inputs,
+                             quint64 generation);
+    void clearPinnedInputs(const QString& reason);
     void refreshPclOverlay(vc3d::spiral::PclRole role);
     void refreshPclOverlays();
     void applyPreviewWindingRange(bool preserveFocus);
@@ -202,14 +213,16 @@ private:
     std::unique_ptr<SpiralOverlayController> _overlay;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
-    // The display-only overlay of one editable PCL role (same-winding or
-    // relative-winding), fed by the service's snapshot artifact of that
-    // role's dataset file.
+    // The display-only overlay of the fit's point collections of one role
+    // (same-winding, or relative-winding with the absolute ones), read from
+    // the attached store at the revisions the session's manifest pins.
     struct PclOverlayState {
         std::unique_ptr<VCCollection> collection;
         std::unique_ptr<PointsOverlayController> overlay;
-        std::optional<std::array<std::size_t, 3>> baseShapeZYX;
-        QString manifestPath;
+        // The pinned collections as a point-collections document, and that
+        // document on disk for VCCollection::loadFromJSON; empty when none.
+        QJsonObject document;
+        QString documentPath;
         bool visible = false;
     };
     std::array<PclOverlayState, vc3d::spiral::kEditablePclRoles.size()> _pclOverlays;
@@ -246,6 +259,12 @@ private:
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
     quint64 _inputSurfaceGeneration = 0;
+    // The session's input manifest and what the attached store holds of it.
+    QString _inputManifestPath;
+    QString _inputDigest;
+    quint64 _pinnedInputGeneration = 0;
+    std::shared_ptr<vc3d::spiral::PinnedStoreInputs> _pinnedInputs;
+    QTemporaryDir _pinnedPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;

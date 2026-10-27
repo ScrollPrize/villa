@@ -204,11 +204,10 @@ signals:
     // service as a second artifact once the surface was on its way.
     void previewDiagnosticsAvailable(const QString& manifestPath,
                                      qint64 generation);
-    // Immutable display-only PCL snapshot of one editable role resolved by
-    // the service. The descriptor carries the source coordinate domain.
-    void pclArtifactAvailable(vc3d::spiral::PclRole role,
-                              const QString& manifestPath,
-                              const QJsonObject& artifactRef);
+    // The current session's input manifest (object_store_inputs.json: the
+    // digest and every object and relationship the fit froze, with revision
+    // pins), downloaded from the service's input manifest artifact.
+    void inputManifestAvailable(const QString& manifestPath, const QString& digest);
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
@@ -393,16 +392,15 @@ private:
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;
     // Per editable PCL role, indexed by vc3d::spiral::pclRoleIndex.
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _installedPclArtifact;
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _fetchingPclArtifact;
+    QString _installedInputManifest;
+    QString _fetchingInputManifest;
     bool _previewDiagnosticsWanted = false;
     QString _fetchingCheckpointArtifact;
-    std::array<quint64, vc3d::spiral::kEditablePclRoles.size()> _pclSequence{};
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastDiagnosticsLocalPath;
-    std::array<QString, vc3d::spiral::kEditablePclRoles.size()> _lastPclLocalPath;
+    QString _lastInputManifestLocalPath;
     QString _synchronizedSessionId;
 
-    QStringList pclArtifactCachePins() const;
+    QStringList artifactCachePins() const;
 };
