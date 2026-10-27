@@ -2,6 +2,7 @@
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/AttachedDocument.hpp"
 #include "GeometryRegionBindings.hpp"
 #include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
@@ -178,6 +179,21 @@ void bindMutations(nb::class_<T>& cls)
             },
             nb::arg("data_uuid"), nb::arg("owner_uuid"), nb::arg("role"),
             "Attach object data to owner in role (an attachment relationship); returns the edge uuid.")
+        .def(
+            "attach_document",
+            [](T& self, const std::string& owner, const std::string& collection, const nb::object& document,
+               const std::string& role, const std::string& listKey, const std::string& positionKey,
+               const std::string& name, const nb::object& coordinates) {
+                const auto parsed = nlohmann::json::parse(jsonDumps(document));
+                const auto frame = nlohmann::json::parse(jsonDumps(coordinates));
+                self.template withWrite<true>([&](vo::ObjectStore& g, vo::WriteTxn& t) {
+                    vo::attachDocument(g, t, owner, collection, parsed, {role, listKey, positionKey}, name, frame);
+                });
+            },
+            nb::arg("owner_uuid"), nb::arg("collection_uuid"), nb::arg("document"), nb::arg("role"),
+            nb::arg("list_key"), nb::arg("position_key"), nb::arg("name"), nb::arg("coordinates"),
+            "Attach a document to owner as point collection collection_uuid (objects/AttachedDocument.hpp): one point "
+            "per record of document[list_key], at record[position_key].")
         .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge, T>(),
              nb::arg("uuid"))
         .def("set_approval", writeMethod<&vo::ObjectStore::setApproval, T>(),
@@ -476,6 +492,10 @@ NB_MODULE(_native, m)
              nb::arg("dataset_root") = std::nullopt,
              "Find a surface/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
+        .def("attached_document", [](PyObjectStore& self, const std::string& owner, const std::string& role) -> nb::object {
+            const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(db, txn, owner, role); });
+            return document ? jsonLoads(document->dump()) : nb::none();
+        }, nb::arg("owner_uuid"), nb::arg("role"), "The document attached to owner in role, or None.")
         .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
             const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
             nb::list out; for (const auto& record : records) out.append(edgeToPy(record));
