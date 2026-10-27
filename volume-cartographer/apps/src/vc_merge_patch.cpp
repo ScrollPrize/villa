@@ -1079,7 +1079,7 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces*
     SurfacePatchIndex patchIndex;
     {
         std::vector<SurfacePatchIndex::SurfacePtr> all = { child.qs, parent.qs };
-        patchIndex.rebuild(all);
+        patchIndex.rebuild(all, 0.0f, true);
     }
 
     std::cout << "[3/6] per-edge overlap + anchor selection (border-only)\n";

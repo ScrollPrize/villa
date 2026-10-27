@@ -1163,7 +1163,7 @@ int main(int argc, char** argv)
     }
     if (!cacheHit) {
         const auto rebuildStart = std::chrono::steady_clock::now();
-        index.rebuild(patchSurfaces, cfg.bboxPadding);
+        index.rebuild(patchSurfaces, cfg.bboxPadding, true);
         const double rebuildElapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - rebuildStart).count();
         std::cout << "SurfacePatchIndex rebuild time=" << rebuildElapsed << "s\n";
@@ -1211,7 +1211,7 @@ int main(int argc, char** argv)
         SurfacePatchIndex sourceIndex;
         sourceIndex.setReadOnly(true);
         sourceIndex.setSamplingStride(cfg.indexStride);
-        sourceIndex.rebuild(std::vector<SurfacePatchIndex::SurfacePtr>{src}, cfg.bboxPadding);
+        sourceIndex.rebuild(std::vector<SurfacePatchIndex::SurfacePtr>{src}, cfg.bboxPadding, true);
         std::cout << "Source index ready: " << sourceIndex.patchCount() << " patches\n";
 
         cv::Mat_<uchar> srcValid(rows, cols);

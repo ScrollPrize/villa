@@ -208,7 +208,7 @@ private:
         for (const auto& info : surfaces) {
             surface_ptrs.push_back(info.surface);
         }
-        patchIndex.rebuild(surface_ptrs);
+        patchIndex.rebuild(surface_ptrs, 0.0f, true);
 
         std::cout << "SurfacePatchIndex built for " << surfaces.size() << " surfaces" << std::endl;
 

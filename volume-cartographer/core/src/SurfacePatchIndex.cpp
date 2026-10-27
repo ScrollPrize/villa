@@ -154,15 +154,6 @@ inline bool isFinitePoint(const cv::Vec3f& p) noexcept
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
-inline bool isValidSurfacePoint(const cv::Vec3f& p) noexcept
-{
-    return p[0] != -1.0f && isFinitePoint(p);
-}
-
-inline bool isValidMappedSurfacePoint(const cv::Vec3f& p) noexcept
-{
-    return p[2] > 0.0f && isFinitePoint(p);
-}
 
 inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
 {
@@ -1845,7 +1836,7 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
-        if (!isValidMappedSurfacePoint(p)) return;
+        if (!vc::geometry::validSurfacePoint(p)) return;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
@@ -3139,8 +3130,8 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
         p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
     }
 
-    const auto valid = rec.mapped ? isValidMappedSurfacePoint : isValidSurfacePoint;
-    if (!valid(p00) || !valid(p10) || !valid(p01) || !valid(p11)) {
+    if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p10) ||
+        !vc::geometry::validSurfacePoint(p01) || !vc::geometry::validSurfacePoint(p11)) {
         return false;
     }
 
@@ -3191,7 +3182,7 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
-        if (!isValidSurfacePoint(p)) return;
+        if (!vc::geometry::validSurfacePoint(p)) return;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);

@@ -281,7 +281,7 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
 
     SurfacePatchIndex index;
     index.setSamplingStride(4);
-    index.rebuild({lazy});
+    index.rebuild({lazy}, 0.0f, /*useMappedSurfaces=*/true);
 
     CHECK_FALSE(index.empty());
     CHECK(index.containsSurface(lazy));

@@ -1778,7 +1778,7 @@ GMAlignState gmAlignAll(const fs::path& merge_path, GMConfig cfg)
         for (const auto& n : st.names) all.push_back(st.surfs.at(n).qs);
         std::cout << "Building SurfacePatchIndex over " << all.size()
                   << " surfaces..." << std::endl;
-        patchIndex.rebuild(all);
+        patchIndex.rebuild(all, 0.0f, true);
     }
 
     std::cout << "[2/6] per-edge overlap+anchors+RANSAC similarity\n";
