@@ -69,10 +69,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
                          SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
-                         SCROLL_SPEC_OWNED_RUN_KEYS, STORE_INPUT_KEYS, PclRole,
-                         ScrollSpecError, SessionState, SpiralInputPaths,
+                         SCROLL_SPEC_OWNED_RUN_KEYS, STORE_INPUT_KEYS,
+                         ScrollSpecError, SessionState,
                          default_user_cache_dir, input_source_enabled,
                          winding_inference_enabled, load_scroll_spec,
                          scroll_spec_config_defaults,
@@ -85,7 +85,7 @@ from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
 from service_artifacts import ArtifactRegistry
 from preview_index import PublishedPreviewIndex
 from service_files import ExclusiveFileLock, FileLockUnavailable
-from service_uploads import (PCL_ROLE_FILES, UPLOADED_CHECKPOINTS_DIRNAME,
+from service_uploads import (UPLOADED_CHECKPOINTS_DIRNAME,
                              UploadEnvironment, UploadManager)
 from lasagna_publish import (LasagnaPublisher, PreviewPublication,
                              stop_process_group)
@@ -99,25 +99,11 @@ from lasagna_publish import (_load_flatten_correspondence,  # noqa: F401
 
 
 SERVICE_VERSION = "10.0.0"
-# Per editable PCL role: the /session/status key carrying its display
-# artifact, the artifact registry kind, the artifact directory prefix, and the
-# human label used in client-facing messages.
-PCL_ARTIFACT_STATUS_KEYS = {
-    PclRole.SAME_WINDING.value: "same_winding_artifact",
-    PclRole.RELATIVE.value: "relative_winding_artifact",
-}
-PCL_ARTIFACT_KINDS = {
-    PclRole.SAME_WINDING.value: "spiral-same-winding-pcl",
-    PclRole.RELATIVE.value: "spiral-relative-winding-pcl",
-}
-PCL_ARTIFACT_DIR_PREFIXES = {
-    PclRole.SAME_WINDING.value: "same-winding",
-    PclRole.RELATIVE.value: "relative-winding",
-}
-PCL_ROLE_LABELS = {
-    PclRole.SAME_WINDING.value: "same-winding",
-    PclRole.RELATIVE.value: "relative-winding",
-}
+# The current session's object-store input manifest, as one immutable
+# artifact per input digest: too large for every status poll, and what a
+# client resolves the fitted inputs' revision pins from.
+INPUT_MANIFEST_ARTIFACT_KIND = "spiral-input-manifest"
+INPUT_MANIFEST_FILE_NAME = "object_store_inputs.json"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 PREVIEW_ARTIFACTS_KEPT = 3
@@ -531,9 +517,6 @@ class ServiceState:
         self._retiring_sessions = []
         self._teardown_lock = threading.Lock()
         self._release_receipts = MutationCoordinator()
-        self._pcl_publication_locks = {
-            role: threading.Lock() for role in EDITABLE_PCL_ROLES
-        }
         self.session = None
         # The SessionLease of the client that owns this service, if any.
         self.session_lease = None
@@ -580,8 +563,8 @@ class ServiceState:
         # One record for the whole of preview publication (see
         # LasagnaPublisher's PreviewPublication), guarded by self.lock.
         self._preview = PreviewPublication()
-        # Display artifacts of the editable PCL roles, keyed by role value.
-        self.pcl_artifacts = {}
+        # The published input manifest of this session: (digest, artifact).
+        self._input_manifest = None
         # A preview export runs off the HTTP thread (it costs minutes); this
         # is what makes the verb single-flight and what /session/status
         # reports so a client reconnecting mid-export can see one is running.
@@ -799,8 +782,8 @@ class ServiceState:
             # never opens an overlay never waits for one.
             response["preview_diagnostics_artifact"] = (
                 self._preview.diagnostics_artifact)
-            for role_value, status_key in PCL_ARTIFACT_STATUS_KEYS.items():
-                response[status_key] = self.pcl_artifacts.get(role_value)
+            response["input_manifest_artifact"] = (
+                self._input_manifest[1] if self._input_manifest else None)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -1321,9 +1304,6 @@ class ServiceState:
             target=self._build,
             args=(session_id, previous, paths, run, preview, scroll),
             name="spiral-session-build", daemon=True)
-        self._start_background(
-            target=self._refresh_pcl_artifacts,
-            name="spiral-pcl-artifact-publish", daemon=True)
 
     def _build(self, session_id, previous, paths, run, preview, scroll):
         """Close the old resident session, then construct the new one.
@@ -1382,111 +1362,11 @@ class ServiceState:
         self._event_metric_iterations = {}
         self._event_errors = {}
         self._event_input_lines = {}
-        self.pcl_artifacts = {}
+        self._input_manifest = None
         stale_raw = self._preview.reset_session_scope()
         for manifest in stale_raw:
             shutil.rmtree(
                 Path(manifest).parent, ignore_errors=True)
-
-    def _publish_pcl_artifact(self, role, source_path=None):
-        """Snapshot one editable role's PCL file without exposing host paths."""
-        role = PclRole(role)
-        if role not in EDITABLE_PCL_ROLES:
-            raise ValueError(f"{role.value} PCLs have no display artifact")
-        # Keep snapshot creation, registration, installation and retention in
-        # one role-scoped transaction, including concurrent session refreshes.
-        with self._pcl_publication_locks[role]:
-            return self._publish_pcl_artifact_locked(role, source_path)
-
-    def _publish_pcl_artifact_locked(self, role, source_path):
-        with self.lock:
-            session_id = self.session_id
-            paths = self.session_paths
-            generation = self.session_revision
-            resolution = self.dataset_resolution
-        if not session_id or paths is None:
-            return None
-        source = Path(source_path) if source_path else None
-        if source is None:
-            for pcl in paths.pcls:
-                if pcl.role == role and pcl.path:
-                    source = Path(pcl.path)
-                    break
-        if source is None:
-            candidate = Path(paths.dataset_root) / PCL_ROLE_FILES[role.value]
-            if candidate.is_file():
-                source = candidate
-        if source is None or not source.is_file():
-            with self.lock:
-                self.pcl_artifacts.pop(role.value, None)
-            return None
-        base_shape = None
-        if resolution is not None and resolution.scroll_spec is not None:
-            base_shape = resolution.scroll_spec.get("base_shape_zyx")
-        if base_shape is None:
-            with self.lock:
-                self.pcl_artifacts.pop(role.value, None)
-            return None
-        kind = PCL_ARTIFACT_KINDS[role.value]
-        root = (Path(paths.output_directory) / ".spiral-artifacts" /
-                f"{PCL_ARTIFACT_DIR_PREFIXES[role.value]}-{generation}-"
-                f"{secrets.token_hex(6)}")
-        root.mkdir(parents=True, exist_ok=False)
-        try:
-            pcl_name = PCL_ROLE_FILES[role.value]
-            shutil.copy2(source, root / pcl_name)
-            # Hash the snapshot, not the live source: publishing runs without
-            # the commit lock, and a write landing between the copy and the
-            # hash would advertise the newer document's revision for the
-            # older bytes, letting a client edit the stale snapshot and still
-            # pass the revision check.
-            source_revision = self._file_sha256(root / pcl_name)
-            editable = self._pcl_source_editable(role, source)
-            descriptor = {
-                "schema_version": 1,
-                "kind": kind,
-                "role": role.value,
-                "base_shape_zyx": list(base_shape),
-                "pcl_file": pcl_name,
-                "source": str(source.resolve()),
-                "source_revision": source_revision,
-                "editable": editable,
-            }
-            (root / "manifest.json").write_text(
-                json.dumps(descriptor, indent=2) + "\n", encoding="utf-8")
-            ref = self.artifacts.register_directory(
-                kind, session_id, generation, root,
-                "manifest.json", delete_root_on_prune=True)
-            ref["role"] = role.value
-            ref["base_shape_zyx"] = list(base_shape)
-            ref["source_revision"] = source_revision
-            ref["editable"] = editable
-            with self.lock:
-                if self.session_id != session_id:
-                    shutil.rmtree(root, ignore_errors=True)
-                    return None
-                self.pcl_artifacts[role.value] = ref
-                self.status_generation += 1
-            self.artifacts.prune(kind, session_id, 1)
-            return ref
-        except BaseException:
-            shutil.rmtree(root, ignore_errors=True)
-            raise
-
-    def _refresh_pcl_artifact(self, role, source_path=None):
-        role = PclRole(role)
-        try:
-            self._publish_pcl_artifact(role, source_path)
-        except Exception as exc:
-            self.events.append(
-                "log", f"{PCL_ROLE_LABELS[role.value].capitalize()} overlay "
-                f"could not be published: {type(exc).__name__}: {exc}",
-                severity="warning", source="service",
-                operation=f"publishing_{role.value}")
-
-    def _refresh_pcl_artifacts(self):
-        for role in EDITABLE_PCL_ROLES:
-            self._refresh_pcl_artifact(role)
 
     def _status_changed(self, status):
         # Runs on the fitter thread. It may only claim immutable raw work;
@@ -1501,17 +1381,68 @@ class ServiceState:
         except Exception as exc:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
+        try:
+            self._note_input_manifest(status)
+        except Exception as exc:
+            print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
         with self.lock:
-            applied_manifest = status.get("input_manifest")
-            if (self.session_paths is not None
-                    and isinstance(applied_manifest, dict)
-                    and applied_manifest != self.session_paths.manifest()):
-                self.session_paths = SpiralInputPaths.from_mapping(
-                    applied_manifest)
-                if self.session_request is not None:
-                    self.session_request["paths"] = \
-                        self.session_paths.manifest()
             self.status_generation += 1
+
+    def _note_input_manifest(self, status):
+        """Publish the session's input manifest once its inputs are frozen.
+
+        Runs on the fitter thread: it claims the digest and leaves copying
+        and hashing to a background thread.
+        """
+        digest = status.get("input_digest")
+        path = status.get("input_manifest_path")
+        if not digest or not path:
+            return
+        with self.lock:
+            if self.session_id is None or (
+                    self._input_manifest and self._input_manifest[0] == digest):
+                return
+            self._input_manifest = (digest, None)
+            session_id = self.session_id
+            generation = self.session_generation
+            output = self._output_root()
+        threading.Thread(
+            target=self._publish_input_manifest,
+            args=(session_id, generation, digest, Path(path), output),
+            name="spiral-input-manifest-publish", daemon=True).start()
+
+    def _publish_input_manifest(self, session_id, generation, digest, source,
+                                output):
+        root = (Path(output) / ".spiral-artifacts" /
+                f"inputs-{digest[:12]}-{secrets.token_hex(6)}")
+        try:
+            root.mkdir(parents=True)
+            shutil.copy2(source, root / INPUT_MANIFEST_FILE_NAME)
+            ref = self.artifacts.register_directory(
+                INPUT_MANIFEST_ARTIFACT_KIND, session_id, generation, root,
+                INPUT_MANIFEST_FILE_NAME, delete_root_on_prune=True)
+            ref["input_digest"] = digest
+        except Exception as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            self.events.append(
+                "log", f"The input manifest could not be published: "
+                f"{type(exc).__name__}: {exc}", severity="warning",
+                source="service", operation="loading_inputs")
+            return
+        with self.lock:
+            current = (self.session_id == session_id and self._input_manifest
+                       and self._input_manifest[0] == digest)
+            if current:
+                self._input_manifest = (digest, ref)
+                self.status_generation += 1
+        if not current:
+            # The session was replaced meanwhile: withdraw only this copy.
+            self.artifacts.prune(
+                INPUT_MANIFEST_ARTIFACT_KIND, session_id, 0,
+                retain=lambda artifact: Path(artifact.root) != root)
+            return
+        self.artifacts.prune(INPUT_MANIFEST_ARTIFACT_KIND, session_id, 1)
 
     def _session_event(self, rank, status):
         """Derive structured event records from one rank's status snapshot.
@@ -1666,6 +1597,7 @@ class ServiceState:
                         "Indexing preview files")
             model_state = (published.raw_manifest or {}).get(
                 "model_state_sha256")
+            input_digest = (published.raw_manifest or {}).get("input_digest")
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
@@ -1684,7 +1616,8 @@ class ServiceState:
                         model_state,
                         manifest_path=published.manifest_path,
                         session_id=session_id, generation=preview_generation,
-                        source_fit_iteration=published.source_fit_iteration)
+                        source_fit_iteration=published.source_fit_iteration,
+                        input_digest=input_digest)
                 except Exception as exc:
                     self.events.append(
                         "log", "Could not index the published preview by "
@@ -1824,11 +1757,13 @@ class ServiceState:
         threading.Thread(
             target=self._restore_published_preview,
             args=(session_id, path, digest, shown,
-                  state.get("completed_iterations")),
+                  state.get("completed_iterations"),
+                  status.get("input_digest")),
             name="spiral-preview-restore", daemon=True).start()
 
     def _restore_published_preview(self, session_id, checkpoint_path, digest,
-                                   shown_digest, completed_iterations):
+                                   shown_digest, completed_iterations,
+                                   input_digest=None):
         preview_index = self._published_preview_index()
         if preview_index is None:
             return
@@ -1837,7 +1772,10 @@ class ServiceState:
             if shown_digest == digest:
                 # The surface on display already is this model state.
                 return
-            entry = preview_index.lookup(digest)
+            # Only a surface published from these same inputs: one fitted to
+            # other inputs is not this session's preview, however equal the
+            # model state.
+            entry = preview_index.lookup(digest, input_digest=input_digest)
             if entry is None:
                 return
             manifest_path = Path(str(entry["manifest_path"]))
@@ -2542,22 +2480,6 @@ class ServiceState:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         return digest.hexdigest()
-
-    def _pcl_source_editable(self, role, source):
-        role = PclRole(role)
-        with self.lock:
-            paths = self.session_paths
-        if paths is None:
-            return False
-        configured = (Path(paths.dataset_root) /
-                      PCL_ROLE_FILES[role.value])
-        try:
-            return (Path(source).resolve() == configured.resolve()
-                    and Path(source).is_file()
-                    and os.access(source, os.R_OK | os.W_OK)
-                    and os.access(Path(source).parent, os.W_OK))
-        except OSError:
-            return False
 
     def _active_checkpoint(self):
         with self.lock:

@@ -24,7 +24,7 @@ from typing import Any, ClassVar, Mapping
 import uuid
 
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_INTERVAL_ITERATIONS,
-                         ScrollSpec, SessionState,
+                         STORE_INPUT_KEYS, ScrollSpec, SessionState,
                          SpiralInputPaths, SpiralPreviewConfig,
                          SpiralRunConfig, run_mutable_config,
                          write_autosave_metadata)
@@ -312,6 +312,15 @@ class RendezvousEndpoint:
     """The picklable half of a rendezvous: where the ranks meet."""
 
     store_path: str
+
+
+def external_input_manifest(paths):
+    """The session's inputs read outside the object store, by path: the
+    umbilicus, shell, lasagna and track stores, fiber directions, winding
+    inference, the resumed checkpoint and the output roots. Patches, PCLs
+    and fibers are identified by the object-store digest instead."""
+    return {key: value for key, value in paths.manifest().items()
+            if key not in STORE_INPUT_KEYS}
 
 
 class InputsFrozenError(RuntimeError):
@@ -619,7 +628,13 @@ class InteractiveFitSession:
         self.run_config = run
         self.scroll = scroll
         self.preview_config = preview
-        self.input_manifest = paths.manifest()
+        self.input_manifest = external_input_manifest(paths)
+        # Identity of the frozen object-store inputs once they are loaded:
+        # their digest, the manifest file the run directory records (rank
+        # zero) and a summary small enough for every status snapshot.
+        self._input_digest = None
+        self._input_manifest_path = None
+        self._input_summary = None
         self.requested_config = dict(run.config)
         self._applied_config = None
         self._run_config = None
@@ -741,6 +756,9 @@ class InteractiveFitSession:
                     getattr(self, "_checkpoint_state", None)),
                 "supports_input_incorporation": self._context is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
+                "input_digest": getattr(self, "_input_digest", None),
+                "input_manifest_path": getattr(self, "_input_manifest_path", None),
+                "input_summary": copy.deepcopy(getattr(self, "_input_summary", None)),
                 "progress": self._progress_reporter().snapshot(),
             }
             if self._run_config is not None:
@@ -1066,10 +1084,19 @@ class InteractiveFitSession:
         inspecting a checkpoint should not require it. A client that wants to
         see the restored model asks for one.
         """
+        inputs = getattr(context, "object_store_inputs", None)
+        manifest_path = Path(context.out_path) / "object_store_inputs.json"
         with self._condition:
             self._context = context
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
+            if inputs is not None and inputs.manifest is not None:
+                from object_store_inputs import input_summary
+                self._input_digest = inputs.digest
+                self._input_summary = input_summary(inputs)
+                self.input_manifest["object_store_digest"] = inputs.digest
+                if manifest_path.is_file():
+                    self._input_manifest_path = str(manifest_path)
         self._record_checkpoint_state(
             getattr(context, "resume_path", None), context.start_iteration)
         self._progress_reporter().clear()
@@ -1672,12 +1699,6 @@ class InteractiveFitSession:
                     self._run_config.update(config)
                     self.requested_config.update(config)
                     self.input_manifest.update(path_changes)
-                    # A role toggle loads or drops point-collection
-                    # documents; the manifest names what is resident.
-                    context_paths = getattr(self._context, 'paths', None)
-                    if context_paths is not None and 'pcls' in self.input_manifest:
-                        self.input_manifest['pcls'] = \
-                            context_paths.manifest()['pcls']
                     # A crossing-ceiling change re-prepared the track pool
                     # with the new ceiling; advertise it.
                     self._run_config_limits = self._run_config_limits_for(
@@ -1820,7 +1841,9 @@ class InteractiveFitSession:
         self._record_checkpoint_state(
             paths.checkpoint or None, context.start_iteration)
         with self._condition:
-            self.input_manifest = paths.manifest()
+            self.input_manifest = {
+                **external_input_manifest(paths),
+                "object_store_digest": self._input_digest}
             self._completed = self._target = context.start_iteration
             self._pending = 0
             self._config_revision += 1
@@ -1938,7 +1961,8 @@ class InteractiveFitSession:
             session_namespace=self.paths.output_directory,
             dataset_root=self.paths.dataset_root,
             completed_iterations=self._completed,
-            model_state_sha256=(checkpoint_state or {}).get("model_state_sha256"))
+            model_state_sha256=(checkpoint_state or {}).get("model_state_sha256"),
+            input_digest=getattr(self, "_input_digest", None))
         return autosave
 
     def _publish_preview(self, diagnostics=False):

@@ -117,6 +117,48 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
         assert json.load(stream)['digest'] == inputs.digest
 
 
+def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
+    from fit_session import read_autosave_metadata
+    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    status = settle(state)
+    inputs = state.session._context.object_store_inputs
+    assert status['input_digest'] == inputs.digest
+    summary = status['input_summary']
+    assert summary['digest'] == inputs.digest
+    assert summary['selection'] == {'surface': 2, 'point_collection': 1, 'fiber': 0}
+    assert summary['relationships'] == {'pcl_patch': 3}
+    # The status lists the inputs read by path, and the store's by digest.
+    manifest = status['input_manifest']
+    assert manifest['object_store_digest'] == inputs.digest
+    assert not {'verified_patches', 'fibers', 'pcls'} & set(manifest)
+    assert manifest['umbilicus'].endswith('umbilicus.json')
+    assert not {'same_winding_artifact', 'relative_winding_artifact'} & set(status)
+    # The whole manifest is an immutable artifact.
+    deadline = time.monotonic() + 30
+    while state.status()['input_manifest_artifact'] is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    artifact = state.status()['input_manifest_artifact']
+    assert artifact['input_digest'] == inputs.digest
+    _, path, _ = state.artifacts.acquire_file(artifact['id'], 'object_store_inputs.json')
+    with open(path) as stream:
+        published = json.load(stream)
+    assert published == {'digest': inputs.digest,
+                         'manifest': json.loads(json.dumps(inputs.manifest))}
+    # Autosaves name the inputs they were fitted to. (The stubbed device
+    # stages leave no model to save, so the archive itself is a stand-in.)
+    session = state.session
+
+    def save_checkpoint(path, completed):
+        Path(path).write_bytes(b'PK\x03\x04')
+        return path
+    session._context.save_checkpoint = save_checkpoint
+    autosave = Path(session._write_autosave())
+    metadata = json.loads(autosave.with_name('checkpoint_autosave.json').read_text())
+    assert metadata['input_digest'] == inputs.digest
+    assert read_autosave_metadata(autosave.with_name('checkpoint_autosave.json'))
+
+
 def test_a_model_rebuild_keeps_the_frozen_inputs(state, store_path, device_stubs):
     state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
     settle(state)

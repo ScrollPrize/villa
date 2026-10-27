@@ -123,7 +123,12 @@ from surface_orientation import spiral_outward_sense_for
 # checkpoints. /dataset no longer resolves patch, fiber or PCL files
 # (pcl_inputs is gone); it advertises the store binding (object_store: uuid,
 # path, author), the launch configuration's selection from it (inputs) and
-# the service's capabilities.
+# the service's capabilities. Status carries input_digest and input_summary
+# of the frozen inputs, input_manifest lists only the inputs read by path,
+# and the full object-store manifest is the input_manifest_artifact; the
+# PCL display artifacts (same_winding_artifact, relative_winding_artifact)
+# are gone. Previews, autosave metadata and the preview index record the
+# input digest, and a published preview is re-shown only for the same inputs.
 API_VERSION = 36
 
 
@@ -980,6 +985,7 @@ def write_autosave_metadata(
     dataset_root: str | Path,
     completed_iterations: int,
     model_state_sha256: str | None = None,
+    input_digest: str | None = None,
 ) -> str:
     """Record what an autosave is, next to it, atomically.
 
@@ -1005,6 +1011,10 @@ def write_autosave_metadata(
         # The surface identity the checkpoint payload carries, readable
         # without loading the archive.
         document["model_state_sha256"] = str(model_state_sha256)
+    if input_digest:
+        # The object-store inputs it was fitted to (the checkpoint's
+        # input_manifest.object_store_digest), likewise.
+        document["input_digest"] = str(input_digest)
     temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(document, stream, indent=2)

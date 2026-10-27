@@ -227,6 +227,21 @@ class PublishedPreviewIndexTests(unittest.TestCase):
             document = json.loads(index.path.read_text())
             self.assertEqual(document["previews"], {})
 
+    def test_lookup_matches_the_inputs_a_surface_was_fitted_to(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            index = PublishedPreviewIndex(base)
+            manifest = self._generation(base, "gen-1", DIGEST)
+            index.record(DIGEST, manifest_path=manifest, session_id="s",
+                         generation=1, input_digest="inputs-a")
+            self.assertEqual(
+                index.lookup(DIGEST, input_digest="inputs-a")["input_digest"],
+                "inputs-a")
+            # The same model state fitted to other inputs, or a lookup that
+            # names none, is not this preview.
+            self.assertIsNone(index.lookup(DIGEST, input_digest="inputs-b"))
+            self.assertIsNone(index.lookup(DIGEST))
+
     def test_pins_follow_their_checkpoint_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -359,6 +374,43 @@ class ServiceRestoreTests(unittest.TestCase):
             self.assertTrue(any(
                 "Preview restored" in str(record.get("text", ""))
                 for record in records), records)
+
+    def test_a_surface_fitted_to_other_inputs_is_not_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            state = self._state(output)
+            published = self._published(output, 1, DIGEST)
+            published.raw_manifest["input_digest"] = "inputs-a"
+            raw = output / "raw" / "g1"
+            raw.mkdir(parents=True)
+            (raw / "manifest.json").write_text("{}")
+            with mock.patch.object(state, "_publish_flattened_preview",
+                                   return_value=(mock.Mock(), published)):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(raw / "manifest.json")})
+                self.assertTrue(_wait(
+                    lambda: state._preview.completed_generation >= 1))
+            self.assertEqual(PublishedPreviewIndex(output).lookup(
+                DIGEST, input_digest="inputs-a")["manifest_path"],
+                str(published.manifest_path))
+            state._preview.artifact = None
+            state._preview.model_state_sha256 = None
+            checkpoint = output / "resumed.ckpt"
+            checkpoint.write_bytes(b"PK\x03\x04checkpoint")
+            state._status_changed({
+                "input_digest": "inputs-b",
+                "checkpoint_state": {"path": str(checkpoint),
+                                     "model_state_sha256": DIGEST,
+                                     "completed_iterations": 40}})
+            # The restore thread pinned the checkpoint's surface, then found
+            # no preview of these inputs to show.
+            self.assertTrue(_wait(
+                lambda: PublishedPreviewIndex(output).pinned_roots()
+                == {published.manifest_path.parent.resolve()}))
+            time.sleep(0.1)
+            self.assertIsNone(state._preview.artifact)
+            self.assertIsNone(state._preview.model_state_sha256)
 
     def test_a_surface_from_an_earlier_service_is_registered_afresh(self):
         with tempfile.TemporaryDirectory() as temporary:

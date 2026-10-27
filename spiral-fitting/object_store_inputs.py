@@ -1599,6 +1599,25 @@ def _geometry_identity(manifest):
     return manifest
 
 
+def input_summary(inputs):
+    """A small description of materialized inputs for a status poll: their
+    identity (digest, store, fit volume) and counts. The manifest holds the
+    per-object detail."""
+    manifest = inputs.manifest
+    return {
+        'digest': inputs.digest,
+        'store_uuid': manifest['store']['uuid'],
+        'volume_uuid': manifest['volume_uuid'],
+        'selection': {kind: entry['count']
+                      for kind, entry in manifest['selection'].items()},
+        'relationships': dict(sorted(Counter(
+            rel['family'] for rel in manifest['relationships']).items())),
+        'excluded_relationships': manifest['excluded_relationships'],
+        'constraints': dict(sorted(inputs.counts.items())),
+        'link_refresh': manifest['link_refresh']['enabled'],
+    }
+
+
 def manifest_digest(manifest):
     text = json.dumps(_compared(manifest), sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(text.encode()).hexdigest()

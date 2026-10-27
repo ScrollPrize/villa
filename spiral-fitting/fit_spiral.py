@@ -3151,9 +3151,12 @@ class FitContext:
                 patch_satisfaction_evaluation=splice_evaluation,
             )
             # The same identity the checkpoint written at this boundary
-            # carries, so the host can pair the two later.
+            # carries, so the host can pair the two later, and the inputs it
+            # was fitted to.
             manifest = dict(manifest)
             manifest['model_state_sha256'] = self.model_state_digest()
+            inputs = getattr(self, 'object_store_inputs', None)
+            manifest['input_digest'] = inputs.digest if inputs is not None else None
             if not diagnostics:
                 return manifest
             diagnostic_weights = {
