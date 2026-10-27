@@ -91,30 +91,6 @@ std::vector<SurfacePatchIndex::SurfacePtr> surfaces = { surf1, surf2, surf3 };
 index.rebuild(surfaces, 2.0f);  // 2 voxel padding on bounding boxes
 ```
 
-### Cache Files
-
-Indexes can be saved and reloaded when the source surfaces, sampling stride, and padding match a cache key.
-
-| Method | Description |
-|--------|-------------|
-| `cacheKeyForSurfaces(surfaces, samplingStride, bboxPadding)` | Build the expected cache key for a surface set and index settings |
-| `loadCache(cachePath, surfaces, expectedKey)` | Load a previously saved index; returns `false` if the file/key/surface set is incompatible |
-| `saveCache(cachePath, cacheKey)` | Save the current index to disk |
-
-```cpp
-const int stride = 1;
-const float padding = 2.0f;
-SurfacePatchIndex index;
-index.setSamplingStride(stride);
-
-const std::string key =
-    SurfacePatchIndex::cacheKeyForSurfaces(surfaces, stride, padding);
-if (!index.loadCache(cachePath, surfaces, key)) {
-    index.rebuild(surfaces, padding);
-    index.saveCache(cachePath, key);
-}
-```
-
 ### Point Location
 
 | Method | Description |
