@@ -1815,21 +1815,6 @@
         "type": "object"
       }
     },
-    "seeding.cast_rays": {
-      "errors": [
-        -32000,
-        -32001,
-        -32007,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_seeding_cast_rays"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
     "seeding.expand": {
       "errors": [
         -32000,
@@ -1845,21 +1830,6 @@
           "wait"
         ],
         "tool": "vc3d_seeding_expand"
-      },
-      "params": {
-        "properties": {},
-        "type": "object"
-      }
-    },
-    "seeding.preview_rays": {
-      "errors": [
-        -32000,
-        -32001,
-        -32007,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_seeding_preview_rays"
       },
       "params": {
         "properties": {},

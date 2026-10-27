@@ -357,8 +357,8 @@ and never open file pickers.
 
 ### Seeding, rendering, flattening, and mesh operations
 
-- Seeding run and expand share one `seeding` source. Preview, cast, reset, and
-  path analysis are synchronous requests over the existing widget state.
+- Seeding run and expand share one `seeding` source. Reset and path analysis
+  are synchronous requests over the existing widget state.
 - `render.tifxyz`, trace, reoptimize, and alpha-composition refinement use the
   shared `tool` source.
 - SLIM and straighten share the `flatten` source and application
@@ -480,9 +480,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
 | `vc3d_seeding_cancel` | `seeding.cancel` |
-| `vc3d_seeding_cast_rays` | `seeding.cast_rays` |
 | `vc3d_seeding_expand` | `seeding.expand` |
-| `vc3d_seeding_preview_rays` | `seeding.preview_rays` |
 | `vc3d_seeding_reset_points` | `seeding.reset_points` |
 | `vc3d_seeding_run` | `seeding.run` |
 | `vc3d_seeding_set_winding_annotation_mode` | `seeding.set_winding_annotation_mode` |

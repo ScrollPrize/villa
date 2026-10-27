@@ -440,15 +440,6 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                  r.get("active") is True, json.dumps(r))
     call_checked("seeding.set_winding_annotation_mode(false)",
                  "seeding.set_winding_annotation_mode", {"active": False})
-    # preview_rays / cast_rays are fire-and-forget; with no focus POI the
-    # precondition dialog is suppressed and the call returns cleanly (proving
-    # that no dialog is opened.
-    r = call_checked("seeding.preview_rays (no focus POI -> clean, no dialog)",
-                     "seeding.preview_rays", {})
-    if r is not None:
-        rec.step("seeding.preview_rays returns requested=true",
-                 r.get("requested") is True, json.dumps(r))
-    call_checked("seeding.cast_rays (async, no hang)", "seeding.cast_rays", {})
     r = call_checked("seeding.reset_points", "seeding.reset_points", {})
     if r is not None:
         rec.step("seeding.reset_points returns reset=true",

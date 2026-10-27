@@ -14,7 +14,6 @@
 #include "ToolProcess.hpp"
 #include <QPointer>
 #include <QToolButton>
-#include <QFutureWatcher>
 #include <QSet>
 #include <QHash>
 #include <QStringList>
@@ -56,8 +55,6 @@ public:
     void setSurfaceCatalog(SurfaceCatalog* catalog);
 
     // Dialog-free operation entry points.
-    bool previewRaysHeadless(QString* errorMessage = nullptr);
-    bool castRaysHeadless(QString* errorMessage = nullptr);
     void runResetPoints() { onResetPointsClicked(); }
 
     // Non-blocking batch entry points shared by the UI and automation. They
@@ -65,7 +62,7 @@ public:
     // signals below. A true return means at least one child was launched.
     bool runSegmentationHeadless(QString* errorMessage);
     bool runExpandSeedsHeadless(QString* errorMessage);
-    // Synchronous path-intensity analysis in Draw mode.
+    // Synchronous path-intensity analysis of the drawn paths.
     bool runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed = nullptr,
                                  int* peaksFound = nullptr);
     // Cancels the active run/expand batch. Each child is asked to terminate,
@@ -101,10 +98,7 @@ public slots:
     void setRelWindingPatchTolerance(double tolerance);
     
 private slots:
-    void onPreviewRaysClicked();
-    void onClearPreviewClicked();
-    void onCastRaysClicked();
-    void onCastRaysFinished();
+    void onAnalyzePathsClicked();
     void onClearPeaksClicked();
     void onRunSegmentationClicked();
     void onExpandSeedsClicked();
@@ -112,15 +106,9 @@ private slots:
     void onCancelClicked();
     
 private:
-    // Mode enum
-    enum class Mode {
-        PointMode,
-        DrawMode
-    };
-    
     void setupUI();
+    void setDrawEnabled(bool enabled);
     void computeDistanceTransform();
-    void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();
     void findPeaksAlongPath(const ViewerOverlayControllerBase::PathPrimitive& path);
@@ -146,7 +134,6 @@ private:
     int findPatchIntersectionsAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
     QColor generatePathColor();
     void displayPaths();
-    void updatePointsDisplay();
     void updateButtonStates();
     
 private:
@@ -154,25 +141,15 @@ private:
     // UI elements
     QLabel* infoLabel;
     QComboBox* collectionComboBox;
-    QDoubleSpinBox* angleStepSpinBox;
+    QPushButton* drawPathsButton;
     QSpinBox* processesSpinBox;
     QSpinBox* ompThreadsSpinBox;
     QSpinBox* thresholdSpinBox;  // Intensity threshold for peak detection
-    QSpinBox* windowSizeSpinBox; // Window size for peak detection
-    QSpinBox* maxRadiusSpinBox;  // Max radius for ray casting
     QSpinBox* expansionIterationsSpinBox; // Number of expansion iterations
-    
-    // Layout and label references for hiding/showing
-    QHBoxLayout* maxRadiusLayout;
-    QLabel* maxRadiusLabel;
-    QHBoxLayout* angleStepLayout;
-    QLabel* angleStepLabel;
-    
+
     QString executablePath;
     
-    QPushButton* previewRaysButton;
-    QPushButton* clearPreviewButton;
-    QPushButton* castRaysButton;
+    QPushButton* analyzePathsButton;
     QPushButton* clearPeaksButton;
     QPushButton* runSegmentationButton;
     QPushButton* expandSeedsButton;
@@ -193,13 +170,13 @@ private:
     VCCollection* _point_collection;
     cv::Mat distanceTransform;
     
-    // Drawing mode data
-    Mode currentMode;
+    // Drawing data: while drawing is on, a left-drag in a viewer draws a path.
+    bool _drawEnabled{false};
     QList<ViewerOverlayControllerBase::PathPrimitive> paths;  
     bool isDrawing;
     ViewerOverlayControllerBase::PathPrimitive currentPath;
     int colorIndex;
-    bool labelWrapsMode = false; // special mode built on DrawMode
+    bool labelWrapsMode = false; // special mode built on drawing; forces it on
     RelWindingIntersectionSource _relWindingIntersectionSource{RelWindingIntersectionSource::CurrentVolume};
     double _relWindingPatchTolerance{1.0};
     
@@ -222,10 +199,4 @@ private:
     SurfaceCatalog::ToolStore _batchStore;  // the children's store contract (new surfaces are tagged "paths")
     std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)
     QString _batchWorkingDir;
-
-    // Async cast rays
-    QFutureWatcher<void>* _castRaysWatcher{nullptr};
-    std::vector<cv::Vec3f> _castRaysPeaks;  // Collected by background thread
-    bool _castRaysWasPointMode{true};  // Track which mode triggered the cast
-
 };

@@ -134,56 +134,6 @@ QJsonObject AgentBridgeServer::handleSeedingSetWindingAnnotationMode(const QJson
 }
 
 
-QJsonObject AgentBridgeServer::handleSeedingPreviewRays(const QJsonValue&)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
-    if (!widget) {
-        QJsonObject data;
-        data["detail"] = "seeding widget is not available";
-        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
-    }
-    QString errorMessage;
-    if (!widget->previewRaysHeadless(&errorMessage)) {
-        QJsonObject data;
-        data["detail"] = errorMessage;
-        throw AgentBridgeError{-32007, "Cannot preview rays", data};
-    }
-    QJsonObject result;
-    result["requested"] = true;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleSeedingCastRays(const QJsonValue&)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
-    if (!widget) {
-        QJsonObject data;
-        data["detail"] = "seeding widget is not available";
-        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
-    }
-    QString errorMessage;
-    if (!widget->castRaysHeadless(&errorMessage)) {
-        QJsonObject data;
-        data["detail"] = errorMessage;
-        throw AgentBridgeError{-32007, "Cannot cast rays", data};
-    }
-    QJsonObject result;
-    result["requested"] = true;
-    return result;
-}
-
-
 QJsonObject AgentBridgeServer::handleSeedingResetPoints(const QJsonValue&)
 {
     CState* state = _window ? _window->_state : nullptr;
@@ -321,7 +271,7 @@ QJsonObject AgentBridgeServer::handleSeedingAnalyzePaths(const QJsonValue&)
     }
     // Synchronous, in-process compute (no QProcess, no nested event loop): runs
     // to completion before returning, so this is a plain synchronous RPC rather
-    // than a job. Requires paths drawn in the widget's Draw mode.
+    // than a job. Requires paths drawn in the widget.
     QString err;
     int pathsAnalyzed = 0;
     int peaksFound = 0;

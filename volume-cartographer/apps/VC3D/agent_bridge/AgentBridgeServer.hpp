@@ -234,8 +234,6 @@ private:
     // Tags, seeding, push/pull, and tracing.
     QJsonObject handleTagsSet(const QJsonValue& params);
     QJsonObject handleSeedingSetWindingAnnotationMode(const QJsonValue& params);
-    QJsonObject handleSeedingPreviewRays(const QJsonValue& params);
-    QJsonObject handleSeedingCastRays(const QJsonValue& params);
     QJsonObject handleSeedingResetPoints(const QJsonValue& params);
     // Batch seeding: run/expand spawn vc_grow_seg_from_seed child processes and
     // resolve through the seedingBatch* signals as source:"seeding" jobs.

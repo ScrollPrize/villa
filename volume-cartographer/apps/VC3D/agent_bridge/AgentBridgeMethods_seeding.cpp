@@ -85,22 +85,6 @@ void AgentBridgeServer::registerSeedingHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("seeding.preview_rays"),
-            .errors = {-32000, -32001, -32007, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_preview_rays")),
-        },
-        [this](const QJsonValue& p) { return handleSeedingPreviewRays(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("seeding.cast_rays"),
-            .errors = {-32000, -32001, -32007, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_cast_rays")),
-        },
-        [this](const QJsonValue& p) { return handleSeedingCastRays(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("seeding.reset_points"),
             .errors = {-32000, -32001, -32010},
             .mcp = Mcp::exact(QStringLiteral("vc3d_seeding_reset_points")),

@@ -17,7 +17,6 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
-#include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
 
@@ -244,7 +243,6 @@ SegmentTriangleHit closestSegmentTriangleHit(const cv::Vec3f& p0,
 SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent)
     : QWidget(parent)
     , currentZSlice(0)
-    , currentMode(Mode::PointMode)
     , isDrawing(false)
     , colorIndex(0)
     , jobsRunning(false)
@@ -255,10 +253,6 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWid
     qRegisterMetaType<PathPrimitive>("PathPrimitive");
     qRegisterMetaType<QList<PathPrimitive>>("QList<PathPrimitive>");
     setupUI();
-
-    _castRaysWatcher = new QFutureWatcher<void>(this);
-    connect(_castRaysWatcher, &QFutureWatcher<void>::finished,
-            this, &SeedingWidget::onCastRaysFinished);
 
     if (_point_collection) {
         connect(_point_collection, &VCCollection::collectionsAdded, this, &SeedingWidget::onCollectionsAdded);
@@ -284,13 +278,14 @@ void SeedingWidget::setupUI()
     auto mainLayout = new QVBoxLayout(this);
     
     // Info label
-    infoLabel = new QLabel("Set a focus point to begin", this);
+    infoLabel = new QLabel("Turn on 'Draw paths' to draw paths in a viewer", this);
     mainLayout->addWidget(infoLabel);
     
-    // Mode toggle button
-    auto modeButton = new QPushButton("Switch to Draw Mode", this);
-    modeButton->setToolTip("Toggle between point mode and draw mode");
-    mainLayout->addWidget(modeButton);
+    // Drawing toggle
+    drawPathsButton = new QPushButton("Draw paths", this);
+    drawPathsButton->setCheckable(true);
+    drawPathsButton->setToolTip("While on, left-drag in a viewer to draw a path");
+    mainLayout->addWidget(drawPathsButton);
     
     // Collection selector
     auto collectionLayout = new QHBoxLayout();
@@ -298,29 +293,6 @@ void SeedingWidget::setupUI()
     collectionComboBox = new QComboBox(this);
     collectionLayout->addWidget(collectionComboBox);
     mainLayout->addLayout(collectionLayout);
-    
-    // Max radius control
-    maxRadiusLayout = new QHBoxLayout();
-    maxRadiusLabel = new QLabel("Max Radius (pixels):", this);
-    maxRadiusLayout->addWidget(maxRadiusLabel);
-    maxRadiusSpinBox = new QSpinBox(this);
-    maxRadiusSpinBox->setRange(50, 20000);
-    maxRadiusSpinBox->setValue(1500);
-    maxRadiusSpinBox->setSingleStep(250);
-    maxRadiusSpinBox->setToolTip("Maximum distance from center point for ray casting");
-    maxRadiusLayout->addWidget(maxRadiusSpinBox);
-    mainLayout->addLayout(maxRadiusLayout);
-    
-    // Angle step control
-    angleStepLayout = new QHBoxLayout();
-    angleStepLabel = new QLabel("Angle Step (degrees):", this);
-    angleStepLayout->addWidget(angleStepLabel);
-    angleStepSpinBox = new QDoubleSpinBox(this);
-    angleStepSpinBox->setRange(1.0, 180.0);
-    angleStepSpinBox->setValue(15.0);
-    angleStepSpinBox->setSingleStep(1.0);
-    angleStepLayout->addWidget(angleStepSpinBox);
-    mainLayout->addLayout(angleStepLayout);
     
     // Processes control
     auto processesLayout = new QHBoxLayout();
@@ -351,16 +323,6 @@ void SeedingWidget::setupUI()
     thresholdLayout->addWidget(thresholdSpinBox);
     mainLayout->addLayout(thresholdLayout);
     
-    // Window size control for peak detection
-    auto windowSizeLayout = new QHBoxLayout();
-    windowSizeLayout->addWidget(new QLabel("Peak Detection Window:", this));
-    windowSizeSpinBox = new QSpinBox(this);
-    windowSizeSpinBox->setRange(1, 10);
-    windowSizeSpinBox->setValue(7);  // Default window size
-    windowSizeSpinBox->setToolTip("Size of window for local maxima detection (larger values detect broader peaks)");
-    windowSizeLayout->addWidget(windowSizeSpinBox);
-    mainLayout->addLayout(windowSizeLayout);
-    
     // Expansion iterations control
     auto expansionLayout = new QHBoxLayout();
     expansionLayout->addWidget(new QLabel("Expansion Iterations:", this));
@@ -372,21 +334,14 @@ void SeedingWidget::setupUI()
     mainLayout->addLayout(expansionLayout);
     
     // Buttons
-    auto previewLayout = new QHBoxLayout();
-    previewRaysButton = new QPushButton("Show Preview Points", this);
-    previewRaysButton->setEnabled(true);
-    previewLayout->addWidget(previewRaysButton);
-    clearPreviewButton = new QPushButton("Clear", this);
-    previewLayout->addWidget(clearPreviewButton);
-    mainLayout->addLayout(previewLayout);
-
-    auto castLayout = new QHBoxLayout();
-    castRaysButton = new QPushButton("Cast Rays", this);
-    castRaysButton->setEnabled(false);
-    castLayout->addWidget(castRaysButton);
-    clearPeaksButton = new QPushButton("Clear", this);
-    castLayout->addWidget(clearPeaksButton);
-    mainLayout->addLayout(castLayout);
+    auto analyzeLayout = new QHBoxLayout();
+    analyzePathsButton = new QPushButton("Analyze Paths", this);
+    analyzePathsButton->setEnabled(false);
+    analyzePathsButton->setToolTip("Find intensity peaks along the drawn paths (into 'seeding_peaks')");
+    analyzeLayout->addWidget(analyzePathsButton);
+    clearPeaksButton = new QPushButton("Clear Peaks", this);
+    analyzeLayout->addWidget(clearPeaksButton);
+    mainLayout->addLayout(analyzeLayout);
     
     runSegmentationButton = new QPushButton("Run Seeding", this);
     runSegmentationButton->setEnabled(false);
@@ -420,37 +375,20 @@ void SeedingWidget::setupUI()
     progressUtil->configureProgressBar(progressDefaults);
     
     // Connect signals
-    connect(modeButton, &QPushButton::clicked, [this, modeButton]() {
-        if (currentMode == Mode::PointMode) {
-            currentMode = Mode::DrawMode;
-            modeButton->setText("Switch to Point Mode");
-            infoLabel->setText("Draw Mode: Click and drag to draw paths");
-        } else {
-            currentMode = Mode::PointMode;
-            modeButton->setText("Switch to Draw Mode");
-            infoLabel->setText("Point Mode: Set a focus point to begin");
-            // Turning off Draw Mode should also disable relative winding annotation.
-            if (labelWrapsMode) {
-                setRelWindingAnnotationMode(false);
-            }
+    connect(drawPathsButton, &QPushButton::toggled, this, [this](bool checked) {
+        setDrawEnabled(checked);
+        // Turning drawing off also ends relative winding annotation.
+        if (!checked && labelWrapsMode) {
+            setRelWindingAnnotationMode(false);
         }
-        updateModeUI();
-        displayPaths();
     });
-    connect(previewRaysButton, &QPushButton::clicked, this, &SeedingWidget::onPreviewRaysClicked);
-    connect(clearPreviewButton, &QPushButton::clicked, this, &SeedingWidget::onClearPreviewClicked);
-    connect(castRaysButton, &QPushButton::clicked, this, &SeedingWidget::onCastRaysClicked);
+    connect(analyzePathsButton, &QPushButton::clicked, this, &SeedingWidget::onAnalyzePathsClicked);
     connect(clearPeaksButton, &QPushButton::clicked, this, &SeedingWidget::onClearPeaksClicked);
     connect(runSegmentationButton, &QPushButton::clicked, this, &SeedingWidget::onRunSegmentationClicked);
     connect(expandSeedsButton, &QPushButton::clicked, this, &SeedingWidget::onExpandSeedsClicked);
     connect(resetPointsButton, &QPushButton::clicked, this, &SeedingWidget::onResetPointsClicked);
     connect(cancelButton, &QPushButton::clicked, this, &SeedingWidget::onCancelClicked);
-    // Connect parameter changes to preview update
-    connect(maxRadiusSpinBox, QOverload<int>::of(&QSpinBox::valueChanged), 
-            this, &SeedingWidget::updateParameterPreview);
-    connect(angleStepSpinBox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), 
-            this, &SeedingWidget::updateParameterPreview);
-    
+
     // Set size policy
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 }
@@ -509,13 +447,6 @@ void SeedingWidget::updateCurrentZSlice(int z)
     currentZSlice = z;
 }
 
-void SeedingWidget::onClearPreviewClicked()
-{
-    if (const auto id = _point_collection->getCollectionId("ray_preview"))
-        _point_collection->clearCollection(*id);
-    infoLabel->setText("Preview points cleared.");
-}
-
 void SeedingWidget::onClearPeaksClicked()
 {
     if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
@@ -523,332 +454,27 @@ void SeedingWidget::onClearPeaksClicked()
     infoLabel->setText("Peak points cleared.");
 }
 
-void SeedingWidget::onPreviewRaysClicked()
+void SeedingWidget::onAnalyzePathsClicked()
 {
     QString errorMessage;
-    if (!previewRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+    if (!runAnalyzePathsHeadless(&errorMessage) && !errorMessage.isEmpty()) {
         QMessageBox::warning(this, tr("Warning"), errorMessage);
     }
 }
 
-bool SeedingWidget::previewRaysHeadless(QString* errorMessage)
+void SeedingWidget::setDrawEnabled(bool enabled)
 {
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (currentMode != Mode::PointMode || !currentVolume) {
-        if (errorMessage) {
-            *errorMessage = tr("Ray preview requires Point mode and a loaded volume.");
-        }
-        return false;
+    _drawEnabled = enabled;
+    if (drawPathsButton->isChecked() != enabled) {
+        const QSignalBlocker blocker(drawPathsButton);
+        drawPathsButton->setChecked(enabled);
     }
-
-    POI* focus_poi = _state->poi("focus");
-    if (!focus_poi) {
-        if (errorMessage) {
-            *errorMessage = tr("No focus point set. Please set a focus point before previewing rays.");
-        }
-        return false;
+    if (!labelWrapsMode) {
+        infoLabel->setText(enabled ? QString("Drawing: %1 path(s); left-drag in a viewer to add one").arg(paths.size())
+                                   : QString("Turn on 'Draw paths' to draw paths in a viewer"));
     }
-
-    if (const auto id = _point_collection->getCollectionId("ray_preview"))
-        _point_collection->clearCollection(*id);
-
-    const double angleStep = angleStepSpinBox->value();
-    const int numSteps = static_cast<int>(360.0 / angleStep);
-    const int maxRadius = maxRadiusSpinBox->value();
-    const cv::Vec3f& startPoint = focus_poi->p;
-
-    std::vector<cv::Vec3f> preview_points;
-
-    const int pointsPerRay = 10;
-    for (int i = 0; i < numSteps; i++) {
-        const double angle = i * angleStep * M_PI / 180.0;
-        const cv::Vec2f rayDir(cos(angle), sin(angle));
-
-        for (int j = 1; j <= pointsPerRay; ++j) {
-            const float dist = (static_cast<float>(j) / pointsPerRay) * maxRadius;
-            cv::Vec3f pointOnRay;
-            pointOnRay[0] = startPoint[0] + dist * rayDir[0];
-            pointOnRay[1] = startPoint[1] + dist * rayDir[1];
-            pointOnRay[2] = startPoint[2];
-            preview_points.push_back(pointOnRay);
-        }
-    }
-
-    if (!preview_points.empty()) {
-        _point_collection->addPoints("ray_preview", preview_points);
-    }
-
-    infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
-    return true;
-}
-
-void SeedingWidget::onCastRaysClicked()
-{
-    QString errorMessage;
-    if (!castRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
-        QMessageBox::warning(this, tr("Warning"), errorMessage);
-    }
-}
-
-bool SeedingWidget::castRaysHeadless(QString* errorMessage)
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (!currentVolume) {
-        if (errorMessage) {
-            *errorMessage = tr("No volume loaded.");
-        }
-        return false;
-    }
-
-    _castRaysWasPointMode = (currentMode == Mode::PointMode);
-
-    if (_castRaysWasPointMode) {
-        POI* focusPoi = _state ? _state->poi("focus") : nullptr;
-        if (!focusPoi) {
-            if (errorMessage) {
-                *errorMessage = tr("No focus point set. Please set a focus point before casting rays.");
-            }
-            return false;
-        }
-    } else {
-        if (paths.empty()) {
-            if (errorMessage) {
-                *errorMessage = tr("Draw at least one path before casting rays.");
-            }
-            return false;
-        }
-    }
-
-    // Reset previous peaks
-    if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
-        _point_collection->clearCollection(*id);
-
-    // Capture all UI parameters before going to background
-    const double angleStep = angleStepSpinBox->value();
-    const int maxRadius = maxRadiusSpinBox->value();
-    const int threshold = thresholdSpinBox->value();
-    const int zSlice = currentZSlice;
-    const cv::Vec3f startPoint = _castRaysWasPointMode
-        ? _state->poi("focus")->p : cv::Vec3f(0, 0, 0);
-    const QList<PathPrimitive> pathsCopy = paths;  // snapshot for draw mode
-
-    // Disable button, show status
-    castRaysButton->setEnabled(false);
-    infoLabel->setText("Computing rays...");
-    emit sendStatusMessageAvailable("Computing rays...", 0);
-
-    // Clear previous results
-    _castRaysPeaks.clear();
-
-    // Launch background computation
-    auto future = QtConcurrent::run(
-        [this, currentVolume, angleStep, maxRadius, threshold,
-         zSlice, startPoint, pathsCopy]() {
-
-        // --- Compute distance transform ---
-        const int width = currentVolume->sliceWidth();
-        const int height = currentVolume->sliceHeight();
-
-        cv::Mat_<uint8_t> sliceData(height, width);
-        cv::Mat_<cv::Vec3f> coords(height, width);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                coords(y, x) = cv::Vec3f(x, y, zSlice);
-            }
-        }
-        currentVolume->sample(sliceData, coords, vc::SampleParams{});
-
-        cv::Mat binaryImage;
-        cv::threshold(sliceData, binaryImage, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
-
-        cv::Mat dt;
-        cv::distanceTransform(binaryImage, dt, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
-
-        // --- Helper lambdas ---
-        auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
-            if (dt.empty()) return 0.0f;
-            int px = std::max(0, std::min(dt.cols - 1, int(std::round(p[0]))));
-            int py = std::max(0, std::min(dt.rows - 1, int(std::round(p[1]))));
-            return dt.at<float>(py, px);
-        };
-
-        auto collectSegmentPeaks = [&](const std::vector<float>& intensities,
-                                       const std::vector<cv::Vec3f>& positions,
-                                       std::vector<cv::Vec3f>& out) {
-            bool inside = false;
-            size_t seg_start = 0;
-
-            auto addCenterOfSegment = [&](size_t s, size_t e) {
-                if (e < s || s >= positions.size() || e >= positions.size()) return;
-
-                const float distEps = 1e-4f;
-                const float intensityEps = 1e-3f;
-
-                size_t center_idx = s + (e - s) / 2;
-                size_t best_idx = center_idx;
-                float best_dt = sampleDistAt(positions[best_idx]);
-                float best_intensity = intensities[best_idx];
-
-                for (size_t k = s; k <= e; ++k) {
-                    float dtVal = sampleDistAt(positions[k]);
-                    float intensity = intensities[k];
-
-                    bool betterDistance = dtVal > best_dt + distEps;
-                    bool similarDistance = std::fabs(dtVal - best_dt) <= distEps;
-                    bool betterIntensity = intensity > best_intensity + intensityEps;
-                    bool similarIntensity = std::fabs(intensity - best_intensity) <= intensityEps;
-
-                    if (betterDistance || (similarDistance && betterIntensity)) {
-                        best_idx = k;
-                        best_dt = dtVal;
-                        best_intensity = intensity;
-                        continue;
-                    }
-
-                    if (similarDistance && similarIntensity) {
-                        size_t currentOffset = (best_idx > center_idx) ? (best_idx - center_idx) : (center_idx - best_idx);
-                        size_t newOffset = (k > center_idx) ? (k - center_idx) : (center_idx - k);
-                        if (newOffset < currentOffset) {
-                            best_idx = k;
-                            best_dt = dtVal;
-                            best_intensity = intensity;
-                        }
-                    }
-                }
-
-                out.push_back(positions[best_idx]);
-            };
-
-            for (size_t i = 0; i < intensities.size(); ++i) {
-                bool curr_inside = intensities[i] >= threshold;
-                if (curr_inside && !inside) {
-                    inside = true;
-                    seg_start = i;
-                }
-                bool at_end = (i + 1 == intensities.size());
-                bool next_inside = at_end ? false : (intensities[i + 1] >= threshold);
-                if (inside && (!next_inside || at_end)) {
-                    size_t seg_end = i;
-                    addCenterOfSegment(seg_start, seg_end);
-                    inside = false;
-                }
-            }
-        };
-
-        // Get volume bounds
-        auto [vw, vh, vd] = currentVolume->shapeXyz();
-        float bx0 = 0, by0 = 0, bz0 = 0;
-        float bx1 = static_cast<float>(vw), by1 = static_cast<float>(vh), bz1 = static_cast<float>(vd);
-
-        if (_castRaysWasPointMode) {
-            // --- Point mode: cast rays ---
-            const int numSteps = static_cast<int>(360.0 / angleStep);
-
-            for (int i = 0; i < numSteps; i++) {
-                const double angle = i * angleStep * M_PI / 180.0;
-                const cv::Vec2f rayDir(cos(angle), sin(angle));
-
-                std::vector<float> intensities;
-                std::vector<cv::Vec3f> positions;
-
-                for (int dist = 1; dist < maxRadius; dist++) {
-                    cv::Vec3f point;
-                    point[0] = startPoint[0] + dist * rayDir[0];
-                    point[1] = startPoint[1] + dist * rayDir[1];
-                    point[2] = startPoint[2];
-
-                    if (point[0] < bx0 || point[0] >= bx1 ||
-                        point[1] < by0 || point[1] >= by1 ||
-                        point[2] < bz0 || point[2] >= bz1) {
-                        break;
-                    }
-
-                    cv::Mat_<cv::Vec3f> coord(1, 1);
-                    coord(0, 0) = point;
-                    cv::Mat_<uint8_t> intensity(1, 1);
-                    currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-                    intensities.push_back(intensity(0, 0));
-                    positions.push_back(point);
-                }
-
-                if (!intensities.empty()) {
-                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
-                }
-            }
-        } else {
-            // --- Draw mode: analyze paths ---
-            for (const auto& path : pathsCopy) {
-                if (path.points.empty()) continue;
-
-                PathPrimitive densifiedPath = path.densify(0.5f);
-
-                std::vector<float> intensities;
-                std::vector<cv::Vec3f> positions;
-
-                for (const auto& pt : densifiedPath.points) {
-                    if (pt[0] >= bx0 && pt[0] < bx1 &&
-                        pt[1] >= by0 && pt[1] < by1 &&
-                        pt[2] >= bz0 && pt[2] < bz1) {
-
-                        cv::Mat_<cv::Vec3f> coord(1, 1);
-                        coord(0, 0) = pt;
-                        cv::Mat_<uint8_t> intensity(1, 1);
-                        currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-                        intensities.push_back(intensity(0, 0));
-                        positions.push_back(pt);
-                    }
-                }
-
-                if (!intensities.empty()) {
-                    collectSegmentPeaks(intensities, positions, _castRaysPeaks);
-                }
-            }
-        }
-
-        // Also store the distance transform for potential later use
-        distanceTransform = dt;
-    });
-
-    _castRaysWatcher->setFuture(future);
-    return true;
-}
-
-void SeedingWidget::onCastRaysFinished()
-{
-    // Add collected peaks to the point collection (main thread)
-    if (!_castRaysPeaks.empty()) {
-        _point_collection->addPoints("seeding_peaks", _castRaysPeaks);
-    }
-
-    const int numPeaks = static_cast<int>(_castRaysPeaks.size());
-
-    // Enable segmentation button if we found peaks
-    runSegmentationButton->setEnabled(numPeaks > 0);
-
-    // Re-enable the cast rays button
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setEnabled(_state && _state->currentVolume() != nullptr);
-    } else {
-        castRaysButton->setEnabled(!paths.empty());
-    }
-
-    if (_castRaysWasPointMode) {
-        infoLabel->setText(QString("Found %1 peaks (shown in red). Review points then click 'Run Segmentation'.").arg(numPeaks));
-        emit sendStatusMessageAvailable(
-            QString("Cast rays and found %1 intensity peaks. Points are displayed for review.").arg(numPeaks),
-            5000);
-    } else {
-        // Draw mode post-processing
-        displayPaths();
-        infoLabel->setText(QString("Found %1 peaks along %2 paths").arg(numPeaks).arg(paths.size()));
-        emit sendStatusMessageAvailable(
-            QString("Analyzed %1 paths and found %2 intensity peaks").arg(paths.size()).arg(numPeaks),
-            5000);
-    }
-
-    _castRaysPeaks.clear();
+    updateModeUI();
+    displayPaths();
 }
 
 void SeedingWidget::computeDistanceTransform()
@@ -882,11 +508,6 @@ void SeedingWidget::computeDistanceTransform()
     // Compute the distance transform
     cv::distanceTransform(binaryImage, distanceTransform,
                           vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
-    
-    // Normalize the distance transform for visualization if needed
-    cv::Mat distNormalized;
-    cv::normalize(distanceTransform, distNormalized, 0, 255, cv::NORM_MINMAX);
-    distNormalized.convertTo(distNormalized, CV_8UC1);
 }
 
 void SeedingWidget::onRunSegmentationClicked()
@@ -1141,103 +762,29 @@ void SeedingWidget::onResetPointsClicked()
     if (_point_collection) {
         if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
             _point_collection->clearCollection(*id);
-        if (const auto id = _point_collection->getCollectionId("seeding_seeds"))
-            _point_collection->clearCollection(*id);
     }
     
     // Clear paths
     paths.clear();
     
     // Reset UI
-    castRaysButton->setEnabled(false);
+    analyzePathsButton->setEnabled(false);
     runSegmentationButton->setEnabled(false);
     expandSeedsButton->setEnabled(false);
     resetPointsButton->setEnabled(false);
-    infoLabel->setText("Click 'Cast Rays' to begin");
+    infoLabel->setText("Draw paths, then click 'Analyze Paths'");
     
-    // Redraw to clear points and paths
-    updatePointsDisplay();
+    // Redraw to clear paths
     displayPaths();
-}
-
-void SeedingWidget::updateParameterPreview()
-{
-    auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto focus_points = _point_collection->getPoints("focus");
-    if (focus_points.empty() || !currentVolume) {
-        return;
-    }
-    auto& center_point = focus_points[0].p;
-
-    // Clear previous preview points
-    if (const auto id = _point_collection->getCollectionId("seeding_preview"))
-        _point_collection->clearCollection(*id);
-    
-    // Get parameters
-    const double angleStep = angleStepSpinBox->value();
-    const int numRays = static_cast<int>(360.0 / angleStep);
-    const int maxRadius = maxRadiusSpinBox->value();
-    
-    // Add points along the radius circle
-    for (int i = 0; i < numRays; ++i) {
-        const double angle = i * angleStep * M_PI / 180.0;
-        const cv::Vec2f rayDir(cos(angle), sin(angle));
-        
-        // Add points along the radius circle
-        float x = center_point[0] + maxRadius * rayDir[0];
-        float y = center_point[1] + maxRadius * rayDir[1];
-        
-        _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
-        
-        // Add intermediate points for better visualization
-        for (int r = maxRadius / 4; r < maxRadius; r += maxRadius / 4) {
-            x = center_point[0] + r * rayDir[0];
-            y = center_point[1] + r * rayDir[1];
-            
-            _point_collection->addPoint("seeding_preview", {x, y, center_point[2]});
-        }
-    }
-    
-    // Update info label
-    infoLabel->setText(QString("Seed at (%1, %2, %3) | Preview: %4 rays, radius %5px")
-                           .arg(center_point[0])
-                           .arg(center_point[1])
-                           .arg(center_point[2])
-                           .arg(numRays)
-                           .arg(maxRadius));
 }
 
 void SeedingWidget::updateModeUI()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setText("Cast Rays");
-        resetPointsButton->setText("Reset Points");
-
-        // Show radius and angle controls in point mode
-        maxRadiusLabel->setVisible(true);
-        maxRadiusSpinBox->setVisible(true);
-        angleStepLabel->setVisible(true);
-        angleStepSpinBox->setVisible(true);
-
-        // Enable/disable based on state
-        castRaysButton->setEnabled(currentVolume != nullptr);
-        resetPointsButton->setEnabled(true);
-    } else { // DrawMode
-        castRaysButton->setText("Analyze Paths");
-        resetPointsButton->setText("Clear All Paths");
-
-        // Hide radius and angle controls in draw mode
-        maxRadiusLabel->setVisible(false);
-        maxRadiusSpinBox->setVisible(false);
-        angleStepLabel->setVisible(false);
-        angleStepSpinBox->setVisible(false);
-
-        // Enable/disable based on paths
-        bool hasPaths = !paths.empty();
-        castRaysButton->setEnabled(hasPaths && currentVolume != nullptr);
-        resetPointsButton->setEnabled(hasPaths);
-    }
+    const bool hasPaths = !paths.empty();
+    resetPointsButton->setText(_drawEnabled ? "Clear All Paths" : "Reset Points");
+    analyzePathsButton->setEnabled(hasPaths && currentVolume != nullptr);
+    resetPointsButton->setEnabled(hasPaths || !_point_collection->getPoints("seeding_peaks").empty());
 }
 
 void SeedingWidget::analyzePaths()
@@ -1296,7 +843,7 @@ bool SeedingWidget::runAnalyzePathsHeadless(QString* errorMessage, int* pathsAna
         return false;
     }
     if (paths.empty()) {
-        if (errorMessage) *errorMessage = tr("No paths to analyze. Draw paths in Draw mode first.");
+        if (errorMessage) *errorMessage = tr("No paths to analyze. Draw paths first.");
         return false;
     }
 
@@ -1485,7 +1032,7 @@ void SeedingWidget::finalizePath()
     displayPaths();
     
     // Update info
-    infoLabel->setText(QString("Draw Mode: %1 path(s)").arg(paths.size()));
+    infoLabel->setText(QString("Drawing: %1 path(s)").arg(paths.size()));
 }
 
 void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
@@ -1782,14 +1329,12 @@ void SeedingWidget::setRelWindingAnnotationMode(bool active)
 
     labelWrapsMode = active;
     if (labelWrapsMode) {
-        currentMode = Mode::DrawMode;
         infoLabel->setText("Rel winding annotation: draw a path; release to create a labeled collection. Hold Shift for decreasing order.");
+        setDrawEnabled(true);
     } else {
-        // Revert to default UI language; keep currentMode as-is
-        infoLabel->setText("Point Mode: Set a focus point to begin");
+        // Revert to the default text; drawing stays as it is.
+        setDrawEnabled(_drawEnabled);
     }
-    updateModeUI();
-    displayPaths();
     emit relWindingAnnotationModeChanged(labelWrapsMode);
 }
 
@@ -1829,17 +1374,12 @@ void SeedingWidget::displayPaths()
     // Send peaks as red points (they should still be displayed as individual points)
 }
 
-void SeedingWidget::updatePointsDisplay()
-{
-    // Send both analysis results (red) and user points (blue) for display
-}
-
 void SeedingWidget::updateButtonStates()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
 
-    // Enable segmentation if we have any points (analysis results OR user points)
-    bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty() || !_point_collection->getPoints("seeding_seeds").empty();
+    // Enable segmentation once the analysis found peaks
+    bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty();
     runSegmentationButton->setEnabled(hasAnyPoints && currentVolume != nullptr);
 
     // Enable expansion if we have a volume AND at least one stored surface
@@ -1850,16 +1390,12 @@ void SeedingWidget::updateButtonStates()
     bool hasAnyData = hasAnyPoints || !paths.empty();
     resetPointsButton->setEnabled(hasAnyData);
 
-    if (currentMode == Mode::PointMode) {
-        castRaysButton->setEnabled(currentVolume != nullptr);
-    } else {
-        castRaysButton->setEnabled(!paths.empty());
-    }
+    analyzePathsButton->setEnabled(!paths.empty() && currentVolume != nullptr);
 }
 
 void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || button != Qt::LeftButton) {
+    if (!_drawEnabled || button != Qt::LeftButton) {
         return;
     }
 
@@ -1869,7 +1405,7 @@ void SeedingWidget::onMousePress(cv::Vec3f vol_point, cv::Vec3f normal, Qt::Mous
 
 void SeedingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || !isDrawing || !(buttons & Qt::LeftButton)) {
+    if (!_drawEnabled || !isDrawing || !(buttons & Qt::LeftButton)) {
         return;
     }
     
@@ -1878,7 +1414,7 @@ void SeedingWidget::onMouseMove(cv::Vec3f vol_point, Qt::MouseButtons buttons, Q
 
 void SeedingWidget::onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    if (currentMode != Mode::DrawMode || button != Qt::LeftButton || !isDrawing) {
+    if (!_drawEnabled || button != Qt::LeftButton || !isDrawing) {
         return;
     }
 

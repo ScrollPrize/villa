@@ -407,17 +407,15 @@ _Widget for creating initial segmentations which can be used for traces or later
 
 <img src="docs/imgs/seeding-ui.png" style="height: 500px">
 
-- `Switch to point mode` : toggles the seeding widget into draw mode (not recommended)
-- `Source Collection` : the source point collection to use as seed points (will autofill if you draw/analyze)
+- `Draw paths` : while on, a left-drag in a viewer draws a path
+- `Source Collection` : the source point collection to use as seed points (`Analyze Paths` writes its peaks to `seeding_peaks`; select it here to seed from them)
 - `Parallel processes` : the number of processes to run seeding with
 - `OMP Threads` : limits the amount of threads each process can use (recommend to set this to 1)
-- `Intensity threshold` : mostly unused, can leave default
-- `Peak detection window` : how closely each peak detected along a path/raycast can be
+- `Intensity threshold` : minimum intensity for a peak along a path
 - `Expansion iterations` : how many iterations to run expansion mode on after initial seeding
-- `Show Preview Points` : unused, can be ignored
-- `Clear` (both) : clears current points, paths, or raycasts
+- `Clear Peaks` : clears the detected peaks
 - `Analyze Paths` : after drawing paths, detect peaks along the line segment on which to place seed points
 - `Run seeding` : creates segmentations from the current seed points
 - `Expand seeds` : expands the current seed points to the given number of iterations
-- `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
+- `Clear All Paths` / `Reset Points` : clears the drawn paths and the detected peaks
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
