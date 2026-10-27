@@ -2,7 +2,7 @@
 #include "cuda/device_io.hpp"
 #include "cuda/batch_queue.hpp"
 #include "../cuda_buffer.hpp"
-#include "../cuda_event.hpp"
+#include "../cuda_stream.hpp"
 using DeviceInputArray = nb::ndarray<nb::array_api, nb::c_contig, nb::device::cuda>;
 // Owner of one or more device invocations' outputs. Arrays are marked exported
 // (their destruction then synchronizes the device) only when shared through

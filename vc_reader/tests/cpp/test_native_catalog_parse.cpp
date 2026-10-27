@@ -106,7 +106,6 @@ int main()
         const auto* sample = manifest.findSample("PHerc0139");
         require(sample, "sample");
         require(sample->type == "scroll" && sample->description == "Example sample", "sample fields");
-        require(sample->canonicalVolumeId == "vol1", "canonical volume");
         require(sample->properties.at("unknown_sample_field") == 7, "sample properties kept");
         require(preferredPhotoArtifact(*sample) &&
                     preferredPhotoArtifact(*sample)->resolvedUrl ==
@@ -117,7 +116,7 @@ int main()
         const auto& scan = sample->scans.front();
         require(scan.longId == "scan-a-long" && scan.createdAt == "2024-01-01T00:00:00Z", "scan identity");
         require(scan.energyKeV == 111.0 && scan.detectorDistanceMm == 220.0 && scan.pixelSizeUm == 2.403, "scan physics");
-        require(scan.location == "ESRF Grenoble" && scan.beamline == "bm18" && scan.name == "SCROLL_RADIX", "acquisition");
+        require(scan.location == "ESRF Grenoble" && scan.name == "SCROLL_RADIX", "acquisition");
         const auto* vol1 = sample->findVolume("vol1");
         require(vol1 && vol1->longId == "vol1-long" && vol1->scanId == "scan-a", "volume identity");
         require(vol1->pixelSizeUm == 7.91 && vol1->energyKeV == 88.0 && vol1->detectorDistanceMm == 12.5, "volume physics");
@@ -151,11 +150,14 @@ int main()
                 "derived representations");
 
         // Registrations: the sample graph, and supersession as an identity edge.
-        const auto forward = findSampleVolumeTransform(*sample, "vol1", "vol2");
-        require(forward && (*forward)(0, 0) == 0.5 && (*forward)(2, 3) == 30, "volume transform");
+        RegistrationGraph registrations;
+        registrations.addSample(*sample);
+        const auto forward = registrations.resolve("vol1", "vol2");
+        require(forward.status == TransformStatus::Resolved && forward.resolved().forward(0, 0) == 0.5 &&
+                    forward.resolved().forward(2, 3) == 30, "volume transform");
         require(sample->volumeTransforms.front().transforms.front().derivationPath == "vol1-vol2", "derivation path");
-        require(findSampleVolumeTransform(*sample, "vol2", "vol1").has_value(), "inverse transform");
-        require(!findSampleVolumeTransform(*sample, "vol1", "missing"), "unrelated volume");
+        require(registrations.resolve("vol2", "vol1").status == TransformStatus::Resolved, "inverse transform");
+        require(registrations.resolve("vol1", "missing").status == TransformStatus::Unavailable, "unrelated volume");
 
         // Opened volumes: the source zarr at a base level, a derived dataset at its level.
         require(levelVolumeId("vol1", 0) == "vol1" && levelVolumeId("vol1", 2) == "vol1@L2", "level ids");
@@ -183,8 +185,7 @@ int main()
         require(segment.width == 123 && segment.height == 456, "segment size");
         require(segment.sourceVolumeId() == "vol1" && segment.stableId() == "PHerc0139-seg-a", "source and lineage");
         require(segment.originalVolumeDownscale == 2, "downscale");
-        require(segment.inkModelsAllow == std::vector<std::string>{"model-a"} && !segment.inkModelsDeny, "ink models");
-        require(segment.spiralDatasetRevision == "r7" && segment.render.is_null(), "segment properties");
+        require(segment.render.is_null(), "segment render");
         require(segment.volumeCoverage.size() == 2, "volume coverage");
         const auto* coverage = segment.coverage("vol1");
         require(coverage && coverage->bbox.low == std::array<double, 3>{10, 20, 30} &&
@@ -196,9 +197,7 @@ int main()
                 "original tifxyz");
         require(segment.hasInkDetection() && segment.hasLayersZarr(), "artifact availability");
         const auto& published = segment.artifacts[1];
-        require(published.creation.process == "transform" && published.creation.derivedFrom &&
-                    published.publicationTier == "testing",
-                "artifact creation info");
+        require(published.creation.process == "transform" && published.creation.derivedFrom, "artifact creation info");
         const auto& labels = segment.artifacts[4];
         require(labels.labelSet == "20260918" && labels.supersedes == std::vector<std::string>{"older"} &&
                     labels.arrays.size() == 2 && labels.registration == "transferred" && labels.mappingCoverage == 0.5,
@@ -249,11 +248,7 @@ int main()
                     images[0].label == "seg-a - ink-detection-downsampled",
                 "ink images");
 
-        // Timestamps and URLs.
-        require(catalogTimestamp("2026-06-02T20:44:01.955138Z") == "20260602204401", "fractional timestamp");
-        require(catalogTimestamp("2026-06-02T20:44:01Z") == "20260602204401", "timestamp");
-        require(catalogTimestamp("20260602204401") == "20260602204401", "digits");
-        require(catalogTimestamp("yesterday") == "yesterday", "other dates unchanged");
+        // URLs.
         require(resolveOpenDataUrl("s3://vesuvius-challenge/full-scrolls/x") ==
                     "https://data.aws.ash2txt.org/samples/full-scrolls/x",
                 "website rewrite");
@@ -261,10 +256,10 @@ int main()
                 "join");
 
         // Models.
-        const auto* model = manifest.findModel("model-a");
-        require(model && model->longId == "model-a-long" && model->suffix == "ink" && model->task == "ink-detection" &&
-                    model->architecture == "timesformer" &&
-                    model->compatibleSamples == std::vector<std::string>{"PHerc0139"} && !model->excludedSamples,
+        require(manifest.models.size() == 1, "models");
+        const auto& model = manifest.models.front();
+        require(model.id == "model-a" && model.longId == "model-a-long" && model.suffix == "ink" &&
+                    model.task == "ink-detection" && model.architecture == "timesformer",
                 "model");
 
         // Only published keys are read.

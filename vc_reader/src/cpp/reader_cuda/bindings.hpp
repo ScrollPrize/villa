@@ -1,6 +1,6 @@
 #pragma once
 #include "reader.hpp"
-#include "../cuda_event.hpp"
+#include "../cuda_stream.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
@@ -46,11 +46,6 @@ inline void bind(nb::module_& m) {
           storage=device::allocate(count*item,id); device::complete(); }
         return owned(std::move(storage),count,{std::uint8_t(code),std::uint8_t(item*8),1},id);
     });
-    nb::class_<device::Event>(m,"CudaEvent")
-        .def("synchronize",&device::Event::synchronize,nb::call_guard<nb::gil_scoped_release>())
-        .def("wait",&device::Event::wait)
-        .def("done",&device::Event::done);
-    m.def("_record_event",[] { return std::make_shared<device::Event>(); });
     nb::class_<PointPlan>(m,"CudaPointPlan");
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }

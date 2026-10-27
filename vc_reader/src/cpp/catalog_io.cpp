@@ -58,7 +58,6 @@ std::string readCatalogFile(const std::filesystem::path& path) {
     if(!in.eof())throw std::runtime_error("cannot read catalog: "+path.string());
     return decode(std::move(body));
 }
-std::string fetchCatalogText(const std::string& url) {return request(url).first;}
 CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions& options) {
     if(!source.starts_with("https://")&&!source.starts_with("http://"))return {loadOpenDataManifestFile(source),false,{}};
     static std::mutex cacheMutex;

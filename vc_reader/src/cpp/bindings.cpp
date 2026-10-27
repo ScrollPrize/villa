@@ -188,17 +188,6 @@ NB_MODULE(_reader, m)
         "url"_a, "auth"_a = AuthTuple{}, "stall_timeout_s"_a = 10, "retries"_a = 5,
         "GET a small object (e.g. .zarray); None if it does not exist (404). PermissionError on 401/403.");
 
-    m.def(
-        "sigv4_headers",
-        [](const std::string& url, const std::string& access_key, const std::string& secret_key,
-           const std::string& session_token, const std::string& region, const std::string& amz_date,
-           const std::vector<std::pair<std::string, std::string>>& extra) {
-            return vcr::sigv4_get_headers(url, {access_key, secret_key, session_token, region}, amz_date, extra);
-        },
-        "url"_a, "access_key"_a, "secret_key"_a, "session_token"_a, "region"_a, "amz_date"_a,
-        "extra"_a = std::vector<std::pair<std::string, std::string>>{},
-        "The headers that sign a GET of url for S3 at amz_date (YYYYMMDDTHHMMSSZ); for tests.");
-
     nb::class_<vcr::MemoryCache>(m, "MemoryCache", "Byte-bounded LRU of decoded chunks, shareable between arrays.")
         .def(nb::init<std::size_t>(), "max_bytes"_a)
         .def_prop_ro("max_bytes", &vcr::MemoryCache::max_bytes)

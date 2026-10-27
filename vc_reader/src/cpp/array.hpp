@@ -86,7 +86,6 @@ struct RebasedCoordinates : Coordinates {
     std::array<std::int64_t, 3> offset{};
     std::int64_t base(std::size_t axis) const { return offset[axis]; }
 };
-using FloatPoints = RebasedCoordinates<PointCoordinates<float>>;
 using FloatAffine = RebasedCoordinates<BasicAffineCoordinates<float>>;
 
 // A chunk an offline read needs is in none of the disk layers.

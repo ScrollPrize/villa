@@ -88,7 +88,6 @@ struct OpenDataArtifact {
     std::string annotatedOn;
     std::optional<double> mappingCoverage;
     OpenDataCreation creation;  // from creation_info
-    std::string publicationTier;  // creation_info.publication.tier
 
     // Preferred public origin selected from origins/access_roots.
     std::string sourcePath;
@@ -125,10 +124,9 @@ struct OpenDataScan {
     std::optional<double> pixelSizeUm;
     std::optional<double> energyKeV;
     std::optional<double> detectorDistanceMm;
-    // Acquisition, from creation.metadata: facility location and beamline, and
-    // the facility's scan name (ESRF scanRadix, DLS scan_name).
+    // Acquisition, from creation.metadata: facility location and the
+    // facility's scan name (ESRF scanRadix, DLS scan_name).
     std::string location;
-    std::string beamline;
     std::string name;
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
@@ -169,7 +167,6 @@ struct OpenDataVolume {
     std::optional<bool> renderSegments;
     // Intensity windowing of the export (creation.metadata).
     std::optional<double> windowU16Min, windowU16Max;
-    std::optional<double> targetWindowF32Min, targetWindowF32Max;
     std::optional<std::array<std::size_t, 3>> shapeZYX;
     std::optional<double> pixelSizeUm;
     std::optional<double> energyKeV;
@@ -209,15 +206,11 @@ struct OpenDataSegment {
     double originalVolumeDownscale = 1;
     std::vector<OpenDataVolumeCoverage> volumeCoverage;
     nlohmann::json render;  // properties.render, as published (null when absent)
-    std::optional<std::vector<std::string>> inkModelsAllow;
-    std::optional<std::vector<std::string>> inkModelsDeny;
-    std::string spiralDatasetRevision;
     std::optional<OpenDataTifxyzInfo> originalTifxyz;
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
     nlohmann::json raw = nlohmann::json::object();
 
-    [[nodiscard]] bool hasArtifactType(std::string_view type) const;
     [[nodiscard]] bool hasInkDetection() const;
     [[nodiscard]] bool hasLayersZarr() const;
     // The volume the segment was authored in: creation.derived_from when it
@@ -255,15 +248,11 @@ struct OpenDataSegmentImage {
 // URL, preferring JPEG renders when the segment publishes any.
 [[nodiscard]] std::vector<OpenDataSegmentImage> inkDetectionImages(const OpenDataSegment&);
 
-// A catalog date as the 14-digit yyyymmddhhmmss surface timestamp; dates in
-// another form are returned unchanged.
-[[nodiscard]] std::string catalogTimestamp(std::string_view date);
 
 struct OpenDataSample {
     std::string id;
     std::string type;
     std::string description;
-    std::string canonicalVolumeId;
     nlohmann::json publicAccessMappings;  // properties.public_access_mappings (null when absent)
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
@@ -320,8 +309,6 @@ struct OpenDataModel {
     OpenDataCreation creation;
     std::string task;
     std::string architecture;
-    std::optional<std::vector<std::string>> compatibleSamples;
-    std::optional<std::vector<std::string>> excludedSamples;
     nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
 };
@@ -350,7 +337,6 @@ struct OpenDataManifest {
     nlohmann::json raw = nlohmann::json::object();
 
     [[nodiscard]] const OpenDataSample* findSample(std::string_view id) const noexcept;
-    [[nodiscard]] const OpenDataModel* findModel(std::string_view id) const noexcept;
     // The catalog volume a remote zarr shows when opened at pyramid
     // `baseLevel`: a volume's preferred zarr, or a derived dataset (its
     // parameters.level added to the base level). URLs compare without trailing
@@ -370,8 +356,6 @@ struct OpenDataManifest {
     const std::filesystem::path& manifestPath,
     std::string manifestUrl = {});
 
-[[nodiscard]] OpenDataManifest fetchOpenDataManifest(
-    std::string manifestUrl = std::string(kDefaultManifestUrl));
 
 
 [[nodiscard]] std::string resolveOpenDataUrl(std::string url);
@@ -387,10 +371,6 @@ struct OpenDataManifest {
 [[nodiscard]] const OpenDataArtifact* preferredPhotoArtifact(
     const OpenDataSample& sample) noexcept;
 
-[[nodiscard]] std::optional<Affine> findSampleVolumeTransform(
-    const OpenDataSample& sample,
-    std::string_view fromVolumeId,
-    std::string_view toVolumeId);
 
 struct CatalogLoadOptions {
     std::filesystem::path cacheFile;

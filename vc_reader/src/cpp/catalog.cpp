@@ -291,7 +291,6 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         artifact.annotatedOn = stringValue(artifact.properties, "annotated_on").value_or("");
         artifact.mappingCoverage = numberValue(artifact.properties, "mapping_coverage");
         artifact.creation = parseCreation(artifact.creationInfo);
-        artifact.publicationTier = stringValue(objectOrEmpty(artifact.creationInfo, "publication"), "tier").value_or("");
         if (const auto* origins = member(itemJson, "origins")) artifact.origins = parseOrigins(*origins);
         selectPreferredOrigin(artifact);
         artifacts.push_back(std::move(artifact));
@@ -314,7 +313,6 @@ OpenDataScan parseScan(std::string id, const nlohmann::json& scanJson)
     scan.detectorDistanceMm = numberValue(scan.properties, "detector_distance_mm");
     const auto metadata = objectOrEmpty(creationJson, "metadata");
     scan.location = stringValue(metadata, "location").value_or("");
-    scan.beamline = stringValue(metadata, "beamline").value_or("");
     const auto acquisition = objectOrEmpty(objectOrEmpty(objectOrEmpty(metadata, "metadata"), "tomo"), "acquisition");
     scan.name = stringValue(acquisition, "scanRadix").value_or(stringValue(metadata, "scan_name").value_or(""));
     scan.artifacts = parseArtifacts(scanJson);
@@ -351,8 +349,6 @@ OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
     const auto metadata = objectOrEmpty(creationJson, "metadata");
     volume.windowU16Min = numberValue(metadata, "window_u16_min");
     volume.windowU16Max = numberValue(metadata, "window_u16_max");
-    volume.targetWindowF32Min = numberValue(metadata, "target_window_f32_min");
-    volume.targetWindowF32Max = numberValue(metadata, "target_window_f32_max");
     volume.artifacts = parseArtifacts(volumeJson);
     volume.raw = volumeJson.is_object() ? volumeJson : nlohmann::json::object();
     return volume;
@@ -375,9 +371,6 @@ OpenDataSegment parseSegment(std::string id, const nlohmann::json& segmentJson)
     if (const auto downscale = numberValue(p, "original_volume_downscale"); downscale && std::isfinite(*downscale) && *downscale > 0)
         segment.originalVolumeDownscale = *downscale;
     if (const auto* render = member(p, "render")) segment.render = *render;
-    segment.inkModelsAllow = stringList(p, "ink_models_allow");
-    segment.inkModelsDeny = stringList(p, "ink_models_deny");
-    segment.spiralDatasetRevision = stringValue(p, "spiral_dataset_revision").value_or("");
     if (const auto* coverage = member(p, "volume_coverage"); coverage && coverage->is_object()) {
         for (auto it = coverage->begin(); it != coverage->end(); ++it) {
             const auto bbox = boundsValue(it.value(), "bbox_transformed");
@@ -424,7 +417,6 @@ OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
     const auto record = objectOrEmpty(sampleJson, "sample");
     sample.id = stringValue(record, "id").value_or(std::move(id));
     sample.description = stringValue(record, "description").value_or("");
-    sample.canonicalVolumeId = stringValue(record, "canonical_volume_id").value_or("");
     sample.properties = objectOrEmpty(record, "properties");
     sample.type = stringValue(sample.properties, "type").value_or("");
     if (const auto* mappings = member(sample.properties, "public_access_mappings")) sample.publicAccessMappings = *mappings;
@@ -484,8 +476,6 @@ std::vector<OpenDataModel> parseModels(const nlohmann::json& metadataJson)
         model.properties = objectOrEmpty(model.raw, "properties");
         model.task = stringValue(model.properties, "task").value_or("");
         model.architecture = stringValue(model.properties, "architecture").value_or("");
-        model.compatibleSamples = stringList(model.properties, "compatible_samples");
-        model.excludedSamples = stringList(model.properties, "excluded_samples");
         models.push_back(std::move(model));
     }
     return models;
@@ -529,11 +519,6 @@ const OpenDataVolumeCoverage* OpenDataSegment::coverage(std::string_view volumeI
     const auto it = std::find_if(volumeCoverage.begin(), volumeCoverage.end(),
                                  [&](const auto& c) { return c.volumeId == volumeId; });
     return it == volumeCoverage.end() ? nullptr : &*it;
-}
-
-bool OpenDataSegment::hasArtifactType(std::string_view type) const
-{
-    return findArtifact(artifacts, type) != nullptr;
 }
 
 bool OpenDataSegment::hasInkDetection() const
@@ -744,14 +729,6 @@ std::shared_ptr<const OpenDataManifest> cachedManifest(const std::filesystem::pa
     return entry.manifest;
 }
 
-const OpenDataModel* OpenDataManifest::findModel(std::string_view id) const noexcept
-{
-    const auto it = std::find_if(models.begin(), models.end(), [&](const OpenDataModel& model) {
-        return model.id == id;
-    });
-    return it == models.end() ? nullptr : &*it;
-}
-
 OpenDataManifest parseOpenDataManifest(std::string_view jsonText, std::string manifestUrl)
 {
     auto root = nlohmann::json::parse(jsonText);
@@ -772,15 +749,6 @@ OpenDataManifest loadOpenDataManifestFile(const std::filesystem::path& manifestP
 {
     if (manifestUrl.empty()) manifestUrl = manifestPath.string();
     return parseOpenDataManifest(readCatalogFile(manifestPath), std::move(manifestUrl));
-}
-
-OpenDataManifest fetchOpenDataManifest(std::string manifestUrl)
-{
-    const auto body = fetchCatalogText(manifestUrl);
-    if (body.empty()) {
-        throw std::runtime_error("Failed to fetch open-data manifest: " + manifestUrl);
-    }
-    return parseOpenDataManifest(body, std::move(manifestUrl));
 }
 
 std::string resolveOpenDataUrl(std::string url)
@@ -874,34 +842,6 @@ std::vector<OpenDataSegmentImage> inkDetectionImages(const OpenDataSegment& segm
     return result;
 }
 
-std::string catalogTimestamp(std::string_view date)
-{
-    const auto isDigit = [&](std::size_t index) {
-        return index < date.size() && std::isdigit(static_cast<unsigned char>(date[index]));
-    };
-    if ((date.size() == 14 || date.size() == 17) &&
-        std::all_of(date.begin(), date.end(), [](unsigned char c) { return std::isdigit(c); }))
-        return std::string(date.substr(0, 14));
-    if (date.size() < 20 || date[4] != '-' || date[7] != '-' || date[10] != 'T' || date[13] != ':' ||
-        date[16] != ':')
-        return std::string(date);
-    for (const std::size_t i : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18})
-        if (!isDigit(i)) return std::string(date);
-    if (date[19] == 'Z') {
-        if (date.size() != 20) return std::string(date);
-    } else if (date[19] == '.') {
-        std::size_t end = 20;
-        while (end < date.size() && std::isdigit(static_cast<unsigned char>(date[end]))) ++end;
-        if (end == 20 || end + 1 != date.size() || date[end] != 'Z') return std::string(date);
-    } else {
-        return std::string(date);
-    }
-    std::string timestamp;
-    for (const auto [begin, count] : {std::pair<std::size_t, std::size_t>{0, 4}, {5, 2}, {8, 2}, {11, 2}, {14, 2}, {17, 2}})
-        timestamp.append(date.substr(begin, count));
-    return timestamp;
-}
-
 const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) noexcept
 {
     for (const auto* type : {"zarr", "zarr3", "volume_zarr", "omezarr", "ome-zarr"}) {
@@ -934,20 +874,6 @@ const OpenDataArtifact* preferredPhotoArtifact(const OpenDataSample& sample) noe
                    type.find("thumbnail") != std::string::npos;
         });
     return it == sample.artifacts.end() ? nullptr : &*it;
-}
-
-std::optional<Affine> findSampleVolumeTransform(
-    const OpenDataSample& sample,
-    std::string_view fromVolumeId,
-    std::string_view toVolumeId)
-{
-    try {
-        RegistrationGraph graph;
-        graph.addSample(sample);
-        const auto result = graph.resolve(std::string(fromVolumeId), std::string(toVolumeId));
-        if (result.status == TransformStatus::Resolved) return result.resolved().forward;
-    } catch (const std::invalid_argument&) { }
-    return std::nullopt;
 }
 
 } // namespace vcr::catalog
