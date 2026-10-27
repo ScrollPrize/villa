@@ -4561,7 +4561,6 @@ QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)
 {
     auto* volumeSelector = new VolumeSelector(parent);
     volumeSelector->setLabelVisible(false);
-    volumeSelector->setBrowseEnabled(false);
     if (auto* combo = volumeSelector->comboBox()) {
         combo->setObjectName(QStringLiteral("annotationVolumeSelect"));
         combo->setMinimumWidth(130);
