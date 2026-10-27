@@ -12,17 +12,20 @@
 // list, and they are stated explicitly here so the block can be compared across
 // segments and against the reference numpy implementation the issue links to
 // (`kit tifxyz isometry`). The same numbers are produced in Python by
-// `vesuvius.tifxyz.compute_grid_isometry`.
+// `vesuvius.tifxyz.compute_grid_isometry`. The flatboi metrics (l2_mean,
+// l2_median, linf, area_error) come from the shared per-triangle core in
+// `TriangleStretch.hpp` (villa #2279 item 4), which flatboi itself also calls, so
+// the grid and flatboi cannot drift.
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <numeric>
 #include <vector>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/TriangleStretch.hpp"
 
 namespace vc::surface
 {
@@ -97,41 +100,6 @@ inline double percentileLinear(const std::vector<double>& sorted, double percent
     const double b = sorted[lower + 1];
     const double diff = b - a;
     return fraction >= 0.5 ? b - diff * (1.0 - fraction) : a + diff * fraction;
-}
-
-// The weighted median the reference implementation uses: a stable sort of the values,
-// the cumulative weight, and the first value whose cumulative weight reaches half the
-// total (a plain searchsorted on the cumulative sum).
-inline double weightedMedian(const std::vector<double>& data, const std::vector<double>& weights)
-{
-    if (data.empty() || data.size() != weights.size()) {
-        return 0.0;
-    }
-    double total = 0.0;
-    for (double w : weights) {
-        total += w;
-    }
-    if (!(total > 0.0)) {
-        return 0.0;
-    }
-    std::vector<std::size_t> order(data.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t i, std::size_t j) {
-        return data[i] < data[j];
-    });
-    const double half = 0.5 * total;
-    double acc = 0.0;
-    std::size_t k = 0;
-    for (; k < order.size(); ++k) {
-        acc += weights[order[k]];
-        if (acc >= half) {
-            break;
-        }
-    }
-    if (k >= order.size()) {
-        k = order.size() - 1;
-    }
-    return data[order[k]];
 }
 
 inline void pushArray3(utils::Json& out, double a, double b, double c)
@@ -263,46 +231,19 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
     // over the same cells; angles at each cell's (r, c) corner.
     std::vector<double> angles;
     angles.reserve(static_cast<std::size_t>(std::max(0, rows - 1)) * std::max(0, cols - 1));
-    std::vector<double> l2sq;
-    std::vector<double> triArea3d;
-    const std::size_t maxCells =
-        static_cast<std::size_t>(std::max(0, rows - 1)) * static_cast<std::size_t>(std::max(0, cols - 1));
-    l2sq.reserve(2 * maxCells);
-    triArea3d.reserve(2 * maxCells);
     double cellAreaSum = 0.0;
     std::size_t cellCount = 0;
 
-    // Singular values of the map from the cell's uniform (column x step_u, row x
-    // step_v) 2D coordinates to its 3D triangles. Both triangles of a cell have the
-    // same diagonal split as SurfaceArea's quadArea (p00-p10-p11 and p00-p11-p01).
-    auto accumulateTriangle = [&](const Vec& a, const Vec& b, const Vec& c,
-                                  const cv::Vec3d& g1, const cv::Vec3d& g2) {
-        const double du1 = g1[0], dv1 = g1[1], dw1 = g1[2];
-        const double du2 = g2[0], dv2 = g2[1], dw2 = g2[2];
-        const double aa = du1 * du1 + dv1 * dv1 + dw1 * dw1;
-        const double bb = du1 * du2 + dv1 * dv2 + dw1 * dw2;
-        const double cc = du2 * du2 + dv2 * dv2 + dw2 * dw2;
-        const double l2sqTri = (aa + cc) / 2.0;
-        const double disc = std::sqrt((aa - cc) * (aa - cc) + 4.0 * bb * bb);
-        const double g = std::sqrt(std::max(((aa + cc) + disc) / 2.0, 0.0));
-        l2sq.push_back(l2sqTri);
-        // Heron's formula on the 3D side lengths.
-        const double ab = std::sqrt((static_cast<double>(b[0]) - a[0]) * (static_cast<double>(b[0]) - a[0]) +
-                                    (static_cast<double>(b[1]) - a[1]) * (static_cast<double>(b[1]) - a[1]) +
-                                    (static_cast<double>(b[2]) - a[2]) * (static_cast<double>(b[2]) - a[2]));
-        const double bc = std::sqrt((static_cast<double>(c[0]) - b[0]) * (static_cast<double>(c[0]) - b[0]) +
-                                    (static_cast<double>(c[1]) - b[1]) * (static_cast<double>(c[1]) - b[1]) +
-                                    (static_cast<double>(c[2]) - b[2]) * (static_cast<double>(c[2]) - b[2]));
-        const double ca = std::sqrt((static_cast<double>(a[0]) - c[0]) * (static_cast<double>(a[0]) - c[0]) +
-                                    (static_cast<double>(a[1]) - c[1]) * (static_cast<double>(a[1]) - c[1]) +
-                                    (static_cast<double>(a[2]) - c[2]) * (static_cast<double>(a[2]) - c[2]));
-        const double s = (ab + bc + ca) / 2.0;
-        const double area3 = std::sqrt(std::max(s * (s - ab) * (s - bc) * (s - ca), 0.0));
-        triArea3d.push_back(area3);
-        return g;
-    };
-
-    double linf = 0.0;
+    // flatboi's stretch metrics come from the shared per-triangle core
+    // (TriangleStretch.hpp, villa #2279 item 4), so the grid and flatboi agree by
+    // construction. Both triangles of a cell have the same diagonal split as
+    // SurfaceArea's quadArea (p00-p10-p11 and p00-p11-p01); their parameter
+    // coordinates are the cell's own uniform ones, column x step_u and row x step_v.
+    std::vector<TriangleStretch> triangles;
+    triangles.reserve(2 * static_cast<std::size_t>(std::max(0, rows - 1)) *
+                      static_cast<std::size_t>(std::max(0, cols - 1)));
+    const double tri1_uv[3][2] = {{0.0, 0.0}, {step_u, 0.0}, {step_u, step_v}};
+    const double tri2_uv[3][2] = {{0.0, 0.0}, {step_u, step_v}, {0.0, step_v}};
     for (int y = 0; y + 1 < rows; ++y) {
         for (int x = 0; x + 1 < cols; ++x) {
             if (!(ok(y, x) && ok(y, x + 1) && ok(y + 1, x) && ok(y + 1, x + 1))) {
@@ -332,20 +273,14 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
                 angles.push_back(std::acos(clamped) * kRadiansToDegrees);
             }
 
-            const cv::Vec3d d00(p00[0], p00[1], p00[2]);
-            const cv::Vec3d d10(p10[0], p10[1], p10[2]);
-            const cv::Vec3d d01(p01[0], p01[1], p01[2]);
-            const cv::Vec3d d11(p11[0], p11[1], p11[2]);
-
-            // Ss and St for the two triangles, from the uniform 2D grid
-            // (column x step_u, row x step_v).
-            const cv::Vec3d tri1_ss = (d10 - d00) * (1.0 / step_u);
-            const cv::Vec3d tri1_st = (d11 - d10) * (1.0 / step_v);
-            const cv::Vec3d tri2_ss = (d11 - d01) * (1.0 / step_u);
-            const cv::Vec3d tri2_st = (d01 - d00) * (1.0 / step_v);
-            const double g1 = accumulateTriangle(p00, p10, p11, tri1_ss, tri1_st);
-            const double g2 = accumulateTriangle(p00, p11, p01, tri2_ss, tri2_st);
-            linf = std::max(linf, std::max(g1, g2));
+            const double p1[3][3] = {{p00[0], p00[1], p00[2]},
+                                     {p10[0], p10[1], p10[2]},
+                                     {p11[0], p11[1], p11[2]}};
+            const double p2[3][3] = {{p00[0], p00[1], p00[2]},
+                                     {p11[0], p11[1], p11[2]},
+                                     {p01[0], p01[1], p01[2]}};
+            triangles.push_back(triangleStretch(p1, tri1_uv));
+            triangles.push_back(triangleStretch(p2, tri2_uv));
         }
     }
 
@@ -360,35 +295,11 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
         stats.angle_p95 = detail::percentileLinear(angles, 95.0);
     }
 
-    if (!triArea3d.empty()) {
-        double sumA3 = 0.0;
-        for (double a : triArea3d) {
-            sumA3 += a;
-        }
-        double weightedL2 = 0.0;
-        for (std::size_t i = 0; i < l2sq.size(); ++i) {
-            weightedL2 += l2sq[i] * triArea3d[i];
-        }
-        if (sumA3 > 0.0) {
-            stats.l2_mean = std::sqrt(weightedL2 / sumA3);
-        }
-        stats.l2_median = detail::weightedMedian(l2sq, triArea3d);
-
-        const double triCount = static_cast<double>(triArea3d.size());
-        const double a2 = 0.5 * step_u * step_v * triCount; // every triangle's 2D area
-        double areaError = 0.0;
-        if (sumA3 > 0.0 && a2 > 0.0) {
-            const double beta = (0.5 * step_u * step_v) / a2; // == 1 / triCount
-            for (double a3 : triArea3d) {
-                const double alpha = a3 / sumA3;
-                areaError += alpha > beta ? 1.0 - beta / (alpha + 1e-30)
-                                          : 1.0 - alpha / (beta + 1e-30);
-            }
-            areaError /= triCount;
-        }
-        stats.area_error = areaError;
-        stats.linf = linf;
-    }
+    const StretchMetrics stretch = aggregateStretch(triangles);
+    stats.l2_mean = stretch.l2_mean;
+    stats.l2_median = stretch.l2_median;
+    stats.linf = stretch.linf;
+    stats.area_error = stretch.area_error;
 
     return stats;
 }

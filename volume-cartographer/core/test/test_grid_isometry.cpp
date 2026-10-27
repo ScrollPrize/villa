@@ -9,6 +9,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/GridIsometry.hpp"
+#include "vc/core/util/TriangleStretch.hpp"
 
 #include <cmath>
 
@@ -145,4 +146,39 @@ TEST_CASE("storeIsometryMeta measures against the metadata scale")
     REQUIRE(meta.contains("isometry"));
     CHECK(meta["isometry"]["step_vx"][0].get_double() == doctest::Approx(4.0));
     CHECK(meta["isometry"]["within_10pct"].get_double() == doctest::Approx(1.0));
+}
+
+TEST_CASE("the shared triangle core matches flatboi's definitions")
+{
+    // A unit right triangle in the xy-plane with the matching parameter triangle:
+    // the map is the identity, so both singular values are 1 and both areas 0.5.
+    const double p[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+    const double uv[3][2] = {{0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}};
+    const auto m = vc::surface::triangleStretch(p, uv);
+    CHECK(m.l2_squared == doctest::Approx(1.0));
+    CHECK(m.linf == doctest::Approx(1.0));
+    CHECK(m.area3d == doctest::Approx(0.5));
+    CHECK(m.area2d == doctest::Approx(0.5));
+
+    // Stretched 1.3x along the first parameter axis: singular values 1.3 and 1.
+    const double p13[3][3] = {{0.0, 0.0, 0.0}, {1.3, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+    const auto m13 = vc::surface::triangleStretch(p13, uv);
+    CHECK(m13.linf == doctest::Approx(1.3));
+    CHECK(m13.l2_squared == doctest::Approx((1.3 * 1.3 + 1.0) / 2.0));
+
+    // A degenerate parameter triangle has no Jacobian and yields all zeros.
+    const double uv0[3][2] = {{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}};
+    const auto m0 = vc::surface::triangleStretch(p, uv0);
+    CHECK(m0.l2_squared == doctest::Approx(0.0));
+    CHECK(m0.linf == doctest::Approx(0.0));
+    CHECK(m0.area3d == doctest::Approx(0.0));
+    CHECK(m0.area2d == doctest::Approx(0.0));
+
+    // Two identical unit triangles are perfectly isometric, and an empty set is 0.
+    const auto agg = vc::surface::aggregateStretch({m, m});
+    CHECK(agg.l2_mean == doctest::Approx(1.0));
+    CHECK(agg.l2_median == doctest::Approx(1.0));
+    CHECK(agg.linf == doctest::Approx(1.0));
+    CHECK(agg.area_error == doctest::Approx(0.0).scale(1.0)); // ~1e-16 of cancellation
+    CHECK(vc::surface::aggregateStretch({}).linf == doctest::Approx(0.0));
 }
