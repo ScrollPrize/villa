@@ -333,8 +333,6 @@ target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/core/src
-        ${CMAKE_SOURCE_DIR}/libs/edt
-        ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
 )
 

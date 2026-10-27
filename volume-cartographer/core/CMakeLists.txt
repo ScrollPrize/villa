@@ -59,13 +59,8 @@ add_library(vc_core
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
-
-# Grid-resolution helpers (vc_merge_tifxyz_grid) live in apps/src but are
-# compiled into vc_core so the unit tests link them without the binary.
-target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
 
 target_link_libraries(vc_core
     PUBLIC vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog
@@ -74,7 +69,6 @@ target_link_libraries(vc_core
         opencv_imgproc
         opencv_imgcodecs
         ${VC_OPENCV_CALIB_TARGETS}
-        opencv_video
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
         TIFF::TIFF

@@ -36,7 +36,7 @@ cmake -S volume-cartographer -B volume-cartographer/build/ci-render-benchmark \
   -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
   -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
   -DVC_RUN_RENDER_BENCHMARKS=ON \
-  -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
+  -DVC_BUILD_APPS=OFF \
   -DVC_BUILD_FLATBOI=OFF
 ```
 
@@ -156,7 +156,7 @@ cmake -S volume-cartographer -B "$build" -G Ninja \
   -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 \
   -DVC_MARCH_NATIVE=OFF -DVC_TESTING=ON \
   -DVC_RUN_RENDER_BENCHMARKS=ON \
-  -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF \
+  -DVC_BUILD_APPS=OFF \
   -DVC_BUILD_FLATBOI=OFF
 cmake --build "$build" --target render_valgrind_ci_measure --parallel "$jobs"
 python3 volume-cartographer/scripts/run_render_valgrind_ci.py freeze-reference \

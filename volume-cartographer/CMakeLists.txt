@@ -57,7 +57,6 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_RUN_RENDER_BENCHMARKS
        "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
-option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
 # practical Windows build — default it off there.
 if(WIN32)
@@ -134,8 +133,8 @@ endif()
 # Skip building app executables (vc_*, VC3D) when generating coverage:
 # the apps add ~3 GB of debug+coverage-instrumented binaries to the
 # build dir and aren't exercised by the unit tests, so they only inflate
-# the build without contributing coverage data. The static libs the
-# tests need (e.g. vc_merge_grid) are still built unconditionally.
+# the build without contributing coverage data. The libraries the
+# tests need are still built unconditionally.
 # Override with -DVC_BUILD_APPS=ON if you need the apps in a coverage
 # build (e.g. for end-to-end tests that spawn the binaries).
 if(VC_ENABLE_COVERAGE)
@@ -143,7 +142,6 @@ if(VC_ENABLE_COVERAGE)
 else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
-option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
 option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
@@ -467,19 +465,8 @@ if(VC_WERROR)
     endif()
 endif()
 
-if(VC_PROFILE_COMPILE)
-    if(MSVC)
-        # MSVC has no stable per-TU timing flag; leave compile profiling to the
-        # GCC/Clang builds.
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        add_compile_options(-ftime-trace -ftime-trace-granularity=200)
-    else()
-        add_compile_options(-ftime-report)
-    endif()
-endif()
-
 # ---- Dependencies -----------------------------------------------------------
-if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
+if(VC_BUILD_APPS OR VC_TESTING)
     find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTORCC ON)
@@ -508,7 +495,7 @@ endif()
 # absolute dylib path so it never degrades into a bare, unresolvable -l flag.
 if(APPLE)
     set(_vc_opencv_modules
-        core imgproc imgcodecs video flann ximgproc)
+        core imgproc imgcodecs flann ximgproc)
     if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
         list(APPEND _vc_opencv_modules calib geometry)
     else()

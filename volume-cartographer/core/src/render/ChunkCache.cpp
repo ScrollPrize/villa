@@ -1,4 +1,4 @@
-#include "ChunkCache.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "SamplingWaitProfile.hpp"
 
 #include <utils/thread_pool.hpp>

@@ -88,12 +88,12 @@ add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
 add_executable(vc_straighten src/vc_straighten.cpp)
-target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann TIFF::TIFF)
+target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann)
 
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
-add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
+add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp src/vc_merge_tifxyz_grid.cpp)
 target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_merge_patch src/vc_merge_patch.cpp)

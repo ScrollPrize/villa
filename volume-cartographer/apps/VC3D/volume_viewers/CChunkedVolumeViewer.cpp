@@ -15,7 +15,7 @@
 #include "ViewerManager.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
-#include "render/ChunkCache.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/SurfaceCache.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"

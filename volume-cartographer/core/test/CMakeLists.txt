@@ -336,10 +336,12 @@ vc_add_test(NAME test_post_process)
 # which exercises the *real* compress path used by VcDataset.
 vc_add_test(NAME test_blosc1_compat LIBS doctest::doctest vc_core Blosc::blosc)
 
-# Parser-only regression tests for vc_merge_tifxyz: gmResolveGrid +
-# gmCheckConnected are compiled into vc_core, so link that and assert the
-# failure messages exactly without spawning the binary.
-vc_add_test(NAME test_merge_grid_resolve)
+# Parser-only regression tests for vc_merge_tifxyz: compile its
+# gmResolveGrid + gmCheckConnected source and assert the failure messages
+# exactly without spawning the binary.
+vc_add_test(NAME test_merge_grid_resolve
+    SOURCES test_merge_grid_resolve.cpp ${PROJECT_SOURCE_DIR}/apps/src/vc_merge_tifxyz_grid.cpp
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/src)
 
 # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
 vc_add_test(NAME test_grow_seg_store_mode)

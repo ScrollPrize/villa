@@ -38,7 +38,6 @@ cmake -S volume-cartographer -B volume-cartographer/build-release \
   -DVC_TESTING=ON \
   -DVC_RUN_RENDER_BENCHMARKS=ON \
   -DVC_BUILD_APPS=OFF \
-  -DVC_BUILD_UI_TRACER=OFF \
   -DVC_BUILD_FLATBOI=OFF
 cmake --build volume-cartographer/build-release --parallel 32 \
   --target bench_render_synthetic
@@ -64,7 +63,7 @@ Configure the non-default Release benchmark graph and run the complete gate:
 cmake -S volume-cartographer -B volume-cartographer/build/ci-render-benchmark \
   -G Ninja -DCMAKE_BUILD_TYPE=Release -DVC_MARCH_NATIVE=OFF \
   -DVC_TESTING=ON -DVC_RUN_RENDER_BENCHMARKS=ON \
-  -DVC_BUILD_APPS=OFF -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=OFF
+  -DVC_BUILD_APPS=OFF -DVC_BUILD_FLATBOI=OFF
 cmake --build volume-cartographer/build/ci-render-benchmark \
   --target bench_render_synthetic --parallel 32
 ctest --test-dir volume-cartographer/build/ci-render-benchmark \
