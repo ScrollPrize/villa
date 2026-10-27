@@ -3,6 +3,9 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
+#include "vc_object_store/objects/UmbilicusFile.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include <fstream>
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <iostream>
@@ -214,6 +217,34 @@ int main() try {
             [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return restored.vertex(r,c);},
             [](int64_t,int64_t){return true;});
         require(complete-whole==3.75,"a missing vertex drops its six triangles");
+    }
+    {
+        // Importing an umbilicus file: the store reads it, decides its frame
+        // against the volume, and replaces the volume's umbilicus.
+        const auto storePath=directory.path/"umbilicus-import.vcobj";
+        {auto created=ObjectStore::create(storePath,options);}
+        ObjectStoreSession session;const auto attachment=session.attach(storePath,options);
+        const auto write=[&](const std::string& name,const std::string& text){
+            const auto path=directory.path/name;std::ofstream(path)<<text;return path;};
+        const auto stamped=readUmbilicusFile(write("stamped.json",
+            R"({"points":[[0,10,20],[400,12,22]],"metadata":{"volume_width":200,"volume_height":200,"volume_slices":800}})"));
+        require(stamped.points.front()==std::array<double,3>{20,10,0}&&stamped.volumeSlices==800,"a stamped file reads XYZ with its frame");
+        const UmbilicusTargetGrid half{{100,100,400},std::nullopt};
+        const auto binding=umbilicusBinding(stamped,half,std::nullopt);
+        require(!binding.refusal&&!binding.confirm&&binding.storedUnitsPerVoxel==2.0,"a stamped grid binds as stated");
+        importVolumeUmbilicus(session,attachment,"v",stamped,*binding.storedUnitsPerVoxel,"stamped",{{"tool","test"}});
+        auto found=volumeUmbilicus(session,attachment,"v");
+        require(found&&found->name=="stamped"&&found->points.front()==std::array<double,3>{10,5,0},"imported in the volume's voxels");
+        const auto plain=readUmbilicusFile(write("plain.txt","# z, y, x\n0, 10, 20\n390, 12, 22\n"));
+        const auto asked=umbilicusBinding(plain,half,std::nullopt);
+        require(!asked.refusal&&asked.confirm,"an unstamped file is confirmed");
+        importVolumeUmbilicus(session,attachment,"v",plain,1.0,"plain",{{"tool","test"}});
+        found=volumeUmbilicus(session,attachment,"v");
+        require(found&&found->name=="plain","importing again replaces the volume's umbilicus");
+        const auto malformed=readUmbilicusFile(write("bad.json",R"({"points":[[0,1,2]],"metadata":{"volume_width":-5}})"));
+        require(umbilicusBinding(malformed,half,std::nullopt).refusal.has_value(),"malformed frame metadata is refused");
+        require(umbilicusBinding(stamped,{{150,150,600},std::nullopt},std::nullopt).refusal.has_value(),
+                "a stamped grid that is no rescale of the volume is refused");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

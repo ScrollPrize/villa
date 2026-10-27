@@ -62,6 +62,7 @@ add_library(vc_objects ${_vc_store_library_type}
     SurfaceProximity.cpp
     ObjectCopy.cpp
     VolumeUmbilicus.cpp
+    UmbilicusFile.cpp
     AttachedDocument.cpp
     SurfaceCreate.cpp
     sync/Synchronize.cpp
