@@ -2214,18 +2214,6 @@ TEST_CASE("arrow pan stop target picks the next control point in the direction")
     CHECK(*skipped == doctest::Approx(28.0));
 }
 
-TEST_CASE("line annotation closest control point chooses nearest valid position")
-{
-    const std::vector<double> positions{12.0, 20.0, 40.0};
-
-    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
-        26.0,
-        positions);
-
-    REQUIRE(closest.has_value());
-    CHECK(*closest == doctest::Approx(20.0));
-}
-
 TEST_CASE("line annotation control point navigation ignores invalid positions")
 {
     using vc3d::line_annotation::GeneratedOverlay;
@@ -2248,16 +2236,11 @@ TEST_CASE("line annotation control point navigation ignores invalid positions")
     const auto next = vc3d::line_annotation::nextGeneratedControlPointLinePosition(
         20.0,
         positions);
-    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
-        26.0,
-        positions);
 
     REQUIRE(previous.has_value());
     REQUIRE(next.has_value());
-    REQUIRE(closest.has_value());
     CHECK(*previous == doctest::Approx(10.0));
     CHECK(*next == doctest::Approx(30.0));
-    CHECK(*closest == doctest::Approx(30.0));
 }
 
 TEST_CASE("line annotation remapped line position follows the same fiber spot")
@@ -4081,7 +4064,6 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
          {1.0f, 0.0f, 0.0f},
          {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
-         {0.0f, 0.0f, 1.0f},
          false},
     };
 
@@ -4147,7 +4129,6 @@ TEST_CASE("line annotation generated strip static and dynamic overlays split own
         {7,
          {0.0f, 0.0f, 0.0f},
          {1.0f, 0.0f, 0.0f},
-         {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          {0.0f, 0.0f, 1.0f},
          false},

@@ -120,7 +120,6 @@ struct GeneratedOverlay {
         // With isLinkCandidate: designated as an ADJACENT link candidate, a
         // green triangle rather than a green circle.
         bool isAdjacentLinkCandidate = false;
-        bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
         char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
@@ -166,9 +165,6 @@ struct GeneratedOverlay {
         cv::Vec3f localDirection{std::numeric_limits<float>::quiet_NaN(),
                                  std::numeric_limits<float>::quiet_NaN(),
                                  std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN()};
         cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN()};
@@ -227,7 +223,6 @@ struct GeneratedOverlay {
         GeneratedCurrentLineMarkerState::Neutral;
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
-    bool currentLineMarkerAsCross = false;
     // Present for strip overlays. Line positions above remain in original
     // LineModel point-index coordinates and are mapped only while projecting.
     vc::lasagna::LineStripPositionMap stripPositionMap;
@@ -1246,28 +1241,6 @@ inline std::optional<double> nextGeneratedControlPointLinePosition(
         }
     }
     return next;
-}
-
-inline std::optional<double> closestGeneratedControlPointLinePosition(
-    double currentLinePosition,
-    const std::vector<double>& controlLinePositions)
-{
-    if (!std::isfinite(currentLinePosition)) {
-        return std::nullopt;
-    }
-    std::optional<double> closest;
-    double closestDistance = std::numeric_limits<double>::infinity();
-    for (const double position : controlLinePositions) {
-        if (!std::isfinite(position)) {
-            continue;
-        }
-        const double distance = std::abs(position - currentLinePosition);
-        if (distance < closestDistance) {
-            closest = position;
-            closestDistance = distance;
-        }
-    }
-    return closest;
 }
 
 inline constexpr double kGeneratedParallaxGhostMinimumOpacity = 0.3;

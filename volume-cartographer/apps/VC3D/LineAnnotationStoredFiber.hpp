@@ -91,7 +91,6 @@ struct StoredFiber {
     std::vector<StoredControlPoint> controlPoints;
     mutable std::vector<cv::Vec3d> linePoints;
     mutable bool linePointsLoaded = true;
-    std::optional<vc::objects::FiberDetail> catalogDetail;
     // Stored snapshots only. Live-session branch metadata must be converted
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.

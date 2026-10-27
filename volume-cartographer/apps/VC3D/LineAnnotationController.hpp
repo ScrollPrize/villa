@@ -244,31 +244,11 @@ public:
         QString text;
     };
 
-    // Persisted branch-link metadata. Live branch refs are coupled to
-    // LineAnnotationSession::controlPoints, reciprocal refs in linked fibers, and
-    // saved-fiber control-point ordering. Any live mutation of control points or
-    // branches must go through the private session paths that call
-    // syncLinkedBranchMetadataAfterFiberModification().
-    // Adjacent links have the same entry schema as ordinary branches, in a
-    // separate top-level array in explicit transfer JSON. Store links carry
-    // their kind on a single shared edge.
-    static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
-
     using FiberBranchRef = vc3d::line_annotation::FiberBranchRef;
 
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
-    using OptimizationTaskFactory =
-        std::function<OptimizationTaskResult(std::filesystem::path,
-                                             std::vector<vc3d::line_annotation::LineControlPoint>,
-                                             std::vector<cv::Vec3d>,
-                                             cv::Vec3d,
-                                             InitialDirectionMode,
-                                             int,
-                                             bool,
-                                             int,
-                                             int)>;
 
     struct ResolvedFiberOptimizationInputs {
         std::shared_ptr<vc::lasagna::LasagnaDataset> normalDataset;
@@ -364,7 +344,6 @@ public:
     // setting is on. Enables editing in the most recent pane of this fiber
     // (as its Enable editing button does); false when it cannot.
     bool enableFiberEditing(uint64_t fiberId);
-    void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
@@ -380,7 +359,6 @@ public:
     void saveOpenFibers();
     using FiberSaveCompletion = std::function<void(bool, const QString&)>;
     void saveOpenFibersHeadless(FiberSaveCompletion onFinished);
-    void closeFiberWindowForSurface(const std::string& surfaceName);
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
@@ -464,20 +442,6 @@ public:
     [[nodiscard]] bool errorDialogsSuppressed() const;
     [[nodiscard]] QString takeLastSuppressedError();
 
-    void setDatasetPickerForTesting(DatasetPicker picker);
-    void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
-    // Replaces the modal QMessageBox that guards fiber optimization-mode
-    // switches; the callback receives the requested mode and returns
-    // whether to proceed.
-    void setModeChangeConfirmationForTesting(
-        std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer);
-    // Replaces the modal QMessageBox shown when the two fibers of a merge
-    // carry different optimization modes; the callback receives (clicked,
-    // candidate) modes and returns the mode to keep, or nullopt to cancel.
-    void setMergeModePickerForTesting(
-        std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
-            vc3d::line_annotation::FiberOptimizationMode,
-            vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
 
@@ -516,9 +480,7 @@ signals:
         uint64_t fiberId,
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
         std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
-    void fiberSaved(uint64_t fiberId, uint64_t generation);
     void fiberRetired(const QString& objectUuid);
-    void fibersDeleted(std::vector<uint64_t> fiberIds);
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -1112,8 +1074,6 @@ private:
     // false right after it returns false without publishing anything.
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::function<bool()>& stillValid = {});
-    bool materializeGeneratedViews(LineAnnotationSession& session,
-                                   const std::string& surfacePrefix);
     void handleShowAsMesh(const std::string& surfaceName);
     [[nodiscard]] std::vector<std::string> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
@@ -1126,15 +1086,6 @@ private:
     void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
-    [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
-                                                             std::vector<cv::Vec3d> initialLinePoints,
-                                                             cv::Vec3d sourceSliceNormal,
-                                                             InitialDirectionMode directionMode,
-                                                             int initialCenterlineLengthVx,
-                                                             bool fullOptimization = false,
-                                                             int activeStart = -1,
-                                                             int activeEnd = -1) const;
     // Current heads of the given fiber UUIDs (nullopt: every active fiber),
     // decoded for editing. Branch refs resolve against their endpoints in the
     // same snapshot; missing and retired objects are skipped. Line points are
@@ -1175,7 +1126,6 @@ private:
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
     void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
-    [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
     [[nodiscard]] uint64_t nextFiberId() const;
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
@@ -1298,7 +1248,6 @@ private:
     void runDialogAutoLink(const DialogAutoLinkCapture& capture);
     [[nodiscard]] AutoLinkChoiceSource choiceSourceFromSession(
         const LineAnnotationSession& session, const std::vector<cv::Vec3d>* linePoints) const;
-    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
@@ -1385,11 +1334,6 @@ private:
     std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
         const std::vector<FiberBranchRef>& branches) const;
     void saveOpenFibersCore();
-    // Closes every dialog pane whose session holds one of the fibers. The
-    // single-dialog invariant means at most the invoking pane matches
-    // today; sweeping by fiber id keeps split/merge retirement correct by
-    // construction rather than by that invariant.
-    void closeDialogPanesForFibers(const std::vector<uint64_t>& fiberIds);
     [[nodiscard]] std::shared_ptr<LineAnnotationSession> makeIntersectionLineSession(
         const StoredFiber& fiber,
         double focusLinePosition,
@@ -1527,13 +1471,6 @@ private:
     // Surfaces with a debounced side-strip dispatch scheduled.
     std::unordered_set<std::string> _pendingSideStripQuerySurfaces;
     DatasetPicker _datasetPicker;
-    OptimizationTaskFactory _optimizationTaskFactory;
-    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>
-        _modeChangeConfirmation;
-    std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
-        vc3d::line_annotation::FiberOptimizationMode,
-        vc3d::line_annotation::FiberOptimizationMode)>
-        _mergeModePicker;
     bool _errorDialogsSuppressed = false;
     // Off while changed store fibers reopen: each keeps the editing state it had.
     bool _applyOpenFibersEditable = true;
@@ -1605,9 +1542,6 @@ private:
     // read-only), so an operation can refuse BEFORE it mutates anything.
     [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
                                                                   const StoredFiber& far) const;
-    // Deduplicates the deferred re-optimization prompt across reentrant
-    // fiber (re)loads.
-    bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for a designated control

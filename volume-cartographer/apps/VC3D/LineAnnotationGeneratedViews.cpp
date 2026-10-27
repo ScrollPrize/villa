@@ -753,31 +753,11 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     generatedStripLinePositionToScene(
                         viewer, quad, overlay.currentLinePosition, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
-                    if (overlay.currentLineMarkerAsCross) {
-                        constexpr qreal kCrossRadius = 5.5;
-                        auto crossStyle = currentMarkerStyle;
-                        crossStyle.brushColor = Qt::transparent;
-                        crossStyle.penCap = Qt::RoundCap;
-                        crossStyle.penJoin = Qt::RoundJoin;
-                        crossStyle.penWidth = 2.0;
-                        crossStyle.z = 170.0;
-                        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                            {markerScene + QPointF{-kCrossRadius, -kCrossRadius},
-                             markerScene + QPointF{kCrossRadius, kCrossRadius}},
-                            false,
-                            crossStyle});
-                        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                            {markerScene + QPointF{-kCrossRadius, kCrossRadius},
-                             markerScene + QPointF{kCrossRadius, -kCrossRadius}},
-                            false,
-                            crossStyle});
-                    } else {
-                        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                            markerScene,
-                            4.0,
-                            true,
-                            currentMarkerStyle});
-                    }
+                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                        markerScene,
+                        4.0,
+                        true,
+                        currentMarkerStyle});
                 }
             }
         }

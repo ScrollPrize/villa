@@ -61,7 +61,6 @@
 #include <QVariant>
 #include <QTimer>
 #include <QToolButton>
-#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -1638,28 +1637,6 @@ void LineAnnotationDialog::setGeneratedControlPoints(
     rebuildGeneratedOverlays();
 }
 
-void LineAnnotationDialog::setGeneratedBranchLinePoints(
-    std::vector<std::vector<cv::Vec3f>> branchLinePoints)
-{
-    if (_closing || !_hasGeneratedViews) {
-        return;
-    }
-    _generatedViews.branchLinePoints = std::move(branchLinePoints);
-    _generatedViews.fiberIntersections.clear();
-    rebuildGeneratedOverlays();
-}
-
-void LineAnnotationDialog::setGeneratedBranchLinks(
-    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks)
-{
-    if (_closing || !_hasGeneratedViews) {
-        return;
-    }
-    _generatedViews.branchLinks = std::move(branchLinks);
-    _generatedViews.fiberIntersections.clear();
-    rebuildGeneratedOverlays();
-}
-
 void LineAnnotationDialog::setGeneratedBranchOverlayData(
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
     std::vector<std::vector<cv::Vec3f>> branchLinePoints,
@@ -2042,11 +2019,6 @@ vc3d::line_annotation::GeneratedOverviewGateState LineAnnotationDialog::overview
     return gate;
 }
 
-bool LineAnnotationDialog::lineGeometryInFlight() const
-{
-    return vc3d::line_annotation::generatedOverviewGeometryInFlight(overviewGateState());
-}
-
 void LineAnnotationDialog::setFiberDisplayName(const QString& name)
 {
     _fiberDisplayName = name;
@@ -2150,7 +2122,6 @@ void LineAnnotationDialog::closeEvent(QCloseEvent* event)
     if (_closeAfterFinalizationAllowed) {
         _closing = true;
         clearGeneratedOverlayRefreshConnections();
-        cancelControlPointPreviewAnimation();
         cancelArrowPan();
         if (_lineUpdateTimer) {
             _lineUpdateTimer->stop();
@@ -2202,111 +2173,6 @@ CChunkedVolumeViewer* LineAnnotationDialog::addPane(
     bindPaneInteractions(surfaceName, viewer, true);
     _panes.push_back(Pane{surfaceName, viewer, subWindow});
     return viewer;
-}
-
-bool LineAnnotationDialog::setGeneratedRows(
-    const std::vector<std::vector<std::pair<std::string, QString>>>& rows,
-    const CChunkedVolumeViewer::CameraState& camera,
-    const std::map<std::string, GeneratedOverlay>& overlays)
-{
-    if (!_viewerManager || !_layout) {
-        return false;
-    }
-
-    if (_showAsMeshAction) {
-        _showAsMeshAction->setEnabled(false);
-    }
-    if (_fullOptimizationAction) {
-        _fullOptimizationAction->setEnabled(false);
-    }
-    if (_resetViewsAction) {
-        _resetViewsAction->setEnabled(false);
-    }
-
-    clearGeneratedOverlayRefreshConnections();
-    cancelArrowPan();
-    // Drop all viewer references BEFORE deleting the widgets: destruction
-    // delivers events through our eventFilter, which must not dereference a
-    // half-destroyed viewer (QPointers only clear once ~QObject runs).
-    _panes.clear();
-    _stripViewers.clear();
-    _stripHoverLocalPos.clear();
-    _stripHoverDrawn.clear();
-    _overviewBar = nullptr;
-    _currentCutOverlaySwapPending = false;
-    _sideCutOverlaySwapPending = false;
-    _stripOverlaySwapPending.clear();
-    clearFastGeneratedOverlayItemRefs();
-    _currentCutViewer = nullptr;
-    _sideCutViewer = nullptr;
-    _suppressPaneClosed = true;
-    if (_mdiArea) {
-        _layout->removeWidget(_mdiArea);
-        delete _mdiArea;
-        _mdiArea = nullptr;
-    }
-    _suppressPaneClosed = false;
-    _hasGeneratedViews = false;
-    _stripContextIndex.reset();
-    _overviewSettledLayout = {};
-    _overviewProvisionalFractions.clear();
-    _overviewLineSpaceControls.clear();
-    _overviewDisplayedLayout = {};
-    _controlsRebased = false;
-    _pendingPlacements.clear();
-    _overviewResolvedArcs.clear();
-    _currentCutManualRotation = cv::Matx33f::eye();
-    _currentCutManualRotationActive = false;
-    _currentCutNormalOffsetVx = 0.0;
-    _currentCutStraightAheadActive = false;
-    _sideCutNormalOffsetVx = 0.0;
-    _generatedControlIndex = {};
-    _haveInitialCurrentCutCamera = false;
-    _haveInitialSideCutCamera = false;
-    _initialStripCameras.clear();
-
-    for (const auto& row : rows) {
-        if (row.empty()) {
-            continue;
-        }
-
-        auto* rowWidget = new QWidget(this);
-        rowWidget->installEventFilter(this);
-        auto* rowLayout = new QHBoxLayout(rowWidget);
-        rowLayout->setContentsMargins(0, 0, 0, 0);
-        rowLayout->setSpacing(0);
-        _layout->addWidget(rowWidget, 1);
-
-        for (const auto& [surfaceName, title] : row) {
-            auto* base = _viewerManager->createViewerInWidget(
-                surfaceName,
-                rowWidget,
-                ViewerManager::ViewerRole::Annotation);
-            if (!base) {
-                return false;
-            }
-            auto* viewer = qobject_cast<CChunkedVolumeViewer*>(base->asQObject());
-            if (!viewer) {
-                return false;
-            }
-            viewer->setObjectName(title);
-            viewer->applyCameraState(generatedPaneCamera(viewer, camera), false);
-            bindPaneInteractions(surfaceName, viewer, false);
-            rowLayout->addWidget(viewer, 1);
-            _panes.push_back(Pane{surfaceName, viewer, {}});
-            if (auto overlay = overlays.find(surfaceName); overlay != overlays.end()) {
-                setGeneratedOverlay(surfaceName, viewer, overlay->second);
-            }
-        }
-    }
-    const bool ok = !_panes.empty();
-    if (_showAsMeshAction) {
-        _showAsMeshAction->setEnabled(ok);
-    }
-    if (_fullOptimizationAction) {
-        _fullOptimizationAction->setEnabled(ok);
-    }
-    return ok;
 }
 
 void LineAnnotationDialog::bindPaneInteractions(const std::string& surfaceName,
@@ -2489,29 +2355,6 @@ void LineAnnotationDialog::clearGeneratedOverlayRefreshConnections()
     _generatedOverlayRefreshQueued = false;
     _generatedOverlayRefreshGeneration = 0;
     _generatedOverlayRefreshCoveredGeneration = 0;
-}
-
-void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
-                                               CChunkedVolumeViewer* viewer,
-                                               const GeneratedOverlay& overlay)
-{
-    if (!kGeneratedLineAnnotationOverlaysEnabled) {
-        return;
-    }
-    if (!viewer) {
-        return;
-    }
-
-    QPointer<CChunkedVolumeViewer> viewerPtr(viewer);
-    const auto apply = [this, surfaceName, viewerPtr, overlay]() {
-        if (!viewerPtr) {
-            return;
-        }
-        applyGeneratedOverlay(surfaceName, viewerPtr, overlay);
-    };
-    viewer->renderVisible(true, "line annotation overlay");
-    apply();
-    viewer->connectOverlaysUpdated(this, apply);
 }
 
 double LineAnnotationDialog::carriedLinePosition(
@@ -3702,16 +3545,6 @@ void LineAnnotationDialog::clearStripContextHover(size_t stripIndex)
     }
 }
 
-void LineAnnotationDialog::applyGeneratedOverlay(const std::string& surfaceName,
-                                                 CChunkedVolumeViewer* viewer,
-                                                 const GeneratedOverlay& overlay)
-{
-    if (!kGeneratedLineAnnotationOverlaysEnabled) {
-        return;
-    }
-    vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
-}
-
 std::string LineAnnotationDialog::applyOverlayForViewer(const std::string& surfaceName,
                                                         CChunkedVolumeViewer* viewer,
                                                         const GeneratedOverlay& overlay)
@@ -3720,12 +3553,6 @@ std::string LineAnnotationDialog::applyOverlayForViewer(const std::string& surfa
         return {};
     }
     return vc3d::line_annotation::applyGeneratedOverlay(viewer, surfaceName, overlay);
-}
-
-void LineAnnotationDialog::clearControlPointContextPreview(const std::string& surfaceName,
-                                                           CChunkedVolumeViewer* viewer)
-{
-    vc3d::line_annotation::clearGeneratedControlPointContextPreview(viewer, surfaceName);
 }
 
 vc3d::line_annotation::GeneratedOverlay LineAnnotationDialog::sideCutOverlayFor(
@@ -4012,17 +3839,6 @@ bool LineAnnotationDialog::shiftCurrentCutStraightAheadByScrollSteps(int steps)
     return true;
 }
 
-void LineAnnotationDialog::cancelControlPointPreviewAnimation()
-{
-    if (!_controlPointPreviewAnimation) {
-        return;
-    }
-    auto* animation = _controlPointPreviewAnimation.data();
-    _controlPointPreviewAnimation = nullptr;
-    animation->stop();
-    animation->deleteLater();
-}
-
 void LineAnnotationDialog::startArrowPan(int direction)
 {
     if (!_hasGeneratedViews || _generatedViews.linePoints.empty() || direction == 0) {
@@ -4064,7 +3880,6 @@ void LineAnnotationDialog::startArrowPan(int direction)
         return;
     }
 
-    cancelControlPointPreviewAnimation();
     setCurrentCutFollowsStripMouse(false);
     const bool wasIdle = (_arrowPanDirection == 0);
     _arrowPanDirection = direction;
@@ -4425,7 +4240,6 @@ void LineAnnotationDialog::jumpToPreviousControlPoint()
     if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
         return;
     }
-    cancelControlPointPreviewAnimation();
     cancelArrowPan();
     const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
         _generatedViews.controlPoints);
@@ -4442,7 +4256,6 @@ void LineAnnotationDialog::jumpToNextControlPoint()
     if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
         return;
     }
-    cancelControlPointPreviewAnimation();
     cancelArrowPan();
     const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
         _generatedViews.controlPoints);
@@ -4452,52 +4265,6 @@ void LineAnnotationDialog::jumpToNextControlPoint()
     if (next) {
         setCurrentLinePosition(*next);
     }
-}
-
-void LineAnnotationDialog::previewClosestControlPoint()
-{
-    if (!_hasGeneratedViews || _generatedViews.controlPoints.empty()) {
-        return;
-    }
-    cancelControlPointPreviewAnimation();
-    cancelArrowPan();
-    const double originalPosition = _currentLinePosition;
-    const auto positions = vc3d::line_annotation::finiteGeneratedControlPointLinePositions(
-        _generatedViews.controlPoints);
-    const auto closest = vc3d::line_annotation::closestGeneratedControlPointLinePosition(
-        originalPosition,
-        positions);
-    if (!closest) {
-        return;
-    }
-    setCurrentLinePosition(*closest);
-
-    auto* animation = new QVariantAnimation(this);
-    _controlPointPreviewAnimation = animation;
-    constexpr int kClosestControlPointHoldMs = 500;
-    constexpr int kClosestControlPointReturnMs = 2000;
-    constexpr int kClosestControlPointTotalMs =
-        kClosestControlPointHoldMs + kClosestControlPointReturnMs;
-    animation->setDuration(kClosestControlPointTotalMs);
-    animation->setStartValue(*closest);
-    animation->setKeyValueAt(static_cast<double>(kClosestControlPointHoldMs) /
-                                 static_cast<double>(kClosestControlPointTotalMs),
-                             *closest);
-    animation->setEndValue(originalPosition);
-    connect(animation, &QVariantAnimation::valueChanged, this, [this, animation](const QVariant& value) {
-        if (_controlPointPreviewAnimation == animation) {
-            setCurrentLinePosition(value.toDouble());
-        }
-    });
-    connect(animation, &QVariantAnimation::finished, this, [this, animation]() {
-        if (_controlPointPreviewAnimation == animation) {
-            _controlPointPreviewAnimation = nullptr;
-            animation->deleteLater();
-        }
-    });
-    QTimer::singleShot(30, animation, [animation]() {
-        animation->start();
-    });
 }
 
 bool LineAnnotationDialog::shiftSideCutPlaneNormalOffsetByScrollSteps(int steps)
@@ -5049,11 +4816,6 @@ const std::vector<double>& LineAnnotationDialog::currentLineArclengths() const
     return vc3d::line_annotation::lineArclengthsUsable(arclengths, _generatedViews.linePoints.size())
         ? arclengths
         : kNone;
-}
-
-LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay() const
-{
-    return vc3d::line_annotation::makeGeneratedStaticStripOverlay(_generatedViews);
 }
 
 LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(
@@ -6203,14 +5965,6 @@ bool LineAnnotationDialog::updateSidePlaneSurface(PlaneSurface* plane, double li
     }
     plane->setFromNormalAndUp(origin, normal, tangent);
     return true;
-}
-
-QPointF LineAnnotationDialog::stripLinePositionToScene(CChunkedVolumeViewer* viewer,
-                                                       QuadSurface* surface,
-                                                       double linePosition) const
-{
-    return vc3d::line_annotation::generatedStripLinePositionToScene(
-        viewer, surface, linePosition, &_generatedViews.stripPositionMap);
 }
 
 void LineAnnotationDialog::keyPressEvent(QKeyEvent* event)

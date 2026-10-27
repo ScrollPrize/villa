@@ -389,7 +389,6 @@ constexpr int kSolveDispatchDebounceMs = 150;
 // Quiet window coalescing the several overlay-rebuild-triggered side-strip
 // intersection requests of one placement into a single dispatch.
 constexpr int kSideStripQueryDebounceMs = 150;
-constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
 
 using Clock = std::chrono::steady_clock;
 
@@ -676,29 +675,6 @@ uint64_t sideStripRequestCacheKey(
     return seed;
 }
 
-std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
-sideStripMarkersFromIntersections(
-    const std::vector<vc::fiber_tracer::FiberSideStripIntersection>& intersections)
-{
-    std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
-    markers.reserve(intersections.size());
-    for (const auto& intersection : intersections) {
-        vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker marker;
-        marker.point = toVec3f(intersection.point);
-        marker.fiberId = intersection.fiberId;
-        marker.segmentIndex = intersection.segmentIndex;
-        marker.arclength = intersection.arclength;
-        marker.distance = intersection.distance;
-        marker.projectedBranchLink =
-            intersection.source == vc::fiber_tracer::FiberSideStripIntersectionSource::BranchLink;
-        if (marker.projectedBranchLink && finitePoint(intersection.connectorStart)) {
-            marker.connectorStart = toVec3f(intersection.connectorStart);
-        }
-        markers.push_back(marker);
-    }
-    return markers;
-}
-
 double elapsedMs(Clock::time_point start, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -953,21 +929,6 @@ void addUniqueSorted(std::vector<std::string>& values, const std::string& value)
     std::sort(values.begin(), values.end());
 }
 
-std::vector<std::string> normalizedFiberTagsFromJson(const nlohmann::json& tags)
-{
-    std::vector<std::string> result;
-    if (!tags.is_array()) {
-        throw std::runtime_error("tags must be an array");
-    }
-    for (const auto& tag : tags) {
-        if (!tag.is_string()) {
-            throw std::runtime_error("tags entries must be strings");
-        }
-        addUniqueSorted(result, QString::fromStdString(tag.get<std::string>()).trimmed().toStdString());
-    }
-    return result;
-}
-
 cv::Vec3d interpolatedPointAtLinePosition(const std::vector<cv::Vec3d>& points,
                                           double linePosition)
 {
@@ -990,91 +951,6 @@ std::vector<cv::Vec3d> linePointPositions(const vc::lasagna::LineModel& line)
         points.push_back(point.position);
     }
     return points;
-}
-
-cv::Vec3f interpolatedUpAtLinePosition(const std::vector<cv::Vec3f>& upVectors,
-                                       double linePosition,
-                                       const cv::Vec3d& tangent)
-{
-    if (upVectors.empty() || !std::isfinite(linePosition)) {
-        return {0.0f, 1.0f, 0.0f};
-    }
-    linePosition = std::clamp(linePosition, 0.0, static_cast<double>(upVectors.size() - 1));
-    const int lower = static_cast<int>(std::floor(linePosition));
-    const int upper = std::min<int>(lower + 1, static_cast<int>(upVectors.size()) - 1);
-    cv::Vec3f lowerUp = upVectors[static_cast<size_t>(lower)];
-    cv::Vec3f upperUp = upVectors[static_cast<size_t>(upper)];
-    if (!finitePoint(lowerUp) || !finitePoint(upperUp)) {
-        return {0.0f, 1.0f, 0.0f};
-    }
-    if (lowerUp.dot(upperUp) < 0.0f) {
-        upperUp *= -1.0f;
-    }
-    const float t = static_cast<float>(linePosition - static_cast<double>(lower));
-    cv::Vec3d up = toVec3d(lowerUp * (1.0f - t) + upperUp * t);
-    up -= tangent * up.dot(tangent);
-    up = normalizedOrZero(up);
-    return finiteDirection(up) ? toVec3f(up) : cv::Vec3f{0.0f, 1.0f, 0.0f};
-}
-
-std::optional<cv::Vec2f> stripLinePositionToSurfacePoint(QuadSurface* surface,
-                                                         double linePosition,
-                                                         const vc::lasagna::LineStripPositionMap* positionMap)
-{
-    if (!surface || !std::isfinite(linePosition)) {
-        return std::nullopt;
-    }
-    const auto* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return std::nullopt;
-    }
-    const double gridColumn = positionMap && positionMap->valid()
-        ? positionMap->originalPositionToStripGridColumn(linePosition)
-        : linePosition;
-    if (!std::isfinite(gridColumn)) {
-        return std::nullopt;
-    }
-    const cv::Vec2d surfacePoint = surface->gridToSurface(
-        {gridColumn, static_cast<double>(points->rows / 2)});
-    return cv::Vec2f{static_cast<float>(surfacePoint[0]),
-                     static_cast<float>(surfacePoint[1])};
-}
-
-void frameStripLineSpan(CChunkedVolumeViewer* viewer,
-                        QuadSurface* surface,
-                        double firstLinePosition,
-                        double secondLinePosition,
-                        const vc::lasagna::LineStripPositionMap* positionMap)
-{
-    if (!viewer || !surface ||
-        !std::isfinite(firstLinePosition) ||
-        !std::isfinite(secondLinePosition)) {
-        return;
-    }
-    const auto first = stripLinePositionToSurfacePoint(surface, firstLinePosition, positionMap);
-    const auto second = stripLinePositionToSurfacePoint(surface, secondLinePosition, positionMap);
-    if (!first || !second) {
-        return;
-    }
-    const double span = std::abs(static_cast<double>((*second)[0] - (*first)[0]));
-    if (!std::isfinite(span) || span <= 1.0e-6) {
-        return;
-    }
-    auto* view = viewer->graphicsView();
-    const int viewportWidth = view && view->viewport() ? view->viewport()->width() : 0;
-    if (viewportWidth <= 0) {
-        return;
-    }
-    constexpr double kViewportFill = 0.86;
-    auto camera = viewer->cameraState();
-    camera.surfacePtrX = static_cast<float>((static_cast<double>((*first)[0]) +
-                                             static_cast<double>((*second)[0])) * 0.5);
-    camera.surfacePtrY = static_cast<float>((static_cast<double>((*first)[1]) +
-                                             static_cast<double>((*second)[1])) * 0.5);
-    camera.scale = static_cast<float>(std::clamp(kViewportFill * static_cast<double>(viewportWidth) / span,
-                                                 0.01,
-                                                 100000.0));
-    viewer->applyCameraState(camera, true);
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
@@ -1141,8 +1017,6 @@ generatedControlMarkers(
             control.tags, vc3d::line_annotation::kBreakTag);
         marker.hasGapToNext = vc3d::line_annotation::spanIsGap(control.segmentToNext);
         marker.hasDamagedToNext = vc3d::line_annotation::spanIsDamaged(control.segmentToNext);
-        marker.hasTracedSegmentToNext =
-            vc3d::line_annotation::isAcceptedNativeTrace(control.segmentToNext);
         if (control.segmentToNext) {
             marker.interpolationGoal =
                 vc3d::line_annotation::segmentInterpolationGoalToString(
@@ -1271,15 +1145,6 @@ nlohmann::json controlsToJson(
     return array;
 }
 
-nlohmann::json linePointsToJson(const std::vector<cv::Vec3d>& points)
-{
-    nlohmann::json array = nlohmann::json::array();
-    for (const auto& point : points) {
-        array.push_back(pointToJson(point));
-    }
-    return array;
-}
-
 nlohmann::json linePointsToJson(const vc::lasagna::LineModel& line)
 {
     nlohmann::json array = nlohmann::json::array();
@@ -1366,22 +1231,6 @@ void writeLineDebugJson(const std::string& eventName,
     output << root.dump(2) << '\n';
 }
 
-cv::Vec3d pointFromJson(const nlohmann::json& value)
-{
-    if (!value.is_array() || value.size() != 3) {
-        throw std::runtime_error("Point must be a [x, y, z] array");
-    }
-    cv::Vec3d point{
-        value.at(0).get<double>(),
-        value.at(1).get<double>(),
-        value.at(2).get<double>(),
-    };
-    if (!finitePoint(point)) {
-        throw std::runtime_error("Point contains non-finite coordinates");
-    }
-    return point;
-}
-
 cv::Vec3d initialTangentForMode(
     LineAnnotationController::InitialDirectionMode mode,
     const cv::Vec3d& sourceSliceNormal,
@@ -1400,12 +1249,6 @@ cv::Vec3d initialTangentForMode(
         return normalizedOrZero(sliceNormal - gtNormal * sliceNormal.dot(gtNormal));
     }
     return normalizedOrZero(sliceNormal.cross(gtNormal));
-}
-
-void validateLasagnaManifest(const fs::path& manifestPath)
-{
-    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    vc::lasagna::LasagnaNormalSampler sampler(dataset);
 }
 
 LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
@@ -1727,8 +1570,6 @@ LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnot
         marker.localControlPoint = toVec3f(branch.controlPointPosition);
         marker.linkedControlPoint = toVec3f(branch.branchControlPointPosition);
         marker.localDirection = toVec3f(normalizedOrZero(branch.controlPointDirection));
-        marker.linkedDirection =
-            toVec3f(normalizedOrZero(branch.branchControlPointDirection));
         marker.planePoint = marker.linkedControlPoint;
         marker.estimated = false;
         markers.push_back(marker);
@@ -1834,29 +1675,10 @@ LineAnnotationController::~LineAnnotationController()
     _lineSolvePool.waitForDone();
 }
 
-void LineAnnotationController::setDatasetPickerForTesting(DatasetPicker picker)
-{
-    _datasetPicker = std::move(picker);
-}
-
-void LineAnnotationController::setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory)
-{
-    _optimizationTaskFactory = std::move(factory);
-}
-
-void LineAnnotationController::setModeChangeConfirmationForTesting(
-    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer)
-{
-    _modeChangeConfirmation = std::move(confirmer);
-}
-
 bool LineAnnotationController::confirmFiberOptimizationModeChange(
     const LineAnnotationSession& session,
     vc3d::line_annotation::FiberOptimizationMode requestedMode)
 {
-    if (_modeChangeConfirmation) {
-        return _modeChangeConfirmation(requestedMode);
-    }
     if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
         // Agent-driven flows are deliberate scripted actions; the 'reviewed'
         // tag is still stripped on the save that follows, so the new
@@ -1890,14 +1712,6 @@ bool LineAnnotationController::confirmFiberOptimizationModeChange(
     return prompt.clickedButton() == proceedButton;
 }
 
-void LineAnnotationController::setMergeModePickerForTesting(
-    std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
-        vc3d::line_annotation::FiberOptimizationMode,
-        vc3d::line_annotation::FiberOptimizationMode)> picker)
-{
-    _mergeModePicker = std::move(picker);
-}
-
 std::optional<vc3d::line_annotation::FiberOptimizationMode>
 LineAnnotationController::pickMergeOptimizationMode(
     const LineAnnotationSession& session,
@@ -1906,9 +1720,6 @@ LineAnnotationController::pickMergeOptimizationMode(
 {
     if (clickedMode == candidateMode) {
         return clickedMode;
-    }
-    if (_mergeModePicker) {
-        return _mergeModePicker(clickedMode, candidateMode);
     }
     if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
         // Agent-driven flows cannot answer modals; the clicked fiber's mode
@@ -4360,11 +4171,6 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     }
 }
 
-void LineAnnotationController::deleteFiber(uint64_t fiberId)
-{
-    deleteFibers({fiberId});
-}
-
 vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers(
     std::vector<uint64_t> fiberIds)
 {
@@ -4391,7 +4197,6 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
         // Retired UUIDs remain in history; old workers cannot recreate them.
         refreshChangedStoreFibers();
         for (const auto& fiber : retired) emit fiberRetired(QString::fromStdString(fiber.uuid));
-        emit fibersDeleted(outcome.deletedIds);
     } catch (const std::exception& error) {
         outcome.error = error.what(); outcome.aborted = true;
         refreshChangedStoreFibers();
@@ -4755,23 +4560,6 @@ void LineAnnotationController::addFibersToPointCollections(std::vector<uint64_t>
     }
 }
 
-void LineAnnotationController::closeDialogPanesForFibers(
-    const std::vector<uint64_t>& fiberIds)
-{
-    // Collect first: closing mutates pane state through queued events.
-    std::vector<std::string> surfaceNames;
-    for (const auto& pane : _panes) {
-        if (pane.session && pane.dialog &&
-            std::find(fiberIds.begin(), fiberIds.end(), pane.session->fiberId) !=
-                fiberIds.end()) {
-            surfaceNames.push_back(pane.surfaceName);
-        }
-    }
-    for (const auto& surfaceName : surfaceNames) {
-        closeFiberWindowForSurface(surfaceName);
-    }
-}
-
 void LineAnnotationController::saveOpenFibersCore()
 {
     std::vector<std::string> surfaces;
@@ -4816,14 +4604,6 @@ LineAnnotationDialog* LineAnnotationController::mostRecentLineAnnotationDialog()
         }
     }
     return nullptr;
-}
-
-void LineAnnotationController::closeFiberWindowForSurface(const std::string& surfaceName)
-{
-    auto* pane = paneForSurface(surfaceName);
-    if (pane && pane->dialog) {
-        pane->dialog->close();
-    }
 }
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
@@ -7580,7 +7360,6 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
         for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
             invalidateFiberAlignmentMetrics(batch[i].fiber.id, true);
         }
-        emit fibersDeleted(retiredIds);
         refreshBranchLineViews();
 
         // 9. The originals' panes close without a finalize or a close-save
@@ -10213,7 +9992,6 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
 
     const auto manifestPath = session.selectedManifestPath;
     const double workingToBaseScale = session.workingToBaseScale;
-    auto factory = _optimizationTaskFactory;
     auto controlPoints = session.controlPoints;
     std::vector<cv::Vec3d> initialLinePoints;
     initialLinePoints.reserve(session.optimizedLine.points.size());
@@ -10237,8 +10015,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
         breakExtrapolationDistanceVxForPane(paneForSurface(session.surfaceName)));
     session.runningStorePin = session.storePin;
     watcher->setFuture(QtConcurrent::run(&_lineSolvePool,
-                                          [factory,
-                                           manifestPath,
+                                          [manifestPath,
                                            controlPoints,
                                            initialLinePoints,
                                            sourceSliceNormal,
@@ -10254,17 +10031,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            focusBoundsBase,
                                            rayTailDistanceBaseVoxels]() mutable {
         OptimizationTaskResult task;
-        if (factory) {
-            task = factory(manifestPath,
-                           std::move(controlPoints),
-                           std::move(initialLinePoints),
-                           sourceSliceNormal,
-                           directionMode,
-                           initialCenterlineLengthVx,
-                           forceFullOptimization,
-                           activeStart,
-                           activeEnd);
-        } else if (normalSampler) {
+        if (normalSampler) {
             (void)dataset;
             task = optimizeLineWithSampler(manifestPath,
                                            std::move(controlPoints),
@@ -12168,41 +11935,6 @@ std::optional<std::string> LineAnnotationController::pickDataset(
     return picked.toStdString();
 }
 
-LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOptimizationTask(
-    fs::path manifestPath,
-    std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
-    std::vector<cv::Vec3d> initialLinePoints,
-    cv::Vec3d sourceSliceNormal,
-    InitialDirectionMode directionMode,
-    int initialCenterlineLengthVx,
-    bool forceFullOptimization,
-    int activeStart,
-    int activeEnd) const
-{
-    if (_optimizationTaskFactory) {
-        return _optimizationTaskFactory(std::move(manifestPath),
-                                        std::move(controlPoints),
-                                        std::move(initialLinePoints),
-                                        sourceSliceNormal,
-                                        directionMode,
-                                        initialCenterlineLengthVx,
-                                        forceFullOptimization,
-                                        activeStart,
-                                        activeEnd);
-    }
-    return optimizeLineFromManifest(std::move(manifestPath),
-                                    1.0,
-                                    std::move(controlPoints),
-                                    std::move(initialLinePoints),
-                                    sourceSliceNormal,
-                                    directionMode,
-                                    initialCenterlineLengthVx,
-                                    forceFullOptimization,
-                                    activeStart,
-                                    activeEnd,
-                                    breakExtrapolationDistanceVxFromSettings());
-}
-
 int LineAnnotationController::breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const
 {
     if (pane && pane->dialog) {
@@ -12391,12 +12123,6 @@ uint64_t LineAnnotationController::fiberIdForDialog(const LineAnnotationDialog* 
         }
     }
     return 0;
-}
-
-fs::path LineAnnotationController::relativeFiberPath(const StoredFiber& fiber) const
-{
-    if (!fiber.storePin) throw std::runtime_error("Fiber has not been committed to an object store");
-    return fs::path(fiber.storePin->object.storeUuid)/fiber.uuid;
 }
 
 std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
@@ -14945,7 +14671,6 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
                 session.controlPoints[i].volumePoint == saved->controlPoints[ordering[i]])
                 session.controlPoints[i].storeId = saved->controlPoints[ordering[i]].storeId;
     }
-    for (const auto& snapshot : snapshots) emit fiberSaved(snapshot.fiber.id, snapshot.fiber.generation);
 }
 
 void LineAnnotationController::waitForFiberSaves()
@@ -15042,7 +14767,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
             StoredFiber fiber;
             fiber.uuid = object.uuid;
             fiber.readOnly = readOnly;
-            fiber.linePointsLoaded = withLines; fiber.catalogDetail = object.fiber;
+            fiber.linePointsLoaded = withLines;
             fiber.fileName = object.name + ".json";
             fiber.generation = object.generation;
             fiber.tags = object.tags;
