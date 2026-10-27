@@ -1714,17 +1714,18 @@ class BaseTrainer:
             if checkpoint_loaded:
                 self._apply_loss_overrides(loss_overrides)
                 # Store any additional state (e.g., EMA model) for subclasses to use
-                try:
-                    ckpt = torch.load(self.mgr.checkpoint_path, map_location=self.device, weights_only=False)
-                    if isinstance(ckpt, dict) and 'ema_model' in ckpt:
-                        self._checkpoint_ema_state = ckpt['ema_model']
-                        print("Found EMA model state in checkpoint")
-                    if isinstance(ckpt, dict) and 'ema_optimizer_step' in ckpt:
-                        self._checkpoint_ema_optimizer_step = ckpt['ema_optimizer_step']
-                        print(f"Found EMA optimizer step in checkpoint: {self._checkpoint_ema_optimizer_step}")
-                    del ckpt
-                except Exception:
-                    pass
+                if not getattr(self.mgr, 'load_weights_only', False):
+                    try:
+                        ckpt = torch.load(self.mgr.checkpoint_path, map_location=self.device, weights_only=False)
+                        if isinstance(ckpt, dict) and 'ema_model' in ckpt:
+                            self._checkpoint_ema_state = ckpt['ema_model']
+                            print("Found EMA model state in checkpoint")
+                        if isinstance(ckpt, dict) and 'ema_optimizer_step' in ckpt:
+                            self._checkpoint_ema_optimizer_step = ckpt['ema_optimizer_step']
+                            print(f"Found EMA optimizer step in checkpoint: {self._checkpoint_ema_optimizer_step}")
+                        del ckpt
+                    except Exception:
+                        pass
 
             if checkpoint_loaded and self.mgr.load_weights_only:
                 scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
