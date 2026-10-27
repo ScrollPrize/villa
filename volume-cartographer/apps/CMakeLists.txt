@@ -121,36 +121,6 @@ target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
-set(vc_diffuse_winding_sources
-    diffusion/continuous3d.cpp
-    diffusion/continous.cpp
-    diffusion/discrete.cpp
-    diffusion/spiral_ceres.cpp
-    diffusion/spiral_common.cpp
-    diffusion/spiral.cpp
-    diffusion/spiral2.cpp
-    diffusion/spiral2cont.cpp
-    diffusion/support.cpp
-    diffusion/vc_diffuse_winding.cpp
-)
-
-# vc_diffuse_winding constructs a Qt VCCollection, so it compiles the shim
-# directly and links Qt; wrap the header for MOC to emit the vtable.
-qt6_wrap_cpp(vc_diffuse_winding_moc ${CMAKE_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
-add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources}
-    ${CMAKE_SOURCE_DIR}/core/src/VCCollection.cpp
-    ${vc_diffuse_winding_moc})
-target_include_directories(vc_diffuse_winding PRIVATE diffusion)
-target_link_libraries(vc_diffuse_winding
-        opencv_videoio
-        opencv_ximgproc
-        vc_core
-        Qt6::Core
-        Boost::program_options
-        OpenMP::OpenMP_CXX
-        Ceres::ceres
-)
-
 add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
 target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 
@@ -170,9 +140,8 @@ add_executable(vc_transform_geom src/vc_transform_geom.cpp)
 target_link_libraries(vc_transform_geom vc_core Boost::program_options)
 
 
-add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
-target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
-target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
+add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp)
+target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc OpenMP::OpenMP_CXX)
 
 # Estimate an umbilicus from a NormalGridVolume
 add_executable(vc_gen_umbilicus src/vc_gen_umbilicus.cpp)
@@ -229,7 +198,7 @@ set(VC_CLI_TARGETS
     vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
     vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
+    vc_tifxyz_gengt vc_tifxyz_mmap_prepare
     vc_merge_tifxyz vc_merge_patch vc_visualize
     vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
     vc_ngrids
@@ -263,7 +232,7 @@ if(VC_USE_PCH)
         vc_obj2tifxyz_legacy vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
         vc_calc_surface_metrics
-        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt vc_diffuse_winding
+        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_transform_geom
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
         vc_thinning

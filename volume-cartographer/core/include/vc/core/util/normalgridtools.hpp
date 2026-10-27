@@ -33,6 +33,11 @@ void align_and_filter_segments(const GridStore& grid_store, GridStore& result, c
 
 cv::Mat visualize_segment_directions(const GridStore& grid_store);
 
+// Adds each trace to the grid, resampled so that consecutive kept points are at
+// least `spiral_step` apart. Traces that end up with fewer than two points are
+// skipped.
+void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, GridStore& normal_grid, double spiral_step);
+
 struct SegmentInfo;
 class SegmentGrid;
 

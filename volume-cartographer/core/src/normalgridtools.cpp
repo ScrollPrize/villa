@@ -569,6 +569,32 @@ std::vector<std::shared_ptr<SegmentInfo>> SegmentGrid::nearest_neighbors(const c
     return candidates;
 }
 
+void populate_normal_grid(const std::vector<std::vector<cv::Point>>& traces, GridStore& normal_grid, double spiral_step) {
+    const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
+
+    for (const auto& trace : traces) {
+        if (trace.size() < 2) continue;
+
+        std::vector<cv::Point> resampled_path;
+        resampled_path.push_back(trace[0]);
+        cv::Point last_point = trace[0];
+
+        for (size_t i = 1; i < trace.size(); ++i) {
+            cv::Point current_point = trace[i];
+            auto v = current_point - last_point;
+            double dist_sq = v.ddot(v);
+            if (dist_sq >= target_dist_sq) {
+                resampled_path.push_back(current_point);
+                last_point = current_point;
+            }
+        }
+
+        if (resampled_path.size() >= 2) {
+            normal_grid.add(resampled_path);
+        }
+    }
+}
+
 std::shared_ptr<SegmentInfo> SegmentGrid::get_random_segment() {
     if (all_segments.empty()) {
         return nullptr;

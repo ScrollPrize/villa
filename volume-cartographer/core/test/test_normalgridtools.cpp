@@ -45,6 +45,20 @@ TEST_CASE("SegmentInfo: middle point and normal from two endpoints")
     CHECK_FALSE(s.flipped);
 }
 
+TEST_CASE("populate_normal_grid keeps points at least spiral_step apart and drops short traces")
+{
+    GridStore grid(cv::Rect(0, 0, 100, 100), 10);
+    const std::vector<std::vector<cv::Point>> traces = {
+        {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}},
+        {{50, 50}, {51, 50}},  // nothing 3 away: one point, dropped
+        {{10, 10}},            // a single point, dropped
+    };
+    populate_normal_grid(traces, grid, 3.0);
+    const auto paths = grid.get_all();
+    REQUIRE(paths.size() == 1);
+    CHECK(*paths[0] == std::vector<cv::Point>{{0, 0}, {3, 0}, {6, 0}});
+}
+
 TEST_CASE("SegmentInfo: diagonal endpoints produce unit normal")
 {
     SegmentInfo s(cv::Point(0, 0), cv::Point(3, 4), 0, 0);

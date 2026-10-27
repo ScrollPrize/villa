@@ -155,11 +155,10 @@ unstripped AppImage instead.
 Two size levers are applied by default:
 - **Strip + split debug info.** The Release build carries full DWARF (VC3D alone
   is ~490 MB unstripped); stripping reclaims it into the companion above.
-- **`EXCLUDE_TOOLS`.** `vc_render_video` and `vc_diffuse_winding` are dropped from
-  the AppImage — they are the only binaries that pull the ~87 MB
-  `opencv_videoio` → ffmpeg codec chain (x265/codec2/aom/SvtAv1/…), and neither
-  is used by any pipeline. They remain in the Docker image. Set `EXCLUDE_TOOLS=`
-  to keep them (adds ~45 MB to the download).
+- **`EXCLUDE_TOOLS`.** `vc_render_video` is dropped from the AppImage — it is
+  the only binary that pulls the ~87 MB `opencv_videoio` → ffmpeg codec chain
+  (x265/codec2/aom/SvtAv1/…), and no pipeline uses it. It remains in the Docker
+  image. Set `EXCLUDE_TOOLS=` to keep it (adds ~45 MB to the download).
 
 Where the ~116 MB goes (uncompressed AppDir ~354 MB, zstd-squashed): binaries
 are ~25 MB after stripping — the rest is genuinely-used shared libraries. The
