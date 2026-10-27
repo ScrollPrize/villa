@@ -3,12 +3,10 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <nlohmann/json.hpp>
+#include <vc_object_store/objects/ToolObjects.hpp>
 
-#include <chrono>
 #include <filesystem>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -23,10 +21,10 @@ struct StoreOutputArgs {
     bool parse(const std::string& arg);
 };
 
-// Surface objects for command-line tools: `--store PATH` with `--surface UUID`
-// inputs and new surface outputs that record their provenance. A hosted
-// replica syncs in the background and finish() waits until the tool's writes
-// reached the hub. Several tools may use the same replica at once.
+// Surface objects for command-line tools as QuadSurfaces: `--store PATH` with
+// `--surface UUID` inputs and new surface outputs that record their
+// provenance. The store's ToolObjects keeps what was read, decides frames and
+// pins, and waits for the hub (objects().finish()).
 class StoreSurfaces {
 public:
     StoreSurfaces(const std::filesystem::path& store, const std::string& tool);
@@ -57,27 +55,9 @@ public:
     // Replace the named channels ("mask" is validity) of a surface this tool
     // loaded with the surface's, the same way. Returns the new geometry revision.
     std::string updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names);
-    // Wait until this tool's writes reached the hub (no-op for local stores).
-    void finish(std::chrono::seconds timeout = std::chrono::seconds(120));
 
-    const std::shared_ptr<vc::objects::ObjectStoreSession>& session() const { return session_; }
-    const vc::objects::AttachmentIdentity& attachment() const { return attachment_; }
+    vc::objects::ToolObjects& objects() { return objects_; }
 
 private:
-    std::string tool_;
-    std::shared_ptr<vc::objects::ObjectStoreSession> session_;
-    vc::objects::AttachmentIdentity attachment_;
-    bool wrote_ = false;
-    // Object and geometry revisions of each loaded surface, the pins of updates.
-    // Loads may run on several threads.
-    std::mutex loadedMutex_;
-    struct Loaded {
-        std::string objectRevision, geometryRevision;
-        bool storedUnits = true;
-        // The volume it was read through; nullopt: stored coordinates.
-        std::optional<std::string> volume;
-    };
-    std::map<std::string, Loaded> loaded_;
-    // The pins of a surface this tool loaded in stored units; throws otherwise.
-    Loaded writable(const std::string& uuid);
+    vc::objects::ToolObjects objects_;
 };

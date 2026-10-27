@@ -378,7 +378,7 @@ int process_stored(StoreSurfaces& store, const std::string& uuid, const std::str
             const auto created = store.create(*refined, out, parameters, {surf->id});
             std::cout << "surface_uuid: " << created << std::endl;
         }
-        store.finish();
+        store.objects().finish();
     } catch (const std::exception& e) {
         std::cerr << "failed to refine stored surface " << uuid << ": " << e.what() << std::endl;
         return EXIT_FAILURE;

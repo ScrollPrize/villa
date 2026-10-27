@@ -850,7 +850,7 @@ int main(int argc, char** argv)
             const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
                                                {"orthogonalize", doOrtho}, {"trim", doTrim}};
             const auto uuid = store->create(result, name, parameters, {stored->id}, storeOptions->tags);
-            store->finish();
+            store->objects().finish();
             std::cout << "surface_uuid: " << uuid << "\n";
             return 0;
         }

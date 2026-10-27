@@ -4,18 +4,9 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 
-#include <cstdlib>
-#include <set>
 #include <stdexcept>
 
-StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool)
-    : tool_(tool), session_(std::make_shared<vc::objects::ObjectStoreSession>())
-{
-    vc::objects::OpenOptions options;
-    const char* user = std::getenv("USER");
-    options.author = user && *user ? user : tool;
-    attachment_ = session_->attach(store, options);
-}
+StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool) : objects_(store, tool) {}
 
 // Loaded surfaces keep the session (and its attachment) alive for their channels;
 // the session detaches when the last of them is gone.
@@ -26,11 +17,12 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
 {
     std::unique_ptr<QuadSurface> surface;
     std::string objectRevision, revision;
-    bool storedUnits = true;
-    session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
+    bool identity = true;
+    const auto& session = objects_.session();
+    session->read(objects_.attachment(), [&](const auto& db, const auto& txn, const auto&) {
         if (volume) {
             const auto view = vc::objects::GeometrySnapshot(db, txn).viewTransformedAt(uuid, *volume);
-            storedUnits = view.mapping() == vc::objects::VolumeAffine::identity();
+            identity = view.mapping() == vc::objects::VolumeAffine::identity();
             surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, &view);
         } else {
             surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
@@ -38,11 +30,8 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
         revision = db.currentGeometry(txn, surface->id)->uuid;
         objectRevision = db.currentObjectRevision(txn, surface->id)->uuid;
     });
-    {
-        std::lock_guard lock(loadedMutex_);
-        loaded_[surface->id] = {objectRevision, revision, storedUnits, volume};
-    }
-    surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
+    objects_.noteRead(surface->id, objectRevision, revision, volume, identity);
+    surface->setChannelLoader(store_channel_loader(session, objects_.attachment(), revision));
     return surface;
 }
 
@@ -50,30 +39,12 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
                                   const std::optional<std::string>& volume)
 {
-    auto coordinates = nlohmann::json::object();
-    std::optional<std::string> loadedIn;
-    {
-        std::lock_guard lock(loadedMutex_);
-        std::set<std::optional<std::string>> frames;
-        for (const auto& source : sources)
-            if (const auto found = loaded_.find(source); found != loaded_.end()) frames.insert(found->second.volume);
-        if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
-        if (!frames.empty()) loadedIn = *frames.begin();
-    }
-    if (volume) coordinates = vc::objects::volumeCoordinates(*volume, 1);
-    else if (loadedIn) coordinates = vc::objects::volumeCoordinates(*loadedIn, 1);
-    else if (!sources.empty())
-        session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
-            const auto source = db.objectByUuid(txn, sources.front());
-            if (!source) throw std::runtime_error("source object not found: " + sources.front());
-            const auto sourceMeta = nlohmann::json::parse(source->meta);
-            if (sourceMeta.contains("coordinates")) coordinates = sourceMeta.at("coordinates");
-        });
+    const auto coordinates = objects_.coordinatesFor(sources, volume);
     const auto uuid = vc::objects::util::newUuid();
-    session_->act(attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        create_quad_in_store(db, txn, uuid, surface, name, tags, coordinates, {tool_, parameters, sources});
+    objects_.session()->act(objects_.attachment(), {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        create_quad_in_store(db, txn, uuid, surface, name, tags, coordinates, {objects_.tool(), parameters, sources});
     });
-    wrote_ = true;
+    objects_.wrote();
     surface.id = uuid;
     return uuid;
 }
@@ -81,48 +52,29 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, storedUnits, volume] = writable(canonical);
+    const auto pins = objects_.writable(canonical);
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto& keep) {
-        revision = write_quad_rect_to_store(db, txn, canonical, surface, cv::Rect(0, 0, points.cols, points.rows),
-                                            geometryRevision, keep);
-    });
-    wrote_ = true;
+    objects_.session()->editKeepingRelationships(objects_.attachment(), {{canonical, pins.objectRevision}}, {},
+        [&](auto& db, auto& txn, const auto& keep) {
+            revision = write_quad_rect_to_store(db, txn, canonical, surface, cv::Rect(0, 0, points.cols, points.rows),
+                                                pins.geometryRevision, keep);
+        });
+    objects_.wrote();
     return revision;
 }
 
 std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, storedUnits, volume] = writable(canonical);
+    const auto pins = objects_.writable(canonical);
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
-        revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
-    });
-    wrote_ = true;
+    objects_.session()->editKeepingRelationships(objects_.attachment(), {{canonical, pins.objectRevision}}, {},
+        [&](auto& db, auto& txn, const auto&) {
+            revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, pins.geometryRevision);
+        });
+    objects_.wrote();
     return revision;
-}
-
-StoreSurfaces::Loaded StoreSurfaces::writable(const std::string& uuid)
-{
-    std::lock_guard lock(loadedMutex_);
-    const auto found = loaded_.find(uuid);
-    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    // Writing a mapped grid back would rewrite every stored coordinate.
-    if (!found->second.storedUnits)
-        throw std::runtime_error("surface " + uuid + " was loaded through a volume mapping other than the identity");
-    return found->second;
-}
-
-void StoreSurfaces::finish(std::chrono::seconds timeout)
-{
-    session_->finalize();
-    if (!wrote_) return;
-    const auto status = session_->syncHubAndWait(attachment_, timeout);
-    if (status && (!status->error.empty() || !status->conflicts.empty()))
-        throw std::runtime_error("writes did not reach the hub: " +
-                                 (status->error.empty() ? std::string("unresolved hub conflicts") : status->error));
 }
 
 bool StoreOutputArgs::parse(const std::string& arg)

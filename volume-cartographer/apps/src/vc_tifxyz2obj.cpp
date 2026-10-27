@@ -358,7 +358,7 @@ int main(int argc, char *argv[])
         try {
             StoreSurfaces store(argv[2], "vc_tifxyz2obj");
             surf = store.load(argv[4], true, volume_uuid);
-            obj_path = store.session()->artifactDirectory(store.attachment(), argv[4]) / name;
+            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), argv[4]) / name;
         } catch (const std::exception& error) {
             std::cerr << "error when loading " << argv[4] << ": " << error.what() << std::endl;
             return EXIT_FAILURE;

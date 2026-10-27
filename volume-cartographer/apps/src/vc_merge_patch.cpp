@@ -1176,9 +1176,9 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces*
         // A stored parent is edited in place; its revision history replaces backups.
         std::cout << "[6/6] publishing the patched parent " << parent.name << "\n";
         const auto revision = store->update(parent.name, *parent.qs);
-        store->finish();
+        store->objects().finish();
         std::cout << "geometry_revision: " << revision << "\n";
-        summary_path = store->session()->artifactDirectory(store->attachment(), parent.name) / "merge_patch_summary.json";
+        summary_path = store->objects().session()->artifactDirectory(store->objects().attachment(), parent.name) / "merge_patch_summary.json";
     } else {
         std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
                   << " (snapshot to " << parent.path.parent_path().string()

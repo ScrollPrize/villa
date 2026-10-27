@@ -1190,7 +1190,7 @@ int main(int argc, char *argv[])
         store.emplace(store_path, "vc_grow_seg_from_segments");
         tgt_dir = std::filesystem::temp_directory_path() / ("vc-grow-segments-" + vc::objects::util::newUuid());
         std::vector<std::string> uuids;
-        store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
@@ -1217,7 +1217,7 @@ int main(int argc, char *argv[])
     auto finish_store = [&] {
         std::error_code error;
         if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, error)) {
-            const auto debug = store->session()->artifactDirectory(store->attachment(), published.front()) / "grow_debug";
+            const auto debug = store->objects().session()->artifactDirectory(store->objects().attachment(), published.front()) / "grow_debug";
             std::filesystem::rename(tgt_dir, debug, error);
             if (error) {
                 error.clear();
@@ -1226,7 +1226,7 @@ int main(int argc, char *argv[])
             if (error) std::cerr << "keeping grow debug output at " << tgt_dir << ": " << error.message() << std::endl;
         }
         if (!error) std::filesystem::remove_all(tgt_dir, error);
-        store->finish();
+        store->objects().finish();
     };
     params["tgt_dir"] = tgt_dir.string();
 

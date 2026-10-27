@@ -2254,13 +2254,13 @@ int gmBlendAndRasterize(GMAlignState& st, int strip_cols)
         const auto& first = st.surfs.at(st.names.front()).qs->meta;
         const std::string name = (first.contains("name") ? first["name"].get_string() : st.names.front()) + "_merged";
         const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.storeOptions->tags);
-        const auto artifacts = cfg.store->session()->artifactDirectory(cfg.store->attachment(), uuid);
+        const auto artifacts = cfg.store->objects().session()->artifactDirectory(cfg.store->objects().attachment(), uuid);
         std::cout << "writing OBJ to " << artifacts / "merge.obj" << "\n";
         gmWriteObj(mesh, obj_header, artifacts / "merge.obj");
         summary["output"] = uuid;
         summary["obj_out"] = (artifacts / "merge.obj").string();
         writeSummary(artifacts / "merge_summary.json");
-        cfg.store->finish();
+        cfg.store->objects().finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
         return 0;
     }

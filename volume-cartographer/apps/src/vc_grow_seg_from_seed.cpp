@@ -480,7 +480,7 @@ static int run_main(int argc, char *argv[])
 
     // The volume's umbilicus, in its (level 0) voxels, unless the parameters name one.
     if (store && volume_uuid && !params.contains("umbilicus_path") && !params.contains("umbilicus_points")) {
-        if (const auto umbilicus = vc::objects::volumeUmbilicus(*store->session(), store->attachment(), *volume_uuid)) {
+        if (const auto umbilicus = vc::objects::volumeUmbilicus(*store->objects().session(), store->objects().attachment(), *volume_uuid)) {
             auto points = Json::array();
             for (const auto& p : umbilicus->points) {
                 auto xyz = Json::array();
@@ -500,7 +500,7 @@ static int run_main(int argc, char *argv[])
         query.tolerance = tolerance;
         query.volume = volume_uuid;
         std::vector<vc::objects::SurfaceProximityHit> hits;
-        store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
             hits = db.nearestSurfaces(txn, query);
         });
         return hits;
@@ -663,7 +663,7 @@ static int run_main(int argc, char *argv[])
         if (store) {
             // One candidate loaded at a time; overlaps are counted with the store's proximity query.
             std::vector<std::string> candidates;
-            store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
                 vc::objects::ObjectSelection selection;
                 selection.kind = "surface";
                 selection.volume = volume_uuid;
@@ -834,7 +834,7 @@ static int run_main(int argc, char *argv[])
     auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
         const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
                                         volume_uuid);
-        store->finish();
+        store->objects().finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
 

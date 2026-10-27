@@ -354,7 +354,7 @@ int main(int argc, char *argv[])
             StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
             const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
                                            parameters, source_surface.empty() ? std::vector<std::string>{} : std::vector<std::string>{source_surface}, store_output.tags, store_output.volume);
-            store.finish();
+            store.objects().finish();
             std::cout << "surface_uuid: " << uuid << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Error storing surface: " << e.what() << std::endl;

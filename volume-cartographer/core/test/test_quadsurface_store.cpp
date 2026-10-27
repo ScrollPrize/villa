@@ -258,7 +258,7 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         CHECK_THROWS(surfaces.load(uuid, true, std::string("other-volume")));
         // A volume registered to "vol" (here shifted by 10 in x) reads through the store's mapping.
         const auto registration = util::newUuid();
-        surfaces.session()->act(surfaces.attachment(), {{registration, std::nullopt}}, [&](auto& db, auto& txn) {
+        surfaces.objects().session()->act(surfaces.objects().attachment(), {{registration, std::nullopt}}, [&](auto& db, auto& txn) {
             VolumeAffine shift; shift(0, 3) = 10;
             db.registerVolumeTransform(txn, "vol", "registered", shift, "test registration", registration);
         });
@@ -311,8 +311,8 @@ TEST_CASE("Tools create surfaces with provenance and push them to a hub")
         (*input->rawPointsPtr())(1, 1)[2] = 5.f;
         created = surfaces.create(*input, "grown", nlohmann::json{{"steps", 3}}, {source}, {"paths"});
         CHECK(input->id == created);
-        CHECK(fs::is_directory(surfaces.session()->artifactDirectory(surfaces.attachment(), created)));
-        surfaces.finish();
+        CHECK(fs::is_directory(surfaces.objects().session()->artifactDirectory(surfaces.objects().attachment(), created)));
+        surfaces.objects().finish();
     }
     auto viewer = ObjectStore::open(dir / "viewer.vcobj", options);
     hubPull(viewer);

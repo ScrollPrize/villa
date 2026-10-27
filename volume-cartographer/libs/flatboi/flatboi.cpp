@@ -1089,14 +1089,14 @@ static int run_store(const StoreOutputArgs& output, const std::string& source, c
   const std::string name = !output.name.empty() ? output.name
       : (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi";
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
-  const auto artifacts = store.session()->artifactDirectory(store.attachment(), uuid);
+  const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
   for (const auto& entry : fs::directory_iterator(report_dir)) {
     std::error_code ignored;
     fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
   }
   std::error_code ignored;
   fs::remove_all(report_dir, ignored);
-  store.finish();
+  store.objects().finish();
   std::cout << "surface_uuid: " << uuid << std::endl;
   return 0;
 }

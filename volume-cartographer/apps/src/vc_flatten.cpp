@@ -136,7 +136,7 @@ int main(int argc, char* argv[]) {
         if (store) {
             std::cout << "Storing the uv channel of " << surf->id << std::endl;
             std::cout << "geometry_revision: " << store->updateChannels(surf->id, *surf, {"uv"}) << std::endl;
-            store->finish();
+            store->objects().finish();
         } else {
             // Save the original surface with UV channel
             std::cout << "Saving surface with UV channel to: " << outputPath << std::endl;
@@ -162,7 +162,7 @@ int main(int argc, char* argv[]) {
             const nlohmann::json parameters = {{"iterations", config.maxIterations}, {"downsample", config.downsampleFactor},
                                                {"abf", config.useABF}, {"scale_to_original_area", config.scaleToOriginalArea}};
             const auto uuid = store->create(*flatSurf, name, parameters, {surf->id}, storeOptions->tags);
-            store->finish();
+            store->objects().finish();
             std::cout << "surface_uuid: " << uuid << std::endl;
         } else {
             // Save the flattened surface
