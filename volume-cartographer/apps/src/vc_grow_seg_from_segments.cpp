@@ -1212,11 +1212,20 @@ int main(int argc, char *argv[])
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
+    // The debug output moves into the first published surface's artifacts;
+    // across filesystems it is copied. It is kept where it is if neither works.
     auto finish_store = [&] {
-        std::error_code ignored;
-        if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, ignored))
-            std::filesystem::rename(tgt_dir, store->session()->artifactDirectory(store->attachment(), published.front()) / "grow_debug", ignored);
-        std::filesystem::remove_all(tgt_dir, ignored);
+        std::error_code error;
+        if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, error)) {
+            const auto debug = store->session()->artifactDirectory(store->attachment(), published.front()) / "grow_debug";
+            std::filesystem::rename(tgt_dir, debug, error);
+            if (error) {
+                error.clear();
+                std::filesystem::copy(tgt_dir, debug, std::filesystem::copy_options::recursive, error);
+            }
+            if (error) std::cerr << "keeping grow debug output at " << tgt_dir << ": " << error.message() << std::endl;
+        }
+        if (!error) std::filesystem::remove_all(tgt_dir, error);
         store->finish();
     };
     params["tgt_dir"] = tgt_dir.string();

@@ -2593,15 +2593,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         disconnect(*connection);
         _growPatchSeedJob.reset();
 
-        const bool silentExecution =
-            _cmdRunner && _cmdRunner->currentExecutionIsSilent();
-
+        // The runner's own completion handler reports a failure.
         if (!success) {
-            if (!silentExecution) {
-                QMessageBox::critical(_parentWidget,
-                                      tr("Error"),
-                                      tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
-            }
             emit statusMessage(tr("Create segment failed"), 3000);
             return;
         }
@@ -3274,9 +3267,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
         bool finalizeOutput = false;
         if (!success) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                                  tr("vc_tifxyz2zarr_sparse failed.\n%1")
-                                      .arg(message));
             emit statusMessage(tr("Rasterize failed"), 3000);
         } else if (!appendRasterizationMetadata(stagedOutputRootStr, validIds)) {
             emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
@@ -3912,9 +3902,6 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
             if (progressDialog) {
                 progressDialog->close();
             }
-            QMessageBox::critical(_parentWidget,
-                                  tr("Error"),
-                                  tr("vc_add_ignore_label failed.\n%1").arg(message));
             emit statusMessage(tr("Add ignore label failed"), 3000);
         } else if (useStaging) {
             if (progressDialog) {
