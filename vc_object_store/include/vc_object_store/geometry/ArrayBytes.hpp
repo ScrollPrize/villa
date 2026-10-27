@@ -68,8 +68,8 @@ template<class T> GeometryArray xyzArray(std::string name, std::string dtype,
 
 namespace vc::objects {
 // Values of stored array bytes (little-endian, the stored dtype: uint8_t |u1,
-// int32_t <i4, int64_t <i8, float <f4, double <f8), e.g. from readGeometryArray
-// or one item of a PackedGeometryArray.
+// int32_t <i4, int64_t <i8, float <f4, double <f8), e.g. from readGeometryArray,
+// readGeometryRanges or one item of a PackedGeometryArray.
 template<class T> std::vector<T> scalarsFromBytes(std::span<const uint8_t> bytes)
 {
     if (bytes.size() % sizeof(T)) throw std::runtime_error("invalid scalar array size");

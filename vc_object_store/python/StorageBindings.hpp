@@ -17,6 +17,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "vc_object_store/objects/GeometryIngest.hpp"
+#include "vc_object_store/objects/GeometryExport.hpp"
 #include "internal/Anchors.hpp"
 #include "internal/JsonFields.hpp"
 #include "internal/RecordFields.hpp"
@@ -40,6 +41,11 @@ bool has(const nb::dict& d, const char* key) { return d.contains(key) && !d[key]
 std::string getStr(const nb::dict& d, const char* key, const std::string& fallback = "")
 {
     return has(d, key) ? nb::cast<std::string>(d[key]) : fallback;
+}
+
+int64_t getInt(const nb::dict& d, const char* key, int64_t fallback = 0)
+{
+    return has(d, key) ? nb::cast<int64_t>(d[key]) : fallback;
 }
 
 std::vector<std::string> getTags(const nb::dict& d)
@@ -86,6 +92,26 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
     vo::detail::validateAnchor(a);
     return a;
 }
+
+nb::dict anchorToPy(const vo::Anchor& a)
+{
+    nb::dict d;
+    if (a.wholeGeometry) d["whole_geometry"] = true;
+    if (!a.channels.empty()) d["channels"] = a.channels;
+    if (!a.metadataKeys.empty()) d["metadata_keys"] = a.metadataKeys;
+    if (!a.points.empty()) {
+        nb::list points;
+        for (const auto& point : a.points) {
+            nb::dict value; value["array"] = point.array; value["index"] = point.index; points.append(value);
+        }
+        d["points"] = points;
+    }
+    if (a.position) d["position"] = nb::make_tuple((*a.position)[0], (*a.position)[1], (*a.position)[2]);
+    if (a.direction) d["direction"] = nb::make_tuple((*a.direction)[0], (*a.direction)[1], (*a.direction)[2]);
+    return d;
+}
+
+nb::str pyStr(const std::string& s) { return nb::str(s.data(), s.size()); }
 
 void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::string>* fields = nullptr)
 {
@@ -139,6 +165,47 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
         });
     });
     return r;
+}
+
+nb::dict edgeToPy(const vo::EdgeRecord& e, const std::set<std::string>* fields = nullptr)
+{
+    nb::dict d;
+    commonToPy(d, e, fields);
+    d["a"] = e.aUuid;
+    d["b"] = e.bUuid;
+    if (!fields || fields->contains("a_anchor")) d["a_anchor"] = anchorToPy(e.aAnchor);
+    if (!fields || fields->contains("b_anchor")) d["b_anchor"] = anchorToPy(e.bAnchor);
+    return d;
+}
+
+vo::EdgeRecord edgeFromPy(const nb::dict& d)
+{
+    vo::EdgeRecord e;
+    e.uuid = getStr(d, "uuid");
+    e.kind = getStr(d, "kind");
+    e.aUuid = getStr(d, "a");
+    e.bUuid = getStr(d, "b");
+    if (has(d, "a_anchor")) e.aAnchor = anchorFromPy(d["a_anchor"]);
+    if (has(d, "b_anchor")) e.bAnchor = anchorFromPy(d["b_anchor"]);
+    e.tags = getTags(d);
+    if (has(d, "meta")) e.meta = jsonDumps(d["meta"]);
+    return e;
+}
+
+std::vector<vo::GeometryArrayEdit> geometryEditsFromPy(const nb::list& input)
+{
+    std::vector<vo::GeometryArrayEdit> result;
+    for (const auto item : input) {
+        const auto entry = nb::cast<nb::dict>(item);
+        const auto bytes = nb::cast<nb::bytes>(entry["data"]);
+        vo::GeometryArrayEdit edit;
+        edit.array = nb::cast<std::string>(entry["array"]);
+        edit.elementOffset = nb::cast<int64_t>(entry["element_offset"]);
+        const auto* p = reinterpret_cast<const uint8_t*>(bytes.c_str());
+        edit.bytes.assign(p, p + bytes.size());
+        result.push_back(std::move(edit));
+    }
+    return result;
 }
 
 vo::GeometryArray arrayFromPy(const nb::handle& item)
@@ -355,3 +422,27 @@ struct PyObjectWriteTxn {
 
 }
 
+vo::GeometrySequenceEdit sequenceEditFromPy(const nb::dict& input) {
+    vo::GeometrySequenceEdit edit;
+    edit.array=nb::cast<std::string>(input["array"]);
+    edit.start=nb::cast<int64_t>(input["start"]); edit.eraseCount=nb::cast<int64_t>(input["erase_count"]);
+    if (has(input,"transformed_annotations")) edit.transformedAnnotations=jsonDumps(input["transformed_annotations"]);
+    if (has(input,"parts")) for (const auto item:nb::cast<nb::list>(input["parts"])) {
+        const auto p=nb::cast<nb::dict>(item); vo::GeometrySequencePart part;
+        if (has(p,"revision")) part.revision=nb::cast<std::string>(p["revision"]);
+        part.start=getInt(p,"start"); part.count=getInt(p,"count");
+        if (has(p,"reverse")) part.reverse=nb::cast<bool>(p["reverse"]);
+        if (has(p,"data")) { const auto bytes=nb::cast<nb::bytes>(p["data"]); const auto* b=reinterpret_cast<const uint8_t*>(bytes.c_str()); part.bytes.assign(b,b+bytes.size()); }
+        if (has(p,"ids")) part.ids=nb::cast<std::vector<int64_t>>(p["ids"]);
+        if (has(p,"annotations")) part.annotations=jsonDumps(p["annotations"]);
+        edit.parts.push_back(std::move(part));
+    }
+    return edit;
+}
+vo::GeometrySurfaceResize surfaceResizeFromPy(const nb::dict& input) {
+    vo::GeometrySurfaceResize resize;
+    resize.row=nb::cast<int64_t>(input["row"]); resize.column=nb::cast<int64_t>(input["column"]);
+    resize.rows=nb::cast<int64_t>(input["rows"]); resize.columns=nb::cast<int64_t>(input["columns"]);
+    nb::dict data; data["kind"]="surface"; data["arrays"]=input["fill"];
+    resize.fill=geometryFromPy(data).arrays; return resize;
+}

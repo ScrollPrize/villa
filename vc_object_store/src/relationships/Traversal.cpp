@@ -164,6 +164,18 @@ std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::str
                               : componentIds(db, objectUuid, edgeKindFilter, includeRetired, adjacentFilter));
 }
 
+std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
+                                                  const std::vector<std::string>& edgeKindFilter,
+                                                  const std::atomic_bool* cancel, bool includeRetired,
+                                              std::optional<bool> adjacentFilter, bool applicableOnly) const
+{
+    if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    if (applicableOnly) requirePublishedGraphRead(txn);
+    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired,
+                                adjacentFilter, applicableOnly ? this : nullptr, &txn));
+}
+
 namespace {
 void finishGraph(GraphReadView& result, sqlite3* db)
 {
@@ -224,6 +236,71 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     }
     finishGraph(result, db);
     return result;
+}
+
+GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelection& selection,
+                                         const EdgeSelection& edges) const
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    requirePublishedGraphRead(txn);
+    validateEdgeSelection(edges);
+    if (edges.endpointUuids)
+        throw std::invalid_argument("graph endpoint scope is specified by its revision selection");
+    GraphReadView result;
+    result.selectedObjects.emplace(); result.selectedRelationships.emplace();
+    RevisionSelection resolved;
+    for (const auto& [object, revision] : selection) {
+        const auto uuid = formatUuid(parseUuid(object));
+        const auto value = revision ? objectRevision(txn, *revision) : currentObjectRevision(txn, uuid);
+        if (!value || value->objectUuid != uuid || value->deleted)
+            throw std::invalid_argument("object history: selection revision does not belong to object");
+        if (!resolved.emplace(uuid, value->uuid).second)
+            throw std::invalid_argument("duplicate object in revision selection");
+    }
+    std::map<std::string, uint64_t> nodes;
+    for (const auto& [object, revision] : resolved) {
+        auto value = *objectRevision(txn, *revision);
+        nodes.emplace(object, result.objectUuids.size());
+        result.objectUuids.push_back(object); result.generations.push_back(value.record.generation);
+        result.geometryRevisions.push_back(value.geometryRevision);
+        result.selectedObjects->push_back(std::move(value));
+    }
+    auto graphEdges = edges;
+    if (!graphEdges.kind) graphEdges.attachments = false;
+    for (auto& selected : relationshipsAt(txn, resolved))
+        if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
+            result.selectedRelationships->push_back(std::move(selected.relationship));
+    auto& relationships = *result.selectedRelationships;
+    std::sort(relationships.begin(), relationships.end(), [](const auto& a, const auto& b) { return a.record.uuid < b.record.uuid; });
+    if (edges.limit && relationships.size() > static_cast<size_t>(*edges.limit)) relationships.resize(*edges.limit);
+    for (const auto& relationship : relationships) {
+        const auto& edge = relationship.record;
+        result.edgeUuids.push_back(edge.uuid);
+        result.endpoints.push_back({nodes.at(edge.aUuid), nodes.at(edge.bUuid)});
+    }
+    finishGraph(result, db);
+    return result;
+}
+
+std::vector<std::string> GraphReadView::reachableWithin(const std::string& objectUuid, int maxDepth,
+                                                       const std::atomic_bool* cancel) const
+{
+    if (maxDepth < 0) throw std::invalid_argument("object store: maxDepth must be >= 0");
+    checkTraversalCancelled(cancel);
+    const auto found = std::find(objectUuids.begin(), objectUuids.end(), formatUuid(parseUuid(objectUuid)));
+    if (found == objectUuids.end()) throw std::invalid_argument("object not in graph: " + objectUuid);
+    const auto start = static_cast<size_t>(found - objectUuids.begin());
+    const auto nodes = breadthFirst(start, maxDepth, cancel, [&](size_t node, auto visit) {
+        for (auto i = offsets[node]; i < offsets[node+1]; ++i) visit(neighbours[i], [] { return true; });
+    });
+    std::vector<std::string> result; result.reserve(nodes.size());
+    for (auto node : nodes) result.push_back(objectUuids[node]);
+    return result;
+}
+
+std::vector<std::string> GraphReadView::componentOf(const std::string& objectUuid, const std::atomic_bool* cancel) const
+{
+    return reachableWithin(objectUuid, INT_MAX, cancel);
 }
 
 } // namespace vc::objects

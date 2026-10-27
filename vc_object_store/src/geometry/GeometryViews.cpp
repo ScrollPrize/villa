@@ -119,6 +119,11 @@ TransformedGeometryView GeometryView::viewTransformedAt(const std::string& targe
     return TransformedGeometryView(snapshot.geometry(id,state_->revision.uuid),*mapping,target,scale);
 }
 
+std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
+    state_->read->require();
+    return state_->read->db->availableTransforms(*state_->read->txn,state_->revision.objectUuid);
+}
+
 void GeometrySnapshot::close() { state_->txn = nullptr; state_->owned.reset(); state_->lease.reset(); }
 bool GeometrySnapshot::active() const { return state_->txn && state_->txn->active(); }
 std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind,
@@ -288,6 +293,29 @@ TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t col
     }
     return result;
 }
+std::vector<GeometryArrayEdit> TransformedGeometryView::coordinateEdits(const std::string& array,int64_t start,
+    const std::vector<geometry::Point>& desired) const {
+    const auto shown=points(array,start,desired.size()); // checks array/range and snapshot lifetime
+    const auto inverse=mapping_.inverse();
+    std::vector<GeometryArrayEdit> edits;
+    for(size_t i=0;i<desired.size();++i) {
+        if(desired[i]==shown[i])continue;
+        auto canonical=inverse.apply(desired[i]);
+        for(double v:canonical)if(!std::isfinite(v))throw std::invalid_argument("coordinate edit is not finite");
+        GeometryArrayEdit edit{array,3*(start+int64_t(i)),{}};
+        if(std::holds_alternative<TrackView>(source_)) {
+            std::array<int32_t,3> integer;
+            for(int k=0;k<3;++k) {
+                const double v=std::round(canonical[k]);
+                if(v<std::numeric_limits<int32_t>::min()||v>std::numeric_limits<int32_t>::max())throw std::overflow_error("track coordinate exceeds int32");
+                integer[k]=int32_t(v);
+            }
+            edit.bytes=detail::scalarBytes<int32_t>(integer);
+        } else edit.bytes=detail::scalarBytes<double>(canonical);
+        edits.push_back(std::move(edit));
+    }
+    return edits;
+}
 void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& txn) const {
     const auto& pinned=revision();
     const auto head=db.currentGeometry(txn,pinned.objectUuid);
@@ -296,6 +324,16 @@ void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& 
         throw std::runtime_error("object changed; reopen its transformed view");
     const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->record.meta),target_,targetScale_);
     if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");
+}
+std::string TransformedGeometryView::writeCoordinates(ObjectStore& db,WriteTxn& txn,const std::string& array,int64_t start,
+    const std::vector<geometry::Point>& desired,const std::vector<GeometryEdgeEdit>& edges) const {
+    validateForWrite(db,txn);
+    return db.editGeometry(txn,revision().objectUuid,coordinateEdits(array,start,desired),revision().uuid,edges);
+}
+std::string TransformedGeometryView::writeSurface(ObjectStore& db,WriteTxn& txn,int64_t row,int64_t column,int64_t rows,int64_t columns,
+    const std::vector<geometry::SurfacePoint>& desired,const std::vector<GeometryEdgeEdit>& edges) const {
+    validateForWrite(db,txn);
+    return db.editGeometry(txn,revision().objectUuid,surfaceEdits(row,column,rows,columns,desired),revision().uuid,edges);
 }
 namespace {
 geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired,

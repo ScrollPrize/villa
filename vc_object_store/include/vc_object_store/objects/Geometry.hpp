@@ -68,6 +68,13 @@ struct GeometrySequenceEdit {
     std::optional<std::string> transformedAnnotations;
 };
 
+// New logical (r,c) maps to old (r+row,c+column). Negative offsets grow
+// top/left. Every array requires one explicitly typed fill pixel, even on crop.
+struct GeometrySurfaceResize {
+    int64_t row = 0, column = 0, rows = 0, columns = 0;
+    std::vector<GeometryArray> fill; // shape {1,1[,components]}, matching dtype
+};
+
 // Descriptors do not load payloads. Revision UUIDs are independent of object
 // UUIDs and content hashes. Parentage records edits, including undo/reverts.
 struct GeometryRevision {

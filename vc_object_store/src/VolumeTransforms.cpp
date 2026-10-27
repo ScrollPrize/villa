@@ -89,6 +89,17 @@ VolumeTransforms ObjectStore::volumeTransforms(const Txn& txn) const {
     }
     return result;
 }
+std::vector<vcr::catalog::TransformResolution> ObjectStore::availableTransforms(const Txn& txn,const std::string& uuid) const {
+    const auto object=objectByUuid(txn,uuid);
+    if(!object)throw std::invalid_argument("object not found");
+    const auto coordinates=geometryCoordinates(nlohmann::json::parse(object->meta).value("coordinates",nlohmann::json::object()));
+    if(coordinates["volume_uuid"].is_null()||coordinates["scale_factor"].is_null())return {};
+    const auto source=coordinates["volume_uuid"].get<std::string>();
+    const auto context=volumeTransforms(txn);
+    auto result=context.graph.available(source);
+    for(auto& resolution:result)resolution=context.resolve(source,resolution.target);
+    return result;
+}
 double ObjectStore::geometryLengthInVolume(const Txn& txn,const std::string& uuid,const std::string& target,double scale) const {
     const auto object=objectByUuid(txn,uuid);
     if(!object || (object->kind!="fiber"&&object->kind!="track"))throw std::invalid_argument("length requires fiber or track");

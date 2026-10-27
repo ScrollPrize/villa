@@ -566,6 +566,15 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
     return result;
 }
 
+std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn, const std::string& revisionUuid,
+    const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const
+{
+    (void)connection(txn);
+    return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+        return reader.ranges(arrayName, ranges);
+    });
+}
+
 std::vector<uint8_t> ObjectStore::readGeometryRectangle(const Txn& txn, const std::string& revisionUuid,
     const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
@@ -585,6 +594,18 @@ detail::SurfaceTile detail::surfaceTile(GeometryReader& reader, int64_t row, int
     for (size_t i = 0; i < tile.points.size(); ++i)
         tile.valid[i] = vc::geometry::validSurfacePoint(tile.points[i]) && (channel.empty() || channel[i]);
     return tile;
+}
+
+std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRectangles(const Txn& txn, const std::string& revisionUuid,
+    const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const
+{
+    (void)connection(txn);
+    return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+        std::vector<std::vector<uint8_t>> result;
+        result.reserve(rectangles.size());
+        for (const auto& r : rectangles) result.push_back(reader.rectangle(arrayName, r[0], r[1], r[2], r[3]));
+        return result;
+    });
 }
 
 } // namespace vc::objects

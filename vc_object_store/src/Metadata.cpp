@@ -109,6 +109,11 @@ void ObjectStore::bindGeometryCoordinates(WriteTxn& txn, const std::string& obje
     setMeta(txn, objectUuid, "coordinates", merged.dump());
 }
 
+void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
+{
+    mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
+}
+
 int64_t ObjectStore::journalPosition(const Txn& txn) const
 {
     Statement position(static_cast<sqlite3*>(connection(txn)), "SELECT COALESCE(MAX(seq),0) FROM journal");

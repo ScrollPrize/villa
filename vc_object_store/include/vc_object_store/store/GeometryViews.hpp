@@ -14,6 +14,7 @@ public:
     // This revision in `targetVolume`'s voxels; an older revision maps with the
     // coordinates of the latest object revision that held it.
     TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
+    std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
     const std::string& objectRevision() const;
 protected:
@@ -110,6 +111,10 @@ public:
     double targetScale() const {return targetScale_;}
     // Validate the pinned mapping and geometry before submitting inverse edits.
     void validateForWrite(const ObjectStore&, const Txn&) const;
+    std::string writeCoordinates(ObjectStore&, WriteTxn&, const std::string& array, int64_t start,
+        const std::vector<geometry::Point>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
+    std::string writeSurface(ObjectStore&, WriteTxn&, int64_t row, int64_t column, int64_t rows, int64_t columns,
+        const std::vector<geometry::SurfacePoint>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
     // Float32 surface consumer adapter. Validity remains separate from XYZ;
     // unchanged displayed vertices reuse the exact canonical float32 values.
     geometry::Surface canonicalSurface(const geometry::Surface& desired) const;
@@ -126,6 +131,10 @@ public:
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
     TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
+    // Encode only explicitly changed positions; unchanged values reuse their
+    // original bytes. Track edits round to nearest, with ties away from zero.
+    std::vector<GeometryArrayEdit> coordinateEdits(const std::string& array,int64_t start,
+        const std::vector<geometry::Point>& desired) const;
 private:
     friend class GeometrySnapshot;
     friend class GeometryView;

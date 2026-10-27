@@ -17,18 +17,24 @@ from vc_object_store import ObjectStore
 with ObjectStore.create("objects.vcobj", author="reviewer") as store:
     report = store.ingest_geometry_source("surface", "/data/surface")
     assert not report["problems"], report["problems"]
-```
-
-```sh
-vc_object_links --db objects.vcobj --author reviewer --link-surface-overlaps
-vc_object_export --db objects.vcobj --uuid SURFACE_UUID --output /data/exported-surface
+    report = store.link_surface_overlaps()
+    assert not report["problems"], report["problems"]
+    surfaces = store.objects_by_kind("surface")
+    store.export_geometry(surfaces[0]["uuid"], "/data/exported-surface")
 ```
 
 Ingestion is **one-time**. Existing UUIDs (even unchanged or retired), duplicates,
 and missing/ambiguous source-link targets fail. Fiber directories and PCL
 documents publish atomically; packed tracks use per-track transactions and can
 report partial success. Track identity is dataset reference plus external key.
-Always inspect `problems`. Use store edits for subsequent changes.
+Always inspect `problems`.
+`ingest_registered_geometry` loads placeholders only if they have no geometry
+history, preserving unrelated metadata. Use store edits for subsequent changes.
+A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
+(public bucket) `storage_ref` is a remote tifxyz: ingestion downloads its
+`meta.json`, `x/y/z.tif` and, when present, `mask.tif`,
+decodes them like a local directory and stores the geometry, so the remote is
+read once. The placeholder, not the remote `meta.json`, supplies the identity.
 
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
@@ -39,9 +45,10 @@ edits, restoration and sync. Replacement can scan all affected IDs;
 ordinary resolution reads only referenced chunks or metadata-snapshot buckets.
 
 Native export selects an immutable object revision and stages output before publication;
-existing destinations are kept unless `--overwrite` is given. Surfaces export their channels as
+`overwrite=False` protects existing destinations. Surfaces export their channels as
 sidecar TIFFs; other kinds reject auxiliary arrays.
-Directory export currently requires Linux `renameat2`.
+Directory export currently requires Linux `renameat2`. Metadata-only
+`export_json` supports filters and field projection; it is not a geometry backup.
 Typed detail counts, lengths, dimensions and boxes are import summaries: use
 current geometry descriptors and spatial queries after edits.
 
@@ -113,8 +120,8 @@ identity and bindings accompany each object. `fiberRevisionJson` remains the
 geometry/annotation-only codec for consumers that read relationships separately.
 
 Object revisions capture metadata, geometry identity and relationship membership.
-`currentObjectRevision`, `objectRevision` and `objectHistory` expose them;
-`currentGeometry` and `geometryRevision` expose geometry (each names its parent).
+`current_object_revision`, `object_revision`, and `object_history` expose them;
+`current_geometry`, `geometry_revision`, and `geometry_history` expose geometry.
 Their UUIDs are distinct: metadata edits need not create geometry revisions.
 
 Pin all modified objects and participating relationship endpoints when preparing
@@ -137,19 +144,21 @@ publishes at most one revision per changed object, including shared endpoints.
 
 `published_at_us` is UTC Unix microseconds, shared by revisions in one action and
 strictly increasing between actions even if the clock goes backward.
-`revisionSelectionAt(txn, time)` selects the latest revisions at that time.
-Objects created later or physically deleted by then are excluded. Retired objects
-are omitted unless `includeRetired`. Restore historical content by publishing a
-new checked action, not by moving old heads.
+`revision_selection_at(time)` selects the latest revisions at that time;
+`revision_read_view_at(time)` returns their `objects`, `relationships`, and resolved
+`selection` together. Objects created later or physically deleted by then are
+excluded. Retired objects are omitted unless `include_retired=True`.
+`revision_read_view({uuid: revision_or_None})` uses an explicit closed selection;
+`None` resolves the latest head in that snapshot. Restore historical content by
+publishing a new checked action, not by moving old heads.
 
 ## Relationships and graphs
 
 Relationships are shared by both endpoints. Addition, removal or rebinding
-revises both objects (once for a self-link). `relationshipsAt(txn, selection)`
-takes an explicit closed selection (UUID to revision, or `nullopt` for the latest
-head in that snapshot) and returns immutable edge versions with
-`aRevision`/`bRevision` object pins and geometry pins. Resolve these pins rather
-than substituting current heads. It reports `applicable` only when both selected
+revises both objects (once for a self-link). `recorded_relationships(object_revision)`
+returns immutable edge versions with `a_revision`/`b_revision` object pins and
+geometry pins. Resolve these pins rather than substituting current heads.
+`relationships_at(selection)` reports `applicable` only when both selected
 endpoints share the same version and its geometry, metadata and lifecycle
 dependencies match. Missing endpoints are inapplicable.
 
@@ -158,57 +167,57 @@ or `whole_geometry`. Editing a dependency requires an explicit decision:
 
 | Decision | Effect |
 | --- | --- |
-| `keepRecordedRelationship` / `action="keep_recorded"` | Validate recorded identities and preserve historical pins; may be inapplicable now |
-| `retainRelationship` / `action="retain"` | Revalidate against resulting endpoints and publish shared new pins |
-| `updateEdge` / `action="update"` | Publish caller-supplied anchors after validation |
-| `removeEdge` / `action="remove"` | Remove the current relationship |
+| `keep_recorded_relationship` / `action="keep_recorded"` | Validate recorded identities and preserve historical pins; may be inapplicable now |
+| `retain_relationship` / `action="retain"` | Revalidate against resulting endpoints and publish shared new pins |
+| `update_edge` / `action="update"` | Publish caller-supplied anchors after validation |
+| `remove_edge` / `action="remove"` | Remove the current relationship |
 
-Geometry edge edits (`GeometryEdgeEdit`) specify `edgeUuid`, `expectedGeneration`,
-`action`, `aRevision` and `bRevision` (geometry UUIDs or `nullopt`); updates also
-supply `aAnchor` and `bAnchor`. Include expected object revisions for all validation
+Geometry `edge_edits` specify `edge_uuid`, `expected_generation`, `action`,
+`a_revision` and `b_revision` (geometry UUIDs or `None`); updates also supply
+`a_anchor` and `b_anchor`. Include expected object revisions for all validation
 endpoints in checked writes. Metadata/lifecycle decisions must match final state
 at commit. Unrelated metadata/point edits leave relationships applicable; physical
 or domain-specific validity remains the caller's responsibility.
 
 **Attachments are not graph links.** Edge kind `attachment` ties a data object
 to the object it describes (VC3D growth corrections, Lasagna fit results on a
-surface). `neighbours`, `componentOf`, `ObjectSelection::connectedTo` and graph
-read views skip attachments unless the `attachment` kind is requested;
-`edgesOf`, `selectEdges` and exports list them. Such point collections carry
-a record meta `role`; the point-collection linker never links them and
+surface). `neighbours`, `component`, `reachable_within`, `connected_to` and
+`graph_read` skip attachments unless the `attachment` kind is requested;
+`edges_of`, `select_edges` and exports list them. Such point collections carry
+a record meta `role`; `link_point_collections_to_surfaces` never links them and
 rejects them when named.
 
-**Same-winding queries must pass `adjacent = false`.** On `selectEdges`,
-`neighbours`, `componentOf` and `graphReadView`, it selects ordinary
-`fiber_branch` edges, including branches without the flag. `true` selects
-adjacent branches; `nullopt` does not filter. Explicit filters exclude other edge
+**Same-winding queries must pass `adjacent=False`.** On `select_edges`,
+`neighbours`, `component`, `reachable_within` and `graph_read`, it selects ordinary
+`fiber_branch` edges, including branches without the flag. `True` selects
+adjacent branches; `None` does not filter. Explicit filters exclude other edge
 kinds and malformed flags before traversal, including parallel edges.
-`applicableOnly` additionally checks current shared membership/dependencies;
-`includeRetired` does not override applicability. Edge pagination follows
+`applicable_only=True` additionally checks current shared membership/dependencies;
+`include_retired=True` does not override applicability. Edge pagination follows
 applicability filtering. Fiber imports reject contradictory ordinary/adjacent
 classifications, including reciprocal declarations, atomically.
 
-```cpp
-auto txn = store.read();
-vc::objects::EdgeSelection sameWinding;
-sameWinding.adjacent = false;
-auto graph = store.graphReadView(txn, objects, sameWinding);
-auto component = store.componentOf(txn, seed, {"fiber_branch"}, nullptr, false, false);
+```python
+with store.graph_read(revisions=selection, adjacent=False, approval_states=[]) as graph:
+    component = graph.component(seed)
+    records = graph.objects()
+    links = graph.edges()
+    packed = graph.read_geometry_arrays("points", nodes=[0, 1])
 ```
 
-Nodes are in canonical UUID order; traversal is breadth-first in edge-UUID order.
+`graph_read` defaults to approved edges; `approval_states=[]` includes all states.
+Explicit revision graphs always require applicability, retain isolated selected
+nodes, and cannot combine `revisions` with current object filters or
+`include_retired`. Nodes are in canonical UUID order; traversal is breadth-first
+in edge-UUID order. Current queries otherwise inspect current records.
 Applicability queries require a read transaction.
-
-Python's `graph_read(object_kind=None, object_uuids=[])` pins the selected objects
-in one read snapshot: `objects(fields)`, `object_uuids`, `geometry_revisions`,
-`generations` and `read_geometry_arrays(name)`. Graph views are thread-confined
-and must close before checkpointing. NumPy arrays are read-only and retain their
-buffers after closure, not the database transaction.
+Graph views are thread-confined and must close before checkpointing. NumPy arrays
+are read-only and retain their buffers after closure, not the database transaction.
 
 ## Retirement and restoration
 
 `retired` and `lifecycle_epoch` are library-managed revision fields. Use
-`retireObject(txn, uuid)` or `restoreObject(txn, uuid, sourceRevision)` in a
+`tx.retire_object(uuid)` or `tx.restore_object(uuid, source_revision=None)` in a
 checked write, with explicit decisions for every surviving incident edge after
 endpoint edits. Retirement retains geometry, metadata and history. Restoration
 uses the last published active content, or an explicit active revision of that
@@ -219,7 +228,7 @@ no-ops. Restoration does not recreate removed links or physically removed rows.
 Lifecycle epochs prevent preserved links from silently reactivating after
 restoration, even with identical geometry. Revalidate explicitly. Default current
 catalogs, spatial queries, traversal and exports omit retired objects and dormant
-edges; traversal cannot pass through retired nodes. `includeRetired`
+edges; traversal cannot pass through retired nodes. `include_retired=True`
 exposes them for inspection without asserting applicability. Direct UUID lookups,
 geometry and historical reads remain available. Lifecycle-only changes reuse
 payloads; restoring different geometry can rebuild spatial indexes.
@@ -227,7 +236,7 @@ payloads; restoring different geometry can rebuild spatial indexes.
 Application references should be ordinary `declared_reference` edges with
 explicit dependencies. Endpoint order is canonical, so put directional roles in
 metadata. Arbitrary UUID strings in JSON are not tracked references.
-`deleteObject` retains history and still rejects managed geometry/current edge
+`delete_object` retains history and still rejects managed geometry/current edge
 references. There is no history/payload purge API.
 
 ## Hosted hub and replicas
@@ -262,15 +271,15 @@ extension (stock OpenSSH does), or writes could not be made durable; the VFS
 refuses to open a hub for writing without it.
 - Without a registered authenticator, `ssh` runs in batch mode: keys and the
   agent only, and only hosts already in `known_hosts`.
-- With one (`vc::sftp::setAuthenticator`), every
+- With one (`vc::sftp::setAuthenticator`, Python `set_sftp_authenticator`), every
   ssh prompt (password, key passphrase, one-time code, accepting a new host key)
   goes to the application through `SSH_ASKPASS`, with ssh's own wording. The
   helper relays prompts through FIFOs in a private 0700 directory, so secrets
   never appear in arguments or the environment. An accepted answer is reused
   when a later connection to the same destination asks the same question; a
   question repeated within one connection means the answer was wrong, so the
-  user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal.
-  Prompts need Linux or macOS; on
+  user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal
+  (Python: `use_terminal_sftp_prompts()`). Prompts need Linux or macOS; on
   Windows `ssh` always runs in batch mode.
 - One ssh connection per destination serves every hub file and helper in a
   process. A broken connection reconnects on next use, unless writes were still
@@ -290,7 +299,7 @@ to WAL. Stores without the `hub_*` tables behave exactly as before.
 requires this replica to hold that object's lease. The check runs at commit, in
 the library, so it covers every client of the replica. Objects created locally
 need no lease until they are pushed, and a push grants their creator a lease.
-`acquireLeases` is all-or-nothing. It refuses objects another replica holds,
+`acquire_leases` is all-or-nothing. It refuses objects another replica holds,
 and objects changed on the hub since this replica last pulled them
 (`HubLeaseRefused::held` / `stale`); pull, then retry. Leases expire after their
 duration (default ten minutes), so clients need roughly synchronized clocks.
@@ -324,23 +333,24 @@ is a no-op for ordinary stores, so callers need not check what they attached.
 sync time for that replica, and a `StoreSessionEvent::Kind::Hub` event tagged with
 the attachment announces each change. `syncHub(attachment)` and
 `resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
-do not use a session call `hub_sync` and `acquire_leases` directly.
+do not use a session call `hub_sync` and the lease functions directly.
 
 Python services use the same session: `ObjectStoreSession().attach(replica,
-author)` starts background sync, `sync_hub_and_wait(attachment)` syncs now and
-returns that sync's status, and `artifact_directory(attachment, uuid)` mirrors
-the C++ call. Data is read and written through `ObjectStore.open(replica)`
-connections to the same file; the session pushes their commits.
+author)` starts background sync, `hold_leases(attachment, uuids)` is a context
+manager whose leases renew until it exits, and `hub_status`, `sync_hub`,
+`artifact_directory`, `copy_object` and `take_events` mirror the C++ calls. Data
+is read and edited through `ObjectStore.open(replica)` connections to the same
+file; the session pushes their commits.
 
 ```python
 import vc_object_store as vos
-from vc_object_store.surfaces import create_surface
 vos.hub_clone(hub, replica, "lasagna")            # once per machine
 session = vos.ObjectStoreSession()
 attachment = session.attach(replica, "lasagna")
-surface_uuid = create_surface(replica, xyz, name="fit", scale=1.0, volume=volume, tool="lasagna")
-model_dir = session.artifact_directory(attachment, surface_uuid)
-session.sync_hub_and_wait(attachment)
+with session.hold_leases(attachment, [surface_uuid]):
+    with vos.ObjectStore.open(replica, author="lasagna") as db:
+        ...  # edit the surface, add objects
+    model_dir = session.artifact_directory(attachment, surface_uuid)
 ```
 
 Records changed both locally and on the hub become conflicts, and pushing stops
@@ -441,8 +451,8 @@ Surface `points` is float32 XYZ. Extra arrays are aligned channels of shape
 `[rows,columns]` or `[rows,columns,components]` with positive component count.
 A channel's rows and columns are each a whole multiple of the points grid
 (1 for a per-vertex channel; for example 20 for ink rendered at 20 pixels per
-grid step). The shapes imply the multiple. Rectangle reads of a channel use
-that channel's own pixel coordinates.
+grid step). The shapes imply the multiple. Rectangle reads and edits of a
+channel use that channel's own pixel coordinates.
 Absent and zero-filled channels differ.
 
 `valid` is the per-vertex validity channel: `|u1` at grid resolution, nonzero
@@ -467,27 +477,29 @@ single-page `mask.tif` (255/0).
 Surface overlaps are relationships made by the linking tools (`surface-overlap`
 detector).
 
-`updateSurfaceChannels(txn, uuid, channels, remove, expectedRevision, edgeEdits)`
+`update_surface_channels(uuid, channels, remove, expected_revision, edge_edits=[])`
 adds/replaces/removes channels atomically. Supply only changed arrays and exact
 little-endian bytes. Removing absent channels, duplicate names or spatial
-dimensions that are not a whole multiple of the grid fails; dtype/components may
-change. Channel edits never change the grid. Typed owned surfaces carry
-`validity` and `channels`.
+dimensions that are not a whole multiple of the grid fails; dtype/components may change. Use
+[structural resizing](structural-editing.md#surface-growth-and-cropping) for shape
+changes. Typed owned surfaces carry `validity` and `channels`.
 
-```cpp
-auto txn = store.write();
-const auto head = store.currentGeometry(txn, uuid)->uuid;
-const float xyz[3] = {12, 24, 36};
-std::vector<uint8_t> bytes(sizeof xyz);
-std::memcpy(bytes.data(), xyz, sizeof xyz);
-// The EdgeDecider overload decides each relationship the edit affects.
-const auto revision = store.editGeometry(txn, uuid, {{"points", 15, bytes}}, head);
-txn.commit();
+```python
+import struct
+
+current = store.current_geometry(uid)
+edits = [{"array": "points", "element_offset": 15,
+          "data": struct.pack("<3f", 12, 24, 36)}]
+affected = store.affected_geometry_edit_edges(uid, edits, current["uuid"])
+assert not affected  # otherwise supply explicit edge_edits
+revision = store.edit_geometry(uid, edits, current["uuid"])
+raw = store.read_geometry_rectangle(revision, "points", 0, 0, 1, 1)
 ```
 
 Sparse offsets count **scalars**, not bytes or points. Edits preserve shape,
 dtype, names and attributes; overlaps apply in input order, last write wins.
 Net no-ops create no revision/journal entry, but stale expectations still fail.
+Rectangle edits preserve all components and require exact byte lengths.
 Geometry, bounds, approvals and relationship decisions publish atomically.
 
 Surface tiles support 32/64/128 (default 128); size 0 uses linear 1 MiB
@@ -504,28 +516,29 @@ the full geometry. Full `put_geometry` replacements have a separate contract.
 
 ## Bounded oriented region browsing
 
-`geometryRegion(txn, RegionSlice, RegionOptions, cancel)` combines conservative
+`geometry_region(RegionSlice, RegionOptions, cancel=None)` combines conservative
 spatial bounds with exact double-precision segment/slab intersections. It returns
 original unclipped XYZ and zero-based segment indices in contiguous runs (for
 polyline kinds); the consumer handles rendering/trimming. `geometry/SegmentClip.hpp` shares the clipper.
 
-```cpp
-vc::objects::RegionSlice view;
-view.origin = {100, 200, 300};
-view.u = {1, 0, 0}; view.v = {0, 1, 0}; view.normal = {0, 0, 1};
-view.localBounds = {-50, -50, -.5, 50, 50, .5};
-vc::objects::RegionOptions options;
-options.kind = "fiber";
-options.maximumObjects = 100;
-auto txn = store.read();
-auto result = store.geometryRegion(txn, view, options);
+```python
+from vc_object_store import RegionSlice, RegionOptions
+
+view = RegionSlice()
+view.origin = [100, 200, 300]
+view.u, view.v, view.normal = [1, 0, 0], [0, 1, 0], [0, 0, 1]
+view.local_bounds = [-50, -50, -.5, 50, 50, .5]
+options = RegionOptions()
+options.kind = "fiber"
+options.maximum_objects = 100
+result = store.geometry_region(view, options)
 ```
 
 Axes must be finite/orthonormal (tolerance `1e-12`); bounds are finite and ordered,
 with zero thickness allowed. Segments can intersect with both endpoints outside.
 `options.kind` selects one polyline kind: `fiber` (nonempty `line_points` take
 precedence over controls) or `track` (`points`, widened exactly to float64), or
-`surface`. Other kinds are rejected. `minPoints` defaults to 2.
+`surface`. Other kinds are rejected. `min_points` defaults to 2.
 
 A surface returns the cut of its exact triangle mesh by the slab's mid-plane
 (normal coordinate halfway between the slab's normal bounds), clipped to the
@@ -542,11 +555,11 @@ Family/minimum length filter import annotations, not recomputed geometry.
 Retired/external-only objects are excluded. UUID ordering is stable; `selected`
 is attempted first when limited. Only intersecting objects consume the limit,
 and each chosen object finishes unless a budget/cancellation stops it.
-`maximumObjects = 0` means unlimited and ignores `selected`. Runs merge across
+`maximum_objects=0` means unlimited and ignores `selected`. Runs merge across
 storage boundaries without duplicate segments. Results own their data and carry
-revision identity from one snapshot.
+revision identity from one snapshot; each Python call starts a fresh snapshot.
 `options.uuids` optionally restricts the query before selected-object priority and
-limits. `nullopt` is unrestricted; an explicit empty list matches nothing. Filter
+limits. `None` is unrestricted; an explicit empty list matches nothing. Filter
 setup participates in cancellation and work/processing budgets.
 
 C++ `ObjectSelection::coordinates` and `RegionOptions::coordinates` accept
@@ -582,20 +595,21 @@ every row; new queries should seek index ranges instead.
 
 | Budget | Default | Charged work |
 | --- | ---: | --- |
-| `outputByteBudget` | 8 MiB | 24 bytes per appended XYZ; a new run needs 48 |
-| `processingByteBudget` | 64 MiB | Payload, verification, metadata, reconstruction and cache bytes |
-| `candidateWorkBudget` | 1,000,000 | Candidate/block visits and segment tests |
-| `sqlStepBudget` | 10,000,000 | SQLite VM instructions, including rejected probes |
-| `maxUnitBytes` | 1 MiB | Largest admitted processing operation |
+| `output_byte_budget` | 8 MiB | 24 bytes per appended XYZ; a new run needs 48 |
+| `processing_byte_budget` | 64 MiB | Payload, verification, metadata, reconstruction and cache bytes |
+| `candidate_work_budget` | 1,000,000 | Candidate/block visits and segment tests |
+| `sql_step_budget` | 10,000,000 | SQLite VM instructions, including rejected probes |
+| `max_unit_bytes` | 1 MiB | Largest admitted processing operation |
 
 Zero budgets allow no work. Work is reserved before processing; whole cached
 chunks are charged on every touch and verification/reconstruction separately.
 Counters measure work, not unique bytes, disk traffic or memory. `stop` is
 `exhausted`, `object_limit`, `output_budget`, `processing_budget`, `candidate_budget`,
-`sql_budget` or `cancelled` (`regionStopName`); only `exhausted` means `complete()`. Partial runs remain
+`sql_budget` or `cancelled`; only `exhausted` means `complete`. Partial runs remain
 valid but imply no spatial coverage. Invalid input/corruption raises.
 
-Cancellation callbacks inspect stats, must not re-enter the store, and
+`RegionCancellation.cancel()` may run from another Python thread; queries
+release the GIL. C++ callbacks inspect stats, must not re-enter the store, and
 propagate exceptions. Checks occur at SQL steps, candidate visits, admitted
 units and segment tests. Hash/JSON/decompression units are indivisible; neither
 SQLite instructions nor OS waits have wall-clock bounds. Budgets guarantee
@@ -624,11 +638,12 @@ Fibers accept current version-4 documents, VC3D version-1 and version-3 fiber
 files and version-1 fiber collections. Version-4 branch endpoints require
 `target_uuid`, and `branch_file` only locates a missing peer's transport file;
 version-3 links resolve by `branch_file`. No older-format repair or database migration is performed.
-Native export's `--revision` pins an object revision, including its metadata and
-relationship snapshot, and reports its geometry revision UUID.
+Native export's `--revision` / Python `object_revision_uuid` pins an object
+revision, including its metadata and relationship snapshot, and returns its
+geometry revision UUID.
 
 Native format clients link `vc_object_store::vc_object_geometry`. Set
 `VC_OBJECT_STORE_BUILD_ADAPTERS=ON` and `VC_OBJECT_STORE_BUILD_LINKING=OFF`
 for import/export without relationship detectors or their CT reader dependency.
-VC3D and the Python package use this configuration; the standalone tools build keeps detectors
+VC3D uses this configuration; the standalone tools/Python build keeps detectors
 on by default. The existing OpenCV/TIFF dependencies supply native formats.

@@ -37,6 +37,18 @@ int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool i
     return s.i64(0);
 }
 
+std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired) const
+{
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    // Column names are ambiguous under the join only for id; qualify by selecting explicit object columns.
+    Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.generation,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
+                    "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
+                    "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
+                    "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=?" +
+                    (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")) + " ORDER BY o.id", tag);
+    return readObjectRows(db, s);
+}
+
 std::vector<std::string> ObjectStore::objectTags(const Txn& txn, const std::optional<std::string>& kind) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

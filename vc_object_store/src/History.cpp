@@ -519,6 +519,18 @@ RevisionSelection ObjectStore::currentRevisions(const Txn& txn, const ObjectSele
     return result;
 }
 
+std::vector<RelationshipRevision> ObjectStore::recordedRelationships(const Txn& txn, const std::string& uuid) const
+{
+    const auto revision = objectRevision(txn, uuid);
+    if (!revision) throw std::invalid_argument("object history: unknown object revision");
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    std::vector<RelationshipRevision> result;
+    if (revision->deleted) return result;
+    for (const auto& [edge, version] : members(db, revision->uuid))
+        result.push_back(relationship(db, version));
+    return result;
+}
+
 std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, const RevisionSelection& selection) const
 {
     DependencyScope dependencies;

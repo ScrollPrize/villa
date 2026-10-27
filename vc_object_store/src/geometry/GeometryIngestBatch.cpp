@@ -1,4 +1,4 @@
-#include "vc_object_store/objects/GeometryIngest.hpp"
+#include "geometry/GeometryIngestBatch.hpp"
 #include "imports/SourceRelationships.hpp"
 #include "internal/Database.hpp"
 #include "vc_object_store/Uuid.hpp"
@@ -36,8 +36,8 @@ void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
     p.object.meta = metadata.dump();
 }
 }
-int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vector<GeometrySource> batch,
-    const std::string& coordinateContext)
+int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext, bool registeredInitial)
 {
     geometryCoordinates(nlohmann::json::parse(coordinateContext));
     auto* connection=ObjectStoreImplAccess::conn(write);
@@ -48,19 +48,40 @@ int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vector<Geomet
         if (p.object.kind != p.geometry.kind) throw std::invalid_argument("import object and geometry kinds differ");
         if(!incoming.insert(p.object.uuid).second)
             throw std::runtime_error("duplicate object UUID in import: "+p.object.uuid);
+        const auto existing=db.objectByUuid(write,p.object.uuid);
+        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
+            detail::parseUuid(p.object.uuid));
         detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
-        if(db.objectByUuid(write,p.object.uuid) || prior.row())
+        if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || prior.row()))
             throw std::runtime_error("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
     }
 
     std::vector<detail::SourceRecord> sources;
     for (auto& p : batch) {
+        const auto existing = db.objectByUuid(write, p.object.uuid);
         normalizeMetadata(p, coordinateContext);
-        db.upsertObject(write, p.object);
+        auto record = existing.value_or(p.object);
+        auto metadata = Json::parse(record.meta);
+        const auto incoming = Json::parse(p.object.meta);
+        metadata["source"] = incoming["source"];
+        if (incoming.contains("coordinate_binding")) metadata["coordinate_binding"] = incoming.at("coordinate_binding");
+        metadata["coordinates"] = mergeGeometryCoordinates(
+            metadata.value("coordinates", Json::object()), incoming["coordinates"]);
+        record.meta = metadata.dump();
+        if (p.object.fiber) record.fiber = p.object.fiber;
+        if (p.object.surface) record.surface = p.object.surface;
+        if (p.object.track) record.track = p.object.track;
+        db.upsertObject(write, record);
         db.putGeometry(write, p.object.uuid, p.geometry);
         p.geometry.arrays.clear();
         sources.push_back({p.object, std::move(p.source)});
+
     }
     return detail::importSourceRelationships(db, write, sources);
+}
+int64_t ingestGeometryBatch(ObjectStore& db, WriteTxn& txn, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext)
+{
+    return detail::ingestGeometryBatch(db, txn, std::move(batch), coordinateContext, false);
 }
 }
