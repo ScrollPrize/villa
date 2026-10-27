@@ -684,6 +684,24 @@ def _stored_model_path(ref: dict[str, Any]) -> Path:
     return path
 
 
+def _stored_corr_points(uuids: list[Any], volume: str | None) -> dict[str, Any]:
+    """The job's correction point collections, read from the service store in ``volume``'s voxels, as VC3D's
+    collection JSON: ``{"collections": {"1": {uuid, name, points: {id: {p, ...}}, ...}, ...}}`` in request order."""
+    if volume is None:
+        raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
+    from vc_object_store.documents import point_collections
+    collections: dict[str, Any] = {}
+    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume), start=1):
+        collection = dict(stored["source"])
+        collection["uuid"] = stored["uuid"]
+        collection["name"] = stored["name"]
+        collection["points"] = {
+            str(point_id): {**(annotation if isinstance(annotation, dict) else {}), "p": list(point)}
+            for point_id, point, annotation in zip(stored["ids"], stored["points"], stored["annotations"])}
+        collections[str(index)] = collection
+    return {"collections": collections}
+
+
 def _request_store_volume(body: dict[str, Any]) -> str | None:
     """The volume a store-mode request works in (one naming this service's store), else None."""
     store_uuid = body.get("store_uuid")
@@ -1018,6 +1036,12 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
         resolved_cfg["external_surfaces"] = external_surfaces
+
+    collection_uuids = resolved_cfg.pop("corr_point_collections", None)
+    if collection_uuids is not None:
+        if not isinstance(collection_uuids, list):
+            raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
+        resolved_cfg["corr_points"] = _stored_corr_points(collection_uuids, _request_store_volume(body))
 
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None

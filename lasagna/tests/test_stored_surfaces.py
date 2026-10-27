@@ -209,6 +209,23 @@ class ServiceStoreRequestTest(unittest.TestCase):
 		with self.assertRaisesRegex(ValueError, "volume_uuid"):
 			fit_service._request_store_volume({"store_uuid": store_uuid})
 
+	def test_correction_collections_resolve_through_the_store(self) -> None:
+		with ObjectStore.open(str(self.store_path), author="test") as db:
+			uid = db.upsert_object(dict(kind="point_collection", name="seeds", meta=dict(
+				coordinates=dict(volume_uuid=VOLUME, scale_factor=2),
+				source=dict(color=[1, 0, 0], point_attributes=[{"wind_a": 1.0}, {"wind_a": 2.0}]))))
+			db.put_geometry(uid, dict(kind="point_collection", arrays=[
+				_array("points", np.array([[2, 4, 6], [8, 10, 12]], "<f8")), _array("point_ids", np.array([5, 7], "<i8"))]))
+		store_uuid = fit_service._store.store_uuid
+		resolved = fit_service._body_with_resolved_job_spec({
+			"store_uuid": store_uuid, "volume_uuid": VOLUME,
+			"job_spec": {"config": {"corr_point_collections": [uid]}}})
+		config = resolved["config"]
+		self.assertNotIn("corr_point_collections", config)
+		collection = config["corr_points"]["collections"]["1"]
+		self.assertEqual((collection["uuid"], collection["name"], collection["color"]), (uid, "seeds", [1, 0, 0]))
+		self.assertEqual(collection["points"]["7"], {"wind_a": 2.0, "p": [4.0, 5.0, 6.0]})
+
 	def test_surface_and_model_refs_resolve_through_the_store(self) -> None:
 		model = fit_service._store.artifact_directory(self.source) / "model.pt"
 		model.write_bytes(b"checkpoint")
