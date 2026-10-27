@@ -6,7 +6,6 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -98,17 +97,7 @@ std::optional<std::pair<int, int>> RawPointsOverlayController::focusGridPosition
         return std::nullopt;
     }
 
-    auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-    if (!patchIndex || patchIndex->empty()) {
-        return std::nullopt;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = focusPoi->p;
-    query.tolerance = 10.0f;
-    query.surfaces.only = SurfacePatchIndex::SurfacePtr(surface, [](QuadSurface*) {});
-
-    const auto hit = patchIndex->locate(query);
+    const auto hit = manager() ? manager()->locate(*surface, focusPoi->p, 10.0f) : std::nullopt;
     if (!hit || hit->distance > 5.0f) {
         return std::nullopt;
     }

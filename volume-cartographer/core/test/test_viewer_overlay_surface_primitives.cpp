@@ -9,6 +9,8 @@
 #include <QTreeWidget>
 
 #include "ViewerManager.hpp"
+#include "test_viewer_manager_stub.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -62,7 +64,7 @@ public:
     {
         SurfaceProjectionContext context;
         context.surface = surface_.get();
-        context.patchIndexGeneration = projectionGeneration_;
+        context.surfaceEditEpoch = projectionGeneration_;
         context.depthLo = depthLo_;
         context.depthHi = depthHi_;
         if (auto* plane = dynamic_cast<PlaneSurface*>(surface_.get())) {
@@ -142,8 +144,6 @@ public:
     void setResetViewOnSurfaceChange(bool) override {}
     void setPlaneIntersectionLinesVisible(bool) override {}
     void setShowSurfaceNormals(bool) override {}
-    void setSegmentationEditActive(bool) override {}
-    void setSegmentationIntersectionDeferral(bool) override {}
     void setSegmentationCursorMirroring(bool) override {}
     void setOverlayVolume(std::shared_ptr<Volume>) override {}
     void setOverlayOpacity(float) override {}
@@ -187,15 +187,12 @@ public:
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) override { return nullptr; }
     void clearSelections() override {}
 
-    void renderIntersections(const char*, std::source_location) override {}
-    void scheduleIntersectionRender(const char*, std::source_location) override {}
-    void invalidateIntersect(const std::string& = "") override {}
+    const std::set<std::string>& intersects() const override { return intersects_; }
+    bool planeIntersectionLinesVisible() const override { return true; }
     float intersectionOpacity() const override { return 1.0f; }
     float intersectionThickness() const override { return 0.0f; }
-    int surfacePatchSamplingStride() const override { return 1; }
     void setIntersectionOpacity(float) override {}
     void setIntersectionThickness(float) override {}
-    void setSurfacePatchSamplingStride(int) override {}
 
     bool surfaceOverlayEnabled() const override { return false; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return surfaceOverlays_; }
@@ -232,6 +229,7 @@ private:
     std::optional<vc::PointRef> selectedPoint_;
     mutable int projectionCalls_{0};
     std::uint64_t projectionGeneration_{0};
+    std::set<std::string> intersects_;
     float depthLo_{0.0f};
     float depthHi_{0.0f};
 };
@@ -279,6 +277,16 @@ public:
 protected:
     void collectPrimitives(VolumeViewerBase*, OverlayBuilder&) override {}
 };
+
+// `surface` as a draft of a fresh store session that ViewerManager::locate reads.
+std::shared_ptr<vc::objects::ObjectStoreSession> draftSession(QuadSurface& surface)
+{
+    auto session = std::make_shared<vc::objects::ObjectStoreSession>();
+    surface.id = vc::objects::util::newUuid();
+    session->setDraft(surface.id, quad_surface_grid(surface), vc::objects::volumeCoordinates("test-volume", 1));
+    vc3d_test::setLocateSession(session, "test-volume");
+    return session;
+}
 
 } // namespace
 
@@ -654,7 +662,7 @@ private slots:
         }
         auto surface = std::make_shared<QuadSurface>(grid, cv::Vec2f(1.0f, 1.0f));
         ViewerManager manager(nullptr, nullptr);
-        manager.surfacePatchIndex()->rebuild({surface}, 0.0f, false);
+        const auto session = draftSession(*surface);
 
         FakeViewer viewer;
         viewer.graphicsView()->resize(800, 600);
@@ -941,7 +949,7 @@ private slots:
         viewer.setCurrentSurface(surface);
 
         ViewerManager manager(nullptr, nullptr);
-        manager.surfacePatchIndex()->rebuild({surface}, 0.0f, false);
+        const auto session = draftSession(*surface);
         ChainTestController controller;
         controller.bindToViewerManager(&manager);
         ChainTestController::OverlayBuilder builder(&viewer);

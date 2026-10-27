@@ -16,7 +16,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -63,13 +62,12 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
-std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
-                                                          const cv::Vec3f& worldPos,
-                                                          cv::Vec3f& pointerSeed,
-                                                          bool& pointerSeedValid,
-                                                          SurfacePatchIndex* patchIndex = nullptr)
+// The valid grid vertex nearest `worldPos` on `surface` (stored, or a draft):
+// the vertex at its nearest point, else the nearest valid one around it.
+std::optional<std::pair<int, int>> locateGridIndex(QuadSurface* surface, ViewerManager* viewerManager,
+                                                   const cv::Vec3f& worldPos)
 {
-    if (!surface) {
+    if (!surface || !viewerManager) {
         return std::nullopt;
     }
 
@@ -78,24 +76,18 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
         return std::nullopt;
     }
 
-    if (!pointerSeedValid) {
-        pointerSeed = cv::Vec3f(0, 0, 0);
-        pointerSeedValid = true;
+    // Anywhere on the surface.
+    constexpr float kAnywhere = 1e6f;
+    const auto hit = viewerManager->locate(*surface, worldPos, kAnywhere);
+    if (!hit) {
+        return std::nullopt;
     }
-
-    surface->pointTo(pointerSeed, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
-    cv::Vec3f raw = surface->loc_raw(pointerSeed);
+    const cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
 
     const int rows = points->rows;
     const int cols = points->cols;
-    if (rows <= 0 || cols <= 0) {
-        return std::nullopt;
-    }
-
-    int approxCol = static_cast<int>(std::lround(raw[0]));
-    int approxRow = static_cast<int>(std::lround(raw[1]));
-    approxRow = std::clamp(approxRow, 0, rows - 1);
-    approxCol = std::clamp(approxCol, 0, cols - 1);
+    int approxCol = std::clamp(static_cast<int>(std::lround(grid[0])), 0, cols - 1);
+    int approxRow = std::clamp(static_cast<int>(std::lround(grid[1])), 0, rows - 1);
 
     if (!vc::geometry::validSurfacePoint((*points)(approxRow, approxCol))) {
         constexpr int kMaxRadius = 12;
@@ -142,48 +134,6 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     return std::make_pair(approxRow, approxCol);
 }
 
-std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* surface,
-                                                                 SurfacePatchIndex* patchIndex,
-                                                                 const cv::Vec3f& worldPos,
-                                                                 cv::Vec3f& pointerSeed,
-                                                                 bool& pointerSeedValid)
-{
-    if (!surface) {
-        return std::nullopt;
-    }
-
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return std::nullopt;
-    }
-
-    if (patchIndex) {
-        cv::Vec2f gridScale = surface->scale();
-        float scale = std::max(gridScale[0], gridScale[1]);
-        if (!std::isfinite(scale) || scale <= 0.0f) {
-            scale = 1.0f;
-        }
-        const float tolerance = std::max(8.0f, scale * 8.0f);
-        // Query without surface filter, then verify result matches our surface
-        SurfacePatchIndex::PointQuery query;
-        query.worldPoint = worldPos;
-        query.tolerance = tolerance;
-        if (auto hit = patchIndex->locate(query)) {
-            if (hit->surface.get() == surface) {
-                const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
-                                           0,
-                                           points->cols - 1);
-                const int row = std::clamp(static_cast<int>(std::round(hit->ptr[1])),
-                                           0,
-                                           points->rows - 1);
-                return std::make_pair(row, col);
-            }
-        }
-    }
-
-    return worldToGridIndexApprox(surface, worldPos, pointerSeed, pointerSeedValid, patchIndex);
-}
-
 std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
                                                       const SegmentationCorrectionsPayload& corrections,
                                                       ViewerManager* viewerManager)
@@ -196,11 +146,6 @@ std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
     if (!points || points->empty()) {
         return std::nullopt;
     }
-
-    SurfacePatchIndex* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
-
-    cv::Vec3f pointerSeed{0.0f, 0.0f, 0.0f};
-    bool pointerSeedValid = false;
 
     const int rows = points->rows;
     const int cols = points->cols;
@@ -224,11 +169,7 @@ std::optional<cv::Rect> computeCorrectionsAffectedBounds(QuadSurface* surface,
         int collectionMaxCol = -1;
 
         for (const auto& colPoint : collection.points) {
-            auto gridIndex = locateGridIndexWithPatchIndex(surface,
-                                                           patchIndex,
-                                                           colPoint.p,
-                                                           pointerSeed,
-                                                           pointerSeedValid);
+            auto gridIndex = locateGridIndex(surface, viewerManager, colPoint.p);
             if (!gridIndex) {
                 continue;
             }
@@ -1005,93 +946,6 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     return true;
 }
 
-// Compute bounding box of cells that changed between two point matrices
-// Returns bounds in the NEW surface's coordinate system
-static cv::Rect computeChangedBounds(const cv::Mat_<cv::Vec3f>& oldPts,
-                                     const cv::Mat_<cv::Vec3f>& newPts)
-{
-    // Handle size differences - the new surface may have padding around it
-    // The old content is centered in the new surface
-    const int padX = (newPts.cols - oldPts.cols) / 2;
-    const int padY = (newPts.rows - oldPts.rows) / 2;
-
-    int minRow = newPts.rows, maxRow = -1;
-    int minCol = newPts.cols, maxCol = -1;
-
-    // Compare the overlapping region (old surface embedded in new)
-    for (int oldRow = 0; oldRow < oldPts.rows; ++oldRow) {
-        const int newRow = oldRow + padY;
-        if (newRow < 0 || newRow >= newPts.rows) continue;
-
-        for (int oldCol = 0; oldCol < oldPts.cols; ++oldCol) {
-            const int newCol = oldCol + padX;
-            if (newCol < 0 || newCol >= newPts.cols) continue;
-
-            const auto& o = oldPts(oldRow, oldCol);
-            const auto& n = newPts(newRow, newCol);
-            if (o[0] != n[0] || o[1] != n[1] || o[2] != n[2]) {
-                minRow = std::min(minRow, newRow);
-                maxRow = std::max(maxRow, newRow);
-                minCol = std::min(minCol, newCol);
-                maxCol = std::max(maxCol, newCol);
-            }
-        }
-    }
-
-    // Check padding cells for valid (non-empty) content that was added
-    // Invalid points have x == -1
-    auto isValid = [](const cv::Vec3f& p) { return p[0] != -1.0f; };
-
-    // Check top/bottom padding rows
-    for (int row = 0; row < padY && row < newPts.rows; ++row) {
-        for (int col = 0; col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-    for (int row = newPts.rows - padY; row < newPts.rows; ++row) {
-        if (row < 0) continue;
-        for (int col = 0; col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-    // Check left/right padding cols
-    for (int row = 0; row < newPts.rows; ++row) {
-        for (int col = 0; col < padX && col < newPts.cols; ++col) {
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-        for (int col = newPts.cols - padX; col < newPts.cols; ++col) {
-            if (col < 0) continue;
-            if (isValid(newPts(row, col))) {
-                minRow = std::min(minRow, row);
-                maxRow = std::max(maxRow, row);
-                minCol = std::min(minCol, col);
-                maxCol = std::max(maxCol, col);
-            }
-        }
-    }
-
-    if (maxRow < 0) {
-        return cv::Rect();  // No changes
-    }
-
-    return cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
-}
-
 void SegmentationGrower::onFutureFinished()
 {
     if (!_watcher) {
@@ -1158,9 +1012,9 @@ void SegmentationGrower::onFutureFinished()
 
     cv::Mat generations = result.surface->channel("generations");
 
-    std::vector<SurfacePatchIndex::SurfacePtr> surfacesToUpdate;
+    std::vector<std::shared_ptr<QuadSurface>> surfacesToUpdate;
     surfacesToUpdate.reserve(3);
-    auto appendUniqueSurface = [&](const SurfacePatchIndex::SurfacePtr& surface) {
+    auto appendUniqueSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
         if (!surface) {
             return;
         }
@@ -1178,21 +1032,10 @@ void SegmentationGrower::onFutureFinished()
     cv::Mat_<cv::Vec3f>* primaryPoints = primarySurface ? primarySurface->rawPointsPtr() : nullptr;
     cv::Mat_<cv::Vec3f>* resultPoints = result.surface->rawPointsPtr();
 
-    // Compute the changed region before swapping points (for efficient R-tree update)
-    // Only use region update when sizes match; otherwise grid coordinates shift
-    cv::Rect changedBounds;
-    bool sizeChanged = false;
     if (primarySurface && primaryPoints && resultPoints) {
-        sizeChanged = (primaryPoints->size() != resultPoints->size());
-        if (!sizeChanged) {
-            changedBounds = computeChangedBounds(*primaryPoints, *resultPoints);
-            qCInfo(lcSegGrowth) << "Changed bounds:" << changedBounds.x << changedBounds.y
-                                << changedBounds.width << "x" << changedBounds.height
-                                << "(surface:" << resultPoints->cols << "x" << resultPoints->rows << ")";
-        } else {
+        if (primaryPoints->size() != resultPoints->size()) {
             qCInfo(lcSegGrowth) << "Surface size changed:" << primaryPoints->cols << "x" << primaryPoints->rows
-                                << "->" << resultPoints->cols << "x" << resultPoints->rows
-                                << "- using full update";
+                                << "->" << resultPoints->cols << "x" << resultPoints->rows;
         }
     }
 
@@ -1226,15 +1069,6 @@ void SegmentationGrower::onFutureFinished()
         if (!generations.empty()) {
             targetSurface->setChannel("generations", generations);
         }
-
-        // Refresh intersection index for this surface so renderIntersections() has up-to-date data
-        if (_context.viewerManager) {
-            if (!changedBounds.empty()) {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr, changedBounds);
-            } else {
-                _context.viewerManager->refreshSurfacePatchIndex(targetSurfacePtr);
-            }
-        }
     }
 
     QuadSurface* surfaceToPersist = nullptr;
@@ -1249,6 +1083,11 @@ void SegmentationGrower::onFutureFinished()
     // Mask is no longer valid after growth/inpainting
     if (surfaceToPersist) {
         surfaceToPersist->invalidateMask();
+    }
+    // The grid (and its validity) changed: an edit's draft follows it; without
+    // an edit the grown surface is saved below.
+    if (sessionActive) {
+        _context.module->publishEditDraft();
     }
 
     if (!sessionActive) {
@@ -1276,7 +1115,6 @@ void SegmentationGrower::onFutureFinished()
 
     if (_context.state) {
         _context.state->setSurface("segmentation", request.segmentationSurface, false, true);
-        // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
     if (!resetDefaults.empty()) {

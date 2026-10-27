@@ -13,7 +13,6 @@
 // OpenCvCompat pulls that header in on 5 and is a no-op on 4.
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QDateTime>
 #include <QEvent>
@@ -2364,18 +2363,14 @@ std::optional<QPointF> SpiralBrushController::mapPatchPoint(
     const QPointF& point, const std::shared_ptr<QuadSurface>& from,
     const std::shared_ptr<QuadSurface>& to) const
 {
-    return vc3d::spiral::projectPatchPoint(point, from, to,
-        _patchIndexProvider ? _patchIndexProvider() : nullptr,
-        kPolylineProjectionToleranceVoxels);
+    return vc3d::spiral::projectPatchPoint(point, from, to, _patchLocator, kPolylineProjectionToleranceVoxels);
 }
 
 std::optional<QPainterPath> SpiralBrushController::mapPatchShape(
     const QPainterPath& path, const std::shared_ptr<QuadSurface>& from,
     const std::shared_ptr<QuadSurface>& to) const
 {
-    return vc3d::spiral::projectPatchShape(path, from, to,
-        _patchIndexProvider ? _patchIndexProvider() : nullptr,
-        kPolylineProjectionToleranceVoxels);
+    return vc3d::spiral::projectPatchShape(path, from, to, _patchLocator, kPolylineProjectionToleranceVoxels);
 }
 
 std::shared_ptr<QuadSurface> SpiralBrushController::setPatchRemoved(const QString& id, bool removed)

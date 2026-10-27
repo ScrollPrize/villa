@@ -47,6 +47,8 @@ private:
     bool synchronizeTransformPersistenceCompatibility();
     void updatePreview();
     void applyRotation();
+    // Make `surface` the active ("segmentation") surface.
+    void showActive(const std::shared_ptr<QuadSurface>& surface);
     static std::shared_ptr<QuadSurface> cloneSurface(const std::shared_ptr<QuadSurface>& surface);
 
     CState* _state{nullptr};

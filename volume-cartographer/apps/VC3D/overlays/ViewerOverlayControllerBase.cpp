@@ -25,7 +25,6 @@
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 namespace
 {
@@ -524,7 +523,9 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
     auto* planeSurface = options.clipToSurface ? dynamic_cast<PlaneSurface*>(surface) : nullptr;
     auto* quadSurface = options.clipToSurface ? dynamic_cast<QuadSurface*>(surface) : nullptr;
     auto* viewerManager = managerForViewer(viewer);
-    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
+    std::vector<std::optional<ViewerManager::SurfaceLocation>> onSurface;
+    if (quadSurface && viewerManager)
+        onSurface = viewerManager->locate(*quadSurface, points, options.quadDistanceTolerance);
 
     QRectF visibleRect;
     if (options.requireSceneVisibility) {
@@ -543,12 +544,8 @@ ViewerOverlayControllerBase::filterPoints(VolumeViewerBase* viewer,
             }
         }
 
-        if (keep && quadSurface) {
-            cv::Vec3f ptr(0, 0, 0);
-            float res = quadSurface->pointTo(ptr, point, options.quadDistanceTolerance, 100, patchIndex);
-            if (res > options.quadDistanceTolerance) {
-                keep = false;
-            }
+        if (keep && quadSurface && (srcIndex >= onSurface.size() || !onSurface[srcIndex])) {
+            keep = false;
         }
 
         if (keep && options.volumePredicate) {
@@ -791,22 +788,13 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     }
 
     auto* viewerManager = managerForViewer(viewer);
-    auto* patchIndex = viewerManager ? viewerManager->surfacePatchIndex() : nullptr;
-    SurfacePatchIndex::SurfacePtr indexedQuad;
-    bool usePatchIndex = false;
-    if (quad && patchIndex && !patchIndex->empty() && std::isfinite(tolerance)) {
-        indexedQuad = SurfacePatchIndex::SurfacePtr(quad, [](QuadSurface*) {});
-        usePatchIndex = patchIndex->containsSurface(indexedQuad);
-    }
-    const std::uint64_t surfaceGeneration = quad && patchIndex
-        ? patchIndex->globalGeneration()
-        : 0;
     const cv::Vec3f planeOrigin = plane ? plane->origin() : cv::Vec3f{};
     const cv::Vec3f planeBasisX = plane ? plane->basisX() : cv::Vec3f{};
     const cv::Vec3f planeBasisY = plane ? plane->basisY() : cv::Vec3f{};
     // Measure distances from the depth band the viewer displays (its normal
     // offset, widened to the slab while compositing).
     const SurfaceProjectionContext projectionContext = viewer->surfaceProjectionContext();
+    const std::uint64_t surfaceGeneration = quad ? projectionContext.surfaceEditEpoch : 0;
     const float depthLo = projectionContext.depthLo;
     const float depthHi = projectionContext.depthHi;
     const bool nominalDepth = depthLo == 0.0f && depthHi == 0.0f;
@@ -844,6 +832,11 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
         entry.sourceIndices.reserve(points.size());
         entry.opacities.reserve(points.size());
         entry.breakDistance = polylineBreakDistance(points);
+        // Where each point lies on a quad surface (stored or a draft), in one read.
+        std::vector<std::optional<ViewerManager::SurfaceLocation>> onSurface;
+        if (quad && viewerManager && std::isfinite(tolerance))
+            onSurface = viewerManager->locate(
+                *quad, points, std::max(tolerance + std::max(std::fabs(depthLo), std::fabs(depthHi)), 1.0e-3f));
 
         auto opacityForDistance = [tolerance](float distance) {
             if (!std::isfinite(distance) || distance < 0.0f) {
@@ -870,21 +863,8 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
                 surfacePoint = {projected[0], projected[1]};
             } else {
                 cv::Vec3f pointer = quad->pointer();
-                if (!usePatchIndex) {
-                    // Quad-surface overlays are UI-only and always have the
-                    // maintained patch index. If its current generation does
-                    // not contain this surface, skip the point rather than
-                    // falling back to pointTo()'s tolerance-dependent random
-                    // search; the next index generation invalidates the cache.
-                    valid = false;
-                } else {
-                    SurfacePatchIndex::PointQuery query;
-                    query.worldPoint = point;
-                    query.tolerance = std::max(
-                        tolerance + std::max(std::fabs(depthLo), std::fabs(depthHi)),
-                        1.0e-3f);
-                    query.surfaces.only = indexedQuad;
-                    if (const auto hit = patchIndex->locate(query)) {
+                {
+                    if (const auto& hit = index < onSurface.size() ? onSurface[index] : std::nullopt) {
                         pointer = hit->ptr;
                         distance = hit->distance;
                         if (!nominalDepth) {

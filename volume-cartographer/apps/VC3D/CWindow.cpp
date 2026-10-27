@@ -13,7 +13,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -1026,7 +1025,8 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _hubStatusLabel->hide();
     statusBar()->addPermanentWidget(_hubStatusLabel);
     connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        if (event.kind != vc::objects::StoreSessionEvent::Kind::Committed) updateHubStatus();
+        using Kind = vc::objects::StoreSessionEvent::Kind;
+        if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
     });
 
     _persistentCacheSpaceTimer = new QTimer(this);
@@ -1617,12 +1617,6 @@ CWindow::~CWindow()
         qApp->removeEventFilter(this);
     }
 
-    // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
-    // if the app is torn down programmatically). Same rationale as the
-    // closeEvent hook — skip SurfacePatchIndex removal during teardown.
-    if (_viewerManager) {
-        _viewerManager->beginShutdown();
-    }
     if (_fileWatcher) {
         _fileWatcher->stopWatching();
     }
@@ -2753,8 +2747,7 @@ void CWindow::CreateWidgets(void)
         _viewerManager.get(),
         [this]() { return segmentationViewer(); },
         this);
-    _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(
-        _state, _surfaceCatalog.get(), _viewerManager.get(), this);
+    _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(_state, _viewerManager.get(), this);
     connect(_surfacePanel.get(), &SurfacePanelController::visibleSurfacesChanged,
             _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
     connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
@@ -3968,14 +3961,6 @@ void CWindow::closeEvent(QCloseEvent* event)
         return;
     }
     _destroyingWindow = true;
-    // Tell ViewerManager to stop maintaining the SurfacePatchIndex. The
-    // CState teardown below iterates every tracked surface and sets it to
-    // nullptr, which would otherwise trigger an O(N) rtree->remove() per
-    // surface — easily 10+ seconds on a flattened segment with millions
-    // of cells.
-    if (_viewerManager) {
-        _viewerManager->beginShutdown();
-    }
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
     }
@@ -5187,14 +5172,13 @@ void CWindow::onConvertPointToAnchor(vc::PointRef point)
     }
 
     // Find the 2D grid location of this point on the surface
-    cv::Vec3f ptr(0, 0, 0);
-    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-    float dist = quad_surface->pointTo(ptr, point_opt->p, 4.0, 1000, patchIndex);
-
-    if (dist > 10.0) {
-        showStatusBarMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
+    constexpr float kMaxDistance = 10.0f;
+    const auto hit = _viewerManager ? _viewerManager->locate(*quad_surface, point_opt->p, kMaxDistance) : std::nullopt;
+    if (!hit) {
+        showStatusBarMessage(tr("Point is farther than %1 voxels from the surface").arg(kMaxDistance), 3000);
         return;
     }
+    const cv::Vec3f ptr = hit->ptr;
 
     // Get the raw grid location (internal coordinates)
     cv::Vec3f loc_3d = quad_surface->loc_raw(ptr);

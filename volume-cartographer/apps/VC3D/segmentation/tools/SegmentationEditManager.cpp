@@ -3,7 +3,6 @@
 #include "../../ViewerManager.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <QLoggingCategory>
 
@@ -45,7 +44,7 @@ const cv::Mat_<cv::Vec3f>* SegmentationEditManager::previewPointsPtr() const
     return _baseSurface ? _baseSurface->rawPointsPtr() : nullptr;
 }
 
-bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurface)
+bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurface, DraftTarget draft)
 {
     if (!baseSurface) {
         return false;
@@ -59,6 +58,7 @@ bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurf
     }
 
     _baseSurface = baseSurface;
+    _draft = std::move(draft);
     _gridScale = baseSurface->scale();
     resetPointerSeed();
 
@@ -69,7 +69,7 @@ bool SegmentationEditManager::beginSession(std::shared_ptr<QuadSurface> baseSurf
     _recentTouched.clear();
     clearActiveDrag();
     rebuildPreviewFromOriginal();
-    rebuildEditSurfacePatchIndex();
+    publishWholeDraft();
 
     _hasPendingEdits = false;
     _pendingGrowthMarking = false;
@@ -82,7 +82,9 @@ void SegmentationEditManager::endSession()
     _recentTouched.clear();
     clearActiveDrag();
 
-    _editSurfacePatchIndex.reset();
+    if (_draft && _baseSurface) _draft->session->clearDraft(_baseSurface->id);
+    _draft.reset();
+    _draftDirty.reset();
     _originalPoints.reset();
     _preResizeOriginalPoints.reset();
     _baseSurface.reset();
@@ -92,51 +94,52 @@ void SegmentationEditManager::endSession()
 }
 
 
-SurfacePatchIndex* SegmentationEditManager::preferredSurfacePatchIndex() const
+void SegmentationEditManager::publishWholeDraft()
 {
-    if (_editSurfacePatchIndex && !_editSurfacePatchIndex->empty()) {
-        return _editSurfacePatchIndex.get();
-    }
-    return _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-}
-
-bool SegmentationEditManager::flushEditSurfacePatchIndex()
-{
-    if (!_editSurfacePatchIndex || !_baseSurface) {
-        return false;
-    }
-    return _editSurfacePatchIndex->flushPendingUpdates(_baseSurface);
-}
-
-void SegmentationEditManager::rebuildEditSurfacePatchIndex()
-{
-    if (!_baseSurface) {
-        _editSurfacePatchIndex.reset();
+    _draftDirty.reset();
+    if (!_draft || !_baseSurface) {
         return;
     }
-    if (!_editSurfacePatchIndex) {
-        _editSurfacePatchIndex = std::make_unique<SurfacePatchIndex>();
-    }
-    if (_viewerManager) {
-        _editSurfacePatchIndex->setSamplingStride(_viewerManager->surfacePatchSamplingStride());
-    }
-    _editSurfacePatchIndex->rebuild({_baseSurface}, 0.0f, false);
+    _draft->session->setDraft(_baseSurface->id, quad_surface_grid(*_baseSurface), _draft->coordinates,
+                              _draft->attachment);
 }
 
-void SegmentationEditManager::queueEditSurfacePatchIndexVertex(int row, int col)
+void SegmentationEditManager::publishDraft(const cv::Rect& vertices)
 {
-    if (!_editSurfacePatchIndex || !_baseSurface) {
-        return;
-    }
-    _editSurfacePatchIndex->queueCellUpdateForVertex(_baseSurface, row, col);
+    markDraft(vertices.y, vertices.y + vertices.height - 1, vertices.x, vertices.x + vertices.width - 1);
+    flushDraft();
 }
 
-void SegmentationEditManager::queueEditSurfacePatchIndexRange(int minRow, int maxRow, int minCol, int maxCol)
+void SegmentationEditManager::markDraft(int minRow, int maxRow, int minCol, int maxCol)
 {
-    if (!_editSurfacePatchIndex || !_baseSurface) {
+    const cv::Rect rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
+    if (rect.width <= 0 || rect.height <= 0) {
         return;
     }
-    _editSurfacePatchIndex->queueCellRangeUpdate(_baseSurface, minRow, maxRow, minCol, maxCol);
+    _draftDirty = _draftDirty ? (*_draftDirty | rect) : rect;
+}
+
+void SegmentationEditManager::flushDraft()
+{
+    const auto* points = previewPointsPtr();
+    if (!_draftDirty || !_draft || !points) {
+        _draftDirty.reset();
+        return;
+    }
+    const cv::Rect rect = *_draftDirty & cv::Rect(0, 0, points->cols, points->rows);
+    _draftDirty.reset();
+    if (rect.empty()) {
+        return;
+    }
+    std::vector<vc::geometry::SurfacePoint> changed;
+    changed.reserve(size_t(rect.area()));
+    for (int r = rect.y; r < rect.y + rect.height; ++r)
+        for (int c = rect.x; c < rect.x + rect.width; ++c) {
+            const auto& p = (*points)(r, c);
+            changed.push_back(vc::geometry::validSurfacePoint(p) ? vc::geometry::SurfacePoint{p[0], p[1], p[2]}
+                                                                 : vc::geometry::SurfacePoint{-1, -1, -1});
+        }
+    _draft->session->updateDraft(_baseSurface->id, rect.y, rect.x, rect.height, rect.width, changed);
 }
 
 void SegmentationEditManager::setRadius(float radiusSteps)
@@ -234,6 +237,10 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
     if (_originalPoints) {
         points.copyTo(*_originalPoints);
     }
+    if (diffFound) {
+        markDraft(minRow, maxRow, minCol, maxCol);
+        flushDraft();
+    }
     _editedVertices.clear();
     _hasPendingEdits = markAsPendingEdit;
 
@@ -303,8 +310,9 @@ bool SegmentationEditManager::setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& po
         _recentTouched.push_back(key);
         _editedVertices[key] = VertexEdit{key.row, key.col, original, current, _pendingGrowthMarking};
 
-        queueEditSurfacePatchIndexVertex(key.row, key.col);
+        markDraft(key.row, key.row, key.col, key.col);
     }
+    flushDraft();
 
     if (_baseSurface) {
         _baseSurface->invalidateCache();
@@ -333,7 +341,7 @@ bool SegmentationEditManager::restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& 
 
     points.copyTo(*preview);
     points.copyTo(*_originalPoints);
-    rebuildEditSurfacePatchIndex();
+    publishWholeDraft();
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
@@ -359,7 +367,7 @@ void SegmentationEditManager::resetPreview()
     } else {
         rebuildPreviewFromOriginal();
     }
-    rebuildEditSurfacePatchIndex();
+    publishWholeDraft();
     _editedVertices.clear();
     _recentTouched.clear();
     clearActiveDrag();
@@ -405,7 +413,7 @@ void SegmentationEditManager::refreshFromBaseSurface()
     }
 
     rebuildPreviewFromOriginal();
-    rebuildEditSurfacePatchIndex();
+    publishWholeDraft();
     _hasPendingEdits = !_editedVertices.empty();
 }
 
@@ -475,7 +483,7 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     }
 
     resetPointerSeed();
-    rebuildEditSurfacePatchIndex();
+    publishWholeDraft();
     return true;
 }
 
@@ -503,22 +511,10 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
 
     const float stepNorm = stepNormalization();
     const float locateTolerance = std::max(stepNorm * 64.0f, 512.0f);
-    auto* patchIndex = preferredSurfacePatchIndex();
-    if (!patchIndex || patchIndex->empty()) {
-        if (warnOnFailure) {
-            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index is unavailable.";
-        }
-        return std::nullopt;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = worldPos;
-    query.tolerance = locateTolerance;
-    query.surfaces.only = _baseSurface;
-    auto hit = patchIndex->locate(query);
+    const auto hit = _viewerManager ? _viewerManager->locate(*_baseSurface, worldPos, locateTolerance) : std::nullopt;
     if (!hit) {
         if (warnOnFailure) {
-            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index missed active surface"
+            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: the active surface is not"
                                         << "within tolerance" << locateTolerance;
         }
         return std::nullopt;
@@ -532,7 +528,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     const int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, rows - 1);
     if (!vc::geometry::validSurfacePoint((*points)(row, col))) {
         if (warnOnFailure) {
-            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index hit invalid vertex"
+            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: nearest point is at an invalid vertex"
                                         << "row" << row << "col" << col;
         }
         return std::nullopt;
@@ -587,6 +583,7 @@ bool SegmentationEditManager::updateActiveDrag(const cv::Vec3f& newCenterWorld)
     const cv::Vec3f delta = newCenterWorld - _activeDrag.baseWorld;
     _activeDrag.targetWorld = newCenterWorld;
     applyGaussianToSamples(delta);
+    flushDraft();
     return true;
 }
 
@@ -637,7 +634,8 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
         _activeDrag.targetWorld = newWorldPositions.front();
     }
 
-    queuePatchIndexRangeForVertices(minRow, maxRow, minCol, maxCol);
+    markDraft(minRow, maxRow, minCol, maxCol);
+    flushDraft();
 
     _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
@@ -787,6 +785,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
     if (!anyChange) {
         return false;
     }
+    flushDraft();
 
     _recentTouched.assign(regionVec.begin(), regionVec.end());
     _hasPendingEdits = true;
@@ -814,6 +813,7 @@ void SegmentationEditManager::cancelActiveDrag()
         (*preview)(sample.row, sample.col) = sample.baseWorld;
         recordVertexEdit(sample.row, sample.col, sample.baseWorld);
     }
+    flushDraft();
 
     _recentTouched.clear();
     clearActiveDrag();
@@ -1027,7 +1027,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
         maxCol = std::max(maxCol, sample.col);
     }
 
-    queuePatchIndexRangeForVertices(minRow, maxRow, minCol, maxCol);
+    markDraft(minRow, maxRow, minCol, maxCol);
 
     _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
@@ -1035,7 +1035,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
     }
 }
 
-void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool queuePatchIndexUpdate)
+void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool markDraftVertex)
 {
     if (!_originalPoints) {
         return;
@@ -1053,9 +1053,8 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     const cv::Vec3f diff = newWorld - original;
     const float deltaSq = diff.dot(diff);
 
-    // Queue cell updates in the edit-session SurfacePatchIndex for R-tree sync.
-    if (queuePatchIndexUpdate) {
-        queueEditSurfacePatchIndexVertex(row, col);
+    if (markDraftVertex) {
+        markDraft(row, row, col, col);
     }
     _hasPendingEdits = true;
 
@@ -1074,15 +1073,6 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
-}
-
-void SegmentationEditManager::queuePatchIndexRangeForVertices(int minRow, int maxRow, int minCol, int maxCol)
-{
-    if (minRow > maxRow || minCol > maxCol) {
-        return;
-    }
-
-    queueEditSurfacePatchIndexRange(minRow - 1, maxRow + 1, minCol - 1, maxCol + 1);
 }
 
 void SegmentationEditManager::clearActiveDrag()

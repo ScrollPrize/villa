@@ -2975,14 +2975,12 @@
       "mcp": {
         "paramRenames": {
           "highlightedSurfaceIds": "highlighted_surface_ids",
-          "intersectionMaxSurfaces": "intersection_max_surfaces",
           "intersectionOpacity": "intersection_opacity",
           "intersectionThickness": "intersection_thickness",
           "normalArrowLengthScale": "normal_arrow_length_scale",
           "normalMaxArrows": "normal_max_arrows",
           "overlayOpacity": "overlay_opacity",
           "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
-          "samplingStride": "sampling_stride",
           "segmentationCursorMirroring": "segmentation_cursor_mirroring",
           "showSurfaceNormals": "show_surface_normals",
           "surfaceOverlayEnabled": "surface_overlay_enabled",
@@ -2998,11 +2996,6 @@
               "type": "string"
             },
             "type": "array"
-          },
-          "intersectionMaxSurfaces": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
           },
           "intersectionOpacity": {
             "type": "number"
@@ -3023,11 +3016,6 @@
           },
           "planeIntersectionLinesVisible": {
             "type": "boolean"
-          },
-          "samplingStride": {
-            "maximum": 2147483647,
-            "minimum": -2147483648,
-            "type": "integer"
           },
           "segmentationCursorMirroring": {
             "type": "boolean"

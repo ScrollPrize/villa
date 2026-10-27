@@ -138,8 +138,6 @@ namespace viewer {
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
-    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";

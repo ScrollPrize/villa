@@ -115,6 +115,15 @@ public:
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {}, bool waitForGeometry = false);
 
+    // The nearest point of each of `uuids` (drafts or objects of the sources)
+    // within `tolerance` of each of `points` (voxels of `volume`): the hits per
+    // point, nearest first, each with its fractional grid position. Placeholders
+    // reached are queued for fetching, not waited for.
+    static std::vector<std::vector<vc::objects::SurfaceProximityHit>> nearest(
+        vc::objects::ObjectStoreSession& session, const std::vector<vc::objects::AttachmentIdentity>& sources,
+        const std::string& volume, const std::vector<std::string>& uuids,
+        const std::vector<std::array<double, 3>>& points, double tolerance);
+
     // Where tools launched for the open volume read and write: the user's store
     // file (a hosted replica's local file) and the volume's id. Throws without a
     // writable attachment and an open volume.

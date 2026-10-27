@@ -319,12 +319,11 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
         }
     }
 
-    cv::Vec3f segPtr(0, 0, 0);
-    auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-    float dist = segSurface->pointTo(segPtr, targetWP, 4.0, 100, patchIndex);
-    if (dist < 0 || dist > 50.0f) {
+    const auto hit = manager() ? manager()->locate(*segSurface, targetWP, 50.0f) : std::nullopt;
+    if (!hit) {
         return;
     }
+    const cv::Vec3f segPtr = hit->ptr;
 
     // Helper to draw an arrow projected onto the plane. Anchor + tip go through the
     // viewer's volumeToScene() (plane projection + PAN offset + viewport-center term)

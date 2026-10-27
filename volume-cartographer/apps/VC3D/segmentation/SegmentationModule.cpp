@@ -452,7 +452,6 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
     }
 
     viewerObject->setProperty("vc_segmentation_bound", true);
-    viewer->setSegmentationEditActive(_editingEnabled);
     _attachedViewers.insert(viewer);
     connect(viewerObject, &QObject::destroyed, this, [this, viewer]() {
         detachViewer(viewer);
@@ -462,7 +461,6 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
 void SegmentationModule::attachViewer(VolumeViewerBase* viewer)
 {
     bindViewerSignals(viewer);
-    updateViewerCursors();
 }
 
 void SegmentationModule::detachViewer(VolumeViewerBase* viewer)
@@ -486,23 +484,16 @@ void SegmentationModule::detachViewer(VolumeViewerBase* viewer)
     }
 }
 
-void SegmentationModule::updateViewerCursors()
+void SegmentationModule::publishEditDraft(const std::optional<cv::Rect>& vertices)
 {
-    for (auto* viewer : std::as_const(_attachedViewers)) {
-        if (!viewer) {
-            continue;
-        }
-        viewer->setSegmentationEditActive(_editingEnabled);
+    if (!_editManager || !_editManager->hasSession()) {
+        return;
     }
-}
-
-SurfacePatchIndex* SegmentationModule::activeEditSurfacePatchIndex() const
-{
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
-        return nullptr;
+    if (vertices) {
+        _editManager->publishDraft(*vertices);
+    } else {
+        _editManager->publishWholeDraft();
     }
-    auto* index = _editManager->editSurfacePatchIndex();
-    return (index && !index->empty()) ? index : nullptr;
 }
 
 void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
@@ -532,7 +523,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setActive(enabled && hasActiveSession() && _drawMaskEnabled);
     }
-    updateViewerCursors();
     if (!enabled) {
         resetManualAddState(true);
         stopAllPushPull();
@@ -944,27 +934,16 @@ void SegmentationModule::handleCorrectionPointAdded(
             gridIdx = _editManager->worldToGridIndex(worldPos);
         }
 
-        // Fallback: use patch index directly
-        if (!gridIdx) {
-            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            auto surfQ = surfaceHolder
-                ? std::dynamic_pointer_cast<QuadSurface>(surfaceHolder)
-                : activeBaseSurfaceShared();
-            if (patchIndex && !patchIndex->empty() && surfQ) {
-                const auto* pts = surface->rawPointsPtr();
-                if (pts && pts->rows > 0 && pts->cols > 0) {
-                    float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
-                    SurfacePatchIndex::PointQuery query;
-                    query.worldPoint = worldPos;
-                    query.tolerance = tol;
-                    query.surfaces.only = surfQ;
-                    auto hit = patchIndex->locate(query);
-                    if (hit) {
-                        cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
-                        int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
-                        int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
-                        gridIdx = {row, col};
-                    }
+        // Otherwise where the surface (stored, or a draft) lies at the point.
+        if (!gridIdx && _viewerManager) {
+            const auto* pts = surface->rawPointsPtr();
+            if (pts && pts->rows > 0 && pts->cols > 0) {
+                const float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
+                if (const auto hit = _viewerManager->locate(*surface, worldPos, tol)) {
+                    const cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
+                    const int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
+                    const int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
+                    gridIdx = {row, col};
                 }
             }
         }
@@ -1917,10 +1896,8 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
                                         touched->width + 2,
                                         touched->height + 2);
             _drag.viewer->invalidateVisRegion("segmentation", changedCells);
-            _drag.viewer->invalidateIntersectRegion("segmentation", changedCells);
         } else {
             _drag.viewer->invalidateVis();
-            _drag.viewer->invalidateIntersect("segmentation");
         }
         _drag.viewer->requestRender();
     }

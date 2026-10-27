@@ -30,7 +30,8 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
+#include "SurfaceCatalog.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace
 {
@@ -698,8 +699,8 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         return;
     }
 
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
-    if (!patchIndex) {
+    const auto session = _state->objectStoreSession();
+    if (!session || !_state->currentVolume()) {
         return;
     }
 
@@ -710,47 +711,46 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     }
 
     // The common interaction path reaches here every overlay refresh. Compare
-    // only O(1) revisions before resolving surface IDs or querying the index.
-    // SurfacePatchIndex's global generation deliberately over-invalidates when
-    // an unrelated surface changes, which is preferable to walking and hashing
+    // only O(1) revisions before resolving surface IDs or querying the store.
+    // The surface map's version deliberately over-invalidates when an
+    // unrelated surface changes, which is preferable to walking and hashing
     // every selected surface on each pan/zoom tick.
     const std::uint64_t overlaysRevision = viewer->surfaceOverlaysRevision();
-    const std::uint64_t indexGeneration = patchIndex->globalGeneration();
+    const std::uint64_t surfacesVersion = _state->surfacesVersion();
     auto cacheIt = _overlapCaches.find(viewer);
     bool needsRebuild = (cacheIt == _overlapCaches.end()) ||
                         (cacheIt->second.surface != currentQuad) ||
                         (cacheIt->second.overlaysRevision != overlaysRevision) ||
-                        (cacheIt->second.indexGeneration != indexGeneration) ||
+                        (cacheIt->second.surfacesVersion != surfacesVersion) ||
                         (std::abs(cacheIt->second.threshold - threshold) > 0.01f) ||
                         (cacheIt->second.sampleStride != kSurfaceOverlapSampleStride) ||
                         (cacheIt->second.image.width() != sampleCols) ||
                         (cacheIt->second.image.height() != sampleRows);
 
     if (needsRebuild) {
-        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
-        std::unordered_map<QuadSurface*, cv::Vec3b> targetColors;
+        // Overlay surfaces by id (stored, or drafts) and their colours.
+        std::vector<std::string> targets;
+        std::unordered_map<std::string, cv::Vec3b> targetColors;
         targets.reserve(overlays.size());
         targetColors.reserve(overlays.size());
 
         for (const auto& [surfId, color] : overlays) {
             auto surfBase = _state->surface(surfId);
             auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
-            if (!overlaySurf || overlaySurf.get() == currentQuad ||
-                (!overlaySurf->id.empty() && overlaySurf->id == currentQuad->id)) {
+            if (!overlaySurf || overlaySurf.get() == currentQuad || overlaySurf->id == currentQuad->id ||
+                !vc::objects::util::isUuid(overlaySurf->id)) {
                 continue;
             }
-            if (!patchIndex->containsSurface(overlaySurf)) {
-                continue;
-            }
-            targets.insert(overlaySurf);
-            targetColors[overlaySurf.get()] = color;
+            const auto uuid = vc::objects::util::canonicalUuid(overlaySurf->id);
+            targets.push_back(uuid);
+            targetColors[uuid] = color;
         }
 
         if (targets.empty()) {
             OverlapCache emptyCache;
             emptyCache.surface = currentQuad;
             emptyCache.overlaysRevision = overlaysRevision;
-            emptyCache.indexGeneration = indexGeneration;
+            emptyCache.surfacesVersion = surfacesVersion;
             emptyCache.threshold = threshold;
             emptyCache.sampleStride = kSurfaceOverlapSampleStride;
             _overlapCaches[viewer] = std::move(emptyCache);
@@ -765,7 +765,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             const bool pendingMatches = _pendingOverlap.viewer == viewer &&
                                         pending.surface == currentQuad &&
                                         pending.overlaysRevision == overlaysRevision &&
-                                        pending.indexGeneration == indexGeneration &&
+                                        pending.surfacesVersion == surfacesVersion &&
                                         std::abs(pending.threshold - threshold) <= 0.01f &&
                                         pending.sampleStride == kSurfaceOverlapSampleStride;
             if (!pendingMatches) {
@@ -788,13 +788,11 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             _pendingOverlap.cache = OverlapCache{};
             _pendingOverlap.cache.surface = currentQuad;
             _pendingOverlap.cache.overlaysRevision = overlaysRevision;
-            _pendingOverlap.cache.indexGeneration = indexGeneration;
+            _pendingOverlap.cache.surfacesVersion = surfacesVersion;
             _pendingOverlap.cache.threshold = threshold;
             _pendingOverlap.cache.sampleStride = kSurfaceOverlapSampleStride;
 
             _overlapComputeRunning = true;
-            _overlapIndexReadInFlight = true;
-            _viewerManager->beginIndexRead();
 
             auto cancel = std::make_shared<std::atomic_bool>(false);
             _overlapCancel = cancel;
@@ -804,7 +802,8 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                  targets = std::move(targets),
                  targetColors = std::move(targetColors),
                  threshold,
-                 patchIndex,
+                 session,
+                 volume = _state->currentVolumeId(),
                  cancel]() -> QImage {
                 try {
                     QElapsedTimer timer;
@@ -816,18 +815,9 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                     uchar* const bits = sampledImage.bits();
                     const auto bytesPerLine = sampledImage.bytesPerLine();
 
-                    // Raw-pointer include set: locateAny filters against it
-                    // without copying (targets keeps the surfaces alive).
-                    std::unordered_set<QuadSurface*> targetsRaw;
-                    targetsRaw.reserve(targets.size());
-                    for (const auto& surf : targets) {
-                        targetsRaw.insert(surf.get());
-                    }
-
                     // Explicit fan-out: VC3D pins the implicit pools (OpenCV/
                     // OMP) to one thread, so parallelism must be spawned here.
-                    // locateAny() only takes a shared_lock, so rows can be
-                    // resolved concurrently; each row owns its scanline.
+                    // Each row is one store read; rows own their scanlines.
                     const unsigned hw = std::thread::hardware_concurrency();
                     const std::size_t workerCount = std::max<std::size_t>(
                         1, std::min<std::size_t>(hw == 0 ? 4 : hw,
@@ -837,34 +827,37 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                     workers.reserve(workerCount);
                     for (std::size_t w = 0; w < workerCount; ++w) {
                         workers.emplace_back(std::async(std::launch::async, [&]() {
-                            SurfacePatchIndex::PointQuery query;
-                            query.tolerance = threshold;
-                            query.surfaces.includeRaw = &targetsRaw;
-
+                            std::vector<std::array<double, 3>> points;
+                            std::vector<int> columns;
                             while (true) {
                                 const int r = nextRow.fetch_add(1, std::memory_order_relaxed);
                                 if (r >= sampledPoints.rows ||
                                     cancel->load(std::memory_order_relaxed)) {
                                     return;
                                 }
-                                auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
+                                points.clear();
+                                columns.clear();
                                 for (int c = 0; c < sampledPoints.cols; ++c) {
                                     const cv::Vec3f& pt = sampledPoints(r, c);
-                                    if (!vc::geometry::validSurfacePoint(pt)) {
+                                    if (vc::geometry::validSurfacePoint(pt)) {
+                                        points.push_back({pt[0], pt[1], pt[2]});
+                                        columns.push_back(c);
+                                    }
+                                }
+                                // The nearest overlay surface within the threshold colours the sample.
+                                const auto hits = SurfaceCatalog::nearest(*session, session->attachments(), volume,
+                                                                          targets, points, threshold);
+                                auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
+                                for (size_t i = 0; i < points.size(); ++i) {
+                                    if (hits[i].empty()) {
                                         continue;
                                     }
-
-                                    query.worldPoint = pt;
-                                    auto hit = patchIndex->locateAny(query);
-                                    if (!hit || !hit->surface) {
-                                        continue;
-                                    }
-                                    auto colorIt = targetColors.find(hit->surface.get());
+                                    const auto colorIt = targetColors.find(hits[i].front().objectUuid);
                                     if (colorIt == targetColors.end()) {
                                         continue;
                                     }
                                     const cv::Vec3b& hitColor = colorIt->second;
-                                    scanline[c] = qRgba(hitColor[2], hitColor[1], hitColor[0], 200);
+                                    scanline[columns[i]] = qRgba(hitColor[2], hitColor[1], hitColor[0], 200);
                                 }
                             }
                         }));
@@ -878,7 +871,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                         Logger()->info("[vc3d-profile] surfaceOverlapCompute elapsed_ms={} "
                                        "size={}x{} targets={} workers={} canceled={}",
                                        timer.elapsed(), sampledPoints.cols, sampledPoints.rows,
-                                       targetsRaw.size(), workerCount, canceled);
+                                       targets.size(), workerCount, canceled);
                     }
                     if (canceled) {
                         return {};  // canceled: result is discarded
@@ -935,12 +928,6 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
 void SegmentationOverlayController::handleOverlapComputeFinished()
 {
     _overlapComputeRunning = false;
-    if (_overlapIndexReadInFlight) {
-        if (_viewerManager) {
-            _viewerManager->endIndexRead();
-        }
-        _overlapIndexReadInFlight = false;
-    }
 
     const bool wasCanceled = _overlapCancel &&
                              _overlapCancel->load(std::memory_order_relaxed);

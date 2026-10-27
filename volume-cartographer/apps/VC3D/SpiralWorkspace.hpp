@@ -39,6 +39,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class Volume;
 class SpiralOverlayController;
+class StoreSurfaceOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
 class SpiralLineDraftOverlay;
@@ -160,10 +161,10 @@ private:
     void updateMinimapViewIndicator();
     void panFlattenedViewerToColumn(float column);
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
-    void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
-                                        const QString& registrationId,
-                                        qint64 generation, quint64 revision,
-                                        bool preserveFocus, int attempt);
+    void syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edited = nullptr);
+    void clearSurfaceDrafts();
+    void installPreviewAlias(const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
+                             qint64 generation, quint64 revision, bool preserveFocus);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void registerPendingPatchSurface(const QString& inputId,
@@ -200,6 +201,11 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
+    std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
+    // Spiral's surfaces are files, not stored objects: each shown one is a
+    // draft of the store session under its (UUID) id, so store queries
+    // (intersections, lookups, overlaps) see it.
+    std::map<std::string, std::weak_ptr<QuadSurface>> _surfaceDrafts;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
     // The display-only overlay of one editable PCL role (same-winding or

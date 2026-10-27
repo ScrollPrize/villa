@@ -13,7 +13,6 @@
 #include <QTimer>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 bool SegmentationModule::prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface)
@@ -56,7 +55,17 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     clearUndoStack();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
-    if (!_editManager->beginSession(surface)) {
+    // The edit's draft is declared in the frame the surface was read through.
+    SegmentationEditManager::DraftTarget draft{_state->objectStoreSession(), {}, storeEdit->pin().attachment};
+    if (const auto& view = storeEdit->view()) {
+        draft.coordinates = vc::objects::volumeCoordinates(view->volume, view->scale);
+    } else {
+        draft.session->read(draft.attachment, [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto record = db.objectByUuid(txn, storeEdit->uuid()))
+                draft.coordinates = nlohmann::json::parse(record->meta).value("coordinates", nlohmann::json::object());
+        });
+    }
+    if (!_editManager->beginSession(surface, std::move(draft))) {
         qCWarning(lcSegModule) << "Failed to begin segmentation editing session";
         return false;
     }
@@ -124,10 +133,6 @@ void SegmentationModule::endEditingSession()
 
     if (_autosaveState.pending()) {
         performAutosave();
-    }
-
-    if (_viewerManager && previewSurface) {
-        _viewerManager->refreshSurfacePatchIndex(previewSurface);
     }
 
     if (_editManager) {

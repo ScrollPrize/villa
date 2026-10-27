@@ -19,7 +19,6 @@
 
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 #include <array>
 
@@ -77,7 +76,6 @@ public:
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
-    void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);
     void setRawPointsOverlay(RawPointsOverlayController* overlay);
@@ -130,12 +128,6 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
-
-    void setSurfacePatchSamplingStride(int stride);
-    int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
-    void setIntersectionMaxSurfaces(int limit);
-    int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
-    void primeSurfacePatchIndicesAsync();
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
@@ -220,17 +212,18 @@ public:
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
-    SurfacePatchIndex* surfacePatchIndex();
-    SurfacePatchIndex* surfacePatchIndexIfReady();
-    SurfacePatchIndex* activeSegmentationEditSurfacePatchIndex() const;
-    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
-    void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
 
-    // Stop maintaining the SurfacePatchIndex. Any subsequent
-    // surfaceWillBeDeleted signals will be ignored instead of triggering
-    // an O(N) rtree removal. Intended to be called from the close path so
-    // that tearing down thousands of cells doesn't block app exit.
-    void beginShutdown() noexcept { _shuttingDown = true; }
+    // Where `point` (voxels of the open volume) lies on `surface` (by its id:
+    // a session draft or a surface of an attached store) within `tolerance`:
+    // its pointer and distance. Nothing without a volume or hit.
+    struct SurfaceLocation {
+        cv::Vec3f ptr;
+        float distance = 0;
+    };
+    std::optional<SurfaceLocation> locate(const QuadSurface& surface, const cv::Vec3f& point, float tolerance) const;
+    // The same for each of `points`, in one read.
+    std::vector<std::optional<SurfaceLocation>> locate(const QuadSurface& surface, const std::vector<cv::Vec3f>& points,
+                                                       float tolerance) const;
 
 signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
@@ -254,38 +247,12 @@ private slots:
     void handleFocusPoiChanged(std::string name, POI* poi);
     void handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    void handleSurfacePatchIndexPrimeFinished();
-    void handleSurfacePatchIndexTaskFinished();
-    void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
-    void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
-    enum class SurfacePatchIndexTaskType {
-        Update,
-        Remove,
-    };
-
-    struct SurfacePatchIndexTask {
-        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
-        std::string id;
-        SurfacePatchIndex::SurfacePtr surface;
-    };
-
-    struct SurfacePatchIndexTaskResult {
-        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
-        std::string id;
-        SurfacePatchIndex::SurfacePtr surface;
-        bool success{false};
-    };
-
     void registerOverlay(ViewerOverlayControllerBase* overlay);
     VolumeViewerBase* initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
                                               const std::string& surfaceName,
                                               ViewerRole role);
-    bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
-    void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
-    void startNextSurfacePatchIndexTask();
-    void scheduleSurfacePatchIndexOverlayRefresh();
 
     CState* _state;
     VCCollection* _points;
@@ -295,7 +262,6 @@ private:
     // Populated by the set*Overlay() methods. Does NOT include VolumeOverlayController
     // (which is not a ViewerOverlayControllerBase subclass).
     std::vector<ViewerOverlayControllerBase*> _allOverlays;
-    bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
     VolumeViewerBase* _activeViewer{nullptr};
@@ -327,9 +293,6 @@ private:
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
     bool _showCoordinateFrames{true};
     double _zScrollSensitivity{1.0};
-    int _surfacePatchSamplingStride{1};
-    std::atomic<bool> _shuttingDown{false};
-    int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     std::size_t _surfaceCacheBudgetBytes{0};
     std::size_t _overlaySurfaceCacheBudgetBytes{0};
@@ -337,33 +300,4 @@ private:
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
-    SurfacePatchIndex _surfacePatchIndex;
-    bool _surfacePatchIndexNeedsRebuild{true};
-    // A first surface entering an empty index has no other builder.
-    bool _surfacePatchIndexPrimeQueued{false};
-    void schedulePrimeSurfacePatchIndices();
-    // Use string IDs for surface tracking to avoid dangling pointers in async operations
-    std::unordered_set<std::string> _indexedSurfaceIds;
-    std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
-    std::vector<SurfacePatchIndexTask> _pendingSurfacePatchIndexTasks;
-    std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
-    QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
-    QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
-    bool _surfacePatchIndexOverlayRefreshPending{false};
-
-    void rebuildSurfacePatchIndexIfNeeded();
-
-public:
-    // Async-intersection mutual exclusion. A viewer's plane-intersection query reads
-    // _surfacePatchIndex on a worker thread; while any such read is in flight the
-    // index must not be mutated (rebuild swap / updateSurface / clear / single-surface
-    // task) or the worker tears. Mutation sites consult _indexReadsInFlight and defer
-    // (mark dirty / stash result / hold task); endIndexRead() applies the deferred
-    // work once reads drain. Begin/end bracket each worker read on the main thread.
-    void beginIndexRead() { ++_indexReadsInFlight; }
-    void endIndexRead();
-private:
-    int _indexReadsInFlight{0};
-    std::shared_ptr<SurfacePatchIndex> _deferredIndexSwap;
-    std::vector<std::string> _deferredIndexSwapIds;
 };

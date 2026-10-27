@@ -76,10 +76,12 @@ public:
     ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
-    [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
+    // The edited surface changed outside the edit manager (growth, mask): its
+    // draft follows `vertices` of it, or its whole grid.
+    void publishEditDraft(const std::optional<cv::Rect>& vertices = std::nullopt);
     [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
     void setDragSigma(float sigmaSteps);
@@ -136,7 +138,6 @@ public:
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);
-    void updateViewerCursors();
 
     bool handleKeyPress(QKeyEvent* event);
     bool handleKeyRelease(QKeyEvent* event);

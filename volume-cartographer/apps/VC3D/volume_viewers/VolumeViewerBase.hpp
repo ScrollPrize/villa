@@ -123,8 +123,6 @@ public:
     virtual void setResetViewOnSurfaceChange(bool enabled) = 0;
     virtual void setPlaneIntersectionLinesVisible(bool visible) = 0;
     virtual void setShowSurfaceNormals(bool enabled) = 0;
-    virtual void setSegmentationEditActive(bool active) = 0;
-    virtual void setSegmentationIntersectionDeferral(bool active) = 0;
     virtual void setSegmentationCursorMirroring(bool enabled) = 0;
     // Suppress only this viewer's local mouse crosshair while a controller
     // supplies a more specific cursor cue. Linked cursor projections remain
@@ -170,26 +168,15 @@ public:
     virtual QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) = 0;
     virtual void clearSelections() = 0;
 
-    // --- Intersection rendering ---
-    virtual void renderIntersections(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) = 0;
-    virtual void scheduleIntersectionRender(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) = 0;
-    virtual void invalidateIntersect(const std::string& name = "") = 0;
-    virtual void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells)
-    {
-        (void)name;
-        (void)changedCells;
-        invalidateIntersect();
-    }
+    // --- Where surfaces cross the view (StoreSurfaceOverlayController draws them) ---
+    // The named surfaces (setIntersects) whose crossings a plane viewer shows,
+    // or the planes ("seg xy/xz/yz") drawn cutting a surface viewer's surface.
+    virtual const std::set<std::string>& intersects() const = 0;
+    virtual bool planeIntersectionLinesVisible() const = 0;
     virtual float intersectionOpacity() const = 0;
     virtual float intersectionThickness() const = 0;
-    virtual int surfacePatchSamplingStride() const = 0;
     virtual void setIntersectionOpacity(float opacity) = 0;
     virtual void setIntersectionThickness(float thickness) = 0;
-    virtual void setSurfacePatchSamplingStride(int stride) = 0;
 
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;

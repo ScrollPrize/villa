@@ -35,7 +35,6 @@ struct POI
     std::optional<cv::Vec3f> surfacePtr;  // Nominal source-surface pointer for exact viewer recentering.
     cv::Vec3f n = {0,0,0};
     bool suppressViewerRecenter = false;
-    bool suppressTransientPlaneIntersections = false;
 };
 
 class CState : public QObject

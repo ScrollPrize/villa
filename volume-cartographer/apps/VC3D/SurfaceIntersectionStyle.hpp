@@ -1,8 +1,9 @@
 #pragma once
-// How plane viewers draw surface intersections: the viewer's own (active and
-// named surfaces) and the store overlay's (the surface list's visible surfaces).
+// How viewers draw where surfaces cross them (StoreSurfaceOverlayController):
+// the active surface, highlighted surfaces and the rest.
 #include <QColor>
 #include <QRgb>
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <functional>
@@ -20,6 +21,20 @@ constexpr int kIntersectionZ = 100;
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
 inline QColor highlightedIntersectionColor() { return QColor(0, 220, 255); }
+// The active surface is drawn stronger, in the colour of the plane it is seen in.
+constexpr float kActiveIntersectionOpacityScale = 1.2f;
+constexpr float kActiveIntersectionWidthScale = 1.3f;
+constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
+inline QColor activeIntersectionColor(const std::string& viewName)
+{
+    if (viewName == "seg yz" || viewName == "yz plane") return QColor(Qt::yellow);
+    if (viewName == "seg xz" || viewName == "xz plane") return QColor(Qt::red);
+    return QColor(255, 140, 0);
+}
+inline float activeIntersectionWidth(float baseWidth)
+{
+    return std::max(baseWidth * kActiveIntersectionWidthScale, baseWidth + kActiveIntersectionMinWidthDelta);
+}
 // A surface's colour, the same in every viewer and overlay.
 inline QColor intersectionColor(const std::string& id)
 {

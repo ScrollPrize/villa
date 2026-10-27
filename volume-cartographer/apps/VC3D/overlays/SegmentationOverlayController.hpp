@@ -126,7 +126,7 @@ private:
     struct OverlapCache {
         QImage image;                                       // ARGB32 overlap image (grid-sized)
         std::uint64_t overlaysRevision{0};                  // Selected overlay-set revision
-        std::uint64_t indexGeneration{0};                   // Index-wide mutation revision
+        std::uint64_t surfacesVersion{0};                   // CState surface map version
         float threshold{0.0f};                              // Threshold when image was built
         QuadSurface* surface{nullptr};                      // Current surface when image was built
         int sampleStride{1};                                // Raw grid stride represented by one image pixel
@@ -141,7 +141,6 @@ private:
     QFutureWatcher<QImage>* _overlapWatcher{nullptr};
     PendingOverlapResult _pendingOverlap;
     bool _overlapComputeRunning{false};
-    bool _overlapIndexReadInFlight{false};
     // Cooperative cancel for the in-flight compute; a fresh flag is created per
     // launch so a canceled worker can't clear a successor's flag.
     std::shared_ptr<std::atomic_bool> _overlapCancel;

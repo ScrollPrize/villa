@@ -224,6 +224,22 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     return opened;
 }
 
+std::vector<std::vector<SurfaceProximityHit>> SurfaceCatalog::nearest(
+    ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources, const std::string& volume,
+    const std::vector<std::string>& uuids, const std::vector<std::array<double, 3>>& points, double tolerance)
+{
+    std::vector<std::vector<SurfaceProximityHit>> result(points.size());
+    if (uuids.empty() || points.empty()) return result;
+    SurfaceProximityQuery query;
+    query.volume = volume;
+    query.uuids = uuids;
+    query.tolerance = tolerance;
+    auto found = session.nearestSurfaces(sources, query, points);
+    for (size_t i = 0; i < points.size(); ++i)
+        for (auto& hit : found[i]) result[i].push_back(std::move(hit.hit));
+    return result;
+}
+
 SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");

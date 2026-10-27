@@ -203,8 +203,7 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
 
     Returns the full settings object: {"intersectionOpacity" (0..1),
     "intersectionThickness" (0..100), "overlayOpacity" (0..1),
-    "intersectionMaxSurfaces" (int >=0), "volumeWindow" ({"low","high"}),
-    "samplingStride" (int >=1), "zScrollSensitivity" (0.1..100),
+    "volumeWindow" ({"low","high"}), "zScrollSensitivity" (0.1..100),
     "segmentationCursorMirroring" (bool),
     "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
     "surfaceOverlayEnabled" (bool),
@@ -218,7 +217,6 @@ async def vc3d_set_render_settings(
     intersection_opacity: Optional[float] = None,
     intersection_thickness: Optional[float] = None,
     overlay_opacity: Optional[float] = None,
-    intersection_max_surfaces: Optional[int] = None,
     plane_intersection_lines_visible: Optional[bool] = None,
     show_surface_normals: Optional[bool] = None,
     surface_overlay_enabled: Optional[bool] = None,
@@ -227,7 +225,6 @@ async def vc3d_set_render_settings(
     normal_arrow_length_scale: Optional[float] = None,
     normal_max_arrows: Optional[int] = None,
     segmentation_cursor_mirroring: Optional[bool] = None,
-    sampling_stride: Optional[int] = None,
     z_scroll_sensitivity: Optional[float] = None,
 ) -> dict[str, Any]:
     """Update the global viewer render settings; changes apply across all
@@ -237,7 +234,6 @@ async def vc3d_set_render_settings(
     intersection_opacity: surface-intersection overlay opacity, clamped 0..1.
     intersection_thickness: intersection line thickness, clamped 0..100.
     overlay_opacity: surface overlay opacity, clamped 0..1.
-    intersection_max_surfaces: cap on intersecting surfaces drawn, int >=0.
     plane_intersection_lines_visible: show plane/surface intersection lines.
     show_surface_normals: draw surface normal indicators.
     surface_overlay_enabled: master toggle for the surface overlay.
@@ -249,12 +245,11 @@ async def vc3d_set_render_settings(
     clamped 4..100 (the GUI slider's range) and persisted like the slider.
     segmentation_cursor_mirroring: mirror the cursor position onto the
     segmentation viewer from other panes.
-    sampling_stride: surface-patch intersection sampling stride, floored to 1.
     z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
     0.1..100.
 
-    The numeric/global fields (opacities, thickness, max-surfaces, volume
-    window, sampling stride, z-scroll sensitivity, cursor mirroring,
+    The numeric/global fields (opacities, thickness, volume window,
+    z-scroll sensitivity, cursor mirroring,
     normal-arrow length/count) are persisted (QSettings/ViewerManager) even
     with no viewer pane open. highlighted_surface_ids is retained by the
     surface panel and applies when viewers become available. The three
@@ -271,7 +266,6 @@ async def vc3d_set_render_settings(
                 "intersectionOpacity": intersection_opacity,
                 "intersectionThickness": intersection_thickness,
                 "overlayOpacity": overlay_opacity,
-                "intersectionMaxSurfaces": intersection_max_surfaces,
                 "planeIntersectionLinesVisible": plane_intersection_lines_visible,
                 "showSurfaceNormals": show_surface_normals,
                 "surfaceOverlayEnabled": surface_overlay_enabled,
@@ -280,7 +274,6 @@ async def vc3d_set_render_settings(
                 "normalArrowLengthScale": normal_arrow_length_scale,
                 "normalMaxArrows": normal_max_arrows,
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
-                "samplingStride": sampling_stride,
                 "zScrollSensitivity": z_scroll_sensitivity,
             }
         ),
