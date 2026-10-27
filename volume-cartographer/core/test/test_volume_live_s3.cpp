@@ -116,7 +116,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     MESSAGE("Catalog cache reuse: " << (after.bytes ? after.bytes->size() : 0)
             << " decoded bytes, " << fetches->load() << " remote chunk fetches");
     CHECK(vc::objects::geometryScaleToVolume(fiber, volume->id()) == 1.0);
-    CHECK(vc3d::coordinateBindingForVolume(*volume, 1).at("coordinates") == fiber.at("coordinates"));
+    CHECK(vc::objects::volumeCoordinates(volume->id(), 1) == fiber.at("coordinates"));
     REQUIRE(project->volumeIDs().size() == 2);
     for (const auto& id : project->volumeIDs()) {
         if (id != volume->id()) {

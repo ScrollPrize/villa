@@ -62,8 +62,8 @@ int main(int argc, char** argv)
             });
             return uuid;
         };
-        const auto native = add("native", vc3d::coordinateBindingForVolume(*volume, 1));
-        const auto half = add("half", vc3d::coordinateBindingForVolume(*volume, 0.5));
+        const auto native = add("native", nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}});
+        const auto half = add("half", nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 0.5)}});
         const auto unbound = add("unbound", std::nullopt);
         const auto other = add("other", nlohmann::json{{"coordinates", geometryCoordinates({{"volume_uuid", "vol2"}, {"scale_factor", 1}})}});
 
@@ -316,7 +316,7 @@ int main(int argc, char** argv)
         Volume::ZarrCreateOptions coarse = create;
         coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = "vol1-level1";
         const auto level = Volume::New(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
-        const auto atLevel = add("at-level", vc3d::coordinateBindingForVolume(*level, 1));
+        const auto atLevel = add("at-level", nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(level->id(), 1)}});
         require(vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "the level is registered");
         require(!vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "an existing relation is kept");
         catalog.setSource(attachment, level);

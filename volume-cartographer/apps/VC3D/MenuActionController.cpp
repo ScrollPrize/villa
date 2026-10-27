@@ -1885,7 +1885,7 @@ void MenuActionController::importUmbilicus()
             != QMessageBox::Yes)
         return;
 
-    auto meta = vc3d::coordinateBindingForVolume(*volume, storedUnitsPerVoxel);
+    nlohmann::json meta{{"coordinates", vc::objects::volumeCoordinates(volume->id(), storedUnitsPerVoxel)}};
     meta["provenance"] = {{"tool", "vc3d-import-umbilicus"},
                           {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
                                           {"frame", derived ? derived->description : std::string("entered")}}},

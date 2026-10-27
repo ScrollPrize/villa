@@ -37,7 +37,7 @@ int runSurfacePanelStoreTests()
             const auto uuid = util::newUuid();
             state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
                 create_quad_in_store(db, txn, uuid, grid, name, tags,
-                                     bound ? vc3d::coordinateBindingForVolume(*volume, 1).dump() : std::string("{}"));
+                                     bound ? nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}}.dump() : std::string("{}"));
             });
             return uuid;
         };

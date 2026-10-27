@@ -110,7 +110,7 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
         for (const auto& [uuid, edge] : linked) pin(uuid);
         for (const auto& [uuid, collection] : desired) pin(uuid);
     });
-    const auto binding = vc3d::coordinateBindingForVolume(volume, 1);
+    const auto coordinates = vc::objects::volumeCoordinates(volume.id(), 1);
     session.editKeepingRelationships(attachment, pins, related, [&](auto& db, auto& txn, const auto&) {
         for (const auto& [uuid, entry] : desired) {
             const auto& [id, collection] = entry;
@@ -122,7 +122,7 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
             if (!current) {
                 record.uuid = uuid;
                 record.kind = "point_collection";
-                for (const auto* key : {"coordinates", "coordinate_binding"}) meta[key] = binding.at(key);
+                meta["coordinates"] = coordinates;
                 meta["role"] = kRole;
             }
             record.name = collection.value("name", std::string{});
@@ -191,7 +191,7 @@ std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session
         pointAttributes.push_back({{"collection_id", point.collectionId}, {"collection_name", point.collectionName},
                                    {"creation_time", point.creationTime}});
     }
-    auto meta = vc3d::coordinateBindingForVolume(volume, 1);
+    Json meta{{"coordinates", vc::objects::volumeCoordinates(volume.id(), 1)}};
     meta["role"] = "growth_annotation";
     meta["source"] = {{"growth_annotation", {{"surface", annotation.surfaceUuid},
                                              {"before_geometry", annotation.beforeGeometry},

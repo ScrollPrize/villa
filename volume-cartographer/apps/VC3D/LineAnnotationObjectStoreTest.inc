@@ -92,7 +92,7 @@ int runObjectStoreControllerTests()
             Volume::ZarrCreateOptions create; create.shapeZYX = {4,4,4};
             create.chunkShapeZYX = {4,4,4}; create.compressor = "none"; create.uuid = "20260411134726";
             const auto volume = Volume::New(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
-            const auto binding = vc3d::coordinateBindingForVolume(*volume, 4);
+            const auto binding = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 4)}};
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
             require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
         }
@@ -120,7 +120,7 @@ int runObjectStoreControllerTests()
                 const auto uuid = vc::objects::util::newUuid();
                 state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
                     ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
-                    record.meta = vc3d::coordinateBindingForVolume(*volume, 2).dump();
+                    record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
                     db.upsertObject(txn, record);
                     db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}));
                 });
@@ -170,7 +170,7 @@ int runObjectStoreControllerTests()
                     return uuid;
                 };
                 // Two stored units per voxel: the volume sees half the coordinates.
-                scaled = add(vc3d::coordinateBindingForVolume(*volume, 2));
+                scaled = add(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}});
                 registered = add({{"coordinates", {{"volume_uuid", "other-volume"}, {"scale_factor", 1}}}});
                 txn.commit();
             }

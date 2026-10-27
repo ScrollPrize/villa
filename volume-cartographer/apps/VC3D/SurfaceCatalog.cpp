@@ -265,7 +265,10 @@ SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 void SurfaceCatalog::bind(const std::string& uuid, double storedUnitsPerVoxel)
 {
     if (!volume_) throw std::runtime_error("Open a volume first");
-    vc3d::bindCoordinates(*session_, *attachment_, uuid, head(uuid), *volume_, storedUnitsPerVoxel);
+    session_->editKeepingRelationships(*attachment_, {{uuid, head(uuid)}}, {}, [&](auto& db, auto& txn, const auto&) {
+        db.bindGeometryCoordinates(txn, uuid, volume_->id(), storedUnitsPerVoxel);
+        db.keepRecordedRelationshipsOf(txn, uuid);
+    });
 }
 
 void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<void(ObjectRecord&)>& change)
@@ -335,8 +338,7 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
                                    const std::vector<std::string>& tags)
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
-    auto meta = vc3d::coordinateBindingForVolume(*volume_, 1);
-    meta["provenance"] = provenance;
+    const nlohmann::json meta{{"coordinates", volumeCoordinates(volume_->id(), 1)}, {"provenance", provenance}};
     const auto uuid = util::newUuid();
     session_->act(*attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
         create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());

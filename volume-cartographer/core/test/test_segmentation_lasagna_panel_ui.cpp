@@ -205,7 +205,7 @@ int main(int argc, char** argv)
     QuadSurface grid(points, cv::Vec2f{1.0f, 1.0f});
     auto addSurface = [&](const std::string& name, nlohmann::json meta) {
         const auto uuid = vo::util::newUuid();
-        meta.update(vc3d::coordinateBindingForVolume(*volume, 1));
+        meta.update(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}});
         session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
             vo::ObjectRecord record;
             record.uuid = uuid;

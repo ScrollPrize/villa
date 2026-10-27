@@ -393,7 +393,6 @@ using vc3d::line_annotation::pointsApproximatelyEqual;
 using vc3d::line_annotation::nearestControlAtPoint;
 using vc3d::line_annotation::storedControlPointIndexByPosition;
 using vc3d::line_annotation::tangentAtLinePosition;
-using vc3d::coordinateBindingForVolume;
 using vc3d::line_annotation::kNeedsReoptimizationTag;
 
 // Arclength radius within which a placement click replaces the existing
@@ -6888,7 +6887,7 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
         const auto volume = _state ? _state->currentVolume() : nullptr;
         if (!volume)
             throw std::runtime_error("An active volume is required to bind a new fiber");
-        linkedFiber.coordinateIdentity.update(coordinateBindingForVolume(*volume, 1.0));
+        linkedFiber.coordinateIdentity["coordinates"] = vc::objects::volumeCoordinates(volume->id(), 1.0);
         const uint64_t linkedFiberId = linkedFiber.id;
         commitFibers({&parentFiber, &linkedFiber});
         return linkedFiberId;
@@ -12832,7 +12831,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
         const auto volume=_state->currentVolume();
         if(!volume) throw std::runtime_error("An active volume is required to bind a new fiber");
         const auto scale=vc3d::line_annotation::resolveFiberBaseToVolumeScale(coordinateBaseShapeZYX,volume->shape());
-        creationBinding=coordinateBindingForVolume(*volume,1.0/scale);
+        creationBinding={{"coordinates",vc::objects::volumeCoordinates(volume->id(),1.0/scale)}};
     } catch(const std::exception& error) {fail(QString::fromUtf8(error.what()));return;}
 
     struct HeadlessResult {
@@ -15153,7 +15152,7 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     if ((!fiber.storePin || fiber.storePin->objectRevision.empty()) && _state && _state->currentVolume()) {
         // A fiber created in an annotation pane is in the volume's voxels.
         for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == fiber.uuid) {
-            snapshot.fiber.coordinateIdentity.update(coordinateBindingForVolume(*_state->currentVolume(),1.0));
+            snapshot.fiber.coordinateIdentity["coordinates"]=vc::objects::volumeCoordinates(_state->currentVolume()->id(),1.0);
             break;
         }
     }
@@ -15323,8 +15322,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     fiber.coordinateBaseShapeZYX = std::array<size_t, 3>{size_t(shape[0]), size_t(shape[1]), size_t(shape[2])};
                 } else if (source.contains("coordinate_base_shape_zyx"))
                     fiber.coordinateBaseShapeZYX = source.at("coordinate_base_shape_zyx").template get<std::array<size_t,3>>();
-                for (const auto* key : {"coordinates", "coordinate_binding"})
-                    if (metadata.contains(key)) fiber.coordinateIdentity[key] = metadata.at(key);
+                if (metadata.contains("coordinates")) fiber.coordinateIdentity["coordinates"] = metadata.at("coordinates");
                 if (object.fiber) {
                     fiber.width = fiber.frame ? object.fiber->width * fiber.frame->storedToVolume.lengthScale()
                                               : object.fiber->width;
@@ -15631,11 +15629,10 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             record.name = fs::path(fiber.fileName).stem().string(); record.tags = fiber.tags;
             record.formatVersion = vc3d::line_annotation::kFiberFormatVersion;
             auto meta = Json::parse(record.meta);
-            if (!current) for (const auto* key : {"coordinates", "coordinate_binding"})
-                if (snapshot.fiber.coordinateIdentity.contains(key)) meta[key] = snapshot.fiber.coordinateIdentity.at(key);
+            if (!current && snapshot.fiber.coordinateIdentity.contains("coordinates"))
+                meta["coordinates"] = snapshot.fiber.coordinateIdentity.at("coordinates");
             fiber.coordinateIdentity = Json::object();
-            for (const auto* key : {"coordinates", "coordinate_binding"})
-                if (meta.contains(key)) fiber.coordinateIdentity[key] = meta.at(key);
+            if (meta.contains("coordinates")) fiber.coordinateIdentity["coordinates"] = meta.at("coordinates");
             auto source = meta.value("source", Json::object());
             const auto& stored = inStoredFrame(fiber);
             auto incoming = fiberSourceMetadata(stored);
@@ -15795,7 +15792,10 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
-    vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,*scale);
+    connection->editKeepingRelationships(pin.attachment,{{fiber.uuid,pin.objectRevision}},{},[&](auto& db,auto& txn,const auto&){
+        db.bindGeometryCoordinates(txn,fiber.uuid,volume->id(),*scale);
+        db.keepRecordedRelationshipsOf(txn,fiber.uuid);
+    });
     return true;
 }
 

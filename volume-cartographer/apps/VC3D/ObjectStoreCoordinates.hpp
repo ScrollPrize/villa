@@ -12,24 +12,4 @@ struct VolumeView {
     double scale = 1;
     vc::objects::VolumeAffine mapping;
 };
-inline nlohmann::json coordinateBindingForVolume(const Volume& volume, double storedUnitsPerVoxel)
-{
-    return {{"coordinates", vc::objects::geometryCoordinates({{"volume_uuid", volume.id()},
-                                                             {"scale_factor", storedUnitsPerVoxel}})},
-            {"coordinate_binding", {{"active_volume_id", volume.id()}, {"shape_zyx", volume.shape()},
-                                    {"resolution_um", volume.voxelSize()}}}};
-}
-// Bind an object of any kind, pinned at `objectRevision`, to `volume`: its stored
-// coordinates are `storedUnitsPerVoxel` units per volume voxel. Its
-// relationships are kept as recorded.
-inline void bindCoordinates(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-                            const std::string& uuid, const std::string& objectRevision, const Volume& volume,
-                            double storedUnitsPerVoxel)
-{
-    const auto assigned = coordinateBindingForVolume(volume, storedUnitsPerVoxel);
-    session.editKeepingRelationships(attachment, {{uuid, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
-        db.bindGeometryCoordinates(txn, uuid, assigned.at("coordinates"), assigned.at("coordinate_binding"));
-        db.keepRecordedRelationshipsOf(txn, uuid);
-    });
-}
 }
