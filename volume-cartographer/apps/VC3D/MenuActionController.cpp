@@ -1327,8 +1327,6 @@ void MenuActionController::showSettingsDialog()
     dialog->exec();
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
-                                       vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
     const bool resetViewOnSurfaceChange =
         settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                        vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
@@ -1336,9 +1334,8 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
                        vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
     if (_window->_viewerManager) {
-        _window->_viewerManager->forEachBaseViewer([showDirHints, showPlaneLines](VolumeViewerBase* viewer) {
+        _window->_viewerManager->forEachBaseViewer([showPlaneLines](VolumeViewerBase* viewer) {
             if (viewer) {
-                viewer->setShowDirectionHints(showDirHints);
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
                 // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();

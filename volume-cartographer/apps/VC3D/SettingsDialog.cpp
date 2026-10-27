@@ -56,22 +56,6 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     if (auto* spin = findChild<QSpinBox*>("spinAxisOverlayOpacity")) {
         spin->setValue(std::clamp(settings.value(viewer::AXIS_OVERLAY_OPACITY, viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt(), 0, 100));
     }
-    // Show direction hints (flip_x arrows)
-    if (findChild<QCheckBox*>("chkShowDirectionHints")) {
-        findChild<QCheckBox*>("chkShowDirectionHints")->setChecked(settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toInt() != 0);
-    }
-    // Direction step size default
-    if (auto* spin = findChild<QDoubleSpinBox*>("spinDirectionStep")) {
-        spin->setValue(settings.value(viewer::DIRECTION_STEP, viewer::DIRECTION_STEP_DEFAULT).toDouble());
-    }
-    // Use segmentation step for hints
-    if (auto* chk = findChild<QCheckBox*>("chkUseSegStepForHints")) {
-        chk->setChecked(settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toInt() != 0);
-    }
-    // Number of step points per direction
-    if (auto* spin = findChild<QSpinBox*>("spinDirectionStepPoints")) {
-        spin->setValue(settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt());
-    }
 
     spinPreloadedSlices->setValue(settings.value(perf::PRELOADED_SLICES, perf::PRELOADED_SLICES_DEFAULT).toInt());
     spinParallelProcesses->setValue(settings.value(perf::PARALLEL_PROCESSES, perf::PARALLEL_PROCESSES_DEFAULT).toInt());
@@ -179,18 +163,6 @@ void SettingsDialog::accept()
     }
     if (auto* spin = findChild<QSpinBox*>("spinAxisOverlayOpacity")) {
         settings.setValue(viewer::AXIS_OVERLAY_OPACITY, spin->value());
-    }
-    if (findChild<QCheckBox*>("chkShowDirectionHints")) {
-        settings.setValue(viewer::SHOW_DIRECTION_HINTS, findChild<QCheckBox*>("chkShowDirectionHints")->isChecked() ? "1" : "0");
-    }
-    if (auto* spin = findChild<QDoubleSpinBox*>("spinDirectionStep")) {
-        settings.setValue(viewer::DIRECTION_STEP, spin->value());
-    }
-    if (auto* chk = findChild<QCheckBox*>("chkUseSegStepForHints")) {
-        settings.setValue(viewer::USE_SEG_STEP_FOR_HINTS, chk->isChecked() ? "1" : "0");
-    }
-    if (auto* spin = findChild<QSpinBox*>("spinDirectionStepPoints")) {
-        settings.setValue(viewer::DIRECTION_STEP_POINTS, spin->value());
     }
 
     settings.setValue(perf::PRELOADED_SLICES, spinPreloadedSlices->value());

@@ -204,7 +204,6 @@ public:
                       const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // --- Fleet setters: apply a viewer preference to every viewer ---
-    void setShowDirectionHints(bool show);
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
     void setPlaneIntersectionLinesVisible(bool visible);

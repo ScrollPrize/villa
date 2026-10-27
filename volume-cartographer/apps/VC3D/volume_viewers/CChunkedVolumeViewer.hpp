@@ -143,8 +143,6 @@ public:
     void setPlaneIntersectionLinesVisible(bool visible) override;
     bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
 
-    void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
-    bool isShowDirectionHints() const override { return _showDirectionHints; }
     void setShowSurfaceNormals(bool on) override { if (_closing) return; _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     void setShowCoordinateFrame(bool show);
@@ -655,7 +653,6 @@ private:
     float _linkedCursorViewTolerance = 10.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
-    bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
     bool _showCoordinateFrame = true;
     float _normalArrowLengthScale = 1.0f;

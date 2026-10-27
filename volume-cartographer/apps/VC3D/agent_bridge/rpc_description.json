@@ -3014,7 +3014,6 @@
           "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
           "samplingStride": "sampling_stride",
           "segmentationCursorMirroring": "segmentation_cursor_mirroring",
-          "showDirectionHints": "show_direction_hints",
           "showSurfaceNormals": "show_surface_normals",
           "surfaceOverlayEnabled": "surface_overlay_enabled",
           "volumeWindow": "volume_window",
@@ -3061,9 +3060,6 @@
             "type": "integer"
           },
           "segmentationCursorMirroring": {
-            "type": "boolean"
-          },
-          "showDirectionHints": {
             "type": "boolean"
           },
           "showSurfaceNormals": {

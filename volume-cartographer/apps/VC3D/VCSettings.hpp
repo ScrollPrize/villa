@@ -106,13 +106,9 @@ namespace viewer {
 
     // Display & Appearance
     constexpr auto DISPLAY_SEGMENT_OPACITY = "viewer/display_segment_opacity";
-    constexpr auto SHOW_DIRECTION_HINTS = "viewer/show_direction_hints";
     constexpr auto SHOW_SURFACE_NORMALS = "viewer/show_surface_normals";
     constexpr auto NORMAL_ARROW_LENGTH_SCALE = "viewer/normal_arrow_length_scale";
     constexpr auto NORMAL_MAX_ARROWS = "viewer/normal_max_arrows";
-    constexpr auto DIRECTION_STEP = "viewer/direction_step";
-    constexpr auto USE_SEG_STEP_FOR_HINTS = "viewer/use_seg_step_for_hints";
-    constexpr auto DIRECTION_STEP_POINTS = "viewer/direction_step_points";
     constexpr auto RESET_VIEW_ON_SURFACE_CHANGE = "viewer/reset_view_on_surface_change";
     constexpr auto SHOW_PLANE_INTERSECTION_LINES = "viewer/show_plane_intersection_lines";
     constexpr auto MIRROR_CURSOR_TO_SEGMENTATION = "viewer/mirror_cursor_to_segmentation";
@@ -120,13 +116,9 @@ namespace viewer {
     constexpr auto POINT_COLLECTION_VIEW_TOLERANCE = "viewer/point_collection_view_tolerance";
 
     constexpr int DISPLAY_SEGMENT_OPACITY_DEFAULT = 70;
-    constexpr bool SHOW_DIRECTION_HINTS_DEFAULT = true;
     constexpr bool SHOW_SURFACE_NORMALS_DEFAULT = false;
     constexpr int NORMAL_ARROW_LENGTH_SCALE_DEFAULT = 100;  // Percentage (100 = 1.0x)
     constexpr int NORMAL_MAX_ARROWS_DEFAULT = 32;  // Max arrows per axis for sampling
-    constexpr double DIRECTION_STEP_DEFAULT = 10.0;
-    constexpr bool USE_SEG_STEP_FOR_HINTS_DEFAULT = true;
-    constexpr int DIRECTION_STEP_POINTS_DEFAULT = 5;
     constexpr bool RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT = false;
     constexpr bool SHOW_PLANE_INTERSECTION_LINES_DEFAULT = true;
     constexpr bool MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT = false;

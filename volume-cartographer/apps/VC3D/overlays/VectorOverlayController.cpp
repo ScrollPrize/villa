@@ -2,14 +2,11 @@
 
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../CState.hpp"
-#include "../VCSettings.hpp"
 #include "../ViewerManager.hpp"
 
 #include "vc/core/util/Surface.hpp"
 
-#include <QSettings>
 #include <QFontMetricsF>
-#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,26 +19,14 @@
 namespace
 {
 constexpr const char* kOverlayGroup = "vector_overlays";
-constexpr qreal kArrowLength = 60.0;
-constexpr qreal kArrowHeadLength = 10.0;
-constexpr qreal kArrowHeadWidth = 6.0;
 constexpr qreal kArrowZ = 30.0;
 constexpr qreal kLabelZ = 31.0;
-constexpr qreal kMarkerZ = 32.0;
-constexpr float kStepCenterRadius = 4.0f;
-constexpr float kStepMarkerRadius = 3.0f;
-const QColor kCenterColor(255, 255, 0);
-const QColor kArrowFalseColor(Qt::red);
-const QColor kArrowTrueColor(Qt::green);
 }
 
 VectorOverlayController::VectorOverlayController(CState* state, QObject* parent)
     : ViewerOverlayControllerBase(kOverlayGroup, parent)
     , _state(state)
 {
-    addProvider([this](VolumeViewerBase* viewer, OverlayBuilder& builder) {
-        collectDirectionHints(viewer, builder);
-    });
     addProvider([this](VolumeViewerBase* viewer, OverlayBuilder& builder) {
         collectSurfaceNormals(viewer, builder);
     });
@@ -59,7 +44,7 @@ bool VectorOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) cons
     if (!viewer) {
         return false;
     }
-    if (!viewer->isShowDirectionHints() && !viewer->isShowSurfaceNormals()) {
+    if (!viewer->isShowSurfaceNormals()) {
         return false;
     }
     for (const auto& provider : _providers) {
@@ -79,216 +64,6 @@ void VectorOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     for (const auto& provider : _providers) {
         if (provider) {
             provider(viewer, builder);
-        }
-    }
-}
-
-void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
-                                                    OverlayBuilder& builder) const
-{
-    if (!viewer->isShowDirectionHints()) {
-        return;
-    }
-
-    auto* currentSurface = viewer->currentSurface();
-    if (!currentSurface) {
-        return;
-    }
-
-    const float scale = viewer->getCurrentScale();
-    QPointF anchorScene = visibleSceneRect(viewer).center();
-
-    auto addArrow = [&](const QPointF& origin, const QPointF& direction, const QColor& color) {
-        if (direction.isNull()) {
-            return;
-        }
-        QPointF dir = direction;
-        double mag = std::hypot(dir.x(), dir.y());
-        if (mag < 1e-3) {
-            return;
-        }
-        dir.setX(dir.x() / mag);
-        dir.setY(dir.y() / mag);
-        QPointF end = origin + dir * kArrowLength;
-
-        OverlayStyle style;
-        style.penColor = color;
-        style.penWidth = 2.0;
-        style.z = kArrowZ;
-
-        builder.addArrow(origin, end, kArrowHeadLength, kArrowHeadWidth, style);
-    };
-
-    auto addLabel = [&](const QPointF& pos, const QString& text, const QColor& color) {
-        OverlayStyle textStyle;
-        textStyle.penColor = color;
-        textStyle.z = kLabelZ;
-
-        QFont font;
-        font.setPointSizeF(9.0);
-
-        builder.addText(pos, text, font, textStyle);
-    };
-
-    auto addMarker = [&](const QPointF& center, const QColor& color, float radius) {
-        OverlayStyle style;
-        style.penColor = Qt::black;
-        style.penWidth = 1.0;
-        style.brushColor = color;
-        style.z = kMarkerZ;
-        builder.addCircle(center, radius, true, style);
-    };
-
-    QuadSurface* segSurface = nullptr;
-    std::shared_ptr<Surface> segSurfaceHolder;  // Keep surface alive during this scope
-    if (viewer->surfName() == "segmentation") {
-        segSurface = dynamic_cast<QuadSurface*>(currentSurface);
-    } else if (_state) {
-        segSurfaceHolder = _state->surface("segmentation");
-        segSurface = dynamic_cast<QuadSurface*>(segSurfaceHolder.get());
-    }
-
-    auto fetchFocusScene = [&](QPointF& anchor) {
-        if (!segSurface || !_state) {
-            return;
-        }
-        if (auto* poi = _state->poi("focus")) {
-            cv::Vec3f ptr(0, 0, 0);
-            auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-            float dist = segSurface->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
-            if (dist >= 0 && dist < 20.0f / scale) {
-                anchor = viewer->volumeToScene(segSurface->coord(ptr, {0, 0, 0}));
-            }
-        }
-    };
-
-    // Read QSettings once for both QuadSurface and PlaneSurface branches
-    using namespace vc3d::settings;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    bool useSegStep = settings.value(viewer::USE_SEG_STEP_FOR_HINTS, viewer::USE_SEG_STEP_FOR_HINTS_DEFAULT).toBool();
-    int numPoints = std::max(0, std::min(100, settings.value(viewer::DIRECTION_STEP_POINTS, viewer::DIRECTION_STEP_POINTS_DEFAULT).toInt()));
-    float stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-    if (useSegStep && segSurface && !segSurface->meta.is_null()) {
-        try {
-            if (segSurface->meta.contains("vc_grow_seg_from_segments_params")) {
-                const auto& p = segSurface->meta.at("vc_grow_seg_from_segments_params");
-                if (p.contains("step")) {
-                    stepVal = p.at("step").get_float();
-                }
-            }
-        } catch (...) {
-            // keep default
-        }
-    }
-    if (stepVal <= 0.0f) {
-        stepVal = settings.value(viewer::DIRECTION_STEP, static_cast<float>(viewer::DIRECTION_STEP_DEFAULT)).toFloat();
-    }
-
-    if (viewer->surfName() == "segmentation") {
-        auto* quad = dynamic_cast<QuadSurface*>(currentSurface);
-        if (!quad) {
-            return;
-        }
-
-        fetchFocusScene(anchorScene);
-
-        QPointF upOffset(0.0, -20.0);
-        QPointF downOffset(0.0, 20.0);
-
-        addArrow(anchorScene + upOffset, QPointF(1.0, 0.0), kArrowFalseColor);
-        addArrow(anchorScene + downOffset, QPointF(-1.0, 0.0), kArrowTrueColor);
-
-        addLabel(anchorScene + upOffset + QPointF(8.0, -8.0), QStringLiteral("false"), kArrowFalseColor);
-        addLabel(anchorScene + downOffset + QPointF(8.0, -8.0), QStringLiteral("true"), kArrowTrueColor);
-
-        cv::Vec3f ptr(0, 0, 0);
-        if (_state) {
-            if (auto* poi = _state->poi("focus")) {
-                auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-                quad->pointTo(ptr, poi->p, 4.0, 100, patchIndex);
-            }
-        }
-
-        cv::Vec3f centerWorld = quad->coord(ptr, {0, 0, 0});
-        if (vc::geometry::validSurfacePoint(centerWorld)) {
-            addMarker(viewer->volumeToScene(centerWorld), kCenterColor, kStepCenterRadius);
-        }
-
-        for (int n = 1; n <= numPoints; ++n) {
-            cv::Vec3f pos = quad->coord(ptr, {n * stepVal, 0, 0});
-            if (vc::geometry::validSurfacePoint(pos)) {
-                addMarker(viewer->volumeToScene(pos), kArrowFalseColor, kStepMarkerRadius);
-            }
-
-            cv::Vec3f neg = quad->coord(ptr, {-n * stepVal, 0, 0});
-            if (vc::geometry::validSurfacePoint(neg)) {
-                addMarker(viewer->volumeToScene(neg), kArrowTrueColor, kStepMarkerRadius);
-            }
-        }
-        return;
-    }
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface)) {
-        if (!segSurface) {
-            return;
-        }
-
-        QPointF upOffset(0.0, -10.0);
-        QPointF downOffset(0.0, 10.0);
-
-        cv::Vec3f targetWP = plane->origin();
-        if (_state) {
-            if (auto* poi = _state->poi("focus")) {
-                targetWP = poi->p;
-            }
-        }
-
-        cv::Vec3f segPtr(0, 0, 0);
-        auto* patchIndex = manager() ? manager()->surfacePatchIndex() : nullptr;
-        segSurface->pointTo(segPtr, targetWP, 4.0, 100, patchIndex);
-
-        cv::Vec3f p0 = segSurface->coord(segPtr, {0, 0, 0});
-        if (!vc::geometry::validSurfacePoint(p0)) {
-            return;
-        }
-
-        const float stepNominal = 2.0f;
-        cv::Vec3f p1 = segSurface->coord(segPtr, {stepNominal, 0, 0});
-        cv::Vec3f dir3 = p1 - p0;
-        const float len2 = dir3.dot(dir3);
-        if (len2 < 1e-10f) {
-            return;
-        }
-        const float len = std::sqrt(len2);
-        dir3 *= (1.0f / len);
-
-        QPointF anchor = viewer->volumeToScene(targetWP);
-
-        QPointF dirEnd = viewer->volumeToScene(targetWP + dir3 * (kArrowLength / scale));
-        QPointF dir2(dirEnd.x() - anchor.x(), dirEnd.y() - anchor.y());
-        if (std::hypot(dir2.x(), dir2.y()) < 1e-3) {
-            return;
-        }
-
-        addArrow(anchor + upOffset, dir2, kArrowFalseColor);
-        addArrow(anchor + downOffset, QPointF(-dir2.x(), -dir2.y()), kArrowTrueColor);
-
-        QPointF redTip = anchor + upOffset + dir2;
-        QPointF greenTip = anchor + downOffset - dir2;
-        addLabel(redTip + QPointF(8.0, -8.0), QStringLiteral("false"), kArrowFalseColor);
-        addLabel(greenTip + QPointF(8.0, -8.0), QStringLiteral("true"), kArrowTrueColor);
-
-        addMarker(anchor, kCenterColor, kStepCenterRadius);
-
-        for (int n = 1; n <= numPoints; ++n) {
-            cv::Vec3f pPos = segSurface->coord(segPtr, {n * stepVal, 0, 0});
-            cv::Vec3f pNeg = segSurface->coord(segPtr, {-n * stepVal, 0, 0});
-            if (vc::geometry::validSurfacePoint(pPos)) {
-                addMarker(viewer->volumeToScene(pPos), kArrowFalseColor, kStepMarkerRadius);
-            }
-            if (vc::geometry::validSurfacePoint(pNeg)) {
-                addMarker(viewer->volumeToScene(pNeg), kArrowTrueColor, kStepMarkerRadius);
-            }
         }
     }
 }

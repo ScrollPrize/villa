@@ -126,8 +126,7 @@ public:
     virtual int datasetScaleIndex() const = 0;
     virtual float datasetScaleFactor() const = 0;
 
-    // --- Direction/normal hints ---
-    virtual bool isShowDirectionHints() const = 0;
+    // --- Surface normal hints ---
     virtual bool isShowSurfaceNormals() const = 0;
     virtual float normalArrowLengthScale() const = 0;
     virtual int normalMaxArrows() const = 0;
@@ -143,7 +142,6 @@ public:
     virtual void setBaseColormap(const std::string& id) = 0;
     virtual void setResetViewOnSurfaceChange(bool enabled) = 0;
     virtual void setPlaneIntersectionLinesVisible(bool visible) = 0;
-    virtual void setShowDirectionHints(bool enabled) = 0;
     virtual void setShowSurfaceNormals(bool enabled) = 0;
     virtual void setSegmentationEditActive(bool active) = 0;
     virtual void setSegmentationIntersectionDeferral(bool active) = 0;

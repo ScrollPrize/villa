@@ -69,7 +69,6 @@ class FakeAgentBridgeServer:
             "intersectionMaxSurfaces": 8,
             "planeIntersectionLinesVisible": True,
             "showSurfaceNormals": False,
-            "showDirectionHints": False,
             "surfaceOverlayEnabled": True,
             "highlightedSurfaceIds": [],
         }

@@ -436,7 +436,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
-| `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
+| `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |

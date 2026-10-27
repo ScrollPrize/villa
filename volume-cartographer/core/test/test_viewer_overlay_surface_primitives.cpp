@@ -129,7 +129,6 @@ public:
     int datasetScaleIndex() const override { return 0; }
     float datasetScaleFactor() const override { return 1.0f; }
 
-    bool isShowDirectionHints() const override { return false; }
     bool isShowSurfaceNormals() const override { return false; }
     float normalArrowLengthScale() const override { return 1.0f; }
     int normalMaxArrows() const override { return 0; }
@@ -144,7 +143,6 @@ public:
     void setBaseColormap(const std::string&) override {}
     void setResetViewOnSurfaceChange(bool) override {}
     void setPlaneIntersectionLinesVisible(bool) override {}
-    void setShowDirectionHints(bool) override {}
     void setShowSurfaceNormals(bool) override {}
     void setSegmentationEditActive(bool) override {}
     void setSegmentationIntersectionDeferral(bool) override {}

@@ -114,7 +114,7 @@ This replaces older manual `QGraphicsItem` creation.
 
 ### VectorOverlayController
 
-- Handles direction hints/step markers using arrow and circle primitives.
+- Draws surface-normal frames using arrow and circle primitives.
 - Controllers can call `addProvider` to register additional vector producers (e.g., surface normals, rays) without modifying existing logic.
 - Example provider registration:
 
@@ -212,7 +212,7 @@ protected:
 `CVolumeViewer` exposes overlay-relevant state:
 
 - `highlightedPointId()`, `selectedPointId()`, `selectedCollectionId()`
-- `isShowDirectionHints()`, `activeBBoxSceneRect()`
+- `isShowSurfaceNormals()`, `activeBBoxSceneRect()`
 - `selections()` returns stored bbox rects with colors
 - `onPathsChanged(...)` stores path primitives and emits `overlaysUpdated()`
 

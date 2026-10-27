@@ -71,14 +71,6 @@ const ShortcutDef SurfaceNormals{
     "Ctrl+N",
     QKeySequence::Open
 };
-const ShortcutDef DirectionHints{
-    "direction_hints",
-    kSectionViewMenu,
-    "Toggle direction hints (flip_x arrows)",
-    ShortcutKind::Text,
-    "Ctrl+T",
-    QKeySequence::Open
-};
 const ShortcutDef CompositeView{
     "composite_view",
     kSectionViewMenu,
@@ -500,7 +492,6 @@ QString buildKeybindsHelpText()
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
-        { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::CompositeView.description, HelpKeyType::Shortcut, &shortcuts::CompositeView, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::RawPointsOverlay.description, HelpKeyType::Shortcut, &shortcuts::RawPointsOverlay, nullptr, nullptr },
         { kSectionViewMenu, keypress::ToggleVolumeOverlay.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleVolumeOverlay, nullptr },

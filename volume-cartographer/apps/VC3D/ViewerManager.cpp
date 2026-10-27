@@ -348,8 +348,6 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool showHints = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
-        baseViewer->setShowDirectionHints(showHints);
         bool showNormals = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
         baseViewer->setShowSurfaceNormals(showNormals);
     }
@@ -745,15 +743,6 @@ VolumeViewerBase* ViewerManager::segmentationViewer() const
         }
     }
     return nullptr;
-}
-
-void ViewerManager::setShowDirectionHints(bool show)
-{
-    forEachBaseViewer([show](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setShowDirectionHints(show);
-        }
-    });
 }
 
 void ViewerManager::setShowSurfaceNormals(bool show)

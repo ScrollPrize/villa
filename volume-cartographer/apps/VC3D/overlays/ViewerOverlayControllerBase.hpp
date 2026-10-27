@@ -532,10 +532,10 @@ private:
         QMetaObject::Connection destroyedConn;
         // Coalesce the rebuildOverlay fan-out onto a 16 ms single-shot
         // timer. overlaysUpdated() gets emitted on every viewport pan/zoom
-        // (post-render side-effect), and collectDirectionHints' pointTo
-        // search was measured at ~7.5% of total CPU in the live profile —
-        // debouncing drops that to one rebuild per tick window regardless
-        // of signal frequency.
+        // (post-render side-effect); overlay rebuilds that search the
+        // surface (pointTo) have measured several percent of total CPU in
+        // live profiles — debouncing drops that to one rebuild per tick
+        // window regardless of signal frequency.
         QTimer* rebuildTimer{nullptr};
         bool rebuildDirty{false};
     };

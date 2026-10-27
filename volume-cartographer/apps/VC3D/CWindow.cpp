@@ -1536,20 +1536,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
-    // Toggle direction hints overlay (Ctrl+T)
-    fDirectionHintsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DirectionHints), this);
-    fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool current = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
-        bool next = !current;
-        settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
-        for (auto* manager : ViewerManager::allManagers()) {
-            manager->setShowDirectionHints(next);
-        }
-    });
-
     // Toggle surface normals visualization (Ctrl+N)
     fSurfaceNormalsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::SurfaceNormals), this);
     fSurfaceNormalsShortcut->setContext(Qt::ApplicationShortcut);

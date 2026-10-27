@@ -376,7 +376,6 @@ private:
     std::unique_ptr<LineAnnotationController> _lineAnnotationController;
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
-    QShortcut* fDirectionHintsShortcut;
     QShortcut* fSurfaceNormalsShortcut;
     QShortcut* fAxisAlignedSlicesShortcut;
     QShortcut* fZoomInShortcut;

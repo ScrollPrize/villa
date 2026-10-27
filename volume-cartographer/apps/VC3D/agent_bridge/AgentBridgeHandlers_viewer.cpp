@@ -318,7 +318,6 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
     if (firstChunked) {
         o["planeIntersectionLinesVisible"] = firstChunked->isPlaneIntersectionLinesVisible();
         o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
-        o["showDirectionHints"] = firstChunked->isShowDirectionHints();
         o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
         o["normalArrowLengthScale"] = firstChunked->normalArrowLengthScale();
         o["normalMaxArrows"] = firstChunked->normalMaxArrows();
@@ -330,9 +329,6 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
         o["showSurfaceNormals"] = settings.value(
             vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
             vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
-        o["showDirectionHints"] = settings.value(
-            vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
-            vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         o["surfaceOverlayEnabled"] = false;
         // Stored as a percentage int (100 = 1.0x) by ViewerNormalVisualizationPanel;
         // convert to the same float scale setNormalArrowLengthScale() takes.
@@ -442,10 +438,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
     const bool showSurfaceNormals = hasShowSurfaceNormals
         ? p.value("showSurfaceNormals").toBool() : false;
 
-    const bool hasShowDirectionHints = p.contains("showDirectionHints");
-    const bool showDirectionHints = hasShowDirectionHints
-        ? p.value("showDirectionHints").toBool() : false;
-
     const bool hasSurfaceOverlayEnabled = p.contains("surfaceOverlayEnabled");
     const bool surfaceOverlayEnabled = hasSurfaceOverlayEnabled
         ? p.value("surfaceOverlayEnabled").toBool() : false;
@@ -503,8 +495,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         });
     if (hasShowSurfaceNormals)
         broadcast([showSurfaceNormals](VolumeViewerBase* v) { v->setShowSurfaceNormals(showSurfaceNormals); });
-    if (hasShowDirectionHints)
-        broadcast([showDirectionHints](VolumeViewerBase* v) { v->setShowDirectionHints(showDirectionHints); });
     if (hasSurfaceOverlayEnabled)
         broadcast([surfaceOverlayEnabled](VolumeViewerBase* v) { v->setSurfaceOverlayEnabled(surfaceOverlayEnabled); });
     if (hasNormalArrowLengthScale) {
