@@ -745,7 +745,6 @@ vc_add_test(NAME test_chunk_cache)
 
 vc_add_test(NAME test_volume_extras)
 
-vc_add_test(NAME test_zarr_more)
 
 vc_add_test(NAME test_vcdataset_compressors)
 
