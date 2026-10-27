@@ -59,7 +59,7 @@ namespace
         deps.umbilicusFingerprint = QStringLiteral("umb|1024:99");
         deps.frame = frameAt(9.596);
         deps.catalogVolume = QStringLiteral("PHerc0139/20260102150214");
-        deps.catalogManifestToken = QStringLiteral("15642382:1757600000000000000");
+        deps.catalogOrientation = QStringLiteral("z-top-to-bottom 1, left-handed 0");
         return deps;
     }
 
@@ -222,21 +222,21 @@ private slots:
         QCOMPARE(verdict(baseline(), current).cause, StaleVerdict::Cause::Fibers);
     }
 
-    // The cached catalog manifest is a dependency like the umbilicus file:
-    // replaced, the winding sense may read differently; the same file again
-    // is fresh. An untagged volume carries no token and never depends on it.
-    void aReplacedCatalogManifestMarksStale()
+    // The catalog's orientation of the volume is a dependency like the
+    // umbilicus: changed, the winding sense may read differently; the same
+    // again is fresh. A volume the catalog does not publish has none.
+    void aChangedCatalogOrientationMarksStale()
     {
         auto current = baseline();
-        current.catalogManifestToken = QStringLiteral("15700000:1758000000000000000");
+        current.catalogOrientation = QStringLiteral("z-top-to-bottom 0, left-handed 0");
         const StaleVerdict changed = verdict(baseline(), current);
         QCOMPARE(changed.action, StaleVerdict::Action::MarkStale);
         QCOMPARE(changed.cause, StaleVerdict::Cause::Catalog);
-        current.catalogManifestToken = baseline().catalogManifestToken;
+        current.catalogOrientation = baseline().catalogOrientation;
         QCOMPARE(verdict(baseline(), current).action, StaleVerdict::Action::Fresh);
         auto untagged = baseline();
         untagged.catalogVolume.clear();
-        untagged.catalogManifestToken.clear();
+        untagged.catalogOrientation.clear();
         QCOMPARE(verdict(untagged, untagged).action, StaleVerdict::Action::Fresh);
     }
 

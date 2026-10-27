@@ -1,16 +1,10 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
 
-#include "OpenDataManifest.hpp"
-
-#include <cstdint>
-#include <filesystem>
-#include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <string_view>
-#include <utility>
+
+class VolumePkg;
 
 namespace vc3d::opendata {
 
@@ -28,28 +22,10 @@ struct VolumeOrientation {
     std::optional<bool> leftHandedCoordinates;
 };
 
-// "PHerc0139/20260102150214@L0" (the vc-open-data-coordinate-space tag) ->
-// {"PHerc0139", "20260102150214"}; nullopt when the text is not of that
-// shape.
-[[nodiscard]] std::optional<std::pair<std::string, std::string>>
-sampleAndVolumeOfCoordinateSpace(std::string_view coordinateSpace);
-
-// The catalog volume a coordinate space names, as one comparable string
-// without the pyramid level ("PHerc0139/20260102150214" for either "@L0"
-// or "@L2" - two levels of one volume are one catalog entry and one
-// winding sense); empty when the text names none.
-[[nodiscard]] std::string catalogVolumeOfCoordinateSpace(std::string_view coordinateSpace);
-
 // The two properties as the volume's catalog entry states them; a property
 // that is absent or not a boolean (the strings "true" / "false" are read as
 // booleans) is unset.
 [[nodiscard]] VolumeOrientation volumeOrientationOf(const vcr::catalog::OpenDataVolume& volume);
-
-// nullopt when the manifest has no such sample or volume.
-[[nodiscard]] std::optional<VolumeOrientation> findVolumeOrientation(
-    const vcr::catalog::OpenDataManifest& manifest,
-    std::string_view sampleId,
-    std::string_view volumeId);
 
 // The fiber map's winding sense for a volume the catalog orients in full:
 // +1 when the winding grows with theta = atan2(dy, dx) about the umbilicus,
@@ -66,79 +42,16 @@ sampleAndVolumeOfCoordinateSpace(std::string_view coordinateSpace);
 // sense whose map is consistent, +1 mirrors it into hundreds of errors.
 [[nodiscard]] std::optional<int> windingChiralityOf(const VolumeOrientation& orientation);
 
-// Orientation lookups against the catalog manifest VC3D caches on disk
-// (the copy the catalog window last fetched). One parse per manifest
-// file version and coordinate space: the file is large, so the answer is
-// memoized on the file's size and mtime and only re-read when either
-// moves. Safe to call from any thread.
-class CatalogVolumeOrientationLookup {
-public:
-    explicit CatalogVolumeOrientationLookup(
-        std::filesystem::path manifestPath = cachedOpenDataManifestPath());
-
-    // One observation of the catalog for a coordinate space: the answer and
-    // the version of the manifest file it was read from, taken together so
-    // a caller cannot pair an answer with another version's token.
-    struct CatalogSense {
-        // nullopt when there is no cached manifest, it does not parse, the
-        // coordinate space does not name a sample and volume, or the
-        // manifest has no such volume. A manifest that has the volume but
-        // leaves the properties unset answers with both fields unset.
-        std::optional<VolumeOrientation> orientation;
-        // The manifest version the answer is bound to (manifestToken()):
-        // empty when the space is empty, "absent" when there is no file,
-        // else its size and mtime - or "unstable" when no version could
-        // be read whole, which equals no version a stat reports, so a
-        // build on that answer never passes for one on any version.
-        std::string manifestToken;
-    };
-    // The answer is bound to one version of the file: the file is measured
-    // before and after the parse and re-read while the two disagree, and a
-    // file that keeps moving answers nullopt, unmemoized, as "unstable".
-    [[nodiscard]] CatalogSense resolve(std::string_view coordinateSpace);
-
-    // Test seam: run between each parse and the measurement after it, to
-    // stand in for a catalog refresh landing mid-read.
-    void setAfterParseHookForTesting(std::function<void()> hook);
-    [[nodiscard]] std::optional<VolumeOrientation> lookup(std::string_view coordinateSpace)
-    {
-        return resolve(coordinateSpace).orientation;
-    }
-
-    // The manifest version a rebuild for this coordinate space would read
-    // (CatalogSense::manifestToken), from a stat and no parse: empty for an
-    // empty space, since the catalog is not consulted for one. Comparable
-    // between builds: equal tokens for equal spaces mean the same answer.
-    [[nodiscard]] std::string manifestToken(std::string_view coordinateSpace) const;
-
-    [[nodiscard]] const std::filesystem::path& manifestPath() const noexcept
-    {
-        return _manifestPath;
-    }
-
-private:
-    struct FileToken {
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type mtime{};
-        bool operator==(const FileToken& other) const noexcept
-        {
-            return size == other.size && mtime == other.mtime;
-        }
-    };
-    struct Memo {
-        std::string coordinateSpace;
-        // Unset when the file was absent at the time.
-        std::optional<FileToken> token;
-        std::optional<VolumeOrientation> value;
-    };
-
-    [[nodiscard]] std::optional<FileToken> fileToken() const;
-    [[nodiscard]] static std::string tokenText(const std::optional<FileToken>& token);
-
-    std::filesystem::path _manifestPath;
-    std::mutex _mutex;
-    std::optional<Memo> _memo;
-    std::function<void()> _afterParseHook;
+// The catalog volume a loaded volume shows ("<sample>/<volume>": one entry and
+// one winding sense for all its pyramid levels) and its orientation, from the
+// catalog the package was loaded with; nullopt for other volumes.
+struct CatalogVolumeSense {
+    std::string volume;
+    VolumeOrientation orientation;
 };
+[[nodiscard]] std::optional<CatalogVolumeSense> catalogVolumeSense(const VolumePkg& pkg, const std::string& volumeId);
+
+// The orientation as comparable text, for dependency checks.
+[[nodiscard]] std::string orientationText(const VolumeOrientation& orientation);
 
 } // namespace vc3d::opendata

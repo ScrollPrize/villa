@@ -36,13 +36,6 @@ std::string trimTrailingSlashes(std::string value)
     return value;
 }
 
-std::string artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return trimTrailingSlashes(artifact.resolvedUrl.empty()
-                                  ? artifact.sourcePath
-                                  : artifact.resolvedUrl);
-}
-
 std::string safePathComponent(std::string value)
 {
     for (char& c : value) {
@@ -55,16 +48,6 @@ std::string safePathComponent(std::string value)
         value.erase(value.begin());
     }
     return value.empty() ? std::string("unnamed") : value;
-}
-
-std::string tagValue(const std::vector<std::string>& tags, std::string_view prefix)
-{
-    for (const auto& tag : tags) {
-        if (tag.rfind(prefix, 0) == 0) {
-            return tag.substr(prefix.size());
-        }
-    }
-    return {};
 }
 
 std::string shortArtifactHash(std::string_view value)
@@ -259,31 +242,6 @@ void publishDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
-std::filesystem::path cachedCatalogManifestPath()
-{
-    return cachedOpenDataManifestPath();
-}
-
-std::vector<std::string> normalGridsEntryTags(const OpenDataNormalGridsInfo& info)
-{
-    std::vector<std::string> tags{"open-data"};
-    if (!info.sampleId.empty()) {
-        tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + info.sampleId);
-    }
-    if (!info.volumeId.empty()) {
-        tags.push_back(std::string(kOpenDataVolumeIdTagPrefix) + info.volumeId);
-    }
-    tags.push_back("vc-open-data-source-coordinate-level:" +
-                   std::to_string(info.sourceCoordinateLevel));
-    if (!info.sampleId.empty() && !info.volumeId.empty()) {
-        tags.push_back("vc-open-data-coordinate-space:" + info.sampleId + "/" +
-                       info.volumeId + "@L" +
-                       std::to_string(info.sourceCoordinateLevel));
-    }
-    tags.push_back(std::string(kOpenDataNormalGridsTagPrefix) + info.url);
-    return tags;
-}
-
 constexpr const char* kCompleteMarker = "normal-grids-complete.json";
 
 // Write the marker NormalGridVolume streams from. Idempotent.
@@ -339,14 +297,13 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
         if (artifact.type != kNormalGridsArtifactType) {
             continue;
         }
-        // An absent level is the documented legacy L0 convention. A present
-        // but malformed level is not safe to auto-associate with any volume.
-        if (artifact.levelParameterPresent && !artifact.sourceCoordinateLevel) {
-            Logger()->warn("Skipping normal-grids artifact with invalid parameters.level for {}/{}",
+        // Without parameters.level the grids cannot be paired with any volume.
+        if (!artifact.sourceCoordinateLevel) {
+            Logger()->warn("Skipping normal-grids artifact with missing or invalid parameters.level for {}/{}",
                            sampleId, volume.id);
             continue;
         }
-        const auto url = artifactUrl(artifact);
+        const auto url = artifact.url();
         if (url.empty()) {
             continue;
         }
@@ -354,8 +311,7 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
         info.sampleId = sampleId;
         info.volumeId = volume.id;
         info.url = url;
-        info.sourceCoordinateLevel = artifact.sourceCoordinateLevel.value_or(0);
-        info.levelWasExplicit = artifact.sourceCoordinateLevel.has_value();
+        info.sourceCoordinateLevel = *artifact.sourceCoordinateLevel;
         const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
             return item.url == info.url &&
                    item.sourceCoordinateLevel == info.sourceCoordinateLevel;
@@ -367,37 +323,15 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     return result;
 }
 
-std::string normalGridsArtifactUrl(const vcr::catalog::OpenDataVolume& volume)
+std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(const VolumePkg& pkg,
+                                                                       const vc::project::Entry& entry)
 {
-    const auto* artifact = normalGridsArtifact(volume);
-    return artifact ? artifactUrl(*artifact) : std::string{};
-}
-
-std::optional<OpenDataNormalGridsInfo> normalGridsInfoFromTags(
-    const std::vector<std::string>& tags)
-{
-    OpenDataNormalGridsInfo info;
-    info.sampleId = tagValue(tags, kOpenDataSampleIdTagPrefix);
-    info.volumeId = tagValue(tags, kOpenDataVolumeIdTagPrefix);
-    info.url = tagValue(tags, kOpenDataNormalGridsTagPrefix);
-    const auto level = tagValue(tags, "vc-open-data-source-coordinate-level:");
-    if (!level.empty()) {
-        try {
-            std::size_t parsed = 0;
-            info.sourceCoordinateLevel = std::stoi(level, &parsed);
-            if (parsed != level.size() || info.sourceCoordinateLevel < 0 ||
-                info.sourceCoordinateLevel > 5) {
-                return std::nullopt;
-            }
-            info.levelWasExplicit = true;
-        } catch (...) {
-            return std::nullopt;
-        }
-    }
-    if (info.volumeId.empty()) {
+    if (!pkg.catalog()) {
         return std::nullopt;
     }
-    return info;
+    const auto url = vc::core::util::normalGridsRemoteUrl(
+        vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()));
+    return url ? pkg.catalog()->volumeAt(*url, 0) : std::nullopt;
 }
 
 std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
@@ -406,14 +340,10 @@ std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCac
                                           int sourceCoordinateLevel,
                                           std::string_view url)
 {
-    auto result = remoteCacheRoot / "normal_grids" /
+    return remoteCacheRoot / "normal_grids" /
            safePathComponent(sampleId.empty() ? "sample" : sampleId) /
-           safePathComponent(volumeId.empty() ? "volume" : volumeId);
-    if (!url.empty() || sourceCoordinateLevel != 0) {
-        const std::string suffix = url.empty() ? std::string{} : "-" + shortArtifactHash(url);
-        result /= "L" + std::to_string(sourceCoordinateLevel) + suffix;
-    }
-    return result;
+           safePathComponent(volumeId.empty() ? "volume" : volumeId) /
+           ("L" + std::to_string(sourceCoordinateLevel) + "-" + shortArtifactHash(url));
 }
 
 bool isCachedNormalGridsDir(const std::filesystem::path& dir)
@@ -434,41 +364,13 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     }
     const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
                                          info.sourceCoordinateLevel, info.url);
-    const auto legacyDir = normalGridsCacheDir(
-        remoteCacheRoot, info.sampleId, info.volumeId);
-    if (info.sourceCoordinateLevel == 0 && legacyDir != dir) {
-        std::error_code ec;
-        if (!std::filesystem::exists(dir, ec) &&
-            std::filesystem::is_directory(legacyDir, ec)) {
-            bool sameArtifact = false;
-            try {
-                const auto marker = nlohmann::json::parse(
-                    std::ifstream(legacyDir /
-                                  vc::core::util::kNormalGridsRemoteMarker));
-                sameArtifact = marker.value("url", std::string{}) == info.url;
-            } catch (...) {
-            }
-            if (sameArtifact) {
-                std::filesystem::rename(legacyDir, dir, ec);
-                if (!ec)
-                    pkg.relocateNormalGridEntry(legacyDir.string(), dir.string());
-            }
-        }
-    }
     if (!writeRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
     }
-    // addNormalGridEntry dedups by location and returns false for duplicates;
-    // either way the entry ends up attached.
-    const auto tags = normalGridsEntryTags(info);
-    if (!pkg.addNormalGridEntry(dir.string(), tags)) {
-        pkg.reconcileNormalGridEntryTags(
-            dir.string(), tags,
-            {"vc-open-data-source-coordinate-level:",
-             "vc-open-data-coordinate-space:",
-             std::string(kOpenDataNormalGridsTagPrefix)});
-    }
+    // addNormalGridEntry dedups by location; either way the entry ends up
+    // attached. The marker's URL names its catalog dataset (normalGridsCatalogView).
+    pkg.addNormalGridEntry(dir.string());
     return true;
 }
 
@@ -491,8 +393,7 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
                 std::optional<std::size_t> artifactIndex;
                 for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
                     const auto& art = volume.artifacts[ai];
-                    if (art.type == kNormalGridsArtifactType &&
-                        artifactUrl(art) == info.url) {
+                    if (art.type == kNormalGridsArtifactType && art.url() == info.url) {
                         artifactIndex = ai;
                         break;
                     }
@@ -725,30 +626,6 @@ std::filesystem::path downloadOpenDataNormalGrids(
     Logger()->info("Downloaded normal grids for {}/{} to {}",
                    info.sampleId, info.volumeId, finalDir.string());
     return finalDir;
-}
-
-std::vector<OpenDataNormalGridsInfo> normalGridsAvailabilityFromCachedManifest()
-{
-    std::vector<OpenDataNormalGridsInfo> result;
-    const auto manifestPath = cachedCatalogManifestPath();
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(manifestPath, ec)) {
-        return result;
-    }
-    vcr::catalog::OpenDataManifest manifest;
-    try {
-        manifest = vcr::catalog::loadOpenDataManifestFile(manifestPath);
-    } catch (...) {
-        return result;
-    }
-    for (const auto& sample : manifest.samples) {
-        for (const auto& volume : sample.volumes) {
-            for (auto info : normalGridsArtifacts(sample.id, volume)) {
-                result.push_back(std::move(info));
-            }
-        }
-    }
-    return result;
 }
 
 } // namespace vc3d::opendata

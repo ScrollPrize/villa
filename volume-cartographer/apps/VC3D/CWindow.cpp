@@ -205,49 +205,6 @@ resolvedLasagnaForState(const CState* state)
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
-std::filesystem::path openDataCatalogManifestCachePath()
-{
-    return vc3d::opendata::cachedOpenDataManifestPath();
-}
-
-std::string openDataCoordinateSpaceForLoadedVolume(
-    const VolumePkg& pkg,
-    const std::string& loadedVolumeId)
-{
-    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
-    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
-        if (tag.rfind(prefix, 0) == 0)
-            return tag.substr(prefix.size());
-    }
-    return {};
-}
-
-std::vector<QString> openDataCatalogVolumeIdCandidates(const VolumePkg& pkg,
-                                                       const std::string& loadedVolumeId)
-{
-    std::vector<QString> candidates;
-    constexpr std::string_view prefix = "vc-open-data-volume-id:";
-
-    auto addCandidate = [&candidates](QString candidate) {
-        if (candidate.isEmpty()) {
-            return;
-        }
-        if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end()) {
-            candidates.push_back(std::move(candidate));
-        }
-    };
-
-    for (const auto& tag : pkg.volumeTags(loadedVolumeId)) {
-        if (tag.rfind(prefix, 0) == 0) {
-            addCandidate(QString::fromStdString(tag.substr(prefix.size())));
-        }
-    }
-    addCandidate(QString::fromStdString(loadedVolumeId));
-
-    return candidates;
-}
-
-
 class DockMenuMainWindow : public QMainWindow
 {
 public:
@@ -668,18 +625,11 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         return QString();
     }
 
-    // Coordinate-tagged entries apply only to an exact coordinate view;
-    // untagged entries keep the legacy behavior for untagged volumes.
-    const auto catalogIds =
-        openDataCatalogVolumeIdCandidates(*pkg, loadedVolumeId);
-    const auto coordinateSpace =
-        openDataCoordinateSpaceForLoadedVolume(*pkg, loadedVolumeId);
-    const std::string coordinateTag = coordinateSpace.empty()
-        ? std::string{}
-        : "vc-open-data-coordinate-space:" + coordinateSpace;
-    constexpr std::string_view volumeIdTagPrefix = "vc-open-data-volume-id:";
-
-    QString untaggedFallback;
+    // A catalog volume pairs with the normal grids the catalog publishes for
+    // its frame (volume and level); other volumes with the first store the
+    // catalog does not publish.
+    const auto view = pkg->catalogView(loadedVolumeId);
+    QString unpublishedFallback;
     for (const auto& path : paths) {
         const auto pathStr = path.string();
         const QString candidateStr = QString::fromStdString(pathStr);
@@ -691,50 +641,26 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
                 break;
             }
         }
-
-        std::vector<QString> entryVolumeIds;
-        if (owningEntry) {
-            if (!coordinateTag.empty()) {
-                if (std::find(owningEntry->tags.begin(), owningEntry->tags.end(),
-                              coordinateTag) != owningEntry->tags.end()) {
-                    if (checkedPath) *checkedPath = candidateStr;
-                    qCInfo(lcSegGrowth) << "Normal grid resolved by coordinate space to"
-                                        << candidateStr;
-                    return candidateStr;
-                }
-                continue;
-            }
-            for (const auto& tag : owningEntry->tags) {
-                if (tag.rfind(volumeIdTagPrefix, 0) == 0) {
-                    entryVolumeIds.push_back(
-                        QString::fromStdString(tag.substr(volumeIdTagPrefix.size())));
-                }
-            }
-        }
-
-        if (entryVolumeIds.empty()) {
-            if (untaggedFallback.isEmpty()) {
-                untaggedFallback = candidateStr;
+        const auto published = owningEntry
+            ? vc3d::opendata::normalGridsCatalogView(*pkg, *owningEntry)
+            : std::nullopt;
+        if (view) {
+            if (published && published->frameId() == view->frameId()) {
+                if (checkedPath) *checkedPath = candidateStr;
+                qCInfo(lcSegGrowth) << "Normal grid resolved by catalog frame to" << candidateStr;
+                return candidateStr;
             }
             continue;
         }
-        const bool matchesVolume = std::any_of(
-            entryVolumeIds.begin(), entryVolumeIds.end(), [&](const QString& id) {
-                return std::find(catalogIds.begin(), catalogIds.end(), id) !=
-                       catalogIds.end();
-            });
-        if (matchesVolume) {
-            if (checkedPath) *checkedPath = candidateStr;
-            qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr
-                                << "for volume" << QString::fromStdString(loadedVolumeId);
-            return candidateStr;
+        if (!published && unpublishedFallback.isEmpty()) {
+            unpublishedFallback = candidateStr;
         }
     }
 
-    if (coordinateTag.empty() && !untaggedFallback.isEmpty()) {
-        if (checkedPath) *checkedPath = untaggedFallback;
-        qCInfo(lcSegGrowth) << "Normal grid resolved to" << untaggedFallback;
-        return untaggedFallback;
+    if (!view && !unpublishedFallback.isEmpty()) {
+        if (checkedPath) *checkedPath = unpublishedFallback;
+        qCInfo(lcSegGrowth) << "Normal grid resolved to" << unpublishedFallback;
+        return unpublishedFallback;
     }
 
     qCInfo(lcSegGrowth) << "Normal grid lookup: no store paired with volume"
@@ -2695,12 +2621,9 @@ void CWindow::updateNormalGridAvailability()
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
         _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
-        if (!_normalGridAvailable && _state->vpkg()) {
-            const auto info = vc3d::opendata::normalGridsInfoFromTags(
-                _state->vpkg()->volumeTags(_state->currentVolumeId()));
-            if (info) {
-                hint = tr("No normal grids are published for this open-data volume.");
-            }
+        if (!_normalGridAvailable && _state->vpkg() &&
+            _state->vpkg()->catalogView(_state->currentVolumeId())) {
+            hint = tr("No normal grids are published for this open-data volume.");
         }
         if (_normalGridAvailable) {
         } else if (!hint.isEmpty()) {
@@ -4913,32 +4836,22 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
-            const auto loadedVolumeTags = _state->vpkg()->volumeTags(id);
-            const bool preferredOpenDataSource =
-                std::find(loadedVolumeTags.begin(), loadedVolumeTags.end(),
-                          "vc-open-data-preferred-source") != loadedVolumeTags.end();
-            for (const auto& tag : loadedVolumeTags) {
-                constexpr std::string_view prefix = "vc-open-data-volume-id:";
-                if (tag.rfind(prefix, 0) != 0) {
-                    continue;
+            // A catalog volume id maps to a loaded volume showing it, its
+            // own zarr at level 0 first.
+            if (const auto view = _state->vpkg()->catalogView(id)) {
+                const QString catalogVolumeId = QString::fromStdString(view->volumeId);
+                const bool preferredOpenDataSource = view->source && view->level == 0;
+                const auto existing = std::find_if(
+                    openDataVolumeIdMap.begin(), openDataVolumeIdMap.end(),
+                    [&](const auto& mapping) { return mapping.first == catalogVolumeId; });
+                if (existing == openDataVolumeIdMap.end()) {
+                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                } else if (preferredOpenDataSource &&
+                           !preferredOpenDataSourceIds.contains(catalogVolumeId)) {
+                    existing->second = idStr;
                 }
-                const QString catalogVolumeId =
-                    QString::fromStdString(tag.substr(prefix.size()));
-                if (!catalogVolumeId.isEmpty()) {
-                    const auto existing = std::find_if(
-                        openDataVolumeIdMap.begin(), openDataVolumeIdMap.end(),
-                        [&](const auto& mapping) {
-                            return mapping.first == catalogVolumeId;
-                        });
-                    if (existing == openDataVolumeIdMap.end()) {
-                        openDataVolumeIdMap.append({catalogVolumeId, idStr});
-                    } else if (preferredOpenDataSource &&
-                               !preferredOpenDataSourceIds.contains(catalogVolumeId)) {
-                        existing->second = idStr;
-                    }
-                    if (preferredOpenDataSource)
-                        preferredOpenDataSourceIds.insert(catalogVolumeId);
-                }
+                if (preferredOpenDataSource)
+                    preferredOpenDataSourceIds.insert(catalogVolumeId);
             }
 
             const QString loweredName = nameStr.toLower();

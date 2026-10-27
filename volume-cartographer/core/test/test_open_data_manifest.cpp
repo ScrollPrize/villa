@@ -2,12 +2,10 @@
 #include <doctest/doctest.h>
 
 #include "OpenDataManifest.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
-#include "VolumeDisplayNames.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/MemMap.hpp"
@@ -25,34 +23,6 @@
 #include <QSettings>
 
 using namespace vc3d::opendata;
-
-TEST_CASE("Overlay coordinate compatibility permits untagged local volumes")
-{
-    const auto scan = coordinateSpaceTag({
-        "vc-open-data-source-coordinate-level:0",
-        "vc-open-data-coordinate-space:PHerc0139/scan@L0"});
-    const auto fiber = coordinateSpaceTag({"vc-lasagna-group:presence"});
-    REQUIRE(scan == "PHerc0139/scan@L0");
-    REQUIRE(fiber.empty());
-    CHECK(coordinateSpaceTagsCompatible(scan, fiber));
-    CHECK(coordinateSpaceTagsCompatible(fiber, scan));
-    CHECK(coordinateSpaceTagsCompatible(fiber, fiber));
-    CHECK(coordinateSpaceTagsCompatible(scan, scan));
-    CHECK_FALSE(coordinateSpaceTagsCompatible(scan, "PHerc0139/scan@L1"));
-    CHECK_FALSE(coordinateSpaceTagsCompatible(scan, "PHerc0139/other@L0"));
-    CHECK(coordinateSpaceTag({}).empty());
-}
-
-TEST_CASE("Volume aliases use semantic tags, not long filenames")
-{
-    CHECK(vc3d::volumeDisplayAlias({"vc-lasagna-group:presence"}) == "fiber");
-    CHECK(vc3d::volumeDisplayAlias({"vc-lasagna-group:nx"}).isEmpty());
-    CHECK(vc3d::volumeDisplayAlias({"surface-prediction"}) == "surf");
-    CHECK(vc3d::volumeDisplayAlias({"vc-open-data-preferred-source"}) == "scan");
-    CHECK(vc3d::volumeDisplayAlias({"vc-open-data-virtual-source"}) == "scan");
-    CHECK(vc3d::volumeDisplayAlias({"prediction", "normal3d"}).isEmpty());
-    CHECK(vc3d::volumeDisplayAlias({}).isEmpty());
-}
 
 namespace {
 
@@ -225,6 +195,33 @@ void writeFile(const std::filesystem::path& path, const std::string& body)
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << body;
     REQUIRE(out.good());
+}
+
+// A Lasagna cache as prepareOpenDataLasagna leaves it: the manifest and the
+// remote marker naming its catalog artifact.
+std::filesystem::path cachedLasagna(const std::filesystem::path& dir, const std::string& artifactUrl,
+                                    const std::string& manifest = R"({"version":2,"groups":{}})")
+{
+    writeFile(dir / "data.lasagna.json", manifest);
+    writeFile(dir / vc::lasagna::kLasagnaRemoteMarker,
+              nlohmann::json{{"artifact_url", artifactUrl}, {"manifest_file", "data.lasagna.json"},
+                             {"anonymous", true}}.dump());
+    return dir / "data.lasagna.json";
+}
+
+// A catalog sample whose volumes publish a source zarr and Lasagna at the
+// given levels (JSON body of "volumes").
+std::shared_ptr<const vcr::catalog::OpenDataManifest> lasagnaCatalog(const std::string& volumes)
+{
+    return std::make_shared<const vcr::catalog::OpenDataManifest>(vcr::catalog::parseOpenDataManifest(
+        R"({"samples": {"sample": {"volumes": )" + volumes + "}}}"));
+}
+
+std::string publishedArtifact(const std::string& type, const std::string& path, std::optional<int> level = std::nullopt)
+{
+    return R"({"type": ")" + type + '"' + (level ? R"(, "parameters": {"level": )" + std::to_string(*level) + "}" : "") +
+           R"(, "origins": [{"path": ")" + path +
+           R"(", "access_roots": [{"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]})";
 }
 
 void copyFixtureFile(const std::filesystem::path& source,
@@ -466,56 +463,34 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
 
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
 {
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addLasagnaDatasetEntry(
-        "/cache/sample/vol-a/data.lasagna.json",
-        {"vc-open-data-lasagna",
-         "vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:3",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_lasagna_pairing_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    vc::project::LoadOptions options;
+    options.catalog = lasagnaCatalog(
+        R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") + ", " +
+        publishedArtifact("lasagna", "vol-a", 3) + R"(]}, "vol-b": {"id": "vol-b", "data": [)" +
+        publishedArtifact("zarr", "vol-b.zarr") + ", " + publishedArtifact("lasagna", "vol-b", 0) + "]}}");
+    auto pkg = VolumePkg::newEmpty(options);
+    REQUIRE(pkg->addLasagnaDatasetEntry(cachedLasagna(root / "vol-a", "https://example.test/vol-a").string()));
+    const auto& catalog = *options.catalog;
 
-    const auto resolved = resolveLasagnaForCoordinateTags(
-        *pkg,
-        {"vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:3",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-a"});
+    const auto resolved = resolveLasagnaForView(*pkg, catalog.volumeAt("https://example.test/vol-a.zarr", 3));
     REQUIRE(resolved.has_value());
     CHECK(resolved->manifestBacked);
     CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
-    CHECK(resolved->coordinateSpace == "sample/vol-a@L3");
     CHECK(resolved->sourceManifestLocation ==
           "https://example.test/vol-a/data.lasagna.json");
 
-    const auto native = resolveLasagnaForCoordinateTags(
-        *pkg,
-        {"vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:0",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-a"});
+    const auto native = resolveLasagnaForView(*pkg, catalog.volumeAt("https://example.test/vol-a.zarr", 0));
     REQUIRE(native.has_value());
     CHECK(native->workingToBaseScale == doctest::Approx(1.0));
-    CHECK(native->coordinateSpace == "sample/vol-a@L0");
 
-    CHECK_THROWS(resolveLasagnaForCoordinateTags(
-        *pkg,
-        {"vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:2",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
-    CHECK_THROWS(resolveLasagnaForCoordinateTags(
-        *pkg,
-        {"vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-b",
-         "vc-open-data-source-coordinate-level:0",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-b"}));
-    CHECK_THROWS(resolveLasagnaForCoordinateTags(
-        *pkg,
-        {"vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:6",
-         "vc-open-data-lasagna-artifact:https://example.test/vol-a"}));
+    // Another level of the volume, and a volume whose published Lasagna was
+    // never cached, have none.
+    CHECK_THROWS(resolveLasagnaForView(*pkg, catalog.volumeAt("https://example.test/vol-a.zarr", 2)));
+    CHECK_THROWS(resolveLasagnaForView(*pkg, catalog.volumeAt("https://example.test/vol-b.zarr", 0)));
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("Manual project Lasagna resolution materializes a selected remote manifest")
@@ -550,7 +525,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->addLasagnaDatasetEntry(location));
     pkg->setSelectedLasagnaDataset(location);
-    const auto resolved = resolveLasagnaForCoordinateTags(*pkg, {});
+    const auto resolved = resolveLasagnaForView(*pkg, std::nullopt);
     REQUIRE(resolved.has_value());
     CHECK(resolved->manifestPath == cached.manifest().manifestPath);
     CHECK(resolved->sourceManifestLocation == location);
@@ -576,34 +551,24 @@ TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume s
     const auto root = std::filesystem::temp_directory_path() /
         ("vc_open_data_lasagna_shape_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
-    const auto manifestPath = root / "data.lasagna.json";
-    writeFile(manifestPath, R"({
+    vc::project::LoadOptions options;
+    options.catalog = lasagnaCatalog(R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") +
+                                     ", " + publishedArtifact("lasagna", "vol-a", 3) + "]}}");
+    auto pkg = VolumePkg::newEmpty(options);
+    REQUIRE(pkg->addLasagnaDatasetEntry(cachedLasagna(root, "https://example.test/vol-a", R"({
       "version":2,
       "source_to_base":1,
       "base_shape_zyx":[100,200,300],
       "groups":{}
-    })");
-
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addLasagnaDatasetEntry(
-        manifestPath.string(),
-        {"vc-open-data-lasagna",
-         "vc-open-data-sample-id:sample",
-         "vc-open-data-volume-id:vol-a",
-         "vc-open-data-source-coordinate-level:3"}));
-    const std::vector<std::string> tags{
-        "vc-open-data-sample-id:sample",
-        "vc-open-data-volume-id:vol-a",
-        "vc-open-data-source-coordinate-level:3"};
-    const auto resolved = resolveLasagnaForCoordinateShape(
-        *pkg, tags, std::array<int, 3>{13, 25, 38});
+    })").string()));
+    const auto resolved = resolveLasagnaForView(
+        *pkg, options.catalog->volumeAt("https://example.test/vol-a.zarr", 3), std::array<int, 3>{13, 25, 38});
     REQUIRE(resolved.has_value());
     CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
 
-    auto inconsistentTags = tags;
-    inconsistentTags.back() = "vc-open-data-source-coordinate-level:2";
-    CHECK_THROWS(resolveLasagnaForCoordinateShape(
-        *pkg, inconsistentTags, std::array<int, 3>{13, 25, 38}));
+    // A level-2 volume of that shape is not what the catalog says it is.
+    CHECK_THROWS(resolveLasagnaForView(
+        *pkg, options.catalog->volumeAt("https://example.test/vol-a.zarr", 2), std::array<int, 3>{13, 25, 38}));
     std::filesystem::remove_all(root);
 }
 
@@ -642,14 +607,12 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
           "http://127.0.0.1:9/source.zarr#vc-base-scale=2");
     CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[0]));
     CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[1]));
-    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
-                    pkg->volumeEntries()[1].tags.end(),
-                    "vc-open-data-coordinate-space:sample/high-resolution@L2") !=
-          pkg->volumeEntries()[1].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
-                    pkg->volumeEntries()[1].tags.end(),
-                    "vc-open-data-lasagna-artifact:http://127.0.0.1:9/lasagna") !=
-          pkg->volumeEntries()[1].tags.end());
+    // The catalog names the rebased view: its volume at level 2.
+    vcr::catalog::OpenDataManifest catalog;
+    catalog.samples = {sample};
+    const auto view = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location);
+    REQUIRE(view);
+    CHECK((view->volumeId == "high-resolution" && view->level == 2 && view->source));
 }
 
 TEST_CASE("Selected Lasagna does not implicitly attach scan views")
@@ -682,14 +645,21 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     attachOpenDataSampleVolumes(*withScan, sample, &selection);
     REQUIRE(withScan->volumeEntries().size() == 1);
     CHECK(withScan->volumeEntries().front().location == source.resolvedUrl);
-    REQUIRE(withScan->addLasagnaDatasetEntry("/cache/selected.lasagna.json", {
-        "vc-open-data-lasagna", "vc-open-data-sample-id:sample",
-        "vc-open-data-volume-id:v", "vc-open-data-source-coordinate-level:2"}));
-    const auto resolved = resolveLasagnaForCoordinateTags(
-        *withScan, withScan->volumeEntries().front().tags);
+    // The L0 scan resolves the level-2 Lasagna directly.
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_selected_lasagna_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    auto catalog = std::make_shared<vcr::catalog::OpenDataManifest>();
+    catalog->samples = {sample};
+    options.catalog = catalog;
+    auto cataloged = VolumePkg::newDetached(options);
+    const auto manifest = cachedLasagna(root, lasagna.resolvedUrl);
+    REQUIRE(cataloged->addLasagnaDatasetEntry(manifest.string()));
+    const auto resolved = resolveLasagnaForView(*cataloged, catalog->volumeAt(source.resolvedUrl, 0));
     REQUIRE(resolved.has_value());
     CHECK(resolved->workingToBaseScale == doctest::Approx(1.0));
-    CHECK(resolved->manifestPath == std::filesystem::path("/cache/selected.lasagna.json"));
+    CHECK(resolved->manifestPath == manifest);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")
@@ -856,24 +826,17 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     CHECK(result.supportedVolumes == 2);
     REQUIRE(pkg->volumeEntries().size() == 2);
 
-    const auto hasTag = [](const vc::project::Entry& entry, const std::string& tag) {
-        return std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end();
+    // The catalog names each entry when it opens, with the pixel size it states.
+    const auto metadataFor = [&](const std::string& id) {
+        for (const auto& entry : pkg->volumeEntries()) {
+            const auto metadata = vc::project::catalogVolumeMetadata(&manifest, entry.location);
+            if (metadata.contains("uuid") && metadata.at("uuid").get_string() == id) return metadata;
+        }
+        FAIL("no entry shows " << id);
+        return utils::Json::object();
     };
-    const auto entryForVolumeId = [&](const std::string& id) -> const vc::project::Entry* {
-        const auto tag = "vc-open-data-volume-id:" + id;
-        const auto it = std::find_if(
-            pkg->volumeEntries().begin(), pkg->volumeEntries().end(), [&](const vc::project::Entry& entry) {
-                return hasTag(entry, tag);
-            });
-        return it == pkg->volumeEntries().end() ? nullptr : &*it;
-    };
-
-    const auto* volumeWithPropertiesEntry = entryForVolumeId("volume-with-properties");
-    REQUIRE(volumeWithPropertiesEntry != nullptr);
-    CHECK(hasTag(*volumeWithPropertiesEntry, "vc-open-data-voxel-size-um:7.910000"));
-    const auto* volumeFromScanEntry = entryForVolumeId("volume-from-scan");
-    REQUIRE(volumeFromScanEntry != nullptr);
-    CHECK(hasTag(*volumeFromScanEntry, "vc-open-data-voxel-size-um:2.403000"));
+    CHECK(metadataFor("volume-with-properties").at("voxelsize").get_double() == doctest::Approx(7.91));
+    CHECK(metadataFor("volume-from-scan").at("voxelsize").get_double() == doctest::Approx(2.403));
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
@@ -915,40 +878,23 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
         CHECK(vc::project::usesAnonymousRemoteAuth(entry));
     }
 
-    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
-                    pkg->volumeEntries()[1].tags.end(),
-                    "prediction") != pkg->volumeEntries()[1].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[1].tags.begin(),
-                    pkg->volumeEntries()[1].tags.end(),
-                    "surface-prediction") != pkg->volumeEntries()[1].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
-                    pkg->volumeEntries()[2].tags.end(),
-                    "ink-detection-3d") != pkg->volumeEntries()[2].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[2].tags.begin(),
-                    pkg->volumeEntries()[2].tags.end(),
-                    "vc-open-data-coordinate-level-unknown:missing-parameters.level") !=
-          pkg->volumeEntries()[2].tags.end());
+    // The source is the catalog volume; predictions without parameters.level
+    // have no catalog frame and are kept unpaired.
+    vcr::catalog::OpenDataManifest catalog;
+    catalog.samples = {sample};
+    const auto source = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[0].location);
+    REQUIRE(source);
+    CHECK((source->volumeId == "scan-volume" && source->level == 0 && source->source));
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, pkg->volumeEntries()[0].location).at("voxelsize").get_double() ==
+          doctest::Approx(7.91));
+    CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location));
+    CHECK_FALSE(vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[2].location));
     CHECK(std::any_of(
         result.messages.begin(), result.messages.end(), [](const std::string& message) {
             return message.find(
-                       "Skipped coordinate pairing for scan-volume "
-                       "(ink-detection-3d-zarr) against source L0:") !=
+                       "Kept scan-volume (ink-detection-3d-zarr) coordinate-unspecified") !=
                    std::string::npos;
         }));
-    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
-                    pkg->volumeEntries()[0].tags.end(),
-                    "vc-open-data-volume-id:scan-volume") != pkg->volumeEntries()[0].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
-                    pkg->volumeEntries()[0].tags.end(),
-                    "vc-open-data-voxel-size-um:7.910000") != pkg->volumeEntries()[0].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
-                    pkg->volumeEntries()[0].tags.end(),
-                    "vc-open-data-source-path:http://127.0.0.1:9/base.zarr") !=
-          pkg->volumeEntries()[0].tags.end());
-    CHECK(std::find(pkg->volumeEntries()[0].tags.begin(),
-                    pkg->volumeEntries()[0].tags.end(),
-                    "vc-open-data-source-original-resolution:7.910000") !=
-          pkg->volumeEntries()[0].tags.end());
 }
 
 TEST_CASE("Project creation defaults to the shared autosave directory")
@@ -1031,9 +977,11 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
     REQUIRE(pkg->volumeEntries().size() == 1);
     const auto& entry = pkg->volumeEntries().front();
     CHECK(entry.location == prediction.resolvedUrl);
-    for (const auto* tag : {"surface-prediction", "vc-open-data-sample-id:sample",
-                           "vc-open-data-volume-id:scan"})
-        CHECK(std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end());
+    vcr::catalog::OpenDataManifest catalog;
+    catalog.samples = {sample};
+    const auto view = vc::project::catalogVolumeView(&catalog, entry.location);
+    REQUIRE(view);
+    CHECK((view->sampleId == "sample" && view->volumeId == "scan" && view->level == 2 && !view->source));
     CHECK(vc::project::usesAnonymousRemoteAuth(entry));
     // The source need not be attached, but its descriptor must be checked before
     // assigning a coordinate frame. A failed check is reported, not silently L0.

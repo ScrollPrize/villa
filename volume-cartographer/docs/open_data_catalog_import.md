@@ -85,15 +85,24 @@ surfaces are added, and fetched surfaces whose published tifxyz changed are
 fetched again as a new revision. The user's store is untouched. Nothing is
 refreshed automatically.
 
-Main and overlay volume selectors put recognized volumes first and prefix their
-existing labels with `fiber -` (manifest presence group), `scan -` (catalog source
-scan, including rebased source views), or `surf -` (surface prediction). These are
-display aliases only: stored names, IDs and paths are unchanged. Unknown/untagged
-volumes retain their original labels. Ordering within each priority group remains
-unchanged. `VolumeDisplayNames.hpp` shares this behavior between selectors.
+## Catalog identity of volumes and datasets
 
-Overlay coordinate compatibility is shared by selection, restoration and viewer
-application through `OpenDataCoordinateIdentity.hpp`. Only two nonempty,
-conflicting coordinate-space tags reject an overlay. A tagged catalog scan and
-an untagged local prediction use the ordinary untagged overlay sampling/scaling
-path; absent tags are not evidence of an incompatible coordinate system.
+Project entries carry no catalog tags. What a remote volume shows is asked of the
+catalog the project was loaded with: `VolumePkg::catalogView(volumeId)` (sample,
+catalog volume, level, and whether it is the volume's own zarr or a dataset
+derived from it). Normal-grid and Lasagna entries are local caches whose remote
+marker records the published URL; `normalGridsCatalogView` and
+`lasagnaCatalogView` resolve it through the catalog. Normal grids and Lasagna pair
+with the open volume by catalog volume and level. Artifacts without
+`parameters.level` are not paired.
+
+Main and overlay volume selectors put recognized volumes first and prefix their
+existing labels with `fiber -` (Lasagna presence group), `scan -` (catalog source
+scan, at any level), or `surf -` (catalog surface prediction). These are display
+aliases only: stored names, IDs and paths are unchanged. Other volumes retain
+their original labels. Ordering within each priority group remains unchanged.
+`VolumeDisplayNames.hpp` shares this behavior between selectors.
+
+An overlay is refused only when the catalog places it and the base volume in
+different frames (catalog volume and level, `VolumePkg::overlayCompatible`); a
+volume the catalog does not publish overlays any other.

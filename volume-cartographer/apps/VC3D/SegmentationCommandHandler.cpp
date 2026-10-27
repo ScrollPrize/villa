@@ -1,6 +1,5 @@
 #include "SegmentationCommandHandler.hpp"
 
-#include "OpenDataCoordinateIdentity.hpp"
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
 #include "SurfaceCatalog.hpp"
@@ -407,52 +406,7 @@ static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
     return true;
 }
 
-static QJsonObject coordinateIdentityObject(
-    const std::optional<vc3d::opendata::CoordinateIdentity>& identity)
-{
-    QJsonObject metadata;
-    if (!identity)
-        return metadata;
-    metadata.insert(QStringLiteral("vc_open_data_coordinate_space"),
-                    QString::fromStdString(identity->coordinateSpace));
-    metadata.insert(QStringLiteral("vc_open_data_source_path"),
-                    QString::fromStdString(identity->sourcePath));
-    metadata.insert(QStringLiteral("vc_open_data_source_coordinate_level"),
-                    identity->sourceCoordinateLevel);
-    metadata.insert(QStringLiteral("vc_open_data_source_coordinate_scale_factor"),
-                    static_cast<int>(identity->sourceCoordinateScaleFactor));
-    metadata.insert(QStringLiteral("vc_open_data_source_original_resolution"),
-                    identity->sourceOriginalResolution);
-    return metadata;
-}
-
-static void copyCoordinateIdentity(QJsonObject& target,
-                                   const QJsonObject& coordinateIdentity)
-{
-    for (auto it = coordinateIdentity.begin(); it != coordinateIdentity.end(); ++it)
-        target.insert(it.key(), it.value());
-}
-
-static QJsonObject coordinateIdentityFromJson(const QJsonObject& source)
-{
-    QJsonObject metadata;
-    static const std::array<QString, 5> keys{
-        QStringLiteral("vc_open_data_coordinate_space"),
-        QStringLiteral("vc_open_data_source_path"),
-        QStringLiteral("vc_open_data_source_coordinate_level"),
-        QStringLiteral("vc_open_data_source_coordinate_scale_factor"),
-        QStringLiteral("vc_open_data_source_original_resolution"),
-    };
-    for (const auto& key : keys) {
-        if (source.contains(key))
-            metadata.insert(key, source.value(key));
-    }
-    return metadata;
-}
-
-static bool updateVolumeIdentityMetadata(
-    const QString& volumePath,
-    const QJsonObject& coordinateIdentity = {})
+static bool updateVolumeIdentityMetadata(const QString& volumePath)
 {
     if (volumePath.isEmpty()) {
         return false;
@@ -476,7 +430,6 @@ static bool updateVolumeIdentityMetadata(
 
     meta.insert(QStringLiteral("uuid"), volumeId);
     meta.insert(QStringLiteral("name"), volumeId);
-    copyCoordinateIdentity(meta, coordinateIdentity);
     return writeJsonObject(metaPath, meta);
 }
 
@@ -3272,9 +3225,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     const QString stagedOutputRootStr = QString::fromStdString(stagedOutputRoot.string());
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
-    const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
-        vc3d::opendata::coordinateIdentityForVolume(
-            *_state->vpkg(), _state->currentVolumeId()));
     QStringList args;
     args << stagedOutputRootStr
          << QStringLiteral("--store") << store->store
@@ -3308,7 +3258,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                          this,
                          [this, guard, connection, runner,
                           stagedOutputRootStr, finalOutputRootStr,
-                          validIds, outputCoordinateIdentity](CommandLineToolRunner::Tool tool,
+                          validIds](CommandLineToolRunner::Tool tool,
                                                   bool success,
                                                   const QString& message,
                                                   const QString&,
@@ -3341,8 +3291,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
                 emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
             } else {
                 finalizeOutput = true;
-                if (!updateVolumeIdentityMetadata(
-                        finalOutputRootStr, outputCoordinateIdentity)) {
+                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
                     emit showWarning(
                         tr("Warning"),
                         tr("Rasterized volume created, but updating meta.json identity failed."));
@@ -3785,8 +3734,6 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         : QString();
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
     const QString runOutputRootStr = useStaging ? stagedOutputRootStr : finalOutputRootStr;
-    const QJsonObject outputCoordinateIdentity = coordinateIdentityFromJson(
-        readJsonObject(QDir(params.volumePath).filePath(QStringLiteral("meta.json"))));
 
     QStringList args;
     args << params.volumePath
@@ -3943,8 +3890,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                           &CommandLineToolRunner::toolFinished,
                           this,
                           [this, guard, finishConnection, outputConnection, progressDialog,
-                           useStaging, stagedOutputRootStr, finalOutputRootStr,
-                           outputCoordinateIdentity]
+                           useStaging, stagedOutputRootStr, finalOutputRootStr]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -3986,8 +3932,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                 emit statusMessage(tr("Ignore label complete, but finalizing output failed"), 5000);
             } else {
                 finalized = true;
-                if (!updateVolumeIdentityMetadata(
-                        finalOutputRootStr, outputCoordinateIdentity)) {
+                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
                     emit showWarning(
                         tr("Warning"),
                         tr("Ignore label volume created, but updating meta.json identity failed."));
@@ -4081,13 +4026,6 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
     metaJson.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
     metaJson.insert(QStringLiteral("rasterized_at"), rasterizedAt);
     metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
-
-    if (_state && _state->vpkg()) {
-        copyCoordinateIdentity(
-            metaJson,
-            coordinateIdentityObject(vc3d::opendata::coordinateIdentityForVolume(
-                *_state->vpkg(), _state->currentVolumeId())));
-    }
 
     if (!writeJsonObject(metaJsonPath, metaJson)) {
         return false;

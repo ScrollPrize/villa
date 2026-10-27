@@ -1,5 +1,4 @@
 #include "ViewerManager.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataManifest.hpp"
 
 #include "AxisAlignedSliceController.hpp"
@@ -1066,10 +1065,9 @@ void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     if (volume && _state && _state->vpkg()) {
-        if (!vc3d::opendata::overlayCoordinatesCompatible(
-                *_state->vpkg(), _state->currentVolumeId(), volumeId)) {
+        if (!_state->vpkg()->overlayCompatible(_state->currentVolumeId(), volumeId)) {
             Logger()->warn(
-                "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
+                "Rejected volume overlay '{}' because the catalog places it in another frame than '{}'.",
                 volumeId, _state->currentVolumeId());
             volume.reset();
         }

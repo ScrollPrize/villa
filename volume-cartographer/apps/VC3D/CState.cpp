@@ -1,6 +1,5 @@
 #include "CState.hpp"
 
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
 
@@ -339,12 +338,6 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     }
     _currentVolume = std::move(vol);
     const auto volumeId = currentVolumeId();
-    _pointCollection->setFileMetadata(
-        (_vpkg && !volumeId.empty())
-            ? vc3d::opendata::coordinateIdentityJson(
-                  vc3d::opendata::coordinateIdentityForVolume(
-                      *_vpkg, volumeId))
-            : utils::Json::object());
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, volumeId);
     emit focusBoundsChanged();
@@ -354,17 +347,13 @@ vc3d::annotation::AnnotationFrame CState::annotationFrame() const
 {
     if (!_currentVolume)
         return {};
-    // Exact coordinate tags outrank rounded physical resolutions, including
-    // when coordinateIdentityForVolume cannot resolve a physical resolution.
+    // A catalog volume's level is exact and outranks rounded physical
+    // resolutions; its level-0 pixel size is the source resolution.
     std::optional<double> exactFactor;
     std::optional<double> stampedResolution;
-    if (_vpkg && _currentVolume) {
-        if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                _vpkg->volumeTags(_currentVolume->id()))) {
-            exactFactor = static_cast<double>(identity->sourceCoordinateScaleFactor);
-            if (identity->sourceOriginalResolution > 0.0)
-                stampedResolution = identity->sourceOriginalResolution;
-        }
+    if (const auto view = _vpkg ? _vpkg->catalogView(_currentVolume->id()) : std::nullopt) {
+        exactFactor = std::ldexp(1.0, view->level);
+        stampedResolution = _vpkg->catalog()->findSample(view->sampleId)->findVolume(view->volumeId)->pixelSizeUm;
     }
     return vc3d::annotation::deriveAnnotationFrame(
         _currentVolume->voxelSize(), _currentVolume->baseScaleLevel(),
@@ -489,7 +478,6 @@ void CState::closeAll()
 
     _pois.clear();
     _pointCollection->clearAll();
-    _pointCollection->setFileMetadata(utils::Json::object());
 
     setVpkg(nullptr);
 }

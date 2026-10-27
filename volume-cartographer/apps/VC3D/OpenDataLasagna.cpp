@@ -77,20 +77,6 @@ std::string identityHash(std::string_view value)
     return out.str();
 }
 
-std::string tagValue(const std::vector<std::string>& tags, std::string_view prefix)
-{
-    for (const auto& tag : tags)
-        if (tag.rfind(prefix, 0) == 0) return tag.substr(prefix.size());
-    return {};
-}
-
-bool hasTag(const std::vector<std::string>& tags, std::string_view value)
-{
-    return std::any_of(tags.begin(), tags.end(), [&](const std::string& tag) {
-        return tag == value;
-    });
-}
-
 bool splitPrefixUrl(const std::string& rawUrl,
                     std::string& origin,
                     std::string& prefix)
@@ -210,25 +196,6 @@ void validatePrepared(const OpenDataLasagnaInfo& info,
     }
 }
 
-std::vector<std::string> entryTags(const OpenDataLasagnaInfo& info)
-{
-    std::vector<std::string> tags{
-        "open-data",
-        std::string(vc::project::kAnonymousRemoteAuthTag),
-        std::string(kOpenDataLasagnaEntryTag),
-        std::string(kOpenDataSampleIdTagPrefix) + info.sampleId,
-        "vc-open-data-volume-id:" + info.volumeId,
-        "vc-open-data-source-coordinate-level:" +
-            std::to_string(info.sourceCoordinateLevel),
-        "vc-open-data-coordinate-space:" + info.sampleId + "/" + info.volumeId +
-            "@L" + std::to_string(info.sourceCoordinateLevel),
-        std::string(kOpenDataLasagnaArtifactTagPrefix) + info.artifactUrl,
-    };
-    if (!info.modelId.empty())
-        tags.push_back(std::string(kOpenDataLasagnaModelTagPrefix) + info.modelId);
-    return tags;
-}
-
 int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
                          const std::array<int, 3>& workingShape)
 {
@@ -250,76 +217,38 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
     return level;
 }
 
-std::optional<ResolvedOpenDataLasagna> resolveForTags(
+std::optional<ResolvedOpenDataLasagna> resolveForView(
     const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags,
+    const std::optional<vcr::catalog::OpenDataVolumeView>& view,
     const std::optional<std::array<int, 3>>& workingShape)
 {
-    const auto sampleId = tagValue(volumeTags, kOpenDataSampleIdTagPrefix);
-    const auto volumeId = tagValue(volumeTags, "vc-open-data-volume-id:");
-    const auto levelText = tagValue(volumeTags, "vc-open-data-source-coordinate-level:");
-    if (!sampleId.empty() && !volumeId.empty()) {
-        std::optional<int> activeLevel;
-        if (!levelText.empty()) {
-            try {
-                std::size_t consumed = 0;
-                const int level = std::stoi(levelText, &consumed);
-                if (consumed != levelText.size() || level < 0 || level > 5)
-                    throw std::runtime_error("invalid");
-                activeLevel = level;
-            } catch (...) {
-                throw std::runtime_error(
-                    "Active catalog volume has an invalid coordinate level");
-            }
-        }
-        const auto lasagnaEntries = pkg.lasagnaDatasetEntries();
-        std::vector<const vc::project::Entry*> parentMatches;
-        for (const auto& entry : lasagnaEntries) {
-            if (!hasTag(entry.tags, kOpenDataLasagnaEntryTag)) continue;
-            if (tagValue(entry.tags, kOpenDataSampleIdTagPrefix) == sampleId &&
-                tagValue(entry.tags, "vc-open-data-volume-id:") == volumeId)
-                parentMatches.push_back(&entry);
+    if (view) {
+        const int activeLevel = view->level;
+        std::vector<std::pair<vc::project::Entry, vcr::catalog::OpenDataVolumeView>> parentMatches;
+        for (const auto& entry : pkg.lasagnaDatasetEntries()) {
+            const auto cached = lasagnaCatalogView(pkg, entry);
+            if (cached && cached->sampleId == view->sampleId && cached->volumeId == view->volumeId)
+                parentMatches.emplace_back(entry, *cached);
         }
 
         if (!parentMatches.empty()) {
-            const auto shapeManifestPath = vc::project::resolveLocalPath(
-                parentMatches.front()->location, pkg.path().parent_path());
             if (workingShape) {
+                const auto shapeManifestPath = vc::project::resolveLocalPath(
+                    parentMatches.front().first.location, pkg.path().parent_path());
                 const auto dataset =
                     vc::lasagna::LasagnaDataset::open(shapeManifestPath);
                 if (!dataset.manifest().baseShapeZYX)
                     throw std::runtime_error(
                         "Lasagna manifest has no base_shape_zyx for coordinate pairing");
-                const int shapeLevel = dyadicLevelForShapes(
-                    *dataset.manifest().baseShapeZYX, *workingShape);
-                if (activeLevel && *activeLevel != shapeLevel)
+                if (dyadicLevelForShapes(*dataset.manifest().baseShapeZYX, *workingShape) != activeLevel)
                     throw std::runtime_error(
                         "Active volume shape disagrees with its catalog coordinate level");
-                activeLevel = shapeLevel;
-            } else if (!activeLevel) {
-                throw std::runtime_error(
-                    "Catalog coordinate tags have no level and no volume shape was supplied");
             }
 
-            std::vector<const vc::project::Entry*> compatibleMatches;
-            for (const auto* entry : parentMatches) {
-                const auto artifactLevelText = tagValue(
-                    entry->tags, "vc-open-data-source-coordinate-level:");
-                int artifactLevel = -1;
-                try {
-                    std::size_t consumed = 0;
-                    artifactLevel = std::stoi(
-                        artifactLevelText, &consumed);
-                    if (consumed != artifactLevelText.size() ||
-                        artifactLevel < 0 || artifactLevel > 5)
-                        throw std::runtime_error("invalid");
-                } catch (...) {
-                    throw std::runtime_error(
-                        "Cached Lasagna entry has an invalid coordinate level");
-                }
-                if (*activeLevel == 0 || *activeLevel == artifactLevel)
-                    compatibleMatches.push_back(entry);
-            }
+            std::vector<const std::pair<vc::project::Entry, vcr::catalog::OpenDataVolumeView>*> compatibleMatches;
+            for (const auto& match : parentMatches)
+                if (activeLevel == 0 || activeLevel == match.second.level)
+                    compatibleMatches.push_back(&match);
             if (compatibleMatches.size() > 1)
                 throw std::runtime_error(
                     "Multiple Lasagna datasets match the active catalog coordinate space");
@@ -327,21 +256,16 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
                 throw std::runtime_error(
                     "No Lasagna dataset is published for the active catalog coordinate level");
 
-            const auto* match = compatibleMatches.front();
-            const auto path = vc::project::resolveLocalPath(
-                match->location, pkg.path().parent_path());
-            const auto artifactUrl =
-                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix);
+            const auto& [entry, cached] = *compatibleMatches.front();
             return ResolvedOpenDataLasagna{
-                path,
-                lasagnaSourceManifestLocation(*match),
-                static_cast<double>(std::uint64_t{1} << *activeLevel),
-                sampleId + "/" + volumeId + "@L" +
-                    std::to_string(*activeLevel),
-                artifactUrl,
+                vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()),
+                lasagnaSourceManifestLocation(pkg, entry),
+                std::ldexp(1.0, activeLevel),
+                cached.artifact->url(),
                 true};
         }
-        if (!tagValue(volumeTags, kOpenDataLasagnaArtifactTagPrefix).empty()) {
+        const auto* volume = pkg.catalog()->findSample(view->sampleId)->findVolume(view->volumeId);
+        if (!lasagnaArtifacts(view->sampleId, *volume).empty()) {
             throw std::runtime_error(
                 "The manifest declares Lasagna for the active catalog volume, "
                 "but its validated local cache entry is unavailable");
@@ -359,7 +283,7 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
         resolvedLocation, options);
     return ResolvedOpenDataLasagna{
-        dataset.manifest().manifestPath, manualLocation, 1.0, {}, {}, false};
+        dataset.manifest().manifestPath, manualLocation, 1.0, {}, false};
 }
 
 } // namespace
@@ -423,14 +347,29 @@ OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
         "(grad_mag/nx/ny) nor fiber inference (presence/nx/ny) channels");
 }
 
-std::string lasagnaSourceManifestLocation(const vc::project::Entry& entry)
+std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumePkg& pkg,
+                                                                   const vc::project::Entry& entry)
 {
-    const auto artifactUrl =
-        tagValue(entry.tags, kOpenDataLasagnaArtifactTagPrefix);
-    if (artifactUrl.empty())
+    if (!pkg.catalog() || vc::project::isLocationRemote(entry.location)) return std::nullopt;
+    const auto marker = vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()).parent_path() /
+                        vc::lasagna::kLasagnaRemoteMarker;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(marker, ec)) return std::nullopt;
+    try {
+        return pkg.catalog()->volumeAt(
+            nlohmann::json::parse(std::ifstream(marker)).value("artifact_url", std::string{}), 0);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::string lasagnaSourceManifestLocation(const VolumePkg& pkg, const vc::project::Entry& entry)
+{
+    const auto view = lasagnaCatalogView(pkg, entry);
+    if (!view)
         return entry.location;
     return vcr::catalog::joinOpenDataUrl(
-        artifactUrl, std::filesystem::path(entry.location).filename().string());
+        view->artifact->url(), std::filesystem::path(entry.location).filename().string());
 }
 
 std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
@@ -614,7 +553,7 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                 continue;
             }
             expected.insert(manifest.string());
-            const auto tags = entryTags(info);
+            const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
             try {
                 const auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
                 const auto kind = validateOpenDataLasagnaManifest(
@@ -630,12 +569,7 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                         std::move(prepared.volume)});
                 }
                 const auto result = pkg.attachPreparedLasagnaDataset(
-                    manifest.string(), tags, fiberInference, volumes,
-                    true, true,
-                    {std::string(kOpenDataLasagnaArtifactTagPrefix),
-                     std::string(kOpenDataLasagnaModelTagPrefix),
-                     "vc-open-data-source-coordinate-level:",
-                     "vc-open-data-coordinate-space:"});
+                    manifest.string(), tags, fiberInference, volumes);
                 if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict)
                     throw std::runtime_error(
                         "a Lasagna volume id conflicts with the project");
@@ -653,8 +587,8 @@ int attachOpenDataLasagna(VolumePkg& pkg,
 
     std::vector<std::string> stale;
     for (const auto& entry : pkg.allLasagnaDatasetEntries()) {
-        if (!hasTag(entry.tags, kOpenDataLasagnaEntryTag) ||
-            tagValue(entry.tags, kOpenDataSampleIdTagPrefix) != sample.id)
+        const auto view = lasagnaCatalogView(pkg, entry);
+        if (!view || view->sampleId != sample.id)
             continue;
         if (expected.count(entry.location) == 0) stale.push_back(entry.location);
     }
@@ -669,22 +603,15 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const auto volume = pkg.volume(loadedVolumeId);
     if (!volume)
         throw std::runtime_error("Active volume is not loaded for Lasagna shape pairing");
-    return resolveForTags(pkg, pkg.volumeTags(loadedVolumeId), volume->shape());
+    return resolveForView(pkg, pkg.catalogView(loadedVolumeId), volume->shape());
 }
 
-std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateTags(
+std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags)
+    const std::optional<vcr::catalog::OpenDataVolumeView>& view,
+    const std::optional<std::array<int, 3>>& workingShapeZYX)
 {
-    return resolveForTags(pkg, volumeTags, std::nullopt);
-}
-
-std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateShape(
-    const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags,
-    const std::array<int, 3>& workingShapeZYX)
-{
-    return resolveForTags(pkg, volumeTags, workingShapeZYX);
+    return resolveForView(pkg, view, workingShapeZYX);
 }
 
 } // namespace vc3d::opendata

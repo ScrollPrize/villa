@@ -11,6 +11,7 @@
 #include <vector>
 
 class VolumePkg;
+namespace vc::project { struct Entry; }
 
 namespace vc3d::opendata {
 
@@ -20,9 +21,6 @@ namespace vc3d::opendata {
 struct OpenDataResourceSelection;
 
 inline constexpr std::string_view kNormalGridsArtifactType = "normal-grids";
-inline constexpr std::string_view kOpenDataSampleIdTagPrefix = "vc-open-data-sample-id:";
-inline constexpr std::string_view kOpenDataVolumeIdTagPrefix = "vc-open-data-volume-id:";
-inline constexpr std::string_view kOpenDataNormalGridsTagPrefix = "vc-open-data-normal-grids:";
 inline constexpr int kNormalGridsDownloadWorkers = 16;
 
 // Pairing of an open-data volume with its normal-grids artifact. `url` is the
@@ -32,35 +30,33 @@ struct OpenDataNormalGridsInfo {
     std::string volumeId;
     std::string url;
     int sourceCoordinateLevel = 0;
-    bool levelWasExplicit = false;
 };
 
 [[nodiscard]] const vcr::catalog::OpenDataArtifact* normalGridsArtifact(const vcr::catalog::OpenDataVolume& volume);
 [[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
     const vcr::catalog::OpenDataVolume& volume);
-[[nodiscard]] std::string normalGridsArtifactUrl(const vcr::catalog::OpenDataVolume& volume);
 
-// Recover the pairing from a loaded volume's project tags. Returns nullopt when
-// the tags carry no open-data volume identity (i.e. not a catalog volume).
-[[nodiscard]] std::optional<OpenDataNormalGridsInfo> normalGridsInfoFromTags(
-    const std::vector<std::string>& tags);
+// The catalog normal grids a normal-grid entry caches (the URL of its remote
+// marker); nullopt for other entries.
+[[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(
+    const VolumePkg& pkg, const vc::project::Entry& entry);
 
-// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>
+// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>/L<level>-<url hash>
 [[nodiscard]] std::filesystem::path normalGridsCacheDir(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
     const std::string& volumeId,
-    int sourceCoordinateLevel = 0,
-    std::string_view artifactUrl = {});
+    int sourceCoordinateLevel,
+    std::string_view artifactUrl);
 
 // True when the directory looks like a complete normal-grid store
 // (metadata.json plus xy/, xz/, yz/).
 [[nodiscard]] bool isCachedNormalGridsDir(const std::filesystem::path& dir);
 
 // Create the streaming cache dir for this pairing (writing the remote-marker
-// file NormalGridVolume streams from) and attach it as a tagged normal-grid
-// project entry. Returns true when the entry is attached (or already present).
+// file NormalGridVolume streams from) and attach it as a normal-grid project
+// entry. Returns true when the entry is attached (or already present).
 bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const OpenDataNormalGridsInfo& info,
                                      const std::filesystem::path& remoteCacheRoot);
@@ -110,10 +106,5 @@ using NormalGridsProgressCallback =
     const NormalGridsProgressCallback& progress = {},
     const std::atomic<bool>* cancelRequested = nullptr,
     std::string* errorOut = nullptr);
-
-// All sample/volume pairings that publish normal grids, read from the catalog's
-// cached manifest (empty when no manifest has been cached yet).
-[[nodiscard]] std::vector<OpenDataNormalGridsInfo>
-normalGridsAvailabilityFromCachedManifest();
 
 } // namespace vc3d::opendata

@@ -261,8 +261,7 @@ bool canAttachRepresentation(const vcr::catalog::OpenDataArtifact& artifact)
     if (!artifact.hasResolvedUrl()) return false;
     const auto kind = vcr::catalog::classifyDerivedRepresentation(artifact);
     if (!kind) return false;
-    if (*kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids &&
-        artifact.levelParameterPresent && !artifact.sourceCoordinateLevel)
+    if (*kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids && !artifact.sourceCoordinateLevel)
         return false;
     if (*kind != vcr::catalog::OpenDataRepresentationKind::Prediction) return true;
     // Prediction artifacts are not necessarily volumes (e.g. meshes).
@@ -849,8 +848,7 @@ void OpenDataCatalogWindow::buildUi()
             const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
             const auto volumeIndex = item->data(kRepresentationVolumeIndexRole).toULongLong();
             emit attachNormalGridsRequested(qstr(sample->id), qstr(sample->volumes.at(volumeIndex).id),
-                artifactUrl(*artifact), artifact->sourceCoordinateLevel.value_or(0),
-                artifact->sourceCoordinateLevel.has_value());
+                artifactUrl(*artifact), *artifact->sourceCoordinateLevel);
         } else if (_attachPredictionHandler) {
             // Preserve the complete catalog context for descriptor validation
             // and coordinate tags, but attach only the selected prediction.

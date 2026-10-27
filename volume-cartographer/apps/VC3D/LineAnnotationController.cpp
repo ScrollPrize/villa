@@ -16,7 +16,6 @@
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
 #include "FiberSaveBatchTracker.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "FiberMapAutoLink.hpp"
@@ -5864,22 +5863,12 @@ LineAnnotationController::umbilicusStatus() const
     }
 }
 
-std::string LineAnnotationController::fiberMapCoordinateSpace() const
+std::optional<vc3d::opendata::CatalogVolumeSense> LineAnnotationController::fiberMapCatalogVolume() const
 {
-    // Read off the tags directly, like annotationFrame(): the coordinate
-    // space is a name, and coordinateIdentityForVolume() would withhold it
-    // over absent physical metadata.
     if (!_state || !_state->vpkg() || _state->currentVolumeId().empty()) {
-        return {};
+        return std::nullopt;
     }
-    try {
-        if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
-            return identity->coordinateSpace;
-        }
-    } catch (...) {
-    }
-    return {};
+    return vc3d::opendata::catalogVolumeSense(*_state->vpkg(), _state->currentVolumeId());
 }
 
 LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSnapshot() const
@@ -5912,7 +5901,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     }
 
     // Which catalog volume this is, for the map's winding sense.
-    snapshot.coordinateSpace = fiberMapCoordinateSpace();
+    snapshot.catalogVolume = fiberMapCatalogVolume();
 
     // The map covers every store fiber bound to the current volume.
     std::vector<StoredFiber> fibers = readStoredFibers(std::nullopt, true);
@@ -8634,7 +8623,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             });
         if (selectedEntry != entries.end()) {
             selectedIdentity =
-                vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+                vc3d::opendata::lasagnaSourceManifestLocation(*vpkg, *selectedEntry);
         }
         if (!vc::project::isLocationRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
@@ -8865,7 +8854,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         });
     if (selectedEntry != fiberEntries.end()) {
         selectedIdentity =
-            vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+            vc3d::opendata::lasagnaSourceManifestLocation(*vpkg, *selectedEntry);
     }
 
     fs::path manifestPath;

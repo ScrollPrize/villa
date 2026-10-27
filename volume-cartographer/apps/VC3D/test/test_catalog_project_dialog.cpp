@@ -92,7 +92,6 @@ private slots:
         QCOMPARE(normals.at(0).at(0).toString(), QString("test"));
         QCOMPARE(normals.at(0).at(1).toString(), QString("scan"));
         QCOMPARE(normals.at(0).at(3).toInt(), 2);
-        QCOMPARE(normals.at(0).at(4).toBool(), true);
     }
 
     void openAndCancel()

@@ -415,17 +415,22 @@ std::vector<vc::project::Entry> entriesFromJson(const utils::Json& arr)
 
 namespace vc::project {
 
+std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::catalog::OpenDataManifest* catalog,
+                                                                  const std::string& location)
+{
+    if (!catalog || !isLocationRemote(location)) return std::nullopt;
+    try {
+        const auto spec = vc::parseRemoteVolumeSpec(location);
+        return catalog->volumeAt(spec.sourceUrl, spec.baseScaleLevel);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    }
+}
+
 utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
 {
     auto metadata = utils::Json::object();
-    if (!catalog || !isLocationRemote(location)) return metadata;
-    vc::RemoteVolumeSpec spec;
-    try {
-        spec = vc::parseRemoteVolumeSpec(location);
-    } catch (const std::invalid_argument&) {
-        return metadata;
-    }
-    const auto view = catalog->volumeAt(spec.sourceUrl, spec.baseScaleLevel);
+    const auto view = catalogVolumeView(catalog, location);
     if (!view) return metadata;
     const auto* volume = catalog->findSample(view->sampleId)->findVolume(view->volumeId);
     if (volume->pixelSizeUm && std::isfinite(*volume->pixelSizeUm) && *volume->pixelSizeUm > 0)
@@ -726,129 +731,6 @@ VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
                               : AttachVolumeResult::Attached;
 }
 
-bool VolumePkg::reconcileVolumeEntryTags(
-    const std::string& location,
-    const std::vector<std::string>& tags,
-    const std::vector<std::string>& singletonPrefixes)
-{
-    for (auto& entry : volumes_) {
-        if (!samePersistedVolumeIdentity(entry.location, location))
-            continue;
-        auto reconciled = entry.tags;
-        for (const auto& prefix : singletonPrefixes) {
-            reconciled.erase(
-                std::remove_if(reconciled.begin(), reconciled.end(), [&](const std::string& tag) {
-                    return tag.rfind(prefix, 0) == 0;
-                }),
-                reconciled.end());
-        }
-        for (const auto& tag : tags) {
-            if (!tag.empty() &&
-                std::find(reconciled.begin(), reconciled.end(), tag) == reconciled.end())
-                reconciled.push_back(tag);
-        }
-        if (reconciled == entry.tags)
-            return false;
-        entry.tags = std::move(reconciled);
-
-        // Deferred catalog loads have nothing to refresh. For an already
-        // loaded volume, reopen its exact portable view only once.
-        for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
-            const auto& volume = it->second;
-            if (!volume || !volume->isRemote() ||
-                !samePersistedVolumeIdentity(volume->remoteLocator(), entry.location))
-                continue;
-            try {
-                auto refreshed = openRemoteVolumeEntry(
-                    entry,
-                    opts_.catalog.get(),
-                    volume->remoteAuth());
-                const auto oldId = it->first;
-                const auto newId = refreshed->id();
-                if (newId != oldId && loadedVolumes_.count(newId) != 0) {
-                    Logger()->warn(
-                        "Reconciled remote volume '{}' would collide with loaded id '{}'; keeping the existing view",
-                        entry.location, newId);
-                    volumeTagsByID_[oldId] = entry.tags;
-                    persistProjectState();
-                    return true;
-                }
-                loadedVolumes_.erase(it);
-                loadedVolumes_[newId] = std::move(refreshed);
-                volumeTagsByID_.erase(oldId);
-                volumeTagsByID_[newId] = entry.tags;
-            } catch (const std::exception& ex) {
-                Logger()->warn("Failed to refresh reconciled remote volume '{}': {}",
-                               entry.location, ex.what());
-            }
-            break;
-        }
-        persistProjectState();
-        return true;
-    }
-    return false;
-}
-
-bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags)
-{
-    if (location.empty() || tags.empty()) return false;
-    for (auto& e : volumes_) {
-        if (!samePersistedVolumeIdentity(e.location, location)) continue;
-        bool changed = false;
-        for (const auto& tag : tags) {
-            if (tag.empty()) continue;
-            if (std::find(e.tags.begin(), e.tags.end(), tag) == e.tags.end()) {
-                e.tags.push_back(tag);
-                changed = true;
-            }
-        }
-        if (!changed) return false;
-
-        for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
-            const auto id = it->first;
-            const auto& volume = it->second;
-            if (!volume) continue;
-            if (volume->isRemote() &&
-                samePersistedVolumeIdentity(volume->remoteLocator(), location)) {
-                auto metadata = vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location);
-                if (!metadata.empty()) {
-                    try {
-                        auto refreshed = openRemoteVolumeEntry(
-                            e,
-                            opts_.catalog.get(),
-                            volume->remoteAuth());
-                        const auto refreshedId = refreshed->id();
-                        if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
-                            loadedVolumes_.erase(it);
-                            loadedVolumes_.emplace(refreshedId, refreshed);
-                            volumeTagsByID_.erase(id);
-                            volumeTagsByID_[refreshedId] = e.tags;
-                        } else if (refreshedId == id) {
-                            it->second = refreshed;
-                            volumeTagsByID_[id] = e.tags;
-                        } else {
-                            Logger()->warn(
-                                "Remote volume metadata for '{}' resolves to duplicate id '{}'; keeping existing loaded volume",
-                                location,
-                                refreshedId);
-                            volumeTagsByID_[id] = e.tags;
-                        }
-                    } catch (const std::exception& ex) {
-                        Logger()->warn("Failed to refresh remote volume manifest metadata '{}': {}", location, ex.what());
-                        volumeTagsByID_[id] = e.tags;
-                    }
-                } else {
-                    volumeTagsByID_[id] = e.tags;
-                }
-                break;
-            }
-        }
-        persistProjectState();
-        return true;
-    }
-    return false;
-}
-
 bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
@@ -858,65 +740,6 @@ bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std:
         resolveNormalGridEntry(normalGrids_.back());
     persistProjectState();
     return true;
-}
-
-bool VolumePkg::reconcileNormalGridEntryTags(
-    const std::string& location,
-    const std::vector<std::string>& tags,
-    const std::vector<std::string>& singletonPrefixes)
-{
-    for (auto& entry : normalGrids_) {
-        if (entry.location != location)
-            continue;
-        auto reconciled = entry.tags;
-        for (const auto& prefix : singletonPrefixes) {
-            reconciled.erase(
-                std::remove_if(reconciled.begin(), reconciled.end(), [&](const auto& tag) {
-                    return tag.rfind(prefix, 0) == 0;
-                }),
-                reconciled.end());
-        }
-        for (const auto& tag : tags) {
-            if (!tag.empty() &&
-                std::find(reconciled.begin(), reconciled.end(), tag) == reconciled.end())
-                reconciled.push_back(tag);
-        }
-        if (reconciled == entry.tags)
-            return false;
-        entry.tags = std::move(reconciled);
-        if (!opts_.deferResolution) {
-            resolvedNormalGridPaths_.clear();
-            for (const auto& normalGrid : normalGrids_)
-                resolveNormalGridEntry(normalGrid);
-        }
-        persistProjectState();
-        return true;
-    }
-    return false;
-}
-
-bool VolumePkg::relocateNormalGridEntry(const std::string& oldLocation,
-                                        const std::string& newLocation)
-{
-    if (oldLocation.empty() || newLocation.empty() || oldLocation == newLocation)
-        return false;
-    if (std::any_of(normalGrids_.begin(), normalGrids_.end(), [&](const auto& entry) {
-            return entry.location == newLocation;
-        }))
-        return false;
-    for (auto& entry : normalGrids_) {
-        if (entry.location != oldLocation)
-            continue;
-        entry.location = newLocation;
-        if (!opts_.deferResolution) {
-            resolvedNormalGridPaths_.clear();
-            for (const auto& normalGrid : normalGrids_)
-                resolveNormalGridEntry(normalGrid);
-        }
-        persistProjectState();
-        return true;
-    }
-    return false;
 }
 
 bool VolumePkg::addLasagnaDatasetEntry(const std::string& location,
@@ -930,34 +753,6 @@ bool VolumePkg::addLasagnaDatasetEntry(const std::string& location,
     return true;
 }
 
-bool VolumePkg::reconcileLasagnaDatasetEntryTags(
-    const std::string& location,
-    const std::vector<std::string>& tags,
-    const std::vector<std::string>& singletonPrefixes)
-{
-    for (auto& entry : lasagnaDatasets_) {
-        if (entry.location != location) continue;
-        auto reconciled = entry.tags;
-        for (const auto& prefix : singletonPrefixes) {
-            reconciled.erase(
-                std::remove_if(reconciled.begin(), reconciled.end(), [&](const auto& tag) {
-                    return tag.rfind(prefix, 0) == 0;
-                }),
-                reconciled.end());
-        }
-        for (const auto& tag : tags) {
-            if (!tag.empty() &&
-                std::find(reconciled.begin(), reconciled.end(), tag) == reconciled.end())
-                reconciled.push_back(tag);
-        }
-        if (reconciled == entry.tags) return false;
-        entry.tags = std::move(reconciled);
-        persistProjectState();
-        return true;
-    }
-    return false;
-}
-
 bool VolumePkg::addFiberInferenceDatasetEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (std::find(tags.begin(), tags.end(), vc::project::kFiberLasagnaTag) == tags.end()) {
@@ -966,23 +761,13 @@ bool VolumePkg::addFiberInferenceDatasetEntry(const std::string& location, std::
     return addLasagnaDatasetEntry(location, std::move(tags));
 }
 
-bool VolumePkg::reconcileFiberInferenceDatasetEntryTags(const std::string& location, const std::vector<std::string>& tags, const std::vector<std::string>& singletonPrefixes)
-{
-    auto tagged = tags;
-    if (std::find(tagged.begin(), tagged.end(), vc::project::kFiberLasagnaTag) == tagged.end()) {
-        tagged.emplace_back(vc::project::kFiberLasagnaTag);
-    }
-    return reconcileLasagnaDatasetEntryTags(location, tagged, singletonPrefixes);
-}
-
 VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const std::string& manifestLocation,
     std::vector<std::string> manifestTags,
     bool fiberInference,
     const std::vector<PreparedVolumeAttachment>& preparedVolumes,
     bool updateSelection,
-    bool persistChanges,
-    const std::vector<std::string>& manifestSingletonPrefixes)
+    bool persistChanges)
 {
     if (manifestLocation.empty())
         throw std::invalid_argument("Lasagna manifest location is required");
@@ -1056,9 +841,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         } else {
             auto tags = manifest->tags;
             removeFiberTag(tags);
-            for (const auto& prefix : manifestSingletonPrefixes) {
-                tags.erase(std::remove_if(tags.begin(), tags.end(), [&](const auto& tag) { return tag.rfind(prefix, 0) == 0; }), tags.end());
-            }
             addUniqueTags(tags, manifestTags);
             if (tags != manifest->tags) {
                 manifest->tags = std::move(tags);
@@ -1365,6 +1147,20 @@ std::vector<std::string> VolumePkg::volumeTags(const std::string& volumeId) cons
     auto it = volumeTagsByID_.find(volumeId);
     if (it == volumeTagsByID_.end()) return {};
     return it->second;
+}
+
+std::optional<vcr::catalog::OpenDataVolumeView> VolumePkg::catalogView(const std::string& volumeId) const
+{
+    const auto loaded = loadedVolumes_.find(volumeId);
+    if (!opts_.catalog || loaded == loadedVolumes_.end() || !loaded->second->isRemote()) return std::nullopt;
+    return opts_.catalog->volumeAt(loaded->second->remoteUrl(), loaded->second->baseScaleLevel());
+}
+
+bool VolumePkg::overlayCompatible(const std::string& baseId, const std::string& overlayId) const
+{
+    const auto base = catalogView(baseId);
+    const auto overlay = catalogView(overlayId);
+    return !base || !overlay || base->frameId() == overlay->frameId();
 }
 
 bool VolumePkg::isRemote() const

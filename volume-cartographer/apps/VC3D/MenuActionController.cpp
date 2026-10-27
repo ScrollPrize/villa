@@ -556,14 +556,14 @@ void MenuActionController::showOpenDataCatalog()
     });
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
             this, [this](const QString& sample, const QString& volume, const QString& url,
-                         int level, bool explicitLevel) {
+                         int level) {
         if (!_window || !_window->_state || !_window->_state->vpkg()) {
             QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
             return;
         }
         try {
             const vc3d::opendata::OpenDataNormalGridsInfo info{
-                sample.toStdString(), volume.toStdString(), url.toStdString(), level, explicitLevel};
+                sample.toStdString(), volume.toStdString(), url.toStdString(), level};
             if (!vc3d::opendata::attachStreamingNormalGridsEntry(
                     *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
                 QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));

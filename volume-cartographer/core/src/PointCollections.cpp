@@ -569,7 +569,7 @@ float PointCollections::computeAutoFillValue(uint64_t collectionId) const
 
 bool PointCollections::saveToJSON(const std::string& filename) const
 {
-    Json j = _fileMetadata.is_object() ? _fileMetadata : Json::object();
+    Json j = Json::object();
     j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
     Json collections_obj = Json::object();
     for (const auto& pair : _collections) {
@@ -612,16 +612,11 @@ bool PointCollections::loadFromJSON(const std::string& filename)
 
     // Parse the whole document before touching the store, so a malformed
     // file (for example an invalid collection uuid) leaves it unchanged.
-    Json fileMetadata;
     std::unordered_map<uint64_t, Collection> collections;
     try {
         if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
             throw std::runtime_error("JSON file has incorrect version or is missing version info.");
         }
-
-        fileMetadata = j;
-        fileMetadata.erase("vc_pointcollections_json_version");
-        fileMetadata.erase("collections");
 
         Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
         if (!collections_obj.is_object()) {
@@ -645,7 +640,6 @@ bool PointCollections::loadFromJSON(const std::string& filename)
     }
 
     clearAll();
-    _fileMetadata = std::move(fileMetadata);
     for (auto& [id, col] : collections) {
         _collections[id] = std::move(col);
     }
@@ -671,16 +665,6 @@ bool PointCollections::loadFromJSON(const std::string& filename)
     onCollectionsAdded(collectionIds);
 
     return true;
-}
-
-void PointCollections::setFileMetadata(const Json& metadata)
-{
-    _fileMetadata = metadata.is_object() ? metadata : Json::object();
-}
-
-const Json& PointCollections::fileMetadata() const
-{
-    return _fileMetadata;
 }
 
 std::map<uint64_t, Json> PointCollections::anchoredCollections() const

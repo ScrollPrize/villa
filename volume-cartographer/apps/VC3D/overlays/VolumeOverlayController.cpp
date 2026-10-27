@@ -1,6 +1,5 @@
 #include "VolumeOverlayController.hpp"
 #include "VolumeComboTooltip.hpp"
-#include "../OpenDataCoordinateIdentity.hpp"
 #include "../VolumeDisplayNames.hpp"
 
 #include "../ViewerManager.hpp"
@@ -392,7 +391,7 @@ void VolumeOverlayController::refreshVolumeOptions()
         const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_volumePkg);
         for (const auto& id : vc3d::orderedDisplayVolumeIds(*_volumePkg)) {
             if (!baseVolumeId.empty() &&
-                !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, id))
+                !_volumePkg->overlayCompatible(baseVolumeId, id))
                 continue;
             std::shared_ptr<Volume> volume;
             try {
@@ -660,9 +659,9 @@ void VolumeOverlayController::applyOverlayVolume()
             ? primary->currentVolumeId()
             : std::string{};
         if (!baseVolumeId.empty() &&
-            !vc3d::opendata::overlayCoordinatesCompatible(*_volumePkg, baseVolumeId, _overlayVolumeId)) {
+            !_volumePkg->overlayCompatible(baseVolumeId, _overlayVolumeId)) {
             emit requestStatusMessage(
-                tr("Overlay rejected: volume coordinate spaces do not match."), 5000);
+                tr("Overlay rejected: the catalog places it in another frame."), 5000);
             _overlayVolumeId.clear();
             if (_ui.volumeSelect) {
                 const QSignalBlocker blocker(_ui.volumeSelect);

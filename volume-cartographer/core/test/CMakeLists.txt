@@ -310,9 +310,6 @@ endif()
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
 
-vc_add_test(NAME test_open_data_coordinate_identity
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 # VCCollection shim: verify the on*() hooks still emit Qt signals. Needs the
 # shim TU + its MOC (it isn't built into a lib anymore).
 qt6_wrap_cpp(vccollection_test_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)

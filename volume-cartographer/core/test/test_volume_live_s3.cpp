@@ -123,6 +123,12 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         if (id != volume->id()) {
             const auto rebased = project->volume(id);
             CHECK(rebased->id() == "20260102150214@L2");
+            // Both show the catalog volume, at their levels: different frames.
+            const auto view = project->catalogView(rebased->id());
+            REQUIRE(view);
+            CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
+            CHECK_FALSE(project->overlayCompatible(volume->id(), rebased->id()));
+            CHECK(project->overlayCompatible(rebased->id(), rebased->id()));
             CHECK(rebased->voxelSize() == doctest::Approx(4 * 2.399));
             CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
             CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());

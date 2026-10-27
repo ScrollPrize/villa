@@ -374,22 +374,6 @@ TEST_CASE("VolumePkg::loadAutosave returns nullptr when no autosave file exists"
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg reconciles coordinate-bearing normal grid tags")
-{
-    auto d = tmpDir("asset_reconcile");
-    const auto grids = (d / "grids").string();
-
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addNormalGridEntry(
-        grids, {"vc-open-data-source-coordinate-level:0"}));
-    CHECK(pkg->reconcileNormalGridEntryTags(
-        grids, {"vc-open-data-source-coordinate-level:2"},
-        {"vc-open-data-source-coordinate-level:"}));
-    CHECK(pkg->normalGridEntries()[0].tags.back() ==
-          "vc-open-data-source-coordinate-level:2");
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of normal grids")
 {
     auto d = tmpDir("lasagna_entries");
@@ -562,7 +546,7 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:old"}, true, oldAttachments) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(
-        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments, true, true, {"model:"}) ==
+        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments) ==
         VolumePkg::AttachLasagnaResult::Attached);
 
     REQUIRE(pkg->lasagnaDatasetEntries().size() == 1);
@@ -570,7 +554,6 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
     CHECK(pkg->selectedLasagnaDataset() == "data.lasagna.json");
     CHECK(pkg->selectedFiberInferenceDataset().empty());
     const auto& manifestTags = pkg->allLasagnaDatasetEntries().front().tags;
-    CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:old") == manifestTags.end());
     CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:new") != manifestTags.end());
     REQUIRE(pkg->volumeEntries().size() == 2);
     CHECK(pkg->hasVolume("old-channel"));

@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <optional>
+#include <filesystem>
 
 #include <opencv2/core/types.hpp>
 #include "utils/Json.hpp"
@@ -16,6 +17,10 @@ namespace vc::core::util {
     // cache: {"url": "<https prefix>"}. Grid files missing locally are fetched
     // from the URL on demand and stored alongside the marker.
     inline constexpr const char* kNormalGridsRemoteMarker = "normal-grids-remote.json";
+
+    // The URL a normal-grid directory's marker records (trailing slashes
+    // trimmed); nullopt without a readable marker.
+    [[nodiscard]] std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir);
 
     class NormalGridVolume {
     public:

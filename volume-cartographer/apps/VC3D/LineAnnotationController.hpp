@@ -30,6 +30,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "AnnotationFrame.hpp"
+#include "OpenDataVolumeOrientation.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
@@ -227,11 +228,9 @@ public:
         // count scaled back to the annotation (level 0) resolution; 0 when the
         // volume is unknown.
         int annotationZSlices = 0;
-        // The current volume's open-data coordinate space
-        // ("<sample>/<volume>@L<level>", from its vc-open-data tags), which
-        // names the catalog entry that orients it; empty for a volume without
-        // the tags.
-        std::string coordinateSpace;
+        // The catalog volume the current volume shows and its orientation;
+        // nullopt for a volume the catalog does not publish.
+        std::optional<vc3d::opendata::CatalogVolumeSense> catalogVolume;
         QString umbilicusMessage;           // why there is no umbilicus; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
@@ -419,11 +418,9 @@ public:
     // The stored umbilicus of the current volume as uuid@revision, or why there
     // is none: changes whenever the umbilicus derived views depend on does.
     [[nodiscard]] QString umbilicusFingerprint() const;
-    // The current volume's open-data coordinate space
-    // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
-    // catalog entry that orients it; empty for a volume without the tags.
-    // A tag read, no parse, so it is cheap enough for dependency checks.
-    [[nodiscard]] std::string fiberMapCoordinateSpace() const;
+    // The catalog volume the current volume shows and its orientation
+    // (catalogVolumeSense); cheap enough for dependency checks.
+    [[nodiscard]] std::optional<vc3d::opendata::CatalogVolumeSense> fiberMapCatalogVolume() const;
     // Bumped on every store commit (local or external) and attachment change.
     // Holders of derived data compare it to decide whether what they built is
     // still current; runtime fiber ids are only meaningful within one

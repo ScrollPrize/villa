@@ -47,6 +47,10 @@ std::filesystem::path resolveLocalPath(const std::string& location,
 
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
+// The catalog dataset a remote location shows (OpenDataManifest::volumeAt at
+// its base level); nullopt for other locations.
+std::optional<vcr::catalog::OpenDataVolumeView> catalogVolumeView(const vcr::catalog::OpenDataManifest*,
+                                                                  const std::string& location);
 // The volume metadata (uuid, voxelsize, name) a catalog gives a location: the
 // catalog volume's level id and voxel size for its own zarr, the voxel size of
 // its grid for a dataset derived from it. Empty for other locations.
@@ -116,40 +120,18 @@ public:
         const std::string& location,
         std::vector<std::string> tags,
         const std::shared_ptr<Volume>& volume);
-    bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
-    // Replace singleton keyed tags and merge ordinary tags in one operation,
-    // refreshing a loaded remote volume at most once.
-    bool reconcileVolumeEntryTags(
-        const std::string& location,
-        const std::vector<std::string>& tags,
-        const std::vector<std::string>& singletonPrefixes);
-    bool reconcileNormalGridEntryTags(
-        const std::string& location,
-        const std::vector<std::string>& tags,
-        const std::vector<std::string>& singletonPrefixes);
-    bool relocateNormalGridEntry(const std::string& oldLocation,
-                                 const std::string& newLocation);
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addLasagnaDatasetEntry(const std::string& location,
                                 std::vector<std::string> tags = {});
-    bool reconcileLasagnaDatasetEntryTags(
-        const std::string& location,
-        const std::vector<std::string>& tags,
-        const std::vector<std::string>& singletonPrefixes);
     bool addFiberInferenceDatasetEntry(const std::string& location,
                                        std::vector<std::string> tags = {});
-    bool reconcileFiberInferenceDatasetEntryTags(
-        const std::string& location,
-        const std::vector<std::string>& tags,
-        const std::vector<std::string>& singletonPrefixes);
     AttachLasagnaResult attachPreparedLasagnaDataset(
         const std::string& manifestLocation,
         std::vector<std::string> manifestTags,
         bool fiberInference,
         const std::vector<PreparedVolumeAttachment>& preparedVolumes,
         bool updateSelection = true,
-        bool persistChanges = true,
-        const std::vector<std::string>& manifestSingletonPrefixes = {});
+        bool persistChanges = true);
     bool removeEntry(const std::string& location);
 
     [[nodiscard]] std::string selectedLasagnaDataset() const;
@@ -186,6 +168,14 @@ public:
     [[nodiscard]] std::vector<std::filesystem::path> normal3dZarrPaths() const;
 
     [[nodiscard]] std::vector<std::string> volumeTags(const std::string& volumeId) const;
+
+    // The catalog the package was loaded with (LoadOptions::catalog).
+    [[nodiscard]] const std::shared_ptr<const vcr::catalog::OpenDataManifest>& catalog() const { return opts_.catalog; }
+    // What a loaded remote volume shows in that catalog; nullopt for other volumes.
+    [[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> catalogView(const std::string& volumeId) const;
+    // An overlay samples in the base volume's voxels; refused only when the
+    // catalog places the two in different frames (catalog volume and level).
+    [[nodiscard]] bool overlayCompatible(const std::string& baseId, const std::string& overlayId) const;
 
     [[nodiscard]] bool isRemote() const;
 

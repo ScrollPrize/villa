@@ -15,11 +15,6 @@ namespace vc::lasagna { struct LasagnaDatasetManifest; }
 namespace vc3d::opendata {
 
 inline constexpr std::string_view kLasagnaArtifactType = "lasagna";
-inline constexpr std::string_view kOpenDataLasagnaEntryTag = "vc-open-data-lasagna";
-inline constexpr std::string_view kOpenDataLasagnaArtifactTagPrefix =
-    "vc-open-data-lasagna-artifact:";
-inline constexpr std::string_view kOpenDataLasagnaModelTagPrefix =
-    "vc-open-data-lasagna-model-id:";
 
 struct OpenDataLasagnaInfo {
     std::string sampleId;
@@ -40,7 +35,6 @@ struct ResolvedOpenDataLasagna {
     std::filesystem::path manifestPath;
     std::string sourceManifestLocation;
     double workingToBaseScale = 1.0;
-    std::string coordinateSpace;
     std::string artifactUrl;
     bool manifestBacked = false;
 };
@@ -57,10 +51,15 @@ enum class OpenDataLasagnaDatasetKind {
     const OpenDataLasagnaInfo& info,
     const vc::lasagna::LasagnaDatasetManifest& manifest);
 
+// The catalog Lasagna artifact a dataset entry caches (the artifact_url of its
+// remote marker); nullopt for other entries.
+[[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(
+    const VolumePkg& pkg, const vc::project::Entry& entry);
+
 // Returns the public manifest URL for a catalogue-backed entry and the stored
 // project location for an ordinary entry.
 [[nodiscard]] std::string lasagnaSourceManifestLocation(
-    const vc::project::Entry& entry);
+    const VolumePkg& pkg, const vc::project::Entry& entry);
 
 // Resolve the single root manifest in a public catalogue artifact directory.
 [[nodiscard]] std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl);
@@ -92,16 +91,12 @@ int attachOpenDataLasagna(VolumePkg& pkg,
     const VolumePkg& pkg,
     const std::string& loadedVolumeId);
 
-// Public for non-GUI consumers and deterministic pairing tests. The tags must
-// describe one catalog coordinate identity; no affine or cross-volume pairing
-// is attempted.
-[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateTags(
+// The same for what the active volume shows in the catalog (nullopt: the
+// project's manual selection), checked against its shape when given. No
+// affine or cross-volume pairing is attempted.
+[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags);
-
-[[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForCoordinateShape(
-    const VolumePkg& pkg,
-    const std::vector<std::string>& volumeTags,
-    const std::array<int, 3>& workingShapeZYX);
+    const std::optional<vcr::catalog::OpenDataVolumeView>& view,
+    const std::optional<std::array<int, 3>>& workingShapeZYX = std::nullopt);
 
 } // namespace vc3d::opendata

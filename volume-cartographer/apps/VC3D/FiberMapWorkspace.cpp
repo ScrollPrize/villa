@@ -760,6 +760,17 @@ QString withUmbilicusStatus(const QString& status, LineAnnotationController* con
     return status + QObject::tr(" · %1 — File > Import Umbilicus…").arg(umbilicus.text);
 }
 
+// FiberMapDependencies::catalogVolume and ::catalogOrientation.
+QString catalogVolumeKey(const std::optional<vc3d::opendata::CatalogVolumeSense>& catalog)
+{
+    return catalog ? QString::fromStdString(catalog->volume) : QString();
+}
+
+QString catalogOrientationKey(const std::optional<vc3d::opendata::CatalogVolumeSense>& catalog)
+{
+    return catalog ? QString::fromStdString(vc3d::opendata::orientationText(catalog->orientation)) : QString();
+}
+
 } // namespace
 
 FiberMapView::FiberMapView(QWidget* parent)
@@ -944,8 +955,6 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                                      QWidget* parent)
     : QMainWindow(parent)
     , _controller(controller)
-    , _catalogOrientation(
-          std::make_shared<vc3d::opendata::CatalogVolumeOrientationLookup>())
 {
     setObjectName(QStringLiteral("fiberMapWorkspace"));
     setWindowTitle(tr("Fiber Map"));
@@ -1685,19 +1694,10 @@ FiberMapWorkspace::currentDependencies() const
     deps.umbilicusGeneration = _controller->umbilicusGeneration();
     deps.umbilicusFingerprint = _controller->umbilicusFingerprint();
     deps.frame = _controller->annotationFrame();
-    const std::string coordinateSpace = _controller->fiberMapCoordinateSpace();
-    deps.catalogVolume = QString::fromStdString(
-        vc3d::opendata::catalogVolumeOfCoordinateSpace(coordinateSpace));
-    deps.catalogManifestToken = catalogManifestTokenFor(coordinateSpace);
+    const auto catalogVolume = _controller->fiberMapCatalogVolume();
+    deps.catalogVolume = catalogVolumeKey(catalogVolume);
+    deps.catalogOrientation = catalogOrientationKey(catalogVolume);
     return deps;
-}
-
-QString FiberMapWorkspace::catalogManifestTokenFor(const std::string& coordinateSpace) const
-{
-    if (!_catalogOrientation) {
-        return {};
-    }
-    return QString::fromStdString(_catalogOrientation->manifestToken(coordinateSpace));
 }
 
 vc3d::fiber_map::FiberMapDependencies
@@ -1710,7 +1710,7 @@ FiberMapWorkspace::layoutDependencies() const
     deps.umbilicusFingerprint = _layoutUmbilicusFingerprint;
     deps.frame = _layoutFrame;
     deps.catalogVolume = _layoutCatalogVolume;
-    deps.catalogManifestToken = _layoutCatalogManifestToken;
+    deps.catalogOrientation = _layoutCatalogOrientation;
     return deps;
 }
 
@@ -1903,17 +1903,9 @@ struct FiberMapWorkspace::RebuildJobResult {
     vc3d::fiber_map::GlobalLayoutParams params;
     bool hadFibers = false;
     bool hadUmbilicus = false;
-    // The catalog's orientation of the snapshot's volume, resolved by the
-    // worker (its first use parses the cached manifest): when it fixes the
-    // winding sense, params.solver.chiralityOverride carries it into the
-    // layout and the status line says so.
-    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> catalogOrientation;
+    // The catalog's orientation of the snapshot's volume fixed the winding
+    // sense (params.solver.chiralityOverride); the status line says so.
     bool senseFromCatalog = false;
-    // The manifest version the worker's catalog answer was read from
-    // (CatalogSense::manifestToken), a dependency watermark like the
-    // umbilicus fingerprint: compared at publication and by the staleness
-    // check afterwards, beside the snapshot's coordinateSpace.
-    QString catalogManifestToken;
     // The workspace's memoization cache, exclusive to the job in flight.
     vc3d::fiber_map::GlobalLayoutCache cache;
     // The gap heat map: wanted at job start (checkbox on), built with these
@@ -1989,16 +1981,9 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
         // back to solving both senses. Settled before the input digest,
         // which covers the override, so a catalog answer that changes
         // reads as changed inputs.
-        if (job->catalogOrientation && !job->snapshot.coordinateSpace.empty()) {
-            // One observation: the answer and the manifest version it came
-            // from, the latter the watermark publication compares against.
-            const auto catalog =
-                job->catalogOrientation->resolve(job->snapshot.coordinateSpace);
-            job->catalogManifestToken = QString::fromStdString(catalog.manifestToken);
-            const auto& orientation = catalog.orientation;
-            const auto sense = orientation
-                                   ? vc3d::opendata::windingChiralityOf(*orientation)
-                                   : std::nullopt;
+        if (const auto& catalog = job->snapshot.catalogVolume) {
+            const auto& orientation = catalog->orientation;
+            const auto sense = vc3d::opendata::windingChiralityOf(orientation);
             if (sense) {
                 job->params.solver.chiralityOverride = *sense;
                 job->senseFromCatalog = true;
@@ -2006,16 +1991,14 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                     "Fiber map: winding sense {:+d} from the catalog for {} "
                     "(z top-to-bottom {}, left-handed {})",
                     *sense,
-                    job->snapshot.coordinateSpace,
-                    *orientation->zTopToBottom,
-                    *orientation->leftHandedCoordinates);
+                    catalog->volume,
+                    *orientation.zTopToBottom,
+                    *orientation.leftHandedCoordinates);
             } else {
                 Logger()->info(
-                    "Fiber map: the catalog does not orient {} ({}); solving "
-                    "both winding senses",
-                    job->snapshot.coordinateSpace,
-                    orientation ? "orientation properties unset"
-                                : "volume not in the cached manifest");
+                    "Fiber map: the catalog does not orient {} (orientation "
+                    "properties unset); solving both winding senses",
+                    catalog->volume);
             }
         }
         job->inputsDigest = vc3d::fiber_map::digestGlobalInputs(
@@ -2185,7 +2168,6 @@ void FiberMapWorkspace::startRebuild(bool fullRebuild, bool automatic)
         job->snapshotMs = snapshotTimer.elapsed();
         job->builtPackageGeneration = _controller->packageGeneration();
         job->builtUmbilicusGeneration = _controller->umbilicusGeneration();
-        job->catalogOrientation = _catalogOrientation;
         job->hadFibers = !job->snapshot.fibers.empty();
         job->hadUmbilicus = !job->snapshot.umbilicusCenters.empty();
         job->wantGapField = _gapsCheck && _gapsCheck->isChecked();
@@ -2332,9 +2314,8 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     // only switched away for now. Another pyramid level of the same volume
     // is the same catalog volume (the frame comparison above judged the
     // grids).
-    const std::string coordinateSpace = _controller->fiberMapCoordinateSpace();
-    if (vc3d::opendata::catalogVolumeOfCoordinateSpace(coordinateSpace) !=
-        vc3d::opendata::catalogVolumeOfCoordinateSpace(job->snapshot.coordinateSpace)) {
+    const auto catalogVolume = _controller->fiberMapCatalogVolume();
+    if (catalogVolumeKey(catalogVolume) != catalogVolumeKey(job->snapshot.catalogVolume)) {
         _layoutCache = std::move(job->cache);
         if (!refreshStaleState()) {
             showStale(tr(
@@ -2351,7 +2332,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
     if (_controller->fiberDataGeneration() != job->snapshot.generation ||
         _controller->umbilicusGeneration() != job->builtUmbilicusGeneration ||
         _controller->umbilicusFingerprint() != job->preReadUmbilicusFingerprint ||
-        catalogManifestTokenFor(coordinateSpace) != job->catalogManifestToken) {
+        catalogOrientationKey(catalogVolume) != catalogOrientationKey(job->snapshot.catalogVolume)) {
         _layoutCache = std::move(job->cache);
         if (isVisible()) {
             (void)_rebuildQueue.request(job->fullRebuild, job->automatic);
@@ -2398,9 +2379,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _gapPublishedError = job.gapError;
     _gapFieldParams = job.gapParams;
     _layoutUmbilicusFingerprint = job.preReadUmbilicusFingerprint;
-    _layoutCatalogVolume = QString::fromStdString(
-        vc3d::opendata::catalogVolumeOfCoordinateSpace(job.snapshot.coordinateSpace));
-    _layoutCatalogManifestToken = job.catalogManifestToken;
+    _layoutCatalogVolume = catalogVolumeKey(job.snapshot.catalogVolume);
+    _layoutCatalogOrientation = catalogOrientationKey(job.snapshot.catalogVolume);
     _layoutGeneration = job.snapshot.generation;
     _layoutFrame = job.snapshot.frame;
     _layoutPackageGeneration = job.builtPackageGeneration;

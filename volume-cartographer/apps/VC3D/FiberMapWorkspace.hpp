@@ -234,9 +234,6 @@ private:
     using StaleVerdict = vc3d::fiber_map::StaleVerdict;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
     [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
-    // The cached catalog manifest's version for a coordinate space
-    // (FiberMapDependencies::catalogManifestToken): a stat, no parse.
-    [[nodiscard]] QString catalogManifestTokenFor(const std::string& coordinateSpace) const;
     // Cheap enough to guard interaction — integer compares, a few volume metadata
     // reads, and stats of the umbilicus candidates. Mutates nothing.
     [[nodiscard]] StaleVerdict evaluateDependencies() const;
@@ -503,7 +500,6 @@ private:
     // worker of every rebuild (the lookup memoizes its one manifest parse
     // and locks internally; the job holds it by shared pointer so a
     // workspace torn down mid-flight cannot pull it from under the worker).
-    std::shared_ptr<vc3d::opendata::CatalogVolumeOrientationLookup> _catalogOrientation;
     bool _haveLastDigests = false;
     vc3d::fiber_map::ContentDigest _lastInputsDigest;
     vc3d::fiber_map::ContentDigest _lastOutputDigest;
@@ -604,7 +600,7 @@ private:
     vc3d::annotation::AnnotationFrame _layoutFrame;
     QString _layoutUmbilicusFingerprint;
     QString _layoutCatalogVolume;
-    QString _layoutCatalogManifestToken;
+    QString _layoutCatalogOrientation;
     // Controller counters as of the build. Compared rather than observed, so that
     // this workspace existing costs annotation work nothing.
     uint64_t _layoutPackageGeneration = 0;

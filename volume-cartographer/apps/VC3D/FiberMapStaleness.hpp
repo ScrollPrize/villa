@@ -25,16 +25,14 @@ struct FiberMapDependencies {
     // The stored umbilicus (uuid@revision), or why there is none.
     QString umbilicusFingerprint;
     vc3d::annotation::AnnotationFrame frame;
-    // Which catalog volume the current volume is
-    // (catalogVolumeOfCoordinateSpace of its coordinate-space tag: sample
-    // and volume, no pyramid level; empty when untagged): the catalog entry
-    // the winding sense is read from, and an identity the grid comparison
-    // can miss (a same-grid store of another volume). And the version of
-    // the cached catalog manifest a rebuild would read it from
-    // (CatalogVolumeOrientationLookup::manifestToken; empty when the space
-    // is empty, so an untagged volume never depends on the manifest).
+    // Which catalog volume the current volume is (CatalogVolumeSense::volume:
+    // sample and volume, no pyramid level; empty for other volumes): the
+    // catalog entry the winding sense is read from, and an identity the grid
+    // comparison can miss (a same-grid store of another volume). And the
+    // orientation the catalog gives it (orientationText; empty for other
+    // volumes), from which the winding sense follows.
     QString catalogVolume;
-    QString catalogManifestToken;
+    QString catalogOrientation;
 };
 
 // What a comparison concluded, separately from acting on it.
@@ -181,10 +179,8 @@ inline StaleVerdict staleVerdictFor(const FiberMapDependencies& built,
         return verdict;
     }
 
-    // The catalog manifest the winding sense is read from was replaced
-    // (the catalog window refreshed it): whether the answer moved is only
-    // known by parsing it, which a rebuild does.
-    if (current.catalogManifestToken != built.catalogManifestToken) {
+    // The catalog now orients the volume differently (a refreshed catalog).
+    if (current.catalogOrientation != built.catalogOrientation) {
         verdict.action = StaleVerdict::Action::MarkStale;
         verdict.cause = StaleVerdict::Cause::Catalog;
         verdict.reason = QObject::tr("catalog changed — press Update");

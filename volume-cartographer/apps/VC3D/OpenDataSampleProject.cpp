@@ -27,24 +27,9 @@ std::string lowerCopy(std::string value)
     return value;
 }
 
-std::string trimTrailingSlashes(std::string value)
-{
-    while (!value.empty() && value.back() == '/') {
-        value.pop_back();
-    }
-    return value;
-}
-
 bool containsInsensitive(const std::string& haystack, const std::string& needle)
 {
     return lowerCopy(haystack).find(lowerCopy(needle)) != std::string::npos;
-}
-
-std::string artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return trimTrailingSlashes(artifact.resolvedUrl.empty()
-                                  ? artifact.sourcePath
-                                  : artifact.resolvedUrl);
 }
 
 bool isSupportedRemoteZarr(const vcr::catalog::OpenDataVolume& volume,
@@ -78,105 +63,6 @@ bool isSupportedRemoteZarr(const vcr::catalog::OpenDataVolume& volume,
     return artifact.type.empty() && containsInsensitive(volume.dataFormat, "zarr");
 }
 
-bool jsonStringEqualsInsensitive(const nlohmann::json& obj,
-                                 const char* key,
-                                 const std::string& expected)
-{
-    if (!obj.is_object()) {
-        return false;
-    }
-    const auto it = obj.find(key);
-    if (it == obj.end() || !it->is_string()) {
-        return false;
-    }
-    return lowerCopy(it->get<std::string>()) == expected;
-}
-
-std::vector<std::string> volumeTags(const vcr::catalog::OpenDataSample& sample,
-                                    const vcr::catalog::OpenDataVolume& volume,
-                                    const vcr::catalog::OpenDataArtifact& artifact,
-                                    bool preferredNativeSource,
-                                    std::optional<int> coordinateLevel = std::nullopt,
-                                    std::optional<double> effectiveVoxelSize = std::nullopt,
-                                    std::string sourcePath = {})
-{
-    std::vector<std::string> tags;
-    auto addUnique = [&tags](std::string tag) {
-        if (!tag.empty() &&
-            std::find(tags.begin(), tags.end(), tag) == tags.end()) {
-            tags.push_back(std::move(tag));
-        }
-    };
-
-    // Every origin admitted by the Open Data manifest is public-read. Persist
-    // the transport policy with the entry so cached catalog projects and
-    // deferred resolution never consult ambient AWS credentials.
-    addUnique(std::string(vc::project::kAnonymousRemoteAuthTag));
-
-    if (jsonStringEqualsInsensitive(artifact.properties, "representation", "normal3d") ||
-        jsonStringEqualsInsensitive(volume.properties, "representation", "normal3d") ||
-        containsInsensitive(artifact.type, "normal3d") ||
-        containsInsensitive(volume.suffix, "normal3d")) {
-        addUnique("normal3d");
-    }
-    if (containsInsensitive(artifact.type, "prediction") ||
-        containsInsensitive(artifact.type, "pred")) {
-        addUnique("prediction");
-    }
-    if (containsInsensitive(artifact.type, "surface") &&
-        containsInsensitive(artifact.type, "prediction")) {
-        addUnique("surface-prediction");
-    }
-    if (containsInsensitive(artifact.type, "ink")) {
-        addUnique("ink-detection");
-    }
-    if (containsInsensitive(artifact.type, "ink") &&
-        containsInsensitive(artifact.type, "3d")) {
-        addUnique("ink-detection-3d");
-    }
-    if (!volume.id.empty()) {
-        addUnique("vc-open-data-volume-id:" + volume.id);
-    }
-    if (!sample.id.empty()) {
-        addUnique(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
-    }
-    if (const auto normalGridsUrl = normalGridsArtifactUrl(volume); !normalGridsUrl.empty()) {
-        addUnique(std::string(kOpenDataNormalGridsTagPrefix) + normalGridsUrl);
-    }
-    const auto lasagna = lasagnaArtifacts(sample.id, volume);
-    if (lasagna.size() == 1) {
-        addUnique(std::string(kOpenDataLasagnaArtifactTagPrefix) +
-                  lasagna.front().artifactUrl);
-    } else if (lasagna.size() > 1) {
-        addUnique(std::string(kOpenDataLasagnaArtifactTagPrefix) + "ambiguous");
-    }
-    if (preferredNativeSource && !coordinateLevel)
-        coordinateLevel = 0;
-    if (preferredNativeSource)
-        addUnique("vc-open-data-preferred-source");
-    if (coordinateLevel) {
-        addUnique("vc-open-data-source-coordinate-level:" +
-                  std::to_string(*coordinateLevel));
-        addUnique("vc-open-data-coordinate-space:" + sample.id + "/" +
-                  volume.id + "@L" + std::to_string(*coordinateLevel));
-        if (!sourcePath.empty())
-            addUnique("vc-open-data-source-path:" + sourcePath);
-        if (volume.pixelSizeUm && std::isfinite(*volume.pixelSizeUm) &&
-            *volume.pixelSizeUm > 0.0) {
-            addUnique("vc-open-data-source-original-resolution:" +
-                      std::to_string(*volume.pixelSizeUm));
-        }
-    }
-    if (effectiveVoxelSize && *effectiveVoxelSize > 0.0) {
-        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*effectiveVoxelSize));
-    } else if (!containsInsensitive(artifact.type, "prediction") &&
-               volume.pixelSizeUm && *volume.pixelSizeUm > 0.0) {
-        addUnique("vc-open-data-voxel-size-um:" + std::to_string(*volume.pixelSizeUm));
-    }
-
-    return tags;
-}
-
 bool isSupportedSurfacePrediction(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return lowerCopy(artifact.type) == "surface-prediction-zarr";
@@ -199,55 +85,7 @@ std::optional<int> predictionSourceCoordinateLevel(const vcr::catalog::OpenDataA
 {
     if (!isSupportedCoordinatePrediction(artifact))
         return std::nullopt;
-
-    if (artifact.sourceCoordinateLevel)
-        return artifact.sourceCoordinateLevel;
-
-    // The first published 3D-ink stores predate parameters.level. They are
-    // native-resolution predictions, but only trust that legacy convention
-    // after preflightPredictionAndSource verifies the prediction descriptor
-    // against physical source /0.
-    if (isSupportedInk3dPrediction(artifact) && !artifact.levelParameterPresent)
-        return 0;
-
-    return std::nullopt;
-}
-
-std::string coordinateSpaceId(const vcr::catalog::OpenDataSample& sample,
-                              const vcr::catalog::OpenDataVolume& volume,
-                              int level)
-{
-    return sample.id + "/" + volume.id + "@L" + std::to_string(level);
-}
-
-std::vector<std::string> coordinateTags(const vcr::catalog::OpenDataSample& sample,
-                                        const vcr::catalog::OpenDataVolume& volume,
-                                        int level,
-                                        double voxelSize,
-                                        const std::string& sourcePath)
-{
-    return {
-        "vc-open-data-source-coordinate-level:" + std::to_string(level),
-        "vc-open-data-coordinate-space:" + coordinateSpaceId(sample, volume, level),
-        "vc-open-data-voxel-size-um:" + std::to_string(voxelSize),
-        "vc-open-data-source-path:" + sourcePath,
-        "vc-open-data-source-original-resolution:" +
-            std::to_string(*volume.pixelSizeUm),
-    };
-}
-
-const std::vector<std::string>& coordinateSingletonPrefixes()
-{
-    static const std::vector<std::string> prefixes{
-        "vc-open-data-voxel-size-um:",
-        "vc-open-data-source-coordinate-level:",
-        "vc-open-data-coordinate-space:",
-        "vc-open-data-source-path:",
-        "vc-open-data-source-original-resolution:",
-        "vc-open-data-name:",
-        "vc-open-data-coordinate-level-unknown",
-    };
-    return prefixes;
+    return artifact.sourceCoordinateLevel;
 }
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
@@ -422,8 +260,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                 " manifest-backed Lasagna dataset(s).");
         }
     }
-    // Catalog loads remain unresolved until volume tags and normal-grid paths
-    // have been reconciled.
+    // Catalog loads remain unresolved until normal-grid paths have been
+    // reconciled.
     if (newProject) {
         // Detached preparation must not overwrite the active project's autosave.
         // Reload the saved JSON to activate ordinary persistence and exercise
@@ -443,12 +281,9 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         if (progressCallback) {
             try { progressCallback({"project-ready"}); } catch (...) {}
         }
-        const std::string sampleTag =
-            std::string(kOpenDataSampleIdTagPrefix) + sample.id;
         for (const auto& entry : pkg->volumeEntries()) {
-            if (std::find(entry.tags.begin(), entry.tags.end(), sampleTag) ==
-                    entry.tags.end() ||
-                pkg->hasLoadedVolumeEntry(entry.location)) {
+            const auto view = vc::project::catalogVolumeView(pkg->catalog().get(), entry.location);
+            if (!view || view->sampleId != sample.id || pkg->hasLoadedVolumeEntry(entry.location)) {
                 continue;
             }
             ++result.failedVolumes;
@@ -490,7 +325,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         std::string predictionUrl;
         std::string sourceUrl;
         int sourceCoordinateLevel = 0;
-        bool inferredSourceCoordinateLevel = false;
     };
     std::vector<PredictionCandidate> predictions;
     struct VirtualSourceCandidate {
@@ -519,7 +353,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const auto* preferredSource = vcr::catalog::preferredVolumeArtifact(volume);
         std::string preferredSourceUrl;
         if (preferredSource) {
-            preferredSourceUrl = artifactUrl(*preferredSource);
+            preferredSourceUrl = preferredSource->url();
             if (isSupportedCoordinatePrediction(*preferredSource) ||
                 !isSupportedRemoteZarr(volume, *preferredSource, preferredSourceUrl)) {
                 preferredSource = nullptr;
@@ -529,7 +363,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         for (std::size_t artifactIndex = 0;
              artifactIndex < volume.artifacts.size(); ++artifactIndex) {
             const auto& artifact = volume.artifacts[artifactIndex];
-            const std::string url = artifactUrl(artifact);
+            const std::string url = artifact.url();
             if (lowerCopy(artifact.type) == kLasagnaArtifactType) {
                 if (selection &&
                     !selection->allowsRepresentation(
@@ -585,22 +419,11 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             }
 
             const auto label = volumeArtifactLabel(volume, artifact);
-            const bool preferredNativeSource = preferredSource == &artifact;
-            auto tags = volumeTags(
-                sample, volume, artifact, preferredNativeSource,
-                preferredNativeSource ? std::optional<int>{0} : std::nullopt,
-                preferredNativeSource ? volume.pixelSizeUm : std::nullopt,
-                preferredNativeSource ? preferredSourceUrl : std::string{});
-            if (isSupportedCoordinatePrediction(artifact) &&
-                !artifact.sourceCoordinateLevel) {
-                tags.push_back(
-                    artifact.levelParameterPresent
-                        ? "vc-open-data-coordinate-level-unknown:invalid-parameters.level"
-                        : "vc-open-data-coordinate-level-unknown:missing-parameters.level");
-            }
+            // Every origin the catalog admits is public-read; the entry keeps
+            // that transport policy so it never consults ambient AWS
+            // credentials. The catalog names the volume when it opens.
+            const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
             if (hasVolumeEntry(pkg, url)) {
-                pkg.reconcileVolumeEntryTags(
-                    url, tags, coordinateSingletonPrefixes());
                 ++result.skippedVolumes;
                 result.messages.push_back("Skipped " + label + ": already attached.");
                 if (!pkg.entryResolutionDeferred() &&
@@ -638,12 +461,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
             if (const auto level = predictionSourceCoordinateLevel(artifact)) {
                 predictions.push_back(PredictionCandidate{
-                    &volume,
-                    &artifact,
-                    url,
-                    preferredSourceUrl,
-                    *level,
-                    !artifact.sourceCoordinateLevel.has_value()});
+                    &volume, &artifact, url, preferredSourceUrl, *level});
             } else if (isSupportedCoordinatePrediction(artifact)) {
                 result.messages.push_back(
                     "Kept " + label +
@@ -692,21 +510,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             continue;
         }
 
-        const double effectiveVoxelSize =
-            *volume.pixelSizeUm * static_cast<double>(std::uint64_t{1} << level);
-        auto predictionTags = volumeTags(
-            sample, volume, prediction, false, level, effectiveVoxelSize,
-            candidate.sourceUrl);
-        pkg.reconcileVolumeEntryTags(
-            candidate.predictionUrl,
-            predictionTags,
-            coordinateSingletonPrefixes());
-        if (candidate.inferredSourceCoordinateLevel) {
-            result.messages.push_back(
-                "Paired legacy " + predictionLabel + " with source L" +
-                std::to_string(level) + " after descriptor validation.");
-        }
-
         if (level == 0)
             continue;
 
@@ -744,9 +547,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             continue;
         }
 
-        const double effectiveVoxelSize =
-            *volume.pixelSizeUm *
-            static_cast<double>(std::uint64_t{1} << level);
         const auto virtualLocator = vc::parseRemoteVolumeSpec(
             candidate.sourceUrl + "#vc-base-scale=" +
             std::to_string(level)).portableLocator;
@@ -756,28 +556,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
         attachedVirtualLocators.push_back(virtualLocator);
 
-        auto tags = coordinateTags(
-            sample, volume, level, effectiveVoxelSize, candidate.sourceUrl);
-        tags.push_back(std::string(vc::project::kAnonymousRemoteAuthTag));
-        tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + sample.id);
-        tags.push_back("vc-open-data-volume-id:" + volume.id);
-        const auto lasagna = lasagnaArtifacts(sample.id, volume);
-        if (lasagna.size() == 1) {
-            tags.push_back(std::string(kOpenDataLasagnaArtifactTagPrefix) +
-                           lasagna.front().artifactUrl);
-        } else if (lasagna.size() > 1) {
-            tags.push_back(
-                std::string(kOpenDataLasagnaArtifactTagPrefix) + "ambiguous");
-        }
-        tags.push_back("vc-open-data-virtual-source");
-        const std::string sourceName = volume.suffix.empty() ? volumeLabel(volume) : volume.suffix;
-        tags.push_back("vc-open-data-name:" + sourceName + " [source L" +
-                       std::to_string(level) + ", " +
-                       std::to_string(effectiveVoxelSize) + " um]");
-
+        const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
         if (hasVolumeEntry(pkg, virtualLocator)) {
-            pkg.reconcileVolumeEntryTags(
-                virtualLocator, tags, coordinateSingletonPrefixes());
             ++result.skippedVolumes;
         } else if (pkg.addVolumeEntry(virtualLocator, tags)) {
             ++result.attachedVolumeEntries;

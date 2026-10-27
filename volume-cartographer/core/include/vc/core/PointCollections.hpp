@@ -115,11 +115,6 @@ public:
    bool saveToJSON(const std::string& filename) const;
    bool loadFromJSON(const std::string& filename);
 
-   // Top-level metadata describing the coordinate space shared by every
-   // point in a saved file. VC3D updates this from the active source volume.
-   void setFileMetadata(const utils::Json& metadata);
-   [[nodiscard]] const utils::Json& fileMetadata() const;
-
    // Segment-specific corrections: the collections anchored on a surface
    // (anchor2d set), as collection JSON by collection id.
    [[nodiscard]] std::map<uint64_t, utils::Json> anchoredCollections() const;
@@ -150,7 +145,6 @@ private:
     uint64_t findOrCreateCollectionByName(const std::string& name);
 
     std::unordered_map<uint64_t, Collection> _collections;
-    utils::Json _fileMetadata = utils::Json::object();
     uint64_t _next_point_id = 1;
     uint64_t _next_collection_id = 1;
 };
