@@ -497,7 +497,7 @@ CPU and CUDA construct and store elastic fields in float32. Ordinary crop
 geometry also uses float32, with wider arithmetic where coordinate range or
 numerical conditioning requires it. Output dtypes are preserved. Small
 coordinate differences can select a neighboring label at a nearest-neighbor
-boundary. New replay plans use float32 fields; old plans must be regenerated.
+boundary. Replay plans store float32 fields.
 See the [precision policy](docs/precision.md) and
 [transform benchmarks](benchmarks/README.md#transform-benchmarks).
 

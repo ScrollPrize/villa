@@ -39,10 +39,6 @@ class Plan:
         self._pipeline = state[0]
         self._plan = self._pipeline._engine.load_plan(state[1])
 
-    @property
-    def steps(self):
-        return self._plan.steps
-
 
 class Pipeline:
     """Construct once; pass an explicit seed for each sample occurrence.
@@ -73,24 +69,11 @@ class Pipeline:
         }
         self._engine = _transforms.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
 
-    def with_targets(self, **targets):
-        """Return a new pipeline with added or replaced target declarations.
-
-        Values describe how arrays are treated, e.g. extra_label=Label() or
-        confidence=ScalarField(). Supply the actual arrays under those names
-        when calling the returned pipeline. Existing targets, transforms,
-        compact mode and the requested backend are preserved; this pipeline
-        is unchanged. Replay plans belong to their original pipeline.
-        """
-        return Pipeline(self.transforms, targets={**self.targets, **targets},
-                        compact=self.compact, backend=self._requested_backend)
-
     def __getstate__(self):
         return self.transforms, self.targets, self.compact, self._requested_backend
 
     def __setstate__(self, state):
-        self.__init__(state[0], targets=state[1], compact=state[2] if len(state) > 2 else True,
-                      backend=state[3] if len(state) > 3 else "cpu")
+        self.__init__(state[0], targets=state[1], compact=state[2], backend=state[3])
 
     @property
     def backend(self):
@@ -127,41 +110,38 @@ class Pipeline:
     @staticmethod
     def _device_result(result, inputs=()):
         from ..cuda import DeviceArray, _ExportOwners
-        arrays, sources, timings, plan = result[:4]
-        owner = _ExportOwners([result[4] if len(result) == 5 else None,
-                               *(v._export_owner for v in inputs)])
+        arrays, sources, plan, outputs = result
+        owner = _ExportOwners([outputs, *(v._export_owner for v in inputs)])
         return ({k: [DeviceArray(*level, _export_owner=owner) for level in v] if isinstance(v, list) else DeviceArray(*v, _export_owner=owner)
-                 for k, v in arrays.items()}, sources, timings, plan)
+                 for k, v in arrays.items()}, sources, plan)
 
     @staticmethod
-    def _outputs(sample, converters, result, profile):
-        arrays, sources, timings, _ = result
+    def _outputs(sample, converters, result):
+        arrays, sources, _ = result
         out = {k: v for k, v in sample.items() if k not in converters}
         for key, value in arrays.items():
             converter = converters.get(key, converters.get(sources[key]))
             out[key] = value if converter is None else (
                 [converter(level) for level in value] if isinstance(value, list) else converter(value)
             )
-        if profile:
-            out["_transform_perf"] = timings
         return out
 
-    def __call__(self, sample, *, seed, profile=False, inplace=False, params=None):
+    def __call__(self, sample, *, seed, inplace=False, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            result = self._device_result(self._engine.run_device(device, seed, False, profile, inplace, params=params or {}),
+            result = self._device_result(self._engine.run_device(device, seed, False, inplace, params=params or {}),
                                          [sample[k] for k in device] if inplace else ())
-            return self._outputs(sample, dict.fromkeys(device), result, profile)
+            return self._outputs(sample, dict.fromkeys(device), result)
         arrays, converters = self._inputs(sample, inplace)
-        result = self._engine.run(arrays, seed, False, profile, inplace, params=params or {})
-        return self._outputs(sample, converters, result, profile)
+        result = self._engine.run(arrays, seed, False, inplace, params=params or {})
+        return self._outputs(sample, converters, result)
 
     def sample(self, sample, *, seed, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            return Plan(self, self._engine.run_device(device, seed, True, False, False, params=params or {})[3])
+            return Plan(self, self._engine.run_device(device, seed, True, False, params=params or {})[2])
         arrays, _ = self._inputs(sample)
-        return Plan(self, self._engine.run(arrays, seed, True, False, params=params or {})[3])
+        return Plan(self, self._engine.run(arrays, seed, True, params=params or {})[2])
 
     def batch(self, batch, *, seeds, device=None, params=None):
         """Transform a batch, returning PyTorch CUDA tensors and unchanged metadata.
@@ -190,7 +170,7 @@ class Pipeline:
         device = self._device_inputs(sample)
         if device is not None:
             result = self._device_result(self._engine.replay_device(device, plan._plan))
-            return self._outputs(sample, dict.fromkeys(device), result, False)
+            return self._outputs(sample, dict.fromkeys(device), result)
         arrays, converters = self._inputs(sample)
-        return self._outputs(sample, converters, self._engine.replay(arrays, plan._plan), False)
+        return self._outputs(sample, converters, self._engine.replay(arrays, plan._plan))
 
