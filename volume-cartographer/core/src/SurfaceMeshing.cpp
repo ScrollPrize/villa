@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -99,6 +101,71 @@ LiftedUVs liftGridUVs(const GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarsePoi
             }
     }
     return lifted;
+}
+
+bool readUvObj(const std::string& path, UvMesh& mesh)
+{
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "Cannot open OBJ file: " << path << std::endl;
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        std::istringstream iss(line);
+        std::string prefix;
+        iss >> prefix;
+
+        if (prefix == "v") {
+            cv::Vec3f v;
+            iss >> v[0] >> v[1] >> v[2];
+            mesh.vertices.push_back(v);
+        }
+        else if (prefix == "vt") {
+            cv::Vec2f uv;
+            iss >> uv[0] >> uv[1];
+            mesh.uvs.push_back(uv);
+        }
+        else if (prefix == "f") {
+            UvFace face;
+            std::string vertex_str;
+            int idx = 0;
+
+            while (iss >> vertex_str && idx < 3) {
+                // Parse vertex/texture/normal indices
+                std::replace(vertex_str.begin(), vertex_str.end(), '/', ' ');
+                std::istringstream viss(vertex_str);
+
+                viss >> face.v[idx];
+                face.v[idx]--; // Convert to 0-based
+
+                if (viss >> face.vt[idx]) {
+                    face.vt[idx]--; // Convert to 0-based
+                } else {
+                    face.vt[idx] = -1;
+                }
+
+                idx++;
+            }
+
+            if (idx == 3) {
+                mesh.faces.push_back(face);
+            }
+        }
+    }
+
+    file.close();
+
+    std::cout << "Loaded OBJ file:" << std::endl;
+    std::cout << "  Vertices: " << mesh.vertices.size() << std::endl;
+    std::cout << "  UVs: " << mesh.uvs.size() << std::endl;
+    std::cout << "  Faces: " << mesh.faces.size() << std::endl;
+
+    return !mesh.vertices.empty() && !mesh.faces.empty() && !mesh.uvs.empty();
 }
 
 namespace {

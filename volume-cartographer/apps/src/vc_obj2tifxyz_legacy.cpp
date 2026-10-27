@@ -4,10 +4,7 @@
 #include <vc_object_store/Uuid.hpp>
 
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <filesystem>
-#include <algorithm>
 #include <limits>
 #include <cmath>
 #include <cstdlib>
@@ -16,74 +13,6 @@
 
 using vc::meshing::StepUvRasterizer;
 using ScaleMethod = StepUvRasterizer::ScaleMethod;
-
-namespace {
-bool loadObj(const std::string& filename, std::vector<cv::Vec3f>& vertices, std::vector<cv::Vec2f>& uvs,
-             std::vector<vc::meshing::UvFace>& faces)
-{
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Cannot open OBJ file: " << filename << std::endl;
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#')
-            continue;
-
-        std::istringstream iss(line);
-        std::string prefix;
-        iss >> prefix;
-
-        if (prefix == "v") {
-            cv::Vec3f v;
-            iss >> v[0] >> v[1] >> v[2];
-            vertices.push_back(v);
-        }
-        else if (prefix == "vt") {
-            cv::Vec2f uv;
-            iss >> uv[0] >> uv[1];
-            uvs.push_back(uv);
-        }
-        else if (prefix == "f") {
-            vc::meshing::UvFace face;
-            std::string vertex_str;
-            int idx = 0;
-
-            while (iss >> vertex_str && idx < 3) {
-                // Parse vertex/texture/normal indices
-                std::replace(vertex_str.begin(), vertex_str.end(), '/', ' ');
-                std::istringstream viss(vertex_str);
-
-                viss >> face.v[idx];
-                face.v[idx]--; // Convert to 0-based
-
-                if (viss >> face.vt[idx]) {
-                    face.vt[idx]--; // Convert to 0-based
-                } else {
-                    face.vt[idx] = -1;
-                }
-
-                idx++;
-            }
-
-            if (idx == 3) {
-                faces.push_back(face);
-            }
-        }
-    }
-
-    file.close();
-
-    std::cout << "Loaded OBJ file:" << std::endl;
-    std::cout << "  Vertices: " << vertices.size() << std::endl;
-    std::cout << "  UVs: " << uvs.size() << std::endl;
-    std::cout << "  Faces: " << faces.size() << std::endl;
-
-    return !vertices.empty() && !faces.empty() && !uvs.empty();
-}
-}
 
 int main(int argc, char *argv[])
 {
@@ -203,14 +132,12 @@ int main(int argc, char *argv[])
 
     StepUvRasterizer converter;
     {
-        std::vector<cv::Vec3f> vertices;
-        std::vector<cv::Vec2f> uvs;
-        std::vector<vc::meshing::UvFace> faces;
-        if (!loadObj(obj_path.string(), vertices, uvs, faces)) {
+        vc::meshing::UvMesh mesh;
+        if (!vc::meshing::readUvObj(obj_path.string(), mesh)) {
             std::cerr << "Failed to load OBJ file" << std::endl;
             return EXIT_FAILURE;
         }
-        converter.setMesh(std::move(vertices), std::move(uvs), std::move(faces));
+        converter.setMesh(std::move(mesh.vertices), std::move(mesh.uvs), std::move(mesh.faces));
     }
 
     // Determine grid dimensions from UV coordinates

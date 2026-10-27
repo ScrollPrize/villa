@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 class QuadSurface;
@@ -51,6 +52,19 @@ struct UvFace {
     int v[3];
     int vt[3];
 };
+
+// The vertices, texture coordinates and triangles of an OBJ file.
+struct UvMesh {
+    std::vector<cv::Vec3f> vertices;
+    std::vector<cv::Vec2f> uvs;
+    std::vector<UvFace> faces;
+};
+
+// Reads the v, vt and f statements of an OBJ file into `mesh` and prints their
+// counts. A face keeps its first three corners, each "v/vt/..." with vt -1 for
+// a corner without one; a face with fewer corners is skipped. Returns false
+// when the file cannot be opened (printing why) or has no vertices, faces or UVs.
+bool readUvObj(const std::string& path, UvMesh& mesh);
 
 // Rasterizes a UV-mapped triangle mesh onto a regular grid spanning its UV
 // bounds; each grid point takes the barycentric mix of its triangle's 3D

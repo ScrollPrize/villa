@@ -5,6 +5,9 @@
 
 #include "vc/core/util/SurfaceMeshing.hpp"
 
+#include <filesystem>
+#include <fstream>
+
 using namespace vc::meshing;
 
 namespace {
@@ -105,4 +108,36 @@ TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are i
     CHECK(onSamples > 40);
     // Vertices beyond the decimated quads (the last fine row/column here) still lift.
     for (std::size_t i = 0; i < fine.cells.size(); ++i) CHECK(lifted.valid[i]);
+}
+
+TEST_CASE("readUvObj reads vertices, UVs and the first three corners of each face")
+{
+    const auto path = std::filesystem::temp_directory_path() / "vc_test_read_uv_obj.obj";
+    std::ofstream(path) << "# comment\n"
+                           "v 1 2 3\nv 4.5 5 6\nv 7 8 9.25\nv 10 11 12\n"
+                           "vt 0.5 0.25\nvt 1 0\nvn 0 0 1\n"
+                           "f 1/1/1 2/2/1 3/1/1\n"
+                           "f 4 3 2\n"
+                           "f 1/2 2/1\n"
+                           "f 1/1 2/2 3/1 4/2\n";
+    UvMesh mesh;
+    REQUIRE(readUvObj(path.string(), mesh));
+    CHECK(mesh.vertices.size() == 4);
+    CHECK(mesh.vertices[1] == cv::Vec3f(4.5f, 5.f, 6.f));
+    CHECK(mesh.uvs.size() == 2);
+    CHECK(mesh.uvs[0] == cv::Vec2f(0.5f, 0.25f));
+    REQUIRE(mesh.faces.size() == 3);
+    CHECK(mesh.faces[0].v[2] == 2);
+    CHECK(mesh.faces[0].vt[1] == 1);
+    CHECK(mesh.faces[1].v[0] == 3);
+    CHECK(mesh.faces[1].vt[0] == -1);
+    CHECK(mesh.faces[2].v[2] == 2);
+    CHECK(mesh.faces[2].vt[2] == 0);
+
+    std::ofstream(path) << "v 1 2 3\nv 4 5 6\nv 7 8 9\nf 1 2 3\n";
+    UvMesh untextured;
+    CHECK_FALSE(readUvObj(path.string(), untextured));
+    std::filesystem::remove(path);
+    UvMesh missing;
+    CHECK_FALSE(readUvObj(path.string(), missing));
 }
