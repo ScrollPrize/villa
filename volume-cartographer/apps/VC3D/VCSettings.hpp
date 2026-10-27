@@ -135,8 +135,6 @@ namespace viewer {
     // Intersection Rendering
     constexpr auto INTERSECTION_OPACITY = "viewer/intersection_opacity";
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
-    constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;

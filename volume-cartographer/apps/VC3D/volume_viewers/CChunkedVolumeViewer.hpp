@@ -131,7 +131,6 @@ public:
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
     bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
@@ -224,7 +223,6 @@ public:
     QPointF lastScenePosition() const override { return _lastScenePos; }
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
-    bool lineAnnotationPlacementMarkerVisible() const;
     bool measurementSupported() const;
     void startMeasurementMode();
     bool isMeasurementActive() const;
@@ -288,7 +286,6 @@ public slots:
     void onMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
-    void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t collectionId);
     void clearCollectionSelection();
@@ -305,7 +302,6 @@ public slots:
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
     bool undoSameWrapAnnotation();
-    void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
 
@@ -525,10 +521,6 @@ private:
     // emits a same-object surfaceChanged signal. Consume that fact at the
     // signal so regional invalidation is not widened to the whole surface.
     bool _surfaceEditInvalidationPending = false;
-    std::string _pendingRenderReason;
-    std::string _pendingRenderCaller;
-    std::string _pendingIntersectionReason;
-    std::string _pendingIntersectionCaller;
 
     bool _volumetricAzimuthInSurface = false;
     // Last-seen frame of a displayed PlaneSurface: when the plane is rotated
@@ -569,7 +561,6 @@ private:
     std::uint64_t _surfaceGeometryEpoch = 0;
     std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
-    cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 

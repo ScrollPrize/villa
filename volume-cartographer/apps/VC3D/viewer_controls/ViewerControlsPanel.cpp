@@ -265,7 +265,7 @@ void ViewerControlsPanel::setupIntersectionControls()
     }
 
     if (_viewerManager) {
-        _viewerManager->setSurfacePatchSamplingStride(1, false);
+        _viewerManager->setSurfacePatchSamplingStride(1);
     }
 }
 

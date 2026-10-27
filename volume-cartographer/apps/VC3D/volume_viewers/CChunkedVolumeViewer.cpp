@@ -161,26 +161,6 @@ bool isSupportedStreamingCompositeMethod(const std::string& method)
            method == "alpha" || method == "volumetric";
 }
 
-int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
-{
-    int axis = 0;
-    float best = std::abs(v[0]);
-    for (int i = 1; i < 3; ++i) {
-        const float a = std::abs(v[i]);
-        if (a > best) {
-            best = a;
-            axis = i;
-        }
-    }
-    if (best < 1.0f - axisEps)
-        return -1;
-    for (int i = 0; i < 3; ++i) {
-        if (i != axis && std::abs(v[i]) > axisEps)
-            return -1;
-    }
-    return axis;
-}
-
 QColor activeSegmentationColorForView(const std::string& surfName)
 {
     if (surfName == "seg yz" || surfName == "yz plane")
@@ -329,11 +309,6 @@ SafeFocusProjection validateSafeFocusProjection(
 std::string profileCaller(const std::source_location& caller)
 {
     return std::format("{}:{} {}", caller.file_name(), caller.line(), caller.function_name());
-}
-
-std::string profileVec3(const cv::Vec3f& v)
-{
-    return std::format("[{:.3f},{:.3f},{:.3f}]", v[0], v[1], v[2]);
 }
 
 std::string profileRect(const cv::Rect& r)
@@ -565,7 +540,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
-    connect(_view, &CVolumeViewerView::sendScrolled, this, &CChunkedVolumeViewer::onScrolled);
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CChunkedVolumeViewer::onZoom);
     connect(_view, &CVolumeViewerView::sendResized, this, &CChunkedVolumeViewer::onResized);
@@ -1703,10 +1677,6 @@ void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::s
 {
     if (_closing) {
         return;
-    }
-    if (ProfileLoggingEnabled()) {
-        _pendingIntersectionReason = reason ? reason : "";
-        _pendingIntersectionCaller = profileCaller(caller);
     }
     ProfileScope profile("scheduleIntersectionRender", reason, caller);
     if (profile.enabled()) {
@@ -3512,10 +3482,6 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
     syncCameraTransform();
-    if (ProfileLoggingEnabled()) {
-        _pendingRenderReason = reason ? reason : "";
-        _pendingRenderCaller = profileCaller(caller);
-    }
     // Hidden viewer (minimized subwindow / background tab): skip the render.
     // Mark stale so showEvent renders it when it becomes visible.
     if (!isVisible()) {
@@ -4927,11 +4893,6 @@ void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled
     if (!enabled) {
         clearLineAnnotationPlacementMarker();
     }
-}
-
-bool CChunkedVolumeViewer::lineAnnotationPlacementMarkerVisible() const
-{
-    return _lineAnnotationPlacementMarker && _lineAnnotationPlacementMarker->isVisible();
 }
 
 void CChunkedVolumeViewer::markSurfaceGeometryChanged()

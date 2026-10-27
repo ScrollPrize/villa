@@ -81,7 +81,6 @@ public:
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);
     void setRawPointsOverlay(RawPointsOverlayController* overlay);
-    RawPointsOverlayController* rawPointsOverlay() const { return _rawPointsOverlay; }
     void setPathsOverlay(PathsOverlayController* overlay);
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
@@ -97,8 +96,6 @@ public:
     //
     // Zero disables a channel and leaves it on the legacy render path.
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-    std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
-    std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
     // Withhold raw-path viewport chunk demand from frames the SurfaceCache
     // fully serves, so tile fills are not starved behind interactive fetches
@@ -111,7 +108,6 @@ public:
 
     void setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId);
     std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
-    const std::string& overlayVolumeId() const { return _overlayVolumeId; }
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
 
@@ -119,7 +115,6 @@ public:
     float overlayOpacity() const { return _overlayOpacity; }
 
     void setOverlayColormap(const std::string& colormapId);
-    const std::string& overlayColormap() const { return _overlayColormapId; }
     void setOverlaySamplingMethod(vc::Sampling method);
     vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayIntensityAsAlpha(bool enabled);
@@ -129,7 +124,6 @@ public:
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
     void setOverlayMaxDisplayedResolution(int level);
-    int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
     void setOverlayComposite(const OverlayCompositeSettings& settings);
     const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
@@ -137,19 +131,17 @@ public:
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
-    void setSurfacePatchSamplingStride(int stride, bool userInitiated = true);
+    void setSurfacePatchSamplingStride(int stride);
     int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
     void setIntersectionMaxSurfaces(int limit);
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
-    void resetStrideUserOverride() {}
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
     // Registered automatically by AxisAlignedSliceController::setViewerManager.
     void setAxisAlignedSliceController(AxisAlignedSliceController* slices) { _slices = slices; }
-    AxisAlignedSliceController* axisAlignedSliceController() const { return _slices; }
 
     // --- Focus / navigation policy shared by all workspaces ---
     // Ensure the "focus" POI exists and lies inside the current volume: a
@@ -255,7 +247,6 @@ signals:
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
-    void samplingStrideChanged(int stride);
     void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
@@ -300,11 +291,6 @@ private:
     VCCollection* _points;
     AxisAlignedSliceController* _slices{nullptr};
     SegmentationOverlayController* _segmentationOverlay{nullptr};
-    PointsOverlayController* _pointsOverlay{nullptr};
-    RawPointsOverlayController* _rawPointsOverlay{nullptr};
-    PathsOverlayController* _pathsOverlay{nullptr};
-    BBoxOverlayController* _bboxOverlay{nullptr};
-    VectorOverlayController* _vectorOverlay{nullptr};
     // All overlay controllers that should be attached/detached from viewers.
     // Populated by the set*Overlay() methods. Does NOT include VolumeOverlayController
     // (which is not a ViewerOverlayControllerBase subclass).
@@ -322,7 +308,6 @@ private:
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
-    std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
@@ -366,10 +351,6 @@ private:
     QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
     bool _surfacePatchIndexOverlayRefreshPending{false};
 
-    // Surfaces currently pinned in the LRU as "highlighted/visible".
-    // We track them so we can unpin the right set when highlights change.
-    std::vector<std::shared_ptr<QuadSurface>> _pinnedHighlightSurfaces;
-
     void rebuildSurfacePatchIndexIfNeeded();
 
 public:
@@ -381,7 +362,6 @@ public:
     // work once reads drain. Begin/end bracket each worker read on the main thread.
     void beginIndexRead() { ++_indexReadsInFlight; }
     void endIndexRead();
-    bool indexReadInFlight() const { return _indexReadsInFlight > 0; }
 private:
     int _indexReadsInFlight{0};
     std::shared_ptr<SurfacePatchIndex> _deferredIndexSwap;

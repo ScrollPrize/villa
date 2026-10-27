@@ -979,31 +979,26 @@ void ViewerManager::setSegmentationModule(SegmentationModule* module)
 
 void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
 {
-    _pointsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setRawPointsOverlay(RawPointsOverlayController* overlay)
 {
-    _rawPointsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)
 {
-    _pathsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setBBoxOverlay(BBoxOverlayController* overlay)
 {
-    _bboxOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
 {
-    _vectorOverlay = overlay;
     registerOverlay(overlay);
 }
 
@@ -1057,7 +1052,6 @@ void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::
         }
     }
     _overlayVolume = std::move(volume);
-    _overlayVolumeId = _overlayVolume ? volumeId : std::string{};
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
@@ -1180,19 +1174,13 @@ void ViewerManager::setVolumeWindow(float low, float high)
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
-void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated)
+void ViewerManager::setSurfacePatchSamplingStride(int stride)
 {
     stride = std::max(1, stride);
     if (_surfacePatchSamplingStride == stride) {
         return;
     }
     _surfacePatchSamplingStride = stride;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    if (userInitiated) {
-        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE, _surfacePatchSamplingStride);
-        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, true);
-    }
 
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;
@@ -1203,8 +1191,6 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     }
 
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setSurfacePatchSamplingStride(_surfacePatchSamplingStride); });
-
-    emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
 
 void ViewerManager::setIntersectionMaxSurfaces(int limit)

@@ -288,7 +288,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
-    _viewerManager->setSurfacePatchSamplingStride(4, false);
+    _viewerManager->setSurfacePatchSamplingStride(4);
     // The flattened preview is this workspace's primary pane: stop publishing
     // raw-path chunk demand for frames the SurfaceCache fully serves, so its
     // tile fills are not starved behind interactive fetches the frame never
@@ -683,7 +683,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     });
     connect(_panel, &SpiralPanel::surfaceIntersectionStrideChanged,
             this, [this](int stride) {
-                _viewerManager->setSurfacePatchSamplingStride(stride, false);
+                _viewerManager->setSurfacePatchSamplingStride(stride);
             });
     connect(_panel, &SpiralPanel::surfaceOverlapChanged, this, [this](bool shown) {
         _showSurfaceOverlap = shown;
