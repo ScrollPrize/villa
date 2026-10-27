@@ -116,7 +116,6 @@ private slots:
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
     void detachEntry();
-    void convertLegacyVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
     void attachRemoteZarr();
@@ -189,10 +188,6 @@ private:
                                   OpenDataSampleOpenOutcome* outcomeOut);
     void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
     void cancelOpenDataVolumePrefills();
-    // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
-    // prompts the user for an output .volpkg.json, and returns the written path
-    // via `convertedOut` on success.
-    bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -223,7 +218,6 @@ private:
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};
-    QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
     QAction* _openDataCatalogAct{nullptr};

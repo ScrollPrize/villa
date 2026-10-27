@@ -1009,7 +1009,6 @@ vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 
-vc_add_test(NAME test_volpkg_convert)
 
 vc_add_test(NAME test_vcdataset)
 

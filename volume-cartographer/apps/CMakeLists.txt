@@ -166,8 +166,6 @@ target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgco
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
 
-add_executable(vc_volpkg_convert src/vc_volpkg_convert.cpp)
-target_link_libraries(vc_volpkg_convert vc_core)
 
 
 # Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
@@ -236,7 +234,7 @@ set(VC_CLI_TARGETS
     vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
     vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
     vc_merge_tifxyz vc_merge_patch vc_visualize
-    vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
+    vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
     vc_ngrids
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
     vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
@@ -269,7 +267,7 @@ if(VC_USE_PCH)
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
         vc_calc_surface_metrics
         vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt vc_diffuse_winding
-        vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
+        vc_merge_tifxyz vc_merge_patch vc_visualize vc_transform_geom
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
         vc_thinning
         vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress

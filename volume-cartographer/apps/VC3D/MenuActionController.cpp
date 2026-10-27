@@ -38,7 +38,6 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/core/util/Umbilicus.hpp"
-#include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
@@ -421,17 +420,15 @@ void MenuActionController::openVolpkg()
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto file = promptLocation(QObject::tr("Open Project"),
-        QObject::tr("Pick a .volpkg.json file, a legacy volpkg folder, or a remote volpkg URL."),
+        QObject::tr("Pick a .volpkg.json project file."),
         settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-        {"*.volpkg.json"}, true, true);
+        {"*.volpkg.json"}, true, false);
     if (file.isEmpty()) return;
 
     if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) {
-        QMessageBox::information(_window, QObject::tr("Convert to .volpkg.json"),
-            QObject::tr("This needs to be converted to a .volpkg.json — pick where to save the converted project."));
-        QString converted;
-        if (!runLegacyVolpkgConvert(file, &converted)) return;
-        file = converted;
+        QMessageBox::warning(_window, QObject::tr("Open Project"),
+            QObject::tr("%1 is not a .volpkg.json project file.").arg(file));
+        return;
     }
     _window->OpenVolume(file);
     _window->UpdateView();
@@ -2166,56 +2163,6 @@ void MenuActionController::detachEntry()
         return;
     }
     _window->refreshCurrentVolumePackageUi();
-}
-
-bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString out = QFileDialog::getSaveFileName(_window,
-        QObject::tr("Save converted .volpkg.json"),
-        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-        QObject::tr("Project (*.volpkg.json)"));
-    if (out.isEmpty()) return false;
-    if (!out.endsWith(".volpkg.json", Qt::CaseInsensitive)) out += ".volpkg.json";
-
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    auto r = vc::convertVolpkg(inputLocation.toStdString(), std::filesystem::path(out.toStdString()));
-    QApplication::restoreOverrideCursor();
-
-    if (!r.ok) {
-        QMessageBox box(_window);
-        box.setWindowTitle(QObject::tr("Volpkg conversion failed"));
-        box.setIcon(QMessageBox::Warning);
-        box.setText(QObject::tr("Could not convert this volpkg to .volpkg.json."));
-        box.setInformativeText(QObject::tr("Input:  %1\nOutput: %2\n\nReason: %3")
-            .arg(inputLocation, out, QString::fromStdString(r.message)));
-        box.setStandardButtons(QMessageBox::Ok);
-        box.setStyleSheet("QLabel{min-width:600px;}");
-        box.exec();
-        return false;
-    }
-    if (!r.message.empty()) {
-        QMessageBox::information(_window, QObject::tr("Volpkg converted with warnings"),
-            QString::fromStdString(r.message));
-    }
-    if (convertedOut) *convertedOut = out;
-    return true;
-}
-
-void MenuActionController::convertLegacyVolpkg()
-{
-    if (!_window) return;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto in = promptLocation(QObject::tr("Convert Legacy Volpkg"),
-                             QObject::tr("Pick the legacy volpkg directory or remote URL."),
-                             settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-                             {}, false, true);
-    if (in.isEmpty()) return;
-    QString out;
-    if (!runLegacyVolpkgConvert(in, &out)) return;
-    auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
-        QObject::tr("Wrote %1 — open it now?").arg(out));
-    if (reply == QMessageBox::Yes) openVolpkgAt(out);
 }
 
 QString MenuActionController::objectStoreAuthor()
