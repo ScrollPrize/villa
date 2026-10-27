@@ -1,4 +1,5 @@
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -35,6 +36,16 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore& store, const T
     VolumeUmbilicus result{record.uuid, record.name, store.currentObjectRevision(txn, record.uuid)->uuid,
                            canonical.viewTransformedAt(volume).points("points", 0, canonical.size())};
     return result;
+}
+
+std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                               const std::string& volume)
+{
+    std::optional<VolumeUmbilicus> umbilicus;
+    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+        umbilicus = volumeUmbilicus(store, txn, volume);
+    });
+    return umbilicus;
 }
 
 std::string setVolumeUmbilicus(ObjectStore& store, WriteTxn& txn, const std::string& volume, ObjectRecord record,

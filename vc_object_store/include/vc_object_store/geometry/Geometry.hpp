@@ -2,6 +2,7 @@
 
 #include "vc_object_store/objects/Geometry.hpp"
 #include <array>
+#include <concepts>
 #include <optional>
 #include <span>
 #include <variant>
@@ -79,5 +80,18 @@ bool validSurfacePoint(const SurfacePoint&);
 // also mark missing vertices with z <= 0 (tracers leave extrapolations there).
 // Their readers and writers convert with this rule at that boundary.
 bool validTifxyzPoint(const SurfacePoint&);
+// The same for any three-component vector (cv::Vec3f, Eigen, ...).
+template <class Vector>
+    requires(!std::same_as<Vector, SurfacePoint>)
+bool validSurfacePoint(const Vector& p)
+{
+    return validSurfacePoint(SurfacePoint{static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])});
+}
+template <class Vector>
+    requires(!std::same_as<Vector, SurfacePoint>)
+bool validTifxyzPoint(const Vector& p)
+{
+    return validTifxyzPoint(SurfacePoint{static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])});
+}
 
 } // namespace vc::geometry

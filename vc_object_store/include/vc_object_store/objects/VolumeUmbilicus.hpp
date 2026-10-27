@@ -3,6 +3,8 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
+class ObjectStoreSession;
+struct AttachmentIdentity;
 // A volume has at most one umbilicus: the live umbilicus object whose
 // coordinates map to it (bound to it, or through a registration).
 struct VolumeUmbilicus {
@@ -14,6 +16,8 @@ struct VolumeUmbilicus {
 RevisionSelection volumeUmbilicusRevisions(const ObjectStore&, const Txn&, const std::string& volume);
 // The umbilicus of `volume`; nullopt when it has none. Throws when several map to it.
 std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore&, const Txn&, const std::string& volume);
+// The same, read from a session's attachment.
+std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume);
 // Makes `record` (an umbilicus whose meta.coordinates map to `volume`) with
 // `geometry` the umbilicus of `volume`, retiring those it replaces. The
 // caller's checked transaction pins volumeUmbilicusRevisions and expects
