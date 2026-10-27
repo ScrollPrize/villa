@@ -167,17 +167,9 @@ namespace viewer {
     // Viewer control group expansion states
     constexpr auto GROUP_NORMAL_VIS_EXPANDED = "viewer/group_normal_vis_expanded";
     constexpr auto GROUP_VIEW_EXPANDED = "viewer/group_view_expanded";
-    constexpr auto GROUP_OVERLAY_EXPANDED = "viewer/group_overlay_expanded";
-    constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
-    constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
-    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_VIEW_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_OVERLAY_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -211,17 +203,6 @@ namespace perf {
     constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
     constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
     constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
-
-    // LOD synthesis method.  Selects how c3d chunks are decoded when a
-    // downscaled view is requested.  Value is one of:
-    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
-    //   "full_decode_box"   — full decode + box-average pool.
-    //   "full_decode_min"   — full decode + min pool.
-    //   "full_decode_max"   — full decode + max pool.
-    // Has no effect until the sampler calls into the LOD-synthesis path
-    // (no-op on the current multi-level zarr pyramid).
-    constexpr auto LOD_METHOD = "perf/lod_method";
-    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
     // Process-wide remote source-download admission. Automatic mode adapts
     // between 2 and the fixed worker capacity. Manual mode admits exactly the
@@ -367,20 +348,15 @@ namespace neighbor_copy {
 // AWS Settings
 // -----------------------------------------------------------------------------
 namespace aws {
-    constexpr auto DEFAULT_PROFILE = "aws/default_profile";
     constexpr auto ACCESS_KEY = "aws/access_key";
     constexpr auto SECRET_KEY = "aws/secret_key";
     constexpr auto SESSION_TOKEN = "aws/session_token";
-
-    constexpr auto DEFAULT_PROFILE_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------
 // Tools Settings
 // -----------------------------------------------------------------------------
 namespace tools {
-    constexpr auto FLATBOI_PATH = "tools/flatboi_path";
-    constexpr auto FLATBOI = "tools/flatboi";  // Legacy key
     constexpr auto GROW_TRACK_VENV = "tools/grow_track_venv";
     constexpr auto GROW_TRACK_VENV_DEFAULT = "";
 }

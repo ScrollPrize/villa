@@ -416,9 +416,9 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
         });
     };
 
-    rememberGroupState(_groupEditing, QStringLiteral("group_editing_expanded"));
-    rememberGroupState(_groupDrag, QStringLiteral("group_drag_expanded"));
-    rememberGroupState(_groupPushPull, QStringLiteral("group_push_pull_expanded"));
+    rememberGroupState(_groupEditing, vc3d::settings::segmentation::GROUP_EDITING_EXPANDED);
+    rememberGroupState(_groupDrag, vc3d::settings::segmentation::GROUP_DRAG_EXPANDED);
+    rememberGroupState(_groupPushPull, vc3d::settings::segmentation::GROUP_PUSH_PULL_EXPANDED);
 }
 
 void SegmentationEditingPanel::writeSetting(const QString& key, const QVariant& value)
@@ -436,7 +436,7 @@ void SegmentationEditingPanel::setShowHoverMarker(bool enabled)
     }
     _showHoverMarker = enabled;
     if (!_restoringSettings) {
-        writeSetting(QStringLiteral("show_hover_marker"), _showHoverMarker);
+        writeSetting(vc3d::settings::segmentation::SHOW_HOVER_MARKER, _showHoverMarker);
         emit hoverMarkerToggled(_showHoverMarker);
     }
     if (_chkShowHoverMarker) {
@@ -452,7 +452,7 @@ void SegmentationEditingPanel::setDragRadius(float value)
         return;
     }
     _dragRadiusSteps = clamped;
-    writeSetting(QStringLiteral("drag_radius_steps"), _dragRadiusSteps);
+    writeSetting(vc3d::settings::segmentation::DRAG_RADIUS_STEPS, _dragRadiusSteps);
     if (_spinDragRadius) {
         const QSignalBlocker blocker(_spinDragRadius);
         _spinDragRadius->setValue(static_cast<double>(_dragRadiusSteps));
@@ -466,7 +466,7 @@ void SegmentationEditingPanel::setDragSigma(float value)
         return;
     }
     _dragSigmaSteps = clamped;
-    writeSetting(QStringLiteral("drag_sigma_steps"), _dragSigmaSteps);
+    writeSetting(vc3d::settings::segmentation::DRAG_SIGMA_STEPS, _dragSigmaSteps);
     if (_spinDragSigma) {
         const QSignalBlocker blocker(_spinDragSigma);
         _spinDragSigma->setValue(static_cast<double>(_dragSigmaSteps));
@@ -480,7 +480,7 @@ void SegmentationEditingPanel::setPushPullRadius(float value)
         return;
     }
     _pushPullRadiusSteps = clamped;
-    writeSetting(QStringLiteral("push_pull_radius_steps"), _pushPullRadiusSteps);
+    writeSetting(vc3d::settings::segmentation::PUSH_PULL_RADIUS_STEPS, _pushPullRadiusSteps);
     if (_spinPushPullRadius) {
         const QSignalBlocker blocker(_spinPushPullRadius);
         _spinPushPullRadius->setValue(static_cast<double>(_pushPullRadiusSteps));
@@ -494,7 +494,7 @@ void SegmentationEditingPanel::setPushPullSigma(float value)
         return;
     }
     _pushPullSigmaSteps = clamped;
-    writeSetting(QStringLiteral("push_pull_sigma_steps"), _pushPullSigmaSteps);
+    writeSetting(vc3d::settings::segmentation::PUSH_PULL_SIGMA_STEPS, _pushPullSigmaSteps);
     if (_spinPushPullSigma) {
         const QSignalBlocker blocker(_spinPushPullSigma);
         _spinPushPullSigma->setValue(static_cast<double>(_pushPullSigmaSteps));
@@ -508,7 +508,7 @@ void SegmentationEditingPanel::setPushPullStep(float value)
         return;
     }
     _pushPullStep = clamped;
-    writeSetting(QStringLiteral("push_pull_step"), _pushPullStep);
+    writeSetting(vc3d::settings::segmentation::PUSH_PULL_STEP, _pushPullStep);
     if (_spinPushPullStep) {
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
@@ -522,7 +522,7 @@ void SegmentationEditingPanel::setEditScale(float value)
         return;
     }
     _editScale = clamped;
-    writeSetting(QStringLiteral("edit_scale"), _editScale);
+    writeSetting(vc3d::settings::segmentation::EDIT_SCALE, _editScale);
     if (_spinEditScale) {
         const QSignalBlocker blocker(_spinEditScale);
         _spinEditScale->setValue(static_cast<double>(_editScale));
@@ -553,15 +553,15 @@ void SegmentationEditingPanel::applyAlphaPushPullConfig(const AlphaPushPullConfi
     if (changed) {
         _alphaPushPullConfig = sanitized;
         if (persist) {
-            writeSetting(QStringLiteral("push_pull_alpha_start"), _alphaPushPullConfig.start);
-            writeSetting(QStringLiteral("push_pull_alpha_stop"), _alphaPushPullConfig.stop);
-            writeSetting(QStringLiteral("push_pull_alpha_step"), _alphaPushPullConfig.step);
-            writeSetting(QStringLiteral("push_pull_alpha_low"), _alphaPushPullConfig.low);
-            writeSetting(QStringLiteral("push_pull_alpha_high"), _alphaPushPullConfig.high);
-            writeSetting(QStringLiteral("push_pull_alpha_radius"), _alphaPushPullConfig.blurRadius);
-            writeSetting(QStringLiteral("push_pull_alpha_compute_scale"), _alphaPushPullConfig.computeScale);
-            writeSetting(QStringLiteral("push_pull_alpha_limit"), _alphaPushPullConfig.perVertexLimit);
-            writeSetting(QStringLiteral("push_pull_alpha_per_vertex"), _alphaPushPullConfig.perVertex);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_START, _alphaPushPullConfig.start);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_STOP, _alphaPushPullConfig.stop);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_STEP, _alphaPushPullConfig.step);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_LOW, _alphaPushPullConfig.low);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_HIGH, _alphaPushPullConfig.high);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_RADIUS, _alphaPushPullConfig.blurRadius);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_COMPUTE_SCALE, _alphaPushPullConfig.computeScale);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_LIMIT, _alphaPushPullConfig.perVertexLimit);
+            writeSetting(vc3d::settings::segmentation::PUSH_PULL_ALPHA_PER_VERTEX, _alphaPushPullConfig.perVertex);
         }
     }
 
@@ -615,7 +615,7 @@ void SegmentationEditingPanel::setSmoothingStrength(float value)
         return;
     }
     _smoothStrength = clamped;
-    writeSetting(QStringLiteral("smooth_strength"), _smoothStrength);
+    writeSetting(vc3d::settings::segmentation::SMOOTH_STRENGTH, _smoothStrength);
     if (_spinSmoothStrength) {
         const QSignalBlocker blocker(_spinSmoothStrength);
         _spinSmoothStrength->setValue(static_cast<double>(_smoothStrength));
@@ -629,7 +629,7 @@ void SegmentationEditingPanel::setSmoothingIterations(int value)
         return;
     }
     _smoothIterations = clamped;
-    writeSetting(QStringLiteral("smooth_iterations"), _smoothIterations);
+    writeSetting(vc3d::settings::segmentation::SMOOTH_ITERATIONS, _smoothIterations);
     if (_spinSmoothIterations) {
         const QSignalBlocker blocker(_spinSmoothIterations);
         _spinSmoothIterations->setValue(_smoothIterations);

@@ -201,7 +201,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
 
     connect(_chkGrowthKeybindsEnabled, &QCheckBox::toggled, this, [this](bool checked) {
         _growthKeybindsEnabled = checked;
-        writeSetting(QStringLiteral("growth_keybinds_enabled"), _growthKeybindsEnabled);
+        writeSetting(vc3d::settings::segmentation::GROWTH_KEYBINDS_ENABLED, _growthKeybindsEnabled);
     });
 
     connect(_spinGrowthSteps, QOverload<int>::of(&QSpinBox::valueChanged), this,
@@ -247,14 +247,14 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     // Z-range connections
     connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
         _correctionsZRangeEnabled = enabled;
-        writeSetting(QStringLiteral("corrections_z_range_enabled"), _correctionsZRangeEnabled);
+        writeSetting(vc3d::settings::segmentation::CORRECTIONS_Z_RANGE_ENABLED, _correctionsZRangeEnabled);
         updateGrowthUiState();
         emit correctionsZRangeChanged(enabled, _correctionsZMin, _correctionsZMax);
     });
     connect(_spinCorrectionsZMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (_correctionsZMin == value) return;
         _correctionsZMin = value;
-        writeSetting(QStringLiteral("corrections_z_min"), _correctionsZMin);
+        writeSetting(vc3d::settings::segmentation::CORRECTIONS_Z_MIN, _correctionsZMin);
         if (_correctionsZRangeEnabled) {
             emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
         }
@@ -262,7 +262,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     connect(_spinCorrectionsZMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (_correctionsZMax == value) return;
         _correctionsZMax = value;
-        writeSetting(QStringLiteral("corrections_z_max"), _correctionsZMax);
+        writeSetting(vc3d::settings::segmentation::CORRECTIONS_Z_MAX, _correctionsZMax);
         if (_correctionsZRangeEnabled) {
             emit correctionsZRangeChanged(true, _correctionsZMin, _correctionsZMax);
         }
@@ -350,7 +350,7 @@ void SegmentationGrowthPanel::applyGrowthSteps(int steps, bool persist, bool fro
     _growthSteps = clamped;
 
     if (persist) {
-        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
+        writeSetting(vc3d::settings::segmentation::GROWTH_STEPS, _growthSteps);
         writeSetting(QStringLiteral("growth_steps_tracer"), _tracerGrowthSteps);
     }
 }
@@ -378,7 +378,7 @@ void SegmentationGrowthPanel::setGrowthMethod(SegmentationGrowthMethod method)
         targetSteps = 0;
     }
     applyGrowthSteps(targetSteps, true, false);
-    writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
+    writeSetting(vc3d::settings::segmentation::GROWTH_METHOD, static_cast<int>(_growthMethod));
     syncUiState(_editingEnabled, _growthInProgress);
     emit growthMethodChanged(_growthMethod);
 }
@@ -512,7 +512,7 @@ void SegmentationGrowthPanel::setGrowthDirectionMask(int mask)
         return;
     }
     _growthDirectionMask = mask;
-    writeSetting(QStringLiteral("growth_direction_mask"), _growthDirectionMask);
+    writeSetting(vc3d::settings::segmentation::GROWTH_DIRECTION_MASK, _growthDirectionMask);
     applyGrowthDirectionMaskToUi();
 }
 
