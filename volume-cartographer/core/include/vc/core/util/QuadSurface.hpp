@@ -323,7 +323,7 @@ public:
     cv::Vec3f gridNormal(int row, int col) const;
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
-                  class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
+                  class SurfacePatchIndex* surfaceIndex = nullptr) override;
     cv::Size size();
     // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
     [[nodiscard]] cv::Size gridSize() const;

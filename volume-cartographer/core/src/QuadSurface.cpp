@@ -4,7 +4,6 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -2088,7 +2087,7 @@ float lookupDepthIndex(QuadSurface* surface, int row, int col)
 
 //search the surface point that is closest to the target coord
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
-                           SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
+                           SurfacePatchIndex* surfaceIndex)
 {
     ensureLoaded();
     if (_points->cols < 2 || _points->rows < 2)
@@ -2128,30 +2127,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         return std::nextafter(th, std::numeric_limits<float>::infinity());
     }
 
-    // Try point index for a better starting hint
-    if (pointIndex && !pointIndex->empty()) {
-        auto nearest = pointIndex->nearest(tgt, th * 4.0f);
-        if (nearest) {
-            // Use nearest point as starting location hint
-            cv::Vec3f hint_ptr{0, 0, 0};
-            // Recursively call without indices to avoid infinite loop
-            float hint_dist = pointTo(hint_ptr, nearest->position, th, std::max(1, max_iters / 4), nullptr, nullptr);
-            if (hint_dist >= 0 && hint_dist < min_dist) {
-                // Now search from this hint toward our actual target
-                loc = cv::Vec2f(hint_ptr[0], hint_ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
-                dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
-                if (dist < th && dist >= 0) {
-                    ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-                    return dist;
-                } else if (dist >= 0 && dist < min_dist) {
-                    min_loc = loc;
-                    min_dist = dist;
-                }
-            }
-        }
-    }
-
-    // Fall back to random sampling if indices didn't help
+    // Fall back to random sampling if the index didn't help
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
