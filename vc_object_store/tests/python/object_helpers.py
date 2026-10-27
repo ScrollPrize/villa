@@ -1,3 +1,8 @@
+def raw(db, revision, name):
+    """The stored bytes of one array of a geometry revision."""
+    return db.read_geometry_arrays([revision], name).values.tobytes()
+
+
 def edge_choice(db, edge_uuid, action, **anchors):
     edge = db.edge(edge_uuid)
     revisions = [db.current_geometry(edge[side]) for side in ("a", "b")]

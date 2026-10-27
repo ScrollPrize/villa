@@ -634,9 +634,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python 
 ```
 
 VC3D and CLI imports share `prepareGeometrySource` and the checked batch ingest.
-Fibers accept current version-4 documents and version-1 fiber collections;
-branch endpoints require `target_uuid`. `branch_file` only locates a missing
-peer's transport file. No older-format repair or database migration is performed.
+Fibers accept current version-4 documents, VC3D version-1 and version-3 fiber
+files and version-1 fiber collections. Version-4 branch endpoints require
+`target_uuid`, and `branch_file` only locates a missing peer's transport file;
+version-3 links resolve by `branch_file`. No older-format repair or database migration is performed.
 Native export's `--revision` / Python `object_revision_uuid` pins an object
 revision, including its metadata and relationship snapshot, and returns its
 geometry revision UUID.
@@ -646,61 +647,3 @@ Native format clients link `vc_object_store::vc_object_geometry`. Set
 for import/export without relationship detectors or their CT reader dependency.
 VC3D uses this configuration; the standalone tools/Python build keeps detectors
 on by default. The existing OpenCV/TIFF dependencies supply native formats.
-
-## Large-store reads and volume-ID correction
-
-`bench_volume_queries` times the volume-targeted reads VC3D issues (viewport
-regions, a line-annotation strip's candidates, the unbound count, a catalog page
-with its unbound tail, and a curved view's control-chain selection), five runs
-each, read-only. Build and run it from this directory; the VC3D read-only
-harness is documented in `docs/fiber-collections.md` in the sibling project:
-
-```sh
-AGENTS_AGENT_MODE=1 ninja -C build bench_volume_queries
-build/bin/bench_volume_queries /path/to/paris4-fibers.vcobj 20260411134726
-```
-
-On the 931,104-fiber Paris 4 store (Ubuntu arm64, RelWithDebInfo, warm cache;
-"before" is schema 13, "after" the same data with the schema 14 columns and index),
-median milliseconds:
-
-| Read | Before | After |
-| --- | ---: | ---: |
-| Region 300×200×6 | 810 | 32 |
-| Region 1500×1000×6 | 826 | 52 |
-| Strip candidates (`spatialRegions`) | 802 | 15 |
-| Unbound count (was a per-binding count + `objectCount`) | 2,516 + 69 | 0.004 |
-| Catalog page of 200 with unbound tail | 3,148 | 1.2 |
-| Control-chain selection | 920 | 47 |
-
-Query results were identical on both schemas (checked with
-`test_object_store_volume_target`).
-
-Older imports may contain a UUIDv5-derived volume binding. Correcting a known
-binding is explicit and preserves prior revisions and all geometry. First preview:
-
-```sh
-python scripts/rebind_volume.py objects.vcobj --from-id OLD_VALUE --to-id CATALOG_ID
-```
-
-After closing editors, add `--apply` with `PYTHONPATH=build/python` to run checked,
-batched metadata transactions. The tool is resumable and refuses stores with
-relationships, whose coordinate dependencies need explicit review. Unknown
-bindings are not inferred. Verify with `PYTHONPATH=build/python python -m pytest
-tests/python/test_rebind_volume.py -q` and `PYTHONPATH=build/python python
-scripts/import_afv.py --self-test`.
-
-The approved Paris 4 correction on 2026-10-22 updated 931,104 fibers and one
-collection from `2d2a9b21-9c82-5343-9443-57838a5fa5a1` to `20260411134726`.
-All current bindings were checked; every scale factor remained 1. The SHA-256
-fingerprint of all 931,104 sorted geometry-head pairs was unchanged, as were
-1,862,208 control points and 344,875,721 line points. Historical metadata was
-checked for 20 fibers and the collection. The final read-only VC3D check took
-3 ms to attach, 2,931 ms to show the first page, and 2 ms to load the selected
-fiber, with 293 UI heartbeats and just one resident editor. This was one
-offscreen Ubuntu arm64 run, not a cross-platform rendering benchmark.
-
-Validation passed: five targeted C++ tests, all 30 Python tests, the AFV
-importer self-test, and VC3D's `--test-object-store` controller regression.
-A fresh import of 1,000 real AFV fibers was also checked for byte-exact line
-geometry and the verbatim catalog volume ID.
