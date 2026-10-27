@@ -1,5 +1,7 @@
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -571,6 +573,18 @@ std::vector<uint8_t> ObjectStore::readGeometryRectangle(const Txn& txn, const st
     return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
         return reader.rectangle(arrayName, row, column, rows, columns);
     });
+}
+
+detail::SurfaceTile detail::surfaceTile(GeometryReader& reader, int64_t row, int64_t column, int64_t rows, int64_t columns)
+{
+    SurfaceTile tile;
+    tile.points = xyzValues<float>(reader.rectangle("points", row, column, rows, columns));
+    tile.valid.resize(tile.points.size());
+    const auto channel = reader.manifest().at("arrays").contains(surfaceValidChannel)
+        ? reader.rectangle(surfaceValidChannel, row, column, rows, columns) : std::vector<uint8_t>{};
+    for (size_t i = 0; i < tile.points.size(); ++i)
+        tile.valid[i] = vc::geometry::validSurfacePoint(tile.points[i]) && (channel.empty() || channel[i]);
+    return tile;
 }
 
 } // namespace vc::objects

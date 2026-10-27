@@ -1,14 +1,9 @@
 #include "spatial/SurfaceIndex.hpp"
 #include "spatial/TriangleDistance.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <limits>
 #include <map>
 namespace vc::object_links {
-namespace {
-bool valid(const cv::Vec3f& p)
-{
-    return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-}
-}
 void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
 {
     surfaces_ = surfaces;
@@ -23,7 +18,7 @@ void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
                 for (int r = row; r < std::min(row + 9, points.rows); ++r) {
                     for (int c = col; c < std::min(col + 9, points.cols); ++c) {
                         const auto point = points(r, c);
-                        if (!valid(point)) continue;
+                        if (!vc::geometry::validSurfacePoint(point)) continue;
                         for (int axis = 0; axis < 3; ++axis) {
                             box[axis] = std::min(box[axis], double(point[axis]));
                             box[axis + 3] = std::max(box[axis + 3], double(point[axis]));
@@ -78,7 +73,7 @@ std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery
                                (a[axis] > high[axis] && b[axis] > high[axis] &&
                                 d[axis] > high[axis] && e[axis] > high[axis]);
                 }
-                if (outside || !valid(a) || !valid(b) || !valid(d) || !valid(e)) continue;
+                if (outside || !vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b) || !vc::geometry::validSurfacePoint(d) || !vc::geometry::validSurfacePoint(e)) continue;
                 for (int t = 0; t < 2; ++t) {
                     const auto hit = t ? objects::detail::closestPointOnTriangle(query.worldPoint, b, e, d)
                                        : objects::detail::closestPointOnTriangle(query.worldPoint, a, b, d);

@@ -256,7 +256,6 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         const auto& arrays = reader.manifest().at("arrays");
         const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
         if (arrays.at("points").at("dtype") != kind.dtype) throw std::runtime_error("surface coordinates must be <f4");
-        const bool hasValid = arrays.contains(surfaceValidChannel);
         const auto columns = shape.at(1);
         EdgeCrossings crossings;
         // Segments between crossing slots.
@@ -267,18 +266,16 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         for (const auto& [row0, col0, rows, cols] : tilesOf(id)) {
             requestWork(&RegionStats::candidateVisits);
             if (rows < 2 || cols < 2) continue;
-            const auto bytes = reader.rectangle("points", row0, col0, rows, cols);
-            const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row0, col0, rows, cols) : std::vector<uint8_t>{};
-            world.resize(size_t(rows * cols));
+            const auto tile = surfaceTile(reader, row0, col0, rows, cols);
+            world.resize(tile.points.size());
             distance.resize(world.size());
-            usable.resize(world.size());
+            usable = tile.valid;
             // Only usable vertices take part in a cell; a region whose usable
             // vertices all lie on one side of the plane has no crossing cell.
             bool below = false, above = false;
             for (size_t i = 0; i < world.size(); ++i) {
-                std::array<float, 3> q; copyScalars<float>(std::span(bytes).subspan(i * 12, 12), q);
-                usable[i] = vc::geometry::validSurfacePoint(q) && (!hasValid || valid[i]);
                 if (!usable[i]) continue;
+                const auto& q = tile.points[i];
                 world[i] = {q[0], q[1], q[2]};
                 if(options.toTarget)world[i]=options.toTarget->apply(world[i]);
                 distance[i] = normalDistance(view, world[i]) - planeOffset;

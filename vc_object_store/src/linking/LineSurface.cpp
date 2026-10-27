@@ -1,4 +1,5 @@
 #include "linking/StoredGeometry.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 // Shared strip construction and surface-contact tests for stored fibers and tracks.
 #include "linking/LineSurface.hpp"
 
@@ -441,7 +442,7 @@ struct Mesh {
             }
         for (int r = 0; r < points.rows; ++r)
             for (int c = 0; c < points.cols; ++c) {
-                if (!valid(points(r, c))) continue;
+                if (!vc::geometry::validSurfacePoint(points(r, c))) continue;
                 const cv::Vec3d p(points(r, c));
                 vertices.push_back(p);
                 normals.push_back(unit(gridNormals[size_t(r) * points.cols + c]));
@@ -457,14 +458,10 @@ struct Mesh {
         index.rebuild({quad});
     }
 
-    static bool valid(const cv::Vec3f& p)
-    {
-        return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-    }
     bool validQuad(int r, int c) const
     {
         const auto& p = *quad->rawPointsPtr();
-        return valid(p(r, c)) && valid(p(r, c + 1)) && valid(p(r + 1, c)) && valid(p(r + 1, c + 1));
+        return vc::geometry::validSurfacePoint(p(r, c)) && vc::geometry::validSurfacePoint(p(r, c + 1)) && vc::geometry::validSurfacePoint(p(r + 1, c)) && vc::geometry::validSurfacePoint(p(r + 1, c + 1));
     }
     bool inBox(const cv::Vec3d& p, double margin) const
     {
@@ -735,10 +732,10 @@ DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inp
 
                     auto points = quad->rawPointsPtr()->clone();
                     for (auto& p : points) {
-                        if (!Mesh::valid(p)) continue; // preserve holes, including the -1 sentinel
+                        if (!vc::geometry::validSurfacePoint(p)) continue; // preserve holes, including the -1 sentinel
                         const cv::Vec3d scaled = cv::Vec3d(p) * params.surfaceScale;
                         p = cv::Vec3f(scaled);
-                        if (!Mesh::valid(p)) throw std::runtime_error("scaled surface coordinate is invalid");
+                        if (!vc::geometry::validSurfacePoint(p)) throw std::runtime_error("scaled surface coordinate is invalid");
                     }
                     // Preserve grid coordinates/UV scale. Only world XYZ changes;
                     // use a detached surface so mapped source TIFFs stay untouched.

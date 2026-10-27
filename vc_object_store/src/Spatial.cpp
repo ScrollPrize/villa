@@ -269,20 +269,15 @@ void refreshSurfaceArea(sqlite3* db, int64_t objectId, const std::string& revisi
     const auto& arrays = manifest.at("arrays");
     const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
     const int64_t rows = shape.at(0), columns = shape.at(1);
-    const bool hasValid = arrays.contains(surfaceValidChannel);
     // Bands of about a million vertices, overlapping by a row.
     const int64_t band = std::max<int64_t>(2, (int64_t(1) << 20) / std::max<int64_t>(columns, 1));
     double total = 0;
     for (int64_t row = 0; row + 1 < rows; row += band - 1) {
         const int64_t count = std::min(band, rows - row);
-        const auto points = xyzValues<float>(reader.rectangle("points", row, 0, count, columns));
-        const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row, 0, count, columns) : std::vector<uint8_t>{};
+        const auto tile = surfaceTile(reader, row, 0, count, columns);
         total = vc::geometry::surfaceGridArea(count, columns,
-            [&](int64_t r, int64_t c) -> const std::array<float, 3>& { return points[size_t(r * columns + c)]; },
-            [&](int64_t r, int64_t c) {
-                const auto i = size_t(r * columns + c);
-                return vc::geometry::validSurfacePoint(points[i]) && (!hasValid || valid[i]);
-            }, total);
+            [&](int64_t r, int64_t c) -> const std::array<float, 3>& { return tile.points[size_t(r * columns + c)]; },
+            [&](int64_t r, int64_t c) { return tile.valid[size_t(r * columns + c)] != 0; }, total);
     }
     execute(db, "INSERT INTO surfaces(object_id,grid_width,grid_height,area) VALUES(?,?,?,?) ON CONFLICT(object_id) "
                 "DO UPDATE SET grid_width=excluded.grid_width,grid_height=excluded.grid_height,area=excluded.area",
@@ -320,23 +315,18 @@ bool editsSurfaceArea(const std::vector<GeometryArrayEdit>& edits)
 // The area of `cells` (row-major) in a surface revision, read row by row.
 double cellsArea(GeometryReader& reader, const std::vector<std::pair<int64_t, int64_t>>& cells)
 {
-    const bool hasValid = reader.manifest().at("arrays").contains(surfaceValidChannel);
     double total = 0;
     for (size_t first = 0; first < cells.size();) {
         const auto row = cells[first].first;
         size_t last = first;
         while (last + 1 < cells.size() && cells[last + 1].first == row) ++last;
         const auto c0 = cells[first].second, columns = cells[last].second - c0 + 2;
-        const auto points = xyzValues<float>(reader.rectangle("points", row, c0, 2, columns));
-        const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row, c0, 2, columns) : std::vector<uint8_t>{};
+        const auto tile = surfaceTile(reader, row, c0, 2, columns);
         for (size_t i = first; i <= last; ++i) {
             const auto c = cells[i].second - c0;
             total = vc::geometry::surfaceGridArea(2, 2,
-                [&](int64_t r, int64_t k) -> const std::array<float, 3>& { return points[size_t(r * columns + c + k)]; },
-                [&](int64_t r, int64_t k) {
-                    const auto at = size_t(r * columns + c + k);
-                    return vc::geometry::validSurfacePoint(points[at]) && (!hasValid || valid[at]);
-                }, total);
+                [&](int64_t r, int64_t k) -> const std::array<float, 3>& { return tile.points[size_t(r * columns + c + k)]; },
+                [&](int64_t r, int64_t k) { return tile.valid[size_t(r * columns + c + k)] != 0; }, total);
         }
         first = last + 1;
     }

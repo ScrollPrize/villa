@@ -2,6 +2,8 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <iostream>
 using namespace vc::objects;
 int main() try
@@ -127,6 +129,15 @@ int main() try
         plane.localBounds = {-1000, -1000, -0.5, 1000, 1000, 0.5};
         region = store.geometryRegion(masked, plane, surfaces);
         require(region.runs.size() == 2 && region.intersectingObjects == 1, "invalid vertices break the cut");
+    }
+    {
+        // The store's vertex validity rule, shared by readers, spatial indexes and linkers.
+        using vc::geometry::SurfacePoint;
+        using vc::geometry::validSurfacePoint;
+        require(validSurfacePoint(SurfacePoint{1, 2, 3}) && validSurfacePoint(SurfacePoint{-2, 0, 0.5f}), "vertices with coordinates");
+        for (const auto& missing : {SurfacePoint{-1, -1, -1}, SurfacePoint{5, -1, 7}, SurfacePoint{1, 2, 0}, SurfacePoint{1, 2, -3},
+                                    SurfacePoint{std::nanf(""), 1, 2}, SurfacePoint{1, std::numeric_limits<float>::infinity(), 2}})
+            require(!validSurfacePoint(missing), "a -1 or non-finite component, or z <= 0, is missing");
     }
     {
         // Nearest surfaces: pick, restrict by UUID, a volume target, and holes.

@@ -1,4 +1,5 @@
 #include "linking/StoredGeometry.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 
 #include <algorithm>
@@ -99,7 +100,7 @@ std::uint64_t splitmix64(std::uint64_t value)
 std::optional<std::pair<cv::Vec3f, cv::Vec3f>> tangentsAt(
     const cv::Mat_<cv::Vec3f>& points, int row, int col, const cv::Vec2f& scale)
 {
-    auto valid = [&](int r, int c) { return points(r, c)[0] != -1.0f; };
+    auto valid = [&](int r, int c) { return vc::geometry::validSurfacePoint(points(r, c)); };
     auto derivU = [&]() -> std::optional<cv::Vec3f> {
         if (col > 0 && col + 1 < points.cols && valid(row, col - 1) && valid(row, col + 1))
             return (points(row, col + 1) - points(row, col - 1)) * (scale[0] * 0.5f);

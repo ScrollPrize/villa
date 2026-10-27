@@ -1,4 +1,5 @@
 #include "linking/StoredGeometry.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "spatial/SurfaceGrid.hpp"
 #include "spatial/SurfaceIndex.hpp"
@@ -37,11 +38,6 @@ struct Surface {
     std::shared_ptr<SurfaceGrid> grid;
     double area = 0;
 };
-
-bool validPoint(const cv::Vec3f& p)
-{
-    return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-}
 
 std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
     const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
@@ -108,10 +104,10 @@ std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs,
         for (int row = 0; row < source.rows; ++row) {
             checkCancelled(cancel);
             for (int col = 0; col < source.cols; ++col) {
-                if (row + 1 < source.rows && col + 1 < source.cols && validPoint(source(row, col)) &&
-                    validPoint(source(row + 1, col)) && validPoint(source(row, col + 1)) && validPoint(source(row + 1, col + 1)))
+                if (row + 1 < source.rows && col + 1 < source.cols && vc::geometry::validSurfacePoint(source(row, col)) &&
+                    vc::geometry::validSurfacePoint(source(row + 1, col)) && vc::geometry::validSurfacePoint(source(row, col + 1)) && vc::geometry::validSurfacePoint(source(row + 1, col + 1)))
                     surface.area += 1;
-                if (validPoint(source(row, col))) {
+                if (vc::geometry::validSurfacePoint(source(row, col))) {
                     working(row, col) *= params.surfaceScale;
                     for (int axis = 0; axis < 3; ++axis)
                         if (!std::isfinite(working(row, col)[axis])) throw std::runtime_error("scaled surface coordinate overflow");
