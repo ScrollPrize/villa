@@ -56,7 +56,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
     // Resolve the sample first so we can distinguish "unknown sample" (-32007)
     // from "manifest unavailable" / "open failed" (-32005).
-    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const auto manifest = vc3d::opendata::cachedCatalog();
     if (!manifest) {
         QJsonObject data;
         data["detail"] = "Open Data manifest is unavailable";
@@ -186,7 +186,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
             "An Open Data sample open is already in progress", data};
     }
 
-    // Progress: forward the download/transform stream as job.progress "output"
+    // Progress: forward the open's stages as job.progress "output"
     // notifications, rate-limited to <=10/s.
     auto onProgress =
         [this](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
@@ -197,24 +197,9 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
             if (now - _lastConsoleBroadcastMs < 100)
                 return;
             _lastConsoleBroadcastMs = now;
-            const int done = progress.completedSegments + progress.failedSegments;
-            QString label;
-            const QString status = QString::fromStdString(progress.status);
-            if (status == QLatin1String("resolving-volumes")) {
-                label = QStringLiteral("Opening remote volumes in parallel...");
-            } else if (status == QLatin1String("project-ready")) {
-                label = QStringLiteral("Open-data project is ready.");
-            } else if (status.startsWith(QLatin1String("placeholder"))) {
-                label = QStringLiteral("Preparing segment metadata: %1/%2 representations.")
-                            .arg(progress.completedSegments).arg(progress.totalSegments);
-            } else if (status.startsWith(QLatin1String("transform-"))) {
-                label = QStringLiteral("Transforming segments: %1/%2 transforms.")
-                            .arg(done).arg(progress.totalSegments);
-            } else {
-                label = QStringLiteral("Downloading segments: %1/%2 segments, %3/%4 files.")
-                            .arg(done).arg(progress.totalSegments)
-                            .arg(progress.completedFiles).arg(progress.totalFiles);
-            }
+            const QString label = progress.status == "project-ready"
+                ? QStringLiteral("Open-data project is ready.")
+                : QStringLiteral("Opening remote volumes in parallel...");
             broadcastJobProgress(it.value(), QStringLiteral("output"), label);
         };
 
@@ -263,8 +248,7 @@ QJsonObject AgentBridgeServer::withOpenDataManifest(
     }
 
     if (!refresh) {
-        if (const vcr::catalog::OpenDataManifest* cached =
-                _window->cachedOpenDataManifest()) {
+        if (const auto cached = vc3d::opendata::cachedCatalog()) {
             return build(*cached);  // AgentBridgeError from build propagates to dispatch.
         }
     }
@@ -299,10 +283,6 @@ void AgentBridgeServer::startManifestFetch(
                     completeDeferredError(token, -32005, "Manifest fetch failed", data);
                     return;
                 }
-                // Cache for subsequent list/describe/open calls (the bridge is a
-                // CWindow friend). cachedOpenDataManifest() checks this first.
-                _window->_openDataManifestCache = *fr.manifest;
-                _window->_openDataManifestLoadAttempted = true;
                 try {
                     completeDeferredResult(token, build(*fr.manifest));
                 } catch (const AgentBridgeError& e) {

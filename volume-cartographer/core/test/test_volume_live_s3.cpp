@@ -11,6 +11,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStore.hpp>
+#include <vc_reader/catalog.hpp>
 
 #include <cstdlib>
 #include <atomic>
@@ -58,7 +59,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     }
     const nlohmann::json fiber = {
         {"coordinates", {{"volume_uuid", "20260102150214"}, {"scale_factor", 1}}}};
-    // Reproduce the URL-derived identity mismatch before applying catalog tags.
+    // Reproduce the URL-derived identity mismatch before the catalog names the volume.
     CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, untagged->id()).has_value());
 
     struct TemporaryProject {
@@ -70,15 +71,15 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
     deferred.failOnRemoteError = true;
+    deferred.catalog = std::make_shared<const vcr::catalog::OpenDataManifest>(vcr::catalog::parseOpenDataManifest(R"({
+      "samples": {"PHerc0139": {"volumes": {"20260102150214": {"id": "20260102150214",
+        "suffix": "20260102150214-2.399um-0.2m-78keV-masked.zarr", "properties": {"pixel_size_um": 2.399},
+        "data": [{"type": "zarr", "origins": [{"path": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+          "access_roots": [{"type": "https", "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+                            "usage": "public-read"}]}]}]}}}}})"));
     auto project = VolumePkg::newDetached(deferred);
-    REQUIRE(project->addVolumeEntry(url, {
-        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
-        "vc-open-data-preferred-source", "vc-open-data-source-coordinate-level:0",
-        "vc-open-data-voxel-size-um:2.399000"}));
-    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {
-        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
-        "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2",
-        "vc-open-data-voxel-size-um:9.596000"}));
+    REQUIRE(project->addVolumeEntry(url, {"vc-remote-auth:anonymous"}));
+    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
     project->save(projectPath);
     project = VolumePkg::load(projectPath, deferred);
     project->resolveDeferredEntries();
@@ -121,9 +122,10 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     for (const auto& id : project->volumeIDs()) {
         if (id != volume->id()) {
             const auto rebased = project->volume(id);
+            CHECK(rebased->id() == "20260102150214@L2");
+            CHECK(rebased->voxelSize() == doctest::Approx(4 * 2.399));
             CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
             CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
-            CHECK(rebased->remotePersistentCachePath() == rebased->remoteCacheRoot() / rebased->id());
         }
     }
 

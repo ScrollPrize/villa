@@ -373,6 +373,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     if (!cachedProjectPath.empty() && isNonEmptyFile(cachedProjectPath)) {
         try {
             vc::project::LoadOptions opts;
+            opts.catalog = vc3d::opendata::cachedCatalog();
             opts.deferResolution = true;
             pkg = VolumePkg::load(
                 cachedProjectPath,
@@ -390,6 +391,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
     if (!pkg) {
         vc::project::LoadOptions opts;
+        opts.catalog = vc3d::opendata::cachedCatalog();
         opts.deferResolution = true;
         pkg = newProject ? VolumePkg::newDetached(opts) : VolumePkg::newEmpty(opts);
     }
@@ -420,20 +422,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                 " manifest-backed Lasagna dataset(s).");
         }
     }
-    // Segments are surfaces of the sample's store; records follow the current
-    // manifest on every open (geometry is fetched when a surface is opened).
-    if (progressCallback) {
-        OpenDataSampleDownloadProgress progress;
-        progress.totalSegments = static_cast<int>(sample.surfaceSegmentCount());
-        progress.status = "importing-surfaces";
-        progressCallback(progress);
-    }
-    importOpenDataSampleSurfaces(sample, remoteCacheRoot, result,
-                                 selection && selection->segmentIds
-                                     ? std::optional(*selection->segmentIds)
-                                     : std::nullopt);
-    // Catalog loads remain unresolved until volume tags, normal-grid paths,
-    // and every segment representation/cache entry have been reconciled.
+    // Catalog loads remain unresolved until volume tags and normal-grid paths
+    // have been reconciled.
     if (newProject) {
         // Detached preparation must not overwrite the active project's autosave.
         // Reload the saved JSON to activate ordinary persistence and exercise
@@ -441,23 +431,17 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
         pkg->save(newProject->path);
         vc::project::LoadOptions opts;
+        opts.catalog = vc3d::opendata::cachedCatalog();
         opts.deferResolution = true;
         pkg = VolumePkg::load(newProject->path, opts);
     }
     if (pkg->entryResolutionDeferred()) {
         if (progressCallback) {
-            OpenDataSampleDownloadProgress progress;
-            progress.totalSegments = static_cast<int>(sample.volumes.size());
-            progress.status = "resolving-volumes";
-            try { progressCallback(progress); } catch (...) {}
+            try { progressCallback({"resolving-volumes"}); } catch (...) {}
         }
         pkg->resolveDeferredEntries();
         if (progressCallback) {
-            OpenDataSampleDownloadProgress progress;
-            progress.totalSegments = static_cast<int>(sample.volumes.size());
-            progress.completedSegments = progress.totalSegments;
-            progress.status = "project-ready";
-            try { progressCallback(progress); } catch (...) {}
+            try { progressCallback({"project-ready"}); } catch (...) {}
         }
         const std::string sampleTag =
             std::string(kOpenDataSampleIdTagPrefix) + sample.id;
@@ -821,24 +805,5 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 
     return result;
 }
-
-void importOpenDataSampleSurfaces(
-    const vcr::catalog::OpenDataSample& sample,
-    const std::filesystem::path& remoteCacheRoot,
-    OpenDataSampleProjectResult& result,
-    const std::optional<std::vector<std::string>>& segmentIds)
-{
-    result.supportedTifxyzSegments += static_cast<int>(sample.surfaceSegmentCount());
-    try {
-        const auto imported = importSampleSurfaces(remoteCacheRoot, sample, segmentIds);
-        result.importedSurfaces += imported.representations;
-        result.addedSurfaces += imported.added;
-        result.messages.insert(result.messages.end(), imported.messages.begin(), imported.messages.end());
-    } catch (const std::exception& error) {
-        result.failedTifxyzSegments += static_cast<int>(sample.surfaceSegmentCount());
-        result.messages.push_back(std::string("Importing Open Data surfaces failed: ") + error.what());
-    }
-}
-
 
 } // namespace vc3d::opendata

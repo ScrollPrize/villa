@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,9 @@ enum class Category { Volumes, NormalGrids };
 struct LoadOptions {
     bool failOnRemoteError = false;
     bool deferResolution = false;
+    // The Open Data catalog: remote entries that show a catalog volume take
+    // their id, voxel size and name from it (vcr::catalog::OpenDataManifest::volumeAt).
+    std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
 };
 
 bool isLocationRemote(const std::string& location);
@@ -43,7 +47,10 @@ std::filesystem::path resolveLocalPath(const std::string& location,
 
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
-utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags);
+// The volume metadata (uuid, voxelsize, name) a catalog gives a location: the
+// catalog volume's level id and voxel size for its own zarr, the voxel size of
+// its grid for a dataset derived from it. Empty for other locations.
+utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest*, const std::string& location);
 
 }
 

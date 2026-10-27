@@ -2,7 +2,6 @@
 
 #include "OpenDataNormalGrids.hpp"
 #include "ProjectCreationDefaults.hpp"
-#include "OpenDataSurfaceStore.hpp"
 #include "VCSettings.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
@@ -197,70 +196,6 @@ QString normalGridsStatusDisplay(const std::filesystem::path& remoteRoot,
     return QObject::tr("Not cached");
 }
 
-QString cacheStateDisplay(SurfaceState state)
-{
-    switch (state) {
-        case SurfaceState::Missing: return QStringLiteral("Not imported");
-        case SurfaceState::Remote: return QStringLiteral("Remote");
-        case SurfaceState::Stored: return QStringLiteral("Stored");
-    }
-    return QStringLiteral("Unknown");
-}
-
-// The sample's tifxyz segments in its surface store: geometry stored, imported
-// but still remote, or not imported.
-struct SampleCacheSummary {
-    int total = 0;
-    int stored = 0;
-    int remote = 0;
-    int missing = 0;
-
-    [[nodiscard]] bool hasTifxyz() const noexcept { return total > 0; }
-    [[nodiscard]] bool hasLocal() const noexcept { return stored > 0; }
-    [[nodiscard]] bool allStored() const noexcept { return total > 0 && stored == total; }
-};
-
-SampleCacheSummary sampleCacheSummary(const std::filesystem::path& remoteCacheRoot,
-                                      const vcr::catalog::OpenDataSample& sample)
-{
-    SampleCacheSummary summary;
-    for (const auto& segment : sample.segments) {
-        if (sample.surfaces(segment).empty()) {
-            continue;
-        }
-        ++summary.total;
-        switch (surfaceStateForSegment(remoteCacheRoot, sample, segment)) {
-            case SurfaceState::Missing: ++summary.missing; break;
-            case SurfaceState::Remote: ++summary.remote; break;
-            case SurfaceState::Stored: ++summary.stored; break;
-        }
-    }
-    return summary;
-}
-
-QString localDataText(const SampleCacheSummary& summary)
-{
-    if (!summary.hasTifxyz()) {
-        return QStringLiteral("-");
-    }
-    return QStringLiteral("%1/%2").arg(summary.stored).arg(summary.total);
-}
-
-QString syncStateText(const SampleCacheSummary& summary)
-{
-    if (!summary.hasTifxyz()) {
-        return QStringLiteral("-");
-    }
-    if (summary.allStored()) {
-        return QStringLiteral("Stored");
-    }
-    QStringList parts;
-    if (summary.stored > 0) parts.push_back(QStringLiteral("%1 stored").arg(summary.stored));
-    if (summary.remote > 0) parts.push_back(QStringLiteral("%1 remote").arg(summary.remote));
-    if (summary.missing > 0) parts.push_back(QStringLiteral("%1 not imported").arg(summary.missing));
-    return parts.join(QStringLiteral(", "));
-}
-
 QTableWidgetItem* item(const QString& text)
 {
     auto* tableItem = new QTableWidgetItem(text);
@@ -374,13 +309,11 @@ QStringList representationCells(const vcr::catalog::OpenDataVolume& volume, cons
                                            : QStringLiteral("—")};
 }
 
-QStringList segmentCells(const std::filesystem::path& remoteRoot,
-                         const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataSegment& segment)
+QStringList segmentCells(const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataSegment& segment)
 {
     return {qstr(segment.id), qstr(segment.suffix), qstr(segment.originalVolumeId),
             optionalInt(segment.width), optionalInt(segment.height), yesNo(!sample.surfaces(segment).empty()),
-            yesNo(segment.hasInkDetection()), yesNo(segment.hasLayersZarr()),
-            cacheStateDisplay(surfaceStateForSegment(remoteRoot, sample, segment)), qstr(segment.createdAt)};
+            yesNo(segment.hasInkDetection()), yesNo(segment.hasLayersZarr()), qstr(segment.createdAt)};
 }
 
 void setCatalogRow(QTableWidget* table, int row, const QStringList& cells)
@@ -506,6 +439,12 @@ void OpenDataCatalogWindow::setAttachPredictionHandler(AttachPredictionHandler h
     updateActionButtons();
 }
 
+void OpenDataCatalogWindow::setRefreshSampleHandler(RefreshSampleHandler handler)
+{
+    _refreshSampleHandler = std::move(handler);
+    updateActionButtons();
+}
+
 void OpenDataCatalogWindow::createSelectedProject()
 {
     if (_manifestRefreshPending || !selectedSample() || !_createProjectHandler) return;
@@ -561,7 +500,6 @@ void OpenDataCatalogWindow::createSelectedProject()
     };
     auto* volumeTree = makeTree(tr("Volumes"), _volumesTable);
     auto* representationTree = makeTree(tr("Representations"), _representationsTable);
-    auto* segmentTree = makeTree(tr("Segments"), _segmentsTable);
     auto group = [](QTreeWidget* tree, const QString& label) {
         auto* item = new QTreeWidgetItem(tree, {label});
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate);
@@ -576,7 +514,7 @@ void OpenDataCatalogWindow::createSelectedProject()
         item->setCheckState(0, Qt::Unchecked);
         return item;
     };
-    std::vector<std::pair<QTreeWidgetItem*, std::string>> volumes, segments;
+    std::vector<std::pair<QTreeWidgetItem*, std::string>> volumes;
     std::vector<std::pair<QTreeWidgetItem*, vcr::catalog::OpenDataRepresentationRef>> representations;
     auto* sourceGroup = group(volumeTree, tr("Source volumes"));
     for (std::size_t row = 0; row < sample.volumes.size(); ++row) {
@@ -600,13 +538,7 @@ void OpenDataCatalogWindow::createSelectedProject()
         auto* item = leaf(groups[label], representationCells(volume, artifact, ref.kind));
         representations.emplace_back(item, ref);
     }
-    auto* segmentGroup = group(segmentTree, tr("Segments (tifxyz)"));
-    for (std::size_t row = 0; row < sample.segments.size(); ++row) {
-        const auto& segment = sample.segments[row];
-        if (!sample.surfaces(segment).empty())
-            segments.emplace_back(leaf(segmentGroup, segmentCells(remoteRoot, sample, segment)), segment.id);
-    }
-    const std::array trees{volumeTree, representationTree, segmentTree};
+    const std::array trees{volumeTree, representationTree};
     for (auto* tree : trees) tree->expandAll();
     auto* selectionRow = new QHBoxLayout;
     for (const auto& [label, checked] : {std::pair{tr("Select all"), true},
@@ -650,13 +582,10 @@ void OpenDataCatalogWindow::createSelectedProject()
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
     selection.representations.emplace();
-    selection.segmentIds.emplace();
     for (const auto& [item, id] : volumes)
         if (item->checkState(0) == Qt::Checked) selection.rawVolumeIds->push_back(id);
     for (const auto& [item, ref] : representations)
         if (item->checkState(0) == Qt::Checked) selection.representations->push_back(ref);
-    for (const auto& [item, id] : segments)
-        if (item->checkState(0) == Qt::Checked) selection.segmentIds->push_back(id);
     const OpenDataNewProject project{QFileInfo(path->text()).absoluteFilePath().toStdString(),
                                      name->text().trimmed().toStdString()};
     if (_createProjectHandler(sample, selection, project)) accept();
@@ -686,15 +615,13 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     _sampleTable = new QTableWidget(splitter);
-    _sampleTable->setColumnCount(7);
+    _sampleTable->setColumnCount(5);
     _sampleTable->setHorizontalHeaderLabels({
         tr("Sample ID"),
         tr("Scans"),
         tr("Volumes"),
         tr("Segments"),
-        tr("Ink"),
-        tr("Stored Surfaces"),
-        tr("Sync Status")
+        tr("Ink")
     });
     _sampleTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     _sampleTable->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -823,7 +750,7 @@ void OpenDataCatalogWindow::buildUi()
     auto* segmentsPage = new QWidget(_tabs);
     auto* segmentsLayout = new QVBoxLayout(segmentsPage);
     _segmentsTable = new QTableWidget(segmentsPage);
-    _segmentsTable->setColumnCount(10);
+    _segmentsTable->setColumnCount(9);
     _segmentsTable->setHorizontalHeaderLabels({
         tr("Segment ID"),
         tr("Suffix"),
@@ -833,7 +760,6 @@ void OpenDataCatalogWindow::buildUi()
         tr("TIFXYZ"),
         tr("Ink"),
         tr("Layers Zarr"),
-        tr("Cache"),
         tr("Created")
     });
     _segmentsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -842,11 +768,9 @@ void OpenDataCatalogWindow::buildUi()
     _segmentsTable->horizontalHeader()->setStretchLastSection(true);
     _segmentsTable->verticalHeader()->hide();
     auto* segmentActions = new QHBoxLayout;
-    _cacheSegmentButton = new QPushButton(tr("Fetch Selected"), segmentsPage);
     _copySegmentUrlButton = new QPushButton(tr("Copy Source URL"), segmentsPage);
     _openSegmentUrlButton = new QPushButton(tr("Open Source URL"), segmentsPage);
     segmentActions->addStretch(1);
-    segmentActions->addWidget(_cacheSegmentButton);
     segmentActions->addWidget(_copySegmentUrlButton);
     segmentActions->addWidget(_openSegmentUrlButton);
     segmentsLayout->addWidget(_segmentsTable, 1);
@@ -863,7 +787,9 @@ void OpenDataCatalogWindow::buildUi()
     auto* bottomRow = new QHBoxLayout;
     _statusLabel = new QLabel(this);
     _statusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    _syncSampleCacheButton = new QPushButton(tr("Fetch All Surfaces"), this);
+    _refreshSampleButton = new QPushButton(tr("Refresh from Open Data"), this);
+    _refreshSampleButton->setToolTip(tr("Re-read the published catalog into this sample's surface store: new and "
+                                        "republished surfaces. Your project's surfaces are untouched."));
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
     _createProjectButton = new QPushButton(tr("Create Project..."), this);
     _createProjectButton->setToolTip(tr("Choose resources for a new project"));
@@ -875,7 +801,7 @@ void OpenDataCatalogWindow::buildUi()
     auto* closeButton = new QPushButton(tr("Close"), this);
     bottomRow->addWidget(_statusLabel, 1);
     bottomRow->addWidget(_doNotShowOnNextOpenCheck);
-    bottomRow->addWidget(_syncSampleCacheButton);
+    bottomRow->addWidget(_refreshSampleButton);
     bottomRow->addWidget(_openSampleButton);
     bottomRow->addWidget(_createProjectButton);
     bottomRow->addWidget(closeButton);
@@ -952,8 +878,7 @@ void OpenDataCatalogWindow::buildUi()
             this, &OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
-    connect(_cacheSegmentButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::cacheSelectedSegment);
-    connect(_syncSampleCacheButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::syncSelectedSampleCache);
+    connect(_refreshSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::refreshSelectedSample);
     connect(_openSampleButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSample);
     connect(_createProjectButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::createSelectedProject);
     connect(_doNotShowOnNextOpenCheck, &QCheckBox::toggled, this, [](bool checked) {
@@ -1074,7 +999,6 @@ void OpenDataCatalogWindow::populateSamples()
     }
 
     const QString needle = _searchEdit->text().trimmed();
-    const auto remoteRoot = vc3d::remoteCachePathFs();
     for (std::size_t i = 0; i < _manifest->samples.size(); ++i) {
         const auto& sample = _manifest->samples[i];
         if (!needle.isEmpty() &&
@@ -1097,7 +1021,6 @@ void OpenDataCatalogWindow::populateSamples()
     for (int row = 0; row < static_cast<int>(_visibleSampleIndexes.size()); ++row) {
         const auto sampleIndex = _visibleSampleIndexes[static_cast<std::size_t>(row)];
         const auto& sample = _manifest->samples[sampleIndex];
-        const auto cacheSummary = sampleCacheSummary(remoteRoot, sample);
         auto* idItem = item(qstr(sample.id));
         idItem->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(sampleIndex));
         _sampleTable->setItem(row, 0, idItem);
@@ -1105,8 +1028,6 @@ void OpenDataCatalogWindow::populateSamples()
         _sampleTable->setItem(row, 2, numericItem(sample.volumeCount()));
         _sampleTable->setItem(row, 3, numericItem(sample.segmentCount()));
         _sampleTable->setItem(row, 4, numericItem(sample.inkDetectionSegmentCount()));
-        _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
     }
     _sampleTable->setSortingEnabled(true);
     _sampleTable->resizeColumnsToContents();
@@ -1138,12 +1059,10 @@ void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* 
     }
 
     const auto remoteRoot = vc3d::remoteCachePathFs();
-    const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
     const auto representations = vcr::catalog::derivedRepresentations(*sample);
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
-           "Representations: %6<br>TIFXYZ segments: %7<br>Ink detections: %8<br>Photos: %9<br>"
-           "Stored surfaces: %10<br>Sync: %11<br><br>%12")
+           "Representations: %6<br>TIFXYZ segments: %7<br>Ink detections: %8<br>Photos: %9<br><br>%10")
             .arg(qstr(sample->id).toHtmlEscaped())
             .arg(qstr(sample->type).toHtmlEscaped())
             .arg(sample->scanCount())
@@ -1153,8 +1072,6 @@ void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* 
             .arg(sample->surfaceSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
             .arg(sample->artifacts.size())
-            .arg(localDataText(cacheSummary).toHtmlEscaped())
-            .arg(syncStateText(cacheSummary).toHtmlEscaped())
             .arg(qstr(sample->description).toHtmlEscaped()));
     loadOverviewPhoto(*sample);
 
@@ -1200,7 +1117,7 @@ void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* 
     _segmentsTable->setRowCount(static_cast<int>(sample->segments.size()));
     for (int row = 0; row < static_cast<int>(sample->segments.size()); ++row) {
         const auto& segment = sample->segments[static_cast<std::size_t>(row)];
-        setCatalogRow(_segmentsTable, row, segmentCells(remoteRoot, *sample, segment));
+        setCatalogRow(_segmentsTable, row, segmentCells(*sample, segment));
         _segmentsTable->item(row, 0)->setData(Qt::UserRole, row);
     }
     _segmentsTable->resizeColumnsToContents();
@@ -1235,28 +1152,6 @@ void OpenDataCatalogWindow::clearDetails()
         _segmentsTable->setRowCount(0);
     }
     updateActionButtons();
-}
-
-void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
-{
-    const auto* sample = selectedSample();
-    if (!sample || !_sampleTable) {
-        updateActionButtons();
-        return;
-    }
-
-    const int row = _sampleTable->currentRow();
-    if (row >= 0) {
-        const auto remoteRoot = vc3d::remoteCachePathFs();
-        const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
-        QSignalBlocker blocker(_sampleTable);
-        const bool sorting = _sampleTable->isSortingEnabled();
-        _sampleTable->setSortingEnabled(false);
-        _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
-        _sampleTable->setSortingEnabled(sorting);
-    }
-    populateDetails(sample);
 }
 
 void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample& sample)
@@ -1485,27 +1380,18 @@ void OpenDataCatalogWindow::updateActionButtons()
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    const bool canCacheSegment = manifestReady && segment && !sample->surfaces(*segment).empty();
     const auto remoteRoot = vc3d::remoteCachePathFs();
-    const auto sampleSummary = sample
-        ? sampleCacheSummary(remoteRoot, *sample)
-        : SampleCacheSummary{};
     const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
                                manifestReady;
-    const bool canSyncSample = manifestReady && sample != nullptr &&
-                               sampleSummary.hasTifxyz();
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
     if (_createProjectButton)
         _createProjectButton->setEnabled(manifestReady && sample && bool(_createProjectHandler));
-    if (_syncSampleCacheButton) {
-        _syncSampleCacheButton->setEnabled(canSyncSample);
-        _syncSampleCacheButton->setText(sampleSummary.allStored()
-            ? tr("Re-sync Surfaces")
-            : tr("Fetch All Surfaces"));
-    }
+    if (_refreshSampleButton)
+        _refreshSampleButton->setEnabled(manifestReady && sample && sample->surfaceSegmentCount() > 0 &&
+                                         bool(_refreshSampleHandler));
     if (_downloadNormalGridsButton) {
         const auto* volume = selectedVolume();
         bool canDownload = false;
@@ -1537,14 +1423,6 @@ void OpenDataCatalogWindow::updateActionButtons()
     if (_openRepresentationUrlButton) {
         _openRepresentationUrlButton->setEnabled(
             manifestReady && hasRepresentationUrl);
-    }
-    if (_cacheSegmentButton) {
-        _cacheSegmentButton->setEnabled(canCacheSegment);
-        _cacheSegmentButton->setText(
-            sample && segment && !sample->surfaces(*segment).empty() &&
-                    surfaceStateForSegment(remoteRoot, *sample, *segment) == SurfaceState::Stored
-                ? tr("Re-import Selected")
-                : tr("Fetch Selected"));
     }
     if (_copySegmentUrlButton) {
         _copySegmentUrlButton->setEnabled(hasSegmentUrl);
@@ -1732,77 +1610,12 @@ void OpenDataCatalogWindow::openSelectedSegmentUrl()
     }
 }
 
-// Fetching a segment imports its representations into the sample's surface
-// store and gives the canonical one its geometry; the others are fetched or
-// generated when they are opened.
-void OpenDataCatalogWindow::cacheSelectedSegment()
+void OpenDataCatalogWindow::refreshSelectedSample()
 {
     const auto* sample = selectedSample();
-    const auto* segment = selectedSegment();
-    if (!sample || !segment || sample->surfaces(*segment).empty()) {
-        return;
-    }
-    const auto remoteRoot = vc3d::remoteCachePathFs();
-    setStatus(tr("Fetching segment %1...").arg(qstr(segment->id)));
-    QString message;
-    try {
-        const auto imported = importSampleSurfaces(remoteRoot, *sample, std::vector<std::string>{segment->id});
-        const auto representations = sample->surfaces(*segment);
-        if (representations.empty()) {
-            message = tr("Segment %1 has no representation in this sample's volumes.").arg(qstr(segment->id));
-        } else {
-            materializeSurface(surfaceStorePath(remoteRoot, sample->id),
-                               surfaceUuidForRepresentation(representations.front().id));
-            message = tr("Stored segment %1 (%2 representation(s) imported).")
-                          .arg(qstr(segment->id))
-                          .arg(imported.representations);
-        }
-    } catch (const std::exception& error) {
-        message = tr("Fetching segment %1 failed: %2").arg(qstr(segment->id), QString::fromUtf8(error.what()));
-    }
-    QCoreApplication::processEvents();
-    refreshSelectedSampleCacheStatus();
-    setStatus(message);
-}
-
-void OpenDataCatalogWindow::syncSelectedSampleCache()
-{
-    const auto* sample = selectedSample();
-    if (!sample || sample->surfaceSegmentCount() == 0) {
-        return;
-    }
-    const auto remoteRoot = vc3d::remoteCachePathFs();
-    setStatus(tr("Fetching the surfaces of %1...").arg(qstr(sample->id)));
-    int stored = 0;
-    int failed = 0;
-    QString firstError;
-    try {
-        (void)importSampleSurfaces(remoteRoot, *sample);
-        const auto store = surfaceStorePath(remoteRoot, sample->id);
-        for (const auto& segment : sample->segments) {
-            const auto representations = sample->surfaces(segment);
-            if (representations.empty()) {
-                continue;
-            }
-            setStatus(tr("Fetching %1 (%2 stored)...").arg(qstr(segment.id)).arg(stored));
-            QCoreApplication::processEvents();
-            try {
-                materializeSurface(store, surfaceUuidForRepresentation(representations.front().id));
-                ++stored;
-            } catch (const std::exception& error) {
-                ++failed;
-                if (firstError.isEmpty()) firstError = QString::fromUtf8(error.what());
-            }
-        }
-    } catch (const std::exception& error) {
-        firstError = QString::fromUtf8(error.what());
-    }
-    refreshSelectedSampleCacheStatus();
-    QString message = tr("Stored %1 segment surface(s).").arg(stored);
-    if (!firstError.isEmpty()) {
-        message += tr(" %1 failed: %2").arg(failed).arg(firstError);
-    }
-    setStatus(message);
+    if (!sample || !_refreshSampleHandler) return;
+    setStatus(tr("Refreshing %1 from Open Data...").arg(qstr(sample->id)));
+    setStatus(_refreshSampleHandler(*sample));
 }
 
 std::filesystem::path OpenDataCatalogWindow::cacheRoot() const

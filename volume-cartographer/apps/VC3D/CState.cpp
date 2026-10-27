@@ -14,6 +14,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -24,10 +25,10 @@ namespace {
 
 std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
-    const auto path=vc3d::opendata::cachedOpenDataManifestPath();
-    if(!std::filesystem::exists(path))return {};
+    const auto catalog=vc3d::opendata::cachedCatalog();
+    if(!catalog)return {};
     auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
-    graph->addCatalog(vcr::catalog::loadOpenDataManifestFile(path));
+    graph->addCatalog(*catalog);
     return graph;
 }
 
@@ -238,21 +239,20 @@ CState::~CState()
         try { _objectStoreSession->detach(*_objectStoreAttachment); } catch (...) {}
     }
     if (!_objectStoreOwner) {
-        for (const auto& [path, attachment] : _catalogAttachments) {
+        for (const auto& [sample, attachment] : _catalogAttachments) {
             try { _objectStoreSession->detach(attachment); } catch (...) {}
         }
     }
 }
 
-vc::objects::AttachmentIdentity CState::catalogAttachment(const std::filesystem::path& path)
+vc::objects::AttachmentIdentity CState::catalogAttachment(const vcr::catalog::OpenDataSample& sample)
 {
-    if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(path);
-    const auto found = _catalogAttachments.find(path);
+    if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(sample);
+    const auto found = _catalogAttachments.find(sample.id);
     if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
-    auto options = viewerOpenOptions();
-    options.readOnly = true;
-    const auto attachment = _objectStoreSession->attach(path, options);
-    _catalogAttachments[path] = attachment;
+    const auto attachment = vc::objects::attachCatalog(*_objectStoreSession, sample, vc3d::remoteCachePathFs(),
+                                                       viewerOpenOptions());
+    _catalogAttachments[sample.id] = attachment;
     pollObjectStoreChanges();
     return attachment;
 }

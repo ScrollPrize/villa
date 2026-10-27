@@ -85,7 +85,7 @@ struct CatalogFixture {
         options.shapeZYX = {4, 4, 4};
         options.chunkShapeZYX = {4, 4, 4};
         options.compressor = "none";
-        options.uuid = "loaded-volume";
+        options.uuid = "catalog-volume";
         volume = Volume::New(root / "ct.zarr", options);
         const auto storePath = root / "sample.vcobj";
         vo::OpenOptions storeOptions;
@@ -100,20 +100,22 @@ struct CatalogFixture {
             record.name = "segment";
             record.meta = nlohmann::json{
                 {"coordinates", {{"volume_uuid", "catalog-volume"}, {"scale_factor", 1}}},
-                {"open_data", {{"ink_detections", {{
+                {"catalog", {{"sample", "sample"}, {"segment", "segment"}, {"files", {{
+                    {"name", inkName},
                     {"label", "model-a"},
-                    {"download_url", "https://example.test/" + inkName},
-                    {"artifact_type", "ink_detection"},
-                    {"local_file", "ink-detections/" + inkName},
+                    {"url", "https://example.test/" + inkName},
                 }}}}}}.dump();
             db.upsertObject(txn, record);
             txn.commit();
         }
-        const auto attachment = state.catalogAttachment(storePath);
-        inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / "ink-detections" / inkName;
+        const auto attachment = state.objectStoreSession()->attachFetched(storePath, storeOptions,
+            [](vo::ObjectStore&, const std::string&, const vo::ObjectStoreSession::FetchWrite&) {
+                throw std::runtime_error("offline");
+            });
+        inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
         catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
         catalog->setSource(std::nullopt, volume);
-        catalog->setCatalogSources({{attachment, "catalog-volume", 1}});
+        catalog->setCatalogSources({attachment});
         QElapsedTimer timer;
         timer.start();
         while ((catalog->loading() || catalog->rows().empty()) && timer.elapsed() < 10000) {
@@ -213,7 +215,7 @@ TEST_CASE("ink detection options follow the active catalog surface")
     overlay.setSurfaceCatalog(fixture.catalog.get());
     REQUIRE(overlay.options().size() == 1);
     CHECK(overlay.options().front().localPath == fixture.inkFile);
-    CHECK(overlay.options().front().url == "https://example.test/prediction.jpg");
+    CHECK(overlay.options().front().name == "prediction.jpg");
 
     // A preview of the same surface keeps them; another surface has none.
     fixture.state.setSurface("segmentation", makeSurface(fixture.surfaceUuid), false, false);

@@ -8,7 +8,6 @@
 #include "OpenDataSampleProject.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "VolumeDisplayNames.hpp"
-#include "OpenDataSurfaceStore.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/MemMap.hpp"
@@ -1047,20 +1046,16 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
     }));
 }
 
-TEST_CASE("Selective catalog projects isolate cached projects and individual segments")
+TEST_CASE("Selective catalog projects isolate cached projects")
 {
     auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
-    auto sample = *manifest.findSample("PHerc0139");
+    const auto sample = *manifest.findSample("PHerc0139");
     const auto root = std::filesystem::current_path() /
         ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
     const auto oldAutosave = VolumePkg::autosaveRoot();
     VolumePkg::setAutosaveRoot(root / "autosave");
-    // Prepare the full catalog cache first, including an unrelated segment.
-    auto extra = sample.segments.front();
-    extra.id = "unselected-segment";
-    extra.longId = "unselected-segment";
-    sample.segments.push_back(extra);
+    // Prepare the full catalog cache first.
     vc::project::LoadOptions options;
     options.deferResolution = true;
     auto full = VolumePkg::newEmpty(options);
@@ -1075,23 +1070,14 @@ TEST_CASE("Selective catalog projects isolate cached projects and individual seg
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
     selection.representations.emplace();
-    selection.segmentIds.emplace();
     OpenDataNewProject destination{root / "empty.volpkg.json", "Empty chosen project"};
     auto empty = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
     CHECK(empty->volumeEntries().empty());
-    CHECK_FALSE(std::filesystem::exists(surfaceStorePath(root, sample.id)));
     CHECK(empty->selectedLasagnaDataset().empty());
     CHECK(empty->name() == destination.name);
     CHECK(empty->path() == destination.path);
     CHECK_FALSE(std::filesystem::exists(root / "fibers"));
 
-    selection.segmentIds->push_back(sample.segments.front().id);
-    destination = {root / "selected.volpkg.json", "Only selected"};
-    auto selected = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
-    CHECK(selected->volumeEntries().empty());
-    // Only the selected segment is recorded in the sample's surface store.
-    CHECK(surfaceStateForSegment(root, sample, sample.segments.front()) == SurfaceState::Remote);
-    CHECK(surfaceStateForSegment(root, sample, extra) == SurfaceState::Missing);
     auto reloaded = VolumePkg::load(destination.path, options);
     CHECK(reloaded->name() == destination.name);
     auto cached = VolumePkg::load(cachedPath, options);
@@ -1174,119 +1160,4 @@ TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
                       }));
 
     std::filesystem::remove_all(cacheRoot);
-}
-
-namespace {
-
-// A sample with a source volume, a published target and a third volume reached
-// by the sample's volume matrix; one segment authored on the source at 2x
-// downscale with one ink detection.
-vcr::catalog::OpenDataSample representationSample()
-{
-    vcr::catalog::OpenDataSample sample;
-    sample.id = "sample";
-    for (const char* id : {"source", "target", "third"}) {
-        vcr::catalog::OpenDataVolume volume;
-        volume.id = id;
-        sample.volumes.push_back(volume);
-    }
-    sample.properties["volume_transforms"] = nlohmann::json::array({{
-        {"from_volume_id", "source"},
-        {"transforms", nlohmann::json::array({{
-            {"to_volume_id", "third"},
-            {"matrix", {{1, 0, 0, 10}, {0, 1, 0, 20}, {0, 0, 1, 30}}},
-        }})},
-    }});
-    sample.volumeTransforms = vcr::catalog::parseOpenDataManifest(
-        nlohmann::json{{"samples", {{"sample", {{"properties", sample.properties}}}}}}.dump())
-        .samples.front().volumeTransforms;
-    vcr::catalog::OpenDataSegment segment;
-    segment.id = "segment";
-    segment.longId = "sample-segment";
-    segment.suffix = "w001";
-    segment.originalVolumeId = "source";
-    segment.originalVolumeDownscale = 2;
-    vcr::catalog::OpenDataArtifact authored;
-    authored.type = "tifxyz-flattened";
-    authored.resolvedUrl = "https://example.test/authored";
-    segment.artifacts.push_back(authored);
-    vcr::catalog::OpenDataArtifact published;
-    published.type = "tifxyz-transformed";
-    published.resolvedUrl = "https://example.test/published";
-    published.targetVolumeId = "target";
-    segment.artifacts.push_back(published);
-    vcr::catalog::OpenDataArtifact ink;
-    ink.type = "ink_detection";
-    ink.resolvedUrl = "https://example.test/ink.png";
-    segment.artifacts.push_back(ink);
-    sample.segments.push_back(segment);
-    return sample;
-}
-
-std::filesystem::path freshRoot(const std::string& tag)
-{
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_store_" + tag + "_" + std::to_string(vc::memmap::pid()));
-    std::filesystem::remove_all(root);
-    return root;
-}
-
-} // namespace
-
-TEST_CASE("Open Data import records representations as catalog surfaces bound to their volumes")
-{
-    namespace vo = vc::objects;
-    const auto sample = representationSample();
-    const auto root = freshRoot("import");
-    const auto imported = importSampleSurfaces(root, sample);
-    CHECK(imported.representations == 2);
-    CHECK(imported.added == 2);
-    const auto store = surfaceStorePath(root, "sample");
-    REQUIRE(std::filesystem::exists(store));
-
-    const auto representations = sample.surfaces(sample.segments.front());
-    const auto native = surfaceUuidForRepresentation(representations[0].id);
-    const auto published = surfaceUuidForRepresentation(representations[1].id);
-    CHECK(native == surfaceUuidForRepresentation(representations[0].id));
-    {
-        vo::OpenOptions options;
-        options.readOnly = true;
-        auto db = vo::ObjectStore::open(store, options);
-        auto read = db.read();
-        const auto nativeRecord = db.objectByUuid(read, native);
-        REQUIRE(nativeRecord);
-        CHECK(nativeRecord->name == "w001");
-        CHECK(nativeRecord->storageKind == "url");
-        CHECK(nativeRecord->storageRef == "https://example.test/authored");
-        const auto nativeMeta = nlohmann::json::parse(nativeRecord->meta);
-        // Authored coordinates are half the source volume's voxels.
-        CHECK(vo::geometryScaleToVolume(nativeMeta, "source") == doctest::Approx(2.0));
-        CHECK(nativeMeta.at("vc_open_data_coordinate_space") == "sample/source@L0");
-        const auto ink = inkDetections(nativeMeta, "/artifacts");
-        REQUIRE(ink.size() == 1);
-        CHECK(ink.front().url == "https://example.test/ink.png");
-        CHECK(ink.front().file.parent_path() == "/artifacts/ink-detections");
-
-        const auto publishedMeta = nlohmann::json::parse(db.objectByUuid(read, published)->meta);
-        CHECK(vo::geometryScaleToVolume(publishedMeta, "target") == doctest::Approx(1.0));
-        CHECK_FALSE(db.currentGeometry(read, native));
-    }
-    CHECK(surfaceStateForSegment(root, sample, sample.segments.front()) == SurfaceState::Remote);
-
-    // Re-importing an unchanged manifest writes nothing.
-    const auto again = importSampleSurfaces(root, sample);
-    CHECK(again.added == 0);
-    CHECK(again.updated == 0);
-    std::filesystem::remove_all(root);
-}
-
-TEST_CASE("Open Data volume tags name the catalog volume and level")
-{
-    const auto volume = catalogVolumeFromTags({"vc-open-data-sample-id:PHerc0139", "vc-open-data-volume-id:vol1",
-                                               "vc-open-data-coordinate-space:PHerc0139/vol1@L2"});
-    REQUIRE(volume);
-    CHECK(volume->sampleId == "PHerc0139");
-    CHECK(volume->volumeId == "vol1");
-    CHECK(volume->level == 2);
-    CHECK_FALSE(catalogVolumeFromTags({"vc-open-data-volume-id:vol1"}));
 }

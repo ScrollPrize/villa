@@ -87,7 +87,6 @@ void AgentBridgeServer::completeCatalogOpenJob(
 
         QJsonObject attached;
         attached["volumes"] = outcome.result.attachedVolumeEntries;
-        attached["surfaces"] = outcome.result.importedSurfaces;
         attached["normalGrids"] = outcome.result.attachedNormalGrids;
         attached["lasagnaDatasets"] = outcome.result.attachedLasagnaDatasets;
         body["attached"] = attached;

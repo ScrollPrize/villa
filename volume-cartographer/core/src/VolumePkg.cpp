@@ -156,13 +156,14 @@ constexpr const char* kDirectRemoteZarrRequired =
 
 std::shared_ptr<Volume> openRemoteVolumeEntry(
     const vc::project::Entry& entry,
+    const vcr::catalog::OpenDataManifest* catalog,
     const vc::HttpAuth& auth = {})
 {
     const bool anonymous = vc::project::usesAnonymousRemoteAuth(entry);
     return Volume::NewFromUrl(
         entry.location,
         anonymous ? vc::HttpAuth{} : auth,
-        vc::project::volumeMetadataFromEntryTags(entry.tags),
+        vc::project::catalogVolumeMetadata(catalog, entry.location),
         !anonymous);
 }
 
@@ -414,29 +415,28 @@ std::vector<vc::project::Entry> entriesFromJson(const utils::Json& arr)
 
 namespace vc::project {
 
-utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags)
+utils::Json catalogVolumeMetadata(const vcr::catalog::OpenDataManifest* catalog, const std::string& location)
 {
     auto metadata = utils::Json::object();
-    const auto voxelSizeTag =
-        tagValueWithPrefix(tags, "vc-open-data-voxel-size-um:");
-    if (!voxelSizeTag.empty()) {
-        try {
-            const double voxelSize = std::stod(voxelSizeTag);
-            if (voxelSize > 0.0)
-                metadata["voxelsize"] = voxelSize;
-        } catch (...) {
-        }
+    if (!catalog || !isLocationRemote(location)) return metadata;
+    vc::RemoteVolumeSpec spec;
+    try {
+        spec = vc::parseRemoteVolumeSpec(location);
+    } catch (const std::invalid_argument&) {
+        return metadata;
     }
-    const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
-    if (!nameTag.empty())
-        metadata["name"] = nameTag;
-    // Only the native source scan owns the catalog ID. Predictions and
-    // rebased source views also carry this tag, but have distinct identities
-    // and coordinate frames. Apply this on every open, including saved projects.
-    const auto catalogId = tagValueWithPrefix(tags, "vc-open-data-volume-id:");
-    if (!catalogId.empty() &&
-        std::find(tags.begin(), tags.end(), "vc-open-data-preferred-source") != tags.end())
-        metadata["uuid"] = catalogId;
+    const auto view = catalog->volumeAt(spec.sourceUrl, spec.baseScaleLevel);
+    if (!view) return metadata;
+    const auto* volume = catalog->findSample(view->sampleId)->findVolume(view->volumeId);
+    if (volume->pixelSizeUm && std::isfinite(*volume->pixelSizeUm) && *volume->pixelSizeUm > 0)
+        metadata["voxelsize"] = std::ldexp(*volume->pixelSizeUm, view->level);
+    std::string name = volume->suffix.empty() ? volume->id : volume->suffix;
+    if (!view->source) name = view->artifact->type + " of " + name;
+    if (view->level) name += " [L" + std::to_string(view->level) + "]";
+    metadata["name"] = name;
+    // The catalog volume's own zarr is that volume (at its level); a derived
+    // dataset is a volume of its own on the same grid.
+    if (view->source) metadata["uuid"] = view->frameId();
     return metadata;
 }
 
@@ -761,6 +761,7 @@ bool VolumePkg::reconcileVolumeEntryTags(
             try {
                 auto refreshed = openRemoteVolumeEntry(
                     entry,
+                    opts_.catalog.get(),
                     volume->remoteAuth());
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
@@ -809,11 +810,12 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
             if (!volume) continue;
             if (volume->isRemote() &&
                 samePersistedVolumeIdentity(volume->remoteLocator(), location)) {
-                auto metadata = vc::project::volumeMetadataFromEntryTags(e.tags);
+                auto metadata = vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location);
                 if (!metadata.empty()) {
                     try {
                         auto refreshed = openRemoteVolumeEntry(
                             e,
+                            opts_.catalog.get(),
                             volume->remoteAuth());
                         const auto refreshedId = refreshed->id();
                         if (refreshedId != id && loadedVolumes_.count(refreshedId) == 0) {
@@ -1289,7 +1291,7 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
         const auto candidate = base / volumeDirName;
         if (!isSingleZarrVolumeDir(candidate)) continue;
         try {
-            auto v = Volume::New(candidate, vc::project::volumeMetadataFromEntryTags(e.tags));
+            auto v = Volume::New(candidate, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) return false;
             loadedVolumes_.emplace(id, v);
@@ -1330,7 +1332,7 @@ bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
     loadedVolumes_.erase(it);
     volumeTagsByID_.erase(volumeId);
     try {
-        auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(tags));
+        auto v = Volume::New(vp, utils::Json::object());
         const auto id = v->id();
         loadedVolumes_.emplace(id, v);
         if (!tags.empty()) volumeTagsByID_[id] = tags;
@@ -1424,7 +1426,7 @@ void VolumePkg::resolveAll()
                     return;
                 }
                 remoteResults[i] = {
-                    openRemoteVolumeEntry(entry), {}};
+                    openRemoteVolumeEntry(entry, opts_.catalog.get()), {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
             } catch (...) {
@@ -1508,7 +1510,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                                e.location, kDirectRemoteZarrRequired);
                 return;
             }
-            auto v = openRemoteVolumeEntry(e);
+            auto v = openRemoteVolumeEntry(e, opts_.catalog.get());
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
@@ -1534,7 +1536,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     }
     auto loadOne = [&](const fs::path& vp) {
         try {
-            auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(e.tags));
+            auto v = Volume::New(vp, vc::project::catalogVolumeMetadata(opts_.catalog.get(), e.location));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());

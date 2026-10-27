@@ -27,7 +27,7 @@ public:
     // surface's artifact directory (downloaded when first selected).
     struct Option {
         QString label;
-        std::string url;
+        std::string name;  // the published file (vc::objects::CatalogFile::name)
         std::filesystem::path localPath;
     };
 

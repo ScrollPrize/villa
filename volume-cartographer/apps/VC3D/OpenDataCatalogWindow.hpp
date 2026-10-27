@@ -39,6 +39,9 @@ public:
     using AttachPredictionHandler = std::function<void(const vcr::catalog::OpenDataSample&,
         const OpenDataResourceSelection&)>;
     void setAttachPredictionHandler(AttachPredictionHandler handler);
+    // Refreshes the sample's surface store from the published catalog; returns the status line.
+    using RefreshSampleHandler = std::function<QString(const vcr::catalog::OpenDataSample&)>;
+    void setRefreshSampleHandler(RefreshSampleHandler handler);
 
 signals:
     void attachVolumeRequested(const QString& url);
@@ -58,8 +61,7 @@ private slots:
     void downloadSelectedVolumeNormalGrids();
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
-    void cacheSelectedSegment();
-    void syncSelectedSampleCache();
+    void refreshSelectedSample();
     void openSelectedSample();
     void createSelectedProject();
 
@@ -85,7 +87,6 @@ private:
     void populateSamples();
     void populateDetails(const vcr::catalog::OpenDataSample* sample);
     void clearDetails();
-    void refreshSelectedSampleCacheStatus();
     void updateActionButtons();
     void loadOverviewPhoto(const vcr::catalog::OpenDataSample& sample);
     void onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResult>* watcher);
@@ -126,8 +127,7 @@ private:
     QPushButton* _openRepresentationUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
-    QPushButton* _cacheSegmentButton{nullptr};
-    QPushButton* _syncSampleCacheButton{nullptr};
+    QPushButton* _refreshSampleButton{nullptr};
     QCheckBox* _doNotShowOnNextOpenCheck{nullptr};
 
     std::optional<vcr::catalog::OpenDataManifest> _manifest;
@@ -140,6 +140,7 @@ private:
     std::function<bool(const vcr::catalog::OpenDataSample&)> _openSampleHandler;
     CreateProjectHandler _createProjectHandler;
     AttachPredictionHandler _attachPredictionHandler;
+    RefreshSampleHandler _refreshSampleHandler;
 };
 
 } // namespace vc3d::opendata

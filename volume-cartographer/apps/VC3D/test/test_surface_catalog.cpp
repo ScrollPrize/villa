@@ -10,7 +10,8 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreCoordinates.hpp"
-#include "OpenDataSurfaceStore.hpp"
+#include <vc_reader/catalog.hpp>
+#include <vc_reader/registrations.hpp>
 #include "VolumeRegistrations.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -311,47 +312,40 @@ int main(int argc, char** argv)
             });
         }
 
-        // A volume opened at pyramid level 1 has its own id: registering the level
-        // relates it to the volume it shows, both ways, once.
+        // An Open Data volume opened at pyramid level 1 is a volume of its own
+        // (vcr::catalog::levelVolumeId), related to the volume it shows by the
+        // catalog's level registrations, which every attachment is given.
+        vcr::catalog::OpenDataSample sample;
+        sample.id = "sample";
+        sample.volumes.push_back({});
+        sample.volumes.back().id = "vol1";
+        auto levels = std::make_shared<vcr::catalog::RegistrationGraph>();
+        levels->addSample(sample);
+        auto withCatalog = options;
+        withCatalog.catalogTransforms = levels;
+        const auto leveled = session->replace(attachment, path, withCatalog);
         Volume::ZarrCreateOptions coarse = create;
-        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = "vol1-level1";
+        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = vcr::catalog::levelVolumeId("vol1", 1);
         const auto level = Volume::New(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
-        const auto atLevel = add("at-level", nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(level->id(), 1)}});
-        require(vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "the level is registered");
-        require(!vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "an existing relation is kept");
-        catalog.setSource(attachment, level);
+        const auto atLevel = util::newUuid();
+        session->act(leveled, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {
+            ObjectRecord record; record.uuid = atLevel; record.kind = "surface"; record.name = "at-level";
+            record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(level->id(), 1)}}.dump();
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, atLevel, quad_surface_geometry(grid));
+        });
+        catalog.setSource(leveled, level);
         pump([&] { const auto* row = catalog.row(native); return !catalog.loading() && row && row->mapping; },
              "the level lists the surfaces of the volume it shows");
         require(*catalog.row(native)->mapping == VolumeAffine::scale(0.5), "seen at the level's scale");
-        catalog.setSource(attachment, volume);
+        catalog.setSource(leveled, volume);
         pump([&] { const auto* row = catalog.row(atLevel); return !catalog.loading() && row && row->mapping; },
              "the full volume lists surfaces made at the level");
         require(*catalog.row(atLevel)->mapping == VolumeAffine::scale(2), "seen at the full volume's scale");
 
-        // Volume switches resolve through the same transforms, levels included.
-        {
-            using vc3d::opendata::CatalogVolume;
-            using vc3d::opendata::volumeToVolume;
-            const CatalogVolume l0{"sample", "scan", 0}, l2{"sample", "scan", 2};
-            const VolumeTransforms none;
-            const auto down = volumeToVolume(none, "scan", l0, "scan-l2", l2);
-            require(down && *down == VolumeAffine::scale(0.25), "a level quarters level-0 coordinates");
-            const auto same = volumeToVolume(none, "scan-l2", l2, "prediction-l2", l2);
-            require(same && *same == VolumeAffine::identity(), "two volumes showing one level share a frame");
-            VolumeTransforms registered;
-            registered.graph.add({"registration", "", "scan", "other", VolumeAffine::scale(3), "registration"});
-            const auto across = volumeToVolume(registered, "scan-l2", l2, "other", std::nullopt);
-            require(across && *across == VolumeAffine::scale(12), "registrations compose with levels");
-            std::optional<VolumeAffine> stored;
-            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-                stored = volumeToVolume(db.volumeTransforms(txn), "vol1", std::nullopt, "vol1-level1", CatalogVolume{"s", "vol1", 1});
-            });
-            require(stored && *stored == VolumeAffine::scale(0.5), "a level the store registered is not related twice");
-        }
-
         catalog.setSource(std::nullopt, volume);
         require(catalog.rows().empty(), "no attachment lists nothing");
-        session->detach(attachment);
+        session->detach(leveled);
         std::cout << "surface catalog tests passed\n";
         return 0;
     } catch (const std::exception& error) {

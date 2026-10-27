@@ -291,17 +291,14 @@ void SurfacePanelController::fetchThenActivate(const std::string& id, bool prese
 {
     _fetchingSurfaceId = id;
     emit statusMessageRequested(tr("Fetching surface %1 from the catalog...").arg(QString::fromStdString(id)), 0);
-    std::function<void()> job;
-    try {
-        job = _catalog->fetchJob(id);
-    } catch (const std::exception& error) {
+    const auto* row = _catalog->row(id);
+    if (!row) {
         _fetchingSurfaceId.clear();
-        emit statusMessageRequested(tr("Cannot fetch surface %1: %2").arg(QString::fromStdString(id), QString::fromUtf8(error.what())), 8000);
         return;
     }
     vc3d::store::background<bool>(this,
-        [job]() {
-            job();
+        [session = _catalog->session(), attachment = row->source, id]() {
+            session->ensureGeometry(attachment, id);
             return true;
         },
         [this, id, preserveEditing](vc3d::store::Outcome<bool> result) {
@@ -430,7 +427,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         QAction* historyAction = contextMenu.addAction(tr("History..."));
         connect(historyAction, &QAction::triggered, this, [this, segmentIdStd]() { showHistory(segmentIdStd); });
         const auto* row = _catalog->row(segmentIdStd);
-        if (row && row->original) {
+        if (row && row->imported()) {
             // Its first revision in your store is the catalog version.
             QAction* resetAction = contextMenu.addAction(tr("Reset to Open Data Version"));
             resetAction->setEnabled(storeWritable);
@@ -643,7 +640,7 @@ void SurfacePanelController::showHistory(const std::string& id)
     if (!row) {
         return;
     }
-    const auto attachment = row->source.attachment;
+    const auto attachment = row->source;
     std::vector<vc::objects::ObjectRevision> history;
     try {
         _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -744,16 +741,17 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
 bool SurfacePanelController::resetToCatalogVersion(const std::string& id, QString* errorMessage)
 {
     const auto* row = _catalog->row(id);
-    if (!row || !row->original) {
+    if (!row || !row->imported()) {
         if (errorMessage) *errorMessage = tr("The surface has no catalog version");
         return false;
     }
-    std::optional<std::string> first;
-    _catalog->session()->read(row->source.attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto history = db.objectHistory(txn, id);
-        if (!history.empty()) first = history.front().uuid;
-    });
-    return first && restoreRevision(id, *first, errorMessage);
+    try {
+        _catalog->session()->restoreImported(row->source, id);
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QString::fromUtf8(error.what());
+        return false;
+    }
+    return true;
 }
 
 bool SurfacePanelController::editInUserStore(const std::string& id, QString* errorMessage)
@@ -1027,7 +1025,7 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
         } catch (const SurfaceCatalog::NoGeometry&) {
             if (!_catalog->row(surfaceId)->catalog) throw;
             // Headless callers wait for a catalog surface to be fetched.
-            _catalog->fetchJob(surfaceId)();
+            _catalog->session()->ensureGeometry(_catalog->row(surfaceId)->source, surfaceId);
             opened = _catalog->open(surfaceId);
         }
     } catch (const std::exception& error) {
@@ -1586,7 +1584,7 @@ std::vector<QString> checkedNames(QComboBox* box)
 void SurfacePanelController::refreshProximityFilters()
 {
     const auto generation = ++_proximityGeneration;
-    if (!_catalog || _catalog->sources().empty()) {
+    if (!_catalog || _catalog->sources().empty() || !_catalog->volume()) {
         _focusAnswer.reset();
         _pointSetAnswer.reset();
         return;
@@ -1608,7 +1606,8 @@ void SurfacePanelController::refreshProximityFilters()
     }
     struct Answers { ProximityAnswer focus, pointSets; };
     vc3d::store::background<Answers>(this,
-        [session = _catalog->session(), sources = _catalog->sources(), focus, pointSets, focusRadius]() {
+        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), focus, pointSets,
+         focusRadius]() {
             auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
                 result.pointSets = sets;
@@ -1618,7 +1617,7 @@ void SurfacePanelController::refreshProximityFilters()
                     bool first = true;
                     for (const auto& point : points) {
                         std::set<std::string> near;
-                        for (const auto& hit : SurfaceCatalog::nearest(*session, sources, point, tolerance))
+                        for (const auto& hit : SurfaceCatalog::nearest(*session, sources, volume, point, tolerance))
                             near.insert(hit.objectUuid);
                         any.insert(near.begin(), near.end());
                         if (first) all = near;

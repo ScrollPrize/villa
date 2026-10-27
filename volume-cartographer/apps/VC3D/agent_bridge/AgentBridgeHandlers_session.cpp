@@ -546,6 +546,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
 
     vc::project::LoadOptions options;
     options.deferResolution = true;
+    options.catalog = vc3d::opendata::cachedCatalog();
     auto package = VolumePkg::newDetached(options);
     package->setName(projectName.toStdString());
     if (!package->addVolumeEntry(volumeLocation, std::move(tags)))

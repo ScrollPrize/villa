@@ -449,7 +449,7 @@ std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTra
     for (const auto& entry : source.surfaces) {
         try {
             surfaces.push_back(SurfaceCatalog::open(source.session, entry.attachment, entry.targetVolume,
-                                                    entry.uuid, entry.targetScale).surface);
+                                                    entry.uuid).surface);
         } catch (const std::exception& ex) {
             // e.g. a catalog surface whose geometry was never fetched.
             qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface" << QString::fromStdString(entry.uuid) << ex.what();
@@ -716,7 +716,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 std::find(row.record.tags.begin(), row.record.tags.end(), sourceTag.toStdString()) == row.record.tags.end()) {
                 continue;
             }
-            source.surfaces.push_back({row.source.attachment, uuid, row.source.volume, row.source.scale});
+            source.surfaces.push_back({row.source, uuid, catalog->volume()->id()});
             source.key += QStringLiteral("|%1@%2").arg(QString::fromStdString(uuid), QString::fromStdString(row.record.changedAt));
         }
 

@@ -36,6 +36,7 @@
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -102,7 +103,6 @@ struct MenuActionController::OpenDataOpenTaskResult {
     vc3d::opendata::OpenDataSampleProjectResult result;
     QString error;
     QString sampleId;
-    qint64 tifxyzSegmentCount{0};
     bool freshProject{false};
 };
 
@@ -581,6 +581,22 @@ void MenuActionController::showOpenDataCatalog()
                                            const auto& project) {
         return openOpenDataSample(sample, true, &selection, nullptr, nullptr, &project);
     });
+    dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
+        if (!_window || !_window->_state) return tr("No viewer state.");
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        try {
+            auto& state = *_window->_state;
+            const auto report = vc::objects::refreshCatalog(*state.objectStoreSession(),
+                                                            state.catalogAttachment(sample), sample);
+            QApplication::restoreOverrideCursor();
+            return tr("%1: %2 surfaces, %3 new, %4 updated, %5 refetched.")
+                .arg(QString::fromStdString(sample.id)).arg(report.surfaces).arg(report.added)
+                .arg(report.updated).arg(report.stale);
+        } catch (const std::exception& e) {
+            QApplication::restoreOverrideCursor();
+            return tr("Refreshing %1 failed: %2").arg(QString::fromStdString(sample.id), QString::fromUtf8(e.what()));
+        }
+    });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QDialog::finished, this, [this]() {
         emit openDataCatalogVisibilityChanged(false);
@@ -607,7 +623,7 @@ bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool 
         return false;
     }
 
-    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const auto manifest = vc3d::opendata::cachedCatalog();
     if (!manifest) {
         return false;
     }
@@ -632,7 +648,7 @@ bool MenuActionController::openOpenDataSampleById(
         return false;
     }
 
-    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const auto manifest = vc3d::opendata::cachedCatalog();
     if (!manifest) {
         if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
         return false;
@@ -731,7 +747,7 @@ bool MenuActionController::startOpenDataSampleOpen(
         if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
         return false;
     }
-    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const auto manifest = vc3d::opendata::cachedCatalog();
     if (!manifest) {
         if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
         return false;
@@ -778,12 +794,6 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
-    const auto selectedSegmentCount = std::count_if(
-        sampleCopy.segments.begin(), sampleCopy.segments.end(), [&](const auto& segment) {
-            return !sampleCopy.surfaces(segment).empty() && (!selectionCopy.segmentIds ||
-                std::find(selectionCopy.segmentIds->begin(), selectionCopy.segmentIds->end(),
-                          segment.id) != selectionCopy.segmentIds->end());
-        });
     // CloseVolume() below is this flow's first destructive step: it emits
     // vpkgChanged, whose defensive handler tears line sessions down without
     // saving. Sessions must instead end -- finalized and saved -- while their
@@ -816,12 +826,12 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     }
 
     QPointer<QProgressDialog> progressDialog;
-    if (interactive && (newProject || selectedSegmentCount > 0)) {
+    if (interactive) {
         auto* dialog = new QProgressDialog(
             QObject::tr("Preparing catalog resources..."),
             QString(),
             0,
-            static_cast<int>(selectedSegmentCount) * 6,
+            0,
             _window);
         dialog->setWindowTitle(QObject::tr("Open Data Sample"));
         dialog->setCancelButton(nullptr);
@@ -867,8 +877,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                         ? QObject::tr("Opening remote volumes in parallel...")
                         : projectReady
                         ? QObject::tr("Open-data project is ready.")
-                        : QObject::tr("Recording %1 segment(s) in the sample's surface store...")
-                              .arg(progress.totalSegments);
+                        : QObject::tr("Preparing catalog resources...");
                     if (projectReady) {
                         progressDialog->setRange(0, 1);
                         progressDialog->setValue(1);
@@ -906,13 +915,10 @@ void MenuActionController::beginOpenDataSampleOpenTask(
 
     _openDataSampleOpenInFlight = true;
     watcher->setFuture(QtConcurrent::run(
-        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy, projectCopy,
-         selectedSegmentCount]() mutable {
+        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy, projectCopy]() mutable {
             OpenDataOpenTaskResult taskResult;
             taskResult.freshProject = projectCopy.has_value();
             taskResult.sampleId = QString::fromStdString(sampleCopy.id);
-            taskResult.tifxyzSegmentCount =
-                static_cast<qint64>(selectedSegmentCount);
             try {
                 taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
                     sampleCopy,
@@ -1012,29 +1018,17 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
     }
     startOpenDataVolumePrefill(
         _window && _window->_state ? _window->_state->currentVolume() : nullptr);
-    if (_window) {
-        // The import may have created the sample's surface store.
-        _window->updateCatalogSurfaceSources();
-    }
-
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
                           .arg(sampleId)
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
-    if (task.tifxyzSegmentCount > 0) {
-        message += QObject::tr(" %1 tifxyz segments are %2 surfaces of the sample store (%3 new).")
-                       .arg(result.supportedTifxyzSegments)
-                       .arg(result.importedSurfaces)
-                       .arg(result.addedSurfaces);
-    }
     if (_window && _window->statusBar()) {
         _window->showStatusBarMessage(message, 7000);
     }
 
     if (interactive &&
         ((!task.freshProject && result.supportedVolumes == 0) ||
-         result.failedVolumes > 0 ||
-         result.failedTifxyzSegments > 0)) {
+         result.failedVolumes > 0)) {
         QString details;
         for (const auto& item : result.messages) {
             if (!details.isEmpty()) {
@@ -1626,7 +1620,9 @@ void MenuActionController::newProject()
     QString file = dlg.selectedFiles().first();
     if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
 
-    auto pkg = VolumePkg::newEmpty();
+    vc::project::LoadOptions options;
+    options.catalog = vc3d::opendata::cachedCatalog();
+    auto pkg = VolumePkg::newEmpty(options);
     QString base = QFileInfo(file).fileName();
     base.chop(QStringLiteral(".volpkg.json").size());
     // setName before save(): while the package has no path it only touches the

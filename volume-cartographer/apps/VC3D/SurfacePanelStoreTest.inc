@@ -6,12 +6,14 @@
 #include <vc_object_store/Uuid.hpp>
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
-#include "OpenDataSurfaceStore.hpp"
+#include <vc_reader/registrations.hpp>
+#include <mutex>
 #include <QTreeWidget>
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
-// read-only catalog store listed beside it at a pyramid level, fetched on
-// activation and edited in the user's store as the same surface.
+// fetched catalog store (as an Open Data sample's) of a volume the open one
+// shows at pyramid level 1, listed beside it, fetched on activation and edited
+// in the user's store as the same surface.
 int runSurfacePanelStoreTests()
 {
     using namespace vc::objects;
@@ -96,13 +98,15 @@ int runSurfacePanelStoreTests()
         pump([&] { return tree.topLevelItemCount() == 2; }, "retired surfaces leave the panel");
         require(visible() == std::vector<std::string>{plain}, "retired surfaces are not drawn");
 
-        // A catalog store of another (catalog) volume that the open volume shows at
-        // level 1: one surface with geometry, one still remote.
+        // A catalog store of the catalog volume the open volume shows at level 1
+        // (the catalog's level registration): one surface with geometry, one
+        // still remote, fetched by the session.
         const auto catalogPath = fs::path(dir.path().toStdString()) / "catalog.vcobj";
         std::string shown, remote;
         {
             auto db = ObjectStore::create(catalogPath, options);
-            const auto binding = nlohmann::json{{"coordinates", {{"volume_uuid", "catalog-volume"}, {"scale_factor", 1}}}}.dump();
+            const auto binding = nlohmann::json{{"coordinates", {{"volume_uuid", "catalog-volume"}, {"scale_factor", 1}}},
+                                                {"catalog", {{"sample", "sample"}, {"segment", "segment"}}}}.dump();
             shown = util::newUuid();
             remote = util::newUuid();
             auto txn = db.write({{shown, std::nullopt}, {remote, std::nullopt}});
@@ -112,15 +116,23 @@ int runSurfacePanelStoreTests()
             db.upsertObject(txn, record);
             txn.commit();
         }
+        auto levels = std::make_shared<vcr::catalog::RegistrationGraph>();
+        levels->add({"level:sample:catalog-volume:1", "1", "catalog-volume", "panel-volume",
+                     vcr::catalog::Affine::scale(0.5), "pyramid level 1"});
+        auto catalogOptions = options;
+        catalogOptions.catalogTransforms = levels;
+        std::mutex fetchedMutex;
         std::vector<std::string> fetched;
-        catalog.setFetcher([&](const fs::path& store, const std::string& uuid) {
-            fetched.push_back(uuid);
-            auto db = ObjectStore::open(store, options);
-            auto txn = db.write({{uuid, db.currentObjectRevision(db.read(), uuid)->uuid}});
-            db.putGeometry(txn, uuid, quad_surface_geometry(grid));
-            txn.commit();
-        });
-        catalog.setCatalogSources({{state.catalogAttachment(catalogPath), "catalog-volume", 0.5}});
+        const auto catalogAttachment = state.objectStoreSession()->attachFetched(catalogPath, catalogOptions,
+            [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
+                { std::lock_guard lock(fetchedMutex); fetched.push_back(uuid); }
+                const auto revision = store.currentObjectRevision(store.read(), uuid)->uuid;
+                write({{uuid, revision}}, [&](ObjectStore& db, WriteTxn& txn) {
+                    db.putGeometry(txn, uuid, quad_surface_geometry(grid));
+                });
+            });
+        auto fetchedNow = [&] { std::lock_guard lock(fetchedMutex); return fetched; };
+        catalog.setCatalogSources({catalogAttachment});
         pump([&] { return tree.topLevelItemCount() == 4; }, "catalog surfaces are listed beside the user's");
         require(catalog.row(shown)->catalog && !catalog.row(plain)->catalog, "rows know their store");
         require(catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5) && !catalog.row(shown)->toolInput(), "catalog rows are scaled to the open volume's level");
@@ -128,13 +140,13 @@ int runSurfacePanelStoreTests()
         require(panel.activateSurfaceById(shown, &error), "catalog surfaces open");
         require((*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "in the open volume's voxels");
         require(!panel.opened()->editable, "catalog surfaces are read-only");
-        require(panel.activateSurfaceById(remote, &error) && fetched == std::vector<std::string>{remote},
+        require(panel.activateSurfaceById(remote, &error) && fetchedNow() == std::vector<std::string>{remote},
                 "a remote catalog surface is fetched when activated headlessly");
 
         // The Patch Tracer reads each source surface from the store it is in.
         PatchTracerSource tracerSource{state.objectStoreSession(), {}, {}};
         for (const auto& [uuid, row] : catalog.rows())
-            if (row.mapping) tracerSource.surfaces.push_back({row.source.attachment, uuid, row.source.volume, row.source.scale});
+            if (row.mapping) tracerSource.surfaces.push_back({row.source, uuid, volume->id()});
         const auto tracerSurfaces = loadPatchTracerSurfaces(tracerSource);
         require(tracerSource.surfaces.size() == 3 && tracerSurfaces.size() == 3 &&
                 std::any_of(tracerSurfaces.begin(), tracerSurfaces.end(), [](const auto& surface) {
@@ -143,15 +155,16 @@ int runSurfacePanelStoreTests()
                 "Patch Tracer sources load from their own stores, catalog ones scaled to the volume");
 
         // Editing a catalog surface edits it in the user's store as the same
-        // surface. The open volume is the catalog volume's level 1, registered in
-        // the user's store as VC3D does when it opens one.
-        vc3d::opendata::registerVolumeLevel(*state.objectStoreSession(), attachment, "panel-volume", "catalog-volume", 1);
+        // surface. The user's store relates the two volumes as the catalog does
+        // (VC3D gives every attachment the catalog's registrations).
+        vc::objects::registerVolumeTransform(*state.objectStoreSession(), attachment, "catalog-volume", "panel-volume",
+                                             vc::objects::VolumeAffine::scale(0.5), "pyramid level 1");
         require(panel.activateSurfaceById(shown, &error), "the catalog surface opens");
         const auto onScreen = panel.opened()->surface;
         require(panel.editInUserStore(shown, &error) && panel.opened()->editable &&
                     panel.opened()->pin.attachment == attachment && panel.opened()->surface == onScreen,
                 "editing a catalog surface continues it, on screen, in the user's store");
-        require(!catalog.row(shown)->catalog && catalog.row(shown)->original &&
+        require(!catalog.row(shown)->catalog && catalog.row(shown)->imported() &&
                     catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5),
                 "its row is the user's, as stored, with the catalog version as its original");
         require(tree.topLevelItemCount() == 4, "it is listed once");

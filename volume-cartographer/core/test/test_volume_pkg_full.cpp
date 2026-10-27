@@ -367,48 +367,26 @@ TEST_CASE("VolumePkg::attachPreparedVolume restores autosave after write failure
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume entry tags produce remote-volume metadata")
+TEST_CASE("A catalog gives remote entries their catalog volume identity at their level")
 {
-    const auto metadata = vc::project::volumeMetadataFromEntryTags({
-        "vc-open-data-voxel-size-um:7.91",
-        "vc-open-data-name:Overlay",
-    });
-    CHECK(metadata.at("voxelsize").get_double() == doctest::Approx(7.91));
-    CHECK(metadata.at("name").get_string() == "Overlay");
+    const auto catalog = vcr::catalog::parseOpenDataManifest(R"({"samples": {"s": {
+      "volumes": {"vol": {"id": "vol", "suffix": "scan.zarr", "properties": {"pixel_size_um": 2.5},
+        "data": [
+          {"type": "zarr", "origins": [{"path": "s/vol.zarr", "access_roots": [
+            {"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]},
+          {"type": "surface-prediction-zarr", "parameters": {"level": 1}, "origins": [{"path": "s/pred.zarr",
+            "access_roots": [{"type": "https", "url": "https://example.test/", "usage": "public-read"}]}]}]}}}}})");
+    const auto source = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr");
+    CHECK(source.at("uuid").get_string() == "vol");
+    CHECK(source.at("voxelsize").get_double() == doctest::Approx(2.5));
+    const auto level = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/vol.zarr#vc-base-scale=2");
+    CHECK(level.at("uuid").get_string() == "vol@L2");
+    CHECK(level.at("voxelsize").get_double() == doctest::Approx(10.0));
+    CHECK(level.at("name").get_string() == "scan.zarr [L2]");
+    const auto prediction = vc::project::catalogVolumeMetadata(&catalog, "https://example.test/s/pred.zarr");
+    CHECK_FALSE(prediction.contains("uuid"));
+    CHECK(prediction.at("voxelsize").get_double() == doctest::Approx(5.0));
+    CHECK(vc::project::catalogVolumeMetadata(&catalog, "https://example.test/elsewhere.zarr").empty());
+    CHECK(vc::project::catalogVolumeMetadata(nullptr, "https://example.test/s/vol.zarr").empty());
 }
 
-TEST_CASE("Only native catalog source entries use the catalog volume ID")
-{
-    const std::string catalogTag = "vc-open-data-volume-id:20260102150214";
-    const auto source = vc::project::volumeMetadataFromEntryTags({
-        catalogTag, "vc-open-data-preferred-source",
-        "vc-open-data-source-coordinate-level:0",
-    });
-    CHECK(source.at("uuid").get_string() == "20260102150214");
-    for (const auto& tags : std::vector<std::vector<std::string>>{
-             {}, {catalogTag}, {"vc-open-data-preferred-source"},
-             {"vc-open-data-preferred-source", "vc-open-data-volume-id:"},
-             {catalogTag, "prediction", "vc-open-data-source-coordinate-level:0"},
-             {catalogTag, "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2"}}) {
-        CHECK_FALSE(vc::project::volumeMetadataFromEntryTags(tags).contains("uuid"));
-    }
-}
-
-TEST_CASE("Local volume entries take the catalog volume ID from their tags")
-{
-    auto d = tmpDir("localcatalogid");
-    makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
-    p->addVolumeEntry((d / "volumes").string(),
-                      {"vc-open-data-volume-id:20251211183505",
-                       "vc-open-data-preferred-source"});
-    CHECK(p->volume("vol1") == nullptr);
-    auto v = p->volume("20251211183505");
-    REQUIRE(v != nullptr);
-    CHECK(v->name() == "vol1");
-    // The identity survives a reload from disk.
-    CHECK(p->reloadSingleVolume("20251211183505"));
-    CHECK(p->volume("20251211183505") != nullptr);
-    CHECK(p->volume("vol1") == nullptr);
-    fs::remove_all(d);
-}

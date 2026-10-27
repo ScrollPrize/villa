@@ -26,8 +26,7 @@ add_executable(test_catalog_project_dialog
     ../OpenDataManifest.cpp
     ../OpenDataSampleProject.cpp
     ../OpenDataLasagna.cpp
-    ../OpenDataNormalGrids.cpp
-    ../OpenDataSurfaceStore.cpp)
+    ../OpenDataNormalGrids.cpp)
 set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_catalog_project_dialog PRIVATE
@@ -682,7 +681,7 @@ endif()
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
     ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
-    ../OpenDataSurfaceStore.cpp ../OpenDataManifest.cpp ../SurfaceAreaCalculator.cpp ../VolumeRegistrations.cpp)
+    ../OpenDataManifest.cpp ../SurfaceAreaCalculator.cpp ../VolumeRegistrations.cpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)

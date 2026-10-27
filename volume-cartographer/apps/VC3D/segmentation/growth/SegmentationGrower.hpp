@@ -42,7 +42,6 @@ struct PatchTracerSource {
         vc::objects::AttachmentIdentity attachment;
         std::string uuid;
         std::string targetVolume;
-        double targetScale = 1;
     };
     std::vector<Surface> surfaces;
     // Identifies the source's content: tag, surfaces and their change stamps.

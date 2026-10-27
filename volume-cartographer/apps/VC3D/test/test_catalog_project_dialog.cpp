@@ -168,7 +168,7 @@ private slots:
             opened = true;
             QVERIFY(dialog->windowTitle().contains("PHercParis4"));
             const auto trees = dialog->findChildren<QTreeWidget*>();
-            QCOMPARE(trees.size(), 3);
+            QCOMPARE(trees.size(), 2);  // volumes and representations; surfaces come from the sample store
             for (auto* tree : trees) {
                 QVERIFY(tree->columnCount() >= 9);
                 QVERIFY(tree->topLevelItemCount() > 0);
@@ -196,8 +196,6 @@ private slots:
                 QCOMPARE(selection.rawVolumeIds->front(), std::string("test-volume"));
                 QVERIFY(selection.representations.has_value());
                 QVERIFY(selection.representations->empty());
-                QVERIFY(selection.segmentIds.has_value());
-                QVERIFY(selection.segmentIds->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
                 QCOMPARE(project.path.string(), temp.filePath("my-selection.VOLPKG.JSON").toStdString());
                 vc::project::LoadOptions options;

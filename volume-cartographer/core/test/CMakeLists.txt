@@ -110,7 +110,6 @@ vc_add_test(NAME test_ink_detection_overlay
     SOURCES test_ink_detection_overlay.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
@@ -884,8 +883,6 @@ vc_add_test(NAME test_open_data_manifest
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSampleProject.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataNormalGrids.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataSurfaceStore.hpp
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 

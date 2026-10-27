@@ -1723,6 +1723,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         if (region) {
             try {
                 const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
+                                                              _surfaceCatalog->volume()->id(),
                                                               vc3d::store::regionSlice(*region), {});
                 for (const auto& run : crossings.runs) {
                     if (active && run.objectUuid == active->id && intersections.contains(active->id)) continue;

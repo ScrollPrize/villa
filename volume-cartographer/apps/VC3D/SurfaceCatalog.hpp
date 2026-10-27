@@ -3,9 +3,10 @@
 // read-only catalog stores (Open Data samples): one row per surface record,
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
-// viewed or edited. Surfaces are identified by their store UUID. A catalog
-// surface is edited in the user's store as the same surface (importCatalogSurface);
-// from then on its row and crossings come from the user's store.
+// viewed or edited. Surfaces are identified by their store UUID and read in the
+// open volume's voxels, through the stores' registrations (an Open Data level
+// is a registered volume). A catalog surface is edited in the user's store as
+// the same surface (importCatalogSurface); the session then reads it from there.
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
@@ -32,24 +33,9 @@ class SurfaceCatalog : public QObject
 
 public:
     // open() of a surface whose geometry is not in its store yet (a catalog
-    // surface still remote); fetch() gives it its geometry.
+    // surface still remote): the session's ensureGeometry fetches it.
     struct NoGeometry : std::runtime_error {
         using std::runtime_error::runtime_error;
-    };
-    // Gives a catalog surface its geometry (blocking; runs on a worker thread).
-    using Fetcher = std::function<void(const std::filesystem::path& store, const std::string& uuid)>;
-    // A store the rows come from, listed by the volume its surfaces are bound
-    // to: the user's store by the open volume's id; a catalog store by the
-    // catalog volume the open volume shows, `scale` open-volume voxels per
-    // bound-volume voxel (an Open Data pyramid level: 1/2^level).
-    struct Source {
-        vc::objects::AttachmentIdentity attachment;
-        std::string volume;
-        double scale = 1;
-        // Surfaces of a catalog store that the user's store holds too
-        // (imported): read from the user's store instead.
-        std::set<std::string> shadowed;
-        bool operator==(const Source&) const = default;
     };
     struct Row {
         // uuid, name, tags, meta, surface detail, change stamps and approval.
@@ -58,11 +44,11 @@ public:
         // cannot map the surface into the volume.
         std::optional<vc::objects::VolumeAffine> mapping;
         // The store it is in; catalog rows are read-only.
-        Source source;
+        vc::objects::AttachmentIdentity source;
         bool catalog = false;
-        // A surface imported from a catalog store: the source still holding the
-        // catalog version (its first revision in the user's store).
-        std::optional<Source> original;
+        // A catalog surface imported into the user's store: its first revision
+        // there is the catalog version (ObjectStoreSession::restoreImported).
+        bool imported() const;
         // Shown and opened in the open volume (through `mapping`).
         bool bound() const { return mapping.has_value(); }
         // Input for external tools, which read stored coordinates: a user
@@ -88,12 +74,10 @@ public:
     // List the surfaces of `volume` in `attachment` (nothing without both).
     void setSource(const std::optional<vc::objects::AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume);
     // Also list these read-only catalog stores (while a volume is open).
-    void setCatalogSources(std::vector<Source> sources);
-    // The user's store (when attached) then the catalog stores.
-    std::vector<Source> sources() const;
-    void setFetcher(Fetcher fetcher) { fetcher_ = std::move(fetcher); }
-    // The work that fetches a catalog row's geometry; run it on a worker thread.
-    std::function<void()> fetchJob(const std::string& uuid) const;
+    void setCatalogSources(std::vector<vc::objects::AttachmentIdentity> sources);
+    // The user's store (when attached) then the catalog stores: the order in
+    // which the session reads a surface held by several (imported ones).
+    std::vector<vc::objects::AttachmentIdentity> sources() const;
     // Session events (CState::objectStoreChanged); other attachments are ignored.
     void handle(const vc::objects::StoreSessionEvent& event);
 
@@ -113,17 +97,18 @@ public:
     // The same from an explicit source, for worker threads.
     static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
                        const vc::objects::AttachmentIdentity& attachment, const std::string& volume,
-                       const std::string& uuid, double scale = 1,
-                       const std::optional<std::string>& revision = std::nullopt);
+                       const std::string& uuid, const std::optional<std::string>& revision = std::nullopt);
 
-    // Where the surfaces of every source cross `slice` (open-volume voxels),
+    // Where the surfaces of every source cross `slice` (voxels of `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
-    // read was. Synchronous: callers run it on a worker thread.
+    // read was. Placeholders reached are fetched by the session. Synchronous:
+    // callers run it on a worker thread.
     struct Crossings {
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
     };
-    static Crossings region(vc::objects::ObjectStoreSession& session, const std::vector<Source>& sources,
+    static Crossings region(vc::objects::ObjectStoreSession& session,
+                            const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
 
@@ -133,7 +118,8 @@ public:
         const std::optional<std::vector<std::string>>& uuids = std::nullopt) const;
     // The same over explicit sources, for worker threads.
     static std::vector<vc::objects::SurfaceProximityHit> nearest(vc::objects::ObjectStoreSession& session,
-        const std::vector<Source>& sources, const std::array<double, 3>& point, double tolerance,
+        const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
+        const std::array<double, 3>& point, double tolerance,
         const std::optional<std::vector<std::string>>& uuids = std::nullopt);
 
     // Where tools launched for the open volume read and write: the user's store
@@ -153,8 +139,8 @@ public:
     void updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change);
     void retire(const std::vector<std::string>& uuids);
     // Edit a catalog surface in the user's store: imports it there as the same
-    // surface, its catalog version (as stored) the first revision, and reads its
-    // row from there. Throws without its geometry (fetch it first).
+    // surface (fetching it first), its catalog version the first revision, and
+    // reads its row from there.
     void importCatalogSurface(const std::string& uuid);
     // A new surface holding `surface` (in the volume's voxels), bound to the
     // volume; `provenance` records how it was made ({tool, parameters, sources}).
@@ -185,8 +171,7 @@ private:
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;
     std::shared_ptr<Volume> volume_;
-    std::vector<Source> catalogSources_;
-    Fetcher fetcher_;
+    std::vector<vc::objects::AttachmentIdentity> catalogSources_;
     std::map<std::string, Row> rows_;
     // Bumped by setSource(): reads of an earlier source are dropped.
     uint64_t generation_ = 0;

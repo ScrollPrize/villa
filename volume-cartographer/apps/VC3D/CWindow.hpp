@@ -184,9 +184,6 @@ private:
     void selectLasagnaOutputSurface(const QString& surfaceUuid);
     // List the current Open Data volume's catalog surfaces beside the user's.
     void updateCatalogSurfaceSources();
-    // An Open Data volume opened at a coarser level is registered to its catalog
-    // volume in the user's store (vc3d::opendata::registerVolumeLevel).
-    void registerCurrentVolumeLevel();
     // The active surface's Lasagna results (attached to it in the store).
     void loadLasagnaResults(Surface* surface);
 
@@ -265,7 +262,6 @@ private slots:
     QString lastVolumeSettingKeyForCurrentPackage() const;
     QString rememberedVolumeIdForCurrentPackage() const;
     void rememberCurrentVolumeForPackage(const QString& volumeId) const;
-    const vcr::catalog::OpenDataManifest* cachedOpenDataManifest() const;
     // Volume coordinates of `from` in `to` when switching volumes, when the two are related.
     std::optional<vcr::catalog::Affine> volumeTransformForSwitch(const std::string& from, const std::string& to) const;
     void resetSegmentationViews(bool persistLayout = true);
@@ -287,8 +283,6 @@ private:
 
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
-    mutable bool _openDataManifestLoadAttempted{false};
-    mutable std::optional<vcr::catalog::OpenDataManifest> _openDataManifestCache;
 
 
     SeedingWidget* _seedingWidget;

@@ -3,6 +3,9 @@
 
 namespace vc3d::opendata {
 std::filesystem::path cachedOpenDataManifestPath();
+// The cached Open Data catalog (vcr::catalog::cachedManifest of that file),
+// nullptr before it has been fetched.
+std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog();
 // Optional subset of a sample's resources to attach. Each axis is independent:
 // an absent sub-field means "no filter on that axis". A raw source volume is
 // governed by `volumeIds` and optional `rawVolumeIds`; a derived representation (normal grids /

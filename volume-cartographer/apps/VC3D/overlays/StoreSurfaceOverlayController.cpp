@@ -104,7 +104,7 @@ std::optional<vc3d::store::Region> StoreSurfaceOverlayController::region(VolumeV
 
 bool StoreSurfaceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return viewer && !_surfaces.empty() && !_catalog->sources().empty() &&
+    return viewer && !_surfaces.empty() && !_catalog->sources().empty() && _catalog->volume() &&
            dynamic_cast<PlaneSurface*>(viewer->currentSurface()) &&
            viewer->surfName() != "segmentation";
 }
@@ -128,11 +128,12 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
     const auto cancel = v.region.cancelled;
     const auto revision = _revision;
     vc3d::store::background<Listing>(this,
-        [session = _catalog->session(), sources = _catalog->sources(), uuids = _surfaces, query, cancel]() {
+        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), uuids = _surfaces,
+         query, cancel]() {
             vc::objects::RegionOptions options;
             options.uuids = uuids;
             options.processingByteBudget = kProcessingBudget;
-            auto crossings = SurfaceCatalog::region(*session, sources, vc3d::store::regionSlice(query), options,
+            auto crossings = SurfaceCatalog::region(*session, sources, volume, vc3d::store::regionSlice(query), options,
                                                     [&] { return cancel->load(); });
             Listing listing;
             listing.complete = crossings.complete;

@@ -334,13 +334,10 @@ int main(int argc, char** argv)
         const auto spec = vc::parseRemoteVolumeSpec(url);
         const auto projectEntry = project->matchingVolumeEntry(url);
         const bool anonymous = projectEntry && vc::project::usesAnonymousRemoteAuth(*projectEntry);
-        const auto metadata = projectEntry
-            ? vc::project::volumeMetadataFromEntryTags(projectEntry->tags)
-            : utils::Json{};
         std::cout << "Opening "
                   << vc::core::util::redactedRemoteLocation(spec.portableLocator)
                   << '\n';
-        auto volume = Volume::NewFromUrl(url, {}, metadata, !anonymous);
+        auto volume = Volume::NewFromUrl(url, {}, utils::Json::object(), !anonymous);
         const auto levels = requestedLevels
             ? *requestedLevels
             : volume->presentScaleLevels();

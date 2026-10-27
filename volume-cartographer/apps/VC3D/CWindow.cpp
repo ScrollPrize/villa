@@ -5,7 +5,6 @@
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataLasagna.hpp"
-#include "OpenDataSurfaceStore.hpp"
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 
 #include "RenderBenchRecorder.hpp"
@@ -2865,39 +2864,19 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
     }
 }
 
-void CWindow::registerCurrentVolumeLevel()
-{
-    const auto attachment = _state->objectStoreAttachment();
-    const auto volume = _state->currentVolume();
-    if (!attachment || !volume || !_state->vpkg()) return;
-    const auto catalog = vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(volume->id()));
-    if (!catalog) return;
-    try {
-        if (vc3d::opendata::registerVolumeLevel(*_state->objectStoreSession(), *attachment, volume->id(),
-                                                catalog->volumeId, catalog->level))
-            Logger()->info("Registered volume {} as {} at level {}", volume->id(), catalog->volumeId, catalog->level);
-    } catch (const std::exception& error) {
-        showStatusBarMessage(tr("Cannot relate this volume to %1 in the object store: %2")
-                                 .arg(QString::fromStdString(catalog->volumeId), QString::fromUtf8(error.what())), 8000);
-    }
-}
-
 void CWindow::updateCatalogSurfaceSources()
 {
-    // An Open Data volume shows its catalog volume's surfaces at its pyramid level.
-    std::vector<SurfaceCatalog::Source> sources;
+    // An Open Data volume shows its sample's catalog surfaces, through the
+    // catalog's registrations (its pyramid levels among them).
+    std::vector<vc::objects::AttachmentIdentity> sources;
     const auto volume = _state->currentVolume();
-    if (volume && _state->vpkg()) {
-        if (const auto catalog = vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(volume->id()))) {
-            const auto store = vc3d::opendata::surfaceStorePath(vc3d::remoteCachePathFs(), catalog->sampleId);
-            std::error_code ec;
-            if (std::filesystem::exists(store, ec)) {
-                try {
-                    sources.push_back({_state->catalogAttachment(store), catalog->volumeId,
-                                       1.0 / double(1 << catalog->level)});
-                } catch (const std::exception& error) {
-                    showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
-                }
+    const auto catalog = vc3d::opendata::cachedCatalog();
+    if (volume && catalog && volume->isRemote()) {
+        if (const auto view = catalog->volumeAt(volume->remoteUrl(), volume->baseScaleLevel())) {
+            try {
+                sources.push_back(_state->catalogAttachment(*catalog->findSample(view->sampleId)));
+            } catch (const std::exception& error) {
+                showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
             }
         }
     }
@@ -3030,12 +3009,7 @@ void CWindow::CreateWidgets(void)
     if (_inkDetectionOverlay) {
         _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
     }
-    // Open Data surfaces come from the sample's catalog store, read-only, fetched when opened.
-    _surfaceCatalog->setFetcher([](const std::filesystem::path& store, const std::string& uuid) {
-        vc3d::opendata::materializeSurface(store, uuid);
-    });
     auto updateSurfaceSource = [this]() {
-        registerCurrentVolumeLevel();
         _surfaceCatalog->setSource(_state->objectStoreAttachment(), _state->currentVolume());
         updateCatalogSurfaceSources();
         LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
@@ -3075,7 +3049,7 @@ void CWindow::CreateWidgets(void)
         auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
         if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
         std::optional<std::string> head;
-        _surfaceCatalog->session()->read(row->source.attachment, [&](const auto& db, const auto& txn, const auto&) {
+        _surfaceCatalog->session()->read(row->source, [&](const auto& db, const auto& txn, const auto&) {
             if (const auto revision = db.currentObjectRevision(txn, active->id)) head = revision->uuid;
         });
         if (!head || (known && known->objectRevision == *head)) {
@@ -4610,6 +4584,7 @@ bool CWindow::OpenVolume(const QString& path,
     QString loadError;
     try {
         vc::project::LoadOptions options;
+        options.catalog = vc3d::opendata::cachedCatalog();
         package = VolumePkg::load(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
@@ -4828,37 +4803,6 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
     settings.setValue(key, volumeId);
 }
 
-const vcr::catalog::OpenDataManifest* CWindow::cachedOpenDataManifest() const
-{
-    if (_openDataManifestCache) {
-        return &*_openDataManifestCache;
-    }
-    if (_openDataManifestLoadAttempted) {
-        return nullptr;
-    }
-    _openDataManifestLoadAttempted = true;
-
-    const auto manifestPath = openDataCatalogManifestCachePath();
-    if (manifestPath.empty() || !std::filesystem::is_regular_file(manifestPath)) {
-        return nullptr;
-    }
-
-    try {
-        _openDataManifestCache = vcr::catalog::loadOpenDataManifestFile(
-            manifestPath,
-            std::string(vcr::catalog::kDefaultManifestUrl));
-        return &*_openDataManifestCache;
-    } catch (const std::exception& ex) {
-        Logger()->warn("Failed to load cached open-data manifest '{}': {}",
-                       manifestPath.string(), ex.what());
-    } catch (...) {
-        Logger()->warn("Failed to load cached open-data manifest '{}': unknown error",
-                       manifestPath.string());
-    }
-
-    return nullptr;
-}
-
 std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std::string& from, const std::string& to) const
 {
     // The store's resolution (catalog registrations, its own and its route
@@ -4868,15 +4812,12 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std:
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             transforms = db.volumeTransforms(txn);
         });
-    } else if (const auto* manifest = cachedOpenDataManifest()) {
-        transforms.graph.addCatalog(*manifest);
+    } else if (const auto catalog = vc3d::opendata::cachedCatalog()) {
+        transforms.graph.addCatalog(*catalog);
     }
-    // Open Data levels are related to their catalog volume (the store may not
-    // have registered one yet: no or read-only store, not opened since).
-    const auto shown = [&](const std::string& id) {
-        return _state->vpkg() ? vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(id)) : std::nullopt;
-    };
-    return vc3d::opendata::volumeToVolume(std::move(transforms), from, shown(from), to, shown(to));
+    const auto resolution = transforms.resolve(from, to);
+    if (resolution.status != vcr::catalog::TransformStatus::Resolved) return std::nullopt;
+    return resolution.resolved().forward;
 }
 
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)

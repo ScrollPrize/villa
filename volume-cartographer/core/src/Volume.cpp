@@ -1415,13 +1415,12 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
                 "or trustworthy native voxel size metadata");
         }
 
-        std::string descriptiveId = id;
-        if (vol->metadata_.contains("uuid") && vol->metadata_["uuid"].is_string() &&
-            !vol->metadata_["uuid"].get_string().empty()) {
-            descriptiveId = vol->metadata_["uuid"].get_string();
-        }
-        vol->metadata_["uuid"] = deriveRebasedRemoteVolumeId(
-            descriptiveId, remoteUrl, spec.baseScaleLevel);
+        // A caller's uuid (the catalog's level volume) names this view;
+        // otherwise it gets one of its own.
+        const bool named = metadata.is_object() && metadata.contains("uuid") && metadata["uuid"].is_string() &&
+                           !metadata["uuid"].get_string().empty();
+        if (!named)
+            vol->metadata_["uuid"] = deriveRebasedRemoteVolumeId(vol->id(), remoteUrl, spec.baseScaleLevel);
     }
 
     return vol;

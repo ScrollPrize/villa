@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
+#include <vc_reader/catalog.hpp>
 
 #include "vc/core/util/Rect3D.hpp"
 #include "AnnotationFrame.hpp"
@@ -51,9 +52,9 @@ public:
     std::optional<vc::objects::AttachmentIdentity> objectStoreAttachment() const;
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
-    // A read-only catalog store (one per Open Data sample) beside the user's,
-    // attached on first use; only the catalog importer writes to it.
-    vc::objects::AttachmentIdentity catalogAttachment(const std::filesystem::path& path);
+    // The sample's catalog store (vc::objects::attachCatalog) beside the
+    // user's, attached on first use and read-only to callers.
+    vc::objects::AttachmentIdentity catalogAttachment(const vcr::catalog::OpenDataSample& sample);
     void pollObjectStoreChanges();
 
     // --- VolumePkg ---
@@ -137,7 +138,7 @@ private:
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
     std::optional<vc::objects::AttachmentIdentity> _objectStoreAttachment;
-    std::map<std::filesystem::path, vc::objects::AttachmentIdentity> _catalogAttachments;
+    std::map<std::string, vc::objects::AttachmentIdentity> _catalogAttachments;  // by sample id
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;

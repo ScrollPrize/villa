@@ -12,6 +12,11 @@ std::filesystem::path cachedOpenDataManifestPath()
     return std::filesystem::path(base.toStdString()) / "open-data-catalog" / "metadata.json";
 }
 
+std::shared_ptr<const vcr::catalog::OpenDataManifest> cachedCatalog()
+{
+    return vcr::catalog::cachedManifest(cachedOpenDataManifestPath());
+}
+
 bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const
 {
     if (!volumeIds)

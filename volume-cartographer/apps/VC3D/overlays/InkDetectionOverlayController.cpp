@@ -4,7 +4,7 @@
 #include "../VolumeViewerCmaps.hpp"
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ObjectStoreRegions.hpp"
-#include "../OpenDataSurfaceStore.hpp"
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include "../SurfaceCatalog.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
@@ -321,9 +321,10 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
     std::vector<Option> next;
     if (const auto* row = _catalog && !nextSegmentKey.empty() ? _catalog->row(nextSegmentKey) : nullptr) {
         try {
-            const auto artifacts = _catalog->session()->artifactDirectory(row->source.attachment, nextSegmentKey, false);
-            for (const auto& detection : vc3d::opendata::inkDetections(nlohmann::json::parse(row->record.meta), artifacts)) {
-                next.push_back({QString::fromStdString(detection.label), detection.url, detection.file});
+            if (const auto reference = vc::objects::catalogReference(row->record)) {
+                const auto artifacts = _catalog->session()->artifactDirectory(row->source, nextSegmentKey, false);
+                for (const auto& file : reference->files)
+                    next.push_back({QString::fromStdString(file.label), file.name, artifacts / file.name});
             }
         } catch (const std::exception&) {
             next.clear();
@@ -385,14 +386,15 @@ void InkDetectionOverlayController::loadSelectedImage()
         if (option == _options.end() || _fetchingPath == _selectedPath) {
             return;
         }
+        const auto* row = _catalog ? _catalog->row(_selectedSegmentKey) : nullptr;
+        if (!row) return;
         _fetchingPath = _selectedPath;
-        const vc3d::opendata::InkDetection detection{option->label.toStdString(), {}, option->url, option->localPath};
         vc3d::store::background<bool>(this,
-            [detection]() {
-                vc3d::opendata::fetchInkDetection(detection);
+            [session = _catalog->session(), attachment = row->source, uuid = _selectedSegmentKey, name = option->name]() {
+                vc::objects::publishedFile(*session, attachment, uuid, name);
                 return true;
             },
-            [this, path = detection.file](vc3d::store::Outcome<bool> result) {
+            [this, path = _selectedPath](vc3d::store::Outcome<bool> result) {
                 _fetchingPath.clear();
                 if (result.error.isEmpty() && _selectedPath == path) {
                     loadSelectedImage();

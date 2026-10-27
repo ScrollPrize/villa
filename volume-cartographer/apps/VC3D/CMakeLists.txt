@@ -76,8 +76,6 @@ set(srcs
     OpenDataVolumeOrientation.hpp
     OpenDataNormalGrids.cpp
     OpenDataNormalGrids.hpp
-    OpenDataSurfaceStore.cpp
-    OpenDataSurfaceStore.hpp
     VolumeRegistrations.cpp
     VolumeRegistrations.hpp
     SurfaceAreaCalculator.cpp
