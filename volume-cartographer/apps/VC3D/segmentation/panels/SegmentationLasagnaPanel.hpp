@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QSet>
 #include <QMetaObject>
 #include <QStringList>
 #include <QWidget>
@@ -242,5 +241,4 @@ private:
     CState* _state{nullptr};
     SurfaceCatalog* _surfaceCatalog{nullptr};
     QMetaObject::Connection _stateSurfaceChangedConnection;
-    QSet<QString> _submittedOutputNames;
 };

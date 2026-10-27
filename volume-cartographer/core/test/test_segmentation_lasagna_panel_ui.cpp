@@ -353,10 +353,11 @@ int main(int argc, char** argv)
         1,
         2,
         3);
-    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_v003")),
-            "New-model launch should version after the volume's surfaces of that name");
-    require(statusBar.currentMessage().contains(QStringLiteral("sheet_v003")),
-            "New-model launch status should include the generated output name");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("output_name")].toString() == QStringLiteral("sheet") &&
+                g_lastLasagnaOptimizationRequest[QStringLiteral("output_name_mode")].toString() == QStringLiteral("version"),
+            "New-model launch should ask the service for the next version of the root name");
+    require(statusBar.currentMessage().contains(QStringLiteral("sheet")),
+            "New-model launch status should name the output root");
     require(g_lastLasagnaOptimizationRequest[QStringLiteral("volume_uuid")].toString() ==
                 QStringLiteral("lasagna-test-volume"),
             "Launches should name the volume their surfaces are in");
@@ -446,10 +447,11 @@ int main(int argc, char** argv)
         4,
         5,
         6);
-    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_off2")),
-            "Offset launch should reserve the next collision-free offset output name");
-    require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2")),
-            "Offset launch status should include the generated offset output name");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("output_name")].toString() == QStringLiteral("sheet") &&
+                g_lastLasagnaOptimizationRequest[QStringLiteral("output_name_mode")].toString() == QStringLiteral("offset"),
+            "Offset launch should ask the service for the next free offset of the root name");
+    require(statusBar.currentMessage().contains(QStringLiteral("offset of sheet")),
+            "Offset launch status should name the output root");
     QJsonObject jobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
     QJsonObject jobConfig = jobSpec[QStringLiteral("config")].toObject();
     require(!jobConfig.contains(QStringLiteral("offset_value")),

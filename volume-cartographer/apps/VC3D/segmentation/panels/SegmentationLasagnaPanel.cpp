@@ -148,30 +148,6 @@ QString lasagnaRootName(QString name)
     return offset >= 0 ? name.left(offset) : name;
 }
 
-// The first free `<root><infix><N>` (N from 1), or after the highest taken
-// version when `afterHighest` (root_v001, root_v002, ...).
-QString nextOutputName(const QString& root, const QString& infix, const QSet<QString>& taken,
-                       bool afterHighest, int width)
-{
-    int next = 1;
-    if (afterHighest) {
-        const QRegularExpression pattern(
-            QStringLiteral("^%1%2(\\d+)$").arg(QRegularExpression::escape(root), QRegularExpression::escape(infix)));
-        for (const QString& name : taken) {
-            if (const auto match = pattern.match(name); match.hasMatch()) {
-                next = std::max(next, match.captured(1).toInt() + 1);
-            }
-        }
-    }
-    const auto candidate = [&](int n) {
-        return root + infix + QStringLiteral("%1").arg(n, width, 10, QLatin1Char('0'));
-    };
-    while (taken.contains(candidate(next))) {
-        ++next;
-    }
-    return candidate(next);
-}
-
 // The segmentation surface's catalog row, when it is a stored surface.
 const SurfaceCatalog::Row* activeSurfaceRow(CState* state, const SurfaceCatalog* catalog)
 {
@@ -199,17 +175,6 @@ QJsonArray linkedSurfacesOf(const SurfaceCatalog::Row& row, const SurfaceCatalog
 }
 
 // Names outputs must not reuse: the volume's surfaces and outputs already requested.
-QSet<QString> takenOutputNames(const SurfaceCatalog* catalog, const QSet<QString>& submitted)
-{
-    QSet<QString> taken = submitted;
-    if (catalog) {
-        for (const auto& [uuid, row] : catalog->rows()) {
-            taken.insert(QString::fromStdString(row.record.name));
-        }
-    }
-    return taken;
-}
-
 }  // namespace
 
 SegmentationLasagnaPanel::SegmentationLasagnaPanel(
@@ -1539,8 +1504,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     } else if (activeRow) {
         rootName = lasagnaRootName(QString::fromStdString(activeRow->record.name));
     }
-    const QSet<QString> takenNames = takenOutputNames(_surfaceCatalog, _submittedOutputNames);
-    QString outputName = nextOutputName(rootName, QStringLiteral("_v"), takenNames, true, 3);
+    // The service names the result in its store: the next free version of the
+    // root, or (offset mode) the first free offset of it.
+    QString outputNameMode = QStringLiteral("version");
 
     QJsonObject config;
     QString configText;
@@ -1631,9 +1597,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
               << " offset=" << offsetVal << std::endl;
 
     if (isOffsetMode && activeRow) {
-        outputName = nextOutputName(rootName, QStringLiteral("_off"), takenNames, false, 1);
+        outputNameMode = QStringLiteral("offset");
         std::cerr << "[lasagna] offset mode: offset=" << offsetVal
-                  << " outputName=" << outputName.toStdString() << std::endl;
+                  << " outputName=" << rootName.toStdString() << "_off<N>" << std::endl;
     }
 
     if (state && state->pointCollection()) {
@@ -1679,7 +1645,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("single_segment")] = true;
     request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
-    request[QStringLiteral("output_name")] = outputName;
+    request[QStringLiteral("output_name")] = rootName;
+    request[QStringLiteral("output_name_mode")] = outputNameMode;
     request[QStringLiteral("volume_uuid")] = QString::fromStdString(_surfaceCatalog->volume()->id());
     if (!volumeShapeZyx.isEmpty()) {
         request[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx;
@@ -1734,10 +1701,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
               << std::endl;
 
     mgr.startOptimization(request);
-    _submittedOutputNames.insert(outputName);
     showStatus(
-        tr("Lasagna optimization started. Output: %1")
-            .arg(outputName),
+        tr("Lasagna optimization started. Output: the next %1 of %2")
+            .arg(outputNameMode == QStringLiteral("offset") ? tr("offset") : tr("version"), rootName),
         3000);
     return SubmissionResult::success();
 }
