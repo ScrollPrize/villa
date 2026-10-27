@@ -113,44 +113,6 @@ struct DistLoss2D {
     }
 };
 
-struct SignedDistanceToSurfaceCost {
-    using Sampler = std::function<float(const cv::Vec3f&)>;
-
-    SignedDistanceToSurfaceCost(Sampler sampler, double weight, float max_move)
-        : sampler_(std::move(sampler)), weight_(weight), max_move_(max_move) {}
-
-    bool operator()(const double* candidate, double* residual) const {
-        if (!sampler_ || weight_ <= 0.0) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (!std::isfinite(candidate[0]) || !std::isfinite(candidate[1]) || !std::isfinite(candidate[2])) {
-            residual[0] = 0.0;
-            return true;
-        }
-        const cv::Vec3f p(static_cast<float>(candidate[0]),
-                          static_cast<float>(candidate[1]),
-                          static_cast<float>(candidate[2]));
-        float dist = sampler_(p);
-        if (!std::isfinite(dist)) {
-            residual[0] = 0.0;
-            return true;
-        }
-        if (max_move_ > 0.0f) {
-            dist = std::clamp(dist, -max_move_, max_move_);
-        }
-        residual[0] = weight_ * static_cast<double>(dist);
-        return true;
-    }
-
-private:
-    Sampler sampler_;
-    double weight_;
-    float max_move_;
-};
-
-
-
 struct StraightLoss {
     StraightLoss(float w) : _w(w) {};
     static constexpr double kStraightAngleCosThreshold = 0.86602540378443864676; // cos(30°); deviations beyond 30° incur penalty
