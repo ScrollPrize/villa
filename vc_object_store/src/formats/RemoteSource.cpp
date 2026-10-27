@@ -1,25 +1,13 @@
 #include "formats/RemoteSource.hpp"
+#include <vc_reader/catalog.hpp>
 #include <vc_reader/native/http.hpp>
 #include <fstream>
 
 namespace vc::objects::formats {
-namespace {
-std::string httpLocation(std::string location)
-{
-    while (location.size() > 1 && location.back() == '/') location.pop_back();
-    if (location.starts_with("s3://")) {
-        const auto rest = location.substr(5);
-        const auto slash = rest.find('/');
-        if (slash == std::string::npos) throw std::invalid_argument("missing S3 key: " + location);
-        location = "https://" + rest.substr(0, slash) + ".s3.amazonaws.com/" + rest.substr(slash + 1);
-    }
-    return location;
-}
-}
-
 void fetchRemoteSurface(const std::string& location, const std::filesystem::path& directory)
 {
-    const auto base = httpLocation(location);
+    auto base = vcr::catalog::resolveOpenDataUrl(location);
+    while (base.size() > 1 && base.back() == '/') base.pop_back();
     vcr::HttpClient client(vcr::HttpOptions{});
     for (const auto& [name, required] : std::initializer_list<std::pair<const char*, bool>>{
              {"meta.json", true}, {"x.tif", true}, {"y.tif", true}, {"z.tif", true},

@@ -112,6 +112,7 @@ NB_MODULE(_catalog,m) {
         return result.manifest;
     },nb::arg("source"),nb::arg("cache")="",nb::arg("refresh")=false,nb::arg("max_age")=3600.,nb::arg("timeout")=60.);
     m.def("join_url",&joinOpenDataUrl);
+    m.def("to_s3",&openDataS3Url);
     m.def("to_https",[](const std::string& url)->std::optional<std::string>{
         if(url.starts_with("http://")||url.starts_with("https://")||url.starts_with("s3://")||url.starts_with("s3+"))return resolveOpenDataUrl(url);
         return std::nullopt;

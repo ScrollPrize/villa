@@ -358,7 +358,11 @@ struct OpenDataManifest {
 
 
 
+// The https:// location of an s3:// URL (public channels by their published
+// rewrite, other buckets by region: s3+REGION://); other URLs are unchanged.
 [[nodiscard]] std::string resolveOpenDataUrl(std::string url);
+// The s3:// form of a URL in a public channel (or already s3://), else nullopt.
+[[nodiscard]] std::optional<std::string> openDataS3Url(std::string url);
 [[nodiscard]] std::string joinOpenDataUrl(std::string root, std::string path);
 
 [[nodiscard]] const OpenDataArtifact* findArtifact(

@@ -751,17 +751,17 @@ OpenDataManifest loadOpenDataManifestFile(const std::filesystem::path& manifestP
     return parseOpenDataManifest(readCatalogFile(manifestPath), std::move(manifestUrl));
 }
 
+// The public channels' s3:// and https:// roots, as the scrollprize.org data
+// browser rewrites them.
+constexpr std::pair<std::string_view, std::string_view> kPublicChannels[] = {
+    {"s3://vesuvius-challenge-open-data/", "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/"},
+    {"s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"},
+};
+
 std::string resolveOpenDataUrl(std::string url)
 {
-    constexpr std::string_view openDataS3 = "s3://vesuvius-challenge-open-data/";
-    constexpr std::string_view challengeS3 = "s3://vesuvius-challenge/";
-    if (startsWith(url, openDataS3)) {
-        return "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/" +
-               url.substr(openDataS3.size());
-    }
-    if (startsWith(url, challengeS3)) {
-        return "https://data.aws.ash2txt.org/samples/" + url.substr(challengeS3.size());
-    }
+    for (const auto& [s3, https] : kPublicChannels)
+        if (startsWith(url, s3)) return std::string(https) + url.substr(s3.size());
     if (startsWith(url, "s3://") || startsWith(url, "s3+")) {
         const auto scheme = url.find("://");
         if (scheme == std::string::npos) return url;
@@ -772,6 +772,14 @@ std::string resolveOpenDataUrl(std::string url)
                (slash == std::string::npos ? "" : path.substr(slash));
     }
     return url;
+}
+
+std::optional<std::string> openDataS3Url(std::string url)
+{
+    if (startsWith(url, "s3://")) return url;
+    for (const auto& [s3, https] : kPublicChannels)
+        if (startsWith(url, https)) return std::string(s3) + url.substr(https.size());
+    return std::nullopt;
 }
 
 std::string joinOpenDataUrl(std::string root, std::string path)

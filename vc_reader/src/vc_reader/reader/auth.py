@@ -55,11 +55,7 @@ def http_url(url: str) -> str:
         return url
     from ..artifacts import to_https
 
-    https = to_https(url)
-    if https is None:
-        bucket, _, key = url[len("s3://"):].partition("/")
-        https = f"https://{bucket}.s3.amazonaws.com/{key}"
-    return https
+    return to_https(url)
 
 
 def split_s3(url: str) -> tuple[str, str]:

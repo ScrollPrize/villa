@@ -12,16 +12,6 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 from . import _catalog
 
-OPEN_DATA_S3_ROOT = "s3://vesuvius-challenge-open-data"
-OPEN_DATA_HTTPS_ROOT = "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com"
-
-# s3:// <-> https:// equivalences for the two public channels. These match the
-# rewrites used by the scrollprize.org data browser (src/data/atlasDataAccess.json).
-HTTPS_REWRITES: tuple[tuple[str, str], ...] = (
-    (OPEN_DATA_S3_ROOT + "/", OPEN_DATA_HTTPS_ROOT + "/"),
-    ("s3://vesuvius-challenge/", "https://data.aws.ash2txt.org/samples/"),
-)
-
 
 class ArtifactType:
     """Artifact ``type`` strings documented by metadata.schema.json.
@@ -80,13 +70,8 @@ def to_https(url: str) -> str | None:
 
 
 def to_s3(url: str) -> str | None:
-    """``s3://`` form of ``url``, or None if it is not under a known bucket."""
-    if url.startswith("s3://"):
-        return url
-    for s3, https in HTTPS_REWRITES:
-        if url.startswith(https):
-            return s3 + url[len(https):]
-    return None
+    """``s3://`` form of ``url``, or None if it is not in a public channel."""
+    return _catalog.to_s3(url)
 
 
 @dataclass(frozen=True)
