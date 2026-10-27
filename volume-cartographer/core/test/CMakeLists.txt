@@ -81,7 +81,7 @@ vc_add_test(NAME test_surface_area_units)
 
 vc_add_test(NAME test_voxel_size_metadata)
 
-vc_add_test(NAME test_appendmask_render)
+vc_add_test(NAME test_read_interpolated_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
 

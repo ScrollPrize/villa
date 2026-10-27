@@ -78,7 +78,7 @@ void AgentBridgeServer::registerEditingHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segmentation.grow_patch_from_seed"),
+            .name = QStringLiteral("segmentation.grow_surface_from_seed"),
             .params = {
                 Params::requiredObject(
                     QStringLiteral("seed"),
@@ -101,7 +101,7 @@ void AgentBridgeServer::registerEditingHandlers()
                 -32009,
             },
             .mcp = Mcp::snakeCase(
-                QStringLiteral("vc3d_grow_patch_from_seed"),
+                QStringLiteral("vc3d_grow_surface_from_seed"),
                 {QStringLiteral("wait")}),
         },
         [this](const QJsonValue& p) {

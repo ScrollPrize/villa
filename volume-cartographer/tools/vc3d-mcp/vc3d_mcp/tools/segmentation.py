@@ -88,7 +88,7 @@ async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
 async def vc3d_save_segment(
     wait: bool = True, ctx: Optional[Context] = None
 ) -> dict[str, Any]:
-    """Force the active segment's pending autosave to disk now.
+    """Write the active segment's pending edits to the store now.
 
     Segment edits are normally flushed by a periodic autosave; this forces that
     flush immediately (the programmatic equivalent of not waiting for the timer).
@@ -139,7 +139,7 @@ async def vc3d_grow_segment(
 
 
 @mcp.tool()
-async def vc3d_grow_patch_from_seed(
+async def vc3d_grow_surface_from_seed(
     seed: Point3D,
     volume_id: Optional[str] = None,
     iterations: int = 200,
@@ -148,20 +148,20 @@ async def vc3d_grow_patch_from_seed(
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
-    """Create a brand-new segment by growing a patch from a 3D seed point
+    """Create a new surface by growing it from a 3D seed point
     (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the
     finished job's output.
 
     seed: volume-space {"x","y","z"} seed point.
     volume_id: vpkg volume id; default is the current volume.
     iterations: 1..100000, default 200 ("generations" in the underlying tool).
-    min_area_cm: minimum patch area in cm^2, >= 0.
+    min_area_cm: minimum surface area in cm^2, >= 0.
     output_tag: tag of the new surface (default "paths").
     wait: if true (MCP-server-side only), block until the job finishes
     (30-minute cap) and return the terminal job.status inline.
     """
     result = await _call(
-        "segmentation.grow_patch_from_seed",
+        "segmentation.grow_surface_from_seed",
         _strip_none(
             {
                 "seed": seed,

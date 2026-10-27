@@ -534,7 +534,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::TifStack;
 
     // volumeId: optional; validated here so a bad id is a clean -32007 before the
-    // job is registered (mirrors segmentation.grow_patch_from_seed).
+    // job is registered (mirrors segmentation.grow_surface_from_seed).
     rp.volumeId = p.value("volumeId").toString();
     if (!rp.volumeId.isEmpty()) {
         const auto ids = state->vpkg()->volumeIDs();

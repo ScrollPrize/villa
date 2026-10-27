@@ -31,7 +31,7 @@ async def vc3d_render_tifxyz(
     This choice is the headline capability over the GUI, which only produces a
     TIFF stack.
     volume_id: vpkg volume id; default is the current volume.
-    output_dir: absolute path, or relative to the volpkg root. Default is the
+    output_dir: absolute path, or relative to the project's directory. Default is the
     surface's artifact directory (output lands in <artifacts>/layers or
     <artifacts>/surface.zarr).
     scale: pixels per level-g voxel, > 0 (default 1.0).

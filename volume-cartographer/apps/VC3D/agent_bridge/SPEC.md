@@ -333,7 +333,7 @@ Methods on segments need an attached store and an open volume (-32000).
 - Manual-add begin/finish, line mode, interpolation, undo, correction point
   mode, push/pull, and synthetic canvas input all use the active
   `SegmentationModule` session.
-- `segmentation.grow_patch_from_seed`, tracing, rendering, and reoptimization
+- `segmentation.grow_surface_from_seed`, tracing, rendering, and reoptimization
   use the existing command-runner lifecycle and never open the interactive
   console or parameter dialogs.
 
@@ -363,8 +363,7 @@ and never open file pickers.
   shared `tool` source.
 - SLIM, ABF, and straighten share the `flatten` source and application
   lifecycle.
-- Crop and area recalculation are synchronous. Mask generation and append use
-  deferred completion from the in-process renderer.
+- Crop and area recalculation are synchronous.
 - Result paths are returned only after successful launch or completion.
 
 ## MCP behavior
@@ -440,7 +439,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
-| `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
+| `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
@@ -481,7 +480,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_run_trace` | `tracer.run_trace` |
 | `vc3d_save_points_json` | `points.save_json` |
-| `vc3d_save_segment` | `segmentation.save` | Force the active segment's pending autosave to disk. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
+| `vc3d_save_segment` | `segmentation.save` | Write the active segment's pending edits to the store now. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
 | `vc3d_seeding_cancel` | `seeding.cancel` |

@@ -1,10 +1,6 @@
-// Regression test for the SIGSEGV in CWindow::onAppendMaskPressed →
-// render_image_from_coords → Volume::sample → readInterpolated3D path.
-//
-// The crash mechanism: callers passed a default-constructed
-// cv::Mat_<uint8_t> img to render_image_from_coords. Down the chain the
-// inner pixel-write loop in Slicing.cpp dereferenced out.ptr<T>(y) on the
-// empty Mat, which is nullptr — fault at addr 0x0 on the very first row.
+// readInterpolated3D (under render_image_from_coords and Volume::sample) with
+// an empty output Mat: the pixel-write loop must size it before writing rows,
+// or out.ptr<T>(y) on the empty Mat faults on the first row.
 //
 // These tests exercise readInterpolated3D directly with a stub
 // IChunkedArray that returns AllFill (no real volume data needed). They

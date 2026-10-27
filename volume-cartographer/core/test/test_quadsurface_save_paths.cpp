@@ -37,16 +37,16 @@ cv::Mat_<cv::Vec3f> grid(int rows = 8, int cols = 8, float z = 0.f)
 
 } // namespace
 
-TEST_CASE("new patch UUID survives metadata and geometry saves")
+TEST_CASE("new surface UUID survives metadata and geometry saves")
 {
     auto root = tmpDir("identity");
-    auto segDir = root / "named_patch";
+    auto segDir = root / "named_surface";
     QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
     created.save(segDir);
     QuadSurface loaded(segDir);
     const std::string uuid = loaded.meta["uuid"].get_string();
     CHECK(vc::objects::util::isUuid(uuid));
-    CHECK(loaded.id == "named_patch");
+    CHECK(loaded.id == "named_surface");
     loaded.ensureLoaded();
     loaded.saveOverwrite();
     CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);

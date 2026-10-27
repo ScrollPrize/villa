@@ -62,7 +62,7 @@ async def vc3d_reoptimize_segment(
     (30-minute cap) and return the terminal job.status inline.
 
     Returns {"jobId", "kind": "segment.reoptimize", "source": "tool",
-    "outputDir", "volumeId"}.
+    "volumeId"}; the new surface's UUID is the finished job's output.
     """
     result = await _call(
         "segment.reoptimize",

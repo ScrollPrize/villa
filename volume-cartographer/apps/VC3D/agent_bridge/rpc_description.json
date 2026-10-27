@@ -2311,7 +2311,7 @@
         "type": "object"
       }
     },
-    "segmentation.grow_patch_from_seed": {
+    "segmentation.grow_surface_from_seed": {
       "errors": [
         -32602,
         -32000,
@@ -2331,7 +2331,7 @@
           "outputTag": "output_tag",
           "volumeId": "volume_id"
         },
-        "tool": "vc3d_grow_patch_from_seed"
+        "tool": "vc3d_grow_surface_from_seed"
       },
       "params": {
         "properties": {

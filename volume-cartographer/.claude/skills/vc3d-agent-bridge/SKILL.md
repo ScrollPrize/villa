@@ -103,7 +103,7 @@ to the right tab/workspace (or activate that pane) before capturing.
 
 `seeding.run`/`seeding.expand` spawn `vc_grow_seg_from_seed` once per source
 point / expansion iteration in store mode, same underlying tool as
-`vc3d_grow_patch_from_seed`. Two things that will bite you, both about the
+`vc3d_grow_surface_from_seed`. Two things that will bite you, both about the
 config VC3D resolves, not the points you commit:
 
 - **New surfaces go to the attached object store, and `seed.json` (or
@@ -116,7 +116,7 @@ config VC3D resolves, not the points you commit:
   yourself.
 - **`normal_grid_path` inside that file is a static local path, with no
   awareness of remote/streaming normal-grid stores** — this is a real,
-  currently-open gap (unlike `vc3d_grow_patch_from_seed`, which resolves
+  currently-open gap (unlike `vc3d_grow_surface_from_seed`, which resolves
   normal grids dynamically and does support remote stores). To seed a remote
   volume, point `normal_grid_path` at the already-fetched local cache dir for
   that sample's normal grid: `~/.VC3D/remote_cache/normal_grids/<sampleId>/

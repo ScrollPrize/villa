@@ -295,7 +295,7 @@ private:
         QString id;          // "job-<n>"
         int     num = 0;     // monotonic order key (parsed-free "most recent" sort)
         QString source;      // fixed lifecycle source reported over the wire
-        QString kind;        // "segmentation.grow", "segmentation.grow_patch_from_seed", ...
+        QString kind;        // "segmentation.grow", "segmentation.grow_surface_from_seed", ...
         QString label;
         QString state;       // "running" | "succeeded" | "failed"
         QString message;

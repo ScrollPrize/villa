@@ -486,8 +486,8 @@ Multipage/volume/non-top-left TIFFs are rejected as channels. Native export
 writes each channel back as `<name>.tif` with the same samples and `valid` as a
 single-page `mask.tif` (255/0).
 
-Ingestion ignores tifxyz `overlapping.json`: surface overlaps are relationships
-made by the linking tools (`surface-overlap` detector).
+Surface overlaps are relationships made by the linking tools (`surface-overlap`
+detector).
 
 `update_surface_channels(uuid, channels, remove, expected_revision, edge_edits=[])`
 adds/replaces/removes channels atomically. Supply only changed arrays and exact

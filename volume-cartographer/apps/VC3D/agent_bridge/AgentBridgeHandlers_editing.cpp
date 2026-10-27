@@ -584,7 +584,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
         : gp.volumeId;
 
     const QString jobId = beginJob(QStringLiteral("tool"),
-                                   QStringLiteral("segmentation.grow_patch_from_seed"),
+                                   QStringLiteral("segmentation.grow_surface_from_seed"),
                                    QStringLiteral("GrowPatch from seed"),
                                    /*broadcastStart=*/false);
 
@@ -602,7 +602,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
 
     QJsonObject result;
     result["jobId"] = jobId;
-    result["kind"] = "segmentation.grow_patch_from_seed";
+    result["kind"] = "segmentation.grow_surface_from_seed";
     result["volumeId"] = effectiveVolumeId;
     return result;
 }

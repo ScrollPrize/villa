@@ -292,7 +292,6 @@ private slots:
             runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
         QCOMPARE(arguments.count("--zarr-output"), 1);
         QCOMPARE(arguments.count("--tif-output"), 1);
-        QVERIFY(!arguments.contains("--include-tifs"));
 
         const int tifOption = arguments.indexOf("--tif-output");
         QVERIFY(tifOption >= 0 && tifOption + 1 < arguments.size());
@@ -316,7 +315,6 @@ private slots:
             runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
         QCOMPARE(arguments.count("--tif-output"), 1);
         QCOMPARE(arguments.count("--zarr-output"), 0);
-        QVERIFY(!arguments.contains("--include-tifs"));
     }
 
     void renderReadsTheStoredSurface()

@@ -3,7 +3,7 @@ vc_calc_surface_metrics can calculate surface metrics from point collection grou
 
 # Workflow
 - annotate sets of relative windings (intra and inter winding), see below
-- take a patch or surface that should be evaluated; the metric tools read tifxyz directories, so export a stored surface first:
+- take a surface that should be evaluated; the metric tools read tifxyz directories, so export a stored surface first:
     ```shell
     vc_object_export --db <objects.vcobj> --uuid <surface uuid> --output <tifxyz_path>
     ```

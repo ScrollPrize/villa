@@ -171,7 +171,7 @@ def run_offscreen(args) -> dict:
         # We discover the viewer's real current Z live via
         # canvas.get_cursor_volume_point and use it for canvas ops, while
         # still using the true curated 3D seed for the real
-        # segmentation.grow_patch_from_seed call below (unaffected by this
+        # segmentation.grow_surface_from_seed call below (unaffected by this
         # viewer-plane quirk since that path takes a seed directly).
         canvas_point = dict(LOCAL_REAL_SEED)
         if target_viewer:
@@ -274,7 +274,7 @@ def run_offscreen(args) -> dict:
                      e.code == -32009 and hint_ok,
                      f"code={e.code} message={e.message} data={e.data}")
 
-        # 8. segmentation.grow_patch_from_seed -- the real headless GrowPatch
+        # 8. segmentation.grow_surface_from_seed -- the real headless GrowPatch
         # path; does not require an active surface. Uses a small iteration
         # count to keep the real vc_grow_seg_from_seed run bounded.
         job_id = None
@@ -286,14 +286,14 @@ def run_offscreen(args) -> dict:
         grow_seed = LOCAL_REAL_SEED_OFFSCREEN_REVERIFY
         try:
             grow_started_at = time.monotonic()
-            r, dt = client.call("segmentation.grow_patch_from_seed",
+            r, dt = client.call("segmentation.grow_surface_from_seed",
                                  {"seed": grow_seed, "volumeId": LOCAL_RAW_VOLUME_ID,
                                   "iterations": args.grow_iterations, "minAreaCm": 0.002},
                                  timeout=30.0)
             job_id = r.get("jobId")
-            rec.step("segmentation.grow_patch_from_seed (started)", job_id is not None, json.dumps(r))
+            rec.step("segmentation.grow_surface_from_seed (started)", job_id is not None, json.dumps(r))
         except BridgeError as e:
-            rec.step("segmentation.grow_patch_from_seed (started)", False,
+            rec.step("segmentation.grow_surface_from_seed (started)", False,
                       f"code={e.code} message={e.message} data={e.data}")
 
         # 8b. Generalized job model: job.status carries a "source"
@@ -347,7 +347,7 @@ def run_offscreen(args) -> dict:
                     break
                 time.sleep(2.0)
             e2e_seconds = time.monotonic() - grow_started_at
-            rec.step("segmentation.grow_patch_from_seed (completed within timeout)",
+            rec.step("segmentation.grow_surface_from_seed (completed within timeout)",
                      last_state in ("succeeded", "failed"),
                      f"final_state={last_state} elapsed={e2e_seconds:.1f}s")
             if grow_success:
@@ -357,7 +357,7 @@ def run_offscreen(args) -> dict:
                 rec.step("segments.list reflects real grown segment",
                          grew, f"before={initial_segment_count} after={len(new_ids)} new={sorted(new_ids - seg_ids)}")
             elif last_state == "failed":
-                rec.step("segmentation.grow_patch_from_seed outcome", False,
+                rec.step("segmentation.grow_surface_from_seed outcome", False,
                          f"job failed: {st.get('message')}; consoleTail={st.get('consoleTail')}")
         result["job_id"] = job_id
         result["grow_seed"] = grow_seed
@@ -398,7 +398,7 @@ def run_offscreen(args) -> dict:
         # purpose of a mutation test.
         run_segment_activation_proof(client, rec, seg_ids)
 
-        # 10c. Known footgun (also flagged for segmentation.grow_patch_from_seed
+        # 10c. Known footgun (also flagged for segmentation.grow_surface_from_seed
         # completion): activating a segment re-centers the viewers onto it
         # (CWindow::onSurfaceActivated's moveOnSurfaceChange path), so the stale
         # pre-activation canvas_point is very likely no longer "on" target_viewer's
@@ -588,12 +588,12 @@ def run_live(args) -> dict:
                                 "minAreaCm": 0.002}
                 if args.grow_volume_id:
                     grow_params["volumeId"] = args.grow_volume_id
-                r, dt = client.call("segmentation.grow_patch_from_seed", grow_params, timeout=30.0)
+                r, dt = client.call("segmentation.grow_surface_from_seed", grow_params, timeout=30.0)
                 job_id = r.get("jobId")
-                rec.step("segmentation.grow_patch_from_seed (started, live)", job_id is not None,
+                rec.step("segmentation.grow_surface_from_seed (started, live)", job_id is not None,
                           json.dumps(r))
             except BridgeError as e:
-                rec.step("segmentation.grow_patch_from_seed (started, live)", False,
+                rec.step("segmentation.grow_surface_from_seed (started, live)", False,
                           f"code={e.code} message={e.message} data={e.data}")
 
             if job_id:
@@ -608,7 +608,7 @@ def run_live(args) -> dict:
                 grow_e2e = time.monotonic() - grow_started_at
                 result["live_grow_e2e_seconds"] = grow_e2e
                 result["live_grow_final_state"] = last_state
-                rec.step("segmentation.grow_patch_from_seed reaches terminal state (live, no dialog hang)",
+                rec.step("segmentation.grow_surface_from_seed reaches terminal state (live, no dialog hang)",
                           last_state in ("succeeded", "failed"),
                           f"final_state={last_state} elapsed={grow_e2e:.2f}s")
                 if last_state == "succeeded":
@@ -620,7 +620,7 @@ def run_live(args) -> dict:
                               f"before={live_initial_segment_count} after={len(new_ids)} "
                               f"new={sorted(new_ids - live_seg_ids)}")
                 elif last_state == "failed":
-                    rec.step("segmentation.grow_patch_from_seed outcome (live)", False,
+                    rec.step("segmentation.grow_surface_from_seed outcome (live)", False,
                               f"job failed: {st.get('message')}; consoleTail={st.get('consoleTail')}")
 
                 # A live-mode ping right after job completion is a cheap way
@@ -711,7 +711,7 @@ def main() -> int:
                          help="explicit volumeId to pass to volume.open (live mode)")
     parser.add_argument("--grow-seed", type=json.loads, default=None,
                          help="JSON {x,y,z} seed: if set, live mode also runs a real "
-                              "segmentation.grow_patch_from_seed job-completion regression check")
+                              "segmentation.grow_surface_from_seed job-completion regression check")
     parser.add_argument("--grow-volume-id", default=None,
                          help="volumeId for the live --grow-seed check (defaults to whatever "
                               "volume.open selected)")
