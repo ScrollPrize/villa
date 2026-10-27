@@ -4,6 +4,8 @@
 #include "internal/Database.hpp"
 #include "internal/TransformedLength.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <limits>
 namespace vc::objects {
@@ -14,6 +16,44 @@ std::optional<VolumeAffine> VolumeTransforms::toVolume(const nlohmann::json& met
     const auto resolution=resolve(coordinates["volume_uuid"].get<std::string>(),target);
     if(resolution.status!=vcr::catalog::TransformStatus::Resolved)return std::nullopt;
     return VolumeAffine::scale(targetScale)*resolution.resolved().forward*VolumeAffine::scale(1./coordinates["scale_factor"].get<double>());
+}
+std::vector<VolumeTransforms::Related> VolumeTransforms::related(const std::string& target) const {
+    std::vector<Related> result;
+    for(auto& routes:graph.reaching(target)) {
+        Related entry;
+        entry.volume=routes.source;
+        entry.status=resolve(routes.source,target).status;
+        entry.routes=std::move(routes.candidates);
+        if(const auto chosen=choices.find({entry.volume,target});chosen!=choices.end())entry.chosen=chosen->second;
+        result.push_back(std::move(entry));
+    }
+    return result;
+}
+std::optional<ObjectRecord> volumeTransformChoice(const ObjectStore& store,const Txn& txn,const std::string& source,const std::string& target) {
+    for(const auto& existing:store.objectsByKind(txn,"volume_transform_choice")) {
+        const auto c=nlohmann::json::parse(existing.meta).at("choice");
+        if(c.at("source_volume")==source&&c.at("target_volume")==target)return existing;
+    }
+    return std::nullopt;
+}
+std::string registerVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
+    const std::string& target,const VolumeAffine& matrix,const std::string& name) {
+    const auto uuid=util::newUuid();
+    session.act(attachment,{{uuid,std::nullopt}},[&](auto& store,auto& txn){store.registerVolumeTransform(txn,source,target,matrix,name,uuid);});
+    return uuid;
+}
+std::string chooseVolumeTransform(ObjectStoreSession& session,const AttachmentIdentity& attachment,const std::string& source,
+    const std::string& target,const std::vector<std::string>& path) {
+    std::string uuid=util::newUuid();
+    std::optional<std::string> revision;
+    session.read(attachment,[&](const auto& store,const auto& txn,const auto&) {
+        if(const auto existing=volumeTransformChoice(store,txn,source,target)) {
+            uuid=existing->uuid;
+            revision=store.currentObjectRevision(txn,uuid)->uuid;
+        }
+    });
+    session.act(attachment,{{uuid,revision}},[&](auto& store,auto& txn){store.chooseVolumeTransform(txn,source,target,path,uuid);});
+    return uuid;
 }
 std::array<double,6> transformBounds(const std::array<double,6>& b,const VolumeAffine& m) {
     std::array<double,6> out;
@@ -104,10 +144,7 @@ std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& 
     (void)transforms.graph.resolve(source,target,path).resolved();
     ObjectRecord record;record.kind="volume_transform_choice";record.name=source+" -> "+target;
     if(uuid)record.uuid=*uuid;
-    for(const auto& existing:objectsByKind(txn,record.kind)) {
-        const auto c=nlohmann::json::parse(existing.meta).at("choice");
-        if(c.at("source_volume")==source&&c.at("target_volume")==target)record=existing;
-    }
+    if(auto existing=volumeTransformChoice(*this,txn,source,target))record=std::move(*existing);
     record.meta=nlohmann::json{{"choice",{{"source_volume",source},{"target_volume",target},{"path",path}}}}.dump();
     return upsertObject(txn,record);
 }
