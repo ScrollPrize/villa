@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
+cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 1.f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r)
@@ -31,7 +31,7 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
     return m;
 }
 
-std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 0.f)
+std::shared_ptr<QuadSurface> makeSurface(int rows = 16, int cols = 16, float z = 1.f)
 {
     return std::make_shared<QuadSurface>(makePlanarGrid(rows, cols, z), cv::Vec2f(1.f, 1.f));
 }
@@ -58,7 +58,7 @@ TEST_CASE("Default ctor is empty")
 TEST_CASE("rebuild populates surface and patch counts")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(8, 8, 0.f);
+    auto a = makeSurface(8, 8, 1.f);
     auto b = makeSurface(8, 8, 5.f);
     idx.rebuild({a, b});
     CHECK_FALSE(idx.empty());
@@ -97,7 +97,7 @@ TEST_CASE("locate point on the surface yields a result")
     idx.rebuild({a});
 
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f); // on the plane
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f); // on the plane
     q.tolerance = 0.5f;
     auto r = idx.locate(q);
     REQUIRE(r.has_value());
@@ -120,11 +120,11 @@ TEST_CASE("locate point off-surface returns nullopt")
 TEST_CASE("locateAll returns all hits within tolerance")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(16, 16, 0.f);
-    auto b = makeSurface(16, 16, 0.f); // coincident
+    auto a = makeSurface(16, 16, 1.f);
+    auto b = makeSurface(16, 16, 1.f); // coincident
     idx.rebuild({a, b});
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f);
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f);
     q.tolerance = 0.5f;
     auto rs = idx.locateAll(q);
     CHECK(rs.size() >= 1);
@@ -136,7 +136,7 @@ TEST_CASE("locateSurfaces deduplicates surface results")
     auto a = makeSurface(16, 16);
     idx.rebuild({a});
     SurfacePatchIndex::PointQuery q;
-    q.worldPoint = cv::Vec3f(4.f, 4.f, 0.f);
+    q.worldPoint = cv::Vec3f(4.f, 4.f, 1.f);
     q.tolerance = 0.5f;
     auto ss = idx.locateSurfaces(q);
     CHECK_FALSE(ss.empty());
@@ -150,8 +150,8 @@ TEST_CASE("forEachTriangle with TriangleQuery visits triangles inside the bounds
     idx.rebuild({a});
 
     SurfacePatchIndex::TriangleQuery q;
-    q.bounds.low = cv::Vec3f(0, 0, -1);
-    q.bounds.high = cv::Vec3f(8, 8, 1);
+    q.bounds.low = cv::Vec3f(0, 0, 0);
+    q.bounds.high = cv::Vec3f(8, 8, 2);
     int count = 0;
     idx.forEachTriangle(q,
         [&](const SurfacePatchIndex::TriangleCandidate& tc) {
@@ -256,10 +256,10 @@ TEST_CASE("generation advances after updateSurface")
 TEST_CASE("computePlaneIntersections returns segments for an intersecting plane")
 {
     SurfacePatchIndex idx;
-    auto a = makeSurface(16, 16, 0.f);
+    auto a = makeSurface(16, 16, 1.f);
     idx.rebuild({a});
 
-    PlaneSurface plane(cv::Vec3f(0, 0, 0), cv::Vec3f(0, 0, 1));
+    PlaneSurface plane(cv::Vec3f(0, 0, 1), cv::Vec3f(0, 0, 1));
     std::unordered_set<SurfacePatchIndex::SurfacePtr> targets{a};
     auto result = idx.computePlaneIntersections(plane, cv::Rect(0, 0, 16, 16), targets);
     // For a Z=0 surface intersected by Z=0 plane, every triangle should

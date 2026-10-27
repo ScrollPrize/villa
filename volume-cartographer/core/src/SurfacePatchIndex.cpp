@@ -858,24 +858,29 @@ struct SurfacePatchIndex::Impl {
         uint16_t hi[3];
     };
 
-    static uint16_t qEnc(float v) noexcept {
+    // Boxes are snapped outward (lower corners down, upper corners up), so a
+    // snapped box contains its geometry. The 0.01-step margin absorbs the
+    // float rounding of a snapped coordinate, so snapping a snapped box again
+    // returns it unchanged (removal matches boxes exactly).
+    static uint16_t qEnc(float v, bool upper) noexcept {
         if (!std::isfinite(v)) return 0;
-        float t = (v - kQLow) * (65535.0f / kQRange);
-        if (t < 0.0f) return 0;
-        if (t > 65535.0f) return 65535;
-        return static_cast<uint16_t>(t + 0.5f);
+        double t = (double(v) - kQLow) * (65535.0 / kQRange);
+        t = upper ? std::ceil(t - 0.01) : std::floor(t + 0.01);
+        if (t < 0.0) return 0;
+        if (t > 65535.0) return 65535;
+        return static_cast<uint16_t>(t);
     }
     static float qDec(uint16_t c) noexcept {
         return kQLow + float(c) * (kQRange / 65535.0f);
     }
     static QBox boxQuantize(const Box3& b) noexcept {
         QBox q;
-        q.lo[0] = qEnc(b.min_corner().get<0>());
-        q.lo[1] = qEnc(b.min_corner().get<1>());
-        q.lo[2] = qEnc(b.min_corner().get<2>());
-        q.hi[0] = qEnc(b.max_corner().get<0>());
-        q.hi[1] = qEnc(b.max_corner().get<1>());
-        q.hi[2] = qEnc(b.max_corner().get<2>());
+        q.lo[0] = qEnc(b.min_corner().get<0>(), false);
+        q.lo[1] = qEnc(b.min_corner().get<1>(), false);
+        q.lo[2] = qEnc(b.min_corner().get<2>(), false);
+        q.hi[0] = qEnc(b.max_corner().get<0>(), true);
+        q.hi[1] = qEnc(b.max_corner().get<1>(), true);
+        q.hi[2] = qEnc(b.max_corner().get<2>(), true);
         return q;
     }
     static Box3 boxDequantize(const QBox& q) noexcept {
