@@ -27,7 +27,7 @@ def main():
     # Legacy tifxyz uses a display name as UUID. Normalize only a temporary
     # import wrapper; native coordinates and the user's files remain unchanged.
     source_patch = (args.dataset / "verified_patches" / "0000_low_band_final").resolve()
-    patch = args.output / "patch"
+    patch = args.output / "surface"
     patch.mkdir()
     for source in source_patch.iterdir():
         if source.name != "meta.json":
@@ -41,7 +41,7 @@ def main():
     for mixed in (False, True):
         destination = args.output / ("mixed.vcobj" if mixed else "explicit.vcobj")
         with ObjectStore.create(str(destination), author="coordinate-smoke") as db:
-            for kind, source in (("patch", patch),
+            for kind, source in (("surface", patch),
                                  ("point_collection", subset)):
                 report = db.ingest_geometry_source(kind, str(source),
                     coordinate_context={"volume_uuid": volume, "scale_factor": 1})
@@ -50,26 +50,26 @@ def main():
             if mixed:
                 for i, record in enumerate(objects):
                     uid = record["uuid"]
-                    factor = 2.0 if record["kind"] == "patch" else (0.25 if i % 2 else 4.0)
+                    factor = 2.0 if record["kind"] == "surface" else (0.25 if i % 2 else 4.0)
                     with db.geometry_snapshot() as snapshot:
-                        geometry = (snapshot.patch(uid) if record["kind"] == "patch"
+                        geometry = (snapshot.surface(uid) if record["kind"] == "surface"
                                     else snapshot.point_collection(uid)).load()
                     points = np.asarray(geometry.points)
-                    valid = points[:, 0] != -1 if record["kind"] == "patch" else np.ones(len(points), dtype=bool)
+                    valid = points[:, 0] != -1 if record["kind"] == "surface" else np.ones(len(points), dtype=bool)
                     points[valid] *= factor
                     geometry.points = points.tolist()
-                    if record["kind"] == "patch":
+                    if record["kind"] == "surface":
                         geometry.scale = [s / factor for s in geometry.scale]
                     revision = db.current_geometry(uid)["uuid"]
-                    if record["kind"] == "patch":
+                    if record["kind"] == "surface":
                         db.put_geometry(uid, geometry, expected_revision=revision)
                     else:
                         db.edit_geometry(uid, [dict(array="points", element_offset=0,
                             data=points.astype("<f8").tobytes())], revision)
                     db.set_meta(uid, "coordinates", {"volume_uuid": volume, "scale_factor": factor})
             options = {"volume_uuid": volume} if mixed else {}
-            first = db.link_point_collections_to_patches(**options)
-            repeat = db.link_point_collections_to_patches(**options)
+            first = db.link_point_collections_to_surfaces(**options)
+            repeat = db.link_point_collections_to_surfaces(**options)
             assert first["edges_created"] > 0, first
             assert repeat["edges_created"] == repeat["edges_updated"] == repeat["stale_removed"] == 0, repeat
             names = {obj["uuid"]: obj["name"] for obj in objects}
@@ -81,7 +81,7 @@ def main():
                     own_a = edge["a"] == obj["uuid"]
                     anchor = edge["a_anchor"] if own_a else edge["b_anchor"]
                     materialized.append((obj["name"], anchor["points"][0]["index"][0],
-                        names[edge["b"] if own_a else edge["a"]], edge["meta"]["point_collection_patch"]["ij"]))
+                        names[edge["b"] if own_a else edge["a"]], edge["meta"]["point_collection_surface"]["ij"]))
             constraints.append(sorted(materialized))
             summaries.append({"mixed": mixed, "objects": len(objects), "first": first, "repeat": repeat})
     assert constraints[0] == constraints[1], "coordinate conversion changed real-data attachments"

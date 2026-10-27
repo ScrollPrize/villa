@@ -1,4 +1,4 @@
-"""Point pairs materialized from stored patch-overlap poses."""
+"""Point pairs materialized from stored surface-overlap poses."""
 import numpy as np
 import pytest
 
@@ -16,7 +16,7 @@ def patch(db, uid, to_xyz, size=40, scale=1, hole=None):
     xyz = np.stack(to_xyz(rows, cols), axis=-1).astype(np.float64) * scale
     if hole is not None:
         xyz[hole] = -1
-    return put(db, "patch", [array("points", xyz, "<f4")], {"scale": [1 / scale, 1 / scale]},
+    return put(db, "surface", [array("points", xyz, "<f4")], {"scale": [1 / scale, 1 / scale]},
                meta={"coordinates": frame(scale)}, **({"uuid": uid} if uid else {}))
 
 
@@ -25,7 +25,7 @@ def flat(dx=0):
 
 
 def overlap_edge(db):
-    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16)
     assert report["edges_created"] == 1 and not report["failed"], report
     return db.edges_by_kind("same-surface")[0]
 
@@ -108,7 +108,7 @@ def test_agreement_radius_is_the_detectors(db):
     # Two planes six voxels apart, accepted under a wide tolerance.
     patch(db, LOW, flat())
     patch(db, HIGH, lambda rows, cols: (cols + 10, rows, np.full_like(rows, 26)))
-    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
     assert report["edges_created"] == 1, report
     edge = db.edges_by_kind("same-surface")[0]
     assert edge["meta"]["fit"]["agreement_radius"] == 10
@@ -128,7 +128,7 @@ def test_edges_without_recorded_fit_fields_must_be_redetected(db):
         old = db.add_edge(dict(a=edge["a"], b=edge["b"], kind="old-" + key, a_anchor=whole, b_anchor=whole,
                                meta=dict(edge["meta"], fit=fit)))
         [result] = db.overlap_correspondences([old], VOLUME)
-        assert "rerun patch-overlap detection" in result["error"] and result["pairs"] == []
+        assert "rerun surface-overlap detection" in result["error"] and result["pairs"] == []
 
 
 def test_unusable_edges_report_errors_independently(db):
@@ -141,7 +141,7 @@ def test_unusable_edges_report_errors_independently(db):
     plain = db.add_edge(dict(a=LOW, b=HIGH, kind="plain", a_anchor=whole, b_anchor=whole))
     results = db.overlap_correspondences([explicit, edge["uuid"], plain, "00000000-0000-4000-8000-0000000000ff"], VOLUME)
     assert [r["error"] is None for r in results] == [False, True, False, False]
-    assert "rerun patch-overlap detection" in results[0]["error"]
+    assert "rerun surface-overlap detection" in results[0]["error"]
     assert results[2]["error"] == "edge has no overlap pose"
     assert results[3]["error"] == "edge not found"
     assert all(r["pairs"] == [] for r in results if r["error"])
@@ -172,7 +172,7 @@ def test_unusable_edges_report_errors_independently(db):
 def test_correspondence_agreement_boundary(db, radius, accepted):
     patch(db, LOW, flat())
     patch(db, HIGH, lambda rows, cols: (cols, rows, np.full_like(rows, 26)))
-    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16, tolerance=7)
     assert report["edges_created"] == 1
     edge = db.edges_by_kind("same-surface")[0]
     # Exact pose isolates the distance gate from fitting error: every pair is

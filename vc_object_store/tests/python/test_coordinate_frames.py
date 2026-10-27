@@ -25,7 +25,7 @@ def patch(db, scale=1, size=33, offset=(0, 0, 20), hole=False):
     xyz = xyz.astype(np.float32)
     if hole:
         xyz[0, 0] = -1
-    return put(db, "patch", [array("points", xyz, "<f4")],
+    return put(db, "surface", [array("points", xyz, "<f4")],
                {"scale": [1 / scale, 1 / scale]}, meta={"coordinates": frame(scale)})[0]
 
 
@@ -72,7 +72,7 @@ def test_mixed_pcl_scales_selection_anchors_and_sentinels(db):
     b = patch(db, 0.5, size=17)
     first, second = collection(db, 4), collection(db, 0.25)
     before = {uid: db.object(uid) for uid in (a, b, first, second)}
-    report = db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    report = db.link_point_collections_to_surfaces(volume_uuid=VOLUME)
     assert report["edges_created"] == 2
     for uid, scale in ((first, 4), (second, 0.25)):
         edge, = db.edges_of(uid)
@@ -81,14 +81,14 @@ def test_mixed_pcl_scales_selection_anchors_and_sentinels(db):
         other = edge["b_anchor"] if edge["a"] == uid else edge["a_anchor"]
         assert anchor["position"] == (10 * scale, 10 * scale, 20 * scale)
         assert other["position"] == (20, 20, 40)  # source patch coordinates
-        assert edge["meta"]["point_collection_patch"]["ij"] == [10, 10]
+        assert edge["meta"]["point_collection_surface"]["ij"] == [10, 10]
         assert edge["meta"]["settings"]["point_scale"] == 1 / scale
-    assert db.link_point_collections_to_patches(volume_uuid=VOLUME)["edges_skipped_existing"] == 2
+    assert db.link_point_collections_to_surfaces(volume_uuid=VOLUME)["edges_skipped_existing"] == 2
     assert {uid: db.object(uid) for uid in before} == before
     # The hole at grid (0,0) remains invalid after scaling (it must not become -0.5).
     hole = collection(db, points=((-0.5, -0.5, -0.5),))
-    assert db.link_point_collections_to_patches(volume_uuid=VOLUME, collection_uuids=[hole],
-                                               patch_uuids=[a], tolerance=0.1)["edges_created"] == 0
+    assert db.link_point_collections_to_surfaces(volume_uuid=VOLUME, collection_uuids=[hole],
+                                               surface_uuids=[a], tolerance=0.1)["edges_created"] == 0
     assert len(db.edges_of(first)) == 1
 
 
@@ -97,21 +97,21 @@ def test_frame_provenance_and_preflight_no_writes(db):
     c = collection(db, 4)
     db.set_meta(c, "coordinates", {})
     before = db.journal_since()
-    report = db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    report = db.link_point_collections_to_surfaces(volume_uuid=VOLUME)
     assert report["failed"] and not report["committed"]
     assert "unknown" in report["issues"][0]["reason"]
     assert db.journal_since() == before
     # A missing frame is declared on the object itself, not per detector run.
     db.set_meta(c, "coordinates", frame(4))
-    assert db.link_point_collections_to_patches(volume_uuid=VOLUME)["edges_created"] == 1
+    assert db.link_point_collections_to_surfaces(volume_uuid=VOLUME)["edges_created"] == 1
     edge, = db.edges_of(c)
     assert edge["meta"]["coordinate_frame"]["objects"][c] == {"coordinates": frame(4)}
     before = db.journal_since()
     with pytest.raises(ValueError, match="identity"):
-        db.link_point_collections_to_patches(volume_uuid=VOLUME, point_scale=0.5)
+        db.link_point_collections_to_surfaces(volume_uuid=VOLUME, point_scale=0.5)
     assert db.journal_since() == before
     with pytest.raises(RuntimeError, match="unknown parameter 'legacy_coordinates'"):
-        db.link_patch_overlaps(volume_uuid=VOLUME, legacy_coordinates={c: frame()})
+        db.link_surface_overlaps(volume_uuid=VOLUME, legacy_coordinates={c: frame()})
 
 
 def write_collections(path, collections):
@@ -138,7 +138,7 @@ def test_ingest_coordinate_context_fills_and_rejects_conflicts(db, tmp_path):
 
 def test_mixed_patch_overlap_parameterization_and_scope(db):
     a, b, c = patch(db, 2), patch(db, 0.5), patch(db, 4)
-    report = db.link_patch_overlaps(volume_uuid=VOLUME)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME)
     assert report["edges_created"] == 3, report
     for edge in db.edges_of(a):
         fit = edge["meta"]["fit"]
@@ -146,12 +146,12 @@ def test_mixed_patch_overlap_parameterization_and_scope(db):
         assert fit["grid_scales"] == {edge["a"]: [1, 1], edge["b"]: [1, 1]}
         assert fit["pose_units"] == "volume_voxels"
         assert {fit["pose_from"], fit["pose_to"]} == {edge["a"], edge["b"]}
-    assert db.link_patch_overlaps(volume_uuid=VOLUME)["edges_skipped_existing"] == 3
-    assert db.link_patch_overlaps(volume_uuid=VOLUME, patch_uuids=[a, b], min_inliers=10000)["stale_removed"] == 1
+    assert db.link_surface_overlaps(volume_uuid=VOLUME)["edges_skipped_existing"] == 3
+    assert db.link_surface_overlaps(volume_uuid=VOLUME, surface_uuids=[a, b], min_inliers=10000)["stale_removed"] == 1
     assert len(db.edges_of(c)) == 2
     db.set_meta(b, "coordinates", frame(volume="other"))
     before = db.journal_since()
-    report = db.link_patch_overlaps(volume_uuid=VOLUME)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME)
     assert report["failed"] and not report["committed"]
     assert "does not match" in report["issues"][0]["reason"]
     assert db.journal_since() == before
@@ -169,13 +169,13 @@ def test_fiber_frame_preflight_precedes_ct_open(db):
     uid = fiber(db, 2)
     db.set_meta(uid, "coordinates", {})
     before = db.journal_since()
-    report = db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME)
+    report = db.link_fibers_to_surfaces("/missing-ct", volume_uuid=VOLUME)
     assert report["failed"] and not report["committed"]
     assert "unknown" in report["issues"][0]["reason"]
     with pytest.raises(ValueError, match="identity"):
-        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME, fiber_scale=2)
+        db.link_fibers_to_surfaces("/missing-ct", volume_uuid=VOLUME, fiber_scale=2)
     with pytest.raises(ValueError, match="working_to_base_scale"):
-        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME, working_to_base_scale=2)
+        db.link_fibers_to_surfaces("/missing-ct", volume_uuid=VOLUME, working_to_base_scale=2)
     assert db.journal_since() == before
 
 
@@ -208,7 +208,7 @@ def test_mixed_lines_and_patch_with_ct(db, tmp_path, kind, ct_downsample):
     first, second = line(4), line(second_scale)
     for uid, scale in ((a, 2), (b, 0.5), (first, 4), (second, second_scale)):
         db.set_meta(uid, "coordinates", frame(scale / ct_downsample))
-    link = db.link_fibers_to_patches if kind == "fiber" else db.link_tracks_to_patches
+    link = db.link_fibers_to_surfaces if kind == "fiber" else db.link_tracks_to_surfaces
     options = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
                    anchor_contact=10, contact_gap=10, strip_margin=0, ct_to_base_scale=ct_downsample)
     report = link(str(ct), **options)
@@ -219,12 +219,12 @@ def test_mixed_lines_and_patch_with_ct(db, tmp_path, kind, ct_downsample):
             anchor = edge["a_anchor"] if edge["a"] == uid else edge["b_anchor"]
             assert anchor["position"] == (96 * scale, 96 * scale, 96 * scale)
             assert anchor["points"][0]["index"] == [24]
-            assert edge["meta"][kind + "_patch"]["patch_grid"] == [32, 32]
+            assert edge["meta"][kind + "_surface"]["surface_grid"] == [32, 32]
             assert edge["meta"]["settings"][kind + "_scale"] == ct_downsample / scale
     assert link(str(ct), **options)["edges_skipped_existing"] == 4
     # Explicit-scale callers still use their supplied multipliers.
-    explicit = {kind + "_uuids": [first], "patch_uuids": [a], kind + "_scale": ct_downsample / 4,
-                "patch_scale": ct_downsample / 2, **{k: v for k, v in options.items() if k != "volume_uuid"}}
+    explicit = {kind + "_uuids": [first], "surface_uuids": [a], kind + "_scale": ct_downsample / 4,
+                "surface_scale": ct_downsample / 2, **{k: v for k, v in options.items() if k != "volume_uuid"}}
     assert link(str(ct), **explicit)["edges_updated"] == 1
     assert len(db.edges_of(first)) == 2
     selected = next(e for e in db.edges_of(first) if a in (e["a"], e["b"]))
@@ -249,20 +249,20 @@ def test_fiber_patch_lasagna_normals(db, tmp_path):
     a = patch(db, 1, 65, (64, 64, 96))
     uid = fiber(db, 1)
     # 128/128 decodes to nx = ny = 0, so the sheet normal is +z, as for the patch.
-    report = db.link_fibers_to_patches(**LINE_OPTIONS, **lasagna(tmp_path, 128, 128))
+    report = db.link_fibers_to_surfaces(**LINE_OPTIONS, **lasagna(tmp_path, 128, 128))
     assert report["edges_created"] == 1, report
     edge = db.edges_of(uid)[0]
     assert a in (edge["a"], edge["b"])
     assert edge["meta"]["normal_method"] == "lasagna-nxny-u8-nearest-v1"
     assert edge["meta"]["normal_source"] == {"normal_x": str(tmp_path / "nx.zarr" / "2"),
                                              "normal_y": str(tmp_path / "ny.zarr" / "2")}
-    assert edge["meta"]["fiber_patch"]["patch_grid"] == [32, 32]
+    assert edge["meta"]["fiber_surface"]["surface_grid"] == [32, 32]
 
 
 def test_fiber_patch_lasagna_without_data_links_nothing(db, tmp_path):
     patch(db, 1, 65, (64, 64, 96))
     uid = fiber(db, 1)
-    report = db.link_fibers_to_patches(**LINE_OPTIONS, **lasagna(tmp_path, 0, 0))
+    report = db.link_fibers_to_surfaces(**LINE_OPTIONS, **lasagna(tmp_path, 0, 0))
     assert report["edges_created"] == 0
     assert any("no valid sheet normals" in problem for problem in report["problems"]), report
     assert db.edges_of(uid) == []
@@ -277,15 +277,15 @@ def test_line_patch_without_normals_uses_centerline(db, kind):
         uid = db.upsert_object({"kind": "track", "meta": {"coordinates": frame(1)},
             "track": {"dataset_ref": "fixture", "external_key": "0", "family": "horizontal"}})
         db.put_geometry(uid, Track([[x, 96, 96] for x in range(72, 121)]))
-    link = db.link_fibers_to_patches if kind == "fiber" else db.link_tracks_to_patches
+    link = db.link_fibers_to_surfaces if kind == "fiber" else db.link_tracks_to_surfaces
     report = link(**LINE_OPTIONS)
     assert report["edges_created"] == 1, report
     edge = db.edges_of(uid)[0]
     assert a in (edge["a"], edge["b"])
     assert edge["meta"]["normal_method"] == "centerline"
     assert edge["meta"]["normal_source"] is None
-    assert edge["meta"][kind + "_patch"]["anchor"] is True
-    assert edge["meta"][kind + "_patch"]["strip_same"] == 1
+    assert edge["meta"][kind + "_surface"]["anchor"] is True
+    assert edge["meta"][kind + "_surface"]["strip_same"] == 1
 
 
 def test_centerline_gate_rejects_adjacent_sheet(db):
@@ -295,7 +295,7 @@ def test_centerline_gate_rejects_adjacent_sheet(db):
     xyz = [[x, 96, 96 if 94 <= x <= 106 else 104] for x in range(72, 129)]
     uid = db.upsert_object({"kind": "fiber", "meta": {"coordinates": frame(1)}})
     db.put_geometry(uid, Fiber([xyz[0], xyz[-1]], xyz))
-    report = db.link_fibers_to_patches(**LINE_OPTIONS)
+    report = db.link_fibers_to_surfaces(**LINE_OPTIONS)
     assert report["edges_created"] == 0, report
 
 
@@ -305,9 +305,9 @@ def test_lasagna_normal_arguments_are_validated(db, tmp_path):
     before = db.journal_since()
     options = lasagna(tmp_path, 128, 128)
     with pytest.raises(ValueError, match="both normal_x and normal_y"):
-        db.link_fibers_to_patches(normal_x_volume=options["normal_x_volume"], volume_uuid=VOLUME)
+        db.link_fibers_to_surfaces(normal_x_volume=options["normal_x_volume"], volume_uuid=VOLUME)
     with pytest.raises(ValueError, match="not both"):
-        db.link_fibers_to_patches("/missing-ct", **LINE_OPTIONS, **options)
+        db.link_fibers_to_surfaces("/missing-ct", **LINE_OPTIONS, **options)
     assert db.journal_since() == before
 
 
@@ -333,5 +333,5 @@ def test_scaled_patch_coordinate_overflow_never_writes(db):
     db.set_meta(p, "coordinates", frame(1e-40))
     before = db.journal_since()
     with pytest.raises(ValueError, match="overflow"):
-        db.link_point_collections_to_patches(volume_uuid=VOLUME, collection_uuids=[c])
+        db.link_point_collections_to_surfaces(volume_uuid=VOLUME, collection_uuids=[c])
     assert db.journal_since() == before

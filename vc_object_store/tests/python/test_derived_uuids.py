@@ -3,7 +3,7 @@ import json
 import uuid
 
 import pytest
-from vc_object_store import ObjectStore, Patch
+from vc_object_store import ObjectStore, Surface
 
 NAMESPACE = "4d388e94-79e1-5047-aed1-a901c3dcb146"
 
@@ -88,8 +88,8 @@ def test_point_collections_without_uuids(tmp_path):
 
 
 def test_patch_named_by_directory(db, tmp_path):
-    uid = db.upsert_object(dict(kind="patch"))
-    db.put_geometry(uid, Patch(1, 2, [1, 1], [[1, 2, 3], [4, 5, 6]]))
+    uid = db.upsert_object(dict(kind="surface"))
+    db.put_geometry(uid, Surface(1, 2, [1, 1], [[1, 2, 3], [4, 5, 6]]))
     directory = tmp_path / "0000_low_band_final"
     db.export_geometry(uid, directory)
     meta = json.loads((directory / "meta.json").read_text())
@@ -98,14 +98,14 @@ def test_patch_named_by_directory(db, tmp_path):
     meta.pop("name", None)
     (directory / "meta.json").write_text(json.dumps(meta))
     with ObjectStore.create(str(tmp_path / "patch.vcobj"), author="test") as store:
-        assert store.ingest_geometry_source("patch", directory)["problems"]
-        report = store.ingest_geometry_source("patch", directory, uuid_namespace=NAMESPACE)
+        assert store.ingest_geometry_source("surface", directory)["problems"]
+        report = store.ingest_geometry_source("surface", directory, uuid_namespace=NAMESPACE)
         assert report["ingested"] == 1 and not report["problems"], report
         assert store.object(derived("patch:0000_low_band_final"))["name"] == "0000_low_band_final"
     del meta["uuid"]
     (directory / "meta.json").write_text(json.dumps(meta))
     with ObjectStore.create(str(tmp_path / "unnamed.vcobj"), author="test") as store:
-        assert store.ingest_geometry_source("patch", str(directory) + "/", uuid_namespace=NAMESPACE)["ingested"] == 1
+        assert store.ingest_geometry_source("surface", str(directory) + "/", uuid_namespace=NAMESPACE)["ingested"] == 1
         assert store.object(derived("patch:0000_low_band_final"))
 
 
