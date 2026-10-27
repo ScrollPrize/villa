@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import datetime
 from enum import Enum
-import glob
 import hashlib
 import json
 import os
@@ -180,23 +179,6 @@ def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
             and fields[key]["runtime_impact"] == "run_boundary"}
 
 
-class PclRole(str, Enum):
-    ABSOLUTE = "absolute"
-    RELATIVE = "relative"
-    SAME_WINDING = "same_winding"
-    DRAWN_CONTROL_POINTS = "drawn_control_points"
-
-
-# Roles whose conventional file the service snapshots as a display artifact
-# and whose collections a client may replace or delete in place. Both roles
-# share one PointCollections document shape; a relative collection carries an
-# integer ``wind_a`` per point whose pairwise differences are the constraint,
-# a same-winding collection carries none.
-EDITABLE_PCL_ROLES: tuple[PclRole, ...] = (PclRole.SAME_WINDING, PclRole.RELATIVE)
-EDITABLE_PCL_ROLE_VALUES: frozenset[str] = frozenset(
-    role.value for role in EDITABLE_PCL_ROLES)
-
-
 _INPUT_TOGGLE_KEYS = {
     "verified_patches": "input_use_verified_patches",
     "tracks_dbm": "input_use_tracks",
@@ -208,19 +190,6 @@ _INPUT_TOGGLE_KEYS = {
     "outer_shell": "input_use_outer_shell",
 }
 
-_PCL_ROLE_TOGGLE_KEYS = {
-    PclRole.ABSOLUTE: "input_use_pcl_absolute",
-    PclRole.RELATIVE: "input_use_pcl_relative",
-    PclRole.SAME_WINDING: "input_use_pcl_same_winding",
-    PclRole.DRAWN_CONTROL_POINTS: "input_use_pcl_drawn_control_points",
-}
-
-
-def pcl_role_toggle_key(role: PclRole | str) -> str:
-    """The input_use_pcl_* configuration key gating one PCL role."""
-    return _PCL_ROLE_TOGGLE_KEYS[PclRole(role)]
-
-
 def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
     """Whether a rebuild may include one optional supervision source."""
     enabled = bool(config.get(_INPUT_TOGGLE_KEYS[source], True))
@@ -229,42 +198,15 @@ def input_source_enabled(config: Mapping[str, Any], source: str) -> bool:
     return enabled
 
 
-def effective_pcl_role(role: PclRole | str | None, path: str = "") -> PclRole:
-    """Resolve the historical role-less PCL convention."""
-    if role is not None:
-        return role if isinstance(role, PclRole) else PclRole(role)
-    if os.path.basename(path) == "abs_winding.json":
-        return PclRole.ABSOLUTE
-    return PclRole.RELATIVE
-
-
-def pcl_input_enabled(config: Mapping[str, Any], role: PclRole | str | None,
-                      path: str = "") -> bool:
-    """Whether a PCL document participates, including source dependencies."""
-    effective_role = effective_pcl_role(role, path)
-    enabled = bool(config.get(_PCL_ROLE_TOGGLE_KEYS[effective_role], True))
-    # Absolute winding annotations only have meaning after attaching to
-    # verified patches. Other roles can still provide unattached strips.
-    if effective_role is PclRole.ABSOLUTE:
-        enabled = enabled and input_source_enabled(config, "verified_patches")
-    return enabled
-
-
-def any_pcl_input_enabled(config: Mapping[str, Any]) -> bool:
-    return any(
-        pcl_input_enabled(config, role)
-        for role in PclRole
-    )
-
-
 # ---------------------------------------------------------------------------
 # Declarative fit-input catalog
 # ---------------------------------------------------------------------------
 #
-# One description of every fit input, consumed by request validation
-# (validate_session_request), dataset resolution (resolve_dataset_root /
-# conventional_input_paths) and run admission
-# (spiral_service.ServiceState.run). Each entry records the input's path kind
+# One description of every fit input read from the dataset by path, consumed
+# by request validation (validate_session_request), dataset resolution
+# (resolve_dataset_root / conventional_input_paths) and run admission
+# (spiral_service.ServiceState.run). Patches, point collections and fibers
+# are not here: they come from the object store (object_store_inputs). Each entry records the input's path kind
 # and its enabling/required predicates over the run configuration. Fit-input
 # paths are static for the lifetime of a resident session, so an entry says
 # nothing about rebuild scope: changing any of them rebuilds the session.
@@ -278,20 +220,8 @@ def _never(config: Mapping[str, Any]) -> bool:
     return False
 
 
-def _verified_patches_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "verified_patches")
-
-
-def _fibers_enabled(config: Mapping[str, Any]) -> bool:
-    return input_source_enabled(config, "fibers")
-
-
 def _tracks_enabled(config: Mapping[str, Any]) -> bool:
     return input_source_enabled(config, "tracks_dbm")
-
-
-def _pcls_enabled(config: Mapping[str, Any]) -> bool:
-    return any_pcl_input_enabled(config)
 
 
 def _shell_losses_enabled(config: Mapping[str, Any]) -> bool:
@@ -351,7 +281,7 @@ class FitInputSpec:
 
     # SpiralInputPaths field name (and manifest/path-change key).
     key: str
-    # "file" | "directory" | "zarr-group" | "dbm" | "pcl-set".
+    # "file" | "directory" | "zarr-group" | "dbm".
     kind: str
     # File contents must parse as JSON.
     json_content: bool = False
@@ -376,12 +306,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("umbilicus", "file", json_content=True,
                  conventional_relative="umbilicus.json",
                  resolve_required=True, required=_always),
-    FitInputSpec("verified_patches", "directory",
-                 conventional_relative="verified_patches",
-                 enabled=_verified_patches_enabled,
-                 required=_verified_patches_enabled),
-    FitInputSpec("fibers", "directory", conventional_relative="fibers",
-                 enabled=_fibers_enabled),
     FitInputSpec("fiber_directions", "file",
                  conventional_relative="fiber_directions.npz",
                  enabled=_fiber_directions_enabled,
@@ -393,8 +317,6 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
     FitInputSpec("tracks_dbm", "dbm",
                  conventional_relative="tracks/2um_ds2_ps256_surf_v2.dbm",
                  enabled=_tracks_enabled),
-    FitInputSpec("pcls", "pcl-set", json_content=True,
-                 enabled=_pcls_enabled),
     FitInputSpec("normal_x", "zarr-group",
                  conventional_relative="lasagna_inputs/las_008_nx.ome.zarr",
                  enabled=lambda config: input_source_enabled(config, "normals"),
@@ -416,57 +338,19 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
 
 _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
 
-# Inputs the object store supplies (object_store_inputs.load_fit_inputs):
-# dataset resolution does not look for them and request validation does not
-# require them. Their catalog entries only describe the path fields that the
-# file-input service read.
-STORE_INPUT_KEYS = frozenset({"verified_patches", "fibers", "pcls"})
-
 
 def fit_input(key: str) -> FitInputSpec | None:
     return _FIT_INPUTS_BY_KEY.get(key)
 
 
-# PCL point-collection inputs: (role, conventional filename). One filename
-# per role serves both directions: dataset resolution probes for it, and
-# committing an uploaded collection of that role merges into it. Every role
-# is discovered by resolve_dataset_root; all of these are optional
-# annotations. The fitter itself reads point collections from an object
-# store, never from these files.
-PCL_ROLE_CONVENTIONS: tuple[tuple[PclRole, str], ...] = (
-    (PclRole.ABSOLUTE, "abs_winding.json"),
-    (PclRole.RELATIVE, "relative_windings.json"),
-    (PclRole.SAME_WINDING, "same_windings.json"),
-    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json"),
-)
-
-
-@dataclass(frozen=True)
-class PclInputSpec:
-    path: str
-    # None marks a legacy role-less input: fit_spiral then infers
-    # winding_is_absolute from the file's basename, as the historical CLI did.
-    role: PclRole | None
-    required: bool = False
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "PclInputSpec":
-        return cls(
-            path=_normalise_path(value.get("path")),
-            role=PclRole(value["role"]),
-            required=bool(value.get("required", False)),
-        )
-
-
 @dataclass(frozen=True)
 class SpiralInputPaths:
+    """The fit inputs read by path; the object store supplies the rest."""
+
     dataset_root: str = ""
     umbilicus: str = ""
-    pcls: tuple[PclInputSpec, ...] = ()
-    fibers: str = ""
     fiber_directions: str = ""
     tracks_dbm: str = ""
-    verified_patches: str = ""
     outer_shell: str = ""
     normal_x: str = ""
     normal_y: str = ""
@@ -479,27 +363,13 @@ class SpiralInputPaths:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "SpiralInputPaths":
-        names = {item.name for item in cls.__dataclass_fields__.values()}
-        kwargs = {
-            name: _normalise_path(value.get(name))
-            for name in names
-            if name != "pcls"
-        }
-        kwargs["pcls"] = tuple(
-            item if isinstance(item, PclInputSpec) else PclInputSpec.from_mapping(item)
-            for item in value.get("pcls", ())
-        )
-        return cls(**kwargs)
+        # Unknown keys (an older manifest's patch, fiber and PCL paths) are
+        # not inputs any more.
+        return cls(**{name: _normalise_path(value.get(name))
+                      for name in cls.__dataclass_fields__})
 
     def manifest(self) -> dict[str, Any]:
-        result = asdict(self)
-        result["pcls"] = [
-            {"path": item.path,
-             "role": item.role.value if item.role is not None else None,
-             "required": item.required}
-            for item in self.pcls
-        ]
-        return result
+        return asdict(self)
 
 
 # Run-block keys the scroll specification owns, mapped to the ScrollSpec field
@@ -589,10 +459,11 @@ SCROLL_SPEC_SCHEMA_VERSION = 1
 
 # Input keys whose paths may depart from the directory conventions. Values in
 # the spec file are resolved relative to the dataset root; conventional paths
-# need no entry at all. PCL collections are per-role request entries, not
-# single overridable paths.
-SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(
-    spec.key for spec in FIT_INPUT_CATALOG if spec.kind != "pcl-set")
+# need no entry at all.
+SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(spec.key for spec in FIT_INPUT_CATALOG)
+# Overrides of inputs that now come from the object store. A specification
+# written for the file-input service may still name them; they are ignored.
+RETIRED_PATH_OVERRIDE_KEYS = ("verified_patches", "fibers")
 
 # Conventional dataset layout for the headless CLI, mirroring the historical
 # fit_spiral module-global defaults. resolve_dataset_root() shares the same
@@ -600,21 +471,8 @@ SCROLL_SPEC_PATH_OVERRIDE_KEYS = tuple(
 _CONVENTIONAL_INPUT_RELATIVES = {
     spec.key: spec.conventional_relative
     for spec in FIT_INPUT_CATALOG
-    if spec.conventional_relative and spec.kind != "pcl-set"
+    if spec.conventional_relative
 }
-
-
-def conventional_pcl_document_path(dataset_root: str, role: PclRole | str) -> str:
-    """Where a dataset keeps one role's point-collection document.
-
-    The same normalised spelling resolve_dataset_root() advertises, so a path
-    derived here compares equal to a resolved ``pcl_inputs`` entry. Empty
-    when there is no dataset root.
-    """
-    if not str(dataset_root or "").strip():
-        return ""
-    filename = dict(PCL_ROLE_CONVENTIONS)[PclRole(role)]
-    return _normalise_path(Path(_normalise_path(dataset_root)) / filename)
 
 
 class ScrollSpecError(ValueError):
@@ -747,6 +605,8 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     paths = document.get("paths", {})
     if not isinstance(paths, Mapping):
         raise ScrollSpecError(f"{source}: paths must be an object")
+    paths = {key: value for key, value in paths.items()
+             if key not in RETIRED_PATH_OVERRIDE_KEYS}
     unknown = sorted(set(paths) - set(SCROLL_SPEC_PATH_OVERRIDE_KEYS))
     if unknown:
         raise ScrollSpecError(
@@ -845,7 +705,7 @@ def conventional_input_paths(
     """Resolve the conventional dataset layout (plus spec overrides) for the
     headless CLI, mirroring the historical fit_spiral module-global defaults.
 
-    Patches, fibers and point collections are left unset: the CLI reads them
+    Patches, fibers and point collections are not paths: the CLI reads them
     from an object store (config object_store_path), never from the dataset.
 
     Unlike resolve_dataset_root() this performs no existence probing: the CLI
@@ -1190,10 +1050,8 @@ def resolve_dataset_root(
         result.scroll_spec = spec.manifest()
 
     for input_spec in FIT_INPUT_CATALOG:
-        # DBM inputs need backing-file probing (below); patches, fibers and
-        # PCLs come from the object store.
-        if (input_spec.kind == "dbm" or input_spec.key in STORE_INPUT_KEYS
-                or not input_spec.conventional_relative):
+        # DBM inputs need backing-file probing (below).
+        if input_spec.kind == "dbm" or not input_spec.conventional_relative:
             continue
         override = spec.path_override(input_spec.key) if spec is not None else ""
         candidate = Path(override) if override \
@@ -1235,14 +1093,6 @@ def resolve_dataset_root(
     return result
 
 
-def _expand_pcl(spec: PclInputSpec) -> list[str]:
-    if not spec.path:
-        return []
-    if glob.has_magic(spec.path):
-        return sorted(_normalise_path(path) for path in glob.glob(spec.path))
-    return [spec.path]
-
-
 def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) -> None:
     try:
         with path.open("r", encoding="utf-8") as stream:
@@ -1278,7 +1128,7 @@ def validate_session_request(
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
     def check_catalog_input(spec: FitInputSpec) -> None:
-        if spec.key in STORE_INPUT_KEYS or not spec.enabled(run.config):
+        if not spec.enabled(run.config):
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,
@@ -1290,19 +1140,6 @@ def validate_session_request(
             value = getattr(paths, spec.key)
             if value and not resolve_logical_dbm(value):
                 errors.append({"field": spec.key, "message": "DBM logical base or backing file was not found"})
-        elif spec.kind == "pcl-set":
-            for index, pcl in enumerate(paths.pcls):
-                if not pcl_input_enabled(run.config, pcl.role, pcl.path):
-                    continue
-                expanded = _expand_pcl(pcl)
-                if pcl.required and not expanded:
-                    errors.append({"field": f"pcls[{index}]", "message": "Required PCL pattern matched no files"})
-                for expanded_path in expanded:
-                    path = Path(expanded_path)
-                    if not path.is_file():
-                        errors.append({"field": f"pcls[{index}]", "message": f"PCL file does not exist: {path}"})
-                    else:
-                        _validate_json_file(path, f"pcls[{index}]", errors)
 
     # The Lasagna store requirements (see the catalog's predicates) are
     # checked after the dense-spacing mode below, so an invalid mode errors

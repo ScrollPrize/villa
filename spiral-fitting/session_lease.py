@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from uuid import uuid4
 
-from input_workspace import MutationCoordinator, WorkspaceLease
+from service_mutations import ClientLease, MutationCoordinator
 from service_http import ApiError
 
 
@@ -27,7 +27,7 @@ class SessionLease:
         self.coordinator = MutationCoordinator()
         # The file lock lives under the service's output root: two services
         # writing one output root cannot both have an owner.
-        self._lease = WorkspaceLease(output_root)
+        self._lease = ClientLease(output_root)
         # Responses of initialize/rebuild commands already started, by
         # command ID, so a retried request does not build twice.
         self.lifecycle_started = {}
@@ -52,7 +52,7 @@ class SessionLease:
 
     @staticmethod
     def _reworded(error):
-        """WorkspaceLease's refusals, in terms of the session lease."""
+        """ClientLease's refusals, in terms of the session lease."""
         messages = {400: "An ASCII session token is required",
                     403: "This client does not own the session lease",
                     409: "Another service owns this output root's session lease"}

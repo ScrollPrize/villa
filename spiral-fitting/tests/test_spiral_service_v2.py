@@ -49,7 +49,7 @@ from lasagna_publish import (PreviewPublication, PublishedPreview,
                              _flatten_request_body)
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA, SCROLL_SPEC_OWNED_RUN_KEYS,
-                         AutosaveError, PclRole, SessionState, SpiralInputPaths,
+                         AutosaveError, SessionState, SpiralInputPaths,
                          resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
 from config import Config
@@ -192,8 +192,6 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
     state.session_paths = SpiralInputPaths.from_mapping({
         "dataset_root": str(dataset_root),
         "output_directory": str(output_directory),
-        "verified_patches": str(Path(dataset_root) / "verified_patches") if dataset_root else "",
-        "fibers": str(Path(dataset_root) / "fibers") if dataset_root else "",
     })
     state.session_request = {
         "paths": state.session_paths.manifest(),
@@ -1140,9 +1138,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         attached = response["session_request"]
         self.assertEqual(attached, self.state.status()["session_request"])
         self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
-        self.assertEqual(attached["paths"]["verified_patches"], "")
-        self.assertEqual(attached["paths"]["fibers"], "")
-        self.assertEqual(attached["paths"]["pcls"], [])
+        self.assertFalse({"verified_patches", "fibers", "pcls"} & set(attached["paths"]))
         self.assertEqual(attached["run"]["z_begin"], 100)
         self.assertEqual(attached["run"]["z_end"], 900)
         for key in SCROLL_SPEC_OWNED_RUN_KEYS:

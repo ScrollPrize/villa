@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
-                         AUTOSAVE_METADATA_SCHEMA, PclInputSpec, PclRole,
+                         AUTOSAVE_METADATA_SCHEMA,
                          ScrollSpecError, SessionState, SpiralInputPaths,
                          load_scroll_spec, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
@@ -23,7 +23,7 @@ from spiral_runtime import (CommandBarrier, CommandBarrierViolation,
                             ConfigureCommand,
                             DtLossScheduleCommand,
                             DistributedInteractiveFitSession,
-                            FileStoreRendezvous, InputBatchCommand,
+                            FileStoreRendezvous,
                             InteractiveFitSession,
                             SaveCheckpointCommand, collective_view)
 import spiral_helpers
@@ -695,7 +695,6 @@ class ProtocolTests(unittest.TestCase):
                          ["dt_loss_schedule"])
         session.wait_for_iteration(100)
         self.assertEqual(calls, [(100, 100, schedule)])
-        self.assertEqual(session._iteration_in_progress, 100)
 
     def test_failed_run_setup_cancels_schedule_and_clears_run_state(self):
         session = self._idle_session(completed=10)
@@ -745,8 +744,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_command_from_another_epoch_fail_stops_the_rank(self):
         session = self._idle_session(rank=1, world_size=2)
-        session._commands.append(InputBatchCommand(
-            session_generation=0, epoch=99, records=[]))
+        session._commands.append(DtLossScheduleCommand(
+            session_generation=0, epoch=99, run_start=0,
+            requested_iterations=1, schedule={}))
         with self.assertRaisesRegex(CommandBarrierViolation,
                                     "from epoch 99 while in epoch 0"):
             session.wait_for_iteration(0)
@@ -1018,20 +1018,6 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
-
-    def _running_session(self, completed, target, reserved=None, epoch=7):
-        session = self._idle_session(completed=completed)
-        session._state = SessionState.Running
-        session._target = target
-        session._pending = target - completed
-        session._iteration_in_progress = None
-        session._live_reservation_iteration = reserved
-        session._live_reservation_epoch = epoch
-        session._warnings = []
-        session._error = None
-        session._publish_status = lambda: None
-        session._progress_reporter = lambda: NullProgressReporter()
-        return session
 
     def test_run_configuration_applies_active_host_values_exactly(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

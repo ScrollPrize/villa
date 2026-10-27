@@ -1,9 +1,9 @@
 """The declarative fit-input catalog shared by validation and planning."""
 
 from config import Config
-from fit_session import (FIT_INPUT_CATALOG, PCL_ROLE_CONVENTIONS, PclRole,
+from fit_session import (FIT_INPUT_CATALOG, RETIRED_PATH_OVERRIDE_KEYS,
                          SCROLL_SPEC_PATH_OVERRIDE_KEYS, SpiralInputPaths,
-                         fit_input, input_source_enabled, pcl_input_enabled,
+                         fit_input, input_source_enabled, parse_scroll_spec,
                          winding_inference_enabled)
 
 
@@ -15,7 +15,9 @@ def test_catalog_covers_every_fit_input_path_field():
         "output_directory", "cache_directory",
     }
     assert keys == input_fields
-    assert set(SCROLL_SPEC_PATH_OVERRIDE_KEYS) == keys - {"pcls"}
+    assert set(SCROLL_SPEC_PATH_OVERRIDE_KEYS) == keys
+    # Patches, fibers and point collections come from the object store.
+    assert not {"verified_patches", "fibers", "pcls"} & keys
 
 
 def test_omitted_spacing_mode_uses_fitter_default():
@@ -75,17 +77,14 @@ def test_lasagna_store_predicates_reproduce_the_mode_contract():
                                "gradient_magnitude", "winding_inference"))
 
 
-def test_patch_inputs_follow_the_disable_switch():
-    verified = fit_input("verified_patches")
-    # Dataset discovery cannot know the initialization config yet; validation
-    # enforces this only when the default-on source is actually selected.
-    assert verified.resolve_required is False
-    assert verified.required({}) is True
-    assert verified.required({"input_disable_patches": True}) is False
-    # A disabled source is not validated at all.
-    assert verified.enabled({"input_disable_patches": True}) is False
-
-    assert verified.enabled({"input_use_verified_patches": False}) is False
+def test_a_specification_naming_retired_patch_or_fiber_paths_still_parses(tmp_path):
+    spec = parse_scroll_spec({
+        "schema_version": 1, "name": "s1", "voxel_size_um": 9.6,
+        "spiral_outward_sense": "CW",
+        "paths": {"verified_patches": "patches", "fibers": "fibers",
+                  "outer_shell": "shell"}}, tmp_path)
+    assert dict(spec.path_overrides) == {"outer_shell": str(tmp_path / "shell")}
+    assert set(RETIRED_PATH_OVERRIDE_KEYS) == {"verified_patches", "fibers"}
 
 
 def test_source_toggles_and_dependencies_are_centralized():
@@ -101,36 +100,3 @@ def test_source_toggles_and_dependencies_are_centralized():
     assert winding_inference_enabled({
         **winding, "input_use_outer_shell": False,
     }) is False
-
-
-def test_pcl_role_toggles_include_legacy_role_inference():
-    for role in PclRole:
-        key = f"input_use_pcl_{role.value}"
-        assert pcl_input_enabled({}, role) is True
-        assert pcl_input_enabled({key: False}, role) is False
-
-    assert pcl_input_enabled(
-        {"input_use_pcl_absolute": False}, None, "/data/abs_winding.json") is False
-    assert pcl_input_enabled(
-        {"input_use_pcl_relative": False}, None, "/data/legacy.json") is False
-    # Absolute PCLs cascade off when their verified-patch prerequisite is off.
-    assert pcl_input_enabled(
-        {"input_use_verified_patches": False}, PclRole.ABSOLUTE) is False
-    # Non-absolute inputs may still become unattached-strip supervision.
-    assert pcl_input_enabled(
-        {"input_use_verified_patches": False}, PclRole.RELATIVE) is True
-
-
-def test_every_pcl_role_has_one_conventional_file():
-    roles = {role.value: filename for role, filename in PCL_ROLE_CONVENTIONS}
-    # One filename per role, serving both discovery and commit; the set is
-    # exactly the role vocabulary, so no role can be uploaded without a
-    # commit target and none is silently undiscoverable.
-    assert roles == {
-        "absolute": "abs_winding.json",
-        "relative": "relative_windings.json",
-        "same_winding": "same_windings.json",
-        "drawn_control_points": "drawn_control_points.json",
-    }
-    assert set(roles) == {role.value for role in PclRole}
-    assert len(set(roles.values())) == len(roles)

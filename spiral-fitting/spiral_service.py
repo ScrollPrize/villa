@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from input_workspace import MutationCoordinator
+from service_mutations import MutationCoordinator
 from session_lease import SessionLease
 from workspace_storage import reclaim_workspaces
 from collections import OrderedDict, deque
@@ -72,7 +72,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
                          SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
-                         SCROLL_SPEC_OWNED_RUN_KEYS, STORE_INPUT_KEYS,
+                         SCROLL_SPEC_OWNED_RUN_KEYS,
                          ScrollSpecError, SessionState,
                          default_user_cache_dir, input_source_enabled,
                          winding_inference_enabled, load_scroll_spec,
@@ -962,8 +962,7 @@ class ServiceState:
                 [{"field": key, "message": "Base input paths are owned by the service"}
                  for key in offending])
         paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
-        for key in (*(spec.key for spec in FIT_INPUT_CATALOG
-                      if spec.key not in STORE_INPUT_KEYS),
+        for key in (*(spec.key for spec in FIT_INPUT_CATALOG),
                     "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
@@ -2736,28 +2735,11 @@ def _route_upload_file(ctx):
 
 _UPLOAD_ID = r"[0-9a-f]{32}"
 
+_LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
+
 # The whole HTTP surface, declared once. Dispatch walks this table; there is
 # no hand-written if-ladder, so a route's method, path, handler and retry
 # semantics are visible in one place.
-def _route_inputs_frozen(ctx):
-    raise inputs_frozen_error()
-
-
-# The input-editing surface of the file-input service. Inputs are frozen, so
-# each answers 409 inputs_frozen to any client, owner or not, rather than 404.
-_FROZEN_INPUT_ROUTES = (
-    ("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content"),
-    ("GET", "/session/input-catalog", "input_catalog"),
-    ("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command"),
-    ("POST", "/session/input-changes", "input_changes"),
-    ("POST", "/session/discard-inputs", "discard_inputs"),
-    ("POST", "/session/resolve-input", "resolve_input"),
-    ("POST", "/session/apply-inputs", "apply_inputs"),
-    ("POST", "/session/commit-inputs", "commit_inputs"),
-)
-_FROZEN_INPUT_OPERATIONS = frozenset(operation for *_, operation in _FROZEN_INPUT_ROUTES)
-_LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
-
 ROUTES = (
     Route("POST", "/session/lease/claim", "lease_claim",
           lambda ctx: ctx.state.lease().claim(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
@@ -2767,8 +2749,6 @@ ROUTES = (
           lambda ctx: ctx.state.release_lease(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
                                               ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
-    *(Route(method, path, operation, _route_inputs_frozen, Idempotency.NONE)
-      for method, path, operation in _FROZEN_INPUT_ROUTES),
     Route("GET", "/health", "health",
           lambda ctx: ctx.state.health(), Idempotency.NONE),
     Route("GET", "/configuration", "configuration",
@@ -2992,8 +2972,6 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
-        if route.operation in _FROZEN_INPUT_OPERATIONS:
-            return route.handler(context)
         lease = state.session_lease
         if (state.dataset_root is not None and lease is None
                 and self.command != "GET"

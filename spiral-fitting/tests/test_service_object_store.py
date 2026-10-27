@@ -296,20 +296,14 @@ def test_a_repeated_initialize_command_builds_once(http):
 
 
 @pytest.mark.parametrize('method,path', [
-    (method, path if isinstance(path, str) else
-     {'input_content': '/session/input-content/0123-ab/1',
-      'input_command': '/session/input-commands/x'}[operation])
-    for method, path, operation in spiral_service._FROZEN_INPUT_ROUTES])
-def test_input_editing_answers_inputs_frozen_to_every_client(http, method, path):
-    body = {'command_id': 'x'} if method == 'POST' else None
-    for token in (None, 'stranger'):
-        status, payload = http(method, path, body, token)
-        assert status == 409
-        assert payload['code'] == 'inputs_frozen'
-        assert payload['rebuild'] == {'inputs': 'reload'}
+    ('GET', '/session/input-catalog'), ('GET', '/session/input-content/0123-ab/1'),
+    ('POST', '/session/input-changes'), ('POST', '/session/apply-inputs'),
+    ('POST', '/session/commit-inputs'), ('POST', '/session/editing/claim')])
+def test_the_input_editing_surface_is_gone(http, method, path):
     http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    body = {'command_id': 'x'} if method == 'POST' else None
     status, payload = http(method, path, body, 'owner')
-    assert (status, payload['code']) == (409, 'inputs_frozen')
+    assert (status, payload['error']) == (404, 'Unknown endpoint')
 
 
 def test_releasing_the_lease_tears_the_session_down(http):
@@ -483,7 +477,7 @@ def test_validation_requires_no_patch_fiber_or_pcl_files(dataset, store):
     state = service(dataset, store)
     assert not (dataset.root / 'verified_patches').exists()
     paths, run, _, _ = state._prepare_session_request(state.startup_session_request())
-    assert (paths.verified_patches, paths.fibers, paths.pcls) == ('', '', ())
+    assert not {'verified_patches', 'fibers', 'pcls'} & set(paths.manifest())
 
 
 def test_starting_the_service_and_discovery_do_not_import_torch(dataset, filled_store,

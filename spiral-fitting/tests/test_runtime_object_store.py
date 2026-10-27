@@ -199,18 +199,6 @@ def test_input_refusals_reach_status_and_events(state, store_path, device_stubs)
     assert error['payload'] == {'input_problems': problems}
 
 
-def test_input_changes_are_refused_before_a_boundary_is_reserved(state, device_stubs):
-    import spiral_runtime
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
-    settle(state)
-    session = state.session
-    epoch = session._live_reservation_epoch
-    with pytest.raises(spiral_runtime.InputsFrozenError):
-        session.apply_input_changes('batch', [{'id': 'x'}])
-    assert session._live_reservation_epoch == epoch
-    assert session._live_reservation_iteration is None
-
-
 # ---------------------------------------------------------------------------
 # Two ranks
 # ---------------------------------------------------------------------------
