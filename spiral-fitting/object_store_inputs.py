@@ -52,6 +52,14 @@ FAMILIES = {
 # The coordinates the fitter works in, recorded with every provenance.
 FIT_UNITS = 'reference-volume voxels (ZYX)'
 
+# Manifest fields that name one replica's local records. Object revision and
+# relationship version UUIDs are per replica (a pull installs the hub's
+# records under new local revisions), so they resolve inputs locally but are
+# left out of the digest. Geometry revisions, record UUIDs, generations and
+# approval states are shared by every replica of a store.
+REPLICA_LOCAL_FIELDS = {'objects': ('object_revision',),
+                        'relationships': ('revision',)}
+
 
 class ObjectStoreInputError(ValueError):
     """A selection, frame or relationship the fitter cannot consume."""
@@ -135,6 +143,35 @@ class ObjectFrame:
         return [float(value) / self.to_fit for value in scale]
 
 
+def content_sha256(value):
+    """SHA-256 of a JSON value in canonical form."""
+    text = json.dumps(value, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def adapter_metadata(kind, meta, fiber=None):
+    """The metadata the adapter reads from one object of ``kind``.
+
+    With the geometry revision (points, arrays and point annotations) it is
+    everything materialization reads, so its hash identifies the object's
+    input content on any replica. Other metadata (review notes, ingest
+    diagnostics) does not reach the fit and does not change the digest.
+    """
+    meta = meta or {}
+    source = meta.get('source') or {}
+    read = {'coordinates': meta.get('coordinates')}
+    if kind == 'surface':
+        read['spiral_patch_erode_cells'] = source.get('spiral_patch_erode_cells')
+    elif kind == 'point_collection':
+        read['winding_is_absolute'] = source.get('winding_is_absolute')
+        read['sampling_group'] = meta.get('sampling_group')
+    elif kind == 'fiber':
+        read['hv_classification'] = source.get('hv_classification')
+        read['family'] = (fiber or {}).get('family')
+        read['manual_family'] = (fiber or {}).get('manual_family')
+    return read
+
+
 @dataclasses.dataclass
 class StoredObject:
     uuid: str
@@ -147,10 +184,15 @@ class StoredObject:
     frame: ObjectFrame = None
     fiber: dict = None
 
+    @property
+    def metadata_sha256(self):
+        return content_sha256(adapter_metadata(self.kind, self.meta, self.fiber))
+
     def provenance(self):
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
                 'object_revision': self.object_revision,
                 'geometry_revision': self.geometry_revision,
+                'metadata_sha256': self.metadata_sha256,
                 'scale_factor': self.frame.scale_factor}
 
 
@@ -169,12 +211,22 @@ class StoredRelationship:
     a_anchor: dict
     b_anchor: dict
     meta: dict
+    a_geometry_revision: str = None
+    b_geometry_revision: str = None
 
     def provenance(self):
+        """Identity by content: the shared record, its endpoints' geometry
+        and a hash of the anchors and metadata materialization reads.
+        ``revision`` (the local edge version) only resolves it locally."""
         return {'uuid': self.uuid, 'revision': self.revision,
                 'kind': self.kind, 'family': self.family,
                 'approval_state': self.approval_state,
-                'generation': self.generation}
+                'generation': self.generation,
+                'a': self.a, 'a_geometry_revision': self.a_geometry_revision,
+                'b': self.b, 'b_geometry_revision': self.b_geometry_revision,
+                'content_sha256': content_sha256(
+                    {'a_anchor': self.a_anchor, 'b_anchor': self.b_anchor,
+                     'meta': self.meta})}
 
 
 @dataclasses.dataclass
@@ -214,7 +266,7 @@ class InputSnapshot:
         }
 
     def digest(self):
-        """SHA-256 of the manifest without the store's local path."""
+        """SHA-256 of the manifest without its replica-local fields."""
         return manifest_digest(self.manifest())
 
 
@@ -312,13 +364,14 @@ def _relationship_family(record, kinds):
     return family
 
 
-def _ordered_endpoints(record, kinds):
-    """(a, a_anchor, b, b_anchor) ordered by kind, then UUID."""
-    a, b = record['a'], record['b']
-    key = lambda uuid: (KINDS.index(kinds[uuid]), uuid)
-    if key(b) < key(a):
-        return b, record['b_anchor'], a, record['a_anchor']
-    return a, record['a_anchor'], b, record['b_anchor']
+def _ordered_endpoints(entry, kinds):
+    """(a, a_anchor, a geometry pin, b, b_anchor, b geometry pin) of a view
+    relationship, ordered by kind, then UUID."""
+    record = entry['record']
+    ends = [(record[side], record[f'{side}_anchor'],
+             entry.get(f'{side}_geometry_revision')) for side in ('a', 'b')]
+    ends.sort(key=lambda end: (KINDS.index(kinds[end[0]]), end[0]))
+    return (*ends[0], *ends[1])
 
 
 def filter_relationships(view_relationships, objects, approved_links_only):
@@ -353,12 +406,13 @@ def filter_relationships(view_relationships, objects, approved_links_only):
         if approved_links_only and state != 'approved':
             exclusions[f'{state} (approved-only)'] += 1
             continue
-        a, a_anchor, b, b_anchor = _ordered_endpoints(record, kinds)
+        a, a_anchor, a_geometry, b, b_anchor, b_geometry = _ordered_endpoints(entry, kinds)
         consumed.append(StoredRelationship(
             uuid=record['uuid'], revision=entry['uuid'], kind=record['kind'],
             family=family, approval_state=state,
             generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
-            b_anchor=b_anchor, meta=record['meta'] or {}))
+            b_anchor=b_anchor, meta=record['meta'] or {},
+            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry))
     consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
     return consumed, exclusions
 
@@ -1460,10 +1514,43 @@ def input_manifest(snapshot, config, normal_source, external_frames=None):
 
 def _compared(manifest):
     """The manifest without what does not define the inputs: the store's
-    local path and how links were refreshed (their results are recorded)."""
+    local path, the replica-local revision UUIDs (REPLICA_LOCAL_FIELDS) and
+    how links were refreshed (their results are recorded). Two replicas of
+    one store holding the same inputs compare equal."""
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
+    for section, fields in REPLICA_LOCAL_FIELDS.items():
+        if section in manifest:
+            manifest[section] = [
+                {key: value for key, value in entry.items() if key not in fields}
+                for entry in manifest[section] or ()]
+    return manifest
+
+
+# Identities a manifest recorded before objects carried metadata hashes and
+# relationships their content: geometry revisions, relationship generations
+# and approval states only.
+_GEOMETRY_IDENTITY = {
+    'objects': ('uuid', 'kind', 'name', 'geometry_revision', 'scale_factor'),
+    'relationships': ('uuid', 'kind', 'family', 'approval_state', 'generation'),
+}
+
+
+def records_content_identity(manifest):
+    """Whether a manifest identifies objects and relationships by content
+    (metadata hashes, relationship content), as every manifest written since
+    replica-independent digests does."""
+    objects = (manifest or {}).get('objects') or ()
+    return all('metadata_sha256' in entry for entry in objects)
+
+
+def _geometry_identity(manifest):
+    manifest = dict(manifest)
+    for section, fields in _GEOMETRY_IDENTITY.items():
+        if section in manifest:
+            manifest[section] = [{key: entry.get(key) for key in fields}
+                                 for entry in manifest[section] or ()]
     return manifest
 
 
@@ -1500,8 +1587,19 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
     if recorded is None:
         problem = 'checkpoint records no object-store inputs'
     else:
-        differences = manifest_differences(recorded, inputs.manifest)
+        current = inputs.manifest
+        legacy = not records_content_identity(recorded)
+        if legacy:
+            # Written before inputs were identified by content: its object
+            # revisions name another replica's (or this one's older) records,
+            # and it holds no metadata hashes, so compare what it does hold.
+            recorded, current = _geometry_identity(recorded), _geometry_identity(current)
+        differences = manifest_differences(recorded, current)
         if not differences:
+            if legacy:
+                log('WARNING: the checkpoint predates content-identified object-store '
+                    'inputs (metadata hashes, relationship content); compared on '
+                    'geometry revisions and relationship generations only')
             return []
         problem = ('checkpoint object-store inputs differ from this fit\'s in '
                    + ', '.join(differences))

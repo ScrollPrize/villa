@@ -447,6 +447,76 @@ def test_resume_refuses_changed_inputs_and_frames(store_path):
     assert quiet.digest == load(store_path).digest
 
 
+def _replicas(store_path, tmp_path):
+    """Two hub clones of the store: the deployed case of one logical store
+    seen through different local files."""
+    import vc_object_store as vos
+    vos.hub_init(store_path, 'ingest')
+    replicas = [str(tmp_path / f'{name}.vcobj') for name in ('a', 'b')]
+    for path, author in zip(replicas, ('alice', 'bob')):
+        vos.hub_clone(store_path, path, author)
+    return replicas
+
+
+def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
+    first, second = _replicas(store_path, tmp_path)
+    # Links refreshed on one replica reach the other through the hub. The
+    # pull installs them, and the objects they revise, under the second
+    # replica's own revision UUIDs.
+    load(first, object_store_author='alice')
+    with ObjectStore.open(first, author='alice') as db:
+        assert db.hub_sync(pull=True, push=True)['pushed']
+    with ObjectStore.open(second, author='bob') as db:
+        assert db.hub_sync(pull=True, push=False)['pulled']
+    a = load(first, object_store_refresh_links=False)
+    b = load(second, object_store_refresh_links=False)
+    local = lambda inputs: {entry['uuid']: entry['object_revision']
+                            for entry in inputs.manifest['objects']}
+    versions = lambda inputs: {entry['uuid']: entry['revision']
+                               for entry in inputs.manifest['relationships']}
+    assert local(a).keys() == local(b).keys()
+    assert local(a) != local(b) and versions(a) != versions(b)
+    assert a.counts == b.counts and len(versions(a)) == 3
+    assert a.digest == b.digest
+    assert osi.manifest_differences(a.manifest, b.manifest) == []
+    assert osi.resume_problems({'object_store': a.manifest}, b) == []
+
+
+def test_digest_covers_the_metadata_the_adapter_reads(store_path):
+    inputs = load(store_path)
+    walk = _uuids(store_path)['walk']
+    with ObjectStore.open(store_path, author='reviewer') as db:
+        db.set_meta(walk, 'review_note', 'checked')
+    assert load(store_path, object_store_refresh_links=False).digest == inputs.digest
+    with ObjectStore.open(store_path, author='reviewer') as db:
+        db.set_meta(walk, 'sampling_group', 'reviewed')
+    changed = load(store_path, object_store_refresh_links=False)
+    assert changed.digest != inputs.digest
+    [problem] = osi.resume_problems({'object_store': inputs.manifest}, changed)
+    assert 'objects' in problem
+
+
+def test_a_checkpoint_before_content_identity_compares_geometry(store_path):
+    inputs = load(store_path)
+    legacy = json.loads(json.dumps(inputs.manifest))
+    # The manifest such a checkpoint recorded: no metadata hashes, no
+    # relationship content, and revision UUIDs of the replica it ran on.
+    for entry in legacy['objects']:
+        del entry['metadata_sha256']
+        entry['object_revision'] = 'another-replica'
+    legacy['relationships'] = [
+        {key: entry[key] for key in ('uuid', 'kind', 'family', 'approval_state',
+                                     'generation')} | {'revision': 'another'}
+        for entry in legacy['relationships']]
+    warnings = []
+    assert osi.resume_problems({'object_store': legacy}, inputs,
+                               log=warnings.append) == []
+    assert 'compared on geometry revisions' in warnings[0]
+    legacy['objects'][0]['geometry_revision'] = 'older-geometry'
+    [problem] = osi.resume_problems({'object_store': legacy}, inputs)
+    assert 'objects' in problem
+
+
 def test_checkpoint_preflight_checks_the_object_store_inputs(store_path):
     import fit_spiral
     from test_checkpoint_load import _checkpoint, _live_context

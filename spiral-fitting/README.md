@@ -270,6 +270,17 @@ materialization settings, and the refresh mode with its fiber-patch normal
 source) and checkpoints carry the same manifest and digest; a resume whose
 inputs differ is refused unless `object_store_allow_changed_inputs`.
 
+The digest identifies inputs the same way on every replica of a store (see
+the store's "Hosted hub and replicas"): an object by its geometry revision
+and a hash of the metadata the adapter reads (`metadata_sha256`: its frame,
+erosion, PCL role and sampling group, fiber classification), a relationship
+by its record, approval, generation, endpoint geometry revisions and a hash
+of its anchors and metadata (`content_sha256`). Object revision and
+relationship version UUIDs differ between replicas; the manifest keeps them
+(`object_revision`, `revision`) to resolve the inputs locally, outside the
+digest. A checkpoint written before these identities is compared on geometry
+revisions and relationship generations, with a warning.
+
 ### Frames and units
 
 The fit's unit is the reference-volume voxel (ZYX), whatever the stored
