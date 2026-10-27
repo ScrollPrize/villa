@@ -120,7 +120,6 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalInteger(QStringLiteral("intersectionMaxSurfaces")),
                 Params::optionalBoolean(QStringLiteral("planeIntersectionLinesVisible")),
                 Params::optionalBoolean(QStringLiteral("showSurfaceNormals")),
-                Params::optionalBoolean(QStringLiteral("showDirectionHints")),
                 Params::optionalBoolean(QStringLiteral("surfaceOverlayEnabled")),
                 Params::optionalArray(
                     QStringLiteral("highlightedSurfaceIds"),

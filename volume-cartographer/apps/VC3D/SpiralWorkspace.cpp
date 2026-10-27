@@ -280,7 +280,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _state = new CState(
         this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
-        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attachment) {
+        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
             _trackedFiberPaths.clear();
         }
@@ -288,7 +288,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
-    _viewerManager->setSurfacePatchSamplingStride(4, false);
+    _viewerManager->setSurfacePatchSamplingStride(4);
     // The flattened preview is this workspace's primary pane: stop publishing
     // raw-path chunk demand for frames the SurfaceCache fully serves, so its
     // tile fills are not starved behind interactive fetches the frame never
@@ -683,7 +683,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     });
     connect(_panel, &SpiralPanel::surfaceIntersectionStrideChanged,
             this, [this](int stride) {
-                _viewerManager->setSurfacePatchSamplingStride(stride, false);
+                _viewerManager->setSurfacePatchSamplingStride(stride);
             });
     connect(_panel, &SpiralPanel::surfaceOverlapChanged, this, [this](bool shown) {
         _showSurfaceOverlap = shown;
@@ -1135,7 +1135,7 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
 void SpiralWorkspace::startLineAnnotationDraft()
 {
     QString reason = lineAnnotationDraftUnavailableReason();
-    if (reason.isEmpty() && !_state->objectStoreSession()->attachment())
+    if (reason.isEmpty() && !_state->objectStoreAttachment())
         reason = tr("Attach an object store before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
@@ -1463,11 +1463,6 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
         });
 }
 
-bool SpiralWorkspace::hasActiveSpiralSession() const
-{
-    return _service && _service->hasActiveSession();
-}
-
 void SpiralWorkspace::addPatchToCurrentFit(
     const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
@@ -1522,28 +1517,6 @@ void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
     _service->removeInputDraft(objectUuid);
 }
 
-bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface)
-{
-    if (!_service || !surface || surface->path.empty()) return false;
-    const auto path = QString::fromStdString(surface->path.string());
-    QString id = _managedPatchCopies.value(path);
-    if (id.isEmpty()) {
-        for (const auto& value : _service->inputDraftStatus()) {
-            const auto input = value.toObject();
-            if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
-                && QFileInfo(mapServicePath(input.value(QStringLiteral("source")).toString())).canonicalFilePath()
-                    == QFileInfo(path).canonicalFilePath()) {
-                id = input.value(QStringLiteral("id")).toString();
-                break;
-            }
-        }
-    }
-    if (id.isEmpty()) return false;
-    _service->removeInputDraft(id);
-    statusBar()->showMessage(tr("Patch removal staged. Apply removes supervision; Commit deletes dataset files."), 15000);
-    return true;
-}
-
 bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface)
 {
     if (!_service || !surface || surface->path.empty()) return true;
@@ -1562,12 +1535,6 @@ bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& su
         return true;
     }
     return true;
-}
-
-void SpiralWorkspace::noteManagedPatchSaved(const QString& path)
-{
-    if (!_managedPatchCopies.contains(path)) return;
-    _service->stagePatch(path, _managedPatchCopies.value(path));
 }
 
 QString SpiralWorkspace::provisionalBrushRoot() const
@@ -1892,7 +1859,7 @@ QComboBox* SpiralWorkspace::volumeSelectionControl() const
 
 void SpiralWorkspace::synchronizeVolume(
     const std::shared_ptr<Volume>& volume,
-    const std::optional<cv::Matx44d>& navigationTransform)
+    const std::optional<vcr::catalog::Affine>& navigationTransform)
 {
     const auto package = _mainState ? _mainState->vpkg() : nullptr;
     if (_state->vpkg() != package) {
@@ -1939,7 +1906,6 @@ SpiralWorkspace::parseLossMaps(const QJsonObject& manifest,
         map.p50 = entry.value(QStringLiteral("p50")).toDouble();
         map.p95 = entry.value(QStringLiteral("p95")).toDouble();
         map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
-        map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
         map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
         map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
             ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()

@@ -12,7 +12,8 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
     const auto id = objectIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
     if (applicableOnly) requirePublishedGraphRead(txn);
-    const std::string filter = fiberAdjacencySql(adjacentFilter) + (edgeKind ? std::string(" AND kind=?2") : "") +
+    const std::string filter = fiberAdjacencySql(adjacentFilter) +
+        (edgeKind ? std::string(" AND kind=?2") : " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'") +
         (includeRetired ? "" : " AND " + activeEdgeSql());
     // Filter before deduplication: a rejected parallel edge must not hide a
     // later applicable edge to the same neighbour. Preserve first-edge order.
@@ -95,6 +96,8 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
         for (size_t i = 0; i < edgeKindFilter.size(); ++i)
             filter += (i ? ",?" : "?") + std::to_string(i + 2);
         filter += ")";
+    } else {
+        filter = " AND kind<>'" + std::string(kAttachmentEdgeKind) + "'";
     }
     filter += fiberAdjacencySql(adjacentFilter);
     if (!includeRetired) filter += " AND " + activeEdgeSql();
@@ -215,6 +218,8 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
     }
     auto selection = edges; selection.bothEndpoints = true;
     selection.includeRetired = objects.includeRetired;
+    // Attachments are not graph links unless asked for by kind.
+    if (!selection.kind) selection.attachments = false;
     if (selection.applicableOnly) {
         selection.endpointUuids = result.objectUuids;
         for (const auto& edge : selectEdges(txn, selection, std::vector<std::string>{})) {
@@ -260,8 +265,10 @@ GraphReadView ObjectStore::graphReadViewAt(const Txn& txn, const RevisionSelecti
         result.geometryRevisions.push_back(value.geometryRevision);
         result.selectedObjects->push_back(std::move(value));
     }
+    auto graphEdges = edges;
+    if (!graphEdges.kind) graphEdges.attachments = false;
     for (auto& selected : relationshipsAt(txn, resolved))
-        if (selected.applicable && matchesEdgeSelection(selected.relationship.record, edges))
+        if (selected.applicable && matchesEdgeSelection(selected.relationship.record, graphEdges))
             result.selectedRelationships->push_back(std::move(selected.relationship));
     auto& relationships = *result.selectedRelationships;
     std::sort(relationships.begin(), relationships.end(), [](const auto& a, const auto& b) { return a.record.uuid < b.record.uuid; });

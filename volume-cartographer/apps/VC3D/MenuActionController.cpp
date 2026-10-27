@@ -10,6 +10,7 @@
 #include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "WrapAnnotationWidget.hpp"
@@ -30,10 +31,14 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
-#include "vc/core/util/Umbilicus.hpp"
-#include "vc/core/util/VolpkgConvert.hpp"
-#include "vc/core/types/Segmentation.hpp"
+#include <vc_object_store/objects/UmbilicusFile.hpp>
+#include "BindCoordinatesPrompt.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
@@ -62,14 +67,12 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPointer>
-#include <QProcess>
 #include <QProgressDialog>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
-#include <QTemporaryDir>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
@@ -100,7 +103,6 @@ struct MenuActionController::OpenDataOpenTaskResult {
     vc3d::opendata::OpenDataSampleProjectResult result;
     QString error;
     QString sampleId;
-    qint64 tifxyzSegmentCount{0};
     bool freshProject{false};
 };
 
@@ -139,17 +141,15 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachVolumeAct = new QAction(QObject::tr("Attach &Volume..."), this);
     connect(_attachVolumeAct, &QAction::triggered, this, &MenuActionController::attachVolume);
 
-    _attachSegmentsAct = new QAction(QObject::tr("Attach Se&gments..."), this);
-    connect(_attachSegmentsAct, &QAction::triggered, this, &MenuActionController::attachSegments);
 
     _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
     connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
 
-    _attachUmbilicusAct = new QAction(QObject::tr("Attach &Umbilicus..."), this);
-    connect(_attachUmbilicusAct, &QAction::triggered, this, &MenuActionController::attachUmbilicus);
+    _importUmbilicusAct = new QAction(QObject::tr("Import &Umbilicus..."), this);
+    connect(_importUmbilicusAct, &QAction::triggered, this, &MenuActionController::importUmbilicus);
 
-    _detachUmbilicusAct = new QAction(QObject::tr("Detach Um&bilicus"), this);
-    connect(_detachUmbilicusAct, &QAction::triggered, this, &MenuActionController::detachUmbilicus);
+    _removeUmbilicusAct = new QAction(QObject::tr("Remove Um&bilicus"), this);
+    connect(_removeUmbilicusAct, &QAction::triggered, this, &MenuActionController::removeUmbilicus);
 
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
@@ -208,11 +208,11 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
-    _mergeTifxyzAct = new QAction(QObject::tr("Merge tifxyz..."), this);
-    connect(_mergeTifxyzAct, &QAction::triggered,
-            this, &MenuActionController::mergeTifxyzFromMenuRequested);
+    _mergeSurfacesAct = new QAction(QObject::tr("Merge Surfaces..."), this);
+    connect(_mergeSurfacesAct, &QAction::triggered,
+            this, &MenuActionController::mergeSurfacesFromMenuRequested);
 
-    _mergePatchAct = new QAction(QObject::tr("Patch tifxyz..."), this);
+    _mergePatchAct = new QAction(QObject::tr("Patch Surface..."), this);
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
@@ -220,10 +220,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_growTrackPatchesAct, &QAction::triggered,
             this, &MenuActionController::growTrackPatchesFromMenuRequested);
 
-    _materializeOpenDataFolderAct = new QAction(
-        QObject::tr("Create/Fetch All Segments for Current Folder"), this);
-    connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
-            &MenuActionController::materializeCurrentOpenDataSegmentFolder);
 
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
@@ -232,7 +228,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_saveProjectAsAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
-    _fileMenu->addAction(_attachSegmentsAct);
     _objectStoreMenu = new QMenu(QObject::tr("Object &Store"), _fileMenu);
     _fileMenu->addMenu(_objectStoreMenu);
     _objectStoreMenu->addAction(QObject::tr("New Object Store..."), this, &MenuActionController::createObjectStore);
@@ -248,26 +243,28 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     refreshRecentObjectStoreMenu();
     _objectStoreMenu->addSeparator();
     auto* syncHub = _objectStoreMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
-        qWindow->_state->objectStoreSession()->syncHub();
+        if (const auto attachment = qWindow->_state->objectStoreAttachment())
+            qWindow->_state->objectStoreSession()->syncHub(*attachment);
         qWindow->promptHubConflicts();
     });
     syncHub->setEnabled(false);
     connect(qWindow->_state, &CState::objectStoreChanged, syncHub, [qWindow, syncHub](const vc::objects::StoreSessionEvent&) {
-        syncHub->setEnabled(qWindow->_state->objectStoreSession()->hubStatus().has_value());
+        const auto attachment = qWindow->_state->objectStoreAttachment();
+        syncHub->setEnabled(attachment && qWindow->_state->objectStoreSession()->hubStatus(*attachment));
     });
     auto* detachStore = _objectStoreMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
-    detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+    detachStore->setEnabled(qWindow->_state->objectStoreAttachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
         [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
-            detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+            detachStore->setEnabled(qWindow->_state->objectStoreAttachment().has_value());
         });
     connect(qWindow->_state, &CState::objectStoreObservationFailed, this,
         [qWindow](const QString& error) {
             QMessageBox::warning(qWindow, QObject::tr("Object store observation failed"), error);
         });
     _fileMenu->addAction(_attachNormalGridAct);
-    _fileMenu->addAction(_attachUmbilicusAct);
-    _fileMenu->addAction(_detachUmbilicusAct);
+    _fileMenu->addAction(_importUmbilicusAct);
+    _fileMenu->addAction(_removeUmbilicusAct);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -299,9 +296,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_materializeOpenDataFolderAct);
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_mergeTifxyzAct);
+    _actionsMenu->addAction(_mergeSurfacesAct);
     _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
@@ -408,14 +404,6 @@ void MenuActionController::updateRecentVolpkgList(const QString& path)
     refreshRecentMenu();
 }
 
-void MenuActionController::removeRecentVolpkgEntry(const QString& path)
-{
-    QStringList files = loadRecentPaths();
-    files.removeAll(path);
-    saveRecentPaths(files);
-    refreshRecentMenu();
-}
-
 void MenuActionController::openVolpkg()
 {
     if (!_window) {
@@ -423,17 +411,15 @@ void MenuActionController::openVolpkg()
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto file = promptLocation(QObject::tr("Open Project"),
-        QObject::tr("Pick a .volpkg.json file, a legacy volpkg folder, or a remote volpkg URL."),
+        QObject::tr("Pick a .volpkg.json project file."),
         settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-        {"*.volpkg.json"}, true, true);
+        {"*.volpkg.json"}, true, false);
     if (file.isEmpty()) return;
 
     if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) {
-        QMessageBox::information(_window, QObject::tr("Convert to .volpkg.json"),
-            QObject::tr("This needs to be converted to a .volpkg.json — pick where to save the converted project."));
-        QString converted;
-        if (!runLegacyVolpkgConvert(file, &converted)) return;
-        file = converted;
+        QMessageBox::warning(_window, QObject::tr("Open Project"),
+            QObject::tr("%1 is not a .volpkg.json project file.").arg(file));
+        return;
     }
     _window->OpenVolume(file);
     _window->UpdateView();
@@ -546,54 +532,32 @@ void MenuActionController::showOpenDataCatalog()
     _openDataCatalogDialog = dialog;
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachVolumeRequested,
             this, &MenuActionController::showAttachRemoteZarrDialog);
-    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
-            this, &MenuActionController::attachCatalogLasagna);
-    dialog->setAttachPredictionHandler([this](const vc3d::opendata::OpenDataSample& sample,
-            const vc3d::opendata::OpenDataResourceSelection& selection) {
-        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
-            return;
-        }
-        try {
-            const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
-                *_window->_state->vpkg(), sample, &selection);
-            _window->refreshCurrentVolumePackageUi(QString(), true);
-            if (result.failedVolumes) {
-                QStringList messages;
-                for (const auto& message : result.messages)
-                    messages.push_back(QString::fromStdString(message));
-                QMessageBox::warning(_window, tr("Attach incomplete"), messages.join('\n'));
-            }
-        } catch (const std::exception& e) {
-            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
-        }
-    });
-    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
-            this, [this](const QString& sample, const QString& volume, const QString& url,
-                         int level, bool explicitLevel) {
-        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
-            return;
-        }
-        try {
-            const vc3d::opendata::OpenDataNormalGridsInfo info{
-                sample.toStdString(), volume.toStdString(), url.toStdString(), level, explicitLevel};
-            if (!vc3d::opendata::attachStreamingNormalGridsEntry(
-                    *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
-                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
-                return;
-            }
-            _window->refreshCurrentVolumePackageUi(QString(), true);
-        } catch (const std::exception& e) {
-            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
-        }
-    });
-    dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
+    dialog->setAttachRepresentationHandler(
+        [this](const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataRepresentationRef& ref) {
+            attachCatalogRepresentation(sample, ref);
+        });
+    dialog->setOpenSampleHandler([this](const vcr::catalog::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
     dialog->setCreateProjectHandler([this](const auto& sample, const auto& selection,
                                            const auto& project) {
-        return openOpenDataSample(sample, true, &selection, nullptr, nullptr, &project);
+        return openOpenDataSample(sample, &selection, &project);
+    });
+    dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
+        if (!_window || !_window->_state) return tr("No viewer state.");
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        try {
+            auto& state = *_window->_state;
+            const auto report = vc::objects::refreshCatalog(*state.objectStoreSession(),
+                                                            state.catalogAttachment(sample), sample);
+            QApplication::restoreOverrideCursor();
+            return tr("%1: %2 surfaces, %3 new, %4 updated, %5 refetched, %6 locally edited surfaces preserved.")
+                .arg(QString::fromStdString(sample.id)).arg(report.surfaces).arg(report.added)
+                .arg(report.updated).arg(report.stale).arg(report.preserved);
+        } catch (const std::exception& e) {
+            QApplication::restoreOverrideCursor();
+            return tr("Refreshing %1 failed: %2").arg(QString::fromStdString(sample.id), QString::fromUtf8(e.what()));
+        }
     });
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &QDialog::finished, this, [this]() {
@@ -615,64 +579,11 @@ bool MenuActionController::isOpenDataCatalogVisible() const
     return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
-bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool interactive)
-{
-    if (!_window || sampleId.isEmpty()) {
-        return false;
-    }
-
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
-    if (!manifest) {
-        return false;
-    }
-
-    const vc3d::opendata::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        return false;
-    }
-
-    return openOpenDataSample(*sample, interactive);
-}
-
-bool MenuActionController::openOpenDataSampleById(
-    const QString& sampleId,
-    const OpenDataSampleOpenOptions& options,
-    QString* errorMessage,
-    vc3d::opendata::OpenDataSampleProjectResult* resultOut)
-{
-    if (!_window || sampleId.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
-        return false;
-    }
-
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
-    if (!manifest) {
-        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
-        return false;
-    }
-
-    const vc3d::opendata::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
-        return false;
-    }
-
-    return openOpenDataSample(*sample, options.interactive, &options.selection,
-                              errorMessage, resultOut);
-}
-
-bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
-                                             bool interactive,
+bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
                                              const vc3d::opendata::OpenDataResourceSelection* selection,
-                                             QString* errorMessage,
-                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut,
                                              const vc3d::opendata::OpenDataNewProject* newProject)
 {
     if (!_window || !_window->_state) {
-        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
         return false;
     }
 
@@ -689,7 +600,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
     }
 
     // Create and Open already explicitly confirms the project switch.
-    if (interactive && !newProject && _window->_state->vpkg()) {
+    if (!newProject && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Project"));
         prompt.setText(QObject::tr("Open sample %1?").arg(QString::fromStdString(sample.id)));
@@ -709,52 +620,31 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
     // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
     // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
         return false;
     }
 
     OpenDataSampleOpenOutcome outcome;
     QEventLoop loop;
     beginOpenDataSampleOpenTask(
-        sample, interactive, selection,
+        sample, /*interactive=*/true, selection,
         [&outcome, &loop](const OpenDataSampleOpenOutcome& o) {
             outcome = o;
             loop.quit();
         },
         {}, newProject);
     loop.exec(QEventLoop::ExcludeUserInputEvents);
-
-    if (errorMessage && !outcome.success) *errorMessage = outcome.error;
-    if (resultOut && outcome.success) *resultOut = outcome.result;
     return outcome.success;
 }
 
 bool MenuActionController::startOpenDataSampleOpen(
-    const QString& sampleId,
-    const OpenDataSampleOpenOptions& options,
+    const vcr::catalog::OpenDataSample& sample,
+    const vc3d::opendata::OpenDataResourceSelection& selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
     std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
     QString* errorMessage)
 {
     if (!_window || !_window->_state) {
         if (errorMessage) *errorMessage = QObject::tr("No application window available.");
-        return false;
-    }
-    if (sampleId.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
-        return false;
-    }
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
-    if (!manifest) {
-        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
-        return false;
-    }
-    const vc3d::opendata::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
         return false;
     }
     if (_openDataSampleOpenInFlight) {
@@ -765,7 +655,7 @@ bool MenuActionController::startOpenDataSampleOpen(
 
     // This entry point is always non-interactive. Completion is delivered
     // through onFinished on the GUI thread.
-    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
+    beginOpenDataSampleOpenTask(sample, /*interactive=*/false, &selection,
                                 std::move(onFinished), std::move(onProgress));
     return true;
 }
@@ -776,7 +666,7 @@ bool MenuActionController::openDataSampleOpenInFlight() const
 }
 
 void MenuActionController::beginOpenDataSampleOpenTask(
-    const vc3d::opendata::OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     bool interactive,
     const vc3d::opendata::OpenDataResourceSelection* selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
@@ -784,7 +674,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const vc3d::opendata::OpenDataNewProject* newProject)
 {
     const QString cacheDir = vc3d::remoteCachePath();
-    const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    const vcr::catalog::OpenDataSample sampleCopy = sample;
     const auto projectCopy = newProject
         ? std::make_optional(*newProject) : std::nullopt;
     // Copy the selection by value so the worker thread never dereferences a
@@ -792,12 +682,6 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
-    const auto selectedSegmentCount = std::count_if(
-        sampleCopy.segments.begin(), sampleCopy.segments.end(), [&](const auto& segment) {
-            return segment.hasTifxyz() && (!selectionCopy.segmentIds ||
-                std::find(selectionCopy.segmentIds->begin(), selectionCopy.segmentIds->end(),
-                          segment.id) != selectionCopy.segmentIds->end());
-        });
     // CloseVolume() below is this flow's first destructive step: it emits
     // vpkgChanged, whose defensive handler tears line sessions down without
     // saving. Sessions must instead end -- finalized and saved -- while their
@@ -830,12 +714,12 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     }
 
     QPointer<QProgressDialog> progressDialog;
-    if (interactive && (newProject || selectedSegmentCount > 0)) {
+    if (interactive) {
         auto* dialog = new QProgressDialog(
             QObject::tr("Preparing catalog resources..."),
             QString(),
             0,
-            static_cast<int>(selectedSegmentCount) * 6,
+            0,
             _window);
         dialog->setWindowTitle(QObject::tr("Open Data Sample"));
         dialog->setCancelButton(nullptr);
@@ -872,65 +756,21 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                     if (!progressDialog) {
                         return;
                     }
-                    const int totalDone = progress.completedSegments + progress.failedSegments;
-                    const QString segment = QString::fromStdString(progress.segmentId);
-                    const QString file = QString::fromStdString(progress.fileName);
                     const QString status = QString::fromStdString(progress.status);
-                    const bool transforming = status.startsWith(QStringLiteral("transform-"));
-                    const bool preparing = status.startsWith(
-                        QStringLiteral("placeholder"));
                     const bool resolvingVolumes =
                         status == QStringLiteral("resolving-volumes");
                     const bool projectReady =
                         status == QStringLiteral("project-ready");
-                    QString label = resolvingVolumes
+                    const QString label = resolvingVolumes
                         ? QObject::tr("Opening remote volumes in parallel...")
                         : projectReady
                         ? QObject::tr("Open-data project is ready.")
-                        : preparing
-                        ? QObject::tr("Preparing segment metadata: %1/%2 representations.")
-                              .arg(progress.completedSegments)
-                              .arg(progress.totalSegments)
-                        : transforming
-                        ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
-                              .arg(progress.totalWorkers)
-                              .arg(totalDone)
-                              .arg(progress.totalSegments)
-                        : QObject::tr("Downloading segments with %1 worker(s): %2/%3 segments, %4/%5 files.")
-                              .arg(progress.totalWorkers)
-                              .arg(totalDone)
-                              .arg(progress.totalSegments)
-                              .arg(progress.completedFiles)
-                              .arg(progress.totalFiles);
-                    if (!resolvingVolumes && !projectReady &&
-                        !segment.isEmpty() && !file.isEmpty()) {
-                        label += transforming
-                            ? QObject::tr("\n%1 -> %2").arg(segment, file)
-                            : QObject::tr("\n%1: %2").arg(segment, file);
-                    } else if (!resolvingVolumes && !projectReady &&
-                               !segment.isEmpty()) {
-                        label += QObject::tr("\n%1").arg(segment);
-                    }
-                    if (progress.failedSegments > 0) {
-                        label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
-                    }
-                    if (resolvingVolumes) {
-                        progressDialog->setRange(0, 0);
-                    } else if (projectReady) {
+                        : QObject::tr("Preparing catalog resources...");
+                    if (projectReady) {
                         progressDialog->setRange(0, 1);
                         progressDialog->setValue(1);
-                    } else if (preparing) {
-                        progressDialog->setRange(
-                            0, std::max(progress.totalSegments, 1));
-                        progressDialog->setValue(std::min(
-                            progress.completedSegments,
-                            std::max(progress.totalSegments, 1)));
                     } else {
-                        progressDialog->setMaximum(
-                            std::max(progress.totalFiles, 1));
-                        progressDialog->setValue(std::min(
-                            progress.completedFiles,
-                            std::max(progress.totalFiles, 1)));
+                        progressDialog->setRange(0, 0);
                     }
                     progressDialog->setLabelText(label);
                 },
@@ -963,13 +803,10 @@ void MenuActionController::beginOpenDataSampleOpenTask(
 
     _openDataSampleOpenInFlight = true;
     watcher->setFuture(QtConcurrent::run(
-        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy, projectCopy,
-         selectedSegmentCount]() mutable {
+        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy, projectCopy]() mutable {
             OpenDataOpenTaskResult taskResult;
             taskResult.freshProject = projectCopy.has_value();
             taskResult.sampleId = QString::fromStdString(sampleCopy.id);
-            taskResult.tifxyzSegmentCount =
-                static_cast<qint64>(selectedSegmentCount);
             try {
                 taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
                     sampleCopy,
@@ -1064,31 +901,22 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
 
     if (_window) {
         _window->refreshCurrentVolumePackageUi(
-            QString::fromStdString(result.preferredVolumeId),
-            true);
+            QString::fromStdString(result.preferredVolumeId));
         _window->UpdateView();
     }
     startOpenDataVolumePrefill(
         _window && _window->_state ? _window->_state->currentVolume() : nullptr);
-
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
                           .arg(sampleId)
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
-    if (task.tifxyzSegmentCount > 0) {
-        message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
-                       .arg(result.cachedTifxyzSegments)
-                       .arg(result.supportedTifxyzSegments)
-                       .arg(result.attachedSegmentEntries);
-    }
     if (_window && _window->statusBar()) {
         _window->showStatusBarMessage(message, 7000);
     }
 
     if (interactive &&
         ((!task.freshProject && result.supportedVolumes == 0) ||
-         result.failedVolumes > 0 ||
-         result.failedTifxyzSegments > 0)) {
+         result.failedVolumes > 0)) {
         QString details;
         for (const auto& item : result.messages) {
             if (!details.isEmpty()) {
@@ -1383,18 +1211,10 @@ void MenuActionController::showSettingsDialog()
         return;
     }
 
-    CState* state = _window->_state;
-    auto* dialog = new SettingsDialog(
-        state ? state->vpkg() : nullptr,
-        _window);
+    auto* dialog = new SettingsDialog(_window);
     dialog->exec();
-    if (dialog->outputSegmentsChanged()) {
-        _window->refreshCurrentVolumePackageUi(QString(), true);
-    }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
-                                       vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
     const bool resetViewOnSurfaceChange =
         settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                        vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
@@ -1402,9 +1222,8 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
                        vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
     if (_window->_viewerManager) {
-        _window->_viewerManager->forEachBaseViewer([showDirHints, showPlaneLines](VolumeViewerBase* viewer) {
+        _window->_viewerManager->forEachBaseViewer([showPlaneLines](VolumeViewerBase* viewer) {
             if (viewer) {
-                viewer->setShowDirectionHints(showDirHints);
                 viewer->setPlaneIntersectionLinesVisible(showPlaneLines);
                 // Re-read viewer settings so changes made in the dialog take effect immediately.
                 viewer->reloadPerfSettings();
@@ -1558,7 +1377,7 @@ void MenuActionController::toggleCursorMirroring(bool enabled)
 
 void MenuActionController::surfaceFromSelection()
 {
-    if (!_window || !_window->_viewerManager || !_window->_state->vpkg()) {
+    if (!_window || !_window->_viewerManager || !_window->_surfacePanel || !_window->_surfaceCatalog) {
         return;
     }
 
@@ -1575,14 +1394,14 @@ void MenuActionController::surfaceFromSelection()
         return;
     }
 
-    if (_window->_state->activeSurfaceId().empty() || !_window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId())) {
+    const auto& opened = _window->_surfacePanel->opened();
+    if (!opened || opened->surface->id != _window->_state->activeSurfaceId()) {
         _window->showStatusBarMessage(QObject::tr("Select a segmentation first"), 3000);
         return;
     }
-
-    auto surf = _window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId());
-    std::filesystem::path baseSegPath = surf->path;
-    std::filesystem::path parentDir = baseSegPath.parent_path();
+    const auto sourceUuid = opened->surface->id;
+    const auto* row = _window->_surfaceCatalog->row(sourceUuid);
+    const std::string sourceName = row && !row->record.name.empty() ? row->record.name : sourceUuid;
 
     int idx = 1;
     int created = 0;
@@ -1594,27 +1413,22 @@ void MenuActionController::surfaceFromSelection()
             continue;
         }
 
-        std::string newId = _window->_state->activeSurfaceId() + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
-        std::filesystem::path outDir = parentDir / newId;
+        const std::string name = sourceName + "_sel_" + ts.toStdString() + "_" + std::to_string(idx++);
+        const vc::objects::SurfaceProvenance provenance{
+            "vc3d-surface-from-selection",
+            {{"scene_rect", {rect.x(), rect.y(), rect.width(), rect.height()}}},
+            {sourceUuid}};
         try {
-            filtered->saveAsNew(outDir);
+            _window->_surfaceCatalog->create(*filtered, name, provenance);
             created++;
         } catch (const std::exception& e) {
             _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
         }
     }
 
-    if (created > 0) {
-        if (_window->_surfacePanel) {
-            _window->_surfacePanel->reloadSurfacesFromDisk();
-        }
-        _window->showStatusBarMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
-    } else {
-        if (_window->_surfacePanel) {
-            _window->_surfacePanel->refreshFiltersOnly();
-        }
-        _window->showStatusBarMessage(QObject::tr("No surfaces created from selection"), 3000);
-    }
+    _window->showStatusBarMessage(created > 0
+        ? QObject::tr("Created %1 surface(s) from selection").arg(created)
+        : QObject::tr("No surfaces created from selection"), created > 0 ? 5000 : 3000);
 }
 
 void MenuActionController::clearSelection()
@@ -1631,87 +1445,6 @@ void MenuActionController::clearSelection()
 
     segViewer->clearSelections();
     _window->showStatusBarMessage(QObject::tr("Selections cleared"), 2000);
-}
-
-void MenuActionController::importObjAsPatch()
-{
-    if (!_window || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("No volume package loaded."));
-        return;
-    }
-
-    QStringList objFiles = QFileDialog::getOpenFileNames(
-        _window,
-        QObject::tr("Select OBJ Files"),
-        QDir::homePath(),
-        QObject::tr("OBJ Files (*.obj);;All Files (*)"));
-
-    if (objFiles.isEmpty()) {
-        return;
-    }
-
-    const auto outDir = _window->_state->vpkg()->outputSegmentsPath();
-    if (outDir.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Error"),
-                             QObject::tr("Project has no output segments directory configured."));
-        return;
-    }
-    QString pathsDir = QString::fromStdString(outDir.string());
-
-    QStringList successfulIds;
-    QStringList failedFiles;
-
-    for (const QString& objFile : objFiles) {
-        QFileInfo fileInfo(objFile);
-        QString baseName = fileInfo.completeBaseName();
-        QString outputDir = pathsDir + "/" + baseName;
-
-        if (QDir(outputDir).exists()) {
-            if (QMessageBox::question(_window, QObject::tr("Overwrite?"),
-                                      QObject::tr("'%1' exists. Overwrite?").arg(baseName),
-                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::No) {
-                continue;
-            }
-        }
-
-        QProcess process;
-        process.setProcessChannelMode(QProcess::MergedChannels);
-
-        QStringList args;
-        args << objFile << outputDir;
-        args << QString::number(1000.0f)
-             << QString::number(1.0f)
-             << QString::number(20);
-
-        QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
-        process.start(toolPath, args);
-
-        if (!process.waitForStarted(5000)) {
-            failedFiles.append(fileInfo.fileName());
-            continue;
-        }
-
-        process.waitForFinished(-1);
-
-        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit) {
-            successfulIds.append(baseName);
-        } else {
-            failedFiles.append(fileInfo.fileName());
-        }
-    }
-
-    if (!successfulIds.isEmpty() && _window->_surfacePanel) {
-        _window->_surfacePanel->reloadSurfacesFromDisk();
-    } else if (_window->_surfacePanel) {
-        _window->_surfacePanel->refreshFiltersOnly();
-    }
-
-    QString message = QObject::tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
-    if (!failedFiles.isEmpty()) {
-        message += QObject::tr("\n\nFailed files:\n%1").arg(failedFiles.join("\n"));
-    }
-
-    QMessageBox::information(_window, QObject::tr("Import Results"), message);
 }
 
 void MenuActionController::beginRotateSurfaceTransform()
@@ -1732,9 +1465,10 @@ void MenuActionController::beginRotateSurfaceTransform()
                                  QObject::tr("Select a segmentation surface before rotating."));
         return;
     }
-
-    if (_window->_segmentationModule &&
-        !_window->_segmentationModule->ensureActiveSurfaceEditableForModification()) {
+    // Rotation saves back to the store the surface was opened from.
+    QString error;
+    if (_window->_surfacePanel && !_window->_surfacePanel->prepareSurfaceEditing(activeSurface->id, &error)) {
+        QMessageBox::information(_window, QObject::tr("Rotate Surface"), error);
         return;
     }
 
@@ -1742,14 +1476,6 @@ void MenuActionController::beginRotateSurfaceTransform()
     if (_window->statusBar()) {
         _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);
     }
-}
-
-void MenuActionController::materializeCurrentOpenDataSegmentFolder()
-{
-    if (!_window || !_window->_surfacePanel) {
-        return;
-    }
-    _window->_surfacePanel->materializeCurrentOpenDataFolder();
 }
 
 void MenuActionController::newProject()
@@ -1779,7 +1505,9 @@ void MenuActionController::newProject()
     QString file = dlg.selectedFiles().first();
     if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
 
-    auto pkg = VolumePkg::newEmpty();
+    vc::project::LoadOptions options;
+    options.catalog = vc3d::opendata::cachedCatalog();
+    auto pkg = VolumePkg::newEmpty(options);
     QString base = QFileInfo(file).fileName();
     base.chop(QStringLiteral(".volpkg.json").size());
     // setName before save(): while the package has no path it only touches the
@@ -1879,7 +1607,7 @@ void MenuActionController::attachVolume()
     }
     bool ok = false;
     QString tagsStr = QInputDialog::getText(_window, QObject::tr("Attach Volume"),
-        QObject::tr("Tags (comma-separated, optional; e.g. normal3d):"),
+        QObject::tr("Tags (comma-separated, optional):"),
         QLineEdit::Normal, QString(), &ok);
     if (!ok) return;
     std::vector<std::string> tags;
@@ -1891,34 +1619,7 @@ void MenuActionController::attachVolume()
         QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add volume (already attached?)"));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
-}
-
-void MenuActionController::attachSegments()
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
-        return;
-    }
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto loc = promptLocation(QObject::tr("Attach Segments"),
-                              QObject::tr("Pick a segment or a folder of segments (local or s3://, https://)."),
-                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-                              {}, false, true);
-    if (loc.isEmpty()) return;
-    const auto err = vc::project::validateLocation(vc::project::Category::Segments, loc.toStdString());
-    if (!err.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("Not a valid segments location:\n\n%1").arg(QString::fromStdString(err)));
-        return;
-    }
-    auto pkg = _window->_state->vpkg();
-    if (!pkg->addSegmentsEntry(loc.toStdString())) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add segments (already attached?)"));
-        return;
-    }
-    if (!pkg->hasOutputSegments()) pkg->setOutputSegments(loc.toStdString());
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 void MenuActionController::attachNormalGrid()
@@ -1943,92 +1644,131 @@ void MenuActionController::attachNormalGrid()
         QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add normal grid (already attached?)"));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
-void MenuActionController::attachUmbilicus()
+namespace {
+// The attached volume an umbilicus stamp names by store directory name, so the
+// stamp can be checked against it. Remote volumes are skipped: the check needs
+// local shape metadata.
+std::shared_ptr<Volume> attachedVolumeByStoreName(const VolumePkg& pkg, const std::string& storeName)
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+    const std::string wanted = std::filesystem::path(storeName).filename().string();
+    if (wanted.empty()) return nullptr;
+    for (const std::string& id : pkg.volumeIDs()) {
+        const std::shared_ptr<Volume> volume = pkg.volume(id);
+        if (volume && !volume->isRemote() && volume->path().filename().string() == wanted) return volume;
+    }
+    return nullptr;
+}
+}
+
+void MenuActionController::importUmbilicus()
+{
+    auto& state = *_window->_state;
+    const auto attachment = state.objectStoreAttachment();
+    const auto volume = state.currentVolume();
+    if (!attachment || !volume || !state.vpkg()) {
+        QMessageBox::information(_window, QObject::tr("Import Umbilicus"),
+            QObject::tr("Open a volume and attach an object store first."));
         return;
     }
-    auto pkg = _window->_state->vpkg();
     const auto file = QFileDialog::getOpenFileName(
-        _window, QObject::tr("Attach Umbilicus"),
-        QString::fromStdString(pkg->getVolpkgDirectory()),
-        QObject::tr("Umbilicus (*.json)"));
+        _window, QObject::tr("Import Umbilicus"),
+        QString::fromStdString(state.vpkg()->getVolpkgDirectory()),
+        QObject::tr("Umbilicus (*.json *.txt *.csv)"));
     if (file.isEmpty()) return;
 
-    vc::core::util::UmbilicusFileInfo info;
+    vc::objects::UmbilicusFile umbilicus;
     try {
-        info = vc::core::util::Umbilicus::LoadFileInfo(
-            std::filesystem::path(file.toStdString()));
+        umbilicus = vc::objects::readUmbilicusFile(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
-                .arg(file, QString::fromUtf8(e.what())));
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1 is not a valid umbilicus file:\n\n%2").arg(file, QString::fromUtf8(e.what())));
         return;
     }
 
-    // Malformed metadata makes the file unusable until it is fixed — the
-    // resolver refuses it — so attaching it would store an attachment nothing
-    // can use and report success beside a warning. Rejected instead, naming
-    // the errors; fix the file and attach again.
-    if (!info.metadataErrors.empty()) {
-        QStringList errors;
-        errors.reserve(static_cast<int>(info.metadataErrors.size()));
-        for (const auto& error : info.metadataErrors) {
-            errors << QString::fromStdString(error);
-        }
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 declares malformed frame metadata and was not "
-                        "attached:\n\n%2")
-                .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
+    // The store decides the frame: the file's stamp against the volume the
+    // umbilicus is bound to, and against an attached volume the stamp names.
+    const auto grid = [](const Volume& v) {
+        const double voxelSize = v.voxelSize();
+        return vc::objects::UmbilicusTargetGrid{
+            {double(v.sliceWidth()), double(v.sliceHeight()), double(v.numSlices())},
+            std::isfinite(voxelSize) && voxelSize > 0 ? std::optional(voxelSize) : std::nullopt};
+    };
+    std::optional<vc::objects::UmbilicusTargetGrid> named;
+    if (umbilicus.volume)
+        if (const auto volumeNamed = attachedVolumeByStoreName(*state.vpkg(), *umbilicus.volume)) named = grid(*volumeNamed);
+    const auto binding = vc::objects::umbilicusBinding(umbilicus, grid(*volume), named);
+    if (binding.refusal) {
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1 does not fit volume %2: %3")
+                .arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id()), QString::fromStdString(*binding.refusal)));
         return;
     }
+    // An inferred frame is offered for confirmation, and a file stating
+    // nothing asks, like an unbound fiber.
+    double storedUnitsPerVoxel = binding.storedUnitsPerVoxel.value_or(1.0);
+    if (binding.confirm) {
+        const QString reason = binding.storedUnitsPerVoxel
+            ? QObject::tr("Inferred from the points: %1").arg(QString::fromStdString(binding.frame))
+            : QObject::tr("The file states no frame.");
+        const auto entered = vc3d::promptStoredUnitsPerVoxel(
+            _window, QObject::tr("Bind Umbilicus Coordinates"), QStringLiteral("umbilicus"), *volume,
+            {{"file", QFileInfo(file).fileName().toStdString()}}, reason, binding.storedUnitsPerVoxel);
+        if (!entered) return;
+        storedUnitsPerVoxel = *entered;
+    }
 
-    pkg->setUmbilicus(file.toStdString());
-    // Consumers that placed geometry relative to the old umbilicus have no other
-    // way to learn this happened.
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
+    vc::objects::RevisionSelection replaced;
+    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, volume->id());
+    });
+    if (!replaced.empty() &&
+        QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
+            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(volume->id())))
+            != QMessageBox::Yes)
+        return;
+
+    try {
+        vc::objects::importVolumeUmbilicus(*state.objectStoreSession(), *attachment, volume->id(), umbilicus,
+            storedUnitsPerVoxel, QFileInfo(file).completeBaseName().toStdString(),
+            {{"tool", "vc3d-import-umbilicus"},
+             {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
+                             {"frame", binding.frame.empty() ? std::string("entered") : binding.frame}}},
+             {"sources", nlohmann::json::array()}});
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Import failed"), QString::fromUtf8(e.what()));
+        return;
     }
-    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
-        // Dimensions alone are a complete statement — the preferred one, in fact,
-        // being exact integer counts — so warning about a missing voxelsize_um
-        // there would call the better-stamped file unstamped.
-        QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
-            QObject::tr("%1 declares no frame, so consumers may have to guess "
-                        "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
-    }
+    _window->showStatusBarMessage(
+        QObject::tr("Imported umbilicus %1 for volume %2").arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id())), 5000);
 }
 
-void MenuActionController::detachUmbilicus()
+void MenuActionController::removeUmbilicus()
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+    auto& state = *_window->_state;
+    const auto attachment = state.objectStoreAttachment();
+    const auto volumeId = state.currentVolumeId();
+    if (!attachment || volumeId.empty()) {
+        QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
+            QObject::tr("Open a volume and attach an object store first."));
         return;
     }
-    auto pkg = _window->_state->vpkg();
-    const auto configured = pkg->umbilicus();
-    if (configured.empty()) {
-        QMessageBox::information(_window, QObject::tr("Detach Umbilicus"),
-            QObject::tr("No umbilicus is attached — the project already resolves one "
-                        "automatically."));
+    vc::objects::RevisionSelection pins;
+    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        pins = vc::objects::volumeUmbilicusRevisions(db, txn, volumeId);
+    });
+    if (pins.empty()) {
+        QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
+            QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(volumeId)));
         return;
     }
-    // Clearing the field persists the project and restores automatic
-    // resolution; the umbilicus is a single-valued field, so it is not part of
-    // the entry-based Detach dialog.
-    pkg->setUmbilicus({});
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Detached umbilicus %1; resolution is automatic again")
-                .arg(QString::fromStdString(configured)), 5000);
-    }
+    state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
+        for (const auto& [id, revision] : pins) db.retireObject(txn, id);
+    });
+    _window->showStatusBarMessage(
+        QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(volumeId)), 5000);
 }
 
 void MenuActionController::attachLasagnaManifest()
@@ -2041,36 +1781,67 @@ void MenuActionController::attachRemoteLasagnaManifest()
     beginLasagnaManifestAttachment(true);
 }
 
-void MenuActionController::attachCatalogLasagna(const QString& artifactUrl, bool fiber)
+void MenuActionController::attachCatalogRepresentation(const vcr::catalog::OpenDataSample& sample,
+                                                       const vcr::catalog::OpenDataRepresentationRef& ref)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
         return;
     }
     const auto targetPackage = _window->_state->vpkg();
-    using Result = std::pair<QString, QString>;
-    auto* watcher = new QFutureWatcher<Result>(this);
-    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, watcher, targetPackage, fiber]() {
-        const auto [url, error] = watcher->result();
-        watcher->deleteLater();
-        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
-        if (!error.isEmpty()) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), error);
+    const auto reportMessages = [this](const QString& title, const std::vector<std::string>& messages) {
+        QStringList lines;
+        for (const auto& message : messages)
+            lines.push_back(QString::fromStdString(message));
+        QMessageBox::warning(_window, title, lines.join('\n'));
+    };
+    // Only this representation: no scan views beside it.
+    vc3d::opendata::OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations = std::vector<vcr::catalog::OpenDataRepresentationRef>{ref};
+
+    if (ref.kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
+        // Caching and validating the dataset reads the network; the project
+        // only changes on the GUI thread, if it is still the open one.
+        using Preparation = vc3d::opendata::OpenDataLasagnaPreparation;
+        auto* watcher = new QFutureWatcher<Preparation>(this);
+        connect(watcher, &QFutureWatcher<Preparation>::finished, this,
+                [this, watcher, targetPackage, reportMessages]() {
+                    auto preparation = watcher->result();
+                    watcher->deleteLater();
+                    if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
+                    auto messages = preparation.messages;
+                    if (vc3d::opendata::attachOpenDataLasagna(*targetPackage, preparation, &messages) > 0)
+                        _window->refreshCurrentVolumePackageUi();
+                    if (!messages.empty())
+                        reportMessages(QObject::tr("Attach Lasagna"), messages);
+                });
+        watcher->setFuture(QtConcurrent::run([sample, selection, cacheRoot = vc3d::remoteCachePathFs()]() {
+            return vc3d::opendata::prepareOpenDataLasagna(sample, cacheRoot, &selection);
+        }));
+        return;
+    }
+
+    try {
+        if (ref.kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
+            if (vc3d::opendata::attachOpenDataNormalGrids(*targetPackage, sample, vc3d::remoteCachePathFs(),
+                                                          &selection) == 0) {
+                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
+                return;
+            }
+            _window->refreshCurrentVolumePackageUi();
             return;
         }
-        beginLasagnaManifestAttachment(true, url, fiber);
-    });
-    watcher->setFuture(QtConcurrent::run([artifactUrl]() -> Result {
-        try {
-            return {QString::fromStdString(vc3d::opendata::discoverOpenDataLasagnaManifestUrl(
-                        artifactUrl.toStdString())), {}};
-        } catch (const std::exception& ex) {
-            return {{}, QString::fromUtf8(ex.what())};
-        }
-    }));
+        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection);
+        _window->refreshCurrentVolumePackageUi();
+        if (result.failedVolumes)
+            reportMessages(tr("Attach incomplete"), result.messages);
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+    }
 }
 
-void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QString& initialUrl, bool fiber)
+void MenuActionController::beginLasagnaManifestAttachment(bool remote)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
@@ -2085,7 +1856,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl, {QStringLiteral("*.lasagna.json")}, true, false, !initialUrl.isEmpty());
+            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
@@ -2103,7 +1874,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
 
     bool roleAccepted = false;
     const QString role =
-        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, fiber ? 1 : 0, false, &roleAccepted);
+        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, 0, false, &roleAccepted);
     if (!roleAccepted)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");
@@ -2182,7 +1953,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
                 QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
                 return;
             }
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+            _window->refreshCurrentVolumePackageUi();
         } catch (const std::exception& error) {
             QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QString::fromUtf8(error.what()));
         }
@@ -2227,10 +1998,6 @@ void MenuActionController::detachEntry()
         items << QObject::tr("[volume] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
     }
-    for (const auto& e : pkg->segmentEntries()) {
-        items << QObject::tr("[segments] %1").arg(QString::fromStdString(e.location));
-        locations << QString::fromStdString(e.location);
-    }
     for (const auto& e : pkg->normalGridEntries()) {
         items << QObject::tr("[normal_grid] %1").arg(QString::fromStdString(e.location));
         locations << QString::fromStdString(e.location);
@@ -2263,86 +2030,7 @@ void MenuActionController::detachEntry()
             QObject::tr("Could not remove entry (not found)."));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
-}
-
-void MenuActionController::setOutputSegments()
-{
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
-        return;
-    }
-    auto pkg = _window->_state->vpkg();
-    QStringList items;
-    for (const auto& e : pkg->segmentEntries()) items << QString::fromStdString(e.location);
-    if (items.isEmpty()) {
-        QMessageBox::information(_window, QObject::tr("No segments"),
-                                 QObject::tr("Attach a segments source first."));
-        return;
-    }
-    bool ok = false;
-    int currentIdx = 0;
-    if (pkg->hasOutputSegments()) {
-        const auto cur = QString::fromStdString(pkg->outputSegmentsPath().string());
-        for (int i = 0; i < items.size(); ++i) {
-            if (items[i] == cur) { currentIdx = i; break; }
-        }
-    }
-    QString chosen = QInputDialog::getItem(_window, QObject::tr("Set Output Segments"),
-        QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
-    if (!ok || chosen.isEmpty()) return;
-    pkg->setOutputSegments(chosen.toStdString());
-    _window->refreshCurrentVolumePackageUi(QString(), true);
-}
-
-bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString out = QFileDialog::getSaveFileName(_window,
-        QObject::tr("Save converted .volpkg.json"),
-        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-        QObject::tr("Project (*.volpkg.json)"));
-    if (out.isEmpty()) return false;
-    if (!out.endsWith(".volpkg.json", Qt::CaseInsensitive)) out += ".volpkg.json";
-
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    auto r = vc::convertVolpkg(inputLocation.toStdString(), std::filesystem::path(out.toStdString()));
-    QApplication::restoreOverrideCursor();
-
-    if (!r.ok) {
-        QMessageBox box(_window);
-        box.setWindowTitle(QObject::tr("Volpkg conversion failed"));
-        box.setIcon(QMessageBox::Warning);
-        box.setText(QObject::tr("Could not convert this volpkg to .volpkg.json."));
-        box.setInformativeText(QObject::tr("Input:  %1\nOutput: %2\n\nReason: %3")
-            .arg(inputLocation, out, QString::fromStdString(r.message)));
-        box.setStandardButtons(QMessageBox::Ok);
-        box.setStyleSheet("QLabel{min-width:600px;}");
-        box.exec();
-        return false;
-    }
-    if (!r.message.empty()) {
-        QMessageBox::information(_window, QObject::tr("Volpkg converted with warnings"),
-            QString::fromStdString(r.message));
-    }
-    if (convertedOut) *convertedOut = out;
-    return true;
-}
-
-void MenuActionController::convertLegacyVolpkg()
-{
-    if (!_window) return;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    auto in = promptLocation(QObject::tr("Convert Legacy Volpkg"),
-                             QObject::tr("Pick the legacy volpkg directory or remote URL."),
-                             settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-                             {}, false, true);
-    if (in.isEmpty()) return;
-    QString out;
-    if (!runLegacyVolpkgConvert(in, &out)) return;
-    auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
-        QObject::tr("Wrote %1 — open it now?").arg(out));
-    if (reply == QMessageBox::Yes) openVolpkgAt(out);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 QString MenuActionController::objectStoreAuthor()
@@ -2404,7 +2092,7 @@ bool MenuActionController::createObjectStore()
 
 bool MenuActionController::requireObjectStore(const QString& purpose)
 {
-    if (_window->_state->objectStoreSession()->attachment()) return true;
+    if (_window->_state->objectStoreAttachment()) return true;
     QMessageBox box(QMessageBox::Information, QObject::tr("Object Store Required"),
         QObject::tr("%1 requires an object store, and none is attached.\n\n"
                     "Create a new empty store (.vcobj), or attach an existing one.").arg(purpose),
@@ -2430,7 +2118,8 @@ bool MenuActionController::attachObjectStoreAt(const QString& path, const QStrin
     // Only writable attachments reveal a hosted replica; a read-only reopen keeps the earlier tag.
     const QString absolute = QFileInfo(path).absoluteFilePath();
     auto stores = loadRecentObjectStores();
-    bool remote = _window->_state->objectStoreSession()->hubStatus().has_value();
+    const auto attachment = _window->_state->objectStoreAttachment();
+    bool remote = attachment && _window->_state->objectStoreSession()->hubStatus(*attachment);
     for (auto it = stores.begin(); it != stores.end();) {
         if (it->path != absolute) { ++it; continue; }
         if (readOnly) remote = remote || it->remote;

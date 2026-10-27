@@ -174,18 +174,6 @@ TEST_CASE("collectPlaneDependencies on AllFill returns keys for the chunk")
     CHECK_FALSE(keys.empty());
 }
 
-TEST_CASE("samplePlaneCoarseToFine with AllFill at finest level")
-{
-    AllFillArray a;
-    cv::Mat_<uint8_t> out(4, 4, uint8_t{0});
-    cv::Mat_<uint8_t> cov(4, 4, uint8_t{0});
-    auto stats = ChunkedPlaneSampler::samplePlaneCoarseToFine(
-        a, /*finestLevel=*/0,
-        cv::Vec3f(0, 0, 0), cv::Vec3f(1, 0, 0), cv::Vec3f(0, 1, 0),
-        out, cov);
-    CHECK(stats.coveredPixels > 0);
-}
-
 TEST_CASE("samplePlaneLevel with non-axis-aligned step vectors")
 {
     GradientArray a;

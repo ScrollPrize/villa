@@ -9,7 +9,8 @@ namespace vc::objects {
 using CoordinateJson = nlohmann::json;
 inline bool hasGeometryCoordinates(const std::string& kind)
 {
-    return kind == "point_collection" || kind == "patch" || kind == "fiber" || kind == "track";
+    return kind == "point_collection" || kind == "surface" || kind == "fiber" || kind == "track" ||
+           kind == "umbilicus";
 }
 // volume_uuid stores the authoritative volume ID verbatim (metadata.json id),
 // including catalog IDs such as "20260411134726". It is not an object UUID.
@@ -33,6 +34,12 @@ inline CoordinateJson geometryCoordinates(CoordinateJson value)
         (!scale.is_number() || !std::isfinite(scale.get<double>()) || scale.get<double>() <= 0))
         throw std::invalid_argument("geometry scale_factor must be finite and positive or null");
     return value;
+}
+// The coordinates of geometry stored at `storedUnitsPerVoxel` units per voxel
+// of `volume` (its meta.coordinates).
+inline CoordinateJson volumeCoordinates(const std::string& volume, double storedUnitsPerVoxel)
+{
+    return geometryCoordinates({{"volume_uuid", volume}, {"scale_factor", storedUnitsPerVoxel}});
 }
 
 inline CoordinateJson mergeGeometryCoordinates(const CoordinateJson& a, const CoordinateJson& b)

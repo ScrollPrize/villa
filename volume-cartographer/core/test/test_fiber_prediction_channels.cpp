@@ -154,37 +154,6 @@ TEST_CASE("auxiliary sampling is concurrent and leaves ordinary prediction sampl
     CHECK(actual.options[0].valid == expected.options[0].valid);
 }
 
-TEST_CASE("real prediction cache remains identical through old and options constructors") {
-    const char* manifest = std::getenv("VC_TEST_CHANNEL_PREDICTION_MANIFEST");
-    const char* anchors = std::getenv("VC_TEST_METRIC_ANCHORS");
-    if (!manifest || !anchors) return;
-    const auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
-    FiberPredictionField legacy(dataset), field(dataset, FiberPredictionFieldOptions{});
-    std::ifstream input(anchors);
-    REQUIRE(input.good());
-    const auto data = nlohmann::json::parse(input);
-    size_t count = 0;
-    for (const auto& cell : data.at("cells")) {
-        for (const auto& component : cell.at("components")) {
-            if (!component.at("retained").get<bool>()) continue;
-            const auto& p = component.at("position_base_xyz");
-            const cv::Vec3d point{p[0].get<double>(),p[1].get<double>(),p[2].get<double>()};
-            const auto expected = legacy.sample(point, {0,0,1});
-            const auto actual = field.sample(point, {0,0,1});
-            REQUIRE(actual.options.size() == expected.options.size());
-            REQUIRE(!actual.options.empty());
-            for (size_t i=0; i<actual.options.size(); ++i) {
-                CHECK(actual.options[i].direction == expected.options[i].direction);
-                CHECK(actual.options[i].presence == expected.options[i].presence);
-                CHECK(actual.options[i].valid == expected.options[i].valid);
-            }
-            ++count;
-        }
-    }
-    CHECK(count > 0);
-    std::cout << "Compared prediction field constructors at " << count << " real anchor positions\n";
-}
-
 TEST_CASE("auxiliary scoring preserves the fused normal corner path") {
     Fixture fixture; fixture.auxiliary();
     fixture.channel<uint8_t>("grad_mag", std::vector<uint8_t>(8,255), utils::ZarrDtype::uint8);
@@ -340,58 +309,6 @@ TEST_CASE("readiness precedes reads and does not remember failed acknowledgement
     }));
     for (auto& worker : workers) CHECK(worker.get()==1);
     CHECK(concurrentCalls==4);
-}
-
-TEST_CASE("real cached fiber samples are identical with publication gating") {
-    const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
-    const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
-    if (!manifest || !fiberPath) return;
-    const auto dataset=vc::lasagna::LasagnaDataset::open(manifest);
-    const auto fiber=loadFiberJson(fiberPath);
-    FiberPredictionFieldOptions options; options.enableWidth=true;
-    FiberPredictionField offline(dataset,options), gated(dataset,options);
-    size_t calls=0, dependencies=0;
-    gated.setReadinessGate([&](const auto& requested) {
-        ++calls; dependencies+=requested.size();
-        for (const auto& d : requested) REQUIRE(fs::is_directory(d.arrayPath));
-    });
-    std::vector<cv::Vec3d> points;
-    const size_t first=fiber.controlPointLineIndices.front();
-    for (size_t i=first;i<std::min(first+32,fiber.linePointsXyzBase.size());++i)
-        points.push_back(fiber.linePointsXyzBase[i]);
-    const std::vector<cv::Vec3d> directions(points.size(),{1,0,0});
-    std::vector<FiberPredictionSample> expected,actual;
-    offline.sampleBatch(points,directions,1,expected);
-    gated.sampleBatch(points,directions,4,actual);
-    REQUIRE(actual.size()==expected.size());
-    for (size_t i=0;i<actual.size();++i) {
-        REQUIRE(actual[i].options.size()==expected[i].options.size());
-        for (size_t j=0;j<actual[i].options.size();++j) {
-            CHECK(actual[i].options[j].presence==expected[i].options[j].presence);
-            CHECK(actual[i].options[j].direction==expected[i].options[j].direction);
-            CHECK(actual[i].options[j].valid==expected[i].options[j].valid);
-        }
-    }
-    CHECK(calls==1);
-    CHECK(dependencies>0);
-    std::cout << "Real Paris4 readiness: " << points.size() << " points, " << dependencies
-              << " dependencies in one gate; offline/live samples exact\n";
-    cv::Vec3d lo=points.front(),hi=lo;
-    std::vector<cv::Vec3f> floatPoints;
-    for (const auto& p : points) {
-        for (int axis=0;axis<3;++axis) {lo[axis]=std::min(lo[axis],p[axis]);hi[axis]=std::max(hi[axis],p[axis]);}
-        floatPoints.emplace_back(p[0],p[1],p[2]);
-    }
-    auto region=gated.pinRegion(lo,hi);
-    CHECK(calls==2);
-    region->seal();
-    std::vector<float> expectedWidths,actualWidths;
-    offline.sampleWidths(floatPoints,expectedWidths);
-    gated.sampleWidths(floatPoints,actualWidths,*region);
-    CHECK(actualWidths==expectedWidths);
-    CHECK(calls==2);
-    CHECK(region->bytes()>0);
-    std::cout << "Real Paris4 pinned widths exact; retained bytes=" << region->bytes() << '\n';
 }
 
 TEST_CASE("pinned prediction regions publish once and sample auxiliary data concurrently") {

@@ -34,6 +34,7 @@ namespace detail { class GeometryReadCache; class SpatialReadCache; }
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    std::map<std::string,double> transformedLengths;
     bool readSnapshot = false;
     bool checkedAction = false, actionConflict = false;
     // Hosted-store bookkeeping for the active write (see hub/HubRules.hpp):

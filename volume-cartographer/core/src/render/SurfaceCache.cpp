@@ -1239,8 +1239,6 @@ void SurfaceCache::shutdown()
         _state->volume->removeChunkReadyListener(chunkReadyId);
 }
 
-std::size_t SurfaceCache::fillWorkerCount() { return surfaceFillPool().worker_count(); }
-
 int SurfaceCache::levels() const { return _state->levels; }
 int SurfaceCache::wMin() const { return _state->wMin; }
 int SurfaceCache::wCount() const { return _state->wCount; }

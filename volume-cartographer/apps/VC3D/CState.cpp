@@ -1,10 +1,12 @@
 #include "CState.hpp"
+#include "PointCollectionSync.hpp"
 
-#include "OpenDataCoordinateIdentity.hpp"
+#include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <exception>
 #include <thread>
 #include <optional>
@@ -12,19 +14,51 @@
 #include <QTimer>
 
 #include "vc/core/types/VolumePkg.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 
 namespace {
 
-bool isValidSurfacePoint(const cv::Vec3f& point)
+std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
 {
-    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
-        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+    const auto catalog=vc3d::opendata::cachedCatalog();
+    if(!catalog)return {};
+    auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+    graph->addCatalog(*catalog);
+    return graph;
+}
+
+// Viewers re-query regions as the view moves: keep verified geometry per read
+// connection well beyond the store's default (16 MB) so warm queries skip
+// reloading and re-hashing chunks.
+vc::objects::OpenOptions viewerOpenOptions()
+{
+    vc::objects::OpenOptions options;
+    options.catalogTransforms = catalogTransformSnapshot();
+    options.geometryCacheBytes = size_t(256) << 20;
+    return options;
+}
+
+// The box spanned by `box`'s corners through `m`.
+Rect3D mappedBox(const Rect3D& box, const vcr::catalog::Affine& m)
+{
+    Rect3D result;
+    result.low = cv::Vec3f::all(std::numeric_limits<float>::infinity());
+    result.high = cv::Vec3f::all(-std::numeric_limits<float>::infinity());
+    for (int corner = 0; corner < 8; ++corner) {
+        const auto p = m.apply({(corner & 1 ? box.high : box.low)[0], (corner & 2 ? box.high : box.low)[1],
+                                (corner & 4 ? box.high : box.low)[2]});
+        for (int axis = 0; axis < 3; ++axis) {
+            result.low[axis] = std::min(result.low[axis], float(p[axis]));
+            result.high[axis] = std::max(result.high[axis], float(p[axis]));
+        }
+    }
+    return result;
 }
 
 struct SurfaceFocusPoint {
@@ -52,7 +86,7 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     }
 
     const cv::Vec3f point = (*points)(row, col);
-    if (!isValidSurfacePoint(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         return std::nullopt;
     }
 
@@ -200,6 +234,7 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         journalTimer->start();
     }
     _pointCollection = new VCCollection(this);
+    if (!objectStoreOwner) _pointCollectionSync = new vc3d::PointCollectionSync(this);
 
     setSurface("xy plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
@@ -207,25 +242,69 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,1,0}));
     setSurface("yz plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
+    connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        // The umbilicus is read through the store's volume mapping, so a
+        // registration change moves it too.
+        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub ||
+            !event.touches({"umbilicus", "volume_transform", "volume_transform_choice"}))
+            return;
+        emit umbilicusChanged();
+    });
 }
 
 CState::~CState()
 {
-    if (!_objectStoreOwner) { try { _objectStoreSession->detach(); } catch (...) {} }
+    if (!_objectStoreOwner && _objectStoreAttachment) {
+        try { _objectStoreSession->detach(*_objectStoreAttachment); } catch (...) {}
+    }
+    if (!_objectStoreOwner) {
+        for (const auto& [sample, attachment] : _catalogAttachments) {
+            try { _objectStoreSession->detach(attachment); } catch (...) {}
+        }
+    }
+}
+
+vc::objects::AttachmentIdentity CState::catalogAttachment(const vcr::catalog::OpenDataSample& sample)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(sample);
+    const auto found = _catalogAttachments.find(sample.id);
+    if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
+    auto options = viewerOpenOptions();
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto author = settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
+    if (author.isEmpty() || author == QStringLiteral("anon"))
+        author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
+    options.author = author.toStdString();
+    const auto attachment = vc::objects::attachCatalog(*_objectStoreSession, sample, vc3d::remoteCachePathFs(), options);
+    _catalogAttachments[sample.id] = attachment;
+    pollObjectStoreChanges();
+    return attachment;
+}
+
+std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
 }
 
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
-    vc::objects::OpenOptions options;
+    if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
+    _pointCollectionSync->flush();
+    auto options = viewerOpenOptions();
     options.author = author.toStdString();
     options.readOnly = readOnly;
-    _objectStoreSession->attach(path.toStdString(), options);
+    _objectStoreAttachment = _objectStoreAttachment
+        ? _objectStoreSession->replace(*_objectStoreAttachment, path.toStdString(), options)
+        : _objectStoreSession->attach(path.toStdString(), options);
     pollObjectStoreChanges();
 }
 
 void CState::detachObjectStore()
 {
-    _objectStoreSession->detach();
+    if (_objectStoreOwner) { _objectStoreOwner->detachObjectStore(); return; }
+    _pointCollectionSync->flush();
+    if (_objectStoreAttachment) _objectStoreSession->detach(*_objectStoreAttachment);
+    _objectStoreAttachment.reset();
     pollObjectStoreChanges();
 }
 
@@ -251,6 +330,7 @@ void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
     const bool changed = _vpkg != pkg;
     _vpkg = std::move(pkg);
+    updateAnnotationVolume();
     if (changed) {
         // Restore without invoking setters: switching projects must not persist
         // the previous project's bounds into either project.
@@ -274,62 +354,44 @@ bool CState::hasVpkg() const { return _vpkg != nullptr; }
 
 std::shared_ptr<Volume> CState::currentVolume() const { return _currentVolume; }
 
-std::string CState::currentVolumeId() const { return _currentVolumeId; }
+std::string CState::currentVolumeId() const { return _currentVolume ? _currentVolume->id() : std::string{}; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     if (_currentVolume == vol) {
-        resolveCurrentVolumeId();
         ++_focusBoundsRevision;
-        emit volumeChanged(_currentVolume, _currentVolumeId);
+        emit volumeChanged(_currentVolume, currentVolumeId());
         emit focusBoundsChanged();
         return;
     }
     _currentVolume = std::move(vol);
-    resolveCurrentVolumeId();
-    _pointCollection->setFileMetadata(
-        (_vpkg && !_currentVolumeId.empty())
-            ? vc3d::opendata::coordinateIdentityJson(
-                  vc3d::opendata::coordinateIdentityForVolume(
-                      *_vpkg, _currentVolumeId))
-            : utils::Json::object());
+    updateAnnotationVolume();
+    const auto volumeId = currentVolumeId();
     ++_focusBoundsRevision;
-    emit volumeChanged(_currentVolume, _currentVolumeId);
+    emit volumeChanged(_currentVolume, volumeId);
     emit focusBoundsChanged();
 }
 
-vc3d::annotation::AnnotationFrame CState::annotationFrame() const
+void CState::updateAnnotationVolume()
 {
-    if (!_currentVolume)
-        return {};
-    // Exact coordinate tags outrank rounded physical resolutions, including
-    // when coordinateIdentityForVolume cannot resolve a physical resolution.
-    std::optional<double> exactFactor;
-    std::optional<double> stampedResolution;
-    if (_vpkg && !_currentVolumeId.empty()) {
-        if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                _vpkg->volumeTags(_currentVolumeId))) {
-            exactFactor = static_cast<double>(identity->sourceCoordinateScaleFactor);
-            if (identity->sourceOriginalResolution > 0.0)
-                stampedResolution = identity->sourceOriginalResolution;
-        }
-    }
-    return vc3d::annotation::deriveAnnotationFrame(
-        _currentVolume->voxelSize(), _currentVolume->baseScaleLevel(),
-        exactFactor, stampedResolution,
-        {static_cast<double>(_currentVolume->sliceWidth()),
-         static_cast<double>(_currentVolume->sliceHeight()),
-         static_cast<double>(_currentVolume->numSlices())});
+    _annotationVolume.reset();
+    if (_currentVolume) _annotationVolume = vc::project::annotationVolume(_vpkg.get(), *_currentVolume);
 }
 
 std::optional<Rect3D> CState::focusBounds() const
 {
-    return vc3d::annotation::focusBoundsInVolume(_focusBounds, annotationFrame());
+    if (!_focusBounds || !_annotationVolume) return std::nullopt;
+    return mappedBox(*_focusBounds, _annotationVolume->fromVolume.inverse());
 }
 
 std::optional<Rect3D> CState::activeFocusBounds() const
 {
     return _focusBoundsEnabled ? focusBounds() : std::nullopt;
+}
+
+std::optional<Rect3D> CState::activeAnnotationFocusBounds() const
+{
+    return _focusBoundsEnabled && _annotationVolume ? _focusBounds : std::nullopt;
 }
 
 bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
@@ -338,19 +400,12 @@ uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
 
 void CState::setFocusBounds(const Rect3D& bounds)
 {
-    const auto inAnnotationFrame =
-        vc3d::annotation::focusBoundsInAnnotationFrame(bounds, annotationFrame());
-    if (!inAnnotationFrame)
+    if (!_annotationVolume)
         return;
-    Rect3D normalized;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(inAnnotationFrame->low[axis]) ||
-            !std::isfinite(inAnnotationFrame->high[axis])) {
+    const auto normalized = mappedBox(bounds, _annotationVolume->fromVolume);
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(normalized.low[axis]) || !std::isfinite(normalized.high[axis]))
             return;
-        }
-        normalized.low[axis] = std::min(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
-        normalized.high[axis] = std::max(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
-    }
     if (_focusBounds && _focusBounds->low == normalized.low &&
         _focusBounds->high == normalized.high) {
         return;
@@ -418,20 +473,10 @@ void CState::clearActiveSurface()
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
 
-void CState::resolveCurrentVolumeId()
+void CState::savePointCollections()
 {
-    _currentVolumeId.clear();
-    if (_vpkg && _currentVolume) {
-        for (const auto& id : _vpkg->volumeIDs()) {
-            if (_vpkg->volume(id) == _currentVolume) {
-                _currentVolumeId = id;
-                return;
-            }
-        }
-    }
-    if (_currentVolume) {
-        _currentVolumeId = _currentVolume->id();
-    }
+    if (_pointCollectionSync) _pointCollectionSync->flush();
+    emit pointCollectionsSaveRequested();
 }
 
 void CState::closeAll()
@@ -440,28 +485,20 @@ void CState::closeAll()
 
     clearActiveSurface();
 
-    setSurface("segmentation", nullptr, true);
-    if (_vpkg) {
-        for (const auto& id : _vpkg->getLoadedSurfaceIDs()) {
-            setSurface(id, nullptr, true);
-        }
-        _vpkg->unloadAllSurfaces();
-    } else {
-        auto names = surfaceNames();
-        for (const auto& name : names) {
-            if (name != "segmentation") {
-                setSurface(name, nullptr, true);
-            }
-        }
-    }
+    // Every surface except the view planes belongs to the closed project.
+    std::vector<std::string> closed;
+    for (const auto& [name, surf] : _surfs)
+        if (!std::dynamic_pointer_cast<PlaneSurface>(surf)) closed.push_back(name);
+    std::sort(closed.begin(), closed.end());
+    for (const auto& name : closed)
+        setSurface(name, nullptr, true);
 
     _currentVolume = nullptr;
-    _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
+    if (_pointCollectionSync) _pointCollectionSync->unload();
     _pointCollection->clearAll();
-    _pointCollection->setFileMetadata(utils::Json::object());
 
     setVpkg(nullptr);
 }
@@ -554,11 +591,6 @@ void CState::setSurfacesBatch(
     finishBatch();
 }
 
-void CState::emitSurfacesChanged()
-{
-    emit surfaceChanged("", nullptr, false);
-}
-
 std::shared_ptr<Surface> CState::surface(const std::string& name)
 {
     auto it = _surfs.find(name);
@@ -598,15 +630,6 @@ std::vector<std::shared_ptr<Surface>> CState::surfaces()
     return result;
 }
 
-std::vector<std::string> CState::surfaceNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _surfs)
-        keys.push_back(it.first);
-
-    return keys;
-}
-
 // --- POI methods (from CSurfaceCollection) ---
 
 std::unique_ptr<POI> CState::createSurfaceFocusPoi(QuadSurface& surface)
@@ -636,25 +659,4 @@ POI* CState::poi(const std::string& name)
     if (it == _pois.end())
         return nullptr;
     return it->second.get();
-}
-
-std::vector<POI*> CState::pois()
-{
-    std::vector<POI*> result;
-    result.reserve(_pois.size());
-
-    for (auto& [key, ptr] : _pois) {
-        result.push_back(ptr.get());
-    }
-
-    return result;
-}
-
-std::vector<std::string> CState::poiNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _pois)
-        keys.push_back(it.first);
-
-    return keys;
 }

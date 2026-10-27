@@ -4,6 +4,10 @@
 Requires the vc_object_store Python extension in PYTHONPATH. The input database
 must contain at least one fiber; neither it nor the user's settings are modified.
 Without --database, create a current-format fixture and check lazy span details.
+VC3D opens a one-volume project; the database gets a surface bound to that
+volume and an Open Data sample store a read-only catalog surface, so the bridge's
+surface workflow (list, activate, rename, tags, review, catalog guards, editing a
+catalog surface) runs against real stores.
 """
 import argparse
 import json
@@ -13,9 +17,25 @@ import sqlite3
 import tempfile
 import time
 
+import numpy as np
+
 from bridge_client import BridgeClient, BridgeError
+from smoke_offscreen import create_test_volume
 from vc3d_process import VC3DProcess
 from vc_object_store import ObjectStore
+
+
+def add_surface(store, name, volume, invalid_rows=0):
+    """A 3x3 surface inside the 16^3 smoke volume, bound to `volume`, followed by
+    `invalid_rows` rows of invalid points; returns its UUID."""
+    rows, cols = np.mgrid[:3 + invalid_rows, :3]
+    points = np.stack([cols * 2.0 + 4, rows * 2.0 + 4, np.full(rows.shape, 8.0)], axis=-1).astype('<f4')
+    points[3:] = -1
+    uuid = store.upsert_object(dict(kind='surface', name=name,
+                                    meta=dict(coordinates=dict(volume_uuid=volume, scale_factor=1))))
+    store.put_geometry(uuid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
+        dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())]))
+    return uuid
 
 
 def main():
@@ -41,17 +61,32 @@ def main():
         with ObjectStore.open(str(database), read_only=True) as store:
             count = len(store.objects_by_kind('fiber'))
         assert count > 0, 'The smoke fixture must contain fibers'
+        # The project's volume is the Open Data sample volume "catvol" at L0.
+        create_test_volume(root / 'volumes' / 'vol1', 'vol1')
+        project = root / 'smoke.volpkg.json'
+        project.write_text(json.dumps(dict(name='smoke', version=1, volumes=[dict(location='volumes', tags=[
+            'vc-open-data-sample-id:smp', 'vc-open-data-volume-id:catvol',
+            'vc-open-data-coordinate-space:smp/catvol@L0'])])))
+        with ObjectStore.open(str(database), author='bridge-fixture') as store:
+            user_surface = add_surface(store, 'smoke surface', 'vol1', invalid_rows=2)
+            # A surface of another scan, registered to vol1 by a shift.
+            registered_surface = add_surface(store, 'registered surface', 'scanb')
+            store.register_volume_transform('scanb', 'vol1', [[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 0]], 'smoke registration')
+        catalog_store = root / 'remote-cache' / 'open_data' / 'stores' / 'smp.vcobj'
+        catalog_store.parent.mkdir(parents=True)
+        with ObjectStore.create(str(catalog_store), author='vc3d-open-data') as store:
+            catalog_surface = add_surface(store, 'catalog surface', 'catvol')
         config = root / 'config'
         config.mkdir()
         (config / 'VC3D.ini').write_text(
-            '[viewer]\nremote_cache_dir=' + str(root / 'remote-cache') +
+            '[viewer]\nusername=bridge-smoke\nremote_cache_dir=' + str(root / 'remote-cache') +
             '\n[project]\nshow_open_data_catalog_on_startup=false\n')
         tag = 'bridge_smoke_' + str(os.getpid())
 
         def launch(index, store=database):
             process = VC3DProcess(args.vc3d,
                 ['--agent-bridge', '--agent-bridge-name', f'vc3d-store-{os.getpid()}-{index}',
-                 '--object-store', str(store)],
+                 '--object-store', str(store), '--volpkg', str(project)],
                 env_overrides={'QT_QPA_PLATFORM': 'offscreen',
                                'XDG_CONFIG_HOME': str(config), 'VC3D_CONFIG_DIR': str(config)})
             client = None
@@ -100,6 +135,8 @@ def main():
                 assert tag + '_external' in edited[0]['tags'], 'Edit after external commit must persist'
             client.call('fiber.save', {}, timeout=120)
             print(f'Attached {count} fibers; immediate edit, external journal refresh and Save barrier passed', flush=True)
+            render(client, root, user_surface, registered_surface)
+            surfaces(client, database, user_surface, catalog_surface)
         finally:
             client.close()
             process.terminate()
@@ -111,10 +148,103 @@ def main():
         finally:
             client.close()
             process.terminate()
-        hosted(root, database, launch, tag)
+        hosted(root, database, launch, tag, user_surface)
 
 
-def hosted(root, database, launch, tag):
+def listed_surfaces(client, wanted):
+    """The surface listing once it holds `wanted` (it is read in the background)."""
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            result, _ = client.call('segments.list', timeout=120)
+            rows = {row['id']: row for row in result['segments']}
+            if wanted <= rows.keys():
+                return rows
+        except BridgeError as error:
+            if error.code != -32000:
+                raise
+        if time.monotonic() > deadline:
+            raise RuntimeError(f'surfaces {wanted} were not listed')
+        time.sleep(.1)
+
+
+def expect_error(client, method, params, code):
+    try:
+        client.call(method, params, timeout=120)
+    except BridgeError as error:
+        assert error.code == code, (method, error)
+        return error
+    raise AssertionError(f'{method} must fail with {code}')
+
+
+def surfaces(client, database, user_surface, catalog_surface):
+    """Surfaces of the user's store are edited through the bridge; catalog surfaces
+    are read-only until copied into the user's store."""
+    rows = listed_surfaces(client, {user_surface, catalog_surface})
+    assert not rows[user_surface]['catalog'] and rows[user_surface]['bound'], rows[user_surface]
+    assert rows[catalog_surface]['catalog'] and rows[catalog_surface]['bound'], rows[catalog_surface]
+
+    activated, _ = client.call('segments.activate', {'segmentId': user_surface}, timeout=120)
+    assert activated['segment']['id'] == user_surface and activated['segment']['active'], activated
+    client.call('tags.set', {'segmentId': user_surface, 'tag': 'approved', 'enabled': True}, timeout=120)
+    client.call('segments.rename', {'segmentId': user_surface, 'newName': 'renamed surface'}, timeout=120)
+    with ObjectStore.open(str(database), read_only=True) as store:
+        record = store.object(user_surface)
+        assert 'approved' in record['tags'] and record['name'] == 'renamed surface', record
+    deadline = time.monotonic() + 30
+    while True:  # the review reads the listing, refreshed by the commit events
+        review, _ = client.call('segments.review', {'filter': {'approved': True}}, timeout=120)
+        if [row['id'] for row in review['segments']] == [user_surface]:
+            break
+        assert time.monotonic() < deadline, review
+        time.sleep(.1)
+    assert review['segments'][0]['reviewState'] == 'approved', review
+    with ObjectStore.open(str(database), read_only=True) as store:
+        before = store.current_geometry(user_surface)
+    client.call('segment.crop_bounds', {'segmentId': user_surface}, timeout=120)
+    with ObjectStore.open(str(database), read_only=True) as store:
+        after = store.current_geometry(user_surface)
+    assert after['parent_uuid'] == before['uuid'], (before, after)
+    assert [array['shape'] for array in after['arrays'] if array['name'] == 'points'] == [[3, 3, 3]], after
+
+    client.call('segments.activate', {'segmentId': catalog_surface}, timeout=120)
+    expect_error(client, 'segments.rename', {'segmentId': catalog_surface, 'newName': 'x'}, -32009)
+    expect_error(client, 'tags.set', {'segmentId': catalog_surface, 'tag': 'approved', 'enabled': True}, -32009)
+
+    # Editing a catalog surface edits it in the user's store, as the same surface
+    # whose first revision is the catalog version as stored.
+    enabled, _ = client.call('segmentation.enable_editing', {'enabled': True}, timeout=120)
+    assert enabled['enabled'], enabled
+    client.call('segmentation.enable_editing', {'enabled': False}, timeout=120)
+    with ObjectStore.open(str(database), read_only=True) as store:
+        record = store.object(catalog_surface)
+        assert record['meta']['coordinates']['volume_uuid'] == 'catvol', record['meta']
+    rows = listed_surfaces(client, {catalog_surface})
+    assert not rows[catalog_surface]['catalog'], rows[catalog_surface]
+    print('Surfaces: list, activate, tags, rename, review and crop edit the store; a catalog surface '
+          'is edited in the user\'s store as the same surface', flush=True)
+
+
+def render(client, root, *surface_ids):
+    """Surfaces render in the open volume's voxels: one bound to it, and one of
+    another scan through the store's registration."""
+    for surface in surface_ids:
+        out = root / ('render-' + surface)
+        started, _ = client.call('render.tifxyz', {'segmentId': surface, 'outputFormat': 'tif_stack',
+                                                   'outputDir': str(out), 'numSlices': 1}, timeout=120)
+        deadline = time.monotonic() + 120
+        while True:
+            status, _ = client.call('job.status', {'jobId': started['jobId']}, timeout=30)
+            if status['state'] in ('succeeded', 'failed'):
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(.2)
+        assert status['state'] == 'succeeded', status
+        assert list((out / 'layers').glob('*.tif')), list(out.rglob('*'))
+    print('Render: a bound surface and a registered one render through the store', flush=True)
+
+
+def hosted(root, database, launch, tag, surface):
     """Two VC3D replicas of one hub exchange edits; a lease held elsewhere blocks editing."""
     import vc_object_store as vos
     hub = root / 'share' / 'hub.vcobj'
@@ -163,7 +293,15 @@ def hosted(root, database, launch, tag):
                 raise AssertionError('Editing a fiber leased by another replica must fail')
             except BridgeError as error:
                 assert 'leased to script' in str(error), error
-        print('Hosted replicas exchanged edits through the hub; a held lease blocked editing', flush=True)
+        # Surfaces travel the same way: a tag set in one replica reaches the other.
+        listed_surfaces(first_client, {surface})
+        first_client.call('tags.set', {'segmentId': surface, 'tag': 'reviewed', 'enabled': True}, timeout=120)
+        deadline = time.monotonic() + 90
+        while 'reviewed' not in listed_surfaces(second_client, {surface})[surface]['tags']:
+            assert time.monotonic() < deadline, 'surface tag did not arrive through the hub'
+            time.sleep(.5)
+        print('Hosted replicas exchanged fiber and surface edits through the hub; a held lease blocked editing',
+              flush=True)
     finally:
         for client, process in ((first_client, first), (second_client, second)):
             if client:

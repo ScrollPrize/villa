@@ -1,8 +1,11 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include <nlohmann/json.hpp>
 #include <future>
 #include <thread>
 #include <iostream>
+#include <cstring>
 #include <algorithm>
 #include <cctype>
 #include <sqlite3.h>
@@ -14,7 +17,7 @@ int main() try
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     // Both pre-backport formats are rejected before the new journal is queried.
-    for (const int version : {14, 15}) {
+    for (const int version : {14, 15, 16}) {
         const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
         { auto db = ObjectStore::create(oldPath, options); }
         sqlite3* raw = nullptr;
@@ -45,22 +48,29 @@ int main() try
     ObjectStoreSession session;
     auto identity = session.attach(path, options);
     auto events = session.takeEvents();
-    require(events.size() == 1 && events[0].kind == StoreSessionEvent::Kind::Attachment, "attachment event");
+    require(events.size() == 1 && events[0].kind == StoreSessionEvent::Kind::Attached, "attachment event");
     mustFail([&] { session.attach(directory.path / "absent.vcobj", options); });
     require(!std::filesystem::exists(directory.path / "absent.vcobj"), "attach must not create");
+    mustFail([&] { session.replace(identity, directory.path / "absent.vcobj", options); });
     require(session.current(identity), "failed replacement preserved old attachment");
+    mustFail([&] { session.attach(path, options); });
+    require(session.attachments().size() == 1, "a store is attached once");
     auto readonly = options; readonly.readOnly = true;
-    identity = session.attach(path, readonly);
-    require(!session.writable(), "read-only attachment reports access mode");
+    identity = session.replace(identity, path, readonly);
+    require(!session.writable(identity), "read-only attachment reports access mode");
     session.read(identity, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, a).has_value(), "read-only attachment reads objects");
     });
     bool callbackRan = false;
     mustFail([&] { session.act(identity, {}, [&](auto&, auto&) { callbackRan = true; }); });
     require(!callbackRan, "read-only actions rejected before callback");
-    identity = session.attach(path, options);
-    session.takeEvents();
-    require(session.writable(), "writable reattachment");
+    identity = session.replace(identity, path, options);
+    events = session.takeEvents();
+    // Two replacements: read-only, then writable again.
+    require(events.size() == 4 && events[2].kind == StoreSessionEvent::Kind::Detached &&
+            events[3].kind == StoreSessionEvent::Kind::Attached && events[3].attachment == identity,
+            "replacement reports the old attachment leaving before the new one joins");
+    require(session.writable(identity), "writable reattachment");
 
     auto heads = [&] {
         RevisionSelection result;
@@ -141,11 +151,12 @@ int main() try
     entered.get_future().wait();
     { auto txn = external.write(); external.setMeta(txn, b, "external", "2"); txn.commit(); }
     changed.set_value();
-    session.detach(); reader.get();
-    require(!session.attachment(), "detached");
+    session.detach(identity); reader.get();
+    require(session.attachments().empty(), "detached");
     events = session.takeEvents();
     require(events.size() == 2 && events[0].kind == StoreSessionEvent::Kind::Committed &&
-            events[1].kind == StoreSessionEvent::Kind::Attachment, "old commits precede detachment");
+            events[1].kind == StoreSessionEvent::Kind::Detached && events[1].attachment == identity,
+            "old commits precede detachment");
     mustFail([&] { session.act(identity, {}, [](auto&, auto&) {}); });
     const auto second = session.attach(path, options);
     require(second.storeUuid == identity.storeUuid && second.generation > identity.generation, "same store invalidates old requests");
@@ -162,7 +173,7 @@ int main() try
         });
     });
     writing.get_future().wait();
-    auto detach = std::async(std::launch::async, [&] { session.detach(); });
+    auto detach = std::async(std::launch::async, [&] { session.detach(second); });
     while (session.current(second)) std::this_thread::yield();
     mustFail([&] { session.act(second, latest, [](auto&, auto&) {}); });
     finishWriting.set_value(); pending.get(); detach.get();
@@ -170,7 +181,207 @@ int main() try
     auto replacementPath = directory.path / "replacement.vcobj";
     { auto replacement = ObjectStore::create(replacementPath, options); }
     auto replacement = session.attach(replacementPath, options);
-    require(replacement.storeUuid != second.storeUuid && replacement.generation > second.generation, "different-store replacement");
-    session.detach();
+    require(replacement.storeUuid != second.storeUuid && replacement.generation > second.generation, "different-store attachment");
+    session.takeEvents();
+
+    // Several stores side by side: a read-only catalog next to a writable store.
+    // Each keeps its own access mode and events; detaching one leaves the other.
+    auto catalog = session.attach(path, readonly);
+    require(session.attachments() == std::vector<AttachmentIdentity>{replacement, catalog}, "attachments in attach order");
+    require(session.writable(replacement) && !session.writable(catalog), "access mode is per attachment");
+    const auto added = util::newUuid();
+    session.act(replacement, {{added, std::nullopt}}, [&](auto& store, auto& txn) {
+        ObjectRecord o; o.uuid = added; o.kind = "surface"; store.upsertObject(txn, o);
+    });
+    { auto txn = external.write(); external.setMeta(txn, a, "catalog", "1"); txn.commit(); }
+    events = session.takeEvents();
+    require(events.size() == 3 && events[0].kind == StoreSessionEvent::Kind::Attached && events[0].attachment == catalog,
+            "second attachment joins");
+    for (const auto& event : std::vector(events.begin() + 1, events.end()))
+        require(event.kind == StoreSessionEvent::Kind::Committed && event.changes.size() == 1 &&
+                event.changes[0].recordUuid == (event.attachment == catalog ? a : added), "events are tagged by attachment");
+    mustFail([&] { session.act(catalog, {}, [](auto&, auto&) {}); });
+
+    // Copying from the read-only catalog into the writable store makes a new,
+    // editable object with the same geometry, channels and point annotations.
+    std::string surface, points;
+    {
+        auto txn = external.write();
+        ObjectRecord record; record.kind = "surface"; record.name = "catalog surface"; record.tags = {"paths"};
+        record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+        surface = external.upsertObject(txn, record);
+        auto data = vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{1, 2, 3}, {4, 5, 6}}, {255, 0}});
+        data.arrays.push_back({"ink", "<u2", {2, 4}, std::vector<uint8_t>(16, 7)});
+        external.putGeometry(txn, surface, data);
+        ObjectRecord collection; collection.kind = "point_collection";
+        collection.meta = R"({"source":{"point_attributes":[{"note":"first"},{}]}})";
+        points = external.upsertObject(txn, collection);
+        external.putGeometry(txn, points, vc::geometry::encode(vc::geometry::PointCollection{{7, 3}, {{1, 2, 3}, {4, 5, 6}}}));
+        txn.commit();
+    }
+    for (const auto& original : {surface, points}) {
+        const auto copied = session.copyObject(catalog, replacement, original);
+        require(copied != original, "copies get new UUIDs");
+        GeometryData source, target;
+        std::string sourceAnnotations, targetAnnotations;
+        session.read(catalog, [&](const auto& store, const auto& txn, const auto&) {
+            const auto revision = store.currentGeometry(txn, original)->uuid;
+            source = store.readGeometryData(txn, revision);
+            if (source.kind != "surface") sourceAnnotations = store.geometryPointAnnotations(txn, revision, "points");
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            const auto object = store.objectByUuid(txn, copied);
+            const auto meta = nlohmann::json::parse(object->meta);
+            require(meta.at("copied_from").at("object_uuid") == original &&
+                    meta.at("copied_from").at("store_uuid") == catalog.storeUuid, "copies record their source");
+            if (object->kind == "surface")
+                require(object->name == "catalog surface" && object->tags == std::vector<std::string>{"paths"} &&
+                        meta.at("coordinates").at("volume_uuid") == "vol", "copies keep name, tags and binding");
+            const auto revision = store.currentGeometry(txn, copied)->uuid;
+            target = store.readGeometryData(txn, revision);
+            if (target.kind != "surface") targetAnnotations = store.geometryPointAnnotations(txn, revision, "points");
+        });
+        require(source.arrays.size() == target.arrays.size(), "copies keep every array");
+        for (size_t i = 0; i < source.arrays.size(); ++i)
+            require(source.arrays[i].name == target.arrays[i].name && source.arrays[i].bytes == target.arrays[i].bytes,
+                    "copies keep exact geometry");
+        require(sourceAnnotations == targetAnnotations, "copies keep point annotations");
+    }
+    const auto named = session.copyObject(catalog, replacement, surface, "renamed");
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, named)->name == "renamed", "a copy can be named");
+    });
+    {
+        // Editing holds the object from the revision on screen.
+        PinnedObject pin{replacement, {replacement.storeUuid, named}, {}, std::nullopt};
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            pin.objectRevision = store.currentObjectRevision(txn, named)->uuid;
+        });
+        { auto held = session.holdForEditing(pin); }
+        auto stale = pin;
+        stale.objectRevision = vc::objects::util::newUuid();
+        bool refused = false;
+        try { auto held = session.holdForEditing(stale); } catch (const std::runtime_error&) { refused = true; }
+        require(refused, "a stale pin cannot be edited");
+        StoreSessionEvent committed;
+        committed.kind = StoreSessionEvent::Kind::Committed;
+        committed.changes.push_back(JournalEntry{});
+        committed.changes.back().kind = "surface";
+        StoreSessionEvent hub;
+        hub.kind = StoreSessionEvent::Kind::Hub;
+        require(committed.touches({"fiber", "surface"}) && !committed.touches({"fiber"}) && hub.touches({"fiber"}),
+                "events say which record kinds they may have changed");
+    }
+    // Importing keeps the object's identity: its source version is its first
+    // revision in the destination, and restoring that revision undoes later edits.
+    session.importObject(catalog, replacement, surface);
+    std::string imported, importedGeometry;
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        const auto history = store.objectHistory(txn, surface);
+        require(history.size() == 1 && history.front().record.name == "catalog surface",
+                "an imported object starts at its source version");
+        imported = history.front().uuid;
+        importedGeometry = *history.front().geometryRevision;
+    });
+    session.act(replacement, {{surface, imported}}, [&](auto& store, auto& txn) {
+        auto record = *store.objectByUuid(txn, surface);
+        record.name = "edited";
+        store.upsertObject(txn, record);
+        store.putGeometry(txn, surface, vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{9, 9, 9}, {4, 5, 6}}, {255, 255}}),
+                         importedGeometry);
+    });
+    std::string edited;
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        edited = store.currentObjectRevision(txn, surface)->uuid;
+        require(store.currentGeometry(txn, surface)->uuid != importedGeometry, "edits make new revisions");
+    });
+    session.act(replacement, {{surface, edited}}, [&](auto& store, auto& txn) { store.restoreObject(txn, surface, imported); });
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, surface)->name == "catalog surface" &&
+                store.currentGeometry(txn, surface)->uuid == importedGeometry, "restoring the first revision resets to the source");
+    });
+    bool refused = false;
+    try { session.importObject(catalog, replacement, surface); } catch (const std::exception&) { refused = true; }
+    require(refused, "an object is imported once");
+    session.takeEvents();
+    const auto looked = session.artifactDirectory(replacement, surface, false);
+    require(!std::filesystem::exists(looked), "looking for artifacts creates nothing");
+    const auto artifacts = session.artifactDirectory(replacement, surface);
+    require(artifacts == looked, "looking and creating name the same directory");
+    require(artifacts == std::filesystem::path(replacementPath.string() + ".artifacts") / surface &&
+            std::filesystem::is_directory(artifacts), "artifacts live beside the store, one directory per object");
+    session.detach(catalog);
+    require(session.current(replacement) && !session.current(catalog), "detaching one keeps the other");
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, added).has_value(), "remaining attachment still reads");
+    });
+    // Edits that keep relationships as recorded: an anchored vertex moves and the
+    // relationship stays, pinned to the geometry it was made from.
+    {
+        const auto sheet = util::newUuid(), marker = util::newUuid();
+        std::string link;
+        session.act(replacement, {{sheet, std::nullopt}, {marker, std::nullopt}}, [&](auto& store, auto& txn) {
+            ObjectRecord record; record.uuid = sheet; record.kind = "surface";
+            store.upsertObject(txn, record);
+            store.putGeometry(txn, sheet, vc::geometry::encode(vc::geometry::Surface{2, 2, {1, 1}, {{1, 1, 1}, {2, 1, 1}, {1, 2, 1}, {2, 2, 1}}}));
+            record.uuid = marker; record.kind = "point_collection";
+            store.upsertObject(txn, record);
+            store.putGeometry(txn, marker, vc::geometry::encode(vc::geometry::PointCollection{{0}, {{1, 1, 1}}}));
+            EdgeRecord edge; edge.kind = "point-surface"; edge.aUuid = sheet; edge.bUuid = marker;
+            edge.aAnchor.points = {{"points", {0, 0}}};
+            edge.bAnchor.points = {{"point_ids", {0}}};
+            link = store.addEdge(txn, edge);
+        });
+        RevisionSelection pins;
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) { pins[sheet] = store.currentObjectRevision(txn, sheet)->uuid; });
+        mustFail([&] { session.act(replacement, pins, [&](auto& store, auto& txn) {
+            const auto head = store.currentGeometry(txn, sheet)->uuid;
+            std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
+            store.editGeometry(txn, sheet, {{"points", 0, moved}}, head);
+        }); });
+        session.editKeepingRelationships(replacement, pins, {}, [&](auto& store, auto& txn, const auto& keep) {
+            const auto head = store.currentGeometry(txn, sheet)->uuid;
+            std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
+            const std::vector<GeometryArrayEdit> edits{{"points", 0, moved}};
+            store.editGeometry(txn, sheet, edits, head, [&](const std::vector<EdgeRecord>& affected) { return keep(affected); });
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.edgeByUuid(txn, link).has_value(), "relationships survive kept-as-recorded edits");
+            const auto points = store.readGeometryArray(txn, store.currentGeometry(txn, sheet)->uuid, "points");
+            float z; std::memcpy(&z, points.data() + 8, 4);
+            require(z == 5, "the anchored vertex moved");
+        });
+        // An object pinned without a revision is created by the same edit.
+        const auto created = util::newUuid();
+        session.editKeepingRelationships(replacement, {{created, std::nullopt}}, {}, [&](auto& store, auto& txn, const auto&) {
+            ObjectRecord record; record.uuid = created; record.kind = "surface";
+            store.upsertObject(txn, record);
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.objectByUuid(txn, created).has_value(), "edits create objects pinned without a revision");
+        });
+        // Tags of current records, kept relationships, and selections by tag sets.
+        session.tagObjects(replacement, {sheet, created}, {"approved", "reviewed"});
+        session.tagObjects(replacement, {created}, {"defective"}, {"approved"});
+        session.editRecords(replacement, {created}, [](ObjectRecord& record) { record.name = "renamed"; });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.edgeByUuid(txn, link).has_value(), "tagging keeps relationships as recorded");
+            const auto tags = store.objectByUuid(txn, created)->tags;
+            require(store.objectByUuid(txn, created)->name == "renamed" &&
+                        std::find(tags.begin(), tags.end(), "approved") == tags.end() &&
+                        std::find(tags.begin(), tags.end(), "defective") != tags.end(),
+                    "tag edits add and remove on the current record");
+            ObjectSelection selection;
+            selection.kind = "surface";
+            selection.tagGroups = {{"approved", "defective"}, {"reviewed"}};
+            require(store.selectObjects(txn, selection).size() == 2, "every tag group must be matched by one tag");
+            selection.withoutTags = {"defective"};
+            const auto kept = store.selectObjects(txn, selection);
+            require(kept.size() == 1 && kept[0].uuid == sheet, "objects with an excluded tag are left out");
+        });
+        mustFail([&] { session.tagObjects(replacement, {util::newUuid()}, {"approved"}); });
+        session.takeEvents();
+    }
+    session.detach(replacement);
     std::cout << "session tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

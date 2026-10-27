@@ -1,4 +1,5 @@
 #include "CChunkedVolumeViewer.hpp"
+#include "SurfaceIntersectionStyle.hpp"
 #include "SurfaceRenderPolicy.hpp"
 
 #include <atomic>
@@ -12,13 +13,11 @@
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
-#include "overlays/SegmentationOverlayController.hpp"
 #include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
-#include "render/ChunkCache.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/SurfaceCache.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
@@ -121,37 +120,14 @@ constexpr int kSurfaceTileRenderDebounceMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kSurfaceCellTileSize = 64;
 
-constexpr std::array<QRgb, 12> kIntersectionPalette = {
-    qRgb(255, 120, 120), qRgb(120, 200, 255), qRgb(120, 255, 140),
-    qRgb(255, 220, 100), qRgb(220, 140, 255), qRgb(255, 160, 200),
-    qRgb(140, 255, 220), qRgb(200, 255, 140), qRgb(255, 180, 120),
-    qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
-};
-constexpr int kIntersectionZ = 100;
+using vc3d::kIntersectionZ;
+using vc3d::kActiveIntersectionZ;
 constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
-constexpr int kHighlightedIntersectionZ = 110;
-constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
-constexpr float kApprovalPlaneIntersectionScale = 1.5f;
 constexpr float kFocusProjectionThreshold = 4.0f;
-
-std::optional<QColor> segmentFolderColorOverride(const QuadSurface* surface)
-{
-    if (!surface || surface->meta.is_null() || !surface->meta.contains("vc3d_segment_folder_color")) {
-        return std::nullopt;
-    }
-    const auto& color = surface->meta["vc3d_segment_folder_color"];
-    if (!color.is_array() || color.size() < 3) {
-        return std::nullopt;
-    }
-    auto channel = [&](size_t index) {
-        return std::clamp(static_cast<int>(std::lround(color.at(index).get_double())), 0, 255);
-    };
-    return QColor(channel(0), channel(1), channel(2));
-}
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -185,26 +161,6 @@ bool isSupportedStreamingCompositeMethod(const std::string& method)
            method == "alpha" || method == "volumetric";
 }
 
-int dominantAxis(const cv::Vec3f& v, float axisEps = 1e-4f)
-{
-    int axis = 0;
-    float best = std::abs(v[0]);
-    for (int i = 1; i < 3; ++i) {
-        const float a = std::abs(v[i]);
-        if (a > best) {
-            best = a;
-            axis = i;
-        }
-    }
-    if (best < 1.0f - axisEps)
-        return -1;
-    for (int i = 0; i < 3; ++i) {
-        if (i != axis && std::abs(v[i]) > axisEps)
-            return -1;
-    }
-    return axis;
-}
-
 QColor activeSegmentationColorForView(const std::string& surfName)
 {
     if (surfName == "seg yz" || surfName == "yz plane")
@@ -220,11 +176,6 @@ float activeSegmentationIntersectionWidth(float baseWidth)
                     baseWidth + kActiveIntersectionMinWidthDelta);
 }
 
-bool validSurfacePoint(const cv::Vec3f& p)
-{
-    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-           p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
-}
 
 bool finiteVec2(const cv::Vec2f& v)
 {
@@ -298,7 +249,7 @@ SafeFocusProjection validateSafeFocusProjection(
     }
 
     result.coord = surface.coord(result.ptr);
-    if (!validSurfacePoint(result.coord)) {
+    if (!vc::geometry::validSurfacePoint(result.coord)) {
         result.reason = "invalid_coord";
         return result;
     }
@@ -358,11 +309,6 @@ SafeFocusProjection validateSafeFocusProjection(
 std::string profileCaller(const std::source_location& caller)
 {
     return std::format("{}:{} {}", caller.file_name(), caller.line(), caller.function_name());
-}
-
-std::string profileVec3(const cv::Vec3f& v)
-{
-    return std::format("[{:.3f},{:.3f},{:.3f}]", v[0], v[1], v[2]);
 }
 
 std::string profileRect(const cv::Rect& r)
@@ -452,7 +398,7 @@ void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
         for (int x = 0; x < w; ++x) {
             cv::Vec3f& p = coordRow[x];
             const cv::Vec3f& n = normalRow[x];
-            if (!validSurfacePoint(p) ||
+            if (!vc::geometry::validSurfacePoint(p) ||
                 !std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                 continue;
             }
@@ -594,7 +540,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
-    connect(_view, &CVolumeViewerView::sendScrolled, this, &CChunkedVolumeViewer::onScrolled);
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CChunkedVolumeViewer::onZoom);
     connect(_view, &CVolumeViewerView::sendResized, this, &CChunkedVolumeViewer::onResized);
@@ -871,37 +816,6 @@ void CChunkedVolumeViewer::setPinnedSurfaceY(std::optional<float> surfaceY)
     // refreshes the measurement overlay.
     submitRender("camera pinned");
     emit overlaysUpdated();
-}
-
-void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& state)
-{
-    if (_closing) {
-        return;
-    }
-    _surfacePtrX = state.surfacePtrX;
-    _surfacePtrY = state.surfacePtrY;
-    _scale = state.scale;
-    // Raw assignment, not setZOffset(): offscreen replay must not schedule
-    // intersection renders in the other viewers.
-    _zOff = state.zOffset;
-    _zOffWorldDir = state.zOffsetWorldDir;
-    recalcPyramidLevel();
-    _genCacheDirty = true;
-    syncCameraTransform();
-    refreshMeasurementOverlay();
-    emit overlaysUpdated();
-}
-
-bool CChunkedVolumeViewer::isRenderQuiescent() const
-{
-    return !_renderWorkerBusy.load(std::memory_order_acquire)
-        && !_pendingRenderJob.has_value()
-        && !_pendingRenderDirty;
-}
-
-std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
-{
-    return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
 }
 
 void CChunkedVolumeViewer::rebuildChunkArray()
@@ -1305,10 +1219,7 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
         isSameCurrentSurface && isEditUpdate && _surfaceEditInvalidationPending;
     if (isCurrentSurface)
         _surfaceEditInvalidationPending = false;
-    const bool isIntersectionTarget =
-        _intersectTgts.count(name) != 0 ||
-        (_intersectTgts.count("visible_segmentation") != 0 &&
-         (name == "segmentation" || _highlightedSurfaceIds.count(name) != 0));
+    const bool isIntersectionTarget = _intersectTgts.count(name) != 0;
 
     if (!isCurrentSurface) {
         if (isIntersectionTarget) {
@@ -1767,10 +1678,6 @@ void CChunkedVolumeViewer::scheduleIntersectionRender(const char* reason, std::s
     if (_closing) {
         return;
     }
-    if (ProfileLoggingEnabled()) {
-        _pendingIntersectionReason = reason ? reason : "";
-        _pendingIntersectionCaller = profileCaller(caller);
-    }
     ProfileScope profile("scheduleIntersectionRender", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format("surf='{}' targets={}", _surfName, _intersectTgts.size()));
@@ -2042,7 +1949,6 @@ struct CChunkedVolumeViewer::RenderContext {
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
-    std::string baseColormapId;
     std::shared_ptr<Surface> surf;
     std::shared_ptr<vc::render::ChunkCache> chunkArray;
     std::shared_ptr<Volume> overlayVolume;
@@ -2453,8 +2359,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto cam = volumetricCamera();
 
         std::array<uint32_t, 256> colorLut{};
-        vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
-                                        ctx.baseColormapId);
+        vc::buildWindowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
         // Ray-segment length correction 1/|d_w| so tilted views don't look
         // artificially transparent (per-frame constant: parallel rays).
         const auto dir = vc3d::volumetric::viewDirection(cam);
@@ -2834,7 +2739,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 const auto* nrow = normals.ptr<cv::Vec3f>(y);
                 auto* dstRow = layerCoords.ptr<cv::Vec3f>(y);
                 for (int x = 0; x < coords.cols; ++x) {
-                    if (!std::isfinite(src[x][0]) || src[x][0] == -1.0f)
+                    if (!vc::geometry::validSurfacePoint(src[x]))
                         dstRow[x] = src[x];
                     else
                         dstRow[x] = src[x] + nrow[x] * offset;
@@ -3281,7 +3186,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.overlayTargetCoverage = overlayTargetCoverage;
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
+    vc::buildWindowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
     std::array<uint32_t, 256> overlayLut{};
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
@@ -3367,7 +3272,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
         job.compositeSettings.params.camAzimuthDeg = 0.0f;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
-    job.baseColormapId = _baseColormapId;
     job.surf = surf;
     job.surfaceName = _surfName;
     job.chunkArray = _chunkArray;
@@ -3385,7 +3289,7 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlaySurfaceCache = _overlaySurfaceCache;
     job.surfaceCacheEpoch = _surfaceCacheEpoch;
     // Focus bounds are in volume base coordinates for every view, including
-    // segment and atlas QuadSurfaces. Mask the generated coordinates, not UVs;
+    // segment QuadSurfaces. Mask the generated coordinates, not UVs;
     // the underlying surface and its cached tiles remain unchanged.
     if (_state) {
         job.focusBoundsBase = _state->activeFocusBounds();
@@ -3437,7 +3341,6 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
            a.windowHigh == b.windowHigh &&
-           a.baseColormapId == b.baseColormapId &&
            a.surf.get() == b.surf.get() &&
            a.surfaceName == b.surfaceName &&
            a.chunkArray.get() == b.chunkArray.get() &&
@@ -3512,7 +3415,6 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
-    ctx.baseColormapId = job.baseColormapId;
     ctx.surf = job.surf;
     ctx.chunkArray = job.chunkArray;
     ctx.overlayVolume = job.overlayVolume;
@@ -3580,10 +3482,6 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         return;
     }
     syncCameraTransform();
-    if (ProfileLoggingEnabled()) {
-        _pendingRenderReason = reason ? reason : "";
-        _pendingRenderCaller = profileCaller(caller);
-    }
     // Hidden viewer (minimized subwindow / background tab): skip the render.
     // Mark stale so showEvent renders it when it becomes visible.
     if (!isVisible()) {
@@ -4362,7 +4260,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 
     if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
         if (const auto hit = pointAtScenePosition(scenePos)) {
-            _selectedCollectionId = hit->first;
             _selectedPoint = vc::PointRef{hit->first, hit->second};
             emit pointClicked(*_selectedPoint);
             emit overlaysUpdated();
@@ -4379,7 +4276,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 
 void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
 {
-    _selectedCollectionId = collectionId;
     if (_selectedPoint) {
         const auto point = _pointCollection ? _pointCollection->getPoint(*_selectedPoint)
                                             : std::optional<ColPoint>{};
@@ -4392,7 +4288,6 @@ void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
 
 void CChunkedVolumeViewer::clearCollectionSelection()
 {
-    _selectedCollectionId.reset();
     _selectedPoint.reset();
     emit overlaysUpdated();
 }
@@ -4400,7 +4295,6 @@ void CChunkedVolumeViewer::clearCollectionSelection()
 void CChunkedVolumeViewer::onPointSelected(vc::PointRef point)
 {
     _selectedPoint = point;
-    _selectedCollectionId = point.collectionId;
     emit overlaysUpdated();
 }
 
@@ -4557,10 +4451,8 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
                     })) {
                 const vc::PointRef hitRef{hit->first, hit->second};
                 if (_pointCollection && _pointCollection->getPoint(hitRef)) {
-                    _selectedCollectionId = hit->first;
                     _selectedPoint = hitRef;
                 } else {
-                    _selectedCollectionId.reset();
                     _selectedPoint.reset();
                 }
                 _sameWrapManualMergePressConsumed = true;
@@ -4877,7 +4769,7 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         float distance = dist;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
-        if (validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
+        if (vc::geometry::validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
             w = (volPoint - surfCoord).dot(surfNormal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
@@ -5001,11 +4893,6 @@ void CChunkedVolumeViewer::setLineAnnotationPlacementPreviewEnabled(bool enabled
     if (!enabled) {
         clearLineAnnotationPlacementMarker();
     }
-}
-
-bool CChunkedVolumeViewer::lineAnnotationPlacementMarkerVisible() const
-{
-    return _lineAnnotationPlacementMarker && _lineAnnotationPlacementMarker->isVisible();
 }
 
 void CChunkedVolumeViewer::markSurfaceGeometryChanged()
@@ -5486,17 +5373,6 @@ void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
         delete item;
 }
 
-void CChunkedVolumeViewer::clearAllOverlayGroups()
-{
-    // Detach before deleting, as in clearOverlayGroup.
-    const auto groups = std::move(_overlayGroups);
-    _overlayGroups.clear();
-    for (const auto& [_, items] : groups) {
-        for (auto* item : items)
-            delete item;
-    }
-}
-
 std::vector<std::pair<QRectF, QColor>> CChunkedVolumeViewer::selections() const
 {
     std::vector<std::pair<QRectF, QColor>> out;
@@ -5561,7 +5437,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     for (int j = j0; j <= j1; ++j) {
         for (int i = i0; i <= i1; ++i) {
             const cv::Vec3f& p = src(j, i);
-            if (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f)
+            if (!vc::geometry::validSurfacePoint(p))
                 continue;
             const double u = (i - cx) / scale[0];
             const double v = (j - cy) / scale[1];
@@ -5577,7 +5453,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     auto countValidInCol = [&](int c) {
         int count = 0;
         for (int r = 0; r < cleaned.rows; ++r) {
-            if (cleaned(r, c)[0] != -1.0f)
+            if (vc::geometry::validSurfacePoint(cleaned(r, c)))
                 ++count;
         }
         return count;
@@ -5585,7 +5461,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     auto countValidInRow = [&](int r) {
         int count = 0;
         for (int c = 0; c < cleaned.cols; ++c) {
-            if (cleaned(r, c)[0] != -1.0f)
+            if (vc::geometry::validSurfacePoint(cleaned(r, c)))
                 ++count;
         }
         return count;
@@ -5613,7 +5489,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
         bottom = -1;
         for (int j = 0; j < cleaned.rows; ++j) {
             for (int i = 0; i < cleaned.cols; ++i) {
-                if (cleaned(j, i)[0] != -1.0f) {
+                if (vc::geometry::validSurfacePoint(cleaned(j, i))) {
                     left = std::min(left, i);
                     right = std::max(right, i);
                     top = std::min(top, j);
@@ -6040,8 +5916,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                     (*points)(row + strideY, col + strideX),
                     (*points)(row + strideY, col),
                 };
-                if (!validSurfacePoint(corners[0]) || !validSurfacePoint(corners[1]) ||
-                    !validSurfacePoint(corners[2]) || !validSurfacePoint(corners[3])) {
+                if (!vc::geometry::validSurfacePoint(corners[0]) || !vc::geometry::validSurfacePoint(corners[1]) ||
+                    !vc::geometry::validSurfacePoint(corners[2]) || !vc::geometry::validSurfacePoint(corners[3])) {
                     markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                     continue;
@@ -6395,18 +6271,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                 resolved.targets.insert(std::move(quad));
             }
         };
-        for (const auto& name : _intersectTgts) {
-            if (name == "visible_segmentation") {
-                if (_highlightedSurfaceIds.empty()) {
-                    addTarget("segmentation");
-                } else {
-                    for (const auto& id : _highlightedSurfaceIds)
-                        addTarget(id);
-                }
-            } else {
-                addTarget(name);
-            }
-        }
+        for (const auto& name : _intersectTgts)
+            addTarget(name);
         std::size_t th = 0;
         for (const auto& t : resolved.targets)
             th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
@@ -6493,10 +6359,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         (std::hash<uint64_t>{}(useEditIndexForActive ? editPatchIndex->globalGeneration() : 0) +
          0x9e3779b9u);
     fp.activeSegHash = activeSeg ? std::hash<const void*>{}(activeSeg.get()) : 0;
-    size_t hh = 0;
-    for (const auto& id : _highlightedSurfaceIds)
-        hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
-    fp.highlightedSurfaceHash = hh;
     fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
     if (segCompositeActive) {
         fp.segSlabFrontQ = int(std::lround(segSlabFront * 1000.0f));
@@ -6550,7 +6412,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.targetHash == b.targetHash &&
                a.targetGenerationHash == b.targetGenerationHash &&
                a.activeSegHash == b.activeSegHash &&
-               a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
                a.segNormalOffsetQ == b.segNormalOffsetQ &&
                a.segSlabFrontQ == b.segSlabFrontQ &&
                a.segSlabBehindQ == b.segSlabBehindQ &&
@@ -6679,80 +6540,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
         return surfaceToScene(proj[0], proj[1]);
     };
-    auto* approvalOverlay = _viewerManager ? _viewerManager->segmentationOverlay() : nullptr;
-    const bool showApprovalMaskIntersections =
-        approvalOverlay && activeSeg && approvalOverlay->hasApprovalMaskData();
-    auto paramToApprovalGrid = [&](const cv::Vec3f& param) {
-        if (!activeSeg) {
-            return QPointF();
-        }
-        const cv::Vec2f grid = activeSeg->ptrToGrid(param);
-        return QPointF(grid[0], grid[1]);
-    };
-    auto addApprovalMaskIntersection = [&](const SurfacePatchIndex::TriangleSegment& seg,
-                                           float renderedOpacity,
-                                           float renderedPenWidth) {
-        if (!showApprovalMaskIntersections) {
-            return;
-        }
-
-        const QPointF gridA = paramToApprovalGrid(seg.surfaceParams[0]);
-        const QPointF gridB = paramToApprovalGrid(seg.surfaceParams[1]);
-        if (!isFinitePoint(gridA) || !isFinitePoint(gridB)) {
-            return;
-        }
-
-        const int steps = std::max(1, int(std::ceil(std::max(std::abs(gridB.x() - gridA.x()),
-                                                             std::abs(gridB.y() - gridA.y())))));
-        const float opacity = std::clamp(renderedOpacity * kApprovalPlaneIntersectionScale,
-                                         0.0f, 1.0f);
-        const float penWidth = std::max(0.0f, renderedPenWidth) *
-                               kApprovalPlaneIntersectionScale;
-
-        for (int step = 0; step < steps; ++step) {
-            const float t0 = static_cast<float>(step) / static_cast<float>(steps);
-            const float t1 = static_cast<float>(step + 1) / static_cast<float>(steps);
-            const float tm = (t0 + t1) * 0.5f;
-
-            const float row = static_cast<float>(gridA.y() + (gridB.y() - gridA.y()) * tm);
-            const float col = static_cast<float>(gridA.x() + (gridB.x() - gridA.x()) * tm);
-            int approvalStatus = 0;
-            if (approvalOverlay->queryApprovalBilinear(row, col, &approvalStatus) <= 0.0f ||
-                approvalStatus == 0) {
-                continue;
-            }
-
-            QColor approvalColor = approvalOverlay->queryApprovalColor(
-                static_cast<int>(std::round(row)),
-                static_cast<int>(std::round(col)));
-            if (!approvalColor.isValid()) {
-                approvalColor = QColor(0, 255, 0);
-            }
-            approvalColor.setAlphaF(opacity);
-            if (approvalColor.alpha() <= 0) {
-                continue;
-            }
-
-            const cv::Vec3f world0 = seg.world[0] + (seg.world[1] - seg.world[0]) * t0;
-            const cv::Vec3f world1 = seg.world[0] + (seg.world[1] - seg.world[0]) * t1;
-            const QPointF a = planeToScene(world0);
-            const QPointF b = planeToScene(world1);
-            if (!isFinitePoint(a) || !isFinitePoint(b)) {
-                continue;
-            }
-
-            const IntersectionStyle approvalStyle{
-                approvalColor.rgba(),
-                kActiveIntersectionZ + 1,
-                int(std::lround(penWidth * 1000.0f)),
-            };
-            QPainterPath& approvalPath = groupedPaths[approvalStyle];
-            groupedColors[approvalStyle] = approvalColor;
-            approvalPath.moveTo(a);
-            approvalPath.lineTo(b);
-        }
-    };
-
     for (const auto& [target, segments] : intersections) {
         if (!target || segments.empty())
             continue;
@@ -6766,24 +6553,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             zValue = kActiveIntersectionZ;
             opacity *= kActiveIntersectionOpacityScale;
             penWidth = activeSegmentationIntersectionWidth(penWidth);
-        } else if (_highlightedSurfaceIds.count(target->id)) {
-            baseColor = QColor(0, 220, 255);
-            zValue = kHighlightedIntersectionZ;
-        } else if (auto folderColor = segmentFolderColorOverride(target.get())) {
-            baseColor = *folderColor;
         } else {
-            const auto& id = target->id;
-            auto it = _surfaceColorAssignments.find(id);
-            size_t idx;
-            if (it != _surfaceColorAssignments.end()) {
-                idx = it->second;
-            } else if (_surfaceColorAssignments.size() < 500) {
-                idx = _nextColorIndex++;
-                _surfaceColorAssignments[id] = idx;
-            } else {
-                idx = std::hash<std::string>{}(id);
-            }
-            baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
+            baseColor = vc3d::intersectionColor(target->id);
         }
         baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
         if (baseColor.alpha() <= 0)
@@ -6832,9 +6603,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                 continue;
             groupedPaths[style].moveTo(a);
             groupedPaths[style].lineTo(b);
-            if (target == activeSeg) {
-                addApprovalMaskIntersection(seg, opacity, penWidth);
-            }
             if (!dashOffsets.empty()) {
                 const cv::Vec3f n0 = target->normal(seg.surfaceParams[0]);
                 const cv::Vec3f n1 = target->normal(seg.surfaceParams[1]);
@@ -6993,31 +6761,6 @@ void CChunkedVolumeViewer::finishPlaneIntersectionCompute(
     // Clear the fp memo so the cache-hit early-out doesn't skip the scene-item build.
     _lastIntersectFp = {};
     renderIntersections("async intersection ready");
-}
-
-void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
-{
-    if (_closing) {
-        return;
-    }
-    std::unordered_set<std::string> next;
-    next.reserve(ids.size());
-    for (const auto& id : ids) {
-        next.insert(id);
-    }
-    if (_highlightedSurfaceIds == next) {
-        return;
-    }
-    _highlightedSurfaceIds.clear();
-    _highlightedSurfaceIds = std::move(next);
-    _resolvedIntersectTargets = {};
-    renderIntersections("highlighted surface ids changed");
-}
-
-const VolumeViewerBase::ActiveSegmentationHandle& CChunkedVolumeViewer::activeSegmentationHandle() const
-{
-    static ActiveSegmentationHandle handle;
-    return handle;
 }
 
 const std::vector<ViewerOverlayControllerBase::PathPrimitive>& CChunkedVolumeViewer::drawingPaths() const

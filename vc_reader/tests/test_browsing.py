@@ -190,7 +190,7 @@ class BrowsingTests(unittest.TestCase):
         self.assertEqual(label.volume.id, 'unpublished')
         self.assertIsNone(label.volume.record)
         self.assertEqual(label.mappable_volumes['a'].transform, Affine.scale(2))
-        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a'])
+        self.assertEqual([m.id for m in label.mappable_volumes.filter(include_superseded=True)], ['a', 'b'])
 
     def test_cycles_and_malformed_overlay_relationships(self):
         c = catalog()
@@ -229,7 +229,7 @@ class PublishedLabelMappingTests(unittest.TestCase):
         from pathlib import Path
         fixture = Path(__file__).resolve().parent / 'fixtures/training/catalog.json'
         with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
-            c = Catalog.from_file(fixture)
+            c = Catalog.load(fixture, use_cache=False)
             label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
             surface_volume = label.surface_volumes.zarr()
             self.assertEqual(surface_volume.artifact_kind, 'layers-zarr')
@@ -254,3 +254,11 @@ class PublishedLabelMappingTests(unittest.TestCase):
             self.assertEqual(label.volume.id, summary['source_volume'])
             # Source ownership never moves the label into B's direct-label list.
             self.assertFalse(mapping.volume.labels)
+
+
+def test_native_artifact_parameter_parity():
+    from vc_reader.artifacts import Artifact
+    from vc_reader import _catalog
+    for level in [None, -1, 2.5, "2", 2, 5, 6, 10**40]:
+        raw = {"type": "surface-prediction-zarr", "parameters": {"level": level}}
+        assert Artifact.from_json(raw).level == _catalog.parse_artifacts([raw])[0].level

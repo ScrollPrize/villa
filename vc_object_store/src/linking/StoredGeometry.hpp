@@ -1,7 +1,7 @@
 #pragma once
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "geometry/GeometrySnapshot.hpp"
-#include "spatial/PatchGrid.hpp"
+#include "spatial/SurfaceGrid.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include <map>
 #include <memory>
@@ -42,7 +42,7 @@ void validateCoordinateParams(const CoordinateParams& params, double explicitSca
 std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
     const CoordinateParams& params, DetectorReport& report, double explicitScale = 1.0);
 nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const CoordinateParams& params);
-std::shared_ptr<PatchGrid> scaledPatchSurface(const std::shared_ptr<PatchGrid>& source, double scale,
+std::shared_ptr<SurfaceGrid> scaledSurfaceGrid(const std::shared_ptr<SurfaceGrid>& source, double scale,
     bool scaleParameterization);
-std::shared_ptr<PatchGrid> patchSurface(const objects::detail::GeometrySnapshot& geometry);
+std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot& geometry);
 } // namespace vc::object_links::detail

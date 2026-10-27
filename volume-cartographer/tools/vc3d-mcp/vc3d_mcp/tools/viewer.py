@@ -196,7 +196,7 @@ async def vc3d_set_axis_aligned_slices(enabled: bool) -> dict[str, Any]:
 @mcp.tool()
 async def vc3d_get_render_settings() -> dict[str, Any]:
     """Read the global viewer render settings (surface-intersection overlays,
-    opacities, normals/direction hints, highlighted surfaces).
+    opacities, normals, highlighted surfaces).
 
     Use this to inspect the current rendering state before tweaking it with
     vc3d_set_render_settings, or to confirm a change took effect.
@@ -207,7 +207,7 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
     "samplingStride" (int >=1), "zScrollSensitivity" (0.1..100),
     "segmentationCursorMirroring" (bool),
     "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
-    "showDirectionHints" (bool), "surfaceOverlayEnabled" (bool),
+    "surfaceOverlayEnabled" (bool),
     "normalArrowLengthScale" (float), "normalMaxArrows" (int),
     "highlightedSurfaceIds" ([str...])}."""
     return await _call("viewer.get_render_settings")
@@ -221,7 +221,6 @@ async def vc3d_set_render_settings(
     intersection_max_surfaces: Optional[int] = None,
     plane_intersection_lines_visible: Optional[bool] = None,
     show_surface_normals: Optional[bool] = None,
-    show_direction_hints: Optional[bool] = None,
     surface_overlay_enabled: Optional[bool] = None,
     highlighted_surface_ids: Optional[list[str]] = None,
     volume_window: Optional[_Window] = None,
@@ -241,7 +240,6 @@ async def vc3d_set_render_settings(
     intersection_max_surfaces: cap on intersecting surfaces drawn, int >=0.
     plane_intersection_lines_visible: show plane/surface intersection lines.
     show_surface_normals: draw surface normal indicators.
-    show_direction_hints: draw growth direction hints.
     surface_overlay_enabled: master toggle for the surface overlay.
     highlighted_surface_ids: replace the set of highlighted surface ids.
     volume_window: {"low", "high"} base-volume display window, clamped 0..255.
@@ -259,10 +257,10 @@ async def vc3d_set_render_settings(
     window, sampling stride, z-scroll sensitivity, cursor mirroring,
     normal-arrow length/count) are persisted (QSettings/ViewerManager) even
     with no viewer pane open. highlighted_surface_ids is retained by the
-    surface panel and applies when viewers become available. The four
+    surface panel and applies when viewers become available. The three
     per-viewer toggles (plane-intersection lines, show-normals,
-    show-direction-hints, surface-overlay) are no-ops with zero viewers; their
-    returned echo reports defaults until a viewer is open.
+    surface-overlay) are no-ops with zero viewers; their returned echo
+    reports defaults until a viewer is open.
 
     Returns the full resulting settings object (same shape as
     vc3d_get_render_settings) so you can confirm what was applied."""
@@ -276,7 +274,6 @@ async def vc3d_set_render_settings(
                 "intersectionMaxSurfaces": intersection_max_surfaces,
                 "planeIntersectionLinesVisible": plane_intersection_lines_visible,
                 "showSurfaceNormals": show_surface_normals,
-                "showDirectionHints": show_direction_hints,
                 "surfaceOverlayEnabled": surface_overlay_enabled,
                 "highlightedSurfaceIds": highlighted_surface_ids,
                 "volumeWindow": volume_window,

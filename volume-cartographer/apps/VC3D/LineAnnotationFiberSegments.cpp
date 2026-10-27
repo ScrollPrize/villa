@@ -2420,8 +2420,7 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
     (void)found;
 }
 
-// The loader's exact-membership scan (kControlPointMatchEpsilon in
-// core/src/Atlas.cpp): controls must be an ordered subset of the dense
+// The exact-membership scan: controls must be an ordered subset of the dense
 // line, so geometry sliced at these indices reloads cleanly.
 std::optional<std::vector<size_t>> orderedControlPointLineIndices(
     const std::vector<cv::Vec3d>& controlPoints,

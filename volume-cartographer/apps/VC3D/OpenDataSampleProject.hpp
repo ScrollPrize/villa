@@ -1,17 +1,26 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
-#include "OpenDataSegmentCache.hpp"
 
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 class VolumePkg;
 
 namespace vc3d::opendata {
+
+// The stage of opening a sample: "resolving-volumes", then "project-ready".
+struct OpenDataSampleDownloadProgress {
+    std::string status;
+};
+
+using OpenDataSampleProgressCallback =
+    std::function<void(const OpenDataSampleDownloadProgress&)>;
 
 struct OpenDataSampleProjectResult {
     int supportedVolumes = 0;
@@ -20,13 +29,6 @@ struct OpenDataSampleProjectResult {
     int failedVolumes = 0;
     int attachedLasagnaDatasets = 0;
     int attachedNormalGrids = 0;
-    int supportedTifxyzSegments = 0;
-    int cachedTifxyzSegments = 0;
-    int attachedSegmentEntries = 0;
-    int skippedTifxyzSegments = 0;
-    int failedTifxyzSegments = 0;
-    int transformedTifxyzSegments = 0;
-    int failedTransformedTifxyzSegments = 0;
     std::string preferredVolumeId;
     std::vector<std::string> messages;
 };
@@ -36,11 +38,11 @@ struct OpenDataNewProject {
     std::string name;
 };
 
-// selection optionally restricts volumes, derived representations and segments;
+// selection optionally restricts volumes and derived representations;
 // nullptr attaches everything. newProject bypasses the cached full-sample project
 // and saves a fresh JSON before returning an ordinarily persistent loaded package.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut = nullptr,
     const OpenDataSampleProgressCallback& progressCallback = {},
@@ -49,15 +51,7 @@ struct OpenDataNewProject {
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const OpenDataResourceSelection* selection = nullptr);
-
-void attachOpenDataSampleSegments(
-    VolumePkg& pkg,
-    const OpenDataSample& sample,
-    const std::filesystem::path& remoteCacheRoot,
-    OpenDataSampleProjectResult& result,
-    const OpenDataSampleProgressCallback& progressCallback = {},
-    bool individualEntries = false);
 
 } // namespace vc3d::opendata

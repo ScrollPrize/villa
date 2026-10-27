@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <QObject>
 #include <QFutureWatcher>
@@ -23,17 +24,10 @@ class CWindow;
 class Volume;
 
 namespace vc3d::opendata {
-struct OpenDataSample;
+
 struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
-
-// Options for opening an Open Data sample. `selection` restricts attached
-// resources; `interactive` permits prompts, progress dialogs, and message boxes.
-struct OpenDataSampleOpenOptions {
-    vc3d::opendata::OpenDataResourceSelection selection;
-    bool interactive{true};
-};
 
 class MenuActionController : public QObject
 {
@@ -48,7 +42,6 @@ public:
 
     void populateMenus(QMenuBar* menuBar);
     void updateRecentVolpkgList(const QString& path);
-    void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     bool openVolpkgAt(const QString& path,
                       bool interactive = true,
@@ -67,18 +60,6 @@ public:
     QString objectStoreAuthor();
     void cloneHostedStore();
     void detachObjectStore();
-    // Resolves sampleId against the cached manifest and opens it. When
-    // interactive is false, prompts, progress dialogs, and message boxes are
-    // suppressed.
-    bool openOpenDataSampleById(const QString& sampleId, bool interactive = true);
-
-    // Opens a sample with explicit resource selection. resultOut receives the
-    // attachment counters and messages when provided.
-    bool openOpenDataSampleById(const QString& sampleId,
-                                const OpenDataSampleOpenOptions& options,
-                                QString* errorMessage = nullptr,
-                                vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
-
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
         bool success{false};
@@ -90,14 +71,13 @@ public:
     // returns immediately.
     //
     // Returns false (with *errorMessage) on synchronous precondition failure (no
-    // window/state, empty/unknown id, manifest unavailable, or an open already in
-    // flight). Returns true once the background task started; exactly one GUI-thread
+    // window/state, or an open already in flight). Returns true once the background task started; exactly one GUI-thread
     // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
-    // with the same stream the interactive QProgressDialog consumes.
-    // options.interactive is ignored; this entry point is always non-interactive.
+    // with the same stream the interactive QProgressDialog consumes. `selection`
+    // restricts the attached resources. This entry point is always non-interactive.
     bool startOpenDataSampleOpen(
-        const QString& sampleId,
-        const OpenDataSampleOpenOptions& options,
+        const vcr::catalog::OpenDataSample& sample,
+        const vc3d::opendata::OpenDataResourceSelection& selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
         std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},
         QString* errorMessage = nullptr);
@@ -109,15 +89,12 @@ private slots:
     void newProject();
     void saveProjectAs();
     void attachVolume();
-    void attachSegments();
     void attachNormalGrid();
-    void attachUmbilicus();
-    void detachUmbilicus();
+    void importUmbilicus();
+    void removeUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
     void detachEntry();
-    void setOutputSegments();
-    void convertLegacyVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
     void attachRemoteZarr();
@@ -130,17 +107,15 @@ private slots:
     void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
-    void importObjAsPatch();
     void beginRotateSurfaceTransform();
-    void materializeCurrentOpenDataSegmentFolder();
     void exitApplication();
 
 signals:
-    // Emitted when the user picks Actions -> Merge tifxyz... CWindow
-    // wires this to SegmentationCommandHandler::onMergeTifxyz with an
+    // Emitted when the user picks Actions -> Merge Surfaces... CWindow
+    // wires this to SegmentationCommandHandler::onMergeSurfaces with an
     // empty seed list so the dialog opens with an empty grid.
-    void mergeTifxyzFromMenuRequested();
-    // Emitted when the user picks Actions -> Patch tifxyz... CWindow
+    void mergeSurfacesFromMenuRequested();
+    // Emitted when the user picks Actions -> Patch Surface... CWindow
     // wires this to SegmentationCommandHandler::onMergePatch with an
     // empty seed list so the dialog opens with empty combo boxes.
     void mergePatchFromMenuRequested();
@@ -165,21 +140,20 @@ private:
     void updateRecentRemoteList(const QString& url);
     void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
-    void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
-    void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
+    void beginLasagnaManifestAttachment(bool remote);
+    void attachCatalogRepresentation(const vcr::catalog::OpenDataSample& sample,
+                                     const vcr::catalog::OpenDataRepresentationRef& ref);
     struct LasagnaAttachTaskResult;
-    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
-                            bool interactive = true,
+    // Interactive: prompts before replacing the open project and shows progress.
+    bool openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
-                            QString* errorMessage = nullptr,
-                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr,
                             const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
     // parented to this; completion and onFinished run on the GUI thread.
     void beginOpenDataSampleOpenTask(
-        const vc3d::opendata::OpenDataSample& sample,
+        const vcr::catalog::OpenDataSample& sample,
         bool interactive,
         const vc3d::opendata::OpenDataResourceSelection* selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
@@ -192,10 +166,6 @@ private:
                                   OpenDataSampleOpenOutcome* outcomeOut);
     void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
     void cancelOpenDataVolumePrefills();
-    // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
-    // prompts the user for an output .volpkg.json, and returns the written path
-    // via `convertedOut` on success.
-    bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -220,15 +190,12 @@ private:
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
-    QAction* _attachSegmentsAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
-    QAction* _attachUmbilicusAct{nullptr};
-    QAction* _detachUmbilicusAct{nullptr};
+    QAction* _importUmbilicusAct{nullptr};
+    QAction* _removeUmbilicusAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};
-    QAction* _setOutputSegmentsAct{nullptr};
-    QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
     QAction* _openDataCatalogAct{nullptr};
@@ -243,13 +210,10 @@ private:
     QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
-    QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
-    QAction* _mergeTifxyzAct{nullptr};
+    QAction* _mergeSurfacesAct{nullptr};
     QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
-    QAction* _materializeOpenDataFolderAct{nullptr};
-    QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;

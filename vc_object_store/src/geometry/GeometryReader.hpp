@@ -47,4 +47,30 @@ private:
     std::vector<std::pair<std::string, nlohmann::json>> deltas_;
     std::unique_ptr<GeometryReader> reverseSource_;
 };
+// A surface rectangle's XYZ and whether each vertex is valid by the store's
+// rule (geometry::validSurfacePoint and the valid channel), row-major.
+struct SurfaceTile {
+    std::vector<std::array<float, 3>> points;
+    std::vector<uint8_t> valid;
+};
+SurfaceTile surfaceTile(GeometryReader&, int64_t row, int64_t column, int64_t rows, int64_t columns);
+
+// The read connection's retained reader for `revision` (verified chunks kept
+// across reads while the store is unchanged), or a new one. Handed back when
+// the read ends normally; dropped when it throws, so partially verified data
+// never poisons a later read.
+class RetainedGeometryReader {
+public:
+    RetainedGeometryReader(sqlite3*, std::string revision);
+    ~RetainedGeometryReader();
+    RetainedGeometryReader(const RetainedGeometryReader&) = delete;
+    RetainedGeometryReader& operator=(const RetainedGeometryReader&) = delete;
+    GeometryReader& operator*() const { return *reader_; }
+    GeometryReader* operator->() const { return reader_.get(); }
+private:
+    sqlite3* db_;
+    std::string revision_;
+    std::shared_ptr<GeometryReader> reader_;
+    int exceptions_;
+};
 }

@@ -21,6 +21,7 @@
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -230,12 +231,19 @@ QJsonObject AgentBridgeServer::handleViewerSetIntersects(const QJsonValue& param
     ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
     const QJsonObject p = params.toObject();
 
-    // The GUI's own filter application (SurfacePanelController::applyFilters)
-    // always seeds the drawn set with "segmentation"; mirror that invariant
-    // here rather than trusting the caller to include it.
+    // Viewers draw the surfaces they hold by name, always the active one
+    // ("segmentation", as SurfacePanelController::applyFilters seeds it); stored
+    // surfaces (catalog UUIDs) are drawn on every plane viewer by the store
+    // surface overlay, like the surface panel's visible set.
     std::set<std::string> ids{"segmentation"};
-    for (const QJsonValue& e : p.value("surfaceIds").toArray())
-        ids.insert(e.toString().toStdString());
+    std::vector<std::string> stored;
+    const auto* catalog = _window ? _window->_surfaceCatalog.get() : nullptr;
+    for (const QJsonValue& e : p.value("surfaceIds").toArray()) {
+        const auto id = e.toString().toStdString();
+        if (catalog && catalog->row(id)) stored.push_back(id);
+        else ids.insert(id);
+    }
+    if (!stored.empty() && _window->_storeSurfaceOverlay) _window->_storeSurfaceOverlay->setSurfaces(stored);
 
     QJsonArray appliedToViewers;
     if (p.contains("viewer") && !p.value("viewer").isNull()) {
@@ -260,6 +268,8 @@ QJsonObject AgentBridgeServer::handleViewerSetIntersects(const QJsonValue& param
 
     QJsonArray surfaceIds;
     for (const auto& id : ids)
+        surfaceIds.append(QString::fromStdString(id));
+    for (const auto& id : stored)
         surfaceIds.append(QString::fromStdString(id));
 
     QJsonObject result;
@@ -308,7 +318,6 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
     if (firstChunked) {
         o["planeIntersectionLinesVisible"] = firstChunked->isPlaneIntersectionLinesVisible();
         o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
-        o["showDirectionHints"] = firstChunked->isShowDirectionHints();
         o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
         o["normalArrowLengthScale"] = firstChunked->normalArrowLengthScale();
         o["normalMaxArrows"] = firstChunked->normalMaxArrows();
@@ -320,9 +329,6 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
         o["showSurfaceNormals"] = settings.value(
             vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
             vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
-        o["showDirectionHints"] = settings.value(
-            vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
-            vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
         o["surfaceOverlayEnabled"] = false;
         // Stored as a percentage int (100 = 1.0x) by ViewerNormalVisualizationPanel;
         // convert to the same float scale setNormalArrowLengthScale() takes.
@@ -334,18 +340,11 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
             vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
     }
 
-    // Highlighted surface ids are sourced from the surface panel (the source of
-    // truth behind the context-menu checkmarks), so get/set stay consistent and
-    // the value is reported even when no viewer is instantiated. Fall back to the
-    // first live viewer only if the panel is unavailable.
+    // The surface panel owns the highlighted surfaces (its context-menu checkmarks).
     QJsonArray highlightIds;
-    if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr) {
+    if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
         for (const std::string& id : panel->highlightedSurfaceIds())
             highlightIds.append(QString::fromStdString(id));
-    } else if (firstChunked) {
-        for (const std::string& id : firstChunked->highlightedSurfaceIds())
-            highlightIds.append(QString::fromStdString(id));
-    }
     o["highlightedSurfaceIds"] = highlightIds;
     return o;
 }
@@ -439,10 +438,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
     const bool showSurfaceNormals = hasShowSurfaceNormals
         ? p.value("showSurfaceNormals").toBool() : false;
 
-    const bool hasShowDirectionHints = p.contains("showDirectionHints");
-    const bool showDirectionHints = hasShowDirectionHints
-        ? p.value("showDirectionHints").toBool() : false;
-
     const bool hasSurfaceOverlayEnabled = p.contains("surfaceOverlayEnabled");
     const bool surfaceOverlayEnabled = hasSurfaceOverlayEnabled
         ? p.value("surfaceOverlayEnabled").toBool() : false;
@@ -477,16 +472,10 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
     }
     if (hasIntersectionMaxSurfaces)
         mgr->setIntersectionMaxSurfaces(intersectionMaxSurfaces);
-    if (hasHighlightedSurfaceIds) {
-        // Route through the surface panel so its _highlightedSurfaceIds (the source
-        // of truth behind the context-menu checkmarks) stays in sync; otherwise the
-        // next GUI highlight toggle would rebuild from the stale panel set and
-        // clobber these. Fall back to ViewerManager if the panel is unavailable.
+    // The surface panel owns the highlighted surfaces (its context-menu checkmarks).
+    if (hasHighlightedSurfaceIds)
         if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
             panel->setHighlightedSurfaceIds(highlightedSurfaceIds);
-        else
-            mgr->setHighlightedSurfaceIds(highlightedSurfaceIds);
-    }
     if (hasVolumeWindow)
         mgr->setVolumeWindow(volumeWindowLow, volumeWindowHigh);
     if (hasSamplingStride)
@@ -506,8 +495,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         });
     if (hasShowSurfaceNormals)
         broadcast([showSurfaceNormals](VolumeViewerBase* v) { v->setShowSurfaceNormals(showSurfaceNormals); });
-    if (hasShowDirectionHints)
-        broadcast([showDirectionHints](VolumeViewerBase* v) { v->setShowDirectionHints(showDirectionHints); });
     if (hasSurfaceOverlayEnabled)
         broadcast([surfaceOverlayEnabled](VolumeViewerBase* v) { v->setSurfaceOverlayEnabled(surfaceOverlayEnabled); });
     if (hasNormalArrowLengthScale) {

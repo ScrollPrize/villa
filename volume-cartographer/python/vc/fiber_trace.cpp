@@ -482,46 +482,6 @@ NB_MODULE(fiber_trace, m)
         .def_rw("online_refine_cap_base",&ft::FiberChunkTraceConfig::onlineRefineCapBase)
         .def("to_json",[](const ft::FiberChunkTraceConfig& c){return ft::fiberChunkConfigJson(c).dump();})
         .def_static("from_json",[](const std::string& j){return ft::fiberChunkConfigFromJson(nlohmann::json::parse(j));});
-    m.def("chunk_cache_specification",[](const ft::FiberChunkTraceConfig& c,const ft::FiberTraceConfig& t,double scale,const std::string& identity) {
-        return ft::fiberChunkCacheSpecification(c,t,scale,identity).dump();
-    },"chunk"_a,"trace"_a,"trace_to_base"_a,"source_identity"_a);
-    m.def("load_chunk_paths",[](const std::string& path) {
-        nb::gil_scoped_release release;
-        return ChunkPathsHandle{ft::loadFiberChunkPaths(path)};
-    },"path"_a);
-    m.def("build_chunk_paths",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
-                                 const ft::FiberTraceConfig& t,const ft::FiberChunkTraceConfig& c,
-                                 const std::array<int,3>& key,size_t workers) {
-        if(workers<1)throw std::invalid_argument("workers must be positive");
-        const auto trace=checkedConfig(field,t,&normals);
-        const auto config=c;
-        if(trace.parallelThreads!=1 || config.cacheOnly)
-            throw std::invalid_argument("uncached construction requires parallel_threads=1 and cache_only=false");
-        std::shared_ptr<ft::FiberChunkPaths> paths;
-        {nb::gil_scoped_release release;
-         ft::FiberCaseQueue queue(workers,1,[&]{
-             paths=ft::buildFiberChunkPaths(key,*field.field,trace,*normals.sampler,config,
-                 field.scales.traceToBaseScale,ft::FiberCaseQueue::parallelFor,
-                 [](const auto& ready){ft::FiberCaseQueue::await(ready);});
-         });queue.join();}
-        return ChunkPathsHandle{paths};
-    },"field"_a,"normals"_a,"trace"_a,"config"_a,"key_xyz"_a,"workers"_a=1);
-    m.def("filter_chunk_paths",[](const ChunkPathsHandle& paths,const ft::FiberChunkTraceConfig& c,
-                                 const NormalSamplerHandle& normals,double scale,size_t workers) {
-        if(workers<1)throw std::invalid_argument("workers must be positive");
-        auto copy=std::make_shared<ft::FiberChunkPaths>(*paths.paths);
-        const auto config=c;
-        std::string report;
-        {nb::gil_scoped_release release;
-         if(workers==1)report=ft::filterFiberChunkConflicts(*copy,config,*normals.sampler,scale).dump();
-         else {
-             ft::FiberCaseQueue queue(workers,1,[&]{
-                 report=ft::filterFiberChunkConflicts(*copy,config,*normals.sampler,scale,ft::FiberCaseQueue::parallelFor).dump();
-             });
-             queue.join();
-         }}
-        return nb::make_tuple(ChunkPathsHandle{copy},report);
-    },"paths"_a,"config"_a,"normals"_a,"trace_to_base"_a,"workers"_a=1);
     nb::class_<ft::FiberChunkReplayConfig>(m,"ChunkReplayConfig")
         .def(nb::init<>())
         .def_rw("error_threshold_base",&ft::FiberChunkReplayConfig::errorThresholdBase)

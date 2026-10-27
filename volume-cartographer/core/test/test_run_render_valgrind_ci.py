@@ -132,37 +132,6 @@ class RenderValgrindCiTest(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()), {"complete": True})
             self.assertEqual(list(path.parent.glob(".*.tmp-*")), [])
 
-    def test_freeze_model_requires_explicit_unpromoted_approval(self):
-        calibration = {
-            "renderer_inputs_used": False,
-            "candidate_accepted": False,
-            "parameters": {"cross_thread_release_ns": 12.5},
-            "event_cost_model": {
-                "feature_names": list(DRIVER.DATA_READ_FEATURE_NAMES),
-                "coefficients_ns": [float(index) for index in range(7)],
-                "stall_overlap_fraction": 0.0,
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / "calibration.json"
-            output = root / "model.json"
-            source.write_text(json.dumps(calibration))
-            args = SimpleNamespace(
-                calibration=source,
-                output=output,
-                model_id="test-model",
-                allow_unpromoted=False,
-            )
-            with self.assertRaisesRegex(RuntimeError, "not accepted"):
-                DRIVER.freeze_model(args)
-            args.allow_unpromoted = True
-            DRIVER.freeze_model(args)
-            model = json.loads(output.read_text())
-            self.assertEqual(model["model_id"], "test-model")
-            self.assertEqual(model["cross_thread_release_ns"], 12.5)
-            self.assertFalse(model["timing_claims_enabled"])
-
     def test_set_tolerance_preserves_all_reference_cases(self):
         reference = {
             "schema_version": 1,

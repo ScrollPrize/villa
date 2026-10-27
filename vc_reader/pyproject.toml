@@ -16,8 +16,8 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
-# The catalog layer is stdlib-only. The reader is the compiled extension built
-# from src/cpp/ (see CMakeLists.txt) plus numpy.
+# Catalog parsing and registrations use the native C++ catalog extension.
+# Array reading additionally requires numpy.
 dependencies = []
 
 [project.optional-dependencies]
@@ -42,4 +42,4 @@ wheel.packages = ["src/vc_reader"]
 cmake.build-type = "Release"
 build-dir = "build/{wheel_tag}"
 # Keep local development artifacts out of source releases if regenerated.
-sdist.exclude = ["benchmarks/results/**", "tests/**", "elastic_comparison/**"]
+sdist.exclude = ["benchmarks/results/**", "tests/**"]

@@ -151,32 +151,3 @@ TEST_CASE("reverse checks fail missing seeds but preserve sampling and configura
     CHECK_THROWS_AS(verifyFiberReverseSpan(prediction,normals,c,line,100,2,8),std::invalid_argument);
 }
 
-TEST_CASE("cached real-data forward trace can be checked backward without ground truth") {
-    const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
-    const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
-    const char* normalManifest=std::getenv("VC_TEST_REVERSE_NORMAL_MANIFEST");
-    if (!manifest || !fiberPath || !normalManifest) return;
-    const auto dataset=vc::lasagna::LasagnaDataset::open(manifest);
-    const auto normalData=vc::lasagna::LasagnaDataset::open(normalManifest);
-    FiberPredictionFieldOptions options; options.enableWidth=true;
-    FiberPredictionField field(dataset,options);
-    vc::lasagna::LasagnaNormalSampler normals(normalData);
-    const auto fiber=loadFiberJson(fiberPath);
-    REQUIRE(fiber.controlPointLineIndices.size()>1);
-    const size_t first=fiber.controlPointLineIndices.front();
-    REQUIRE(first+1<fiber.linePointsXyzBase.size());
-    auto c=config(); c.stepVoxels=16; c.widthRelativeTolerance=.4; c.widthCosineWeight=true;
-    const auto forward=traceFiberExtrapolation(field,fiber.linePointsXyzBase[first],
-        fiber.linePointsXyzBase[first+1]-fiber.linePointsXyzBase[first],64,c,&normals);
-    REQUIRE(forward.points.size()>1);
-    const auto geometry=makePolylineArcGeometry(forward.points);
-    c.widthReferenceMean=forward.widthMean;
-    const double serial=verifyFiberReverseSpan(field,normals,c,geometry,geometry.length(),20,40);
-    c.parallelThreads=4;
-    const double parallel=verifyFiberReverseSpan(field,normals,c,geometry,geometry.length(),20,40);
-    CHECK(serial==parallel);
-    CHECK(serial>=0); CHECK(serial<=geometry.length());
-    std::cout << "Real-data reverse check: forward=" << geometry.length()
-        << " base voxels; remaining=" << serial << "; verified=" << geometry.length()-serial
-        << "; serial/parallel exact\n";
-}

@@ -13,6 +13,7 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <vc_reader/affine.hpp>
 #include <atomic>
 #include <array>
 #include <cstddef>
@@ -57,19 +58,16 @@ public:
     ViewerSplitGrid* viewerGrid() const { return _grid; }
     QComboBox* volumeSelectionControl() const;
     void synchronizeVolume(const std::shared_ptr<Volume>& volume,
-                           const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+                           const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // Cross-panel entry points for "Add to current spiral fit".
-    bool hasActiveSpiralSession() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
     bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
     void refreshTrackedFibers();
     void noteFiberRetired(const QString& objectUuid);
-    bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);
     bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
-    void noteManagedPatchSaved(const QString& path);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
@@ -109,7 +107,6 @@ private:
             double p50 = 0.0;
             double p95 = 0.0;
             double maximum = 0.0;
-            double displayMaximum = 0.0;
             qint64 sampleCount = 0;
             qint64 eligibleSampleCount = 0;
             qint64 projectedSampleCount = 0;

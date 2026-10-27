@@ -44,6 +44,7 @@ struct HttpOptions {
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
     Auth auth;
+    long request_timeout_ms = 0;
 };
 
 struct HttpResponse {
@@ -143,6 +144,7 @@ public:
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
             curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
             curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, options_.connect_timeout_ms);
+            curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, options_.request_timeout_ms);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
             curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, options_.stall_timeout_s);
             curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);

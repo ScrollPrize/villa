@@ -4,6 +4,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
+#include "../ObjectStoreRegions.hpp"
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
@@ -168,26 +169,6 @@ void ViewerOverlayControllerBase::OverlayBuilder::addCircle(const QPointF& cente
     CirclePrimitive prim;
     prim.center = center;
     prim.radius = radius;
-    prim.filled = filled;
-    prim.style = style;
-    _primitives.emplace_back(std::move(prim));
-}
-
-void ViewerOverlayControllerBase::OverlayBuilder::addRotatedEllipse(const QPointF& center,
-                                                                    qreal radiusX,
-                                                                    qreal radiusY,
-                                                                    qreal rotationRadians,
-                                                                    bool filled,
-                                                                    OverlayStyle style)
-{
-    if (radiusX <= 0.0 || radiusY <= 0.0) {
-        return;
-    }
-    RotatedEllipsePrimitive prim;
-    prim.center = center;
-    prim.radiusX = radiusX;
-    prim.radiusY = radiusY;
-    prim.rotationRadians = rotationRadians;
     prim.filled = filled;
     prim.style = style;
     _primitives.emplace_back(std::move(prim));
@@ -1154,9 +1135,16 @@ QRectF ViewerOverlayControllerBase::visibleSceneRect(VolumeViewerBase* viewer) c
     return view->mapToScene(view->viewport()->rect()).boundingRect();
 }
 
-bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const
+std::optional<vc::fibers::ViewRegion> ViewerOverlayControllerBase::planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const
 {
-    return visibleSceneRect(viewer).contains(scenePoint);
+    if (!viewer || !dynamic_cast<PlaneSurface*>(viewer->currentSurface())) return std::nullopt;
+    const auto rect = visibleSceneRect(viewer);
+    if (rect.isEmpty()) return std::nullopt;
+    const auto corner = [&](const QPointF& scene) {
+        const auto p = viewer->sceneToVolume(scene);
+        return vc::fibers::Point{p[0], p[1], p[2]};
+    };
+    return vc3d::store::viewRegion(corner(rect.topLeft()), corner(rect.topRight()), corner(rect.bottomLeft()), halfDepth);
 }
 
 Surface* ViewerOverlayControllerBase::viewerSurface(VolumeViewerBase* viewer) const
@@ -1393,22 +1381,6 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         prim.center.y() - prim.radius,
                         prim.radius * 2.0,
                         prim.radius * 2.0);
-                    auto style = prim.style;
-                    if (!prim.filled) {
-                        style.brushColor = Qt::transparent;
-                    }
-                    addItem(item, style);
-                } else if constexpr (std::is_same_v<T, RotatedEllipsePrimitive>) {
-                    flushPointGroups();
-                    if (prim.radiusX <= 0.0 || prim.radiusY <= 0.0) {
-                        return;
-                    }
-                    QPainterPath path;
-                    path.addEllipse(QPointF(0.0, 0.0), prim.radiusX, prim.radiusY);
-                    QTransform transform;
-                    transform.translate(prim.center.x(), prim.center.y());
-                    transform.rotateRadians(prim.rotationRadians);
-                    auto* item = new QGraphicsPathItem(transform.map(path));
                     auto style = prim.style;
                     if (!prim.filled) {
                         style.brushColor = Qt::transparent;

@@ -1,6 +1,5 @@
 #include "ViewerManager.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"
@@ -20,7 +19,6 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <QApplication>
@@ -98,16 +96,27 @@ bool finiteVec3(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const vcr::catalog::Affine& matrix)
 {
-    cv::Vec3d transformed;
-    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+    if (!finiteVec3(point)) {
         return std::nullopt;
     }
+    const auto transformed = matrix.apply({point[0], point[1], point[2]});
     const cv::Vec3f out(static_cast<float>(transformed[0]),
                         static_cast<float>(transformed[1]),
                         static_cast<float>(transformed[2]));
     return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+// A direction's normal through the transform, kept when it does not map.
+cv::Vec3f transformNormal(const cv::Vec3f& normal, const vcr::catalog::Affine& matrix)
+{
+    if (!finiteVec3(normal)) {
+        return normal;
+    }
+    const auto mapped = matrix.mapNormal({normal[0], normal[1], normal[2]});
+    const cv::Vec3f out(static_cast<float>(mapped[0]), static_cast<float>(mapped[1]), static_cast<float>(mapped[2]));
+    return finiteVec3(out) && cv::norm(out) > 0.0f ? out : normal;
 }
 
 cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
@@ -120,39 +129,6 @@ cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& vo
     point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
     point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
     return point;
-}
-
-// Uniform distance scale of an affine transform, or nullopt when the linear
-// part is too anisotropic for a single scalar to be meaningful.
-std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
-{
-    cv::Mat linear(3, 3, CV_64F);
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            linear.at<double>(row, col) = matrix(row, col);
-        }
-    }
-
-    cv::SVD svd(linear, cv::SVD::NO_UV);
-    if (svd.w.rows < 3) {
-        return std::nullopt;
-    }
-    const double s0 = svd.w.at<double>(0, 0);
-    const double s1 = svd.w.at<double>(1, 0);
-    const double s2 = svd.w.at<double>(2, 0);
-    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
-        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
-        return std::nullopt;
-    }
-
-    const double mean = (s0 + s1 + s2) / 3.0;
-    const double maxDeviation =
-        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
-    const double relativeDeviation = maxDeviation / mean;
-    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
-        return std::nullopt;
-    }
-    return mean;
 }
 
 std::vector<ViewerManager*>& managerRegistry()
@@ -372,8 +348,6 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool showHints = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
-        baseViewer->setShowDirectionHints(showHints);
         bool showNormals = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
         baseViewer->setShowSurfaceNormals(showNormals);
     }
@@ -654,18 +628,10 @@ void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surf
         if (!dynamic_cast<PlaneSurface*>(surf)) {
             return;
         }
-        if (auto* patchIndex = surfacePatchIndexIfReady()) {
-            static constexpr float kPatchPickToleranceVoxels = 10.0f;
-            SurfacePatchIndex::PointQuery query;
-            query.worldPoint = volLoc;
-            query.tolerance = kPatchPickToleranceVoxels;
-            if (const auto hit = patchIndex->locate(query)) {
-                const auto current = std::dynamic_pointer_cast<QuadSurface>(
-                    _state ? _state->surface("segmentation") : nullptr);
-                if (hit->surface && hit->surface != current &&
-                    !hit->surface->id.empty()) {
-                    emit surfaceActivationRequested(hit->surface->id);
-                }
+        static constexpr float kPatchPickToleranceVoxels = 10.0f;
+        if (_surfacePicker) {
+            if (const auto id = _surfacePicker(volLoc, kPatchPickToleranceVoxels)) {
+                emit surfaceActivationRequested(*id);
             }
         }
         std::string surfId;
@@ -779,15 +745,6 @@ VolumeViewerBase* ViewerManager::segmentationViewer() const
     return nullptr;
 }
 
-void ViewerManager::setShowDirectionHints(bool show)
-{
-    forEachBaseViewer([show](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setShowDirectionHints(show);
-        }
-    });
-}
-
 void ViewerManager::setShowSurfaceNormals(bool show)
 {
     forEachBaseViewer([show](VolumeViewerBase* viewer) {
@@ -812,33 +769,6 @@ void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)
     forEachBaseViewer([visible](VolumeViewerBase* viewer) {
         if (viewer) {
             viewer->setPlaneIntersectionLinesVisible(visible);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlaysEnabled(bool enabled)
-{
-    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlayEnabled(enabled);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlapThreshold(float threshold)
-{
-    forEachBaseViewer([threshold](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlapThreshold(threshold);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays)
-{
-    forEachBaseViewer([&overlays](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlays(overlays);
         }
     });
 }
@@ -906,13 +836,15 @@ std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureN
 }
 
 void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
-                                      const cv::Matx44d& transform)
+                                      const vcr::catalog::Affine& transform)
 {
     if (!snapshot || !_state || !_state->currentVolume()) {
         return;
     }
 
-    const auto navigationScale = relativeAffineDistanceScale(transform);
+    // The camera keeps its on-screen scale through a near-similarity (column
+    // lengths within about 2%); other transforms keep the camera as it was.
+    const auto navigationScale = transform.similarityScale(0.04);
     for (const auto& captured : snapshot->entries) {
         CChunkedVolumeViewer* viewer = captured.viewer.data();
         if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
@@ -942,7 +874,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
             : captured.camera.zOffset;
         camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
         if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
-            const auto direction = vc::core::util::transformNormal(
+            const auto direction = transformNormal(
                 captured.camera.zOffsetWorldDir, transform);
             if (finiteVec3(direction)) {
                 camera.zOffsetWorldDir = direction;
@@ -953,7 +885,7 @@ void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnap
 }
 
 void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
-                                 const std::optional<cv::Matx44d>& navigationTransform)
+                                 const std::optional<vcr::catalog::Affine>& navigationTransform)
 {
     if (!_state) {
         return;
@@ -968,7 +900,7 @@ void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
             transformedFocusPoint = transformPoint(focus->p, *navigationTransform);
             if (cv::norm(focus->n) > 0.0f) {
                 const cv::Vec3f normal =
-                    vc::core::util::transformNormal(focus->n, *navigationTransform);
+                    transformNormal(focus->n, *navigationTransform);
                 if (finiteVec3(normal)) {
                     transformedFocusNormal = normal;
                 }
@@ -1047,31 +979,26 @@ void ViewerManager::setSegmentationModule(SegmentationModule* module)
 
 void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)
 {
-    _pointsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setRawPointsOverlay(RawPointsOverlayController* overlay)
 {
-    _rawPointsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setPathsOverlay(PathsOverlayController* overlay)
 {
-    _pathsOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setBBoxOverlay(BBoxOverlayController* overlay)
 {
-    _bboxOverlay = overlay;
     registerOverlay(overlay);
 }
 
 void ViewerManager::setVectorOverlay(VectorOverlayController* overlay)
 {
-    _vectorOverlay = overlay;
     registerOverlay(overlay);
 }
 
@@ -1114,24 +1041,17 @@ void ViewerManager::setIntersectionThickness(float thickness)
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setIntersectionThickness(_intersectionThickness); });
 }
 
-void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
-{
-    forEachBaseViewer([&ids](VolumeViewerBase* v) { v->setHighlightedSurfaceIds(ids); });
-}
-
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     if (volume && _state && _state->vpkg()) {
-        if (!vc3d::opendata::overlayCoordinatesCompatible(
-                *_state->vpkg(), _state->currentVolumeId(), volumeId)) {
+        if (!_state->vpkg()->overlayCompatible(_state->currentVolumeId(), volumeId)) {
             Logger()->warn(
-                "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
+                "Rejected volume overlay '{}' because the catalog places it in another frame than '{}'.",
                 volumeId, _state->currentVolumeId());
             volume.reset();
         }
     }
     _overlayVolume = std::move(volume);
-    _overlayVolumeId = _overlayVolume ? volumeId : std::string{};
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
@@ -1254,19 +1174,13 @@ void ViewerManager::setVolumeWindow(float low, float high)
     emit volumeWindowChanged(_volumeWindowLow, _volumeWindowHigh);
 }
 
-void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated)
+void ViewerManager::setSurfacePatchSamplingStride(int stride)
 {
     stride = std::max(1, stride);
     if (_surfacePatchSamplingStride == stride) {
         return;
     }
     _surfacePatchSamplingStride = stride;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    if (userInitiated) {
-        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE, _surfacePatchSamplingStride);
-        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, true);
-    }
 
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;
@@ -1277,8 +1191,6 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     }
 
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setSurfacePatchSamplingStride(_surfacePatchSamplingStride); });
-
-    emit samplingStrideChanged(_surfacePatchSamplingStride);
 }
 
 void ViewerManager::setIntersectionMaxSurfaces(int limit)
@@ -1288,9 +1200,6 @@ void ViewerManager::setIntersectionMaxSurfaces(int limit)
         return;
     }
     _intersectionMaxSurfaces = limit;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, limit);
 }
 
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
@@ -1315,66 +1224,11 @@ SurfacePatchIndex* ViewerManager::activeSegmentationEditSurfacePatchIndex() cons
     return _segmentationModule ? _segmentationModule->activeEditSurfacePatchIndex() : nullptr;
 }
 
-void ViewerManager::setSurfacePatchIndexCacheKey(const QString& key)
-{
-    if (key == _surfacePatchIndexCacheKey) {
-        return;
-    }
-    const bool primeBusy = _surfacePatchIndexWatcher && _surfacePatchIndexWatcher->isRunning();
-    const bool taskBusy = (_surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning()) ||
-                          !_pendingSurfacePatchIndexTasks.empty();
-    // Stash the live index under the outgoing key so returning to that folder
-    // selection can skip the full rebuild. Only safe when the index is current
-    // and no worker is reading or mutating it; otherwise it is simply dropped
-    // and rebuilt on return like before.
-    if (!_surfacePatchIndexCacheKey.isEmpty() && !_surfacePatchIndexNeedsRebuild &&
-        !_surfacePatchIndex.empty() && !primeBusy && !taskBusy &&
-        !_deferredIndexSwap && _indexReadsInFlight == 0) {
-        CachedSurfacePatchIndex entry;
-        entry.index = std::move(_surfacePatchIndex);
-        entry.ids = std::move(_indexedSurfaceIds);
-        _surfacePatchIndexCache.insert_or_assign(_surfacePatchIndexCacheKey, std::move(entry));
-        _surfacePatchIndex = SurfacePatchIndex{};
-        _surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride);
-        VC3D_DEBUG_QCINFO(lcViewerManager) << "Stashed SurfacePatchIndex for" << _surfacePatchIndexCacheKey;
-    }
-    // The old folder's surfaces are about to be unbound; clearing the indexed
-    // ids keeps handleSurfaceWillBeDeleted from queueing per-cell rtree
-    // removals for surfaces the next prime replaces wholesale anyway.
-    _indexedSurfaceIds.clear();
-    _surfacePatchIndexNeedsRebuild = true;
-    _surfacePatchIndexCacheKey = key;
-    forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
-}
-
-void ViewerManager::clearSurfacePatchIndexCache()
-{
-    _surfacePatchIndexCache.clear();
-    _surfacePatchIndexCacheKey.clear();
-}
-
-void ViewerManager::invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface)
-{
-    if (!surface) {
-        return;
-    }
-    // The surface's geometry changed; any stashed index containing it would
-    // pass the instance-identity check on reuse while holding stale patches.
-    for (auto it = _surfacePatchIndexCache.begin(); it != _surfacePatchIndexCache.end();) {
-        if (it->second.index.containsSurface(surface)) {
-            it = _surfacePatchIndexCache.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
 {
     if (!surface) {
         return;
     }
-    invalidateSurfacePatchIndexCacheFor(surface);
     // An intersection worker is reading the index now: defer the in-place mutation
     // (mark dirty -> rebuilt on the next query) instead of tearing the read.
     if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }
@@ -1410,7 +1264,6 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Skipped SurfacePatchIndex update (no changes)";
         return;
     }
-    invalidateSurfacePatchIndexCacheFor(surface);
     if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }  // defer: worker reading
 
     const std::string surfId = surface->id;
@@ -1462,9 +1315,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surface : allSurfaces) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
-            if (vc3d::opendata::isOpenDataSegmentPlaceholder(quad->path)) {
-                continue;
-            }
             // Skip if we've already seen this surface (shared_ptr hash uses underlying pointer)
             if (seenSurfaces.insert(quad).second) {
                 quadSurfaces.push_back(quad);
@@ -1490,7 +1340,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
 
     // The live index already covers exactly this surface set at the current
-    // stride (e.g. a reload that only changed folder colors): nothing to do.
+    // stride (e.g. a reload that only changed tags or colors): nothing to do.
     if (!hadRunningBuild && !_surfacePatchIndexNeedsRebuild && !_deferredIndexSwap &&
         !_surfacePatchIndex.empty() &&
         _surfacePatchIndex.samplingStride() == _surfacePatchSamplingStride &&
@@ -1501,47 +1351,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                     })) {
         _pendingSurfacePatchIndexSurfaceIds.clear();
         return;
-    }
-
-    // A folder-selection switch may have stashed a still-valid index for this
-    // exact surface set — swap it back in instead of rebuilding.
-    if (auto cacheIt = _surfacePatchIndexCache.find(_surfacePatchIndexCacheKey);
-        cacheIt != _surfacePatchIndexCache.end()) {
-        CachedSurfacePatchIndex entry = std::move(cacheIt->second);
-        _surfacePatchIndexCache.erase(cacheIt);
-        const bool matches =
-            entry.index.samplingStride() == _surfacePatchSamplingStride &&
-            entry.index.surfaceCount() == quadSurfaces.size() &&
-            std::all_of(quadSurfaces.begin(), quadSurfaces.end(),
-                        [&entry](const SurfacePatchIndex::SurfacePtr& quad) {
-                            return entry.index.containsSurface(quad);
-                        });
-        if (matches) {
-            _surfacesQueuedDuringRebuild.clear();
-            _pendingSurfacePatchIndexSurfaceIds.clear();
-            if (_indexReadsInFlight > 0) {
-                // A worker is reading the live index; apply via the deferred
-                // swap path once reads drain.
-                _deferredIndexSwap = std::make_shared<SurfacePatchIndex>(std::move(entry.index));
-                _deferredIndexSwapIds.assign(surfaceIds.begin(), surfaceIds.end());
-                _surfacePatchIndexNeedsRebuild = false;
-                return;
-            }
-            _surfacePatchIndex = std::move(entry.index);
-            _indexedSurfaceIds = std::move(entry.ids);
-            _surfacePatchIndexNeedsRebuild = false;
-            VC3D_DEBUG_QCINFO(lcViewerManager) << "Reused stashed SurfacePatchIndex for"
-                                    << _indexedSurfaceIds.size() << "surfaces"
-                                    << "(" << _surfacePatchIndexCacheKey << ")";
-            forEachBaseViewer([](VolumeViewerBase* v) {
-                v->invalidateIntersect();
-                v->renderIntersections("surface index cache hit");
-            });
-            scheduleSurfacePatchIndexOverlayRefresh();
-            return;
-        }
-        // Entry went stale (surfaces reloaded, deleted, or stride changed);
-        // it was dropped above — fall through to a full rebuild.
     }
 
     // Clear rebuild flag since we're about to do an async build
@@ -1794,7 +1603,6 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     if (_surfacePatchIndex.hasPendingUpdates(quad)) {
         // Pending cell updates mean real geometry changes; stashed indexes
         // containing this surface are stale.
-        invalidateSurfacePatchIndexCacheFor(quad);
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);

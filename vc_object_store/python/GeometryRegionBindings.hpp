@@ -31,7 +31,8 @@ inline void bindGeometryRegion(nb::module_& m)
         .def_rw("sql_step_budget", &vo::RegionOptions::sqlStepBudget)
         .def_rw("max_unit_bytes", &vo::RegionOptions::maxUnitBytes)
         .def_rw("coordinates", &vo::RegionOptions::coordinates)
-        .def_rw("volume", &vo::RegionOptions::volume);
+        .def_rw("volume", &vo::RegionOptions::volume)
+        .def_rw("target_scale", &vo::RegionOptions::targetScale);
 }
 inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice& slice,
                                      const vo::RegionOptions& options, RegionCancellation* cancel)

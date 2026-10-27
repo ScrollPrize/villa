@@ -9,8 +9,10 @@
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/render/ChunkCache.hpp"
-#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStore.hpp>
+#include <vc_reader/catalog.hpp>
 
 #include <cstdlib>
 #include <atomic>
@@ -58,8 +60,8 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     }
     const nlohmann::json fiber = {
         {"coordinates", {{"volume_uuid", "20260102150214"}, {"scale_factor", 1}}}};
-    // Reproduce the URL-derived identity mismatch before applying catalog tags.
-    CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *untagged).has_value());
+    // Reproduce the URL-derived identity mismatch before the catalog names the volume.
+    CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, untagged->id()).has_value());
 
     struct TemporaryProject {
         std::filesystem::path path = std::filesystem::temp_directory_path() /
@@ -70,15 +72,15 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
     deferred.failOnRemoteError = true;
+    deferred.catalog = std::make_shared<const vcr::catalog::OpenDataManifest>(vcr::catalog::parseOpenDataManifest(R"({
+      "samples": {"PHerc0139": {"volumes": {"20260102150214": {"id": "20260102150214",
+        "suffix": "20260102150214-2.399um-0.2m-78keV-masked.zarr", "properties": {"pixel_size_um": 2.399},
+        "data": [{"type": "zarr", "origins": [{"path": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
+          "access_roots": [{"type": "https", "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
+                            "usage": "public-read"}]}]}]}}}}})"));
     auto project = VolumePkg::newDetached(deferred);
-    REQUIRE(project->addVolumeEntry(url, {
-        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
-        "vc-open-data-preferred-source", "vc-open-data-source-coordinate-level:0",
-        "vc-open-data-voxel-size-um:2.399000"}));
-    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {
-        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
-        "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2",
-        "vc-open-data-voxel-size-um:9.596000"}));
+    REQUIRE(project->addVolumeEntry(url, {"vc-remote-auth:anonymous"}));
+    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
     project->save(projectPath);
     project = VolumePkg::load(projectPath, deferred);
     project->resolveDeferredEntries();
@@ -115,15 +117,29 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     }
     MESSAGE("Catalog cache reuse: " << (after.bytes ? after.bytes->size() : 0)
             << " decoded bytes, " << fetches->load() << " remote chunk fetches");
-    CHECK(vc3d::geometryScaleForVolume(fiber, *volume) == 1.0);
-    CHECK(vc3d::coordinateBindingForVolume(*volume, 1).at("coordinates") == fiber.at("coordinates"));
+    CHECK(vc::objects::geometryScaleToVolume(fiber, volume->id()) == 1.0);
+    CHECK(vc::objects::volumeCoordinates(volume->id(), 1) == fiber.at("coordinates"));
     REQUIRE(project->volumeIDs().size() == 2);
     for (const auto& id : project->volumeIDs()) {
         if (id != volume->id()) {
             const auto rebased = project->volume(id);
-            CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *rebased).has_value());
+            CHECK(rebased->id() == "20260102150214@L2");
+            // Both show the catalog volume, at their levels: different frames.
+            const auto view = project->catalogView(rebased->id());
+            REQUIRE(view);
+            CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
+            CHECK_FALSE(project->overlayCompatible(volume->id(), rebased->id()));
+            CHECK(project->overlayCompatible(rebased->id(), rebased->id()));
+            CHECK(rebased->voxelSize() == doctest::Approx(4 * 2.399));
+            CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
             CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
-            CHECK(rebased->remotePersistentCachePath() == rebased->remoteCacheRoot() / rebased->id());
+            // Annotations on either level are kept in the level-0 catalog volume.
+            const auto annotation = vc::project::annotationVolume(project.get(), *rebased);
+            CHECK(annotation.id == "20260102150214");
+            CHECK(annotation.fromVolume.apply({1, 2, 3}) == std::array<double, 3>{4, 8, 12});
+            REQUIRE(annotation.voxelSizeUm);
+            CHECK(*annotation.voxelSizeUm == doctest::Approx(2.399));
+            CHECK(vc::project::annotationVolume(project.get(), *volume).id == "20260102150214");
         }
     }
 
@@ -144,7 +160,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         CHECK(matched.size() == all.size());
         CHECK(store.unboundObjectCount(txn, "fiber", volume->id()) == 0);
         for (const auto& object : matched)
-            CHECK(vc3d::geometryScaleForVolume(nlohmann::json::parse(object.meta), *volume) == 1.0);
+            CHECK(vc::objects::geometryScaleToVolume(nlohmann::json::parse(object.meta), volume->id()) == 1.0);
         MESSAGE("Matched " << matched.size() << " real hub fibers to " << volume->id());
     }
 }

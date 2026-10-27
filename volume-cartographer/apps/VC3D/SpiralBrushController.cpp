@@ -175,9 +175,6 @@ void SpiralBrushController::bindFlattenedViewer(VolumeViewerBase* viewer)
     if (auto* view = _flattened.viewer ? _flattened.viewer->graphicsView() : nullptr)
         view->setRenderHint(QPainter::Antialiasing, true);
     _viewer = _flattened.viewer;
-    _viewObject = _flattened.viewObject;
-    _viewport = _flattened.viewport;
-    _cursorWidget = _flattened.cursorWidget;
     invalidateEditablePclHitIndex();
     updateCursorWidget();
 }
@@ -236,42 +233,6 @@ std::uint64_t SpiralBrushController::sourceOrder(PclRole role, std::size_t index
         offset += sourcesFor(earlier).sources.size();
     }
     return offset + index;
-}
-
-void SpiralBrushController::resetSession()
-{
-    _patchMode.deactivate();
-    _gestures.clear();
-    _polylines.clear();
-    for (const PclRole role : vc3d::spiral::kEditablePclRoles) {
-        auto& set = sourcesFor(role);
-        set.sources.clear();
-        set.indexById.clear();
-        set.editableIds.clear();
-        set.suppressedIds.clear();
-    }
-    _visiblePointCollectionIds.clear();
-    clearPointChainProjectionCache();
-    _usedColors.clear();
-    _sampledColor.reset();
-    _pointPlacement.deactivate();
-    _cursorInside = false;
-    _cursorBound = nullptr;
-    updateCursorWidget();
-    _dragMode = DragMode::None;
-    _activeGesture = -1;
-    _activePolyline = -1;
-    _nextPolylineSequence = 1;
-    _polylineBlocked = false;
-    _vHeld = false;
-    _vClickConsumed = false;
-    _hoveredEditablePcl.reset();
-    invalidateEditablePclHitIndex();
-    _pclLeftClickConsumed = false;
-    for (const PclRole role : vc3d::spiral::kEditablePclRoles)
-        emit suppressedPclCollectionIdsChanged(role, {});
-    refreshAll();
-    emit paintStateChanged();
 }
 
 bool SpiralBrushController::hasUnfinalizedPaint() const
@@ -385,28 +346,6 @@ void SpiralBrushController::setPointViewTolerance(double tolerance)
     _pointViewToleranceVoxels = clamped;
     invalidateEditablePclHitIndex();
     refreshAll();
-}
-
-void SpiralBrushController::replacementConflict(const QString& id, bool discardDraft)
-{
-    for (auto line = _polylines.begin(); line != _polylines.end(); ++line) {
-        if (line->id != id || !line->pclEdit) continue;
-        const QString target = line->pclEdit->collectionId;
-        if (discardDraft) {
-            const int index = static_cast<int>(std::distance(_polylines.begin(), line));
-            if (_activePolyline == index) _activePolyline = -1;
-            _polylines.erase(line);
-        } else {
-            line->id.clear();
-            line->state = GestureState::Ready;
-            line->pclEdit->submissionBlocked = true;
-        }
-        updateSuppressedPclIds();
-        invalidateEditablePclHitIndex();
-        refreshAll();
-        emit paintStateChanged();
-        return;
-    }
 }
 
 const std::vector<cv::Vec3f>& SpiralBrushController::pointCollectionPositions(

@@ -15,7 +15,6 @@
 
 class SegmentationEditManager;
 class SegmentationWidget;
-class SegmentationOverlayController;
 class CState;
 class SegmentationModule;
 class QuadSurface;
@@ -29,13 +28,7 @@ public:
     SegmentationPushPullTool(SegmentationModule& module,
                              SegmentationEditManager* editManager,
                              SegmentationWidget* widget,
-                             SegmentationOverlayController* overlay,
                              CState* state);
-
-    void setDependencies(SegmentationEditManager* editManager,
-                         SegmentationWidget* widget,
-                         SegmentationOverlayController* overlay,
-                         CState* state);
 
     void setStepMultiplier(float multiplier);
     [[nodiscard]] float stepMultiplier() const { return _stepMultiplier; }
@@ -49,7 +42,6 @@ public:
     bool start(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stop(int direction);
     void stopAll();
-    bool applyStep();
 
     void cancel() override { stopAll(); }
     [[nodiscard]] bool isActive() const override { return _ppState.active; }
@@ -102,7 +94,6 @@ private:
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
     SegmentationWidget* _widget{nullptr};
-    SegmentationOverlayController* _overlay{nullptr};
     CState* _state{nullptr};
 
     struct State

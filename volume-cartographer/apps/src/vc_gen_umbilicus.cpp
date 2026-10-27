@@ -5,7 +5,7 @@
 // it to the single point the sheet normals of that section point away from. This tool runs that
 // function, the one in core/src/normalgridtools.cpp and not a copy of it, over a set of slices
 // and writes the points it returns as an umbilicus file, which is the form
-// Umbilicus::FromFile and resolveScrollUmbilicus already read.
+// vc::objects::readUmbilicusFile and VC3D's Import Umbilicus read.
 //
 // Only the xy plane is offered, because an umbilicus is a curve with one point per z, and the xy
 // grids are the slices whose centre that point is. The xz and yz grids of the same volume hold
@@ -198,7 +198,7 @@ int main(int argc, char** argv)
         ("input,i", po::value<std::string>(),
             "Normal grid volume directory, a directory of NNNNNN.grid files, or one .grid file")
         ("output,o", po::value<std::string>(),
-            "Umbilicus json to write (control_points, as Umbilicus::FromFile reads them)")
+            "Umbilicus json to write (control_points, as Import Umbilicus reads them)")
         ("csv", po::value<std::string>(),
             "Also write every single estimate here, one row per slice and repeat")
         ("slices", po::value<std::string>(),
@@ -503,7 +503,7 @@ int main(int argc, char** argv)
         metadata["voxelsize_um"] = vm["voxelsize-um"].as<double>();
     }
     // The grid dimension triplet is stamped only when all three are given. Two of three is read
-    // by Umbilicus::LoadFileInfo as a malformed statement and refuses the file, and the tool
+    // by vc::objects::readUmbilicusFile as a malformed statement and refuses the file, and the tool
     // cannot supply the third itself: the grids state their extent in x and y but not the slice
     // count of the volume they came from, since a sparse or partial set of grid files is
     // indistinguishable from a short volume.

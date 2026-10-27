@@ -93,12 +93,12 @@ to use direct chunks. Neither route changes interpolation or fill semantics.
 
 ## Replay and numerical changes
 
-New replay records use `VCA2`. Local intensity fields serialize their compact
+Replay records use `VCA2`. Local intensity fields serialize their compact
 axis coefficients and normalization scalars. Dense fields are serialized as float32; component
 indices are integers. Matrices and shared scalar parameters retain the reasons
-listed above. `VCA1` records are rejected: regenerate old plans. A new plan
-reproduces its recorded execution exactly on the tested backend; CPU/CUDA and
-older-version outputs need not be bitwise equal.
+listed above. Records in another format are rejected. A plan reproduces its
+recorded execution exactly on the tested backend; CPU and CUDA outputs need not
+be bitwise equal.
 
 For three 128³ random images (seeds 0, 123, 456), the geometry precision change
 produced maximum image error of about 7.5e-6 against the preceding double-geometry

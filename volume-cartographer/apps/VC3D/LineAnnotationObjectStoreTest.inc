@@ -5,13 +5,16 @@
 #include "FiberCollectionController.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SpiralServiceManager.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
+#include "support/TestZarrVolume.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
     using Controller = LineAnnotationController;
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
-    const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::util::newUuid()+".vcobj");
+    const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
     auto checkHubStatus = [&](CState& state, Controller& controller,
                               FiberCollectionController& collection,
                               const std::function<bool()>& catalogReady) {
@@ -28,7 +31,7 @@ int runObjectStoreControllerTests()
         for (int i = 0; i < 20; ++i) {
             QElapsedTimer timer; timer.start();
             state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
-                *state.objectStoreSession()->attachment(), 0, {}});
+                *state.objectStoreAttachment(), 0, {}});
             QApplication::processEvents();
             while (!catalogReady() && timer.elapsed() < 10000) {
                 QApplication::processEvents(); QThread::msleep(1);
@@ -88,12 +91,204 @@ int runObjectStoreControllerTests()
         }
         {
             QTemporaryDir volumeDir;
-            Volume::ZarrCreateOptions create; create.shapeZYX = {4,4,4};
-            create.chunkShapeZYX = {4,4,4}; create.compressor = "none"; create.uuid = "20260411134726";
-            const auto volume = Volume::New(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
-            const auto binding = vc3d::coordinateBindingForVolume(*volume, 4);
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {4,4,4};
+            create.chunkShapeZYX = {4,4,4}; create.uuid = "20260411134726";
+            const auto volume = vc::test::createZarrVolume(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
+            const auto binding = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 4)}};
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
-            require(vc3d::geometryScaleForVolume(binding, *volume) == .25, "VC3D matches the authoritative volume ID");
+            require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
+        }
+        {
+            // The umbilicus is the store's, bound to a volume; its frame was set when stored.
+            QTemporaryDir dir;
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.uuid = "umbilicus-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions umbilicusOptions; umbilicusOptions.author = "vc3d-umbilicus-test";
+            { auto db = ObjectStore::create(storePath, umbilicusOptions); }
+            CState state;
+            Controller controller(&state,nullptr,nullptr,nullptr);
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-umbilicus-test");
+            state.setCurrentVolume(volume);
+            int changed = 0, fibersChanged = 0;
+            QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
+            QObject::connect(&controller, &Controller::fibersChanged, [&] { ++fibersChanged; });
+            const auto attachment = *state.objectStoreAttachment();
+            require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id()) &&
+                        !controller.umbilicusStatus().available,
+                    "a volume without a stored umbilicus has none");
+            auto add = [&](const std::string& name) {
+                const auto uuid = vc::objects::util::newUuid();
+                state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+                    ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
+                    record.meta = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}}.dump();
+                    db.upsertObject(txn, record);
+                    db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}));
+                });
+                state.pollObjectStoreChanges();
+                return uuid;
+            };
+            const auto first = add("scroll");
+            const auto stored = vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id());
+            require(changed > 0, "committing an umbilicus announces it");
+            require(fibersChanged == 0, "a commit touching no fiber leaves the fiber caches alone");
+            require(stored && stored->uuid == first &&
+                    stored->points == std::vector<vc::geometry::Point>{{4, 3, 0}, {4, 3, 15}},
+                    "the stored umbilicus is read in the volume's voxels");
+            require(controller.umbilicusStatus().available && controller.umbilicusStatus().text == "scroll",
+                    "the fiber map status names the stored umbilicus");
+            const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->id);
+            require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
+            const auto token = controller.umbilicusFingerprint();
+            add("second");
+            require(controller.umbilicusStatus().text.contains("several") &&
+                    controller.umbilicusFingerprint() != token,
+                    "several umbilici bound to one volume are refused");
+            state.detachObjectStore();
+        }
+        {
+            // A volume's point collections live in the store: edits reach it in a
+            // debounced transaction, a new session loads them, and someone else's
+            // commit reloads them; corrections (anchored) stay out.
+            QTemporaryDir dir;
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.uuid = "points-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions pointOptions; pointOptions.author = "vc3d-points-test";
+            { auto db = ObjectStore::create(storePath, pointOptions); }
+            auto settle = [](const std::function<bool()>& done) {
+                QElapsedTimer timer; timer.start();
+                while (!done() && timer.elapsed() < 5000) { QApplication::processEvents(); QThread::msleep(5); }
+                return done();
+            };
+            CState state;
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+            state.setCurrentVolume(volume);
+            auto* points = state.pointCollection();
+            const auto first = points->addPoint("seeds", {1, 2, 3});
+            points->addPoint("seeds", {4, 5, 6});
+            const auto anchored = points->addCollection("correction");
+            points->setCollectionAnchor2d(anchored, cv::Vec2f(1, 1));
+            points->addPoint("correction", {7, 7, 7});
+            const auto attachment = *state.objectStoreAttachment();
+            auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, volume->id()); };
+            require(settle([&] { return stored().size() == 1 && stored()[0].points.points.size() == 2; }),
+                    "an edited collection reaches the store after the debounce");
+            require(stored()[0].name == "seeds", "the store holds the collection's name");
+            auto moved = *points->getPoint({first.collectionId, first.id});
+            moved.p = {9, 9, 9};
+            points->updatePoint(moved);
+            require(settle([&] { return stored()[0].points.points[0] == std::array<double, 3>{9, 9, 9}; }),
+                    "a moved point is written back keeping its id");
+            {
+                CState other;
+                other.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+                other.setCurrentVolume(volume);
+                const auto& loaded = other.pointCollection()->getAllCollections();
+                require(loaded.size() == 1 && loaded.begin()->second.name == "seeds" && loaded.begin()->second.points.size() == 2,
+                        "a new session loads the volume's collections");
+                other.detachObjectStore();
+            }
+            auto edited = stored()[0];
+            edited.points.points[1] = {3, 3, 3};
+            vc::objects::writeVolumeCollections(*state.objectStoreSession(), attachment, volume->id(), {edited}, {});
+            state.pollObjectStoreChanges();
+            require(settle([&] {
+                        const auto found = points->getAllCollections().find(*points->getCollectionId("seeds"));
+                        return std::any_of(found->second.points.begin(), found->second.points.end(),
+                                           [](const auto& p) { return p.second.p == cv::Vec3f(3, 3, 3); });
+                    }), "someone else's commit reloads the collection");
+            require(points->getCollectionId("correction").has_value(), "a reload keeps the corrections");
+            points->clearCollection(*points->getCollectionId("seeds"));
+            require(settle([&] { return stored().empty(); }), "a removed collection is retired");
+            state.detachObjectStore();
+        }
+        {
+            // Fibers bound by scale or through a registration are read and edited
+            // in the open volume's voxels and saved back to their stored frame.
+            QTemporaryDir dir;
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,16,16};
+            create.chunkShapeZYX = {16,16,16}; create.uuid = "frame-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions frameOptions; frameOptions.author = "vc3d-frame-test";
+            VolumeAffine shear; shear(0,0)=2; shear(0,1)=.5; shear(0,3)=1; shear(2,3)=3;
+            std::string scaled, registered;
+            const std::vector<vc::geometry::Point> controls{{2,4,6},{10,4,6}}, line{{2,4,6},{6,4,6},{10,4,6}};
+            {
+                auto db = ObjectStore::create(storePath, frameOptions);
+                auto txn = db.write();
+                (void)db.registerVolumeTransform(txn, "other-volume", "frame-volume", shear, "scan registration");
+                auto add = [&](const nlohmann::json& meta) {
+                    ObjectRecord record; record.kind = "fiber"; record.meta = meta.dump();
+                    vc::objects::FiberDetail detail; detail.width = 8; record.fiber = detail;
+                    const auto uuid = db.upsertObject(txn, record);
+                    vc::geometry::Fiber fiber; fiber.controlPoints = controls; fiber.linePoints = line;
+                    db.putGeometry(txn, uuid, vc::geometry::encode(fiber));
+                    return uuid;
+                };
+                // Two stored units per voxel: the volume sees half the coordinates.
+                scaled = add(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 2)}});
+                registered = add({{"coordinates", {{"volume_uuid", "other-volume"}, {"scale_factor", 1}}}});
+                txn.commit();
+            }
+            CState state;
+            Controller controller(&state,nullptr,nullptr,nullptr);
+            controller._errorDialogsSuppressed = true;
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-frame-test");
+            state.setCurrentVolume(volume);
+            auto read = [&](const std::string& uuid) {
+                auto fibers = controller.readStoredFibers(std::vector<std::string>{uuid}, true);
+                require(fibers.size() == 1 && fibers.front().editorError.empty(), "bound fiber decodes");
+                return fibers.front();
+            };
+            auto stored = [&](const std::string& uuid) {
+                vc::geometry::Fiber fiber;
+                state.objectStoreSession()->read(*state.objectStoreAttachment(), [&](const auto& db, const auto& txn, const auto&) {
+                    fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
+                });
+                return fiber;
+            };
+            auto s = read(scaled), r = read(registered);
+            require(s.frame && r.frame && controller.fiberInVolume(s) && controller.fiberInVolume(r),
+                    "fibers bound by scale or registration are read in the volume");
+            require(cv::Vec3d(s.controlPoints[1]) == cv::Vec3d{5,2,3} && s.width == 4, "scale-bound fiber in volume voxels");
+            require(cv::Vec3d(r.controlPoints[0]) == cv::Vec3d{7,4,9}, "registered fiber in volume voxels");
+            // Move one control point (and its line sample) of each; save through the controller.
+            for (auto* fiber : {&s, &r}) {
+                fiber->controlPoints[1][0] += 1;
+                fiber->linePoints[2][0] += 1;
+            }
+            std::vector<Controller::FiberSaveSnapshot> edits{controller.makeFiberSaveSnapshot(s), controller.makeFiberSaveSnapshot(r)};
+            controller.commitFiberStoreAction(edits);
+            const auto savedScaled = stored(scaled), savedRegistered = stored(registered);
+            require(savedScaled.controlPoints[0] == controls[0] && savedScaled.linePoints[1] == line[1],
+                    "unchanged points keep their stored values");
+            require(savedScaled.controlPoints[1] == vc::geometry::Point{12,4,6} && savedScaled.linePoints[2] == savedScaled.controlPoints[1],
+                    "a moved point is saved in the stored frame");
+            require(savedRegistered.controlPoints[0] == controls[0] && savedRegistered.linePoints[1] == line[1],
+                    "unchanged points of a registered fiber keep their stored values");
+            const auto moved = shear.apply(savedRegistered.controlPoints[1]);
+            require(std::abs(moved[0] - (r.controlPoints[1][0])) < 1e-9 && savedRegistered.linePoints[2] == savedRegistered.controlPoints[1],
+                    "a moved registered point maps back through the inverse");
+            const auto reread = read(scaled);
+            require(reread.width == 4 && cv::Vec3d(reread.controlPoints[1]) == cv::Vec3d{6,2,3}, "the saved fiber reads back in the volume");
+            // A record-only edit of a fiber read without its line (tag, rename)
+            // loads the line on save in the same frame and leaves it unchanged.
+            for (const auto& uuid : {scaled, registered}) {
+                const auto before = stored(uuid);
+                auto lazy = controller.readStoredFibers(std::vector<std::string>{uuid}).front();
+                require(!lazy.linePointsLoaded, "lines are loaded on demand");
+                lazy.tags.push_back("reviewed");
+                std::vector<Controller::FiberSaveSnapshot> tagEdit{controller.makeFiberSaveSnapshot(lazy)};
+                controller.commitFiberStoreAction(tagEdit);
+                const auto after = stored(uuid);
+                require(after.linePoints == before.linePoints && after.controlPoints == before.controlPoints,
+                        "a record-only edit keeps the stored geometry");
+            }
+            state.detachObjectStore();
         }
         OpenOptions options; options.author = "vc3d-controller-test";
         { auto db = ObjectStore::create(path,options); }
@@ -111,9 +306,8 @@ int runObjectStoreControllerTests()
         Controller::StoredFiber a;
         a.id = controller.nextFiberId(); a.fileName = "same_name.json";
         a.username = "test"; a.startedAt = "20260101"; a.sequence = 1;
-        a.coordinateBaseShapeZYX = std::array<size_t,3>{100,100,100};
         for (int x : {0,10,20}) { a.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1}); a.linePoints.emplace_back(x*1.,0,1); }
-        auto b = a; b.uuid = vc::util::newUuid(); b.id = controller.nextFiberId();
+        auto b = a; b.uuid = vc::objects::util::newUuid(); b.id = controller.nextFiberId();
         std::vector<Controller::FiberSaveSnapshot> batch{controller.makeFiberSaveSnapshot(a),controller.makeFiberSaveSnapshot(b)};
         controller.commitFiberStoreAction(batch);
         a = batch[0].fiber; b = batch[1].fiber;
@@ -159,7 +353,7 @@ int runObjectStoreControllerTests()
                 [](const auto& row) { return row.links == 1 && row.componentSize == 2; }); };
             while (!linked() && timer.elapsed() < 10000) { QApplication::processEvents(); QThread::msleep(1); }
             require(linked(), "catalog rows come from the store with shared links and components");
-            require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.toVolume.has_value(); }),
+            require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.mapping.has_value(); }),
                     "fibers without a binding list without a volume length");
         }
         require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");
@@ -176,8 +370,8 @@ int runObjectStoreControllerTests()
                 [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
             QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
             const auto connection = state.objectStoreSession();
-            const auto attachment = *connection->attachment();
-            const auto unrelated = vc::util::newUuid();
+            const auto attachment = *state.objectStoreAttachment();
+            const auto unrelated = vc::objects::util::newUuid();
             connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
                 db.upsertObject(txn, record);
@@ -185,7 +379,7 @@ int runObjectStoreControllerTests()
             state.pollObjectStoreChanges();
             // Old/foreign attachments must not invalidate this store's fibers.
             StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,
-                {vc::util::newUuid(), attachment.generation}, 0, {}};
+                {vc::objects::util::newUuid(), attachment.generation}, 0, {}};
             JournalEntry change; change.kind = "fiber"; foreign.changes.push_back(change);
             state.objectStoreChanged(foreign);
             QApplication::processEvents();
@@ -194,6 +388,12 @@ int runObjectStoreControllerTests()
             require(controller._fiberDataGeneration == generation &&
                     controller._sideStripStoredSnapshotCache.size() == snapshots,
                     "unrelated and foreign commits preserve warm fiber snapshots");
+            foreign.attachment = attachment;
+            foreign.changes.front().kind = kAttachmentEdgeKind;
+            state.objectStoreChanged(foreign);
+            require(controller._fiberDataGeneration > generation && controller._sideStripStoredSnapshotCache.empty(),
+                    "attachment changes in the user store invalidate fiber snapshots");
+
         }
         const auto transferPaths = controller.fiberTransportPaths({a.id});
         require(transferPaths.size() == 2, "transport includes both linked endpoints");
@@ -268,15 +468,17 @@ int runObjectStoreControllerTests()
             require(imported.readStoredFibers(std::nullopt).size() == 2 && service->inputDraftStatus().size() == 2,
                     "service-only component is imported into attached store before editing");
             auto document = aWire;
-            const auto uuid = vc::util::newUuid(); document["uuid"] = uuid;
+            const auto uuid = vc::objects::util::newUuid(); document["uuid"] = uuid;
             document["branches"] = nlohmann::json::array(); document["adjacent_branches"] = nlohmann::json::array();
             document.erase("optimization_mode"); document["custom_annotation"] = {{"note", "retain"}};
-            const auto volumeUuid = vc::util::newUuid();
+            const auto volumeUuid = vc::objects::util::newUuid();
             document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
             document["coordinate_binding"] = {{"active_volume_id", "display"}};
             QString error;
-            const auto id = imported.importFiberJson(document, "optional-mode.json", &error);
-            if (!id) throw std::runtime_error(error.toStdString());
+            const auto single = fs::path(directory.path().toStdString()) / "optional-mode.json";
+            { std::ofstream out(single); out << document.dump(); }
+            if (!imported.importFibersFromPath(single, &error)) throw std::runtime_error(error.toStdString());
+            const auto id = imported.fiberIdForUuid(uuid);
             auto found = imported.readStoredFiber(id, true);
             require(found && !found->readOnly && found->controlPoints.size() == 3,
                     "absent optional optimization mode keeps geometry editable");
@@ -321,7 +523,7 @@ int runObjectStoreControllerTests()
                 require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
         }
         a = resolve(a.uuid); b = resolve(b.uuid);
-        require(controller.generatedBranchLinkMarkers(a.branches, 1.0).empty(), "unbound peers have no branch markers");
+        require(controller.generatedBranchLinkMarkers(a.branches).empty(), "unbound peers have no branch markers");
         {
             auto changedSession = std::make_shared<Controller::LineAnnotationSession>();
             changedSession->fiberId = a.id; changedSession->fiberUuid = a.uuid; changedSession->storePin = a.storePin;
@@ -405,7 +607,7 @@ int runObjectStoreControllerTests()
             firstSeed.controlPoints.emplace_back(cv::Vec3d{1,2,3});
             firstSeed.tags = {la::kNeedsReoptimizationTag};
             auto secondSeed = firstSeed;
-            secondSeed.id = controller.nextFiberId(); secondSeed.uuid = vc::util::newUuid();
+            secondSeed.id = controller.nextFiberId(); secondSeed.uuid = vc::objects::util::newUuid();
             std::vector<Controller::FiberSaveSnapshot> seeds{
                 controller.makeFiberSaveSnapshot(firstSeed), controller.makeFiberSaveSnapshot(secondSeed)};
             controller.commitFiberStoreAction(seeds);
@@ -417,10 +619,9 @@ int runObjectStoreControllerTests()
         Controller::StoredFiber parent;
         parent.id=controller.nextFiberId(); parent.fileName="parent.json";
         parent.username="test"; parent.startedAt="20260101"; parent.sequence=3;
-        parent.coordinateBaseShapeZYX=std::array<size_t,3>{100,100,100};
         for(int x:{30,40,50,60}) {parent.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1});parent.linePoints.emplace_back(x*1.,0,1);}
         batch={controller.makeFiberSaveSnapshot(parent)};
-        const auto frame=nlohmann::json{{"volume_uuid",vc::util::newUuid()},{"scale_factor",4.0}};
+        const auto frame=nlohmann::json{{"volume_uuid",vc::objects::util::newUuid()},{"scale_factor",4.0}};
         batch.front().fiber.coordinateIdentity["coordinates"]=frame;
         controller.commitFiberStoreAction(batch);parent=batch.front().fiber;
         parent=resolve(parent.uuid);
@@ -451,7 +652,7 @@ int runObjectStoreControllerTests()
             live->surfaceName="store-test-interaction";live->fiberId=merged.id;live->fiberUuid=merged.uuid;
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
-            live->storePin=merged.storePin;live->coordinateBaseShapeZYX=merged.coordinateBaseShapeZYX;
+            live->storePin=merged.storePin;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {
                 la::LineControlPoint control(double(i),merged.controlPoints[i],i==0,int(i));
@@ -479,20 +680,20 @@ int runObjectStoreControllerTests()
             CState child(nullptr,false,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
-        require(state.objectStoreSession()->attachment().has_value(),"secondary destruction keeps main attachment");
+        require(state.objectStoreAttachment().has_value(),"secondary destruction keeps main attachment");
         state.detachObjectStore();
         require(controller.readStoredFibers(std::nullopt).empty() && controller.fiberUuidForId(merged.id).empty(),
                 "detach leaves nothing to read and no identities");
         {
             // Store-valid control-only geometry must not empty the editor catalog.
             auto db = ObjectStore::open(path, options);
-            ObjectRecord object; object.uuid = vc::util::newUuid(); object.kind = "fiber"; object.name = "controls-only";
+            ObjectRecord object; object.uuid = vc::objects::util::newUuid(); object.kind = "fiber"; object.name = "controls-only";
             auto txn = db.write({{object.uuid,{}}});
             object.formatVersion = 1;
             db.upsertObject(txn, object);
             db.putGeometry(txn, object.uuid, vc::geometry::encode(vc::geometry::Fiber{{{0,0,0},{1,0,0}}, {}}));
             txn.commit();
-            ObjectRecord missing; missing.uuid = vc::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
+            ObjectRecord missing; missing.uuid = vc::objects::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
             { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
             state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
             const auto everything = controller.readStoredFibers(std::nullopt);
@@ -537,41 +738,40 @@ int runObjectStoreControllerTests()
             auto fiber=resolve(everything.front().uuid);
             if(const char* ct=std::getenv("VC3D_OBJECT_STORE_SMOKE_CT")) {
                 state.setCurrentVolume(Volume::New(ct));
-                require(!controller.fiberCoordinateScale(fiber.id,false),"unbound real fiber requires explicit assignment");
+                require(!controller.ensureFiberInVolume(fiber.id,false) && !fiber.frame,"unbound real fiber requires explicit assignment");
+                const auto stored = fiber;
                 QTimer::singleShot(0,[] {
                     for(auto* widget:QApplication::topLevelWidgets()) if(auto* input=qobject_cast<QInputDialog*>(widget)) {
                         input->setTextValue("4");input->accept();
                     }
                 });
                 controller._errorDialogsSuppressed=false;
-                const auto factor=controller.fiberCoordinateScale(fiber.id,true);
+                const bool bound=controller.ensureFiberInVolume(fiber.id,true);
                 controller._errorDialogsSuppressed=true;
-                require(factor && *factor==0.25,"explicit scale-2 binding persists");
+                require(bound,"explicit scale-4 binding persists");
                 fiber=resolve(fiber.uuid);
                 auto mismatched = fiber.coordinateIdentity;
-                mismatched["coordinates"]["volume_uuid"] = vc::util::newUuid();
-                require(!vc3d::geometryScaleForVolume(mismatched, *state.currentVolume()),
+                mismatched["coordinates"]["volume_uuid"] = vc::objects::util::newUuid();
+                require(!vc::objects::geometryScaleToVolume(mismatched, state.currentVolume()->id()),
                         "matching display ID cannot override conflicting volume UUID");
-                const auto display = controller.fiberInVolumeCoordinates(fiber);
-                require(display.controlPoints.front() == fiber.controlPoints.front() * .25 && display.linePoints.front() == fiber.linePoints.front() * .25, "display geometry uses explicit binding");
-                require(resolve(fiber.uuid).linePoints == fiber.linePoints, "display transform does not change stored geometry");
+                require(fiber.frame && cv::Vec3d(fiber.controlPoints.front()) == cv::Vec3d(stored.controlPoints.front()) * .25 &&
+                        fiber.linePoints.front() == stored.linePoints.front() * .25, "a bound fiber is read in the volume's voxels");
                 require(!fiber.branches.empty(), "real fixture has a linked peer");
                 const auto branch = fiber.branches.front();
                 auto peer = controller.readStoredFiber(branch.branchFiberId, true);
                 require(peer.has_value(), "linked peer is present");
-                const auto peerScale = controller.fiberCoordinateScaleForVolume(peer->id, state.currentVolume());
-                require(peerScale.has_value(), "linked peer is bound to the CT");
-                const auto markers = controller.generatedBranchLinkMarkers({branch}, .25);
-                require(markers.size() == 1 && markers[0].localControlPoint == toVec3f(branch.controlPointPosition) * .25f &&
-                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition) * float(*peerScale),
-                    "linked markers use both coordinate frames");
+                require(controller.fiberBoundToVolume(peer->id, state.currentVolume()), "linked peer is bound to the CT");
+                const auto markers = controller.generatedBranchLinkMarkers({branch});
+                require(markers.size() == 1 && markers[0].localControlPoint == toVec3f(branch.controlPointPosition) &&
+                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition),
+                    "linked markers are in the volume's voxels");
                 Controller::LineAnnotationSession preview;
-                preview.branches = {branch}; preview.fiberBaseToVolumeScale = .25; preview.showLinkedLineOverlays = true;
-                const auto native = la::linePointsBetweenOuterControlPoints(peer->linePoints, la::storedControlPointPositions(peer->controlPoints));
+                preview.branches = {branch}; preview.showLinkedLineOverlays = true;
+                const auto line = la::linePointsBetweenOuterControlPoints(peer->linePoints, la::storedControlPointPositions(peer->controlPoints));
                 const auto overlays = controller.generatedBranchLinePointsForSession(preview);
-                require(overlays.size() == 1 && overlays.front().front() == toVec3f(native.front()) * float(*peerScale),
-                    "linked polyline uses its own frame");
-                const auto point=fiber.controlPoints.front()*(*factor);
+                require(overlays.size() == 1 && overlays.front().front() == toVec3f(line.front()),
+                    "linked polyline is in the volume's voxels");
+                const cv::Vec3d point=fiber.controlPoints.front();
                 Array3D<uint8_t> crop({2,2,2});
                 require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");
                 std::cerr << "CT smoke: " << ct << " scale 2, voxel size " << state.currentVolume()->voxelSize() << " um, sampled XYZ " << point << "\n";

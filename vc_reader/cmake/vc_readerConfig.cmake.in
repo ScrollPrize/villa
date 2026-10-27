@@ -1,6 +1,9 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+find_dependency(nlohmann_json CONFIG)
+find_dependency(CURL)
+find_dependency(ZLIB)
 if(@VC_READER_ENABLE_CUDA@)
     find_dependency(CUDAToolkit)
 endif()

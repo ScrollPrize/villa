@@ -137,7 +137,6 @@ void Session::restore_valid(const Sample& s) {
 }
 std::shared_ptr<void> begin(const Sample& s) { return std::make_shared<Session>(s); }
 void finish(Sample& s, void* context) { static_cast<Session*>(context)->finish(s); }
-void synchronize() { check(cudaStreamSynchronize(vcr::device::stream())); }
 } // namespace vcr::transforms::cuda
 
 #include "device_io.hpp"
@@ -207,7 +206,6 @@ void export_outputs(void* context) {
     for (auto& [key,a]:static_cast<Session*>(context)->arrays) a.buffer->exported=true;
     for (auto& [key,levels]:static_cast<Session*>(context)->pyramids) for (auto& a:levels) a.buffer->exported=true;
 }
-void check_device(void* context) { static_cast<Session*>(context)->check_status(); }
 void release_outputs(void* context, const std::vector<std::string>& keys) {
     for (const auto& key:keys) static_cast<Session*>(context)->arrays.erase(key);
 }

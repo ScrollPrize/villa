@@ -1,16 +1,22 @@
 # Point Based correction workflow
 
-vc_grow_seg_from_seed can now incorporate point based annotations to constraint the solver to move the patch surface through those points.
-Together with the resume feature this can be used to grow larger patches, fixing errors as they appear.
+vc_grow_seg_from_seed can incorporate point based annotations to constrain the solver to move the patch surface through those points.
+Together with resuming from an existing surface this can be used to grow larger patches, fixing errors as they appear.
 
-This is currently not integrated into VC3D gui but must be called from command line - VC3D is however used for the point annotation.
+Inside VC3D the same corrections are part of the segmentation editor (see [extending_and_modifying_segmentations.md](extending_and_modifying_segmentations.md)); there they are stored with the surface as linked point collections. This document covers the command line, which works on the surfaces of an object store.
 
 ## Workflow
 
-1. Grow some patch using vc_grow_seg_from_seed (potentially with snapshot-interval)
-2. Annotate corrections using the point collection feature in VC3D
-3. optional: mask areas that should be removed before continuing patch growth
-4. re-run vc_grow_seg_from_seed with --resume and --correct
+1. Grow some patch into the store with vc_grow_seg_from_seed (`--store`, `--volume-uuid`)
+2. Annotate corrections using the point collection feature in VC3D and save them as JSON (Point Collections → Save)
+3. optional: mask areas that should be removed before continuing patch growth (the segmentation editor's mask brush commits them to the surface)
+4. re-run vc_grow_seg_from_seed with `--surface <uuid>` and `--correct <corrections.json>`; the result is a new surface whose provenance names the one it resumed from
+
+```shell
+vc_grow_seg_from_seed -v <volume.zarr> -p <params.json> \
+  --store <objects.vcobj> --volume-uuid <volume id> \
+  --surface <surface uuid> --correct <corrections.json>
+```
 
 ## Details
 
@@ -25,9 +31,10 @@ The correction feature will solve an area around each collection of points, Ofte
 ## Useful Parameters
 
 ### config json for vc_grow_seg_from_seed
-- set "snapshot-interval" - will cause the code to save snapshot_gen_XXX snapshots at the specified interval
 - z_min,z_max - limits z range -> useful to solve a long spiral, can be quite thin (just a few quads)
+- "snapshot-interval" - in tifxyz mode (`--target-dir`) saves snapshot_gen_XXX snapshots at the specified interval; store mode writes no snapshots
 
 ### vc_grow_seg_from_seed
---resume - the surface from which to resume processing (correct & grow)
---correct - pass the json with the correction points to apply them
+- `--surface` - the stored surface from which to resume processing (correct & grow)
+- `--correct` - pass the json with the correction points to apply them
+- `--resume` - tifxyz mode only: the tifxyz directory to resume from

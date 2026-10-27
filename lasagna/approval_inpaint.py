@@ -49,7 +49,59 @@ def load_approval_mask(path: str | Path, *, expected_shape: tuple[int, int] | No
 	return mask.astype(bool, copy=False)
 
 
-def _load_tifxyz_arrays(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+@dataclass(frozen=True)
+class ApprovalSurface:
+	"""The surface approval inpaint reads: coordinates, its d channel and approval mask."""
+	xyz: np.ndarray  # (H, W, 3) float32, -1 at missing vertices
+	d: np.ndarray  # (H, W) float32
+	approval: np.ndarray  # (H, W) bool
+	meta: dict
+
+	@property
+	def valid(self) -> np.ndarray:
+		return np.isfinite(self.xyz).all(axis=-1) & np.all(self.xyz != -1.0, axis=-1)
+
+	def scaled(self, factor: float, *, base_shape_zyx: tuple[int, int, int] | None) -> "ApprovalSurface":
+		"""Coordinates scaled by ``factor`` (missing vertices kept), meta scaled to match."""
+		import volume_scale
+		x, y, z = volume_scale.scale_tifxyz_arrays(self.xyz[..., 0], self.xyz[..., 1], self.xyz[..., 2], factor)
+		meta = volume_scale.scale_tifxyz_meta(
+			self.meta, factor, base_shape_zyx=base_shape_zyx, lasagna_base_shape_zyx=base_shape_zyx)
+		return ApprovalSurface(xyz=np.stack([x, y, z], axis=-1), d=self.d, approval=self.approval, meta=meta)
+
+
+def _d_channel(d: np.ndarray | None, shape: tuple[int, int], *, name: str) -> np.ndarray:
+	if d is None:
+		print(f"[approval_inpaint] {name} not found; generated corr point wind_a defaults to 0.0", flush=True)
+		return np.zeros(shape, dtype=np.float32)
+	d = np.asarray(d).astype(np.float32)
+	if d.ndim == 3:
+		if d.shape[-1] in (3, 4):
+			d = d[..., 0]
+		else:
+			d = d[0]
+	if tuple(d.shape) != tuple(shape):
+		raise ValueError(f"{name} shape mismatch: got {d.shape}, expected {shape}")
+	return d
+
+
+def load_approval_surface(path: str | Path, *, store: str | Path | None = None,
+						  volume: str | None = None) -> ApprovalSurface:
+	"""A tifxyz directory with approval.tif (and optionally d.tif), or a stored surface (``vcobj:`` reference
+	into ``store``, in voxels of ``volume``) with ``approval`` (and optionally ``d``) channels."""
+	from stored_surfaces import parse_surface_ref, read_surface
+	if parse_surface_ref(path) is not None:
+		stored = read_surface(store, str(path), volume=volume)
+		approval = stored.channel("approval")
+		if approval is None:
+			raise ValueError(f"stored surface {path} has no approval channel")
+		shape = stored.xyz.shape[:2]
+		approval = _as_2d_nonzero(approval, name=f"{path} approval")
+		if tuple(approval.shape) != tuple(shape):
+			raise ValueError(f"approval mask shape mismatch: got {approval.shape}, expected {shape}")
+		return ApprovalSurface(xyz=stored.xyz, d=_d_channel(stored.channel("d"), shape, name="d channel"),
+							   approval=approval.astype(bool, copy=False), meta=stored.meta)
+
 	p = Path(path)
 	if not p.is_dir():
 		raise ValueError(f"approval inpaint tifxyz path is not a directory: {p}")
@@ -66,21 +118,9 @@ def _load_tifxyz_arrays(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.nd
 	if x.ndim != 2:
 		raise ValueError(f"tifxyz coordinate images must be 2D, got {x.shape}")
 	xyz = np.stack([x, y, z], axis=-1)
-	valid = np.isfinite(xyz).all(axis=-1) & np.all(xyz != -1.0, axis=-1)
 
 	d_path = p / "d.tif"
-	if d_path.exists():
-		d = tifffile.imread(str(d_path)).astype(np.float32)
-		if d.ndim == 3:
-			if d.shape[-1] in (3, 4):
-				d = d[..., 0]
-			else:
-				d = d[0]
-		if tuple(d.shape) != tuple(x.shape):
-			raise ValueError(f"d.tif shape mismatch: got {d.shape}, expected {x.shape}")
-	else:
-		print("[approval_inpaint] d.tif not found; generated corr point wind_a defaults to 0.0", flush=True)
-		d = np.zeros_like(x, dtype=np.float32)
+	d = _d_channel(tifffile.imread(str(d_path)) if d_path.exists() else None, x.shape, name="d.tif")
 
 	meta: dict = {}
 	try:
@@ -89,7 +129,8 @@ def _load_tifxyz_arrays(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.nd
 	except Exception:
 		meta = {}
 
-	return xyz, valid, d, meta
+	approval = load_approval_mask(p / "approval.tif", expected_shape=x.shape)
+	return ApprovalSurface(xyz=xyz, d=d, approval=approval, meta=meta)
 
 
 def _source_mesh_step(meta: dict, fallback: float) -> float:
@@ -541,7 +582,7 @@ def _snap_extent_to_mesh_step(raw_extent: float, mesh_step: float) -> int:
 
 def build_approval_inpaint(
 	*,
-	tifxyz_path: str | Path,
+	surface: ApprovalSurface,
 	seed: tuple[float, float, float],
 	mesh_step: float,
 	corr_spacing: float | None = None,
@@ -550,8 +591,7 @@ def build_approval_inpaint(
 	output_mask: bool = False,
 	output_mask_dilate: int = 3,
 ) -> ApprovalInpaintResult:
-	xyz, valid, d, meta = _load_tifxyz_arrays(tifxyz_path)
-	approval = load_approval_mask(Path(tifxyz_path) / "approval.tif", expected_shape=valid.shape)
+	xyz, valid, d, approval, meta = surface.xyz, surface.valid, surface.d, surface.approval, surface.meta
 	d_valid = np.isfinite(d) & (d >= 0.0)
 	valid = valid & d_valid
 	labels, _n_components, sizes = find_unapproved_components(approval, valid)

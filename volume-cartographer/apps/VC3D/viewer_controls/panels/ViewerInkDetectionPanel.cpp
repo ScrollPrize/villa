@@ -1,9 +1,10 @@
 #include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
 
 #include "ViewerManager.hpp"
-#include "VolumeViewerCmaps.hpp"
 #include "elements/LabeledControlRow.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+
+#include "vc/core/render/Colormaps.hpp"
 
 #include <QComboBox>
 #include <QLabel>
@@ -176,9 +177,8 @@ void ViewerInkDetectionPanel::populateColormaps()
     const QSignalBlocker blocker(_colormapCombo);
     _colormapCombo->clear();
     _colormapCombo->addItem(tr("Grayscale"), QString());
-    const auto& entries = volume_viewer_cmaps::entries(volume_viewer_cmaps::EntryScope::SharedOnly);
-    for (const auto& entry : entries) {
-        _colormapCombo->addItem(entry.label, QString::fromStdString(entry.id));
+    for (const auto& entry : vc::entries(vc::EntryScope::SharedOnly)) {
+        _colormapCombo->addItem(QString::fromStdString(entry.label), QString::fromStdString(entry.id));
     }
     _colormapCombo->setCurrentIndex(0);
 }

@@ -9,11 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <QDir>
-#include <QStandardPaths>
-#include <QString>
-#include <QUrl>
-#include <QXmlStreamReader>
+#include <vc_reader/s3_listing.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -28,173 +24,44 @@
 namespace vc3d::opendata {
 namespace {
 
-std::string trimTrailingSlashes(std::string value)
-{
-    while (!value.empty() && value.back() == '/') {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string artifactUrl(const OpenDataArtifact& artifact)
-{
-    return trimTrailingSlashes(artifact.resolvedUrl.empty()
-                                  ? artifact.sourcePath
-                                  : artifact.resolvedUrl);
-}
-
-std::string safePathComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') {
-            c = '_';
-        }
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_')) {
-        value.erase(value.begin());
-    }
-    return value.empty() ? std::string("unnamed") : value;
-}
-
-std::string tagValue(const std::vector<std::string>& tags, std::string_view prefix)
-{
-    for (const auto& tag : tags) {
-        if (tag.rfind(prefix, 0) == 0) {
-            return tag.substr(prefix.size());
-        }
-    }
-    return {};
-}
-
-std::string shortArtifactHash(std::string_view value)
-{
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    std::ostringstream out;
-    out << std::hex << std::setfill('0') << std::setw(16) << hash;
-    return out.str();
-}
-
-// Split "https://host/some/key/prefix" into origin ("https://host") and the
-// key prefix ("some/key/prefix/").
-bool splitRemotePrefix(const std::string& url, std::string& origin, std::string& prefix)
-{
-    const auto schemePos = url.find("://");
-    if (schemePos == std::string::npos) {
-        return false;
-    }
-    const auto hostEnd = url.find('/', schemePos + 3);
-    if (hostEnd == std::string::npos) {
-        return false;
-    }
-    origin = url.substr(0, hostEnd);
-    prefix = trimTrailingSlashes(url.substr(hostEnd + 1)) + "/";
-    return prefix.size() > 1;
-}
-
 struct RemoteObject {
     std::string relativePath;  // key with the listing prefix stripped
     std::uint64_t size = 0;
 };
 
-// Anonymous S3 ListObjectsV2 over the public bucket. Returns every object
-// under `prefix`, paginated 1000 keys at a time.
-std::vector<RemoteObject> listRemotePrefix(const std::string& origin,
-                                           const std::string& prefix,
+// Every object under `prefix` (anonymous ListObjectsV2), 1000 keys a page.
+std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
                                            const std::atomic<bool>* cancelRequested,
                                            std::string* errorOut)
 {
     std::vector<RemoteObject> objects;
-    QString continuationToken;
-
-    while (true) {
+    std::string continuationToken;
+    do {
         if (cancelRequested && cancelRequested->load(std::memory_order_acquire)) {
             if (errorOut) *errorOut = "cancelled";
             return {};
         }
-
-        QString listUrl = QString::fromStdString(origin) +
-                          QStringLiteral("/?list-type=2&max-keys=1000&prefix=") +
-                          QString::fromUtf8(QUrl::toPercentEncoding(QString::fromStdString(prefix)));
-        if (!continuationToken.isEmpty()) {
-            listUrl += QStringLiteral("&continuation-token=") +
-                       QString::fromUtf8(QUrl::toPercentEncoding(continuationToken));
-        }
-
-        std::string body;
+        vcr::s3::ListPage page;
         try {
-            body = vc::httpGetString(listUrl.toStdString());
+            page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken)));
         } catch (const std::exception& e) {
             if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
             return {};
         }
-        if (body.empty()) {
-            if (errorOut) *errorOut = "listing returned no data for " + prefix;
-            return {};
-        }
-
-        QXmlStreamReader xml(QString::fromStdString(body));
-        QString nextToken;
-        bool truncated = false;
-        while (!xml.atEnd()) {
-            xml.readNext();
-            if (!xml.isStartElement()) {
+        for (const auto& object : page.objects) {
+            if (object.key.rfind(prefix.key, 0) != 0 || object.key.size() == prefix.key.size() ||
+                object.key.back() == '/') {
                 continue;
             }
-            if (xml.name() == QStringLiteral("Contents")) {
-                RemoteObject object;
-                while (!(xml.isEndElement() && xml.name() == QStringLiteral("Contents")) &&
-                       !xml.atEnd()) {
-                    xml.readNext();
-                    if (!xml.isStartElement()) {
-                        continue;
-                    }
-                    if (xml.name() == QStringLiteral("Key")) {
-                        const std::string key = xml.readElementText().toStdString();
-                        if (key.rfind(prefix, 0) == 0) {
-                            object.relativePath = key.substr(prefix.size());
-                        }
-                    } else if (xml.name() == QStringLiteral("Size")) {
-                        object.size = xml.readElementText().toULongLong();
-                    }
-                }
-                if (!object.relativePath.empty() && object.relativePath.back() != '/') {
-                    objects.push_back(std::move(object));
-                }
-            } else if (xml.name() == QStringLiteral("NextContinuationToken")) {
-                nextToken = xml.readElementText();
-            } else if (xml.name() == QStringLiteral("IsTruncated")) {
-                truncated = xml.readElementText() == QStringLiteral("true");
-            }
+            objects.push_back({object.key.substr(prefix.key.size()), object.size});
         }
-        if (xml.hasError()) {
-            if (errorOut) {
-                *errorOut = "failed to parse listing: " + xml.errorString().toStdString();
-            }
-            return {};
-        }
-
-        if (!truncated || nextToken.isEmpty()) {
-            break;
-        }
-        continuationToken = nextToken;
-    }
+        continuationToken = std::move(page.nextContinuationToken);
+    } while (!continuationToken.empty());
 
     if (objects.empty() && errorOut) {
-        *errorOut = "no objects found under " + prefix;
+        *errorOut = "no objects found under " + prefix.key;
     }
     return objects;
-}
-
-std::string encodedObjectUrl(const std::string& origin, const std::string& key)
-{
-    const QByteArray encoded =
-        QUrl::toPercentEncoding(QString::fromStdString(key), QByteArrayLiteral("/"));
-    return origin + "/" + std::string(encoded.constData(), encoded.size());
 }
 
 void writeFile(const std::filesystem::path& target, const std::vector<std::byte>& bytes)
@@ -259,58 +126,20 @@ void publishDirectory(const std::filesystem::path& tempDir,
     std::filesystem::remove_all(backupDir, ec);
 }
 
-std::filesystem::path cachedCatalogManifestPath()
+// <remoteCacheRoot>/normal_grids/<sampleId>/<volumeId>/L<level>-<url hash>
+std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
+                                          const std::string& sampleId,
+                                          const std::string& volumeId,
+                                          int sourceCoordinateLevel,
+                                          std::string_view url)
 {
-    return cachedOpenDataManifestPath();
-}
-
-std::vector<std::string> normalGridsEntryTags(const OpenDataNormalGridsInfo& info)
-{
-    std::vector<std::string> tags{"open-data"};
-    if (!info.sampleId.empty()) {
-        tags.push_back(std::string(kOpenDataSampleIdTagPrefix) + info.sampleId);
-    }
-    if (!info.volumeId.empty()) {
-        tags.push_back(std::string(kOpenDataVolumeIdTagPrefix) + info.volumeId);
-    }
-    tags.push_back("vc-open-data-source-coordinate-level:" +
-                   std::to_string(info.sourceCoordinateLevel));
-    if (!info.sampleId.empty() && !info.volumeId.empty()) {
-        tags.push_back("vc-open-data-coordinate-space:" + info.sampleId + "/" +
-                       info.volumeId + "@L" +
-                       std::to_string(info.sourceCoordinateLevel));
-    }
-    tags.push_back(std::string(kOpenDataNormalGridsTagPrefix) + info.url);
-    return tags;
+    return remoteCacheRoot / "normal_grids" /
+           vcr::catalog::safePathComponent(sampleId.empty() ? "sample" : sampleId) /
+           vcr::catalog::safePathComponent(volumeId.empty() ? "volume" : volumeId) /
+           ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
 }
 
 constexpr const char* kCompleteMarker = "normal-grids-complete.json";
-
-// Write the marker NormalGridVolume streams from. Idempotent.
-bool writeRemoteMarker(const std::filesystem::path& dir, const std::string& url)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        return false;
-    }
-    const auto markerPath = dir / vc::core::util::kNormalGridsRemoteMarker;
-    if (std::filesystem::is_regular_file(markerPath, ec)) {
-        try {
-            const auto existing = nlohmann::json::parse(std::ifstream(markerPath));
-            if (existing.value("url", std::string()) == url) {
-                return true;
-            }
-        } catch (...) {
-        }
-    }
-    nlohmann::json marker;
-    marker["url"] = url;
-    std::ofstream out(markerPath, std::ios::trunc);
-    out << marker.dump(2);
-    out.close();
-    return static_cast<bool>(out);
-}
 
 void writeCompleteMarker(const std::filesystem::path& dir,
                          int files,
@@ -325,28 +154,24 @@ void writeCompleteMarker(const std::filesystem::path& dir,
 
 } // namespace
 
-const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume)
-{
-    return findArtifact(volume.artifacts, kNormalGridsArtifactType);
-}
-
 std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
-    const OpenDataVolume& volume)
+    const vcr::catalog::OpenDataVolume& volume)
 {
     std::vector<OpenDataNormalGridsInfo> result;
-    for (const auto& artifact : volume.artifacts) {
-        if (artifact.type != kNormalGridsArtifactType) {
+    for (std::size_t artifactIndex = 0; artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+        const auto& artifact = volume.artifacts[artifactIndex];
+        if (vcr::catalog::classifyDerivedRepresentation(artifact) !=
+            vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
             continue;
         }
-        // An absent level is the documented legacy L0 convention. A present
-        // but malformed level is not safe to auto-associate with any volume.
-        if (artifact.levelParameterPresent && !artifact.sourceCoordinateLevel) {
-            Logger()->warn("Skipping normal-grids artifact with invalid parameters.level for {}/{}",
+        // Without parameters.level the grids cannot be paired with any volume.
+        if (!artifact.sourceCoordinateLevel) {
+            Logger()->warn("Skipping normal-grids artifact with missing or invalid parameters.level for {}/{}",
                            sampleId, volume.id);
             continue;
         }
-        const auto url = artifactUrl(artifact);
+        const auto url = artifact.url();
         if (url.empty()) {
             continue;
         }
@@ -354,8 +179,8 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
         info.sampleId = sampleId;
         info.volumeId = volume.id;
         info.url = url;
-        info.sourceCoordinateLevel = artifact.sourceCoordinateLevel.value_or(0);
-        info.levelWasExplicit = artifact.sourceCoordinateLevel.has_value();
+        info.sourceCoordinateLevel = *artifact.sourceCoordinateLevel;
+        info.artifactIndex = artifactIndex;
         const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
             return item.url == info.url &&
                    item.sourceCoordinateLevel == info.sourceCoordinateLevel;
@@ -367,64 +192,22 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     return result;
 }
 
-std::string normalGridsArtifactUrl(const OpenDataVolume& volume)
+std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(const VolumePkg& pkg,
+                                                                       const vc::project::Entry& entry)
 {
-    const auto* artifact = normalGridsArtifact(volume);
-    return artifact ? artifactUrl(*artifact) : std::string{};
-}
-
-std::optional<OpenDataNormalGridsInfo> normalGridsInfoFromTags(
-    const std::vector<std::string>& tags)
-{
-    OpenDataNormalGridsInfo info;
-    info.sampleId = tagValue(tags, kOpenDataSampleIdTagPrefix);
-    info.volumeId = tagValue(tags, kOpenDataVolumeIdTagPrefix);
-    info.url = tagValue(tags, kOpenDataNormalGridsTagPrefix);
-    const auto level = tagValue(tags, "vc-open-data-source-coordinate-level:");
-    if (!level.empty()) {
-        try {
-            std::size_t parsed = 0;
-            info.sourceCoordinateLevel = std::stoi(level, &parsed);
-            if (parsed != level.size() || info.sourceCoordinateLevel < 0 ||
-                info.sourceCoordinateLevel > 5) {
-                return std::nullopt;
-            }
-            info.levelWasExplicit = true;
-        } catch (...) {
-            return std::nullopt;
-        }
-    }
-    if (info.volumeId.empty()) {
+    if (!pkg.catalog()) {
         return std::nullopt;
     }
-    return info;
+    const auto url = vc::core::util::normalGridsRemoteUrl(
+        vc::project::resolveLocalPath(entry.location, pkg.path().parent_path()));
+    return url ? pkg.catalog()->volumeAt(*url, 0) : std::nullopt;
 }
 
-std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCacheRoot,
-                                          const std::string& sampleId,
-                                          const std::string& volumeId,
-                                          int sourceCoordinateLevel,
-                                          std::string_view url)
-{
-    auto result = remoteCacheRoot / "normal_grids" /
-           safePathComponent(sampleId.empty() ? "sample" : sampleId) /
-           safePathComponent(volumeId.empty() ? "volume" : volumeId);
-    if (!url.empty() || sourceCoordinateLevel != 0) {
-        const std::string suffix = url.empty() ? std::string{} : "-" + shortArtifactHash(url);
-        result /= "L" + std::to_string(sourceCoordinateLevel) + suffix;
-    }
-    return result;
-}
+namespace {
 
-bool isCachedNormalGridsDir(const std::filesystem::path& dir)
-{
-    std::error_code ec;
-    return std::filesystem::is_directory(dir / "xy", ec) &&
-           std::filesystem::is_directory(dir / "xz", ec) &&
-           std::filesystem::is_directory(dir / "yz", ec) &&
-           std::filesystem::is_regular_file(dir / "metadata.json", ec);
-}
-
+// Create the streaming cache dir for this pairing (writing the remote-marker
+// file NormalGridVolume streams from) and attach it as a normal-grid project
+// entry. Returns true when the entry is attached (or already present).
 bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const OpenDataNormalGridsInfo& info,
                                      const std::filesystem::path& remoteCacheRoot)
@@ -434,46 +217,20 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     }
     const auto dir = normalGridsCacheDir(remoteCacheRoot, info.sampleId, info.volumeId,
                                          info.sourceCoordinateLevel, info.url);
-    const auto legacyDir = normalGridsCacheDir(
-        remoteCacheRoot, info.sampleId, info.volumeId);
-    if (info.sourceCoordinateLevel == 0 && legacyDir != dir) {
-        std::error_code ec;
-        if (!std::filesystem::exists(dir, ec) &&
-            std::filesystem::is_directory(legacyDir, ec)) {
-            bool sameArtifact = false;
-            try {
-                const auto marker = nlohmann::json::parse(
-                    std::ifstream(legacyDir /
-                                  vc::core::util::kNormalGridsRemoteMarker));
-                sameArtifact = marker.value("url", std::string{}) == info.url;
-            } catch (...) {
-            }
-            if (sameArtifact) {
-                std::filesystem::rename(legacyDir, dir, ec);
-                if (!ec)
-                    pkg.relocateNormalGridEntry(legacyDir.string(), dir.string());
-            }
-        }
-    }
-    if (!writeRemoteMarker(dir, info.url)) {
+    if (!vc::core::util::writeNormalGridsRemoteMarker(dir, info.url)) {
         Logger()->warn("Failed to create streaming normal-grid cache at {}", dir.string());
         return false;
     }
-    // addNormalGridEntry dedups by location and returns false for duplicates;
-    // either way the entry ends up attached.
-    const auto tags = normalGridsEntryTags(info);
-    if (!pkg.addNormalGridEntry(dir.string(), tags)) {
-        pkg.reconcileNormalGridEntryTags(
-            dir.string(), tags,
-            {"vc-open-data-source-coordinate-level:",
-             "vc-open-data-coordinate-space:",
-             std::string(kOpenDataNormalGridsTagPrefix)});
-    }
+    // addNormalGridEntry dedups by location; either way the entry ends up
+    // attached. The marker's URL names its catalog dataset (normalGridsCatalogView).
+    pkg.addNormalGridEntry(dir.string());
     return true;
 }
 
+} // namespace
+
 int attachOpenDataNormalGrids(VolumePkg& pkg,
-                              const OpenDataSample& sample,
+                              const vcr::catalog::OpenDataSample& sample,
                               const std::filesystem::path& remoteCacheRoot,
                               const OpenDataResourceSelection* selection)
 {
@@ -485,24 +242,11 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
             continue;
         }
         for (const auto& info : normalGridsArtifacts(sample.id, volume)) {
-            if (selection) {
-                // Map this representation back to its artifact index before
-                // applying the representation filter.
-                std::optional<std::size_t> artifactIndex;
-                for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
-                    const auto& art = volume.artifacts[ai];
-                    if (art.type == kNormalGridsArtifactType &&
-                        artifactUrl(art) == info.url) {
-                        artifactIndex = ai;
-                        break;
-                    }
-                }
-                if (!artifactIndex ||
-                    !selection->allowsRepresentation(
-                        volumeIndex, *artifactIndex,
-                        OpenDataRepresentationKind::NormalGrids, volume.id)) {
-                    continue;
-                }
+            if (selection &&
+                !selection->allowsRepresentation(
+                    volumeIndex, info.artifactIndex,
+                    vcr::catalog::OpenDataRepresentationKind::NormalGrids, volume.id)) {
+                continue;
             }
             if (attachStreamingNormalGridsEntry(pkg, info, remoteCacheRoot)) {
                 ++attached;
@@ -515,7 +259,7 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
 NormalGridsCacheState normalGridsCacheState(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
-    const OpenDataVolume& volume)
+    const vcr::catalog::OpenDataVolume& volume)
 {
     NormalGridsCacheState state;
     const auto artifacts = normalGridsArtifacts(sampleId, volume);
@@ -584,9 +328,8 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return finalDir;
     }
 
-    std::string origin;
-    std::string prefix;
-    if (!splitRemotePrefix(info.url, origin, prefix)) {
+    const auto remote = vcr::s3::splitPrefixUrl(info.url);
+    if (!remote || remote->key.empty()) {
         if (errorOut) *errorOut = "unsupported normal grids URL: " + info.url;
         return {};
     }
@@ -597,7 +340,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         progress(state);
     }
 
-    const auto objects = listRemotePrefix(origin, prefix, cancelRequested, errorOut);
+    const auto objects = listRemotePrefix(*remote, cancelRequested, errorOut);
     if (objects.empty()) {
         return {};
     }
@@ -649,7 +392,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
                     std::filesystem::create_hard_link(streamed, target, linkEc);
                 }
                 if (linkEc || !std::filesystem::is_regular_file(target, linkEc)) {
-                    const auto url = encodedObjectUrl(origin, prefix + object.relativePath);
+                    const auto url = vcr::s3::objectUrl(remote->origin, remote->key + object.relativePath);
                     const auto bytes = vc::httpGetBytes(url);
                     // httpGetBytes returns an empty body for 4xx misses; only
                     // accept it when the listing says the object really is empty.
@@ -709,7 +452,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return {};
     }
 
-    if (!isCachedNormalGridsDir(finalDir)) {
+    if (!vc::core::util::hasNormalGridFiles(finalDir)) {
         if (errorOut) {
             *errorOut = "downloaded data at " + finalDir.string() +
                         " is not a normal grid store (missing xy/xz/yz or metadata.json)";
@@ -719,36 +462,12 @@ std::filesystem::path downloadOpenDataNormalGrids(
 
     // Keep the dir streamable (harmless once complete) and record completion
     // so the catalog can report "all downloaded" without a remote listing.
-    writeRemoteMarker(finalDir, info.url);
+    vc::core::util::writeNormalGridsRemoteMarker(finalDir, info.url);
     writeCompleteMarker(finalDir, static_cast<int>(objects.size()), state.totalBytes);
 
     Logger()->info("Downloaded normal grids for {}/{} to {}",
                    info.sampleId, info.volumeId, finalDir.string());
     return finalDir;
-}
-
-std::vector<OpenDataNormalGridsInfo> normalGridsAvailabilityFromCachedManifest()
-{
-    std::vector<OpenDataNormalGridsInfo> result;
-    const auto manifestPath = cachedCatalogManifestPath();
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(manifestPath, ec)) {
-        return result;
-    }
-    OpenDataManifest manifest;
-    try {
-        manifest = loadOpenDataManifestFile(manifestPath);
-    } catch (...) {
-        return result;
-    }
-    for (const auto& sample : manifest.samples) {
-        for (const auto& volume : sample.volumes) {
-            for (auto info : normalGridsArtifacts(sample.id, volume)) {
-                result.push_back(std::move(info));
-            }
-        }
-    }
-    return result;
 }
 
 } // namespace vc3d::opendata

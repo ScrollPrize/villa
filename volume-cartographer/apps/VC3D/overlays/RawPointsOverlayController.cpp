@@ -17,12 +17,6 @@ namespace
 constexpr const char* kOverlayGroupRawPoints = "raw_points_overlay";
 constexpr qreal kZValue = 85.0;  // Below vertex markers but above most overlays
 
-// Check if a point is valid (not the sentinel -1 value)
-bool isValidPoint(const cv::Vec3f& p)
-{
-    return p[0] != -1.f;
-}
-
 } // namespace
 
 RawPointsOverlayController::RawPointsOverlayController(CState* state, QObject* parent)
@@ -46,77 +40,6 @@ void RawPointsOverlayController::setEnabled(bool enabled)
     }
     _enabled = enabled;
     refreshAll();
-}
-
-void RawPointsOverlayController::setMaxPoints(int maxPoints)
-{
-    maxPoints = std::max(100, maxPoints);
-    if (_maxPoints == maxPoints) {
-        return;
-    }
-    _maxPoints = maxPoints;
-    if (_enabled) {
-        refreshAll();
-    }
-}
-
-void RawPointsOverlayController::setGridRadius(int radius)
-{
-    radius = std::max(1, radius);
-    if (_gridRadius == radius) {
-        return;
-    }
-    _gridRadius = radius;
-    if (_enabled) {
-        refreshAll();
-    }
-}
-
-void RawPointsOverlayController::setPlaneDistanceThreshold(float threshold)
-{
-    threshold = std::max(0.1f, threshold);
-    if (std::abs(_planeDistanceThreshold - threshold) < 0.01f) {
-        return;
-    }
-    _planeDistanceThreshold = threshold;
-    if (_enabled) {
-        refreshAll();
-    }
-}
-
-void RawPointsOverlayController::setPointRadius(float radius)
-{
-    radius = std::clamp(radius, 0.5f, 10.0f);
-    if (std::abs(_pointRadius - radius) < 0.01f) {
-        return;
-    }
-    _pointRadius = radius;
-    if (_enabled) {
-        refreshAll();
-    }
-}
-
-void RawPointsOverlayController::setPointColor(const QColor& color)
-{
-    if (_pointColor == color) {
-        return;
-    }
-    _pointColor = color;
-    if (_enabled) {
-        refreshAll();
-    }
-}
-
-void RawPointsOverlayController::setPointOpacity(float opacity)
-{
-    opacity = std::clamp(opacity, 0.0f, 1.0f);
-    if (std::abs(_pointOpacity - opacity) < 0.01f) {
-        return;
-    }
-    _pointOpacity = opacity;
-    if (_enabled) {
-        refreshAll();
-    }
 }
 
 bool RawPointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -244,7 +167,7 @@ void RawPointsOverlayController::collectFlattenedViewPoints(VolumeViewerBase* vi
     for (int r = minRow; r <= maxRow; ++r) {
         for (int c = minCol; c <= maxCol; ++c) {
             const cv::Vec3f& p = (*points)(r, c);
-            if (!isValidPoint(p)) {
+            if (!vc::geometry::validSurfacePoint(p)) {
                 continue;
             }
 
@@ -345,7 +268,7 @@ void RawPointsOverlayController::collectPlaneViewPoints(VolumeViewerBase* viewer
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& p = (*points)(r, c);
-            if (!isValidPoint(p)) {
+            if (!vc::geometry::validSurfacePoint(p)) {
                 continue;
             }
 

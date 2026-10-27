@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
+#include <vc_reader/affine.hpp>
 
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
@@ -76,12 +77,10 @@ public:
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
-    SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
     void setSegmentationEditActive(bool active);
     void setSegmentationModule(SegmentationModule* module);
     void setPointsOverlay(PointsOverlayController* overlay);
     void setRawPointsOverlay(RawPointsOverlayController* overlay);
-    RawPointsOverlayController* rawPointsOverlay() const { return _rawPointsOverlay; }
     void setPathsOverlay(PathsOverlayController* overlay);
     void setBBoxOverlay(BBoxOverlayController* overlay);
     void setVectorOverlay(VectorOverlayController* overlay);
@@ -97,8 +96,6 @@ public:
     //
     // Zero disables a channel and leaves it on the legacy render path.
     void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-    std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
-    std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
 
     // Withhold raw-path viewport chunk demand from frames the SurfaceCache
     // fully serves, so tile fills are not starved behind interactive fetches
@@ -111,7 +108,6 @@ public:
 
     void setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId);
     std::shared_ptr<Volume> overlayVolume() const { return _overlayVolume; }
-    const std::string& overlayVolumeId() const { return _overlayVolumeId; }
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
 
@@ -119,7 +115,6 @@ public:
     float overlayOpacity() const { return _overlayOpacity; }
 
     void setOverlayColormap(const std::string& colormapId);
-    const std::string& overlayColormap() const { return _overlayColormapId; }
     void setOverlaySamplingMethod(vc::Sampling method);
     vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayIntensityAsAlpha(bool enabled);
@@ -129,7 +124,6 @@ public:
     float overlayWindowLow() const { return _overlayWindowLow; }
     float overlayWindowHigh() const { return _overlayWindowHigh; }
     void setOverlayMaxDisplayedResolution(int level);
-    int overlayMaxDisplayedResolution() const { return _overlayMaxDisplayedResolution; }
     void setOverlayComposite(const OverlayCompositeSettings& settings);
     const OverlayCompositeSettings& overlayComposite() const { return _overlayComposite; }
 
@@ -137,26 +131,17 @@ public:
     float volumeWindowLow() const { return _volumeWindowLow; }
     float volumeWindowHigh() const { return _volumeWindowHigh; }
 
-    void setSurfacePatchSamplingStride(int stride, bool userInitiated = true);
+    void setSurfacePatchSamplingStride(int stride);
     int surfacePatchSamplingStride() const { return _surfacePatchSamplingStride; }
     void setIntersectionMaxSurfaces(int limit);
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
-    void resetStrideUserOverride() {}
-
-    // Folder-selection keyed retention of built surface patch indexes. The
-    // surface panel sets the key before rebinding surfaces on a folder
-    // switch; the live index is stashed under the outgoing key and swapped
-    // back in (if still valid) when the user returns to that selection.
-    void setSurfacePatchIndexCacheKey(const QString& key);
-    void clearSurfacePatchIndexCache();
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
     // Registered automatically by AxisAlignedSliceController::setViewerManager.
     void setAxisAlignedSliceController(AxisAlignedSliceController* slices) { _slices = slices; }
-    AxisAlignedSliceController* axisAlignedSliceController() const { return _slices; }
 
     // --- Focus / navigation policy shared by all workspaces ---
     // Ensure the "focus" POI exists and lies inside the current volume: a
@@ -191,6 +176,10 @@ public:
                                                       Qt::MouseButton button,
                                                       Qt::KeyboardModifiers modifiers)>;
     void setVolumeClickInterceptor(VolumeClickInterceptor interceptor) { _volumeClickInterceptor = std::move(interceptor); }
+    // The id of a drawn surface within `tolerance` voxels of a volume point
+    // other than the active one (Ctrl+Shift+click activation).
+    using SurfacePicker = std::function<std::optional<std::string>(const cv::Vec3f&, float tolerance)>;
+    void setSurfacePicker(SurfacePicker picker) { _surfacePicker = std::move(picker); }
 
     // --- Volume-switch policy shared by all workspaces ---
     // Snapshot of per-viewer cameras and view centers, retargetable through an
@@ -198,21 +187,17 @@ public:
     struct ViewerNavigationSnapshot;
     std::shared_ptr<ViewerNavigationSnapshot> captureNavigation() const;
     void restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
-                           const cv::Matx44d& transform);
+                           const vcr::catalog::Affine& transform);
     // Set the volume on the state, re-derive the focus POI (volume-centered
     // when new/absent, clamped otherwise, transformed when a coordinate
     // transform is supplied) and retarget the captured viewer navigation.
     void switchVolume(std::shared_ptr<Volume> volume,
-                      const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+                      const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // --- Fleet setters: apply a viewer preference to every viewer ---
-    void setShowDirectionHints(bool show);
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
     void setPlaneIntersectionLinesVisible(bool visible);
-    void setSurfaceOverlaysEnabled(bool enabled);
-    void setSurfaceOverlapThreshold(float threshold);
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
 
     // --- Reset-view-on-surface-change policy ---
     // Store the new default on every viewer, keeping the segmentation viewer
@@ -235,7 +220,6 @@ public:
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
-    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
     SurfacePatchIndex* surfacePatchIndexIfReady();
     SurfacePatchIndex* activeSegmentationEditSurfacePatchIndex() const;
@@ -263,7 +247,6 @@ signals:
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
-    void samplingStrideChanged(int stride);
     void zScrollSensitivityChanged(double sensitivity);
 
 private slots:
@@ -308,11 +291,6 @@ private:
     VCCollection* _points;
     AxisAlignedSliceController* _slices{nullptr};
     SegmentationOverlayController* _segmentationOverlay{nullptr};
-    PointsOverlayController* _pointsOverlay{nullptr};
-    RawPointsOverlayController* _rawPointsOverlay{nullptr};
-    PathsOverlayController* _pathsOverlay{nullptr};
-    BBoxOverlayController* _bboxOverlay{nullptr};
-    VectorOverlayController* _vectorOverlay{nullptr};
     // All overlay controllers that should be attached/detached from viewers.
     // Populated by the set*Overlay() methods. Does NOT include VolumeOverlayController
     // (which is not a ViewerOverlayControllerBase subclass).
@@ -322,6 +300,7 @@ private:
     std::vector<VolumeViewerBase*> _baseViewers;
     VolumeViewerBase* _activeViewer{nullptr};
     VolumeClickInterceptor _volumeClickInterceptor;
+    SurfacePicker _surfacePicker;
     // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
@@ -329,7 +308,6 @@ private:
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
-    std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
     vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
@@ -360,16 +338,6 @@ private:
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
-    struct CachedSurfacePatchIndex {
-        SurfacePatchIndex index;
-        std::unordered_set<std::string> ids;
-    };
-    // Indexes stashed on folder-selection switches, keyed by the selection
-    // they were built for. Entries are validated against the current surface
-    // instances (and stride) before being swapped back in.
-    std::map<QString, CachedSurfacePatchIndex> _surfacePatchIndexCache;
-    QString _surfacePatchIndexCacheKey;
-    void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
     // A first surface entering an empty index has no other builder.
     bool _surfacePatchIndexPrimeQueued{false};
@@ -383,10 +351,6 @@ private:
     QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
     bool _surfacePatchIndexOverlayRefreshPending{false};
 
-    // Surfaces currently pinned in the LRU as "highlighted/visible".
-    // We track them so we can unpin the right set when highlights change.
-    std::vector<std::shared_ptr<QuadSurface>> _pinnedHighlightSurfaces;
-
     void rebuildSurfacePatchIndexIfNeeded();
 
 public:
@@ -398,7 +362,6 @@ public:
     // work once reads drain. Begin/end bracket each worker read on the main thread.
     void beginIndexRead() { ++_indexReadsInFlight; }
     void endIndexRead();
-    bool indexReadInFlight() const { return _indexReadsInFlight > 0; }
 private:
     int _indexReadsInFlight{0};
     std::shared_ptr<SurfacePatchIndex> _deferredIndexSwap;

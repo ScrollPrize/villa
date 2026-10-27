@@ -1,6 +1,6 @@
 #pragma once
 
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 
 #include <algorithm>
@@ -80,11 +80,11 @@ inline double shiftedLinePositionByArclength(double currentPosition,
     const double deltaBaseVoxels = static_cast<double>(scrollSteps) *
                                    static_cast<double>(shiftScrollLineStepSize(viewerSliceStepSize)) *
                                    kShiftScrollLineStepBaseVoxels;
-    const double currentArclength = vc3d::fiber_slice::arclengthAtLinePosition(
+    const double currentArclength = vc3d::fiber_line::arclengthAtLinePosition(
         cumulativeArclengths, std::clamp(currentPosition, 0.0, maxLinePosition));
     const double targetArclength = std::clamp(
         currentArclength + deltaBaseVoxels, 0.0, cumulativeArclengths.back());
-    return std::clamp(vc3d::fiber_slice::linePositionAtArclength(cumulativeArclengths, targetArclength),
+    return std::clamp(vc3d::fiber_line::linePositionAtArclength(cumulativeArclengths, targetArclength),
                       0.0,
                       maxLinePosition);
 }
@@ -158,8 +158,8 @@ inline double straightAheadDistanceForShiftScroll(double fromPosition,
     if (!lineArclengthsUsable(cumulativeArclengths)) {
         return 0.0;
     }
-    return vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, toPosition) -
-           vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, fromPosition);
+    return vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, toPosition) -
+           vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, fromPosition);
 }
 
 inline double bottomCrossSliceLinePosition(double centerPosition,
@@ -226,7 +226,7 @@ inline double snappedControlPointLinePositionByArclength(
         return snappedControlPointLinePosition(position, controlLinePositions);
     }
     const double targetArclength =
-        vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, position);
+        vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, position);
     double bestPosition = position;
     double bestDistance = std::numeric_limits<double>::infinity();
     for (const double controlLinePosition : controlLinePositions) {
@@ -234,7 +234,7 @@ inline double snappedControlPointLinePositionByArclength(
             continue;
         }
         const double distance = std::abs(
-            vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, controlLinePosition) -
+            vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, controlLinePosition) -
             targetArclength);
         if (distance < bestDistance) {
             bestDistance = distance;

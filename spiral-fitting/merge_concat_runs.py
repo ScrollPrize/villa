@@ -69,7 +69,7 @@ def invalid_mask(pts):
 
 def resample_to(pts, target_hw):
     """Linear-resample (H,W,3) points to target (H,W), re-masking invalid regions
-    with -1 (same approach as scripts/repair_tifxyz_spacing.py:resample_points)."""
+    with -1."""
     th, tw = target_hw
     if pts.shape[:2] == (th, tw):
         out = pts.copy()

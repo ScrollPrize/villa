@@ -33,8 +33,9 @@ Inspect the reported problems before proceeding. Ingestion preserves source UUID
 and imports a directory's branch graph atomically. Fiber transfer accepts the
 current version-4 format; there is no legacy-file conversion or refresh path. Native JSON import/export in
 VC3D is an explicit transfer operation; exported files are not live storage.
-Surfaces, point collections, CT, inference volumes and atlas directories retain
-their existing storage.
+Surfaces and the point collections attached to them (corrections, tool results)
+are objects of the same store; CT and inference volumes retain their existing
+storage.
 
 Open a CT volume and select a fiber in the **Fibers** panel of the status bar. When its
 coordinate identity or scale is missing, the binding dialog shows the active
@@ -49,7 +50,7 @@ open-data `metadata.json` verbatim (for example `20260411134726`). VC3D compares
 it directly with `Volume::id()`; it does not generate or canonicalize a UUID.
 Its scale must be finite and positive. Advisory labels cannot override a different
 volume ID. Existing derived-UUID bindings require an explicit metadata correction. Transfer preserves known and unknown coordinates for every
-geometry kind; atlas export adjusts the declared scale with the exported XYZ.
+geometry kind.
 
 Completed interactions and accepted solver results commit immediately. Save waits
 for outstanding work and writes; it is not required to persist an edit. Conflicts
@@ -62,9 +63,10 @@ their distinct winding semantics.
 Catalog, overlay and spatial requests use `ObjectStore` directly through the
 application's shared `ObjectStoreSession`. There is no fiber repository. Runtime
 numeric handles map to store/object UUIDs; names and transport paths are labels.
-Atlas mappings record object and geometry revision pins. Spiral and service
-requests serialize pinned revisions into temporary transport artifacts while
-retaining their existing wire formats. Fiber transport uses UUID filenames, with
+Spiral requests
+serialize pinned revisions into temporary transport artifacts while retaining
+their existing wire formats; the Lasagna service reads surfaces from the store
+itself (`{type: "surface", uuid, revision}` references). Fiber transport uses UUID filenames, with
 display names stored separately. The object-store `fiberNetworkJson` exporter
 reads pinned relationship edges and resolves stable control-point IDs into wire
 indices, preserving reciprocal ordinary, adjacent, and pending branches. Adding
@@ -79,8 +81,8 @@ already committed to the object store.
 
 The shared `GeometryIngest.hpp` API accepts either native files or decoded batches.
 Generic `updateGeometryArrays` handles array/sequence edits across geometry kinds;
-VC3D retains editing semantics and UI state. Shared coordinate and artifact helpers
-are reusable by future point-collection and tifxyz integrations. Optional native
+VC3D retains editing semantics and UI state. The same coordinate and artifact helpers
+serve point collections and surfaces. Optional native
 fiber annotations remain optional; import/export preserves unknown metadata and
 branch identities, approval state, and stable control-point IDs.
 
@@ -93,8 +95,8 @@ volume's voxels, followed by fibers not bound to that volume. Each row's details
 expanded. Every edit, tag and link action reads the fiber's current revision and
 commits a checked action; a link is one shared edge, so changing it never rewrites
 the fiber at the other end. Opening a fiber in Line Annotation reads it and its
-linked peers in one snapshot. Whole-store tools (detailed export, the fiber map,
-atlas search) query the whole store when they run.
+linked peers in one snapshot. Whole-store tools (detailed export, the fiber map)
+query the whole store when they run.
 
 VC3D queries in the active volume's voxels through the store's volume target
 (`ObjectSelection::volume`, `RegionOptions::volume`), which spans every
@@ -131,7 +133,7 @@ AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j6 VC3D \
   test_line_annotation_fiber_deletion test_spiral_input_workflow test_object_store_fiber_json
 ctest --test-dir build --output-on-failure
 PYTHONPATH=build/python python3 -m pytest tests/python -q
-ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|atlas|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
+ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
 ```
 
 With `VC_TESTING` enabled, the production controller test can additionally use a

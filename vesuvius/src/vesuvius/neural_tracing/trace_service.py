@@ -14,7 +14,6 @@ from vesuvius.neural_tracing.infer import Inference
 from vesuvius.neural_tracing.nets.models import load_checkpoint
 
 HEATMAP_REQUEST_TYPE = "heatmap_next_points"
-DENSE_REQUEST_TYPE = "dense_displacement_grow"
 COPY_REQUEST_TYPE = "displacement_copy_grow"
 
 
@@ -34,14 +33,14 @@ def _print_json_log(label, payload):
     default=None,
     help=(
         "Optional heatmap checkpoint path or checkpoint sentinel. "
-        "Dense requests do not require this."
+        "Displacement copy requests may name their own."
     ),
 )
 @click.option(
     "--volume_zarr",
     type=click.Path(exists=True),
     required=True,
-    help="Path to ome-zarr folder (used as default volume_path for dense requests).",
+    help="Path to ome-zarr folder (the default volume_path of displacement copy requests).",
 )
 @click.option("--volume_scale", type=int, required=True, help="OME scale to use")
 @click.option("--socket_path", type=click.Path(), required=True, help="Path to Unix domain socket")
@@ -61,7 +60,7 @@ def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, parent_pid, n
         "no_cache": bool(no_cache),
         "inference": None,
         "inference_lock": threading.Lock(),
-        "dense_lock": threading.Lock(),
+        "displacement_lock": threading.Lock(),
     }
 
     if parent_pid is not None and int(parent_pid) > 1:
@@ -139,35 +138,11 @@ def _normalize_key(key):
     return str(key).replace("-", "_")
 
 
-def _merge_dense_args(dst, src):
+def _merge_args(dst, src):
     if not isinstance(src, dict):
         return
     for key, value in src.items():
         dst[_normalize_key(key)] = value
-
-
-def _build_dense_args(request, state):
-    from vesuvius.neural_tracing.inference.infer_global_extrap import normalize_dense_args
-
-    dense_args = {}
-
-    _merge_dense_args(dense_args, request.get("dense_args"))
-    _merge_dense_args(dense_args, request.get("args"))
-    _merge_dense_args(dense_args, request.get("overrides"))
-    _merge_dense_args(dense_args, request)
-
-    dense_args = normalize_dense_args(dense_args)
-    dense_args.setdefault("iterations", 1)
-    dense_args.setdefault("volume_path", state.get("volume_zarr"))
-    dense_args.setdefault("volume_scale", state.get("volume_scale"))
-
-    if dense_args.get("tifxyz_path") is None:
-        return None, "Missing required field for dense displacement: tifxyz_path"
-    if dense_args.get("grow_direction") is None:
-        return None, "Missing required field for dense displacement: grow_direction"
-    if dense_args.get("volume_path") is None:
-        return None, "Missing required field for dense displacement: volume_path"
-    return dense_args, None
 
 
 def _build_copy_args(request, state):
@@ -175,68 +150,24 @@ def _build_copy_args(request, state):
 
     copy_args = {}
 
-    _merge_dense_args(copy_args, request.get("copy_args"))
-    _merge_dense_args(copy_args, request.get("args"))
-    _merge_dense_args(copy_args, request.get("overrides"))
-    _merge_dense_args(copy_args, request)
+    _merge_args(copy_args, request.get("copy_args"))
+    _merge_args(copy_args, request.get("args"))
+    _merge_args(copy_args, request.get("overrides"))
+    _merge_args(copy_args, request)
 
     copy_args = normalize_copy_args(copy_args)
     copy_args.setdefault("volume_path", state.get("volume_zarr"))
     copy_args.setdefault("volume_scale", state.get("volume_scale"))
     copy_args.setdefault("checkpoint_path", state.get("checkpoint_path"))
 
-    if copy_args.get("tifxyz_path") is None:
-        return None, "Missing required field for displacement copy: tifxyz_path"
+    for field in ("store", "surface_uuid", "volume_uuid"):
+        if copy_args.get(field) is None:
+            return None, f"Missing required field for displacement copy: {field}"
     if copy_args.get("volume_path") is None:
         return None, "Missing required field for displacement copy: volume_path"
     if copy_args.get("checkpoint_path") is None:
         return None, "Missing required field for displacement copy: checkpoint_path"
     return copy_args, None
-
-
-def _process_dense_request(request, state):
-    dense_args, err = _build_dense_args(request, state)
-    if err is not None:
-        _print_json_log(
-            "dense request rejected",
-            {
-                "request_type": DENSE_REQUEST_TYPE,
-                "error": err,
-                "request_keys": sorted(str(k) for k in request.keys())
-                if isinstance(request, dict)
-                else [],
-            },
-        )
-        return {"error": err}
-
-    _print_json_log(
-        "dense request args",
-        {"request_type": DENSE_REQUEST_TYPE, "run_args": dense_args},
-    )
-
-    from vesuvius.neural_tracing.inference.infer_global_extrap import run_global_extrap
-
-    try:
-        with state["dense_lock"]:
-            output_path = run_global_extrap(dense_args)
-    except Exception as exc:
-        return {"error": f"Dense displacement failed: {exc}"}
-
-    return {
-        "ok": True,
-        "output_tifxyz_path": output_path,
-        "grow_direction": str(dense_args.get("grow_direction")),
-        "iterations": int(dense_args.get("iterations", 1)),
-        "resolved": {
-            "volume_path": dense_args.get("volume_path"),
-            "volume_scale": int(dense_args.get("volume_scale")),
-            "checkpoint_path": dense_args.get("checkpoint_path"),
-            "config_path": dense_args.get("config_path"),
-            "tifxyz_path": dense_args.get("tifxyz_path"),
-            "tifxyz_out_dir": dense_args.get("tifxyz_out_dir"),
-            "edge_input_rowscols": dense_args.get("edge_input_rowscols"),
-        },
-    }
 
 
 def _process_copy_request(request, state):
@@ -262,32 +193,33 @@ def _process_copy_request(request, state):
     from vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps import run_copy_displacement
 
     try:
-        with state["dense_lock"]:
+        with state["displacement_lock"]:
             outputs = run_copy_displacement(copy_args)
     except Exception as exc:
         return {"error": f"Displacement copy failed: {exc}"}
 
     if not isinstance(outputs, dict):
         return {"error": "Displacement copy returned invalid outputs payload."}
-    front_path = outputs.get("front")
-    back_path = outputs.get("back")
-    if not isinstance(front_path, str) or not front_path:
-        return {"error": "Displacement copy output missing 'front' path."}
-    if not isinstance(back_path, str) or not back_path:
-        return {"error": "Displacement copy output missing 'back' path."}
+    front = outputs.get("front")
+    back = outputs.get("back")
+    if not isinstance(front, str) or not front:
+        return {"error": "Displacement copy output missing 'front' surface."}
+    if not isinstance(back, str) or not back:
+        return {"error": "Displacement copy output missing 'back' surface."}
 
     return {
         "ok": True,
-        "output_tifxyz_paths": {
-            "front": front_path,
-            "back": back_path,
+        "output_surfaces": {
+            "front": front,
+            "back": back,
         },
         "resolved": {
             "volume_path": copy_args.get("volume_path"),
             "volume_scale": int(copy_args.get("volume_scale")),
             "checkpoint_path": copy_args.get("checkpoint_path"),
-            "tifxyz_path": copy_args.get("tifxyz_path"),
-            "out_dir": copy_args.get("out_dir"),
+            "store": copy_args.get("store"),
+            "surface_uuid": copy_args.get("surface_uuid"),
+            "geometry_revision": copy_args.get("geometry_revision"),
             "output_prefix": copy_args.get("output_prefix"),
         },
     }
@@ -377,8 +309,6 @@ def process_request(request, state):
     """Process a single inference request and return results."""
 
     request_type = request.get("request_type", HEATMAP_REQUEST_TYPE)
-    if request_type == DENSE_REQUEST_TYPE:
-        return _process_dense_request(request, state)
     if request_type == COPY_REQUEST_TYPE:
         return _process_copy_request(request, state)
     if request_type == HEATMAP_REQUEST_TYPE:
@@ -386,7 +316,7 @@ def process_request(request, state):
     return {
         "error": (
             f"Unknown request_type '{request_type}'. "
-            f"Supported: '{HEATMAP_REQUEST_TYPE}', '{DENSE_REQUEST_TYPE}', '{COPY_REQUEST_TYPE}'."
+            f"Supported: '{HEATMAP_REQUEST_TYPE}', '{COPY_REQUEST_TYPE}'."
         )
     }
 

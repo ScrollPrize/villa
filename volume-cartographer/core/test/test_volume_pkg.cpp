@@ -7,7 +7,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Segmentation.hpp"
+#include "support/TestZarrVolume.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -84,14 +84,12 @@ TEST_CASE("resolveLocalPath: absolute, relative+base, file:// prefix")
 TEST_CASE("validateLocation: empty location is rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "").empty());
-    CHECK_FALSE(validateLocation(Category::Segments, "").empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, "").empty());
 }
 
 TEST_CASE("validateLocation: remote allowed only for Volumes")
 {
     CHECK(validateLocation(Category::Volumes, "s3://b/k").empty());
-    CHECK_FALSE(validateLocation(Category::Segments, "s3://b/k").empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, "https://x/y").empty());
 }
 
@@ -138,26 +136,11 @@ TEST_CASE("validateLocation: non-directory local path is rejected")
     fs::remove_all(d);
 }
 
-TEST_CASE("validateLocation: empty directory not a valid volume/segment/normalgrid")
+TEST_CASE("validateLocation: empty directory not a valid volume/normalgrid")
 {
     auto d = tmpDir("empty");
     CHECK_FALSE(validateLocation(Category::Volumes, d.string()).empty());
-    CHECK_FALSE(validateLocation(Category::Segments, d.string()).empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, d.string()).empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("validateLocation: a segment-shaped dir validates for Segments")
-{
-    // Make a minimal tifxyz segment-like directory.
-    auto d = tmpDir("seg");
-    auto segDir = d / "myseg";
-    fs::create_directories(segDir);
-    { std::ofstream f(segDir / "meta.json");
-      f << R"({"type":"seg","uuid":"test","format":"tifxyz"})"; }
-    // Both the directory itself, and the parent (because it contains a seg subdir).
-    CHECK(validateLocation(Category::Segments, segDir.string()).empty());
-    CHECK(validateLocation(Category::Segments, d.string()).empty());
     fs::remove_all(d);
 }
 
@@ -179,7 +162,6 @@ TEST_CASE("VolumePkg::newEmpty produces an empty package")
     auto p = VolumePkg::newEmpty();
     REQUIRE(p);
     CHECK(p->volumeEntries().empty());
-    CHECK(p->segmentEntries().empty());
     CHECK(p->normalGridEntries().empty());
 }
 
@@ -248,128 +230,6 @@ TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
     CHECK_FALSE(p->removeEntry("/vol1"));
 }
 
-TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
-{
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addSegmentsEntry("/segs"));
-    CHECK(p->segmentEntries().size() == 1);
-    // Second add doesn't override outputSegments
-    CHECK(p->addSegmentsEntry("/more_segs"));
-    CHECK(p->segmentEntries().size() == 2);
-    p->clearOutputSegments();
-    CHECK_FALSE(p->addSegmentsEntry(""));
-}
-
-TEST_CASE("VolumePkg: segment entries match normalized local paths")
-{
-    auto d = tmpDir("segment_entry_identity");
-    fs::create_directories(d / "segments");
-
-    auto p = VolumePkg::newEmpty();
-    p->save(d / "project.volpkg.json");
-    REQUIRE(p->addSegmentsEntry("segments", {"source:test"}));
-
-    const auto matching = p->matchingSegmentsEntry((d / "segments").string() + "/");
-    REQUIRE(matching);
-    CHECK(matching->location == "segments");
-    CHECK(matching->tags == std::vector<std::string>{"source:test"});
-    CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
-    CHECK(p->segmentEntries().size() == 1);
-
-    std::error_code symlinkError;
-    fs::create_directory_symlink(
-        d / "segments", d / "segments-alias", symlinkError);
-    if (!symlinkError) {
-        CHECK(p->matchingSegmentsEntry((d / "segments-alias").string()));
-        CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
-    }
-
-#ifndef _WIN32
-    fs::create_directories(d / "segments\\");
-    CHECK_FALSE(p->matchingSegmentsEntry((d / "segments\\").string()));
-    CHECK(p->addSegmentsEntry((d / "segments\\").string()));
-#endif
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment directory-name lookup is case-insensitive")
-{
-    auto d = tmpDir("segment_source_name");
-    fs::create_directories(d / "one" / "User-Segments");
-
-    auto p = VolumePkg::newEmpty();
-    p->save(d / "project.volpkg.json");
-    REQUIRE(p->addSegmentsEntry(
-        (d / "one" / "User-Segments").string()));
-
-    const auto matching =
-        p->matchingSegmentsEntryByDirectoryName("user-segments");
-    REQUIRE(matching);
-    CHECK(matching->location ==
-          (d / "one" / "User-Segments").string());
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment attachment rolls back after a write failure")
-{
-    auto d = tmpDir("segment_attach_rollback");
-    auto makeSegment = [](const fs::path& path, const std::string& id) {
-        fs::create_directories(path);
-        std::ofstream meta(path / "meta.json");
-        meta << R"({"type":"seg","uuid":")" << id
-             << R"(","format":"tifxyz"})";
-    };
-    makeSegment(d / "initial", "initial");
-    makeSegment(d / "new", "new");
-
-    const auto project = d / "project.volpkg.json";
-    auto p = VolumePkg::newEmpty();
-    p->save(project);
-    REQUIRE(p->addSegmentsEntry((d / "initial").string()));
-    fs::remove(project);
-    fs::create_directory(project);
-
-    CHECK_THROWS(p->attachSegmentsEntry(
-        (d / "new").string(), {"source:test"}, true));
-    REQUIRE(p->segmentEntries().size() == 1);
-    CHECK(p->segmentEntries().front().location == (d / "initial").string());
-    CHECK(p->outputSegmentsPath() == d / "initial");
-    CHECK(p->segmentationIDs() == std::vector<std::string>{"initial"});
-
-    vc::project::LoadOptions deferred;
-    deferred.deferResolution = true;
-    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
-    REQUIRE(autosave->segmentEntries().size() == 1);
-    CHECK(autosave->segmentEntries().front().location ==
-          (d / "initial").string());
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
-{
-    auto d = tmpDir("seg_transients");
-    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
-        fs::create_directories(segDir);
-        std::ofstream f(segDir / "meta.json");
-        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
-    };
-
-    writeSegMeta(d / "stable-seg", "stable-seg");
-    writeSegMeta(d / "stable-seg.tmp-12345", "stable-seg.tmp-12345");
-    writeSegMeta(d / "stable-seg.previous", "stable-seg.previous");
-
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addSegmentsEntry(d.string()));
-    const auto ids = p->segmentationIDs();
-    REQUIRE(ids.size() == 1);
-    CHECK(ids.front() == "stable-seg");
-
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg: addNormalGridEntry")
 {
     auto p = VolumePkg::newEmpty();
@@ -388,7 +248,6 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
         auto p = VolumePkg::newEmpty();
         p->setName("Roundtrip");
         p->addVolumeEntry("/vol-x");
-        p->addSegmentsEntry("/seg-x");
         p->addNormalGridEntry("/ng-x");
         p->save(jsonPath);
     }
@@ -399,7 +258,6 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
     CHECK(loaded->name() == "Roundtrip");
     CHECK(loaded->volumeEntries().size() == 1);
     CHECK(loaded->volumeEntries()[0].location == "/vol-x");
-    CHECK(loaded->segmentEntries().size() == 1);
     CHECK(loaded->normalGridEntries().size() == 1);
     fs::remove_all(d);
 }
@@ -435,7 +293,6 @@ TEST_CASE("VolumePkg: missing selected_lasagna_dataset loads as empty")
     auto loaded = VolumePkg::load(jsonPath);
     REQUIRE(loaded);
     CHECK(loaded->selectedLasagnaDataset().empty());
-    CHECK(loaded->selectedLasagnaDatasetPath().empty());
     fs::remove_all(d);
 }
 
@@ -454,105 +311,9 @@ TEST_CASE("VolumePkg: selected_lasagna_dataset round-trips through save/load")
     auto loaded = VolumePkg::load(jsonPath);
     REQUIRE(loaded);
     CHECK(loaded->selectedLasagnaDataset() == manifest);
-    CHECK(loaded->selectedLasagnaDatasetPath() == fs::path(manifest));
 
     loaded->clearSelectedLasagnaDataset();
     CHECK(loaded->selectedLasagnaDataset().empty());
-    CHECK(loaded->selectedLasagnaDatasetPath().empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: selectedLasagnaDatasetPath resolves relative to project file")
-{
-    auto d = tmpDir("lasagna_relative");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-        p->setSelectedLasagnaDataset("datasets/reference.lasagna.json");
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->selectedLasagnaDataset() == "datasets/reference.lasagna.json");
-    CHECK(loaded->selectedLasagnaDatasetPath() ==
-          d / "datasets" / "reference.lasagna.json");
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: missing umbilicus loads as empty")
-{
-    auto d = tmpDir("umbilicus_missing");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->umbilicus().empty());
-    CHECK(loaded->umbilicusPath().empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: umbilicus round-trips through save/load")
-{
-    auto d = tmpDir("umbilicus_roundtrip");
-    auto jsonPath = d / "project.json";
-    const std::string location = (d / "umbilicus.json").string();
-    {
-        auto p = VolumePkg::newEmpty();
-        p->setUmbilicus(location);
-        CHECK(p->umbilicus() == location);
-        p->save(jsonPath);
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->umbilicus() == location);
-    CHECK(loaded->umbilicusPath() == fs::path(location));
-
-    // An empty location clears the field, and the cleared state persists.
-    loaded->setUmbilicus("");
-    CHECK(loaded->umbilicus().empty());
-    CHECK(loaded->umbilicusPath().empty());
-    loaded->save(jsonPath);
-    auto reloaded = VolumePkg::load(jsonPath);
-    REQUIRE(reloaded);
-    CHECK(reloaded->umbilicus().empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: umbilicusPath resolves relative to project file")
-{
-    auto d = tmpDir("umbilicus_relative");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-        p->setUmbilicus("annotations/umbilicus.json");
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->umbilicus() == "annotations/umbilicus.json");
-    CHECK(loaded->umbilicusPath() == d / "annotations" / "umbilicus.json");
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::New is an alias for load")
-{
-    auto d = tmpDir("new_alias");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->setName("Alias");
-        p->save(jsonPath);
-    }
-    auto loaded = VolumePkg::New(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->name() == "Alias");
     fs::remove_all(d);
 }
 
@@ -564,63 +325,6 @@ TEST_CASE("VolumePkg: autosave file path is settable")
     CHECK(VolumePkg::autosaveRoot() == d);
     // Restore so other tests aren't affected.
     VolumePkg::setAutosaveRoot(saved);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::loadAutosave returns nullptr when no autosave file exists")
-{
-    auto saved = VolumePkg::autosaveRoot();
-    auto d = tmpDir("no_autosave");
-    VolumePkg::setAutosaveRoot(d);
-    auto p = VolumePkg::loadAutosave();
-    CHECK(p == nullptr);
-    VolumePkg::setAutosaveRoot(saved);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::setLoadFirstSegmentationDirectory: round-trip")
-{
-    VolumePkg::setLoadFirstSegmentationDirectory("custom_segs");
-    // Clear it again with empty string
-    VolumePkg::setLoadFirstSegmentationDirectory("");
-    CHECK(true);
-}
-
-TEST_CASE("VolumePkg reconciles and relocates coordinate-bearing asset entries")
-{
-    auto d = tmpDir("asset_reconcile");
-    const auto oldSegments = (d / "segments-old").string();
-    const auto newSegments = (d / "segments-new").string();
-    const auto grids = (d / "grids").string();
-
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(
-        oldSegments,
-        {"user-tag", "vc-open-data-coordinate-space:sample/source@L0"}));
-    CHECK(pkg->reconcileSegmentsEntryTags(
-        oldSegments,
-        {"vc-open-data-coordinate-space:sample/source@L2",
-         "vc-open-data-source-coordinate-level:2"},
-        {"vc-open-data-coordinate-space:",
-         "vc-open-data-source-coordinate-level:"}));
-    REQUIRE(pkg->segmentEntries().size() == 1);
-    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
-                    pkg->segmentEntries()[0].tags.end(),
-                    "user-tag") != pkg->segmentEntries()[0].tags.end());
-    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
-                    pkg->segmentEntries()[0].tags.end(),
-                    "vc-open-data-coordinate-space:sample/source@L0") ==
-          pkg->segmentEntries()[0].tags.end());
-    CHECK(pkg->relocateSegmentsEntry(oldSegments, newSegments));
-    CHECK(pkg->segmentEntries()[0].location == newSegments);
-
-    REQUIRE(pkg->addNormalGridEntry(
-        grids, {"vc-open-data-source-coordinate-level:0"}));
-    CHECK(pkg->reconcileNormalGridEntryTags(
-        grids, {"vc-open-data-source-coordinate-level:2"},
-        {"vc-open-data-source-coordinate-level:"}));
-    CHECK(pkg->normalGridEntries()[0].tags.back() ==
-          "vc-open-data-source-coordinate-level:2");
     fs::remove_all(d);
 }
 
@@ -652,14 +356,13 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
     const auto project = d / "project.json";
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->addLasagnaDatasetEntry("regular.lasagna.json", {"user-tag"}));
-    REQUIRE(pkg->addFiberInferenceDatasetEntry("fiber.lasagna.json", {"model:v1"}));
+    REQUIRE(pkg->addLasagnaDatasetEntry("fiber.lasagna.json", {"model:v1", std::string(vc::project::kFiberLasagnaTag)}));
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
     pkg->save(project);
 
     const auto json = utils::Json::parse_file(project);
     REQUIRE(json.contains("lasagna_datasets"));
-    CHECK_FALSE(json.contains("fiber_inference_datasets"));
     REQUIRE(json.at("lasagna_datasets").size() == 2);
 
     vc::project::LoadOptions options;
@@ -674,52 +377,16 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg migrates the legacy fiber inference array without losing tags")
-{
-    auto d = tmpDir("legacy_fiber_lasagna");
-    const auto project = d / "project.json";
-    {
-        std::ofstream out(project);
-        out << R"({
-          "name":"legacy",
-          "version":1,
-          "lasagna_datasets":[
-            {"location":"shared.lasagna.json","tags":["canonical-tag"]}
-          ],
-          "fiber_inference_datasets":[
-            {"location":"shared.lasagna.json","tags":["legacy-tag"]},
-            {"location":"fiber.lasagna.json","tags":[]}
-          ],
-          "selected_fiber_inference_dataset":"fiber.lasagna.json"
-        })";
-    }
-    vc::project::LoadOptions options;
-    options.deferResolution = true;
-    const auto loaded = VolumePkg::load(project, options);
-    REQUIRE(loaded->fiberInferenceDatasetEntries().size() == 2);
-    REQUIRE(loaded->allLasagnaDatasetEntries().size() == 2);
-    const auto& shared = loaded->allLasagnaDatasetEntries().front();
-    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "canonical-tag") != shared.tags.end());
-    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "legacy-tag") != shared.tags.end());
-    CHECK(vc::project::isFiberLasagnaEntry(shared));
-
-    loaded->save(project);
-    const auto saved = utils::Json::parse_file(project);
-    CHECK_FALSE(saved.contains("fiber_inference_datasets"));
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries")
 {
     auto d = tmpDir("lasagna_batch_attach");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "lasagna-view";
     create.name = "presence";
-    create.compressor.clear();
-    auto volume = Volume::New(d / "backing.zarr", create);
+    auto volume = vc::test::createZarrVolume(d / "backing.zarr", create);
 
     VolumePkg::PreparedVolumeAttachment derived{
         (d / "backing.zarr").string(),
@@ -770,17 +437,16 @@ TEST_CASE("VolumePkg Lasagna attach fills but does not replace selected datasets
 TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning volumes")
 {
     auto d = tmpDir("lasagna_batch_reconcile");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "old-channel";
     create.name = "old";
-    create.compressor.clear();
-    auto oldVolume = Volume::New(d / "old.zarr", create);
+    auto oldVolume = vc::test::createZarrVolume(d / "old.zarr", create);
     create.uuid = "new-channel";
     create.name = "new";
-    auto newVolume = Volume::New(d / "new.zarr", create);
+    auto newVolume = vc::test::createZarrVolume(d / "new.zarr", create);
 
     const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
         (d / "old.zarr").string(),
@@ -796,7 +462,7 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:old"}, true, oldAttachments) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(
-        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments, true, true, {"model:"}) ==
+        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments) ==
         VolumePkg::AttachLasagnaResult::Attached);
 
     REQUIRE(pkg->lasagnaDatasetEntries().size() == 1);
@@ -804,7 +470,6 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
     CHECK(pkg->selectedLasagnaDataset() == "data.lasagna.json");
     CHECK(pkg->selectedFiberInferenceDataset().empty());
     const auto& manifestTags = pkg->allLasagnaDatasetEntries().front().tags;
-    CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:old") == manifestTags.end());
     CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:new") != manifestTags.end());
     REQUIRE(pkg->volumeEntries().size() == 2);
     CHECK(pkg->hasVolume("old-channel"));
@@ -815,14 +480,13 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
 TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular volumes")
 {
     auto d = tmpDir("lasagna_shared_ownership");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "shared-lasagna-view";
     create.name = "shared";
-    create.compressor.clear();
-    auto volume = Volume::New(d / "shared.zarr", create);
+    auto volume = vc::test::createZarrVolume(d / "shared.zarr", create);
 
     const VolumePkg::PreparedVolumeAttachment first{
         (d / "shared.zarr").string(),
@@ -851,15 +515,14 @@ TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular vol
 TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source volume")
 {
     auto d = tmpDir("lasagna_independent_ownership");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "independent-lasagna-source";
     create.name = "source";
-    create.compressor.clear();
     const auto location = (d / "source.zarr").string();
-    auto volume = Volume::New(location, create);
+    auto volume = vc::test::createZarrVolume(location, create);
 
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
@@ -888,15 +551,14 @@ TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source vol
 TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations")
 {
     auto d = tmpDir("lasagna_mismatched_location");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "source";
     create.name = "source";
-    create.compressor.clear();
     const auto location = (d / "source.zarr").string();
-    auto prepared = Volume::New(d / "other.zarr", create);
+    auto prepared = vc::test::createZarrVolume(d / "other.zarr", create);
 
     auto pkg = VolumePkg::newEmpty();
     const VolumePkg::PreparedVolumeAttachment derived{
@@ -941,34 +603,3 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg: segments are keyed by directory name, not meta uuid")
-{
-    // A converted dataset gives each patch a random object uuid that differs
-    // from its directory; a copy may even share one. Neither may hide a
-    // segment or break directory-based lookups.
-    auto d = tmpDir("seg_uuid_keys");
-    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
-        fs::create_directories(segDir);
-        std::ofstream f(segDir / "meta.json");
-        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
-    };
-    const std::string shared = "0f8fad5b-d9cb-469f-a165-70867728950e";
-    writeSegMeta(d / "seg_a", shared);
-    writeSegMeta(d / "seg_b", shared);
-
-    auto p = VolumePkg::newEmpty();
-    REQUIRE(p->addSegmentsEntry(d.string()));
-    auto ids = p->segmentationIDs();
-    std::sort(ids.begin(), ids.end());
-    CHECK(ids == std::vector<std::string>{"seg_a", "seg_b"});
-    REQUIRE(p->segmentation("seg_a"));
-    CHECK(p->segmentation("seg_a")->uuid() == shared);
-
-    writeSegMeta(d / "seg_c", "a3bb189e-8bf9-4888-9912-ace4e6543002");
-    CHECK(p->addSingleSegmentation("seg_c"));
-    CHECK(p->segmentation("seg_c"));
-    CHECK(p->reloadSingleSegmentation("seg_c"));
-    CHECK(p->removeSingleSegmentation("seg_c"));
-
-    fs::remove_all(d);
-}

@@ -327,7 +327,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
     const bool drawDirectBranchLinks = !overlay.useSurfaceCenterLine;
     primitives.reserve(3 + branchPointCount + overlay.controlPoints.size() +
-                       overlay.predSnapPoints.size() * 2 +
                        (drawDirectBranchLinks ? overlay.branchLinks.size() * 4 : 0) +
                        overlay.fiberIntersections.size() * 3);
 
@@ -532,17 +531,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         generatedCurrentLineMarkerColor(overlay.currentLineMarkerState, 210);
     currentMarkerStyle.penWidth = 1.5;
     currentMarkerStyle.z = 153.0;
-
-    ViewerOverlayControllerBase::OverlayStyle predSnapLineStyle;
-    predSnapLineStyle.penColor = QColor(255, 120, 40, 185);
-    predSnapLineStyle.penWidth = 1.0;
-    predSnapLineStyle.z = 158.0;
-
-    ViewerOverlayControllerBase::OverlayStyle predSnapPointStyle;
-    predSnapPointStyle.penColor = QColor(255, 120, 40, 225);
-    predSnapPointStyle.brushColor = QColor(255, 120, 40, 165);
-    predSnapPointStyle.penWidth = 1.0;
-    predSnapPointStyle.z = 159.0;
 
     ViewerOverlayControllerBase::OverlayStyle branchLinkStyle;
     branchLinkStyle.penColor = QColor(255, 60, 180, 225);
@@ -760,57 +748,16 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                     }
                 }
             }
-            for (const auto& predSnap : overlay.predSnapPoints) {
-                if (!finiteGeneratedPoint(predSnap.snapPoint)) {
-                    continue;
-                }
-                const QPointF controlScene = finiteGeneratedPoint(predSnap.controlPoint)
-                    ? viewer->volumeToScene(predSnap.controlPoint)
-                    : generatedStripLinePositionToScene(
-                          viewer, quad, predSnap.linePosition, &overlay.stripPositionMap);
-                const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
-                if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
-                    primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                        {controlScene, snapScene},
-                        false,
-                        predSnapLineStyle});
-                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                        snapScene,
-                        3.0,
-                        true,
-                        predSnapPointStyle});
-                }
-            }
             if (std::isfinite(overlay.currentLinePosition)) {
                 const QPointF markerScene =
                     generatedStripLinePositionToScene(
                         viewer, quad, overlay.currentLinePosition, &overlay.stripPositionMap);
                 if (finiteScenePoint(markerScene)) {
-                    if (overlay.currentLineMarkerAsCross) {
-                        constexpr qreal kCrossRadius = 5.5;
-                        auto crossStyle = currentMarkerStyle;
-                        crossStyle.brushColor = Qt::transparent;
-                        crossStyle.penCap = Qt::RoundCap;
-                        crossStyle.penJoin = Qt::RoundJoin;
-                        crossStyle.penWidth = 2.0;
-                        crossStyle.z = 170.0;
-                        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                            {markerScene + QPointF{-kCrossRadius, -kCrossRadius},
-                             markerScene + QPointF{kCrossRadius, kCrossRadius}},
-                            false,
-                            crossStyle});
-                        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                            {markerScene + QPointF{-kCrossRadius, kCrossRadius},
-                             markerScene + QPointF{kCrossRadius, -kCrossRadius}},
-                            false,
-                            crossStyle});
-                    } else {
-                        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                            markerScene,
-                            4.0,
-                            true,
-                            currentMarkerStyle});
-                    }
+                    primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                        markerScene,
+                        4.0,
+                        true,
+                        currentMarkerStyle});
                 }
             }
         }
@@ -836,25 +783,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (!overlay.useSurfaceCenterLine) {
-        for (const auto& predSnap : overlay.predSnapPoints) {
-            if (!finiteGeneratedPoint(predSnap.controlPoint) ||
-                !finiteGeneratedPoint(predSnap.snapPoint)) {
-                continue;
-            }
-            const QPointF controlScene = viewer->volumeToScene(predSnap.controlPoint);
-            const QPointF snapScene = viewer->volumeToScene(predSnap.snapPoint);
-            if (finiteScenePoint(controlScene) && finiteScenePoint(snapScene)) {
-                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                    {controlScene, snapScene},
-                    false,
-                    predSnapLineStyle});
-                primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                    snapScene,
-                    4.0,
-                    true,
-                    predSnapPointStyle});
-            }
-        }
         for (const auto& control : overlay.controlPoints) {
             const qreal radius = (control.hasBranches ? 12.0 : (control.isSeed ? 11.0 : 10.0)) +
                                  (drawsTagRing(control) ? 2.0 : 0.0);

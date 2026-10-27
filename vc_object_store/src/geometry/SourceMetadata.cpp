@@ -9,7 +9,7 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
 {
     const auto metadata = Json::parse(object.meta);
     auto result = geometryTransferMetadata(metadata);
-    if (object.kind == "patch") result["scale"] = Json::parse(revision.attributes).at("scale");
+    if (object.kind == "surface") result["scale"] = Json::parse(revision.attributes).at("scale");
     result.erase("origin");
     GeometryReader structure(txn,revision.uuid);
     if (structure.manifest().contains("sequences"))

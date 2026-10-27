@@ -5,6 +5,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/TrackInput.hpp"
+#include "formats/RemoteSource.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <map>
@@ -16,7 +17,7 @@ using Json = nlohmann::json;
 namespace fs = std::filesystem;
 using formats::Prepared;
 using formats::fiber;
-using formats::patch;
+using formats::surface;
 using formats::collections;
 using formats::track;
 using formats::readJson;
@@ -82,8 +83,9 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
 {
     if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
     if (kind == "fiber") return formats::fibers(source, availableUuids, options);
-    if (kind == "patch") return {patch(source, options.uuidNamespace)};
+    if (kind == "surface") return {surface(source, options.uuidNamespace)};
     if (kind == "point_collection") return collections(source, options);
+    if (kind == "umbilicus") return {formats::umbilicus(source)};
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
 
@@ -98,7 +100,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
     {
         auto read = db.read();
         if (objectUuids.empty()) {
-            for (const char* kind : {"patch", "fiber", "point_collection", "track"}) {
+            for (const char* kind : {"surface", "fiber", "point_collection", "track"}) {
                 auto batch = db.objectsByKind(read, kind); objects.insert(objects.end(), batch.begin(), batch.end());
             }
         } else {
@@ -132,11 +134,24 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
                 if (found == store->sourceIds().end() || *found != id) throw std::runtime_error("track source ID missing");
                 p = track(*store, found - store->sourceIds().begin(), object);
                 if (fs::exists(packed / "metadata.json")) p.source = readJson(packed / "metadata.json");
+            } else if (object.storageKind == "url") {
+                // Remote tifxyz: fetched once, decoded here, then held by the store.
+                if (object.kind != "surface" || !formats::isRemoteSource(object.storageRef))
+                    throw std::runtime_error("remote sources are tifxyz surfaces at http(s):// or s3:// URLs");
+                const auto staging = fs::temp_directory_path() / ("vc-object-fetch-" + util::newUuid());
+                fs::create_directory(staging);
+                try {
+                    formats::fetchRemoteSurface(object.storageRef, staging);
+                    p = surface(staging);
+                } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
+                std::error_code ignored; fs::remove_all(staging, ignored);
+                // The registration, not the remote meta.json, is the identity.
+                p.object.uuid = object.uuid;
             } else {
                 std::optional<fs::path> path;
                 { auto read = db.read(); path = db.resolveStoragePath(read, object.uuid, datasetRoot); }
                 if (!path) throw std::runtime_error("source not found by UUID");
-                if (object.kind == "patch") p = patch(*path);
+                if (object.kind == "surface") p = surface(*path);
                 else if (object.kind == "fiber") p = fiber(*path);
                 else if (object.kind == "point_collection") {
                     if (!pclCache.contains(*path)) pclCache[*path] = collections(*path);
@@ -222,5 +237,12 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
         }
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;
+}
+std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::string& objectUuid,
+    const std::string& name, const fs::path& tiff)
+{
+    const auto current = db.currentGeometry(txn, objectUuid);
+    if (!current || current->kind != "surface") throw std::invalid_argument("channel import requires a stored surface: " + objectUuid);
+    return db.updateSurfaceChannels(txn, objectUuid, {formats::surfaceChannel(name, tiff)}, {}, current->uuid);
 }
 } // namespace vc::objects

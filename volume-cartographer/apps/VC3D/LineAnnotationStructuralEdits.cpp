@@ -188,8 +188,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // The join span has no real geometry until the merged line is re-fit.
     addUniqueSorted(merged.tags, std::string{kNeedsReoptimizationTag});
     merged.hvClassification =
-        classifyFiberHv(storedControlPointPositions(merged.controlPoints));
-    merged.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
+        vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(merged.controlPoints));
     merged.coordinateIdentity = clicked.coordinateIdentity;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
@@ -243,7 +242,6 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
-        half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
         half.coordinateIdentity = parent.coordinateIdentity;
     };
     StoredFiber& prefix = result.prefix;
@@ -278,8 +276,8 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         moved.controlPointIndex = remapped->second;
         (remapped->first ? suffix : prefix).branches.push_back(std::move(moved));
     }
-    prefix.hvClassification = classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
-    suffix.hvClassification = classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
+    prefix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(prefix.controlPoints));
+    suffix.hvClassification = vc::fiber_tracer::classifyFiberHv(storedControlPointPositions(suffix.controlPoints));
 
     if (linkHalves) {
         // "Split and link, same winding": record the boundary connection as
