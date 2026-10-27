@@ -136,6 +136,18 @@ TEST_CASE("remote object paths are joined before an unchanged query")
           "https://example.test/source.zarr/metadata.json");
 }
 
+TEST_CASE("listable prefix URLs split into origin and key prefix")
+{
+    const auto split = vc::splitRemotePrefixUrl("https://bucket.test/a/b.zarr//");
+    REQUIRE(split);
+    CHECK(split->origin == "https://bucket.test");
+    CHECK(split->keyPrefix == "a/b.zarr/");
+    CHECK(vc::splitRemotePrefixUrl("https://bucket.test/a")->keyPrefix == "a/");
+    CHECK_FALSE(vc::splitRemotePrefixUrl("https://bucket.test/"));
+    CHECK_FALSE(vc::splitRemotePrefixUrl("https://bucket.test"));
+    CHECK_FALSE(vc::splitRemotePrefixUrl("bucket.test/a"));
+}
+
 TEST_CASE("fragment-free remote volume specs retain existing resolution")
 {
     const std::string input = "https://example.test/source.zarr?token=x/";

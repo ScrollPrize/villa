@@ -5,6 +5,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
 #include <nlohmann/json.hpp>
@@ -27,31 +28,6 @@
 
 namespace vc3d::opendata {
 namespace {
-
-std::string trimTrailingSlashes(std::string value)
-{
-    while (!value.empty() && value.back() == '/') {
-        value.pop_back();
-    }
-    return value;
-}
-
-// Split "https://host/some/key/prefix" into origin ("https://host") and the
-// key prefix ("some/key/prefix/").
-bool splitRemotePrefix(const std::string& url, std::string& origin, std::string& prefix)
-{
-    const auto schemePos = url.find("://");
-    if (schemePos == std::string::npos) {
-        return false;
-    }
-    const auto hostEnd = url.find('/', schemePos + 3);
-    if (hostEnd == std::string::npos) {
-        return false;
-    }
-    origin = url.substr(0, hostEnd);
-    prefix = trimTrailingSlashes(url.substr(hostEnd + 1)) + "/";
-    return prefix.size() > 1;
-}
 
 struct RemoteObject {
     std::string relativePath;  // key with the listing prefix stripped
@@ -454,12 +430,13 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return finalDir;
     }
 
-    std::string origin;
-    std::string prefix;
-    if (!splitRemotePrefix(info.url, origin, prefix)) {
+    const auto remote = vc::splitRemotePrefixUrl(info.url);
+    if (!remote) {
         if (errorOut) *errorOut = "unsupported normal grids URL: " + info.url;
         return {};
     }
+    const std::string& origin = remote->origin;
+    const std::string& prefix = remote->keyPrefix;
 
     NormalGridsDownloadProgress state;
     state.status = "listing";

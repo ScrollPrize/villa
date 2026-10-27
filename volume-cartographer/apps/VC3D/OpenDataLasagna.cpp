@@ -7,6 +7,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "utils/zarr.hpp"
@@ -40,33 +41,14 @@ void writeMarker(const std::filesystem::path& path, const std::string& text)
     }
 }
 
-std::string trimSlashes(std::string value)
-{
-    while (!value.empty() && value.back() == '/') value.pop_back();
-    return value;
-}
-
-bool splitPrefixUrl(const std::string& rawUrl,
-                    std::string& origin,
-                    std::string& prefix)
-{
-    const auto url = trimSlashes(rawUrl);
-    const auto scheme = url.find("://");
-    if (scheme == std::string::npos) return false;
-    const auto path = url.find('/', scheme + 3);
-    if (path == std::string::npos) return false;
-    origin = url.substr(0, path);
-    prefix = url.substr(path + 1) + "/";
-    return !prefix.empty();
-}
-
 std::string discoverManifestKey(const OpenDataLasagnaInfo& info)
 {
-    std::string origin;
-    std::string prefix;
-    if (!splitPrefixUrl(info.artifactUrl, origin, prefix))
+    const auto remote = vc::splitRemotePrefixUrl(info.artifactUrl);
+    if (!remote)
         throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " +
                                  info.artifactUrl);
+    const std::string& origin = remote->origin;
+    const std::string& prefix = remote->keyPrefix;
     const QString listUrl = QString::fromStdString(origin) +
         QStringLiteral("/?list-type=2&max-keys=100&delimiter=%2F&prefix=") +
         QString::fromUtf8(QUrl::toPercentEncoding(QString::fromStdString(prefix)));
@@ -262,11 +244,10 @@ std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
     OpenDataLasagnaInfo info;
     info.artifactUrl = artifactUrl;
     const auto key = discoverManifestKey(info);
-    std::string origin;
-    std::string prefix;
-    if (!splitPrefixUrl(artifactUrl, origin, prefix))
+    const auto remote = vc::splitRemotePrefixUrl(artifactUrl);
+    if (!remote)
         throw std::runtime_error("Invalid Lasagna artifact URL");
-    return vcr::catalog::joinOpenDataUrl(origin, key);
+    return vcr::catalog::joinOpenDataUrl(remote->origin, key);
 }
 
 OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(

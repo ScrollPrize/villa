@@ -45,4 +45,16 @@ RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input);
 // are preserved exactly (no decoding, reordering, or re-encoding).
 std::string joinRemoteUrlPath(const std::string& baseUrl, const std::string& childPath);
 
+// A listable object-store prefix URL split into the origin the listing request
+// goes to and the key prefix it lists: "https://host/some/key/prefix/" is
+// origin "https://host" and keyPrefix "some/key/prefix/".
+struct RemotePrefix {
+    std::string origin;
+    std::string keyPrefix;
+};
+
+// Trailing slashes on the URL are ignored. nullopt when the URL has no scheme
+// or no key path below its host.
+std::optional<RemotePrefix> splitRemotePrefixUrl(const std::string& url);
+
 }  // namespace vc

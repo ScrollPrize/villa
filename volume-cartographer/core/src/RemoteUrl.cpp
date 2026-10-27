@@ -204,4 +204,24 @@ std::string joinRemoteUrlPath(const std::string& baseUrl, const std::string& chi
     return path + query;
 }
 
+std::optional<RemotePrefix> splitRemotePrefixUrl(const std::string& url)
+{
+    const auto scheme = url.find("://");
+    if (scheme == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto hostEnd = url.find('/', scheme + 3);
+    if (hostEnd == std::string::npos) {
+        return std::nullopt;
+    }
+    std::string keyPrefix = url.substr(hostEnd + 1);
+    while (!keyPrefix.empty() && keyPrefix.back() == '/') {
+        keyPrefix.pop_back();
+    }
+    if (keyPrefix.empty()) {
+        return std::nullopt;
+    }
+    return RemotePrefix{url.substr(0, hostEnd), keyPrefix + "/"};
+}
+
 }  // namespace vc
