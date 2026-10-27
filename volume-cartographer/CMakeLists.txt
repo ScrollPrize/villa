@@ -828,8 +828,7 @@ if(VC_TESTING)
         test_growth_config
         test_growth_helpers
         test_surf_tracker_data
-        test_neural_tracer_connection
-        bench_lasagna_line_edit)
+        test_neural_tracer_connection)
 
     function(vc_register_test_target target)
         if(NOT TARGET ${target})

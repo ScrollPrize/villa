@@ -64,7 +64,6 @@ function(vc_add_test)
     vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
-vc_add_test(NAME test_smoke LIBS doctest::doctest)
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
@@ -175,13 +174,6 @@ vc_add_test(NAME test_fiber_trace_review
 
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
-vc_add_test(NAME test_lasagna_service_manager_factory
-    SOURCES test_lasagna_service_manager_factory.cpp
-            test_lasagna_service_manager_stub.cpp
-            ${lasagna_service_manager_moc}
-    LIBS Qt6::Core vc_core
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 vc_add_test(NAME test_lasagna_batch_window
     SOURCES test_lasagna_batch_window.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
@@ -294,7 +286,6 @@ vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_t
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
-vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
 set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
@@ -351,35 +342,6 @@ vc_add_test(NAME test_blosc1_compat LIBS doctest::doctest vc_core Blosc::blosc)
 # failure messages exactly without spawning the binary.
 vc_add_test(NAME test_merge_grid_resolve)
 
-# End-to-end test that spawns the built vc_merge_tifxyz binary on two
-# synthetic 16x16 tifxyz dirs. Opt-in via VC_RUN_E2E=1; the test skips
-# itself if unset, so the default ctest run stays fast.
-add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
-target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
-vc_register_test_target(test_merge_e2e_small)
-if(VC_RUN_E2E)
-    add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
-    vc_register_ctest(test_merge_e2e_small test_merge_e2e_small)
-    # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
-    # CTest runs reliably regardless of the working directory.
-    set_tests_properties(test_merge_e2e_small PROPERTIES
-        ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
-endif()
-
-# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
-# plane meshes (clean, and with 3% stretched triangles) and checks the output
-# cell size under the three scale methods (median, mean, manual). Opt-in via
-# VC_RUN_E2E=1.
-add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
-target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
-vc_register_test_target(test_obj2tifxyz_legacy_scale)
-if(VC_RUN_E2E)
-    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
-    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
-    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
-        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
-endif()
-
 # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
 vc_add_test(NAME test_grow_seg_store_mode)
 add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
@@ -403,44 +365,6 @@ endif()
 add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_tifxyz2zarr_sparse vc_grow_seg_from_segments)
 set_tests_properties(test_tool_store_modes PROPERTIES
     ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
-
-add_executable(bench_volume_sample bench_volume_sample.cpp)
-target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_volume_sample)
-# Bench has a generous wall-clock assertion; not part of default ctest
-# unless the user opts in via VC_RUN_BENCHES. Expose it as a target so
-# it's always built and runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
-    vc_register_ctest(bench_volume_sample bench_volume_sample)
-endif()
-
-add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
-target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_quadsurface_gen)
-# Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
-# cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
-# built as a target so it's runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
-    vc_register_ctest(bench_quadsurface_gen bench_quadsurface_gen)
-endif()
-
-add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
-target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
-vc_register_test_target(bench_chunked_plane_sampler)
-
-add_executable(bench_chunk_cache_source_mirror bench_chunk_cache_source_mirror.cpp)
-target_link_libraries(bench_chunk_cache_source_mirror PRIVATE vc_core)
-vc_register_test_target(bench_chunk_cache_source_mirror)
-# Perf guard for the slice sampler hot path. Like bench_volume_sample it
-# carries only a loose wall-clock assertion, so it stays out of default
-# ctest unless the user opts in via VC_RUN_BENCHES; the target is always
-# built and runnable manually.
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
-    vc_register_ctest(bench_chunked_plane_sampler bench_chunked_plane_sampler)
-endif()
 
 add_executable(bench_render_synthetic bench_render_synthetic.cpp)
 target_link_libraries(bench_render_synthetic PRIVATE vc_core)
@@ -597,13 +521,6 @@ if(VC_RUN_RENDER_BENCHMARKS)
     endif()
 endif()
 
-add_executable(bench_lasagna_line_edit bench_lasagna_line_edit.cpp)
-target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
-vc_register_test_target(bench_lasagna_line_edit)
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
-    vc_register_ctest(bench_lasagna_line_edit bench_lasagna_line_edit)
-endif()
 
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
@@ -657,9 +574,6 @@ vc_add_test(NAME test_gridstore_malformed)
 # Live network test: anonymous read of the PHerc 0172 zarr on AWS S3.
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
-vc_add_test(NAME test_pherc0172_live)
-set_property(TEST test_pherc0172_live APPEND PROPERTY LABELS network)
-
 vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)

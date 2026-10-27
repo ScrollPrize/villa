@@ -1,6 +1,7 @@
 // The mesh tools' outputs on small fixed inputs: the OBJ vc_tifxyz2obj writes
-// (bytes) and the grids vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize from
-// an OBJ. The expected values were recorded from the tools before their mesh
+// (bytes), the grids vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize from
+// an OBJ, and the cell size vc_obj2tifxyz_legacy keeps on a plane with a few
+// stretched triangles. The expected values were recorded from the tools before their mesh
 // code moved into vc::meshing; each tool's binary comes from VC_<TOOL>_BIN.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -11,6 +12,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -201,4 +204,82 @@ TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
         dir.path / "legacy.log");
     const auto legacy = load_quad_from_tifxyz(dir.path / "legacy");
     checkStats(stats(*legacy->rawPointsPtr(), validPoint), GridStats{19, 22, 311, {20450.56852722168, 22397.15013885498, 12711.597316741943}, {22333.401655410762, 24536.34768153762, 13867.411323276525}}, 3);
+}
+
+namespace {
+constexpr int kPlaneN = 200;
+constexpr double kPlaneStep = 4.0; // voxels per lattice cell
+constexpr double kPlaneUv = 20.0;  // vt units per lattice cell, as vc_merge_tifxyz writes them
+
+// A kPlaneN^2 lattice plane; `stretched` lifts every 100th vertex off it.
+void writePlaneObj(const fs::path& path, bool stretched)
+{
+    std::ofstream f(path);
+    for (int i = 0; i < kPlaneN; ++i)
+        for (int j = 0; j < kPlaneN; ++j) {
+            double z = 500.0;
+            if (stretched && i % 10 == 5 && j % 10 == 5) z += 9.8 * kPlaneStep;
+            f << "v " << 1000.0 + j * kPlaneStep << " " << 1000.0 + i * kPlaneStep << " " << z << "\n";
+        }
+    for (int i = 0; i < kPlaneN; ++i)
+        for (int j = 0; j < kPlaneN; ++j) f << "vt " << j * kPlaneUv << " " << i * kPlaneUv << "\n";
+    auto id = [](int i, int j) { return i * kPlaneN + j + 1; };
+    for (int i = 0; i + 1 < kPlaneN; ++i)
+        for (int j = 0; j + 1 < kPlaneN; ++j) {
+            const int a = id(i, j), b = id(i, j + 1), c = id(i + 1, j), d = id(i + 1, j + 1);
+            f << "f " << a << "/" << a << " " << b << "/" << b << " " << d << "/" << d << "\n";
+            f << "f " << a << "/" << a << " " << d << "/" << d << " " << c << "/" << c << "\n";
+        }
+}
+
+double medianNeighbourStep(const QuadSurface& surface)
+{
+    const cv::Mat_<cv::Vec3f>& p = *surface.rawPointsPtr();
+    std::vector<double> d;
+    for (int r = 0; r < p.rows; ++r)
+        for (int c = 0; c < p.cols; ++c) {
+            if (!validPoint(p(r, c))) continue;
+            if (c + 1 < p.cols && validPoint(p(r, c + 1))) d.push_back(cv::norm(p(r, c + 1) - p(r, c)));
+            if (r + 1 < p.rows && validPoint(p(r + 1, c))) d.push_back(cv::norm(p(r + 1, c) - p(r, c)));
+        }
+    REQUIRE(!d.empty());
+    std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+    return d[d.size() / 2];
+}
+}
+
+TEST_CASE("vc_obj2tifxyz_legacy keeps the cell size when a few triangles are stretched")
+{
+    Dir dir;
+    writePlaneObj(dir.path / "clean.obj", false);
+    writePlaneObj(dir.path / "stretched.obj", true);
+    const auto step = [&](const std::string& mesh, const std::string& tag, const std::string& extra) {
+        const auto out = dir.path / (mesh + "_" + tag);
+        run(tool("VC_OBJ2TIFXYZ_LEGACY_BIN") + " " + quoted(dir.path / (mesh + ".obj")) + " " + quoted(out) + " 4 " + extra,
+            dir.path / (mesh + "_" + tag + ".log"));
+        return medianNeighbourStep(*load_quad_from_tifxyz(out));
+    };
+    // tag, extra argument, whether the stretched mesh keeps the lattice step
+    const struct { const char* tag; const char* extra; bool robust; } methods[] = {
+        {"median", "", true},                    // default
+        {"mean", "--scale-method=mean", false},
+        {"manual", "--uv-scale=0.2", true},      // vt = cell * 20 on a 4 voxel lattice
+    };
+    for (const auto& m : methods) {
+        CHECK(std::abs(step("clean", m.tag, m.extra) - kPlaneStep) <= 0.01 * kPlaneStep);
+        const double stretched = step("stretched", m.tag, m.extra);
+        if (m.robust) CHECK(std::abs(stretched - kPlaneStep) <= 0.01 * kPlaneStep);
+        else CHECK(stretched < 0.9 * kPlaneStep);
+    }
+
+    // Invalid scale options are refused and write nothing.
+    const char* refused[] = {"--uv-scale=abc", "--uv-scale=0", "--uv-scale=-1",
+                             "--uv-scale=0.2 --scale-method=mean", "--scale-method=foo"};
+    for (size_t i = 0; i < std::size(refused); ++i) {
+        const auto out = dir.path / ("refused_" + std::to_string(i));
+        const auto command = tool("VC_OBJ2TIFXYZ_LEGACY_BIN") + " " + quoted(dir.path / "clean.obj") + " " + quoted(out) +
+                             " 4 " + refused[i] + " > " + quoted(dir.path / ("refused_" + std::to_string(i) + ".log")) + " 2>&1";
+        CHECK_MESSAGE(std::system(command.c_str()) != 0, refused[i] << " not refused");
+        CHECK_MESSAGE(!fs::exists(out), refused[i] << " created " << out);
+    }
 }
