@@ -1349,36 +1349,26 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     return options;
 }
 
-void SegmentationCommandHandler::configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath)
+void SegmentationCommandHandler::configureCommandRunnerForVolume(const std::string& volumeId)
 {
     if (!_cmdRunner) {
         return;
     }
-
     _cmdRunner->setRemoteVolumeUrl(QString());
     _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
-
-    if (!_state || !_state->vpkg() || volumePath.isEmpty()) {
+    if (!_state || !_state->vpkg() || !_state->vpkg()->hasVolume(volumeId)) {
         return;
     }
-
-    for (const auto& volumeId : _state->vpkg()->volumeIDs()) {
-        auto volume = _state->vpkg()->volume(volumeId);
-        if (!volume || !volume->isRemote()) {
-            continue;
-        }
-        if (commandPathForVolume(volume) != volumePath) {
-            continue;
-        }
-
-        const auto& auth = volume->remoteAuth();
-        _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
-        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
-                                        QString::fromStdString(auth.secret_key),
-                                        QString::fromStdString(auth.session_token),
-                                        QString::fromStdString(auth.region));
+    const auto volume = _state->vpkg()->volume(volumeId);
+    if (!volume->isRemote()) {
         return;
     }
+    const auto& auth = volume->remoteAuth();
+    _cmdRunner->setRemoteVolumeUrl(QString::fromStdString(volume->remoteLocator()));
+    _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
+                                    QString::fromStdString(auth.secret_key),
+                                    QString::fromStdString(auth.session_token),
+                                    QString::fromStdString(auth.region));
 }
 
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
@@ -1407,64 +1397,34 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
         return;
     }
 
-    if (!_cmdRunner) {
-        emit statusMessage(tr("Command line tools not available"), 3000);
-        return;
-    }
-
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
-        return;
-    }
-
+    RenderSegmentParams params;
+    params.volumeId = dlg.volumeId();
     // Trim once: the dialog enables its Zarr options on the trimmed path, so the
-    // command builder has to use the same value or the two disagree on a pattern
-    // with trailing whitespace.
-    const QString chosenOutputPattern = dlg.outputPattern().trimmed();
-    _cmdRunner->setStore(stored->store);
-    _cmdRunner->setSurface(QString::fromStdString(stored->uuid));
-    _cmdRunner->setOutputPattern(chosenOutputPattern);
-    // Interactive renders default to a TIFF stack; a .zarr output path is how
-    // the dialog asks for the zarr store instead. That same suffix is what
-    // enables its "Also write TIFF slices (Zarr)" checkbox, so the two have to
-    // agree or the checkbox has nothing to attach to.
-    _cmdRunner->setRenderOutputFormat(
-        chosenOutputPattern.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)
-            ? CommandLineToolRunner::RenderOutputFormat::Zarr
-            : CommandLineToolRunner::RenderOutputFormat::TifStack);
-    _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
-    // The surface is read in the rendered volume's voxels through the store.
-    const auto renderVolume = _state && _state->vpkg() && _state->vpkg()->hasVolume(dlg.volumeId().toStdString())
-        ? _state->vpkg()->volume(dlg.volumeId().toStdString())
-        : nullptr;
-    if (!renderVolume) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Choose a volume of the open project to render."));
+    // command has to use the same value. A .zarr output path asks for the zarr
+    // store (which "Also write TIFF slices (Zarr)" attaches to), else a TIFF stack.
+    params.outputPattern = dlg.outputPattern().trimmed();
+    params.outputFormat = params.outputPattern.endsWith(QStringLiteral(".zarr"), Qt::CaseInsensitive)
+        ? CommandLineToolRunner::RenderOutputFormat::Zarr
+        : CommandLineToolRunner::RenderOutputFormat::TifStack;
+    params.scale = static_cast<float>(dlg.scale());
+    params.groupIdx = dlg.groupIdx();
+    params.numSlices = dlg.numSlices();
+    params.ompThreads = dlg.ompThreads();
+    params.cropX = dlg.cropX();
+    params.cropY = dlg.cropY();
+    params.cropWidth = dlg.cropWidth();
+    params.cropHeight = dlg.cropHeight();
+    params.rotateDegrees = dlg.rotateDegrees();
+    params.flipAxis = dlg.flipAxis();
+    params.includeTifs = dlg.includeTifs();
+    params.flatten = dlg.flatten();
+    params.flattenIterations = dlg.flattenIterations();
+    params.flattenDownsample = dlg.flattenDownsample();
+    CommandLaunchError error;
+    if (!startRenderImpl(segmentId, params, /*interactive=*/true, &error, nullptr)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return;
     }
-    _cmdRunner->setRenderVoxelSize(
-        renderVolume ? renderVolume->voxelSize() : 0.0,
-        renderVolume &&
-            (renderVolume->baseScaleLevel() > 0 ||
-             renderVolume->hasExplicitVoxelSizeOverride()));
-    _cmdRunner->setRenderVolume(dlg.volumeId());
-    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    _cmdRunner->setVolumePath(commandPathForVolume(renderVolume));
-    _cmdRunner->setRemoteVolumeUrl(renderVolume->isRemote() ? commandPathForVolume(renderVolume) : QString());
-    if (renderVolume->isRemote()) {
-        const auto& auth = renderVolume->remoteAuth();
-        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
-                                        QString::fromStdString(auth.secret_key),
-                                        QString::fromStdString(auth.session_token),
-                                        QString::fromStdString(auth.region));
-    } else {
-        _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
-    }
-    _cmdRunner->setRenderAdvanced(
-        dlg.cropX(), dlg.cropY(), dlg.cropWidth(), dlg.cropHeight(), dlg.rotateDegrees(), dlg.flipAxis());
-    _cmdRunner->setIncludeTifs(dlg.includeTifs());
-    _cmdRunner->setFlattenOptions(dlg.flatten(), dlg.flattenIterations(), dlg.flattenDownsample());
-
-    _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
     emit statusMessage(tr("Rendering surface: %1").arg(stored->name), 5000);
 }
 
@@ -1695,6 +1655,15 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
                                                     CommandLaunchError* error,
                                                     QString* resolvedOutputDir)
 {
+    return startRenderImpl(segmentId, params, /*interactive=*/false, error, resolvedOutputDir);
+}
+
+bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
+                                                 const RenderSegmentParams& params,
+                                                 bool interactive,
+                                                 CommandLaunchError* error,
+                                                 QString* resolvedOutputDir)
+{
     const CommandLaunchErrorSetter setErr{error};
 
     // Validate without opening dialogs.
@@ -1742,30 +1711,30 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         return false;
     }
 
-    // Resolve the output base relative to the package and create it if needed.
-    const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
-    std::filesystem::path baseDir;
-    try {
-        if (params.outputDir.isEmpty()) {
-            auto* catalog = _surfacePanel->catalog();
-            baseDir = catalog->session()->artifactDirectory(*catalog->attachment(), stored->uuid);
-        } else {
-            std::filesystem::path requested(params.outputDir.toStdString());
-            baseDir = requested.is_absolute() ? requested : (volpkgPath / requested);
+    // An explicit output pattern, else one in the output base (relative to the
+    // package, or the surface's artifacts), created if needed.
+    QString outputPattern = params.outputPattern;
+    if (outputPattern.isEmpty()) {
+        const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
+        std::filesystem::path baseDir;
+        try {
+            if (params.outputDir.isEmpty()) {
+                auto* catalog = _surfacePanel->catalog();
+                baseDir = catalog->session()->artifactDirectory(*catalog->attachment(), stored->uuid);
+            } else {
+                std::filesystem::path requested(params.outputDir.toStdString());
+                baseDir = requested.is_absolute() ? requested : (volpkgPath / requested);
+            }
+            std::filesystem::create_directories(baseDir);
+        } catch (const std::exception& e) {
+            setErr(tr("Failed to create output directory: %1").arg(e.what()));
+            return false;
         }
-        std::filesystem::create_directories(baseDir);
-    } catch (const std::exception& e) {
-        setErr(tr("Failed to create output directory: %1").arg(e.what()));
-        return false;
+        const bool wantZarr = params.outputFormat == CommandLineToolRunner::RenderOutputFormat::Zarr;
+        outputPattern = QString::fromStdString((baseDir / (wantZarr ? "surface.zarr" : "layers")).string());
     }
 
-    const bool wantZarr =
-        params.outputFormat == CommandLineToolRunner::RenderOutputFormat::Zarr;
-    const std::filesystem::path outputArtifact =
-        baseDir / (wantZarr ? "surface.zarr" : "layers");
-    const QString outputPattern = QString::fromStdString(outputArtifact.string());
-
-    // Reset options omitted from this API so prior UI settings cannot leak in.
+    // Every option is set, so earlier settings cannot leak in.
     _cmdRunner->setStore(stored->store);
     _cmdRunner->setSurface(QString::fromStdString(stored->uuid));
     _cmdRunner->setOutputPattern(outputPattern);
@@ -1783,15 +1752,18 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     }
 
     _cmdRunner->setVolumePath(volumePath);
-    configureCommandRunnerRemoteAuthForVolumePath(volumePath);
+    configureCommandRunnerForVolume(renderVolume->id());
 
     _cmdRunner->setRenderVolume(QString::fromStdString(renderVolume->id()));
-    _cmdRunner->setRenderAdvanced(0, 0, 0, 0, 0.0, -1);
-    _cmdRunner->setIncludeTifs(false);
-    _cmdRunner->setFlattenOptions(false, 10, 1);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
+    _cmdRunner->setRenderAdvanced(params.cropX, params.cropY, params.cropWidth, params.cropHeight,
+                                  params.rotateDegrees, params.flipAxis);
+    _cmdRunner->setIncludeTifs(params.includeTifs);
+    _cmdRunner->setFlattenOptions(params.flatten, params.flattenIterations, params.flattenDownsample);
     if (!_cmdRunner->execute(
             CommandLineToolRunner::Tool::RenderTifXYZ,
-            CommandLineToolRunner::ExecutionOptions::silent())) {
+            interactive ? CommandLineToolRunner::ExecutionOptions{}
+                        : CommandLineToolRunner::ExecutionOptions::silent())) {
         setErr(tr("Failed to start render."));
         return false;
     }
@@ -2014,7 +1986,7 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
     paramsFile->flush();
 
-    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+    configureCommandRunnerForVolume(dlg.selectedVolumeId().toStdString());
     _cmdRunner->setStore(stored->store);
     _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
                                       dlg.selectedVolumeId(), outputTag, QString());
@@ -2253,7 +2225,7 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                                       selectedVolumeId,
                                       QStringLiteral("paths"),
                                       QStringLiteral("local"));
-    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
@@ -2414,7 +2386,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
          << QString::number(seedPoint.y(), 'g', 10)
          << QString::number(seedPoint.z(), 'g', 10);
 
-    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+    configureCommandRunnerForVolume(selectedVolumeId.toStdString());
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();

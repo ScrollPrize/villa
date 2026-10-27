@@ -96,6 +96,15 @@ public:
         int     numSlices{1};         // number of slices to render; >= 1
         bool    hasVoxelSize{false};  // true => override voxel size with voxelSizeUm
         double  voxelSizeUm{0.0};     // physical voxel size (micrometers), > 0
+        QString outputPattern;        // explicit output (the dialog's); overrides outputDir
+        int     ompThreads{-1};       // -1 => the tool's default
+        int     cropX{0}, cropY{0}, cropWidth{0}, cropHeight{0};
+        double  rotateDegrees{0.0};
+        int     flipAxis{-1};         // -1 => no flip
+        bool    includeTifs{false};   // also write TIFF slices (Zarr output)
+        bool    flatten{false};
+        int     flattenIterations{10};
+        int     flattenDownsample{1};
     };
 
     // Arguments accepted by startSlimFlatten. keepPercent defaults to full
@@ -237,6 +246,12 @@ public:
                             const RenderSegmentParams& params,
                             CommandLaunchError* error = nullptr,
                             QString* resolvedOutputDir = nullptr);
+    // The one render launch, from the dialog (interactive) or the bridge.
+    bool startRenderImpl(const std::string& segmentId,
+                         const RenderSegmentParams& params,
+                         bool interactive,
+                         CommandLaunchError* error,
+                         QString* resolvedOutputDir);
 
     /// Starts SLIM/flatboi asynchronously with dialogs suppressed. Preconditions
     /// and tools are resolved before launch; completion uses flattenJobFinished.
@@ -338,7 +353,8 @@ private:
      */
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
-    void configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath);
+    // The tool reads volume `volumeId`: a remote one with its locator and auth.
+    void configureCommandRunnerForVolume(const std::string& volumeId);
 
     /**
      * Fixed resume-local tracer params before caller overrides.
