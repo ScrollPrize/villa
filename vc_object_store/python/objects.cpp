@@ -514,6 +514,20 @@ NB_MODULE(_native, m)
             const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(db, txn, owner, role); });
             return document ? jsonLoads(document->dump()) : nb::none();
         }, nb::arg("owner_uuid"), nb::arg("role"), "The document attached to owner in role, or None.")
+        .def("point_collections", [](PyObjectStore& self, const std::vector<std::string>& uuids, const std::string& volume) {
+            const auto collections = self.withRead<true>([&](auto& db, auto& txn) { return vo::pointCollections(db, txn, uuids, volume); });
+            nb::list out;
+            for (const auto& collection : collections) {
+                nb::dict item;
+                item["uuid"] = collection.uuid; item["name"] = collection.name;
+                item["ids"] = collection.points.ids; item["points"] = collection.points.points;
+                item["annotations"] = jsonLoads(collection.annotations.dump());
+                item["source"] = jsonLoads(collection.source.dump());
+                out.append(item);
+            }
+            return out;
+        }, nb::arg("uuids"), nb::arg("volume"),
+           "Point collections by UUID (any role), in the volume's voxels: uuid, name, ids, points, annotations, source.")
         .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
             const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
             nb::list out; for (const auto& record : records) out.append(edgeToPy(record));

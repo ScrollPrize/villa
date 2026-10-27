@@ -213,20 +213,40 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
     });
 }
 
+std::vector<AttachedCollection> volumeCollections(const ObjectStore& store, const Txn& txn, const std::string& volume)
+{
+    std::vector<AttachedCollection> result;
+    ObjectSelection selection;
+    selection.kind = "point_collection";
+    selection.volume = volume;
+    for (const auto& object : store.selectObjects(txn, selection)) {
+        if (nlohmann::json::parse(object.meta).contains("role")) continue;
+        if (const auto head = store.currentGeometry(txn, object.uuid))
+            result.push_back(readCollection(store, txn, object, head->uuid, ViewFrame{volume, 1}));
+    }
+    return result;
+}
+
+std::vector<AttachedCollection> pointCollections(const ObjectStore& store, const Txn& txn, const std::vector<std::string>& uuids,
+                                                 const std::string& volume)
+{
+    std::vector<AttachedCollection> result;
+    for (const auto& uuid : uuids) {
+        const auto object = store.objectByUuid(txn, util::canonicalUuid(uuid));
+        if (!object || object->retired || object->kind != "point_collection")
+            throw std::runtime_error("point collection not found: " + uuid);
+        const auto head = store.currentGeometry(txn, object->uuid);
+        if (!head) throw std::runtime_error("point collection has no geometry: " + uuid);
+        result.push_back(readCollection(store, txn, *object, head->uuid, ViewFrame{volume, 1}));
+    }
+    return result;
+}
+
 std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
                                                   const std::string& volume)
 {
     std::vector<AttachedCollection> result;
-    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
-        ObjectSelection selection;
-        selection.kind = "point_collection";
-        selection.volume = volume;
-        for (const auto& object : store.selectObjects(txn, selection)) {
-            if (nlohmann::json::parse(object.meta).contains("role")) continue;
-            if (const auto head = store.currentGeometry(txn, object.uuid))
-                result.push_back(readCollection(store, txn, object, head->uuid, ViewFrame{volume, 1}));
-        }
-    });
+    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { result = volumeCollections(store, txn, volume); });
     return result;
 }
 

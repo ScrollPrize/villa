@@ -323,7 +323,7 @@ def test_unsupported_schema_is_rejected(db, version, read_only):
 @pytest.mark.parametrize('kind,detail', [
     ('fiber', dict(family='V', manual_family=True, control_point_count=2, line_point_count=3,
                   length=4.5, width=2.5, width_gap_fraction=.3, optimization_mode='fit', bbox=[0., 1., 2., 3., 4., 5.])),
-    ('surface', dict(grid_width=3, grid_height=2, scale=(.5, .25), bbox=None)),
+    ('surface', dict(grid_width=3, grid_height=2, scale=(.5, .25), area=0., bbox=None)),
     ('track', dict(dataset_ref='dataset', external_key='track', family='H', point_count=3, length=4.5, bbox=None)),
 ])
 def test_record_fields_and_transaction_bindings(db, kind, detail):

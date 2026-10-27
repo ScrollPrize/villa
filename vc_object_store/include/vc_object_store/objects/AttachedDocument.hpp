@@ -59,7 +59,13 @@ void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, 
 // A volume's point collections: the live point_collection objects whose
 // coordinates map to `volume` (bound to it, or through a registration) and
 // that are no object's attached data (no meta.role), in its voxels.
+std::vector<AttachedCollection> volumeCollections(const ObjectStore&, const Txn&, const std::string& volume);
+// The same, read from a session's attachment.
 std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume);
+// The live point collections `uuids` (any role), in `volume`'s voxels and in
+// that order. Throws for one that is missing or does not map to the volume.
+std::vector<AttachedCollection> pointCollections(const ObjectStore&, const Txn&, const std::vector<std::string>& uuids,
+                                                 const std::string& volume);
 // In one commit: `changed` (in `volume`'s voxels) are created, bound to its
 // voxels, or revised keeping their points' identity; `removed` are retired.
 void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume,

@@ -15,7 +15,9 @@ def test_created_surface_reads_back_through_registrations(db_path):
         assert record["tags"] == ["paths"]
         assert record["meta"]["coordinates"] == {"volume_uuid": "a", "scale_factor": 1}
         assert record["meta"]["provenance"] == {"tool": "pytest", "parameters": {"seed": 7}, "sources": ["src"]}
-        assert record["meta"]["area_vx2"] == 12.0 and "format" not in record["meta"] and "uuid" not in record["meta"]
+        # The store keeps the area itself (one valid row: no cell has four valid corners).
+        assert "area_vx2" not in record["meta"] and "format" not in record["meta"] and "uuid" not in record["meta"]
+        assert record["surface"]["area"] == 0 and record["surface"]["grid_width"] == 2
         db.register_volume_transform("a", "b", [[2, 0, 0, 10], [0, 1, 0, 0], [0, 0, 1, 0]])
     points, valid, scale, _, revision, channels = read_surface(db_path, uid, volume="a")
     assert channels == {"approval"} and revision
