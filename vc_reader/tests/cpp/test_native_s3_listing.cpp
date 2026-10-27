@@ -30,9 +30,11 @@ int main()
         const auto split = splitPrefixUrl("https://bucket.test/a/b.zarr//");
         require(split && split->origin == "https://bucket.test" && split->key == "a/b.zarr/", "split");
         require(splitPrefixUrl("https://bucket.test/a")->key == "a/", "split adds slash");
-        require(!splitPrefixUrl("https://bucket.test/") && !splitPrefixUrl("https://bucket.test") &&
-                    !splitPrefixUrl("bucket.test/a"),
-                "no prefix");
+        const auto root = splitPrefixUrl("https://bucket.test/");
+        require(root && root->origin == "https://bucket.test" && root->key.empty() &&
+                    splitPrefixUrl("https://bucket.test")->key.empty(),
+                "bucket root");
+        require(!splitPrefixUrl("bucket.test/a") && !splitPrefixUrl("https:///a"), "no host");
 
         // Page URLs: sorted parameters, encoded values.
         require(listUrl({"https://b.test", "a b/c/"}) ==

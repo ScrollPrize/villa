@@ -18,8 +18,8 @@ struct Prefix {
     std::string key;  // empty lists the bucket root; else ends with '/'
 };
 
-// Trailing slashes on the URL are ignored. nullopt when the URL has no scheme
-// or no key path below its host.
+// Trailing slashes on the URL are ignored; a URL naming only the host (the
+// bucket) has an empty key. nullopt when the URL has no scheme or no host.
 [[nodiscard]] std::optional<Prefix> splitPrefixUrl(std::string_view url);
 
 // The GET URL of one ListObjectsV2 page under `prefix`. With a delimiter

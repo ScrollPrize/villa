@@ -1,5 +1,6 @@
 #include "vc_reader/s3_listing.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <stdexcept>
@@ -116,12 +117,11 @@ std::optional<Prefix> splitPrefixUrl(std::string_view url)
 {
     const auto scheme = url.find("://");
     if (scheme == std::string_view::npos) return std::nullopt;
-    const auto hostEnd = url.find('/', scheme + 3);
-    if (hostEnd == std::string_view::npos) return std::nullopt;
-    auto key = url.substr(hostEnd + 1);
+    const auto hostEnd = std::min(url.find('/', scheme + 3), url.size());
+    if (hostEnd == scheme + 3) return std::nullopt;
+    auto key = url.substr(std::min(hostEnd + 1, url.size()));
     while (!key.empty() && key.back() == '/') key.remove_suffix(1);
-    if (key.empty()) return std::nullopt;
-    return Prefix{std::string(url.substr(0, hostEnd)), std::string(key) + "/"};
+    return Prefix{std::string(url.substr(0, hostEnd)), key.empty() ? std::string() : std::string(key) + "/"};
 }
 
 std::string listUrl(const Prefix& prefix, std::string_view delimiter, std::string_view continuationToken, int maxKeys)

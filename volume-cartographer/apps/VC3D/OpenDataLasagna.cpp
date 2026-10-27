@@ -134,7 +134,7 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
 std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
 {
     const auto prefix = vcr::s3::splitPrefixUrl(artifactUrl);
-    if (!prefix)
+    if (!prefix || prefix->key.empty())
         throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " + artifactUrl);
     const auto page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(*prefix, "/", {}, 100)));
     std::vector<std::string> keys;

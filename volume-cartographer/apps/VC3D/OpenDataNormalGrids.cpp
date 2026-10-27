@@ -361,7 +361,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
     }
 
     const auto remote = vcr::s3::splitPrefixUrl(info.url);
-    if (!remote) {
+    if (!remote || remote->key.empty()) {
         if (errorOut) *errorOut = "unsupported normal grids URL: " + info.url;
         return {};
     }
