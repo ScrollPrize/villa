@@ -106,7 +106,7 @@ int main(int argc, char* argv[]) {
 
     // Load surface
     std::cout << "Loading surface: " << inputPath << std::endl;
-    auto surf = loadToolSurface(store ? &*store : nullptr, storeOptions ? &*storeOptions : nullptr, inputPath.string());
+    auto surf = store ? store->load(inputPath.string(), true, storeOptions->volume) : load_quad_from_tifxyz(inputPath);
     if (!surf) {
         std::cerr << "Failed to load surface: " << inputPath << std::endl;
         return 1;

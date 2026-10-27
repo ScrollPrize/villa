@@ -1080,7 +1080,7 @@ static int run_store(const StoreOutputArgs& output, const std::string& source, c
 {
   StoreSurfaces store(output.store, "flatboi");
   // With --volume-uuid the surface is flattened in that volume's voxels.
-  const auto surface = store.load(source, true, output.volume.empty() ? std::nullopt : std::optional(output.volume));
+  const auto surface = store.load(source, true, output.volume);
   const fs::path report_dir = fs::temp_directory_path() / ("flatboi-" + source + "-" + std::to_string(::getpid()));
   fs::create_directories(report_dir);
   const auto flat = flatten(*surface, opt, report_dir / "slim.obj", source);
@@ -1088,7 +1088,7 @@ static int run_store(const StoreOutputArgs& output, const std::string& source, c
 
   const std::string name = !output.name.empty() ? output.name
       : (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi";
-  const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.coordinates());
+  const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
   const auto artifacts = store.session()->artifactDirectory(store.attachment(), uuid);
   for (const auto& entry : fs::directory_iterator(report_dir)) {
     std::error_code ignored;
@@ -1179,7 +1179,7 @@ int main(int argc, char** argv) {
   if (store_mode != !source_surface.empty()) {
     std::cerr << "--store and --source-surface go together\n"; return 1;
   }
-  if (!store_mode && (!store_output.name.empty() || !store_output.tags.empty() || !store_output.volume.empty())) {
+  if (!store_mode && (!store_output.name.empty() || !store_output.tags.empty() || store_output.volume)) {
     std::cerr << "--name, --tag and --volume-uuid need --store\n"; return 1;
   }
   // The OBJ or tifxyz path, or nothing in store mode.

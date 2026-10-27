@@ -814,7 +814,7 @@ int main(int argc, char** argv)
         storeOptions = StoreToolOptions::from(vm);
         if (storeOptions) {
             store.emplace(storeOptions->store, "vc_straighten");
-            stored = loadToolSurface(&*store, &*storeOptions, inPath);
+            stored = store->load(inPath, true, storeOptions->volume);
             g = gridOf(*stored);
         } else {
             g = loadGrid(inPath);

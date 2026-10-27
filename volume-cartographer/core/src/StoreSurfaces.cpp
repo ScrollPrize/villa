@@ -48,7 +48,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
 
 std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
-                                  const std::optional<nlohmann::json>& coordinates)
+                                  const std::optional<std::string>& volume)
 {
     auto meta = nlohmann::json::object();
     std::optional<std::string> loadedIn;
@@ -60,8 +60,8 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
         if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
         if (!frames.empty()) loadedIn = *frames.begin();
     }
-    if (coordinates) meta["coordinates"] = *coordinates;
-    else if (loadedIn) meta["coordinates"] = *volumeCoordinates(*loadedIn);
+    if (volume) meta["coordinates"] = vc::objects::volumeCoordinates(*volume, 1);
+    else if (loadedIn) meta["coordinates"] = vc::objects::volumeCoordinates(*loadedIn, 1);
     else if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
             const auto source = db.objectByUuid(txn, sources.front());
@@ -140,15 +140,4 @@ bool StoreOutputArgs::parse(const std::string& arg)
     else if (const auto v = value("--volume-uuid")) volume = *v;
     else return false;
     return true;
-}
-
-std::optional<nlohmann::json> volumeCoordinates(const std::string& volume)
-{
-    if (volume.empty()) return std::nullopt;
-    return vc::objects::geometryCoordinates({{"volume_uuid", volume}, {"scale_factor", 1}});
-}
-
-std::optional<nlohmann::json> StoreOutputArgs::coordinates() const
-{
-    return volumeCoordinates(volume);
 }

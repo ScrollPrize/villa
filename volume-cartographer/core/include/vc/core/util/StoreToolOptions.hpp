@@ -14,15 +14,10 @@
 struct StoreToolOptions {
     std::filesystem::path store;
     // The volume stored surfaces are read in (through the store's view of them:
-    // their binding or a registration) and new surfaces are bound to; empty:
+    // their binding or a registration) and new surfaces are bound to; none:
     // stored coordinates.
-    std::string volume;
+    std::optional<std::string> volume;
     std::vector<std::string> tags;
-
-    std::optional<std::string> readVolume() const
-    {
-        return volume.empty() ? std::nullopt : std::optional<std::string>(volume);
-    }
 
     // --store (described by `storeHelp`), --volume-uuid and, for tools that
     // create surfaces, --tag.
@@ -55,12 +50,3 @@ struct StoreToolOptions {
         return options;
     }
 };
-
-// A tool's input surface: the stored surface `input` names in store mode (read
-// in options.volume's voxels when given), else the tifxyz directory `input`.
-inline std::unique_ptr<QuadSurface> loadToolSurface(StoreSurfaces* store, const StoreToolOptions* options,
-                                                    const std::string& input, bool applyValidity = true)
-{
-    if (store) return store->load(input, applyValidity, options ? options->readVolume() : std::nullopt);
-    return load_quad_from_tifxyz(input);
-}

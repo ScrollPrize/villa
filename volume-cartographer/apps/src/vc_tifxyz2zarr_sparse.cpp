@@ -1511,7 +1511,7 @@ int main(int argc, char* argv[])
             vm.insert({"input", po::variable_value(std::string(), false)});
             store.emplace(storeOptions->store, "vc_tifxyz2zarr_sparse");
             // Meshes are rasterized in the output volume's voxels.
-            loadMesh = [&](const fs::path& uuid) { return loadToolSurface(&*store, &*storeOptions, uuid.string()); };
+            loadMesh = [&](const fs::path& uuid) { return store->load(uuid.string(), true, storeOptions->volume); };
         } else if (vm.count("surface")) {
             throw std::runtime_error("--surface needs --store");
         }

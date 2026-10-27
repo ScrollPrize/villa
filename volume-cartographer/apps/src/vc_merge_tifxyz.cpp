@@ -420,7 +420,7 @@ struct GMSurface {
 
 GMSurface gmLoadSurface(const GMSurfaceSpec& spec, StoreSurfaces* store, const StoreToolOptions* options)
 {
-    auto up = loadToolSurface(store, options, spec.path.string());
+    auto up = store ? store->load(spec.path.string(), true, options->volume) : load_quad_from_tifxyz(spec.path);
     if (!up) throw std::runtime_error("failed to load surface: " + spec.path.string());
     GMSurface g;
     g.name = spec.name;

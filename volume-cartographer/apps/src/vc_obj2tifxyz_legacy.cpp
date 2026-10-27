@@ -176,7 +176,7 @@ int main(int argc, char *argv[])
     }
 
     if (output_dir.empty() == store_output.store.empty() ||
-        (store_output.store.empty() && (!store_output.name.empty() || !store_output.tags.empty() || !store_output.volume.empty()))) {
+        (store_output.store.empty() && (!store_output.name.empty() || !store_output.tags.empty() || store_output.volume))) {
         std::cerr << "Give an output directory or --store=<store>; --name, --tag and --volume-uuid need --store" << std::endl;
         return EXIT_FAILURE;
     }
@@ -228,7 +228,7 @@ int main(int argc, char *argv[])
             nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};
             StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
             const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
-                                           parameters, {}, store_output.tags, store_output.coordinates());
+                                           parameters, {}, store_output.tags, store_output.volume);
             store.finish();
             std::cout << "surface_uuid: " << uuid << std::endl;
         } catch (const std::exception& e) {

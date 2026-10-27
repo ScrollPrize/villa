@@ -18,16 +18,10 @@ struct StoreOutputArgs {
     std::filesystem::path store;
     std::string name;
     std::vector<std::string> tags;
-    std::string volume;
+    std::optional<std::string> volume;
     // Consumes `arg` when it is one of the options above.
     bool parse(const std::string& arg);
-    // meta.coordinates for outputs: bound to `volume` at its voxel scale.
-    std::optional<nlohmann::json> coordinates() const;
 };
-
-// The coordinates of a tool's output in `volume`'s voxels (scale 1); none when
-// no volume is named.
-std::optional<nlohmann::json> volumeCoordinates(const std::string& volume);
 
 // Surface objects for command-line tools: `--store PATH` with `--surface UUID`
 // inputs and new surface outputs that record their provenance. A hosted
@@ -49,12 +43,13 @@ public:
                                       const std::optional<std::string>& volume = std::nullopt);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
     // (e.g. area) except tifxyz file keys and status tags (`tags` are the record's); meta.provenance records the tool, its
-    // parameters and the source objects. meta.coordinates, unless given, is the
-    // frame the sources were loaded in: the volume they were read through (scale
-    // 1), else the first source's binding. Sources read in different frames throw.
+    // parameters and the source objects. It is bound to `volume`'s voxels when
+    // given, else to the frame the sources were loaded in: the volume they were
+    // read through, else the first source's binding. Sources read in different
+    // frames throw.
     std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
-                       const std::optional<nlohmann::json>& coordinates = std::nullopt);
+                       const std::optional<std::string>& volume = std::nullopt);
     // Publish the edited vertices of a surface this tool loaded, checked against
     // the revision it loaded; relationships are kept as recorded. The grid must
     // keep its size. Returns the new geometry revision.

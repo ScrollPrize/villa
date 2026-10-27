@@ -987,7 +987,8 @@ int main(int argc, char *argv[])
     uint32_t sweep_seed = 1;
     // Store mode: sources and outputs are surface objects.
     std::filesystem::path store_path;
-    std::string src_surface, volume_uuid, source_tag;
+    std::string src_surface, source_tag;
+    std::optional<std::string> volume_uuid;
     std::vector<std::string> output_tags;
 
     bool use_old_args = argc == 6 && argv[1][0] != '-' && argv[2][0] != '-' &&
@@ -1193,14 +1194,13 @@ int main(int argc, char *argv[])
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
-            if (!volume_uuid.empty()) selection.volume = volume_uuid;
+            selection.volume = volume_uuid;
             for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);
         // Read in the bound volume's voxels, the units of the selection and the output binding.
-        const auto volume = volume_uuid.empty() ? std::nullopt : std::optional<std::string>(volume_uuid);
-        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid, true, volume));
+        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid, true, volume_uuid));
     }
     std::vector<QuadSurface*> stored_source_pointers;
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
@@ -1208,7 +1208,7 @@ int main(int argc, char *argv[])
     auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
         const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
                                         source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
-                                        output_tags, volumeCoordinates(volume_uuid));
+                                        output_tags, volume_uuid);
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
