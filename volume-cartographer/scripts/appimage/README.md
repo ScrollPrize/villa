@@ -1,6 +1,6 @@
 # Linux AppImage packaging
 
-Bundles VC3D (the GUI) plus all ~35 `vc_*` command-line tools into a single
+Bundles VC3D (the GUI) plus all the `vc_*` command-line tools into a single
 relocatable `VC3D-<version>-linux-x86_64.AppImage`, where `<version>` is the git
 `<sha7>-<commit-date>` (matching the macOS/Windows package names). Ad-hoc builds
 with no git info produce an unversioned `VC3D-linux-x86_64.AppImage`.

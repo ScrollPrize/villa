@@ -122,28 +122,24 @@ naturally bounded by available graph work.
 
 ## Maintenance Rules
 
-Model calibration, case references, and tolerance are independent controls:
+The model, case references, and tolerance are independent controls:
 
-- **Recalibrate** only when changing how Callgrind events map to the score.
+- **Change the model** only when changing how Callgrind events map to the score.
 - **Refresh references** when an understood code or toolchain change shifts the
   expected score while the model remains valid.
 - **Change tolerance** when intentionally changing regression sensitivity.
 
-Do not recalibrate or widen tolerance merely to make an unexplained regression
+Do not change the model or widen tolerance merely to make an unexplained regression
 pass. Each operation requires a focused diff and its reason in the changelog or
 pull-request description.
 
-## Recalibrating The Model
+## Changing The Model
 
-The synthetic event-cost and synchronization calibration scripts that produced
-`core/test/data/render_valgrind_ci_model.json` have been retired; the frozen
-model stays checked in. `run_render_valgrind_ci.py freeze-model` still freezes a
-calibration `model.json` with synthetic-only provenance and the exact
-seven-feature data-read basis, and rejects an unaccepted calibration.
-
-A model change is recorded but does not fail by identity. Refresh all eight
-references only when an understood model change intentionally shifts the score
-baseline. Never use renderer observations to fit these coefficients.
+`core/test/data/render_valgrind_ci_model.json` is a frozen, synthetic-only
+model over the seven-feature data-read basis. A model change is recorded but
+does not fail by identity. Refresh all eight references only when an
+understood model change intentionally shifts the score baseline. Never use
+renderer observations to fit these coefficients.
 
 ## Refreshing Performance References
 
@@ -200,7 +196,7 @@ cmake --build volume-cartographer/build/ci-render-benchmark \
 ```
 
 `set-tolerance` validates the range and preserves every other reference field.
-Do not recalibrate the model, recollect profiles, or run `freeze-reference`
+Do not change the model, recollect profiles, or run `freeze-reference`
 solely to change policy width.
 
 ## Required Validation
