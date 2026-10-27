@@ -302,7 +302,6 @@ static int run_main(int argc, char *argv[])
             ("correct", po::value<std::string>(), "JSON file with point-based corrections for resume mode")
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
-            ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
             ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
                                                     "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
@@ -398,10 +397,6 @@ static int run_main(int argc, char *argv[])
                 std::cerr << "ERROR: --resume-opt must be one of 'skip', 'local', or 'global'" << std::endl;
                 return EXIT_FAILURE;
             }
-        }
-
-        if (vm.count("resume-generations")) {
-            params["resume_generations"] = vm["resume-generations"].as<int>();
         }
 
         if (vm.count("segment-name")) {
