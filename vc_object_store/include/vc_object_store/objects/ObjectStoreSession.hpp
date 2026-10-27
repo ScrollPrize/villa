@@ -3,6 +3,8 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include <chrono>
+#include <initializer_list>
+#include <string_view>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
@@ -41,6 +43,9 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
+    // Whether it may have changed records of these kinds: a commit touching
+    // one, or any attachment or hub event.
+    bool touches(std::initializer_list<std::string_view> kinds) const;
 };
 
 // Hosted replicas (objects/Hub.hpp) attached to a session sync in the background.
@@ -153,6 +158,10 @@ public:
     // hub is ahead. Blocks on the hub; throws HubLeaseRefused when another
     // replica holds one. Returns an empty hold for other stores.
     LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects);
+    // Editing an object from the revision on screen: lease it (leasing may first
+    // pull the hub's newer record), then check that the pin is still its current
+    // revision. Throws when it is not.
+    LeaseHold holdForEditing(const PinnedObject&);
     // nullopt unless the attachment is a writable hosted replica.
     std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
     // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.

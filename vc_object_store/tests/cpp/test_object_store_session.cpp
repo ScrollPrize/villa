@@ -251,6 +251,27 @@ int main() try
     session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, named)->name == "renamed", "a copy can be named");
     });
+    {
+        // Editing holds the object from the revision on screen.
+        PinnedObject pin{replacement, {replacement.storeUuid, named}, {}, std::nullopt};
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            pin.objectRevision = store.currentObjectRevision(txn, named)->uuid;
+        });
+        { auto held = session.holdForEditing(pin); }
+        auto stale = pin;
+        stale.objectRevision = vc::objects::util::newUuid();
+        bool refused = false;
+        try { auto held = session.holdForEditing(stale); } catch (const std::runtime_error&) { refused = true; }
+        require(refused, "a stale pin cannot be edited");
+        StoreSessionEvent committed;
+        committed.kind = StoreSessionEvent::Kind::Committed;
+        committed.changes.push_back(JournalEntry{});
+        committed.changes.back().kind = "surface";
+        StoreSessionEvent hub;
+        hub.kind = StoreSessionEvent::Kind::Hub;
+        require(committed.touches({"fiber", "surface"}) && !committed.touches({"fiber"}) && hub.touches({"fiber"}),
+                "events say which record kinds they may have changed");
+    }
     // Importing keeps the object's identity: its source version is its first
     // revision in the destination, and restoring that revision undoes later edits.
     session.importObject(catalog, replacement, surface);

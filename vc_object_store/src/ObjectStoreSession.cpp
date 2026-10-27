@@ -340,6 +340,25 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
     return result;
 }
 
+bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) const
+{
+    if (kind != Kind::Committed) return true;
+    return std::any_of(changes.begin(), changes.end(), [&](const auto& change) {
+        return std::find(kinds.begin(), kinds.end(), change.kind) != kinds.end();
+    });
+}
+
+LeaseHold ObjectStoreSession::holdForEditing(const PinnedObject& pin)
+{
+    auto lease = holdLeases(pin.attachment, {pin.object.objectUuid});
+    read(pin.attachment, [&](const auto& store, const auto& txn, const auto&) {
+        const auto head = store.currentObjectRevision(txn, pin.object.objectUuid);
+        if (!head || head->uuid != pin.objectRevision)
+            throw std::runtime_error("It changed in the object store since it was opened; reopen it to edit");
+    });
+    return lease;
+}
+
 LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, const std::vector<std::string>& objects)
 {
     auto attachment = acquire(identity, true);
