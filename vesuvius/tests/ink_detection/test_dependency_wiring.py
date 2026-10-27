@@ -32,12 +32,18 @@ def test_ink_runtime_dependencies_are_heavy_extras_and_configured_as_package_dat
 
     project = pyproject["project"]
     extras = project["optional-dependencies"]
-    model_names = _distribution_names(extras["models"])
+    model_core_names = _distribution_names(extras["models-core"])
     all_names = _distribution_names(extras["all"])
     core_names = _distribution_names(project["dependencies"])
     volume_names = _distribution_names(extras["volume-only"])
 
-    assert _INK_RUNTIME_DISTRIBUTIONS <= model_names
+    # Ink workflows must not need the monorepo C++ packages, so they can be
+    # installed where those cannot be built (e.g. macOS).
+    assert _INK_RUNTIME_DISTRIBUTIONS <= model_core_names
+    assert {"volume-cartographer", "vc-object-store"}.isdisjoint(model_core_names)
+    # `models` stays the full stack: everything in models-core plus the C++ packages.
+    assert set(extras["models"]) == {
+        "vesuvius[models-core]", "volume-cartographer", "vc-object-store"}
     assert _INK_RUNTIME_DISTRIBUTIONS <= all_names
     assert _INK_RUNTIME_DISTRIBUTIONS.isdisjoint(core_names)
     assert _INK_RUNTIME_DISTRIBUTIONS.isdisjoint(volume_names)

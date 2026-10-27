@@ -75,6 +75,11 @@ first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian
 libraries. This requirement does not apply to the base `vesuvius` installation
 shown above.
 
+If you only need ink detection, inference or training, and not
+`vesuvius.neural_tracing`, `uv sync --extra models-core` installs the same
+machine-learning stack without building those bindings. This works on macOS
+(Apple silicon, MPS) with no Homebrew C++ dependencies.
+
 ## Data licence
 
 Using the data that `vesuvius` reads means agreeing to these terms:
