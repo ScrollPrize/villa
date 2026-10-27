@@ -247,6 +247,41 @@ int main() try
                     "copies keep exact geometry");
         require(sourceAnnotations == targetAnnotations, "copies keep point annotations");
     }
+    const auto named = session.copyObject(catalog, replacement, surface, "renamed");
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, named)->name == "renamed", "a copy can be named");
+    });
+    // Importing keeps the object's identity: its source version is its first
+    // revision in the destination, and restoring that revision undoes later edits.
+    session.importObject(catalog, replacement, surface);
+    std::string imported, importedGeometry;
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        const auto history = store.objectHistory(txn, surface);
+        require(history.size() == 1 && history.front().record.name == "catalog surface",
+                "an imported object starts at its source version");
+        imported = history.front().uuid;
+        importedGeometry = *history.front().geometryRevision;
+    });
+    session.act(replacement, {{surface, imported}}, [&](auto& store, auto& txn) {
+        auto record = *store.objectByUuid(txn, surface);
+        record.name = "edited";
+        store.upsertObject(txn, record);
+        store.putGeometry(txn, surface, vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{9, 9, 9}, {4, 5, 6}}, {255, 255}}),
+                         importedGeometry);
+    });
+    std::string edited;
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        edited = store.currentObjectRevision(txn, surface)->uuid;
+        require(store.currentGeometry(txn, surface)->uuid != importedGeometry, "edits make new revisions");
+    });
+    session.act(replacement, {{surface, edited}}, [&](auto& store, auto& txn) { store.restoreObject(txn, surface, imported); });
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, surface)->name == "catalog surface" &&
+                store.currentGeometry(txn, surface)->uuid == importedGeometry, "restoring the first revision resets to the source");
+    });
+    bool refused = false;
+    try { session.importObject(catalog, replacement, surface); } catch (const std::exception&) { refused = true; }
+    require(refused, "an object is imported once");
     session.takeEvents();
     const auto looked = session.artifactDirectory(replacement, surface, false);
     require(!std::filesystem::exists(looked), "looking for artifacts creates nothing");

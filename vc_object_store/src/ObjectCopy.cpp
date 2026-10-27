@@ -4,7 +4,8 @@
 #include <limits>
 
 namespace vc::objects {
-ObjectCopy readObjectCopy(const ObjectStore& store, const Txn& txn, const std::string& objectUuid)
+ObjectCopy readObjectCopy(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+                          const std::optional<std::string>& copyUuid)
 {
     const auto object = store.objectByUuid(txn, objectUuid);
     if (!object) throw std::invalid_argument("object to copy not found: " + objectUuid);
@@ -12,7 +13,7 @@ ObjectCopy readObjectCopy(const ObjectStore& store, const Txn& txn, const std::s
     const auto geometry = store.currentGeometry(txn, object->uuid);
     ObjectCopy copy;
     auto& record = copy.record;
-    record.uuid = util::newUuid();
+    record.uuid = copyUuid ? *copyUuid : util::newUuid();
     record.kind = object->kind;
     record.name = object->name;
     record.tags = object->tags;

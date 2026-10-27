@@ -125,8 +125,15 @@ public:
     RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
         const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&);
     // Copy an object's current record and geometry from one attachment into
-    // another as a new object (objects/ObjectCopy.hpp); returns its UUID.
-    std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
+    // another as a new object (objects/ObjectCopy.hpp) named `name` (empty: the
+    // original's name), in one commit; returns its UUID.
+    std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid,
+                           const std::string& name = {});
+    // Bring an object into another attachment as the same object (same UUID):
+    // its current record and geometry become its first revision there, so
+    // restoring that revision returns to the source's version. Throws when the
+    // destination already has the object.
+    void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory

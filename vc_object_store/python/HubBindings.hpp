@@ -100,6 +100,8 @@ inline void bindObjectStoreSession(nb::module_& m)
         .def("artifact_directory", &vo::ObjectStoreSession::artifactDirectory, nb::arg("attachment"), nb::arg("object_uuid"),
              nb::arg("create") = true)
         .def("copy_object", &vo::ObjectStoreSession::copyObject, nb::arg("source"), nb::arg("destination"),
+             nb::arg("object_uuid"), nb::arg("name") = std::string(), nb::call_guard<nb::gil_scoped_release>())
+        .def("import_object", &vo::ObjectStoreSession::importObject, nb::arg("source"), nb::arg("destination"),
              nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("finalize", &vo::ObjectStoreSession::finalize, nb::call_guard<nb::gil_scoped_release>())
         .def("take_events", [](vo::ObjectStoreSession& self) {
