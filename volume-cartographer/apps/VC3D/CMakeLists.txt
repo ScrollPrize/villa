@@ -155,8 +155,6 @@ set(srcs
     segmentation/tools/SegmentationPushPullTool.cpp
     segmentation/tools/SegmentationPushPullTool.hpp
     segmentation/tools/SegmentationTool.hpp
-    segmentation/tools/SegmentationBrushTool.cpp
-    segmentation/tools/SegmentationBrushTool.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp

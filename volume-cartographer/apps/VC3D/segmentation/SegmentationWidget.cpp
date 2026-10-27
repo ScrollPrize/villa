@@ -460,7 +460,6 @@ void SegmentationWidget::setTtaOutlierDropThresh(double threshold) { _neuralTrac
 void SegmentationWidget::setCopyCheckpointPath(const QString& path) { _neuralTracerPanel->setCopyCheckpointPath(path); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 
-void SegmentationWidget::setEraseBrushActive(bool /*active*/) {}
 
 // --- Lasagna delegations ---
 

@@ -1,6 +1,5 @@
 #include "SegmentationModule.hpp"
 
-#include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "growth/SegmentationCorrections.hpp"

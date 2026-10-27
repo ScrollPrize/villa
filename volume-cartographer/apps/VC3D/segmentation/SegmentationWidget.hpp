@@ -85,7 +85,6 @@ public:
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
-    void setEraseBrushActive(bool active);
     void setManualAddActive(bool active);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
     // Route direct changes through the panel so manualAddConfigChanged reaches
