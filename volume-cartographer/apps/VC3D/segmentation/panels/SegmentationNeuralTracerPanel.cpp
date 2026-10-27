@@ -319,7 +319,6 @@ void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
         return;
     }
     _neuralTracerEnabled = enabled;
-    writeSetting(QStringLiteral("neural_tracer_enabled"), _neuralTracerEnabled);
 
     if (_chkNeuralTracerEnabled) {
         const QSignalBlocker blocker(_chkNeuralTracerEnabled);

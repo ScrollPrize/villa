@@ -24,7 +24,6 @@ public:
 
     void startStroke(const QPointF& surfacePos);
     void extendStroke(const QPointF& surfacePos, bool forceSample);
-    void pauseStroke();
     void finishStroke();
     void cancelStroke();
     void refreshFromSurface();

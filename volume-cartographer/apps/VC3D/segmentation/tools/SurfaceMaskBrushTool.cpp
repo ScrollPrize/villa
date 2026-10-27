@@ -5,15 +5,12 @@
 #include "../../ViewerManager.hpp"
 
 #include <QCoreApplication>
-#include <QLoggingCategory>
 
 #include <algorithm>
 #include <cmath>
 #include <exception>
 
 #include "vc/core/util/QuadSurface.hpp"
-
-Q_LOGGING_CATEGORY(lcSurfaceMaskBrush, "vc.segmentation.surfacemask")
 
 namespace
 {
@@ -179,17 +176,6 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
     }
 
     _lastGridPosition = gridPos;
-    invalidateOverlay();
-}
-
-void SurfaceMaskBrushTool::pauseStroke()
-{
-    if (!_strokeActive) {
-        return;
-    }
-
-    _strokeActive = false;
-    _lastGridPosition.reset();
     invalidateOverlay();
 }
 

@@ -435,9 +435,6 @@ private:
 
     DragState _drag;
     HoverState _hover;
-    bool _forceFullSurfaceAutosave{false};
-    int _pendingGridOffsetColDelta{0};
-    int _pendingGridOffsetRowDelta{0};
     CorrectionDragState _correctionDrag;
     PointMoveDragState _pointMoveDrag;
     std::optional<uint64_t> _selectedAnnotationCollectionId;

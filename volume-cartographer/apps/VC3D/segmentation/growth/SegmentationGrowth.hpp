@@ -22,7 +22,6 @@ class Volume;
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
-    // 3 was Patch Tracer; a persisted 3 now reads back as Tracer.
     ManualAdd = 4,
 };
 

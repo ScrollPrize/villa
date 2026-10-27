@@ -365,22 +365,6 @@ std::optional<CorrectionsBounds> computeCorrectionsBounds(
     return bounds;
 }
 
-void queueIndexUpdateForBounds(SurfacePatchIndex* index,
-                               const SurfacePatchIndex::SurfacePtr& surface,
-                               const cv::Rect& vertexRect)
-{
-    if (!index || !surface || vertexRect.width <= 0 || vertexRect.height <= 0) {
-        return;
-    }
-
-    const int rowStart = vertexRect.y;
-    const int rowEnd = vertexRect.y + vertexRect.height;
-    const int colStart = vertexRect.x;
-    const int colEnd = vertexRect.x + vertexRect.width;
-
-    index->queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
-}
-
 void refreshSegmentationViewers(ViewerManager* manager)
 {
     if (!manager) {
@@ -673,7 +657,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             request.customParams["normal_grid_level"] = growthScale;
         }
     }
-    const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
     if (neuralTracerEnabled && !inpaintOnly) {

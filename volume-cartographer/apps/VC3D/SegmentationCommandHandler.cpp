@@ -235,14 +235,6 @@ static QJsonObject readJsonObject(const QString& path)
     return doc.object();
 }
 
-static bool writeJsonObject(const QString& path, const QJsonObject& obj)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
-    f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
-    return true;
-}
-
 struct RasterizeDialogResult {
     int chunkSize{128};
     int zMin{0};

@@ -128,8 +128,7 @@ private:
 
     void writeSetting(const QString& key, const QVariant& value);
     void populateConfigCombo(QComboBox* combo, const QString& dir,
-                             const QString& selectName, QString& outPath,
-                             bool growOnly = false);
+                             const QString& selectName, QString& outPath);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);

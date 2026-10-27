@@ -41,8 +41,6 @@ const QColor kNeighborFill = QColor(0, 220, 255, 160);
 const QColor kNeighborBorder = QColor(255, 255, 255, 210);
 const QColor kGrowthFill = QColor(140, 255, 160, 210);
 const QColor kGrowthBorder = QColor(80, 190, 90, 230);
-const QColor kHoverFill = QColor(255, 255, 255, 200);
-const QColor kHoverBorder = QColor(255, 255, 255, 240);
 constexpr qreal kMarkerRadius = 5.0;
 constexpr qreal kMarkerPenWidth = 2.0;
 constexpr qreal kActivePenWidth = 2.5;
@@ -908,7 +906,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         return;
     }
 
-    // Position using the same coordinate math as the approval mask overlay
+    // Place the overlap image by mapping surface grid cells to scene coordinates.
     const cv::Vec2f surfScale = currentQuad->scale();
     const cv::Vec3f center = currentQuad->center();
 

@@ -76,11 +76,6 @@ QString lasagnaModeDebugName(int mode)
     }
 }
 
-double bytesToMiB(qint64 bytes)
-{
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
-
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
 {
     QStringList names;
@@ -109,18 +104,6 @@ QJsonArray volumeShapeZyxForState(CState* state)
         static_cast<int>(shape[1]),
         static_cast<int>(shape[2]),
     };
-}
-
-std::filesystem::path volpkgRootForState(CState* state)
-{
-    if (!state || !state->vpkg()) {
-        return {};
-    }
-    const std::filesystem::path dir(state->vpkg()->getVolpkgDirectory());
-    if (dir.empty()) {
-        return {};
-    }
-    return std::filesystem::absolute(dir).lexically_normal();
 }
 
 // A stored surface for a Lasagna job: the service reads it from the store by
@@ -1744,9 +1727,6 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     QString widthUnit = settings.value(
         QStringLiteral("lasagna_new_model_width_unit"),
         QStringLiteral("voxels")).toString().trimmed().toLower();
-    if (widthUnit == QStringLiteral("vx")) {
-        widthUnit = QStringLiteral("voxels");
-    }
     if (widthUnit != QStringLiteral("wraps")) {
         widthUnit = QStringLiteral("voxels");
     }
@@ -1896,8 +1876,7 @@ void SegmentationLasagnaPanel::setLasagnaDataInputPath(const QString& path)
 
 void SegmentationLasagnaPanel::populateConfigCombo(
     QComboBox* combo, const QString& dir,
-    const QString& selectName, QString& outPath,
-    bool /*growOnly*/)
+    const QString& selectName, QString& outPath)
 {
     if (!combo) return;
 

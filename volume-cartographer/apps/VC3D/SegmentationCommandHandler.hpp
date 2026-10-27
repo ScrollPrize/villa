@@ -164,9 +164,6 @@ signals:
     /** Replaces statusBar()->showMessage() */
     void statusMessage(QString text, int timeout);
 
-    /** Replaces QMessageBox::warning() for non-blocking warnings */
-    void showWarning(QString title, QString text);
-
     /**
      * Emitted when a flattening job (SLIM or straighten) begins.
      * Emitted from both interactive slots and direct start* methods. `kind` is
