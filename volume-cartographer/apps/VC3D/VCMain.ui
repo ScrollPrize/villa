@@ -1457,11 +1457,6 @@
    </widget>
    </widget>
   </widget>
-  <action name="actionOpen">
-   <property name="text">
-    <string>Open</string>
-   </property>
-  </action>
  </widget>
  <customwidgets>
  <customwidget>

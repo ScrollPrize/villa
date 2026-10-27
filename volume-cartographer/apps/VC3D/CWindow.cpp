@@ -4,7 +4,6 @@
 #include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
-#include "OpenDataLasagna.hpp"
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 
 #include "StatusDockPanelHost.hpp"
@@ -54,8 +53,6 @@
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QPointF>
 #include <QMessageBox>
 #include <QtConcurrent/QtConcurrent>
@@ -102,7 +99,6 @@
 #include <QPushButton>
 #include <QItemSelectionModel>
 #include <QItemSelection>
-#include <QUnhandledException>
 #include "utils/Json.hpp"
 #include <QPointer>
 #include <QListView>
@@ -190,14 +186,6 @@ constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
 constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
 constexpr auto MAIN_VIEWER_LAYOUT_SURFACES_SETTING = "mainWin/main_viewer_layout_surfaces";
 constexpr auto MAIN_VIEWER_LAYOUT_HIDDEN_SETTING = "mainWin/main_viewer_layout_hidden";
-
-std::optional<vc3d::opendata::ResolvedOpenDataLasagna>
-resolvedLasagnaForState(const CState* state)
-{
-    if (!state || !state->vpkg()) return std::nullopt;
-    return vc3d::opendata::resolveLasagnaForVolume(
-        *state->vpkg(), state->currentVolumeId());
-}
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
@@ -393,47 +381,6 @@ void applyMainViewerLayout(ViewerSplitGrid* grid, ViewerManager* manager)
     }
 }
 
-QString extractFutureExceptionMessage(const std::exception& e)
-{
-    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
-        const std::exception_ptr ptr = unhandled->exception();
-        if (ptr) {
-            try {
-                std::rethrow_exception(ptr);
-            } catch (const std::exception& inner) {
-                return QString::fromStdString(inner.what());
-            } catch (...) {
-                return QObject::tr("Unknown non-standard exception");
-            }
-        }
-    }
-    return QString::fromStdString(e.what());
-}
-
-QString formatOptionalDouble(std::optional<double> value, int precision = 3)
-{
-    return (value && std::isfinite(*value))
-        ? QString::number(*value, 'f', precision)
-        : QStringLiteral("-");
-}
-
-QJsonObject toQtJsonObject(const nlohmann::json& json)
-{
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(
-        QByteArray::fromStdString(json.dump()), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        throw std::runtime_error("failed to convert JSON object for Qt");
-    }
-    return doc.object();
-}
-
-nlohmann::json fromQtJsonObject(const QJsonObject& object)
-{
-    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    return nlohmann::json::parse(bytes.constData());
-}
-
 class FunctionEventFilter final : public QObject
 {
 public:
@@ -463,24 +410,11 @@ VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
     return nullptr;
 }
 
-bool isChunkedViewer(VolumeViewerBase* viewer)
-{
-    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
-}
-
 bool moveOnSurfaceChangeEnabled()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     return settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                           vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-}
-
-void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
 }
 
 struct SurfaceFocusPoint {
@@ -489,11 +423,6 @@ struct SurfaceFocusPoint {
     int row = -1;
     int col = -1;
 };
-
-bool isFiniteVec3(const cv::Vec3f& point)
-{
-    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
-}
 
 std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row, int col)
 {
@@ -1737,23 +1666,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     }
 }
 
-VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
-{
-    if (!_viewerManager) {
-        return nullptr;
-    }
-
-    VolumeViewerBase* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
-    if (!viewer) {
-        return nullptr;
-    }
-
-    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
-        configureChunkedViewerConnections(chunkedViewer);
-    }
-    return viewer;
-}
-
 VolumeViewerBase* CWindow::newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent)
 {
     if (!_viewerManager || !parent) {
@@ -2524,9 +2436,6 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
     }
 
     if (_surfacePanel) {
-        if (_viewerManager) {
-            _viewerManager->resetStrideUserOverride();
-        }
         _surfacePanel->refreshPointSetFilterOptions();
     }
 
@@ -5363,16 +5272,6 @@ void CWindow::onMoveOnSurfaceChangedToggled(bool enabled)
 
     for (auto* manager : ViewerManager::allManagers()) {
         manager->setResetViewOnSurfaceChangeDefault(enabled);
-    }
-}
-
-void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES, enabled ? "1" : "0");
-
-    for (auto* manager : ViewerManager::allManagers()) {
-        manager->setPlaneIntersectionLinesVisible(enabled);
     }
 }
 

@@ -179,7 +179,6 @@ private:
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
 
-    VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
     VolumeViewerBase* newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent);
     void closeEvent(QCloseEvent* event) override;
 
@@ -229,7 +228,6 @@ private slots:
     void onAxisOverlayVisibilityToggled(bool enabled);
     void onAxisOverlayOpacityChanged(int value);
     void onMoveOnSurfaceChangedToggled(bool enabled);
-    void onPlaneIntersectionLinesToggled(bool enabled);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
     void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
