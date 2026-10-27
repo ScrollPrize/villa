@@ -102,6 +102,27 @@ class SQLiteTrackDBMTests(unittest.TestCase):
             finally:
                 writer.close()
 
+    def test_symlinked_store_keeps_committed_wal_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            alias = Path(temporary) / 'alias.dbm'
+            try:
+                alias.symlink_to(path)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f'file symlinks are unavailable: {exc}')
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('PRAGMA wal_autocheckpoint = 0')
+                writer.execute('INSERT INTO Dict VALUES (?, ?)', (b'new', b'committed in WAL'))
+                writer.commit()
+                self.assertTrue(Path(str(path) + '-wal').exists())
+                self.assertFalse(Path(str(alias) + '-wal').exists())
+                with tracks.open_tracks_dbm(alias) as database:
+                    self.assertEqual(database[b'new'], b'committed in WAL')
+                    self.assertEqual(len(database), 3)
+            finally:
+                writer.close()
+
 
 if __name__ == '__main__':
     unittest.main()

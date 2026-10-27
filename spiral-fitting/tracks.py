@@ -213,7 +213,9 @@ class _SQLiteTrackDBM:
         # Complete, checkpointed stores need no reader-created sidecars. An
         # existing WAL may hold committed pages, so retain normal SQLite
         # locking and WAL reads while it is present.
-        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        # SQLite opens a symlink's target; check that target's WAL as well.
+        path = Path(path).resolve()
+        uri = path.as_uri() + '?mode=ro'
         if not Path(str(path) + '-wal').exists():
             uri += '&immutable=1'
         self._connection = sqlite3.connect(uri, uri=True)
