@@ -81,10 +81,13 @@ public:
     void setSurface(const QString& uuid);
     void setOutputPattern(const QString& pattern);
 
+    // `store` and `volume`, when given, are the run's store contract (ToolProcess::Launch).
     bool executeCustomCommand(const QString& command,
                              const QStringList& args,
                              const QString& label = QString(),
-                             ExecutionOptions options = {});
+                             ExecutionOptions options = {},
+                             const QString& store = {},
+                             const QString& volume = {});
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
@@ -163,7 +166,7 @@ public:
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
 
 #ifdef VC_TESTING
-    QStringList argumentsForTesting(Tool tool) { return buildArguments(tool); }
+    QStringList argumentsForTesting(Tool tool) { return vc3d::ToolProcess::arguments(launchFor(tool)); }
 #endif
 
     // Valid while toolFinished is being delivered for the completed process.
@@ -181,6 +184,8 @@ signals:
 
 private:
     QStringList buildArguments(Tool tool);
+    // The tool's arguments and store contract (all but the executable and environment).
+    vc3d::ToolProcess::Launch launchFor(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
     void finishExecution(bool success,
@@ -241,6 +246,8 @@ private:
     Tool _currentTool;
     QString _customCommand;
     QStringList _customArgs;
+    QString _customStore;
+    QString _customVolume;
     QString _customLabel;
 
     int _nextOmpThreads{-1};

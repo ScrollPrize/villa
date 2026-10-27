@@ -269,9 +269,8 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         }
     }
 
-    vc3d::ToolProcess::Launch launch;
+    auto launch = launchFor(tool);
     launch.tool = toolCmd;
-    launch.args = isCustom ? _customArgs : buildArguments(tool);
     launch.ompThreads = ompThreads;
     if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
         launch.environment.insert(QStringLiteral("AWS_ACCESS_KEY_ID"), _remoteAccessKey);
@@ -346,11 +345,15 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 bool CommandLineToolRunner::executeCustomCommand(const QString& command,
                                                  const QStringList& args,
                                                  const QString& label,
-                                                 ExecutionOptions options)
+                                                 ExecutionOptions options,
+                                                 const QString& store,
+                                                 const QString& volume)
 {
     _customCommand = command;
     _customArgs = args;
     _customLabel = label;
+    _customStore = store;
+    _customVolume = volume;
     return execute(Tool::CustomCommand, options);
 }
 
@@ -394,6 +397,26 @@ void CommandLineToolRunner::finishExecution(bool success,
     _deliveringCompletion = false;
 }
 
+vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
+{
+    vc3d::ToolProcess::Launch launch;
+    if (tool == Tool::CustomCommand) {
+        launch.args = _customArgs;
+        launch.store = _customStore;
+        launch.volume = _customVolume;
+        return launch;
+    }
+    launch.args = buildArguments(tool);
+    // vc_tifxyz2obj takes its store options first, in fixed positions.
+    if (tool != Tool::tifxyz2obj) {
+        launch.store = _storePath;
+        launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
+                        : tool == Tool::MergePatch ? QString()
+                                                   : _volumeUuid;
+    }
+    return launch;
+}
+
 QStringList CommandLineToolRunner::buildArguments(Tool tool)
 {
     QStringList args;
@@ -405,9 +428,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                          ? QStringLiteral("--zarr-output")
                          : QStringLiteral("--tif-output"))
                  << _outputPattern
-                 << "--store" << _storePath
                  << "--surface" << _surfaceUuid
-                 << "--volume-uuid" << _renderVolumeUuid
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
@@ -452,9 +473,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
         case Tool::GrowSegFromSegment:
             args << "--volume" << _volumePath
                  << "--params" << _jsonParams
-                 << "--store" << _storePath
                  << "--surface" << _sourceSurfaceUuid
-                 << "--volume-uuid" << _volumeUuid
                  << "--source-tag" << _sourceTag
                  << "--tag" << _outputTag;
             break;
@@ -469,18 +488,14 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             break;
         case Tool::AlphaCompRefine:
             // Without a new name the surface is refined in place.
-            args << "--store" << _storePath
-                 << "--volume-uuid" << _volumeUuid
-                 << "--surface" << _surfaceUuid;
+            args << "--surface" << _surfaceUuid;
             if (!_refineName.isEmpty()) args << "--name" << _refineName;
             args << _volumePath << _jsonParams;
             break;
         case Tool::NeighborCopy:
             args << "-v" << _volumePath
                  << "-p" << _jsonParams
-                 << "--store" << _storePath
                  << "--surface" << _resumeSurfaceUuid
-                 << "--volume-uuid" << _volumeUuid
                  << "--tag" << _outputTag;
             if (!_resumeOpt.isEmpty()) {
                 args << "--resume-opt" << _resumeOpt;
@@ -488,8 +503,6 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             break;
         case Tool::MergeTifxyz:
             args << "--merge" << _mergeJsonPath
-                 << "--store" << _storePath
-                 << "--volume-uuid" << _volumeUuid
                  << "--tag" << _outputTag;
             // Empty refSurface -> let vc_merge_tifxyz auto-pick the
             // surface with the largest valid-cell count. Otherwise pass
@@ -508,8 +521,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
         case Tool::MergePatch:
             // Roles are auto-detected by valid-cell count unless the user
             // swapped them in the dialog (the first surface is the parent).
-            args << "--store" << _storePath
-                 << "--surface" << _patchParentSurface
+            args << "--surface" << _patchParentSurface
                  << "--surface" << _patchChildSurface;
             if (_patchExplicitRoles) args << "--explicit-roles";
             args << "--border-cells"      << QString::number(_patchBorderCells)

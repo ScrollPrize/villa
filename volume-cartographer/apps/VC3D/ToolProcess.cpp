@@ -29,6 +29,14 @@ QString quoteArg(const QString& arg)
 
 ToolProcess::ToolProcess(QObject* parent) : QObject(parent) {}
 
+QStringList ToolProcess::arguments(const Launch& launch)
+{
+    QStringList args = launch.args;
+    if (!launch.store.isEmpty()) args << QStringLiteral("--store") << launch.store;
+    if (!launch.volume.isEmpty()) args << QStringLiteral("--volume-uuid") << launch.volume;
+    return args;
+}
+
 ToolProcess::~ToolProcess()
 {
     if (process_ && process_->state() != QProcess::NotRunning) {
@@ -47,7 +55,7 @@ bool ToolProcess::start(const Launch& launch)
         return false;
     }
     QString program = executable_;
-    QStringList args = launch.args;
+    QStringList args = arguments(launch);
     if (launch.lowPriority) {
 #if defined(Q_OS_UNIX)
         if (const auto nice = QStandardPaths::findExecutable(QStringLiteral("nice")); !nice.isEmpty()) {

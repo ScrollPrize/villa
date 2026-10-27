@@ -26,6 +26,10 @@ public:
         // A tool name (vc3d::findToolExecutable) or an executable path.
         QString tool;
         QStringList args;
+        // The store contract: `--store` and `--volume-uuid` follow `args` when set
+        // (tools take options anywhere; a script's path stays first).
+        QString store;
+        QString volume;
         // OMP_NUM_THREADS for the run, when positive.
         int ompThreads = -1;
         // Variables added to the system environment.
@@ -54,6 +58,9 @@ public:
     };
 
     explicit ToolProcess(QObject* parent = nullptr);
+
+    // The arguments a launch runs with: its own, then the store contract.
+    static QStringList arguments(const Launch& launch);
     ~ToolProcess() override;
 
     // False (and no finished()) when the executable is not found; error() says why.

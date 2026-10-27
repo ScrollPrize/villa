@@ -1001,17 +1001,14 @@ void SeedingWidget::setSurfaceCatalog(SurfaceCatalog* catalog)
     if (_surfaceCatalog) connect(_surfaceCatalog, &SurfaceCatalog::rowsChanged, this, &SeedingWidget::updateButtonStates);
 }
 
-std::optional<QStringList> SeedingWidget::batchStore(QString* error) const
+std::optional<SurfaceCatalog::ToolStore> SeedingWidget::batchStore(QString* error) const
 {
     if (!_surfaceCatalog) {
         *error = tr("Attach an object store and open a volume first.");
         return std::nullopt;
     }
     try {
-        const auto tools = _surfaceCatalog->toolStore();
-        return QStringList{QStringLiteral("--store"), QString::fromStdString(tools.store.string()),
-                           QStringLiteral("--volume-uuid"), QString::fromStdString(tools.volume),
-                           QStringLiteral("--tag"), QStringLiteral("paths")};
+        return _surfaceCatalog->toolStore();
     } catch (const std::exception& e) {
         *error = QString::fromUtf8(e.what());
         return std::nullopt;
@@ -1028,7 +1025,7 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
     const QStringList toolArgs = QStringList()
                   << QStringLiteral("-v") << _batchVolumePath
                   << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
-                  << _batchStore
+                  << QStringLiteral("--tag") << QStringLiteral("paths")
                   << QStringLiteral("--seed")
                   << QString::number(point.p[0])
                   << QString::number(point.p[1])
@@ -1994,7 +1991,7 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
     const QStringList toolArgs = QStringList()
                   << QStringLiteral("-v") << _batchVolumePath
                   << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
-                  << _batchStore;
+                  << QStringLiteral("--tag") << QStringLiteral("paths");
 
     std::cout << "Starting expansion job " << iterationIndex << std::endl;
     launchBatchProcess(iterationIndex, toolArgs);
@@ -2013,6 +2010,8 @@ void SeedingWidget::launchBatchProcess(int index, const QStringList& toolArgs)
     launch.args = toolArgs;
     launch.ompThreads = _batchOmpThreads;
     launch.workingDirectory = _batchWorkingDir;
+    launch.store = QString::fromStdString(_batchStore.store.string());
+    launch.volume = QString::fromStdString(_batchStore.volume);
     launch.lowPriority = true;
     if (!run->start(launch)) {
         vc3d::ToolProcess::Result failed;

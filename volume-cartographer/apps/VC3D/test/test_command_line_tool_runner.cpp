@@ -342,7 +342,7 @@ private slots:
         args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
         QCOMPARE(value(args, "--surface"), QString("src-uuid"));
         QCOMPARE(value(args, "--name"), QString("refined"));
-        QCOMPARE(args.mid(args.size() - 2), QStringList({"volume.zarr", "params.json"}));
+        QCOMPARE(args.mid(args.indexOf("volume.zarr"), 2), QStringList({"volume.zarr", "params.json"}));
         runner.setObjRefineParams("volume.zarr", "src-uuid", "", "params.json", "vol");
         args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
         QVERIFY2(!args.contains("--name"), "no name refines in place");

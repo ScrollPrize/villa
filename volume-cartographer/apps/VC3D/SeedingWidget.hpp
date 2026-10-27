@@ -10,6 +10,7 @@
 #include <QProgressBar>
 #include <QHBoxLayout>
 #include <QLineEdit>
+#include "SurfaceCatalog.hpp"
 #include "ToolProcess.hpp"
 #include <QPointer>
 #include <QToolButton>
@@ -36,7 +37,6 @@ class ViewerManager;
 class SurfacePatchIndex;
 class QuadSurface;
 
-class SurfaceCatalog;
 
 class SeedingWidget : public QWidget {
     Q_OBJECT
@@ -184,9 +184,9 @@ private:
     // Data
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
-    // Store-mode arguments for vc_grow_seg_from_seed: new surfaces go to the
-    // attached store, bound to the current volume and tagged "paths".
-    std::optional<QStringList> batchStore(QString* error) const;
+    // The store vc_grow_seg_from_seed writes to: new surfaces go to the
+    // attached store, bound to the current volume.
+    std::optional<SurfaceCatalog::ToolStore> batchStore(QString* error) const;
     SurfaceCatalog* _surfaceCatalog{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
     int currentZSlice;
@@ -219,7 +219,7 @@ private:
     // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
     // not filesystem::path, since a remote locator is a URL.
     QString _batchVolumePath;
-    QStringList _batchStore;  // the tool's --store/--volume-uuid/--tag arguments
+    SurfaceCatalog::ToolStore _batchStore;  // the children's store contract (new surfaces are tagged "paths")
     std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)
     QString _batchWorkingDir;
 

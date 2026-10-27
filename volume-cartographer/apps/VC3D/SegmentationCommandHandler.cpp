@@ -627,6 +627,7 @@ class FlattenJob : public QObject {
 public:
     struct Spec {
         QString tool;         // executable path
+        QString store, volume;  // the store contract (ToolProcess::Launch)
         QStringList args;
         QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
         QString title;        // "SLIM-flatten", "ABF++ flatten", "Straighten"
@@ -670,6 +671,8 @@ public:
         vc3d::ToolProcess::Launch launch;
         launch.tool = spec_.tool;
         launch.args = spec_.args;
+        launch.store = spec_.store;
+        launch.volume = spec_.volume;
         if (!run_->start(launch)) {
             vc3d::ToolProcess::Result failed;
             failed.error = run_->error();
@@ -1381,9 +1384,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
 
     const QString outputName = params.outputName.isEmpty() ? stored->name + QStringLiteral("_flatboi") : params.outputName;
     const int iters = params.iterations > 0 ? params.iterations : 50;
-    QStringList args{QStringLiteral("--store"), stored->store,
-                     QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
-                     QStringLiteral("--volume-uuid"), stored->volumeUuid,
+    QStringList args{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
                      QStringLiteral("--name"), outputName};
     if (params.keepPercent < 100.0) args << QStringLiteral("--keep=%1").arg(params.keepPercent, 0, 'f', 4);
     if (params.inpaintHoles) args << QStringLiteral("--inpaint");
@@ -1391,7 +1392,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     args << QString::number(iters) << params.energyType;
 
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {flatboiExe, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
+                   {flatboiExe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
                     outputName, iters, /*modal=*/true, /*computeArea=*/true},
                    /*suppressDialogs=*/!interactive);
 
@@ -1427,14 +1428,12 @@ bool SegmentationCommandHandler::startAbfFlattenImpl(const std::string& segmentI
         return false;
     }
     const QString outputName = stored->name + QStringLiteral("_abf");
-    const QStringList args{QStringLiteral("--store"), stored->store,
-                           QStringLiteral("--volume-uuid"), stored->volumeUuid,
-                           QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
+    const QStringList args{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
                            QStringLiteral("--name"), outputName,
                            QStringLiteral("--iterations"), QString::number(std::max(1, iterations)),
                            QStringLiteral("--downsample"), QString::number(std::max(1, downsampleFactor))};
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe, args, QStringLiteral("flatten.abf"), tr("ABF++ flatten"), tr("ABF++ Flattening..."), outputName},
+                   {exe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.abf"), tr("ABF++ flatten"), tr("ABF++ Flattening..."), outputName},
                    /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
@@ -1475,9 +1474,8 @@ bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentI
     std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
               << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe,
-                    QStringList{QStringLiteral("--store"), stored->store, QStringLiteral("--volume-uuid"), stored->volumeUuid,
-                                QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
+                   {exe, stored->store, stored->volumeUuid,
+                    QStringList{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
                                 QStringLiteral("--name"), outputName} + args,
                     QStringLiteral("flatten.straighten"), tr("Straighten"), tr("Running vc_straighten..."), outputName},
                    /*suppressDialogs=*/!interactive);
@@ -1984,8 +1982,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     QStringList args;
     args << QStringLiteral("-v") << selectedVolumePath
          << QStringLiteral("-p") << _growPatchSeedJob->paramsPath
-         << QStringLiteral("--store") << store->store
-         << QStringLiteral("--volume-uuid") << selectedVolumeId
          << QStringLiteral("--tag") << params.outputTag.trimmed()
          << QStringLiteral("--seed")
          << QString::number(seedPoint.x(), 'g', 10)
@@ -2029,7 +2025,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
     if (!_cmdRunner->executeCustomCommand(
-            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options)) {
+            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options, store->store, selectedVolumeId)) {
         QObject::disconnect(*connection);
         _growPatchSeedJob.reset();
         return fail(tr("Failed to start vc_grow_seg_from_seed."));
@@ -2608,8 +2604,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
     QStringList args;
     args << finalOutputRootStr
-         << QStringLiteral("--store") << store->store
-         << QStringLiteral("--volume-uuid") << store->volumeUuid
          << QStringLiteral("--reference-zarr")
          << referenceZarr
          << QStringLiteral("--chunk-size")
@@ -2663,7 +2657,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
     });
 
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"))) {
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"), {}, store->store,
+                                      store->volumeUuid)) {
         QObject::disconnect(*connection);
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Failed to start vc_tifxyz2zarr_sparse."));
@@ -2900,8 +2895,7 @@ void SegmentationCommandHandler::onGrowTrackPatches()
 
     // The patches become surfaces of the current volume, like traced ones.
     QStringList args;
-    args << script << scriptArgs << QStringLiteral("--store") << store->store
-         << QStringLiteral("--volume-uuid") << store->volumeUuid << QStringLiteral("--tag") << QStringLiteral("paths");
+    args << script << scriptArgs << QStringLiteral("--tag") << QStringLiteral("paths");
 
     if (dlg.ompThreads() > 0) {
         _cmdRunner->setNextOmpThreads(dlg.ompThreads());
@@ -2937,7 +2931,8 @@ void SegmentationCommandHandler::onGrowTrackPatches()
     });
 
     _cmdRunner->showConsoleOutput();
-    const bool started = _cmdRunner->executeCustomCommand(python, args, tr("Grow Track Patches"));
+    const bool started = _cmdRunner->executeCustomCommand(python, args, tr("Grow Track Patches"), {}, store->store,
+                                                          store->volumeUuid);
     if (!started) {
         QObject::disconnect(*connection);
         emit statusMessage(tr("Failed to start grow_track_graph.py"), 5000);
