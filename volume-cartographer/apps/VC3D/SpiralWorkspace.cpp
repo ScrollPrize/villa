@@ -286,6 +286,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _trackedFiberPaths.clear();
             if (_service)
                 _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
+        } else {
+            noteStoreChanges(event);
         }
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
@@ -1480,48 +1482,30 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
 void SpiralWorkspace::addPatchToCurrentFit(
     const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
-    if (!_service) return;
-    const QString inputId = QFileInfo(tifxyzDirectory).fileName();
-    registerPendingPatchSurface(inputId, surface);
-    statusBar()->showMessage(tr("Preparing patch %1 for the Spiral session…").arg(inputId));
-    _service->stagePatch(tifxyzDirectory, inputId);
-    _service->applyInputDrafts();
+    Q_UNUSED(tifxyzDirectory);
+    Q_UNUSED(surface);
+    QMessageBox::information(this, tr("Add patch to the Spiral fit"),
+                             SpiralServiceManager::inputsFrozenMessage());
 }
 
 void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
 {
-    if (stageFiberInputs(fiberIds)) _service->applyInputDrafts();
+    Q_UNUSED(fiberIds);
+    QMessageBox::information(this, tr("Add fibers to the Spiral fit"),
+                             SpiralServiceManager::inputsFrozenMessage());
 }
 
 bool SpiralWorkspace::stageFiberInputs(const std::vector<uint64_t>& fiberIds)
 {
-    if (!_service || !_lineAnnotationController || fiberIds.empty()) return false;
-    try {
-        const auto paths = _lineAnnotationController->fiberTransportPaths(fiberIds);
-        for (const auto& [uuid, path] : paths) {
-            const auto id = QString::fromStdString(uuid);
-            const auto source = QString::fromStdString(path.string());
-            if (_trackedFiberPaths.value(id) == source) continue;
-            _trackedFiberPaths[id] = source;
-            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
-        }
-        return true;
-    } catch (const std::exception& error) {
-        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
-        return false;
-    }
+    // Fibers reach a fit only through the service's object store.
+    Q_UNUSED(fiberIds);
+    return false;
 }
 
 void SpiralWorkspace::refreshTrackedFibers()
 {
-    if (!_service || !_lineAnnotationController || _trackedFiberPaths.isEmpty()) return;
-    std::vector<uint64_t> ids;
-    for (const auto& uuid : _trackedFiberPaths.keys()) {
-        const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());
-        if (id && _lineAnnotationController->fiberPin(id)) ids.push_back(id);
-        else noteFiberRetired(uuid);
-    }
-    stageFiberInputs(ids);
+    // Nothing is uploaded for the fit to track: its fibers are pinned store
+    // revisions (see loadPinnedInputs).
 }
 
 void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
@@ -1533,21 +1517,9 @@ void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
 
 bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface)
 {
-    if (!_service || !surface || surface->path.empty()) return true;
-    const auto path = QString::fromStdString(surface->path.string());
-    if (_managedPatchCopies.contains(path)) return true;
-    for (const auto& value : _service->inputDraftStatus()) {
-        const auto input = value.toObject();
-        if (input.value(QStringLiteral("kind")).toString() != QStringLiteral("patch")) continue;
-        const auto source = mapServicePath(input.value(QStringLiteral("source")).toString());
-        if (QFileInfo(source).canonicalFilePath() != QFileInfo(path).canonicalFilePath()) continue;
-        QString error;
-        const auto copy = _service->workingCopy(path, &error);
-        if (copy.isEmpty()) { statusBar()->showMessage(error, 15000); return false; }
-        _managedPatchCopies[copy] = input.value(QStringLiteral("id")).toString();
-        surface->path = copy.toStdString();
-        return true;
-    }
+    // Fit inputs are not file copies to edit and upload any more; a surface
+    // opened for editing edits its own store object.
+    Q_UNUSED(surface);
     return true;
 }
 
@@ -1574,6 +1546,12 @@ void SpiralWorkspace::inputDraftPrepared(const QString&, const QString& error)
 
 void SpiralWorkspace::finalizeBrushPaint()
 {
+    // Painted patches and drawn collections stay in memory: they cannot join
+    // a fit whose inputs are frozen, and are kept for store-backed editing.
+    statusBar()->showMessage(SpiralServiceManager::inputsFrozenMessage(), 15000);
+    _pendingExitAction = {};
+    _commitAfterBrushUploads = false;
+    return;
     if (!_service || !_service->hasActiveSession()) {
         statusBar()->showMessage(tr("Load a Spiral fit before finalizing drawn inputs"), 10000);
         return;
@@ -1675,15 +1653,10 @@ void SpiralWorkspace::finalizeBrushPaint()
 
 void SpiralWorkspace::submitReadyDrafts(bool commitAfterAdd)
 {
-    if (_draftPreparationRemaining > 0 || _brush->dragging()) return;
-    _commitAfterBrushUploads = commitAfterAdd;
-    _brush->markDraftsReady();
-    if (!_brush->hasReadyDrafts()) {
-        _commitAfterBrushUploads = false;
-        _service->applyInputDrafts(commitAfterAdd);
-        return;
-    }
-    finalizeBrushPaint();
+    // Drafts stay local, ready for store-backed editing; a frozen fit takes
+    // none of them.
+    Q_UNUSED(commitAfterAdd);
+    statusBar()->showMessage(SpiralServiceManager::inputsFrozenMessage(), 15000);
 }
 
 bool SpiralWorkspace::hasPendingBrushWork() const
@@ -1732,21 +1705,15 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         exit();
         return;
     }
-    QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral inputs"),
-                    tr("This Spiral workspace contains input additions, edits, or removals "
-                       "that have not been committed to the dataset."), QMessageBox::NoButton, this);
-    auto* commit = box.addButton(tr("Commit"), QMessageBox::AcceptRole);
+    QMessageBox box(QMessageBox::Warning, tr("Unfinished Spiral drawings"),
+                    tr("This Spiral workspace holds drawn patches or point collections "
+                       "that are not part of the fit: its inputs are frozen and come "
+                       "from the object store. Leaving discards them."),
+                    QMessageBox::NoButton, this);
     auto* discard = box.addButton(tr("Discard and Exit"), QMessageBox::DestructiveRole);
     box.addButton(QMessageBox::Cancel);
     box.exec();
-    if (box.clickedButton() == commit) {
-        _pendingExitAction = std::move(exit);
-        _commitAfterBrushUploads = true;
-        if (_brush->hasUnfinalizedPaint() || _brush->hasUnfinalizedPolylines())
-            _brush->markDraftsReady();
-        if (_brush->hasReadyDrafts()) finalizeBrushPaint();
-        else maybeCommitForPendingExit();
-    } else if (box.clickedButton() == discard) {
+    if (box.clickedButton() == discard) {
         discardBrushWork();
         exit();
     }
@@ -2261,10 +2228,60 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
     state.overlay->setVisible(state.visible);
 }
 
+void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& event)
+{
+    if (!_pinnedInputs || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
+        || !event.touches({"surface", "point_collection", "fiber", "point-surface",
+                           "same-surface", "fiber_branch"}))
+        return;
+    const auto before = _changedPinnedRecords.size() + _changedOtherInputs.size();
+    for (const auto& change : event.changes) {
+        const QString uuid = QString::fromStdString(change.recordUuid);
+        if (_pinnedRecords.contains(uuid)) _changedPinnedRecords.insert(uuid);
+        else if (change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber")
+            _changedOtherInputs.insert(uuid);
+    }
+    if (_changedPinnedRecords.size() + _changedOtherInputs.size() != before) updateInputFreshness();
+}
+
+void SpiralWorkspace::updateInputFreshness()
+{
+    if (!_panel) return;
+    if (!_pinnedInputs) {
+        _panel->setInputFreshness({});
+        return;
+    }
+    using vc3d::spiral::PinState;
+    const auto& inputs = *_pinnedInputs;
+    QStringList notes;
+    if (const auto missing = inputs.count(PinState::Missing))
+        notes << tr("%n fitted input(s) are missing from the attached store and are not shown", "", int(missing));
+    const auto changed = inputs.count(PinState::Edited) + inputs.count(PinState::MetadataChanged);
+    if (changed)
+        notes << tr("%n fitted input(s) changed in the store before this view loaded", "", int(changed));
+    if (!_changedPinnedRecords.isEmpty())
+        notes << tr("%n fitted object(s) or link(s) changed since", "", int(_changedPinnedRecords.size()));
+    if (!_changedOtherInputs.isEmpty())
+        notes << tr("%n other surface(s), collection(s) or fiber(s) changed, which a "
+                    "rebuild's selection may include", "", int(_changedOtherInputs.size()));
+    if (notes.isEmpty()) {
+        _panel->setInputFreshness(tr("The attached store holds every fitted input as fitted"));
+        return;
+    }
+    // Shown, never applied: the overlays keep the fitted revisions.
+    _panel->setInputFreshness(tr("Stale: %1. The overlays show the fitted revisions; "
+                                 "Rebuild Fit reads the current inputs.")
+                                  .arg(notes.join(QStringLiteral("; "))));
+}
+
 void SpiralWorkspace::clearPinnedInputs(const QString& reason)
 {
     ++_pinnedInputGeneration;
     _pinnedInputs.reset();
+    _pinnedRecords.clear();
+    _changedPinnedRecords.clear();
+    _changedOtherInputs.clear();
+    updateInputFreshness();
     for (auto& state : _pclOverlays) {
         state.document = {};
         state.documentPath.clear();
@@ -2331,6 +2348,14 @@ void SpiralWorkspace::installPinnedInputs(
 {
     if (generation != _pinnedInputGeneration) return;
     _pinnedInputs = inputs;
+    _pinnedRecords.clear();
+    _changedPinnedRecords.clear();
+    _changedOtherInputs.clear();
+    for (const auto& entry : inputs->surfaces) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
+    for (const auto& entry : inputs->pointCollections) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
+    for (const auto& entry : inputs->fibers) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
+    for (const auto& uuid : inputs->relationshipUuids) _pinnedRecords.insert(QString::fromStdString(uuid));
+    updateInputFreshness();
     using vc3d::spiral::PinState;
     InputSurfaceLoadResult surfaces;
     surfaces.categories = {QStringLiteral("verified")};
@@ -2388,8 +2413,6 @@ void SpiralWorkspace::installPinnedInputs(
 
     QStringList notes;
     for (const auto& problem : inputs->problems) notes << QString::fromStdString(problem);
-    if (const auto edited = inputs->count(PinState::Edited) + inputs->count(PinState::MetadataChanged))
-        notes << tr("%n fitted input(s) changed in the store since the fit; the fitted revisions are shown", "", int(edited));
     if (!notes.isEmpty()) statusBar()->showMessage(notes.join(QStringLiteral("; ")), 15000);
 }
 

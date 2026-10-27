@@ -1,4 +1,5 @@
 #include "SpiralPanel.hpp"
+#include "SpiralPreviewProvenance.hpp"
 #include "SpiralInputRows.hpp"
 #include "SpiralActivityWidget.hpp"
 #include "SpiralDescriptions.hpp"
@@ -806,7 +807,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_checkpointDownloadTimer, &QTimer::timeout, this,
             refreshCheckpointDownload);
 
-    auto* ephemeralLabel = new QLabel(tr("Dataset inputs and local drafts:"), runContents);
+    // What the resident fit read from its object store, and whether the
+    // store still holds it.
+    _fitInputs = new QLabel(tr("No fit inputs yet"), runContents);
+    _fitInputs->setObjectName(QStringLiteral("spiralFitInputs"));
+    _fitInputs->setWordWrap(true);
+    _fitInputs->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    runLayout->addWidget(_fitInputs);
+    describe(QStringLiteral("fit_inputs"), {_fitInputs});
+
+    auto* ephemeralLabel = new QLabel(tr("Local drafts (not part of the fit):"), runContents);
     _inputList = new QListWidget(runContents);
     _inputList->setObjectName(QStringLiteral("spiralInputList"));
     _inputList->setMaximumHeight(80);
@@ -1694,10 +1704,43 @@ void SpiralPanel::setLossMapLegend(const QString& text)
 void SpiralPanel::setLocalDraftsReady(bool ready)
 {
     _localDraftsReady = ready;
-    if (_addInputs) _addInputs->setEnabled(_connected && _hasSession && ready);
-    if (_commitInputs)
-        _commitInputs->setEnabled(_connected && _hasSession
-                                  && (ready || _uncommittedCount > 0));
+    // Drafts are kept for store-backed editing; none reaches a frozen fit.
+    if (_addInputs) _addInputs->setEnabled(false);
+    if (_commitInputs) _commitInputs->setEnabled(false);
+}
+
+void SpiralPanel::setInputFreshness(const QString& text)
+{
+    _inputFreshness = text;
+    updateFitInputs();
+}
+
+void SpiralPanel::updateFitInputs()
+{
+    if (!_fitInputs) return;
+    const QJsonObject& summary = _lastInputSummary;
+    if (summary.isEmpty()) {
+        _fitInputs->setText(_hasSession ? tr("The fit's inputs are being read from the object store")
+                                        : tr("No fit inputs yet"));
+        return;
+    }
+    const QJsonObject selection = summary.value(QStringLiteral("selection")).toObject();
+    QStringList links;
+    const QJsonObject relationships = summary.value(QStringLiteral("relationships")).toObject();
+    for (auto it = relationships.begin(); it != relationships.end(); ++it)
+        links << QStringLiteral("%1 %2").arg(it.key()).arg(it.value().toInteger());
+    QString text = tr("Fitted inputs %1: %2 surfaces, %3 point collections, %4 fibers in volume %5")
+                       .arg(summary.value(QStringLiteral("digest")).toString().left(12))
+                       .arg(selection.value(QStringLiteral("surface")).toInteger())
+                       .arg(selection.value(QStringLiteral("point_collection")).toInteger())
+                       .arg(selection.value(QStringLiteral("fiber")).toInteger())
+                       .arg(summary.value(QStringLiteral("volume_uuid")).toString());
+    text += tr("\nLinks: %1 (%2)")
+                .arg(links.isEmpty() ? tr("none") : links.join(QStringLiteral(", ")),
+                     summary.value(QStringLiteral("link_refresh")).toBool()
+                         ? tr("refreshed at startup") : tr("as stored, not refreshed"));
+    if (!_inputFreshness.isEmpty()) text += QStringLiteral("\n") + _inputFreshness;
+    _fitInputs->setText(text);
 }
 
 void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
@@ -2181,7 +2224,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         stateText += tr("\nPreview: iteration %1 — lag %2")
             .arg(previewIteration)
             .arg(qMax<qint64>(0, currentIteration - previewIteration));
+        const QString inputs = vc3d::spiralPreviewInputNote(
+            {previewIteration, _service->displayedPreviewInputDigest()},
+            status.value(QStringLiteral("input_digest")).toString());
+        if (!inputs.isEmpty()) stateText += QStringLiteral(" — ") + inputs;
     }
+    _lastInputSummary = status.value(QStringLiteral("input_summary")).toObject();
+    updateFitInputs();
     if (status.value(QStringLiteral("preview_active")).toBool())
     {
         const qint64 activeIteration = status.value(
@@ -2392,9 +2441,11 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         refreshInputVisibility();
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(_connected && _service->ownsSessionLease() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));
-    _addInputs->setEnabled(_connected && _service->ownsSessionLease() && _hasSession && (_localDraftsReady || _service->hasInputDrafts()));
-    _commitHint->setText(tr("Checked inputs are selected. Saves update local drafts; Apply changes future fit steps; Commit writes the selected revisions."));
+    // A resident fit's inputs are frozen: nothing here changes them.
+    Q_UNUSED(commitAvailable);
+    _commitInputs->setEnabled(false);
+    _addInputs->setEnabled(false);
+    _commitHint->setText(_service->inputsFrozenMessage());
 }
 
 void SpiralPanel::setSessionCheckpoint(const QString& hostPath)

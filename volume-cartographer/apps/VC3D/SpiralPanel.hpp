@@ -48,6 +48,9 @@ public:
     void setLossMapLegend(const QString& text);
     void setLocalPatchDrafts(const QJsonArray& drafts);
     void setLocalDraftsReady(bool ready);
+    // Whether the store still holds the fitted inputs as fitted, and what
+    // changed since; shown with the session's input summary.
+    void setInputFreshness(const QString& text);
     // Enables the Display toggle of one editable PCL role's overlay; an
     // unavailable overlay is unchecked and explains itself in the tooltip.
     void setPclOverlayAvailable(vc3d::spiral::PclRole role, bool available,
@@ -209,6 +212,10 @@ private:
     QPushButton* _addInputs = nullptr;
     QPushButton* _removeInput = nullptr;
     QLabel* _commitHint = nullptr;
+    QLabel* _fitInputs = nullptr;
+    QString _inputFreshness;
+    QJsonObject _lastInputSummary;
+    void updateFitInputs();
     QJsonArray _localPatchDrafts;
     QJsonArray _lastInputDrafts;
     QHash<QString, QListWidgetItem*> _inputItems;

@@ -91,6 +91,7 @@ public:
     {
         return _displayedPreviewSourceIteration;
     }
+    QString displayedPreviewInputDigest() const { return _displayedPreviewInputDigest; }
 
     // Create the first resident session. The service exposes dataset and
     // checkpoint discovery before this without importing the fit runtime.
@@ -141,6 +142,8 @@ public:
     // after the surface, so this follows what the panel is displaying rather
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
+    // Why no input change reaches a resident fit: its inputs are frozen.
+    static QString inputsFrozenMessage();
     void commitInputs();
     void applyInputDrafts(bool commit = false, const QStringList& selection = {});
     QJsonArray inputDraftStatus() const;
@@ -388,6 +391,7 @@ private:
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     qint64 _displayedPreviewSourceIteration = -1;
+    QString _displayedPreviewInputDigest;
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;

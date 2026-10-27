@@ -160,6 +160,10 @@ private:
     void installPinnedInputs(const std::shared_ptr<vc3d::spiral::PinnedStoreInputs>& inputs,
                              quint64 generation);
     void clearPinnedInputs(const QString& reason);
+    // Count a store commit against the fitted inputs and say how current
+    // they are; nothing is reloaded.
+    void noteStoreChanges(const vc::objects::StoreSessionEvent& event);
+    void updateInputFreshness();
     void refreshPclOverlay(vc3d::spiral::PclRole role);
     void refreshPclOverlays();
     void applyPreviewWindingRange(bool preserveFocus);
@@ -264,6 +268,11 @@ private:
     QString _inputDigest;
     quint64 _pinnedInputGeneration = 0;
     std::shared_ptr<vc3d::spiral::PinnedStoreInputs> _pinnedInputs;
+    // Record UUIDs of the fitted objects and relationships, and those of them
+    // (and of other surfaces, collections and fibers) changed since loading.
+    QSet<QString> _pinnedRecords;
+    QSet<QString> _changedPinnedRecords;
+    QSet<QString> _changedOtherInputs;
     QTemporaryDir _pinnedPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;

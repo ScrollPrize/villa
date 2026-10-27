@@ -63,6 +63,8 @@ struct PinnedStoreInputs {
     std::vector<PinnedSurface> surfaces;
     std::vector<PinnedPointCollection> pointCollections;
     std::vector<PinnedFiber> fibers;
+    // The relationships the fit consumed, by record UUID (shared by replicas).
+    std::vector<std::string> relationshipUuids;
     // Why the manifest does not describe this store, or a pin it cannot read.
     std::vector<std::string> problems;
 

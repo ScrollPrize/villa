@@ -156,6 +156,8 @@ PinnedStoreInputs readPinnedStoreInputs(const ObjectStore& db, const Txn& txn, c
     result.digest = document.value("digest", std::string());
     result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
     result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
+    for (const auto& relationship : manifest.value("relationships", Json::array()))
+        result.relationshipUuids.push_back(relationship.at("uuid").get<std::string>());
     if (const auto local = db.uuid(txn); local != result.storeUuid) {
         result.problems.push_back("the fit read store " + result.storeUuid + ", not this store "
                                   + local);

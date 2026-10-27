@@ -48,6 +48,14 @@ bool writeDocument(const QString& path, const QJsonObject& document)
 }
 }
 
+QString SpiralServiceManager::inputsFrozenMessage()
+{
+    return tr("Fit inputs come from the service's object store and are frozen for this "
+              "fit. Edit patches, point collections and fibers in the store, then use "
+              "Rebuild Fit to read them; editing them from this workspace arrives with "
+              "store-backed editing.");
+}
+
 void SpiralServiceManager::reportInputPreparation(const QString& message)
 {
     emit inputPreparationProgress(message);
@@ -394,6 +402,12 @@ void SpiralServiceManager::commitInputs() { applyInputDrafts(true); }
 
 void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& selection)
 {
+    // A resident fit's inputs are frozen: the service answers every input
+    // change with inputs_frozen. Drafts stay local for store-backed editing.
+    Q_UNUSED(commit);
+    Q_UNUSED(selection);
+    emit inputBatchFinished(inputsFrozenMessage());
+    return;
     if (!_leaseOwner) {
         emit inputBatchFinished(tr("This connection does not own dataset editing"));
         return;
@@ -709,6 +723,10 @@ void SpiralServiceManager::finishInputCommand()
 
 void SpiralServiceManager::resolveInputConflict(const QJsonObject& conflict, const QString& action)
 {
+    Q_UNUSED(conflict);
+    Q_UNUSED(action);
+    emit errorOccurred(inputsFrozenMessage());
+    return;
     const auto id = conflict.value(QStringLiteral("id")).toString();
     const auto draft = _inputDrafts.value(id);
     if (!draft) return;
@@ -785,6 +803,10 @@ void SpiralServiceManager::fetchInputContent(const QString& id, quint64 revision
 
 void SpiralServiceManager::editInputDraft(const QString& id)
 {
+    // Its content would come from the service's input catalog, which is gone.
+    Q_UNUSED(id);
+    emit errorOccurred(inputsFrozenMessage());
+    return;
     const auto draft = _inputDrafts.value(id);
     if (!draft || draft->deleted()) return;
     const auto snapshot = draft->snapshot();
