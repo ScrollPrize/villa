@@ -23,6 +23,7 @@
 #include <QThread>
 #include <filesystem>
 #include <iostream>
+#include <set>
 
 namespace fs = std::filesystem;
 using namespace vc::objects;
@@ -345,6 +346,67 @@ int main(int argc, char** argv)
 
         catalog.setSource(std::nullopt, volume);
         require(catalog.rows().empty(), "no attachment lists nothing");
+
+        // A cold intersection query waits for every selected placeholder and
+        // returns their crossings together, without fetching unrelated surfaces.
+        {
+            const auto remotePath = fs::path(dir.path().toStdString()) / "remote.vcobj";
+            const std::vector<std::string> ids{util::newUuid(), util::newUuid(), util::newUuid(), util::newUuid()};
+            {
+                auto db = ObjectStore::create(remotePath, options);
+                auto txn = db.write();
+                for (const auto& uuid : ids) {
+                    ObjectRecord record;
+                    record.uuid = uuid;
+                    record.kind = "surface";
+                    record.storageKind = "file";
+                    record.storageRef = uuid;
+                    record.meta = nlohmann::json{{"coordinates", volumeCoordinates(volume->id(), 1)}}.dump();
+                    record.surface.emplace();
+                    record.surface->bbox = std::array<double, 6>{0, 0, 1, 2, 2, 1};
+                    db.upsertObject(txn, record);
+                }
+                txn.commit();
+            }
+            // The session owns the fetch thread; destroy it before its captures.
+            std::atomic_int fetchCount{0};
+            ObjectStoreSession remoteSession;
+            const auto remote = remoteSession.attachFetched(remotePath, options,
+                [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
+                    if (uuid == ids[2]) throw std::runtime_error("test fetch failure");
+                    const auto revision = store.currentObjectRevision(store.read(), uuid)->uuid;
+                    ++fetchCount;
+                    write({{uuid, revision}}, [&](auto& db, auto& txn) {
+                        db.putGeometry(txn, uuid, quad_surface_geometry(grid));
+                    });
+                });
+            RegionSlice slice;
+            slice.origin = {0, 1, 0};
+            slice.u = {1, 0, 0};
+            slice.v = {0, 0, 1};
+            slice.normal = {0, 1, 0};
+            slice.localBounds = {-1, -1, -1, 3, 3, 1};
+            RegionOptions query;
+            query.uuids = std::vector<std::string>{ids[0], ids[1]};
+            const auto crossings = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true);
+            std::set<std::string> crossed;
+            for (const auto& run : crossings.runs) crossed.insert(run.objectUuid);
+            require(crossings.complete && crossed == std::set<std::string>{ids[0], ids[1]} && fetchCount == 2,
+                    "one cold query returns all required intersections after fetching only selected surfaces");
+            const auto warm = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true);
+            require(warm.complete && warm.runs.size() == crossings.runs.size() && fetchCount == 2,
+                    "warm queries reuse fetched geometry");
+            query.uuids = std::vector<std::string>{ids[2]};
+            bool failed = false;
+            try { SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true); }
+            catch (const GeometryUnavailable&) { failed = true; }
+            require(failed, "fetch errors are reported instead of publishing an empty complete overlay");
+            query.uuids = std::vector<std::string>{ids[3]};
+            const auto cancelled = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query,
+                                                          [] { return true; }, true);
+            require(!cancelled.complete && cancelled.runs.empty() && fetchCount == 2,
+                    "cancelled queries neither publish intersections nor fetch more surfaces");
+        }
         session->detach(leveled);
         std::cout << "surface catalog tests passed\n";
         return 0;

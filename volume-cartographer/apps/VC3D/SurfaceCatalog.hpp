@@ -103,8 +103,9 @@ public:
 
     // Where the surfaces of every source cross `slice` (voxels of `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
-    // read was. Placeholders reached are fetched by the session. Synchronous:
-    // callers run it on a worker thread.
+    // read was. Placeholders reached are queued for fetching. With
+    // waitForGeometry, waits for them and re-reads before returning; use that
+    // only on a worker thread.
     struct Crossings {
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
@@ -112,7 +113,7 @@ public:
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
-                            const std::function<bool()>& cancelled = {});
+                            const std::function<bool()>& cancelled = {}, bool waitForGeometry = false);
 
     // Where tools launched for the open volume read and write: the user's store
     // file (a hosted replica's local file) and the volume's id. Throws without a

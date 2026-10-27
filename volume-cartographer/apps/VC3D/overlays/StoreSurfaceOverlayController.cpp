@@ -10,6 +10,7 @@
 
 #include <QGraphicsView>
 #include <QPainterPath>
+#include <utility>
 
 namespace {
 // Surfaces cross the slab's mid-plane; the depth only selects candidate tiles.
@@ -34,7 +35,7 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, Surf
         if (std::any_of(uuids.begin(), uuids.end(), [this](const std::string& uuid) {
                 return std::binary_search(_surfaces.begin(), _surfaces.end(), uuid);
             }))
-            invalidate();
+            refreshCommittedSurfaces();
     });
     // The surface being edited is drawn by the viewer: redraw without it.
     connect(_state, &CState::surfaceChanged, this, [this](const std::string& name, const std::shared_ptr<Surface>&, bool edit) {
@@ -74,8 +75,24 @@ void StoreSurfaceOverlayController::invalidate()
         view->runs.clear();
         view->displayed.reset();
         view->dirty = true;
+        view->refreshPending = false;
     }
     refreshAll();
+}
+
+void StoreSurfaceOverlayController::refreshCommittedSurfaces()
+{
+    for (auto& [viewer, view] : _views) {
+        if (view->region.busy) {
+            // Fetching a placeholder commits its geometry. Cancelling here
+            // would repeatedly interrupt the batch that is waiting for it.
+            view->refreshPending = true;
+        } else {
+            view->region.refresh();
+            view->dirty = true;
+            refreshViewer(viewer);
+        }
+    }
 }
 
 void StoreSurfaceOverlayController::detachViewer(VolumeViewerBase* viewer)
@@ -117,7 +134,7 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
             options.uuids = uuids;
             options.processingByteBudget = kProcessingBudget;
             auto crossings = SurfaceCatalog::region(*session, sources, volume, vc3d::store::regionSlice(query), options,
-                                                    [&] { return cancelled.load(); });
+                                                    [&] { return cancelled.load(); }, true);
             Listing listing;
             listing.complete = crossings.complete;
             for (auto& run : crossings.runs) listing.runs.push_back({std::move(run.objectUuid), std::move(run.points)});
@@ -125,7 +142,13 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
         },
         [this, viewer](View& v, Listing* listing) {
             v.dirty = true;
-            if (listing) v.runs = std::move(listing->runs);
+            if (std::exchange(v.refreshPending, false)) {
+                // Coalesce commits into one final read, including any edits
+                // made while the batch was fetching. Keep the old display.
+                v.region.refresh();
+            } else if (listing) {
+                v.runs = std::move(listing->runs);
+            }
             refreshViewer(viewer);
         });
 }
@@ -140,6 +163,7 @@ void StoreSurfaceOverlayController::collectPrimitives(VolumeViewerBase* viewer, 
     v.displayed = current;
     v.displayedRect = visibleSceneRect(viewer);
     const auto notice = !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
+                        : v.region.busy ? tr("Fetching surface intersections…")
                         : v.region.loaded && !v.region.complete ? tr("Partial surface view · zoom in")
                                                                 : QString{};
     if (!notice.isEmpty()) {

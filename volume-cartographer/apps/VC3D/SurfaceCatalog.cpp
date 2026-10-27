@@ -264,16 +264,34 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
 
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,
                                                  const std::string& volume, const RegionSlice& slice, RegionOptions options,
-                                                 const std::function<bool()>& cancelled)
+                                                 const std::function<bool()>& cancelled, bool waitForGeometry)
 {
-    Crossings crossings;
     options.kind = "surface";
     options.volume = volume;
-    for (auto& [attachment, result] : session.geometryRegion(sources, slice, options,
-                                                             [&](const auto&) { return cancelled && cancelled(); })) {
-        crossings.complete = crossings.complete && result.complete();
-        for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
+    const auto isCancelled = [&] { return cancelled && cancelled(); };
+    for (;;) {
+        if (isCancelled()) return {{}, false};
+        auto results = session.geometryRegion(sources, slice, options,
+                                              [&](const auto&) { return isCancelled(); });
+        bool fetched = false;
+        for (const auto& [attachment, result] : results) {
+            if (!waitForGeometry) break;
+            for (const auto& uuid : result.remote) {
+                if (isCancelled()) return {{}, false};
+                // Region reads queue remote geometry but do not wait for it.
+                // Wait outside the read transaction, then read the whole batch
+                // again instead of publishing each arriving surface separately.
+                session.ensureGeometry(attachment, uuid, isCancelled);
+                fetched = true;
+            }
+        }
+        if (fetched) continue;
+        Crossings crossings;
+        for (auto& [attachment, result] : results) {
+            crossings.complete = crossings.complete && result.complete();
+            for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
+        }
+        return crossings;
     }
-    return crossings;
 }
 

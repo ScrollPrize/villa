@@ -49,10 +49,13 @@ private:
         QRectF displayedRect;
         std::vector<Run> runs;
         bool dirty{true};
+        bool refreshPending{false};
     };
     void request(VolumeViewerBase* viewer, const vc3d::store::Region& region);
     // Data changed: query every view again.
     void invalidate();
+    // Keep displayed lines and let an in-flight fetch finish before re-querying.
+    void refreshCommittedSurfaces();
 
     CState* _state;
     SurfaceCatalog* _catalog;
