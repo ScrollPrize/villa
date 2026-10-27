@@ -170,6 +170,16 @@ class StoredExportTest(unittest.TestCase):
 			self.assertEqual((artifacts / "model.pt").read_bytes(), ckpt.read_bytes())
 			self.assertTrue((artifacts / "model_params.json").is_file())
 
+	def test_new_surfaces_take_the_next_free_name_of_their_root(self) -> None:
+		with tempfile.TemporaryDirectory() as td:
+			store = Path(td) / "objects.vcobj"
+			with ObjectStore.create(str(store), author="test") as db:
+				for name in ("sheet_v001", "sheet_v004", "sheet_off1", "other_v009"):
+					db.upsert_object(dict(kind="surface", name=name, meta={}))
+			self.assertEqual(stored_surfaces.next_free_name(store, "sheet", "version"), "sheet_v005")
+			self.assertEqual(stored_surfaces.next_free_name(store, "sheet", "offset"), "sheet_off2")
+			self.assertEqual(stored_surfaces.next_free_name(store, "new", "version"), "new_v001")
+
 	def test_export_takes_exactly_one_destination(self) -> None:
 		for argv in (["--input", "m.pt"], ["--input", "m.pt", "--output", "o", "--store", "s"],
 					 ["--input", "m.pt", "--store", "s"]):

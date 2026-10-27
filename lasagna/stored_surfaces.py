@@ -39,6 +39,24 @@ def open_store(store: str | Path, *, read_only: bool = True, author: str | None 
 	return ObjectStore.open(str(store), author=author or getpass.getuser())
 
 
+def next_free_name(store: str | Path, root: str, mode: str) -> str:
+	"""The name a new surface of ``root`` takes among the store's surfaces: ``version`` gives the next
+	``<root>_vNNN`` after the highest stored, ``offset`` the first free ``<root>_offN``."""
+	import re
+	with open_store(store) as db:
+		taken = {row["name"] for row in db.select_objects(object_kind="surface", fields=["name"])}
+	infix, width = ("_v", 3) if mode == "version" else ("_off", 1)
+	number = 1
+	if mode == "version":
+		pattern = re.compile(re.escape(root + infix) + r"(\d+)$")
+		for name in taken:
+			if match := pattern.fullmatch(name):
+				number = max(number, int(match.group(1)) + 1)
+	while f"{root}{infix}{number:0{width}d}" in taken:
+		number += 1
+	return f"{root}{infix}{number:0{width}d}"
+
+
 class StoreSession:
 	"""A store attached for this process: a hosted replica syncs with its hub in the background (pushing writes
 	made through any connection to the file); artifact directories hold files belonging to an object (a fit's

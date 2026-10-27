@@ -7,7 +7,7 @@ import math
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +86,9 @@ def _build_parser() -> argparse.ArgumentParser:
 	g.add_argument("--flatten-map-output", default=None,
 		help="For flatten checkpoints, write the output-to-source map as a .npy sidecar")
 	g.add_argument("--output-name", default=None, help="Override tifxyz directory name")
+	g.add_argument("--output-name-mode", choices=("exact", "version", "offset"), default="exact",
+		help="With --store: take --output-name as is, or as the root of the next free <root>_vNNN (after the "
+			 "highest stored) or <root>_offN name")
 	g.add_argument("--voxel-size-um", type=float, default=None,
 		help="Voxel size in micrometers (for area calculation)")
 	g.add_argument("--target-volume-shape-zyx", type=int, nargs=3, metavar=("Z", "Y", "X"), default=None,
@@ -1264,6 +1267,9 @@ def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = 
 		return _export(cfg, cancel_fn=_check_cancel, state=state)
 	own_session = store_session is None
 	session = stored_surfaces.StoreSession(cfg.store) if own_session else store_session
+	if cfg.output_name and args.output_name_mode != "exact":
+		cfg = replace(cfg, output_name=stored_surfaces.next_free_name(
+			session.path, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
 	created = created_surfaces if created_surfaces is not None else []
 	try:
 		result = _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)

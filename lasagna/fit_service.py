@@ -2059,6 +2059,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
+                # The store picks the free name (VC3D sends the root and how to version it).
+                if store_volume is not None and body.get("output_name_mode"):
+                    export_argv.extend(["--output-name-mode", str(body["output_name_mode"])])
             if body.get("omit_model", False):
                 export_argv.append("--omit-model")
             if body.get("export_flatten_map", False):
