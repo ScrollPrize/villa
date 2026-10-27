@@ -36,18 +36,17 @@ public:
     using CreateProjectHandler = std::function<bool(const vcr::catalog::OpenDataSample&,
         const OpenDataResourceSelection&, const OpenDataNewProject&)>;
     void setCreateProjectHandler(CreateProjectHandler handler);
-    using AttachPredictionHandler = std::function<void(const vcr::catalog::OpenDataSample&,
-        const OpenDataResourceSelection&)>;
-    void setAttachPredictionHandler(AttachPredictionHandler handler);
+    // Attaches one derived representation of the sample (a prediction, normal
+    // grids or Lasagna) to the open project.
+    using AttachRepresentationHandler = std::function<void(const vcr::catalog::OpenDataSample&,
+        const vcr::catalog::OpenDataRepresentationRef&)>;
+    void setAttachRepresentationHandler(AttachRepresentationHandler handler);
     // Refreshes the sample's surface store from the published catalog; returns the status line.
     using RefreshSampleHandler = std::function<QString(const vcr::catalog::OpenDataSample&)>;
     void setRefreshSampleHandler(RefreshSampleHandler handler);
 
 signals:
     void attachVolumeRequested(const QString& url);
-    void attachLasagnaRequested(const QString& url, bool fiber);
-    void attachNormalGridsRequested(const QString& sampleId, const QString& volumeId,
-                                   const QString& url, int level);
 
 private slots:
     void reloadManifest();
@@ -95,6 +94,7 @@ private:
 
     [[nodiscard]] const vcr::catalog::OpenDataSample* selectedSample() const;
     [[nodiscard]] const vcr::catalog::OpenDataVolume* selectedVolume() const;
+    [[nodiscard]] std::optional<vcr::catalog::OpenDataRepresentationRef> selectedRepresentation() const;
     [[nodiscard]] const vcr::catalog::OpenDataArtifact* selectedRepresentationArtifact() const;
     [[nodiscard]] const vcr::catalog::OpenDataSegment* selectedSegment() const;
     [[nodiscard]] QString selectedVolumeUrl() const;
@@ -136,7 +136,7 @@ private:
     QString _pendingPhotoSampleId;
     std::function<bool(const vcr::catalog::OpenDataSample&)> _openSampleHandler;
     CreateProjectHandler _createProjectHandler;
-    AttachPredictionHandler _attachPredictionHandler;
+    AttachRepresentationHandler _attachRepresentationHandler;
     RefreshSampleHandler _refreshSampleHandler;
 };
 

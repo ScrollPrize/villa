@@ -140,8 +140,9 @@ private:
     void updateRecentRemoteList(const QString& url);
     void showAttachRemoteZarrDialog(const QString& initialUrl);
     void attachRemoteZarrUrl(const QString& url);
-    void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
-    void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
+    void beginLasagnaManifestAttachment(bool remote);
+    void attachCatalogRepresentation(const vcr::catalog::OpenDataSample& sample,
+                                     const vcr::catalog::OpenDataRepresentationRef& ref);
     struct LasagnaAttachTaskResult;
     // Interactive: prompts before replacing the open project and shows progress.
     bool openOpenDataSample(const vcr::catalog::OpenDataSample& sample,

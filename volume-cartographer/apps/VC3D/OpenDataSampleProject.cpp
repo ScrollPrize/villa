@@ -197,8 +197,9 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                                       std::to_string(result.attachedNormalGrids) +
                                       " streaming normal grid store(s).");
         }
-        result.attachedLasagnaDatasets = attachOpenDataLasagna(
-            *pkg, sample, remoteCacheRoot, &result.messages, selection);
+        auto lasagna = prepareOpenDataLasagna(sample, remoteCacheRoot, selection);
+        result.messages.insert(result.messages.end(), lasagna.messages.begin(), lasagna.messages.end());
+        result.attachedLasagnaDatasets = attachOpenDataLasagna(*pkg, lasagna, &result.messages);
         if (result.attachedLasagnaDatasets > 0) {
             result.messages.push_back(
                 "Attached " + std::to_string(result.attachedLasagnaDatasets) +

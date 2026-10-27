@@ -242,6 +242,11 @@ bool isCachedNormalGridsDir(const std::filesystem::path& dir)
            std::filesystem::is_regular_file(dir / "metadata.json", ec);
 }
 
+namespace {
+
+// Create the streaming cache dir for this pairing (writing the remote-marker
+// file NormalGridVolume streams from) and attach it as a normal-grid project
+// entry. Returns true when the entry is attached (or already present).
 bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const OpenDataNormalGridsInfo& info,
                                      const std::filesystem::path& remoteCacheRoot)
@@ -260,6 +265,8 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
     pkg.addNormalGridEntry(dir.string());
     return true;
 }
+
+} // namespace
 
 int attachOpenDataNormalGrids(VolumePkg& pkg,
                               const vcr::catalog::OpenDataSample& sample,

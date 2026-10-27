@@ -1,5 +1,6 @@
 #include "OpenDataCatalogWindow.hpp"
 
+#include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
@@ -234,15 +235,29 @@ QString predictionTypeCell(const vcr::catalog::OpenDataArtifact& artifact)
     return artifact.predictionType.empty() ? QStringLiteral("—") : qstr(artifact.predictionType);
 }
 
-bool canAttachRepresentation(const vcr::catalog::OpenDataArtifact& artifact)
+// Whether the project's attach for the representation's kind takes it, at a
+// public URL.
+bool canAttachRepresentation(const vcr::catalog::OpenDataSample& sample,
+                             const vcr::catalog::OpenDataRepresentationRef& ref)
 {
+    const auto& volume = sample.volumes[ref.volumeIndex];
+    const auto& artifact = volume.artifacts[ref.artifactIndex];
     if (!artifact.hasResolvedUrl()) return false;
-    const auto kind = vcr::catalog::classifyDerivedRepresentation(artifact);
-    if (!kind) return false;
-    if (*kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids && !artifact.sourceCoordinateLevel)
-        return false;
-    // Prediction artifacts are not necessarily volumes (e.g. meshes).
-    return *kind != vcr::catalog::OpenDataRepresentationKind::Prediction || vcr::catalog::isZarrArtifact(artifact);
+    switch (ref.kind) {
+    case vcr::catalog::OpenDataRepresentationKind::NormalGrids: {
+        const auto grids = normalGridsArtifacts(sample.id, volume);
+        return std::any_of(grids.begin(), grids.end(),
+                           [&](const auto& info) { return info.artifactIndex == ref.artifactIndex; });
+    }
+    case vcr::catalog::OpenDataRepresentationKind::Lasagna: {
+        const auto lasagna = lasagnaArtifacts(volume);
+        return std::find(lasagna.begin(), lasagna.end(), ref.artifactIndex) != lasagna.end();
+    }
+    case vcr::catalog::OpenDataRepresentationKind::Prediction:
+        // Prediction artifacts are not necessarily volumes (e.g. meshes).
+        return vcr::catalog::isZarrArtifact(artifact);
+    }
+    return false;
 }
 
 QString representationCoordinates(const vcr::catalog::OpenDataArtifact& artifact,
@@ -403,9 +418,9 @@ void OpenDataCatalogWindow::setCreateProjectHandler(CreateProjectHandler handler
     updateActionButtons();
 }
 
-void OpenDataCatalogWindow::setAttachPredictionHandler(AttachPredictionHandler handler)
+void OpenDataCatalogWindow::setAttachRepresentationHandler(AttachRepresentationHandler handler)
 {
-    _attachPredictionHandler = std::move(handler);
+    _attachRepresentationHandler = std::move(handler);
     updateActionButtons();
 }
 
@@ -809,29 +824,15 @@ void OpenDataCatalogWindow::buildUi()
         if (!url.isEmpty()) emit attachVolumeRequested(url);
     });
     connect(_attachRepresentationButton, &QPushButton::clicked, this, [this]() {
-        const auto* artifact = selectedRepresentationArtifact();
-        if (_manifestRefreshPending || !artifact || !canAttachRepresentation(*artifact)) return;
-        const auto kind = *vcr::catalog::classifyDerivedRepresentation(*artifact);
-        if (kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
-            emit attachLasagnaRequested(qstr(artifact->url()), artifact->predictionType == "fibers");
-        } else if (kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
-            const auto* sample = selectedSample();
-            const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
-            const auto volumeIndex = item->data(kRepresentationVolumeIndexRole).toULongLong();
-            emit attachNormalGridsRequested(qstr(sample->id), qstr(sample->volumes.at(volumeIndex).id),
-                qstr(artifact->url()), *artifact->sourceCoordinateLevel);
-        } else if (_attachPredictionHandler) {
-            // Preserve the complete catalog context for descriptor validation
-            // and coordinate tags, but attach only the selected prediction.
-            const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
-            OpenDataResourceSelection selection;
-            selection.rawVolumeIds.emplace();
-            selection.representations = std::vector<vcr::catalog::OpenDataRepresentationRef>{{
-                item->data(kRepresentationVolumeIndexRole).toULongLong(),
-                item->data(kRepresentationArtifactIndexRole).toULongLong(), kind}};
-            const auto sample = *selectedSample();
-            _attachPredictionHandler(sample, selection);
-        }
+        const auto* sample = selectedSample();
+        const auto ref = selectedRepresentation();
+        if (_manifestRefreshPending || !sample || !ref || !_attachRepresentationHandler ||
+            !canAttachRepresentation(*sample, *ref))
+            return;
+        // The full sample gives the attach its catalog context (source volumes,
+        // shapes, levels); the handler attaches only this representation.
+        const auto sampleCopy = *sample;
+        _attachRepresentationHandler(sampleCopy, *ref);
     });
     _attachRepresentationButton->setObjectName("attachCatalogRepresentation");
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
@@ -1255,25 +1256,29 @@ const vcr::catalog::OpenDataVolume* OpenDataCatalogWindow::selectedVolume() cons
     return &sample->volumes[static_cast<std::size_t>(volumeIndex)];
 }
 
-const vcr::catalog::OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
+std::optional<vcr::catalog::OpenDataRepresentationRef> OpenDataCatalogWindow::selectedRepresentation() const
 {
     const auto* sample = selectedSample();
-    if (!sample || !_representationsTable ||
-        _representationsTable->currentRow() < 0) {
-        return nullptr;
+    if (!sample || !_representationsTable || _representationsTable->currentRow() < 0) {
+        return std::nullopt;
     }
-    const auto* rowItem = _representationsTable->item(
-        _representationsTable->currentRow(), 0);
-    if (!rowItem) return nullptr;
-    const auto volumeIndex = static_cast<std::size_t>(
-        rowItem->data(kRepresentationVolumeIndexRole).toULongLong());
-    const auto artifactIndex = static_cast<std::size_t>(
-        rowItem->data(kRepresentationArtifactIndexRole).toULongLong());
-    if (volumeIndex >= sample->volumes.size() ||
-        artifactIndex >= sample->volumes[volumeIndex].artifacts.size()) {
-        return nullptr;
+    const auto* rowItem = _representationsTable->item(_representationsTable->currentRow(), 0);
+    if (!rowItem) return std::nullopt;
+    const auto volumeIndex = static_cast<std::size_t>(rowItem->data(kRepresentationVolumeIndexRole).toULongLong());
+    const auto artifactIndex = static_cast<std::size_t>(rowItem->data(kRepresentationArtifactIndexRole).toULongLong());
+    if (volumeIndex >= sample->volumes.size() || artifactIndex >= sample->volumes[volumeIndex].artifacts.size()) {
+        return std::nullopt;
     }
-    return &sample->volumes[volumeIndex].artifacts[artifactIndex];
+    const auto kind =
+        vcr::catalog::classifyDerivedRepresentation(sample->volumes[volumeIndex].artifacts[artifactIndex]);
+    if (!kind) return std::nullopt;
+    return vcr::catalog::OpenDataRepresentationRef{volumeIndex, artifactIndex, *kind};
+}
+
+const vcr::catalog::OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
+{
+    const auto ref = selectedRepresentation();
+    return ref ? &selectedSample()->volumes[ref->volumeIndex].artifacts[ref->artifactIndex] : nullptr;
 }
 
 const vcr::catalog::OpenDataSegment* OpenDataCatalogWindow::selectedSegment() const
@@ -1333,12 +1338,12 @@ void OpenDataCatalogWindow::updateActionButtons()
     const bool manifestReady = !_manifestRefreshPending;
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasRepresentationUrl = !selectedRepresentationUrl().isEmpty();
-    const auto* representation = selectedRepresentationArtifact();
     if (_attachRepresentationButton) {
-        _attachRepresentationButton->setEnabled(manifestReady && representation &&
-            canAttachRepresentation(*representation) &&
-            (vcr::catalog::classifyDerivedRepresentation(*representation) != vcr::catalog::OpenDataRepresentationKind::Prediction ||
-             bool(_attachPredictionHandler)));
+        const auto* sample = selectedSample();
+        const auto representation = selectedRepresentation();
+        _attachRepresentationButton->setEnabled(manifestReady && sample && representation &&
+                                                bool(_attachRepresentationHandler) &&
+                                                canAttachRepresentation(*sample, *representation));
     }
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();

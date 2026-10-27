@@ -87,12 +87,12 @@ bool compatibleBaseShape(
     return true;
 }
 
-void validatePrepared(const OpenDataLasagnaInfo& info,
-                      const std::filesystem::path& manifestPath)
+OpenDataLasagnaDatasetKind validatePrepared(const vcr::catalog::OpenDataVolume& volume,
+                                            const vcr::catalog::OpenDataArtifact& artifact,
+                                            const vc::lasagna::LasagnaDataset& dataset)
 {
-    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     const auto& manifest = dataset.manifest();
-    (void)validateOpenDataLasagnaManifest(info, manifest);
+    const auto kind = validateOpenDataLasagnaManifest(volume, artifact, manifest);
     std::set<std::string> scheduled;
     std::vector<std::future<void>> validations;
     for (const auto& group : manifest.groups) {
@@ -106,6 +106,7 @@ void validatePrepared(const OpenDataLasagnaInfo& info,
     for (auto& validation : validations) {
         validation.get();
     }
+    return kind;
 }
 
 int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
@@ -129,9 +130,8 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
     return level;
 }
 
-} // namespace
-
-std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
+// The single root manifest in a public catalogue artifact directory.
+std::string discoverManifestUrl(const std::string& artifactUrl)
 {
     const auto prefix = vcr::s3::splitPrefixUrl(artifactUrl);
     if (!prefix || prefix->key.empty())
@@ -156,52 +156,8 @@ std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
     return vcr::catalog::joinOpenDataUrl(prefix->origin, keys.front());
 }
 
-OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
-    const OpenDataLasagnaInfo& info,
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
-{
-    if (info.sourceCoordinateLevel < 0 ||
-        info.sourceCoordinateLevel > 5) {
-        throw std::runtime_error(
-            "Lasagna artifact has missing or invalid parameters.level");
-    }
-    if (info.lasagnaVersionPresent && !info.lasagnaVersion) {
-        throw std::runtime_error(
-            "Lasagna artifact has invalid creation_info.lasagna_version");
-    }
-    if (info.sourceToBasePresent && !info.sourceToBase) {
-        throw std::runtime_error(
-            "Lasagna artifact has invalid creation_info.source_to_base");
-    }
-    if (manifest.version != 2) {
-        throw std::runtime_error("Unsupported open-data Lasagna manifest version " +
-                                 std::to_string(manifest.version));
-    }
-    if (info.lasagnaVersion && manifest.version != *info.lasagnaVersion) {
-        throw std::runtime_error("Outer and inner Lasagna versions disagree");
-    }
-    if (info.sourceToBase &&
-        std::abs(manifest.sourceToBase - *info.sourceToBase) > 1.0e-12) {
-        throw std::runtime_error("Outer and inner source_to_base values disagree");
-    }
-    if (info.baseShapeZYX &&
-        (!manifest.baseShapeZYX ||
-         !compatibleBaseShape(*info.baseShapeZYX, *manifest.baseShapeZYX))) {
-        throw std::runtime_error(
-            "Lasagna base_shape_zyx does not match its parent volume");
-    }
-
-    if (!manifest.fiberPredictionPrefixes().empty()) {
-        return OpenDataLasagnaDatasetKind::FiberInference;
-    }
-    if (manifest.hasNormalSource()) {
-        return OpenDataLasagnaDatasetKind::Normal;
-    }
-    throw std::runtime_error(
-        "Open-data Lasagna artifact contains neither normal Lasagna "
-        "(grad_mag/nx/ny) nor fiber inference (presence/nx/ny) channels");
-}
-
+// The catalog Lasagna artifact a dataset entry caches (the artifact_url of its
+// remote marker); nullopt for other entries.
 std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumePkg& pkg,
                                                                    const vc::project::Entry& entry)
 {
@@ -218,6 +174,174 @@ std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(const VolumeP
     }
 }
 
+std::filesystem::path lasagnaCacheDir(const std::filesystem::path& remoteCacheRoot,
+                                      const std::string& sampleId,
+                                      const vcr::catalog::OpenDataVolume& volume,
+                                      const vcr::catalog::OpenDataArtifact& artifact)
+{
+    std::ostringstream identity;
+    identity << artifact.url() << '\n' << artifact.modelId.value_or(std::string{}) << '\n'
+             << artifact.lasagnaVersion.value_or(-1) << '\n'
+             << std::setprecision(17) << artifact.sourceToBase.value_or(-1.0);
+    if (volume.shapeZYX) {
+        for (const auto extent : *volume.shapeZYX) identity << '\n' << extent;
+    }
+    return remoteCacheRoot / "open_data" / "lasagna" /
+           vcr::catalog::safePathComponent(sampleId) / vcr::catalog::safePathComponent(volume.id) /
+           cacheKey(identity.str());
+}
+
+struct CachedLasagna {
+    std::filesystem::path manifest;
+    vc::lasagna::LasagnaDataset dataset;
+    OpenDataLasagnaDatasetKind kind;
+};
+
+// Download the artifact's small dataset manifest beside a remote marker naming
+// it, and open and validate it with its Zarr descriptors.
+CachedLasagna cacheLasagna(
+    const std::string& sampleId,
+    const vcr::catalog::OpenDataVolume& volume,
+    const vcr::catalog::OpenDataArtifact& artifact,
+    const std::filesystem::path& remoteCacheRoot)
+{
+    if (remoteCacheRoot.empty())
+        throw std::runtime_error("No remote cache directory configured");
+    const auto artifactUrl = artifact.url();
+    const auto modelId = artifact.modelId.value_or(std::string{});
+    const int level = *artifact.sourceCoordinateLevel;
+    const auto cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
+    const auto finalDir = lasagnaCacheDir(cacheRoot, sampleId, volume, artifact);
+    const auto markerPath = finalDir / vc::lasagna::kLasagnaRemoteMarker;
+    if (std::filesystem::is_regular_file(markerPath)) {
+        auto marker = nlohmann::json::parse(std::ifstream(markerPath));
+        if (marker.value("artifact_url", std::string{}) == artifactUrl &&
+            marker.value("sample_id", std::string{}) == sampleId &&
+            marker.value("volume_id", std::string{}) == volume.id &&
+            marker.value("model_id", std::string{}) == modelId) {
+            const auto manifest = finalDir / marker.value("manifest_file", std::string{});
+            if (std::filesystem::is_regular_file(manifest)) {
+                bool markerChanged = false;
+                if (!marker.value("anonymous", false)) {
+                    marker["anonymous"] = true;
+                    markerChanged = true;
+                }
+                if (marker.value("source_coordinate_level", -1) != level) {
+                    marker["source_coordinate_level"] = level;
+                    markerChanged = true;
+                }
+                if (markerChanged) {
+                    writeMarker(markerPath, marker.dump(2));
+                }
+                auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
+                const auto kind = validatePrepared(volume, artifact, dataset);
+                return {manifest, std::move(dataset), kind};
+            }
+        }
+    }
+
+    const auto manifestUrl = discoverManifestUrl(artifactUrl);
+    const auto relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
+    vc::core::util::RemoteFileCacheOptions cacheOptions;
+    cacheOptions.cacheRoot = cacheRoot;
+    cacheOptions.destination = (finalDir / relativeName).lexically_relative(cacheRoot);
+    cacheOptions.discoverAwsCredentials = false;
+    const auto cached = vc::core::util::cacheRemoteFile(manifestUrl, cacheOptions);
+    nlohmann::json marker{
+        {"version", 1},
+        {"anonymous", true},
+        {"artifact_url", artifactUrl},
+        {"sample_id", sampleId},
+        {"volume_id", volume.id},
+        {"model_id", modelId},
+        {"source_coordinate_level", level},
+        {"manifest_file", relativeName},
+    };
+    if (artifact.lasagnaVersion)
+        marker["lasagna_version"] = *artifact.lasagnaVersion;
+    if (artifact.sourceToBase)
+        marker["source_to_base"] = *artifact.sourceToBase;
+    if (volume.shapeZYX)
+        marker["base_shape_zyx"] = *volume.shapeZYX;
+    writeMarker(markerPath, marker.dump(2));
+    try {
+        auto dataset = vc::lasagna::LasagnaDataset::open(cached.path);
+        const auto kind = validatePrepared(volume, artifact, dataset);
+        return {cached.path, std::move(dataset), kind};
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(markerPath, ec);
+        throw;
+    }
+}
+
+} // namespace
+
+std::vector<std::size_t> lasagnaArtifacts(const vcr::catalog::OpenDataVolume& volume)
+{
+    std::vector<std::size_t> result;
+    for (std::size_t index = 0; index < volume.artifacts.size(); ++index) {
+        const auto& artifact = volume.artifacts[index];
+        if (vcr::catalog::classifyDerivedRepresentation(artifact) != vcr::catalog::OpenDataRepresentationKind::Lasagna ||
+            artifact.url().empty() || !artifact.levelParameterPresent || !artifact.sourceCoordinateLevel)
+            continue;
+        const bool duplicate = std::any_of(result.begin(), result.end(), [&](std::size_t other) {
+            const auto& item = volume.artifacts[other];
+            return item.url() == artifact.url() && item.modelId == artifact.modelId &&
+                   item.sourceCoordinateLevel == artifact.sourceCoordinateLevel;
+        });
+        if (!duplicate) result.push_back(index);
+    }
+    return result;
+}
+
+OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
+    const vcr::catalog::OpenDataVolume& volume,
+    const vcr::catalog::OpenDataArtifact& artifact,
+    const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    if (!artifact.sourceCoordinateLevel || *artifact.sourceCoordinateLevel < 0 ||
+        *artifact.sourceCoordinateLevel > 5) {
+        throw std::runtime_error(
+            "Lasagna artifact has missing or invalid parameters.level");
+    }
+    if (artifact.lasagnaVersionPresent && !artifact.lasagnaVersion) {
+        throw std::runtime_error(
+            "Lasagna artifact has invalid creation_info.lasagna_version");
+    }
+    if (artifact.sourceToBasePresent && !artifact.sourceToBase) {
+        throw std::runtime_error(
+            "Lasagna artifact has invalid creation_info.source_to_base");
+    }
+    if (manifest.version != 2) {
+        throw std::runtime_error("Unsupported open-data Lasagna manifest version " +
+                                 std::to_string(manifest.version));
+    }
+    if (artifact.lasagnaVersion && manifest.version != *artifact.lasagnaVersion) {
+        throw std::runtime_error("Outer and inner Lasagna versions disagree");
+    }
+    if (artifact.sourceToBase &&
+        std::abs(manifest.sourceToBase - *artifact.sourceToBase) > 1.0e-12) {
+        throw std::runtime_error("Outer and inner source_to_base values disagree");
+    }
+    if (volume.shapeZYX &&
+        (!manifest.baseShapeZYX ||
+         !compatibleBaseShape(*volume.shapeZYX, *manifest.baseShapeZYX))) {
+        throw std::runtime_error(
+            "Lasagna base_shape_zyx does not match its parent volume");
+    }
+
+    if (!manifest.fiberPredictionPrefixes().empty()) {
+        return OpenDataLasagnaDatasetKind::FiberInference;
+    }
+    if (manifest.hasNormalSource()) {
+        return OpenDataLasagnaDatasetKind::Normal;
+    }
+    throw std::runtime_error(
+        "Open-data Lasagna artifact contains neither normal Lasagna "
+        "(grad_mag/nx/ny) nor fiber inference (presence/nx/ny) channels");
+}
+
 std::string lasagnaSourceManifestLocation(const VolumePkg& pkg, const vc::project::Entry& entry)
 {
     const auto view = lasagnaCatalogView(pkg, entry);
@@ -227,225 +351,76 @@ std::string lasagnaSourceManifestLocation(const VolumePkg& pkg, const vc::projec
         view->artifact->url(), std::filesystem::path(entry.location).filename().string());
 }
 
-std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
-    const std::string& sampleId,
-    const vcr::catalog::OpenDataVolume& volume)
+OpenDataLasagnaPreparation prepareOpenDataLasagna(const vcr::catalog::OpenDataSample& sample,
+                                                  const std::filesystem::path& remoteCacheRoot,
+                                                  const OpenDataResourceSelection* selection)
 {
-    std::vector<OpenDataLasagnaInfo> result;
-    for (std::size_t artifactIndex = 0;
-         artifactIndex < volume.artifacts.size(); ++artifactIndex) {
-        const auto& artifact = volume.artifacts[artifactIndex];
-        if (vcr::catalog::classifyDerivedRepresentation(artifact) != vcr::catalog::OpenDataRepresentationKind::Lasagna)
-            continue;
-        const auto url = artifact.url();
-        if (url.empty()) continue;
-        OpenDataLasagnaInfo info;
-        info.sampleId = sampleId;
-        info.volumeId = volume.id;
-        info.artifactIndex = artifactIndex;
-        info.artifactUrl = url;
-        info.modelId = artifact.modelId.value_or(std::string{});
-        if (!artifact.levelParameterPresent || !artifact.sourceCoordinateLevel)
-            continue;
-        info.sourceCoordinateLevel = *artifact.sourceCoordinateLevel;
-        info.lasagnaVersionPresent = artifact.lasagnaVersionPresent;
-        info.lasagnaVersion = artifact.lasagnaVersion;
-        info.sourceToBasePresent = artifact.sourceToBasePresent;
-        info.sourceToBase = artifact.sourceToBase;
-        info.baseShapeZYX = volume.shapeZYX;
-        const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
-            return item.artifactUrl == info.artifactUrl &&
-                   item.modelId == info.modelId &&
-                   item.sourceCoordinateLevel == info.sourceCoordinateLevel;
-        });
-        if (duplicate == result.end()) result.push_back(std::move(info));
-    }
-    return result;
-}
-
-std::filesystem::path lasagnaCacheDir(
-    const std::filesystem::path& remoteCacheRoot,
-    const OpenDataLasagnaInfo& info)
-{
-    std::ostringstream identity;
-    identity << info.artifactUrl << '\n' << info.modelId << '\n'
-             << info.lasagnaVersion.value_or(-1) << '\n'
-             << std::setprecision(17) << info.sourceToBase.value_or(-1.0);
-    if (info.baseShapeZYX) {
-        for (const auto extent : *info.baseShapeZYX) identity << '\n' << extent;
-    }
-    return remoteCacheRoot / "open_data" / "lasagna" /
-           vcr::catalog::safePathComponent(info.sampleId) / vcr::catalog::safePathComponent(info.volumeId) /
-           cacheKey(identity.str());
-}
-
-std::filesystem::path prepareOpenDataLasagna(
-    const OpenDataLasagnaInfo& info,
-    const std::filesystem::path& remoteCacheRoot,
-    std::string* errorOut)
-{
-    try {
-        if (remoteCacheRoot.empty())
-            throw std::runtime_error("No remote cache directory configured");
-        const auto cacheRoot = std::filesystem::absolute(remoteCacheRoot).lexically_normal();
-        const auto finalDir = lasagnaCacheDir(cacheRoot, info);
-        const auto markerPath = finalDir / vc::lasagna::kLasagnaRemoteMarker;
-        if (std::filesystem::is_regular_file(markerPath)) {
-            auto marker = nlohmann::json::parse(std::ifstream(markerPath));
-            if (marker.value("artifact_url", std::string{}) == info.artifactUrl &&
-                marker.value("sample_id", std::string{}) == info.sampleId &&
-                marker.value("volume_id", std::string{}) == info.volumeId &&
-                marker.value("model_id", std::string{}) == info.modelId) {
-                const auto manifest = finalDir /
-                    marker.value("manifest_file", std::string{});
-                if (std::filesystem::is_regular_file(manifest)) {
-                    bool markerChanged = false;
-                    if (!marker.value("anonymous", false)) {
-                        marker["anonymous"] = true;
-                        markerChanged = true;
-                    }
-                    if (marker.value("source_coordinate_level", -1) !=
-                        info.sourceCoordinateLevel) {
-                        marker["source_coordinate_level"] =
-                            info.sourceCoordinateLevel;
-                        markerChanged = true;
-                    }
-                    if (markerChanged) {
-                        writeMarker(markerPath, marker.dump(2));
-                    }
-                    validatePrepared(info, manifest);
-                    return manifest;
+    OpenDataLasagnaPreparation preparation;
+    preparation.sampleId = sample.id;
+    for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size(); ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        const auto attachable = lasagnaArtifacts(volume);
+        for (std::size_t artifactIndex = 0; artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+            const auto& artifact = volume.artifacts[artifactIndex];
+            if (vcr::catalog::classifyDerivedRepresentation(artifact) !=
+                    vcr::catalog::OpenDataRepresentationKind::Lasagna ||
+                (selection && !selection->allowsRepresentation(volumeIndex, artifactIndex,
+                                                               vcr::catalog::OpenDataRepresentationKind::Lasagna,
+                                                               volume.id))) {
+                continue;
+            }
+            if (std::find(attachable.begin(), attachable.end(), artifactIndex) == attachable.end()) {
+                if (!artifact.url().empty() && (!artifact.levelParameterPresent || !artifact.sourceCoordinateLevel))
+                    preparation.messages.push_back("Skipped Lasagna for " + volume.id +
+                                                   ": parameters.level is missing or invalid.");
+                continue;
+            }
+            preparation.artifactUrls.push_back(artifact.url());
+            try {
+                const auto cached = cacheLasagna(sample.id, volume, artifact, remoteCacheRoot);
+                OpenDataLasagnaPreparation::Dataset dataset{
+                    cached.manifest.string(), cached.kind == OpenDataLasagnaDatasetKind::FiberInference, {}};
+                for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(cached.dataset, dataset.manifest)) {
+                    dataset.volumes.push_back(
+                        {std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
                 }
+                preparation.datasets.push_back(std::move(dataset));
+            } catch (const std::exception& error) {
+                preparation.messages.push_back("Failed to prepare Lasagna for " + volume.id +
+                                               " at coordinate level L" +
+                                               std::to_string(*artifact.sourceCoordinateLevel) + ": " +
+                                               error.what());
             }
         }
-
-        const auto manifestUrl = discoverOpenDataLasagnaManifestUrl(info.artifactUrl);
-        const auto relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
-        vc::core::util::RemoteFileCacheOptions cacheOptions;
-        cacheOptions.cacheRoot = cacheRoot;
-        cacheOptions.destination =
-            (finalDir / relativeName).lexically_relative(cacheRoot);
-        cacheOptions.discoverAwsCredentials = false;
-        const auto cached = vc::core::util::cacheRemoteFile(
-            manifestUrl, cacheOptions);
-        nlohmann::json marker{
-            {"version", 1},
-            {"anonymous", true},
-            {"artifact_url", info.artifactUrl},
-            {"sample_id", info.sampleId},
-            {"volume_id", info.volumeId},
-            {"model_id", info.modelId},
-            {"source_coordinate_level", info.sourceCoordinateLevel},
-            {"manifest_file", relativeName},
-        };
-        if (info.lasagnaVersion)
-            marker["lasagna_version"] = *info.lasagnaVersion;
-        if (info.sourceToBase)
-            marker["source_to_base"] = *info.sourceToBase;
-        if (info.baseShapeZYX)
-            marker["base_shape_zyx"] = *info.baseShapeZYX;
-        writeMarker(
-            finalDir / vc::lasagna::kLasagnaRemoteMarker, marker.dump(2));
-        try {
-            validatePrepared(info, cached.path);
-        } catch (...) {
-            std::error_code ec;
-            std::filesystem::remove(markerPath, ec);
-            throw;
-        }
-        return cached.path;
-    } catch (const std::exception& e) {
-        if (errorOut) *errorOut = e.what();
-        return {};
     }
+    return preparation;
 }
 
-int attachOpenDataLasagna(VolumePkg& pkg,
-                          const vcr::catalog::OpenDataSample& sample,
-                          const std::filesystem::path& remoteCacheRoot,
-                          std::vector<std::string>* messages,
-                          const OpenDataResourceSelection* selection)
+int attachOpenDataLasagna(VolumePkg& pkg, const OpenDataLasagnaPreparation& preparation,
+                          std::vector<std::string>* messages)
 {
     int attached = 0;
     std::set<std::string> expected;
-    for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
-         ++volumeIndex) {
-        const auto& volume = sample.volumes[volumeIndex];
-        if (selection && !selection->allowsVolume(volume.id)) {
+    const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
+    for (const auto& dataset : preparation.datasets) {
+        expected.insert(dataset.manifest);
+        if (pkg.attachPreparedLasagnaDataset(dataset.manifest, tags, dataset.fiberInference, dataset.volumes) ==
+            VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
+            if (messages)
+                messages->push_back("Failed to attach Lasagna volumes of " + dataset.manifest +
+                                    ": a Lasagna volume id conflicts with the project");
             continue;
         }
-        const auto infos = lasagnaArtifacts(sample.id, volume);
-        const bool hasLasagnaArtifact = std::any_of(
-            volume.artifacts.begin(), volume.artifacts.end(), [](const auto& artifact) {
-                return vcr::catalog::classifyDerivedRepresentation(artifact) ==
-                       vcr::catalog::OpenDataRepresentationKind::Lasagna;
-            });
-        if (infos.empty() && hasLasagnaArtifact) {
-            if (messages) messages->push_back(
-                "Skipped Lasagna for " + volume.id +
-                ": parameters.level is missing or invalid.");
-            continue;
-        }
-        if (infos.empty()) continue;
-
-        for (const auto& info : infos) {
-            if (selection &&
-                !selection->allowsRepresentation(
-                    volumeIndex, info.artifactIndex,
-                    vcr::catalog::OpenDataRepresentationKind::Lasagna, volume.id)) {
-                continue;
-            }
-            std::string error;
-            const auto manifest =
-                prepareOpenDataLasagna(info, remoteCacheRoot, &error);
-            if (manifest.empty()) {
-                if (messages) {
-                    messages->push_back(
-                        "Failed to prepare Lasagna for " + volume.id +
-                        " at coordinate level L" +
-                        std::to_string(info.sourceCoordinateLevel) + ": " + error);
-                }
-                continue;
-            }
-            expected.insert(manifest.string());
-            const std::vector<std::string> tags{std::string(vc::project::kAnonymousRemoteAuthTag)};
-            try {
-                const auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
-                const auto kind = validateOpenDataLasagnaManifest(
-                    info, dataset.manifest());
-                const bool fiberInference =
-                    kind == OpenDataLasagnaDatasetKind::FiberInference;
-                std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
-                for (auto& prepared :
-                     vc::lasagna::prepareLasagnaProjectVolumes(
-                         dataset, manifest.string())) {
-                    volumes.push_back({
-                        std::move(prepared.location), std::move(prepared.tags),
-                        std::move(prepared.volume)});
-                }
-                const auto result = pkg.attachPreparedLasagnaDataset(
-                    manifest.string(), tags, fiberInference, volumes);
-                if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict)
-                    throw std::runtime_error(
-                        "a Lasagna volume id conflicts with the project");
-            } catch (const std::exception& error) {
-                if (messages) {
-                    messages->push_back(
-                        "Failed to attach Lasagna volumes for " + volume.id +
-                        ": " + error.what());
-                }
-                continue;
-            }
-            ++attached;
-        }
+        ++attached;
     }
 
     std::vector<std::string> stale;
     for (const auto& entry : pkg.allLasagnaDatasetEntries()) {
         const auto view = lasagnaCatalogView(pkg, entry);
-        if (!view || view->sampleId != sample.id)
-            continue;
-        if (expected.count(entry.location) == 0) stale.push_back(entry.location);
+        if (view && view->sampleId == preparation.sampleId && !expected.count(entry.location) &&
+            std::find(preparation.artifactUrls.begin(), preparation.artifactUrls.end(), view->artifact->url()) !=
+                preparation.artifactUrls.end())
+            stale.push_back(entry.location);
     }
     for (const auto& location : stale) pkg.removeEntry(location);
     return attached;
@@ -509,7 +484,7 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
                 true};
         }
         const auto* volume = pkg.catalog()->findSample(view->sampleId)->findVolume(view->volumeId);
-        if (!lasagnaArtifacts(view->sampleId, *volume).empty()) {
+        if (!lasagnaArtifacts(*volume).empty()) {
             throw std::runtime_error(
                 "The manifest declares Lasagna for the active catalog volume, "
                 "but its validated local cache entry is unavailable");

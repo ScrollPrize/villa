@@ -532,48 +532,10 @@ void MenuActionController::showOpenDataCatalog()
     _openDataCatalogDialog = dialog;
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachVolumeRequested,
             this, &MenuActionController::showAttachRemoteZarrDialog);
-    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
-            this, &MenuActionController::attachCatalogLasagna);
-    dialog->setAttachPredictionHandler([this](const vcr::catalog::OpenDataSample& sample,
-            const vc3d::opendata::OpenDataResourceSelection& selection) {
-        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
-            return;
-        }
-        try {
-            const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
-                *_window->_state->vpkg(), sample, &selection);
-            _window->refreshCurrentVolumePackageUi();
-            if (result.failedVolumes) {
-                QStringList messages;
-                for (const auto& message : result.messages)
-                    messages.push_back(QString::fromStdString(message));
-                QMessageBox::warning(_window, tr("Attach incomplete"), messages.join('\n'));
-            }
-        } catch (const std::exception& e) {
-            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
-        }
-    });
-    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
-            this, [this](const QString& sample, const QString& volume, const QString& url,
-                         int level) {
-        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
-            return;
-        }
-        try {
-            const vc3d::opendata::OpenDataNormalGridsInfo info{
-                sample.toStdString(), volume.toStdString(), url.toStdString(), level};
-            if (!vc3d::opendata::attachStreamingNormalGridsEntry(
-                    *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
-                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
-                return;
-            }
-            _window->refreshCurrentVolumePackageUi();
-        } catch (const std::exception& e) {
-            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
-        }
-    });
+    dialog->setAttachRepresentationHandler(
+        [this](const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataRepresentationRef& ref) {
+            attachCatalogRepresentation(sample, ref);
+        });
     dialog->setOpenSampleHandler([this](const vcr::catalog::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
@@ -1819,36 +1781,67 @@ void MenuActionController::attachRemoteLasagnaManifest()
     beginLasagnaManifestAttachment(true);
 }
 
-void MenuActionController::attachCatalogLasagna(const QString& artifactUrl, bool fiber)
+void MenuActionController::attachCatalogRepresentation(const vcr::catalog::OpenDataSample& sample,
+                                                       const vcr::catalog::OpenDataRepresentationRef& ref)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
         return;
     }
     const auto targetPackage = _window->_state->vpkg();
-    using Result = std::pair<QString, QString>;
-    auto* watcher = new QFutureWatcher<Result>(this);
-    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, watcher, targetPackage, fiber]() {
-        const auto [url, error] = watcher->result();
-        watcher->deleteLater();
-        if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
-        if (!error.isEmpty()) {
-            QMessageBox::warning(_window, QObject::tr("Attach failed"), error);
+    const auto reportMessages = [this](const QString& title, const std::vector<std::string>& messages) {
+        QStringList lines;
+        for (const auto& message : messages)
+            lines.push_back(QString::fromStdString(message));
+        QMessageBox::warning(_window, title, lines.join('\n'));
+    };
+    // Only this representation: no scan views beside it.
+    vc3d::opendata::OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations = std::vector<vcr::catalog::OpenDataRepresentationRef>{ref};
+
+    if (ref.kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
+        // Caching and validating the dataset reads the network; the project
+        // only changes on the GUI thread, if it is still the open one.
+        using Preparation = vc3d::opendata::OpenDataLasagnaPreparation;
+        auto* watcher = new QFutureWatcher<Preparation>(this);
+        connect(watcher, &QFutureWatcher<Preparation>::finished, this,
+                [this, watcher, targetPackage, reportMessages]() {
+                    auto preparation = watcher->result();
+                    watcher->deleteLater();
+                    if (!_window || !_window->_state || _window->_state->vpkg() != targetPackage) return;
+                    auto messages = preparation.messages;
+                    if (vc3d::opendata::attachOpenDataLasagna(*targetPackage, preparation, &messages) > 0)
+                        _window->refreshCurrentVolumePackageUi();
+                    if (!messages.empty())
+                        reportMessages(QObject::tr("Attach Lasagna"), messages);
+                });
+        watcher->setFuture(QtConcurrent::run([sample, selection, cacheRoot = vc3d::remoteCachePathFs()]() {
+            return vc3d::opendata::prepareOpenDataLasagna(sample, cacheRoot, &selection);
+        }));
+        return;
+    }
+
+    try {
+        if (ref.kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
+            if (vc3d::opendata::attachOpenDataNormalGrids(*targetPackage, sample, vc3d::remoteCachePathFs(),
+                                                          &selection) == 0) {
+                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
+                return;
+            }
+            _window->refreshCurrentVolumePackageUi();
             return;
         }
-        beginLasagnaManifestAttachment(true, url, fiber);
-    });
-    watcher->setFuture(QtConcurrent::run([artifactUrl]() -> Result {
-        try {
-            return {QString::fromStdString(vc3d::opendata::discoverOpenDataLasagnaManifestUrl(
-                        artifactUrl.toStdString())), {}};
-        } catch (const std::exception& ex) {
-            return {{}, QString::fromUtf8(ex.what())};
-        }
-    }));
+        const auto result = vc3d::opendata::attachOpenDataSampleVolumes(*targetPackage, sample, &selection);
+        _window->refreshCurrentVolumePackageUi();
+        if (result.failedVolumes)
+            reportMessages(tr("Attach incomplete"), result.messages);
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+    }
 }
 
-void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QString& initialUrl, bool fiber)
+void MenuActionController::beginLasagnaManifestAttachment(bool remote)
 {
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
@@ -1863,7 +1856,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
     QString location;
     if (remote) {
         location =
-            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), initialUrl.isEmpty() ? QStringLiteral("s3://") : initialUrl, {QStringLiteral("*.lasagna.json")}, true, false, !initialUrl.isEmpty());
+            promptLocation(QObject::tr("Attach Remote Lasagna Manifest"), QObject::tr("Pick a remote .lasagna.json manifest."), QStringLiteral("s3://"), {QStringLiteral("*.lasagna.json")}, true, false, false);
         if (location.isEmpty())
             return;
         if (!vc::lasagna::isRemoteLasagnaLocation(location.toStdString())) {
@@ -1881,7 +1874,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
 
     bool roleAccepted = false;
     const QString role =
-        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, fiber ? 1 : 0, false, &roleAccepted);
+        QInputDialog::getItem(_window, QObject::tr("Lasagna Data Role"), QObject::tr("Attach this manifest as:"), {QObject::tr("Regular Lasagna"), QObject::tr("Fiber inference")}, 0, false, &roleAccepted);
     if (!roleAccepted)
         return;
     const bool fiberInference = role == QObject::tr("Fiber inference");

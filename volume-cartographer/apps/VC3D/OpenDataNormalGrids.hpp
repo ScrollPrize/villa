@@ -50,13 +50,6 @@ struct OpenDataNormalGridsInfo {
 // (metadata.json plus xy/, xz/, yz/).
 [[nodiscard]] bool isCachedNormalGridsDir(const std::filesystem::path& dir);
 
-// Create the streaming cache dir for this pairing (writing the remote-marker
-// file NormalGridVolume streams from) and attach it as a normal-grid project
-// entry. Returns true when the entry is attached (or already present).
-bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
-                                     const OpenDataNormalGridsInfo& info,
-                                     const std::filesystem::path& remoteCacheRoot);
-
 // Set up streaming normal grids for every volume of this sample that has a
 // normal-grids artifact. Returns the number of entries attached. selection
 // optionally restricts volumes and representations; nullptr attaches all.

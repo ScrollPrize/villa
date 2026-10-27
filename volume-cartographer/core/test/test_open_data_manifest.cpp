@@ -301,16 +301,13 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     REQUIRE(volume.shapeZYX.has_value());
     CHECK(*volume.shapeZYX == std::array<std::size_t, 3>{100, 200, 300});
 
-    const auto artifacts = lasagnaArtifacts(sample.id, volume);
-    REQUIRE(artifacts.size() == 1);
-    CHECK(artifacts.front().volumeId == "volume");
-    CHECK(artifacts.front().artifactIndex == 0);
-    CHECK(artifacts.front().artifactUrl == "https://example.test/lasagna/volume");
-    CHECK(artifacts.front().modelId == "model-7");
-    CHECK(artifacts.front().sourceCoordinateLevel == 2);
-    CHECK(artifacts.front().lasagnaVersion == 2);
-    CHECK(artifacts.front().sourceToBase == doctest::Approx(1.0));
-    CHECK(artifacts.front().baseShapeZYX == volume.shapeZYX);
+    REQUIRE(lasagnaArtifacts(volume) == std::vector<std::size_t>{0});
+    const auto& artifact = volume.artifacts.front();
+    CHECK(artifact.url() == "https://example.test/lasagna/volume");
+    CHECK(artifact.modelId == "model-7");
+    CHECK(artifact.sourceCoordinateLevel == 2);
+    CHECK(artifact.lasagnaVersion == 2);
+    CHECK(*artifact.sourceToBase == doctest::Approx(1.0));
 
     const auto inner = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
       "version":2,
@@ -322,13 +319,13 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
         "ny":{"zarr":"ny.zarr","channels":["ny"]}
       }
     })");
-    CHECK(validateOpenDataLasagnaManifest(artifacts.front(), inner) ==
+    CHECK(validateOpenDataLasagnaManifest(volume, artifact, inner) ==
           OpenDataLasagnaDatasetKind::Normal);
 
     auto missingLevelVolume = volume;
     missingLevelVolume.artifacts.front().levelParameterPresent = false;
     missingLevelVolume.artifacts.front().sourceCoordinateLevel.reset();
-    CHECK(lasagnaArtifacts(sample.id, missingLevelVolume).empty());
+    CHECK(lasagnaArtifacts(missingLevelVolume).empty());
 }
 
 TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
@@ -373,10 +370,10 @@ TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
   }
 })");
     const auto& volume = manifest.samples.front().volumes.front();
-    const auto infos = lasagnaArtifacts("PHercParis4", volume);
-    REQUIRE(infos.size() == 1);
-    CHECK_FALSE(infos.front().lasagnaVersionPresent);
-    CHECK_FALSE(infos.front().sourceToBasePresent);
+    REQUIRE(lasagnaArtifacts(volume).size() == 1);
+    const auto& artifact = volume.artifacts.front();
+    CHECK_FALSE(artifact.lasagnaVersionPresent);
+    CHECK_FALSE(artifact.sourceToBasePresent);
 
     const auto inner = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
       "version":2,
@@ -388,15 +385,17 @@ TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
         "ny":{"zarr":"ny.zarr/3","scaledown":3,"channels":["ny"]}
       }
     })");
-    CHECK(validateOpenDataLasagnaManifest(infos.front(), inner) ==
+    CHECK(validateOpenDataLasagnaManifest(volume, artifact, inner) ==
           OpenDataLasagnaDatasetKind::FiberInference);
 }
 
 TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
 {
-    OpenDataLasagnaInfo info;
-    info.sourceCoordinateLevel = 1;
-    info.baseShapeZYX = std::array<std::size_t, 3>{100, 200, 300};
+    vcr::catalog::OpenDataVolume volume;
+    volume.shapeZYX = std::array<std::size_t, 3>{100, 200, 300};
+    vcr::catalog::OpenDataArtifact artifact;
+    artifact.levelParameterPresent = true;
+    artifact.sourceCoordinateLevel = 1;
 
     const auto wrongShape = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
       "version":2,
@@ -409,14 +408,14 @@ TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
       }
     })");
     CHECK_THROWS_WITH_AS(
-        validateOpenDataLasagnaManifest(info, wrongShape),
+        validateOpenDataLasagnaManifest(volume, artifact, wrongShape),
         doctest::Contains("base_shape_zyx"),
         std::runtime_error);
 
-    info.baseShapeZYX = std::array<std::size_t, 3>{100, 202, 300};
-    info.lasagnaVersionPresent = true;
+    volume.shapeZYX = std::array<std::size_t, 3>{100, 202, 300};
+    artifact.lasagnaVersionPresent = true;
     CHECK_THROWS_WITH_AS(
-        validateOpenDataLasagnaManifest(info, wrongShape),
+        validateOpenDataLasagnaManifest(volume, artifact, wrongShape),
         doctest::Contains("lasagna_version"),
         std::runtime_error);
 }
@@ -438,25 +437,20 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
     }
     sample.volumes.push_back(std::move(volume));
 
-    const auto infos =
-        lasagnaArtifacts(sample.id, sample.volumes.front());
-    REQUIRE(infos.size() == 2);
-    CHECK(infos[0].artifactIndex == 0);
-    CHECK(infos[0].sourceCoordinateLevel == 1);
-    CHECK(infos[1].artifactIndex == 1);
-    CHECK(infos[1].sourceCoordinateLevel == 3);
+    REQUIRE(lasagnaArtifacts(sample.volumes.front()) == std::vector<std::size_t>{0, 1});
 
-    auto pkg = VolumePkg::newEmpty();
     OpenDataResourceSelection selection;
     selection.representations =
         std::vector<vcr::catalog::OpenDataRepresentationRef>{{0, 1,
                                                 vcr::catalog::OpenDataRepresentationKind::Lasagna}};
-    std::vector<std::string> messages;
-    CHECK(attachOpenDataLasagna(
-              *pkg, sample, {}, &messages, &selection) == 0);
-    REQUIRE(messages.size() == 1);
-    CHECK(messages.front().find("coordinate level L3") != std::string::npos);
-    CHECK(messages.front().find("ambiguous") == std::string::npos);
+    const auto preparation = prepareOpenDataLasagna(sample, {}, &selection);
+    CHECK(preparation.datasets.empty());
+    CHECK(preparation.artifactUrls == std::vector<std::string>{"https://example.test/lasagna/L3"});
+    REQUIRE(preparation.messages.size() == 1);
+    CHECK(preparation.messages.front().find("coordinate level L3") != std::string::npos);
+    CHECK(preparation.messages.front().find("ambiguous") == std::string::npos);
+    auto pkg = VolumePkg::newEmpty();
+    CHECK(attachOpenDataLasagna(*pkg, preparation) == 0);
 }
 
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
@@ -737,14 +731,17 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(infos[1].sourceCoordinateLevel == 2);
     CHECK(infos[1].artifactIndex == 1);
 
-    const auto root = std::filesystem::path("/tmp/open-data-normal-grids-test");
-    const auto first = normalGridsCacheDir(root, infos[0].sampleId, infos[0].volumeId,
-                                           infos[0].sourceCoordinateLevel, infos[0].url);
-    const auto second = normalGridsCacheDir(root, infos[1].sampleId, infos[1].volumeId,
-                                            infos[1].sourceCoordinateLevel, infos[1].url);
-    CHECK(first != second);
-    CHECK(first.string().find("L0-") != std::string::npos);
-    CHECK(second.string().find("L2-") != std::string::npos);
+    // Each level streams from its own cache entry.
+    const auto root = std::filesystem::temp_directory_path() /
+        ("vc_open_data_normal_grids_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    auto pkg = VolumePkg::newEmpty();
+    CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
+    const auto entries = pkg->normalGridEntries();
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].location.find("L0-") != std::string::npos);
+    CHECK(entries[1].location.find("L2-") != std::string::npos);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
