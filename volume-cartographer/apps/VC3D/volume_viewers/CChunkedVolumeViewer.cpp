@@ -844,37 +844,6 @@ void CChunkedVolumeViewer::setPinnedSurfaceY(std::optional<float> surfaceY)
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& state)
-{
-    if (_closing) {
-        return;
-    }
-    _surfacePtrX = state.surfacePtrX;
-    _surfacePtrY = state.surfacePtrY;
-    _scale = state.scale;
-    // Raw assignment, not setZOffset(): offscreen replay must not schedule
-    // intersection renders in the other viewers.
-    _zOff = state.zOffset;
-    _zOffWorldDir = state.zOffsetWorldDir;
-    recalcPyramidLevel();
-    _genCacheDirty = true;
-    syncCameraTransform();
-    refreshMeasurementOverlay();
-    emit overlaysUpdated();
-}
-
-bool CChunkedVolumeViewer::isRenderQuiescent() const
-{
-    return !_renderWorkerBusy.load(std::memory_order_acquire)
-        && !_pendingRenderJob.has_value()
-        && !_pendingRenderDirty;
-}
-
-std::size_t CChunkedVolumeViewer::chunkFetchesInFlight() const
-{
-    return _chunkArray ? _chunkArray->stats().remoteFetchesInFlight : 0;
-}
-
 void CChunkedVolumeViewer::rebuildChunkArray()
 {
     if (_chunkArray)

@@ -54,24 +54,8 @@ class Volume;
 class VolumePkg;
 class Surface;
 class QuadSurface;
-class RenderBenchRecorder;
-class RenderBenchReplay;
 class QTreeWidget;
 class QStandardItemModel;
-
-// Render-bench profiling modes (see RenderBenchRecorder/RenderBenchReplay).
-struct RenderBenchOptions {
-    QString recordPath;   // non-empty: record camera-state timeline to this file
-    QString replayPath;   // non-empty: replay a recorded timeline then quit
-    bool replayWarm = false;
-    bool replayOffscreen4k = false;
-    bool replaySkipChunkComplete = false;
-    bool replaySkipFastRender = false;
-    bool replayTimedProfile = false;
-    int replayTimedProfilePeriodMs = 200;
-    int replayLimit = 0;
-    bool debugDownloadQueue = false;
-};
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -115,7 +99,6 @@ class CWindow : public QMainWindow
 
     friend class MenuActionController;
     friend class VolumeAttachmentController;
-    friend class RenderBenchReplay;
     friend class AgentBridgeServer;
 
 public:
@@ -144,7 +127,7 @@ public:
     };
 
     explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     RenderBenchOptions benchOptions = {});
+                     bool debugDownloadQueue = false);
     ~CWindow(void);
 
     bool openVolumePackage(const QString& path,
@@ -266,9 +249,6 @@ private slots:
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
-    // Attaches the render-bench recorder once a volume+segment are active (no-op
-    // unless --record was passed and the recorder isn't already attached).
-    void maybeAttachBenchRecorder();
     void onSegmentationGrowthStatusChanged(bool running);
     void updateSharedStatusLabel();
     void onZScrollSensitivityChanged(double sensitivity);
@@ -363,10 +343,7 @@ private:
     std::unique_ptr<MenuActionController> _menuController;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
-    // Render-bench profiling harness (record/replay navigation timelines).
-    RenderBenchOptions _benchOptions;
-    std::unique_ptr<RenderBenchRecorder> _benchRecorder;
-    std::unique_ptr<RenderBenchReplay> _benchReplay;
+    bool _debugDownloadQueue{false};
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 

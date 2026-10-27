@@ -23,10 +23,6 @@ set(srcs
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
-    RenderBenchRecorder.cpp
-    RenderBenchRecorder.hpp
-    RenderBenchReplay.cpp
-    RenderBenchReplay.hpp
     FileWatcherService.cpp
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp

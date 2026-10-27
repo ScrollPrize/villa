@@ -7,8 +7,6 @@
 #include "OpenDataLasagna.hpp"
 #include <vc_object_store/objects/VolumeTransforms.hpp>
 
-#include "RenderBenchRecorder.hpp"
-#include "RenderBenchReplay.hpp"
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -808,9 +806,9 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
+CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _cmdRunner(nullptr),
-    _benchOptions(std::move(benchOptions)),
+    _debugDownloadQueue(debugDownloadQueue),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
@@ -938,7 +936,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     vc::render::processChunkCacheService()->configureDecodedByteCapacity(
         _cacheSizeBytes);
-    _state = new CState(this, _benchOptions.debugDownloadQueue);
+    _state = new CState(this, _debugDownloadQueue);
     connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
     updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -1681,27 +1679,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     fRepeatLasagnaActionShortcut->setContext(Qt::ApplicationShortcut);
     connect(fRepeatLasagnaActionShortcut, &QShortcut::activated,
             this, &CWindow::repeatLastLasagnaAction);
-
-
-    // Render-bench: kick off replay once the event loop is running, or arm the
-    // recorder to attach when a volume+segment becomes active.
-    if (!_benchOptions.replayPath.isEmpty()) {
-        _benchReplay = std::make_unique<RenderBenchReplay>();
-        _benchReplay->setReplayLimit(_benchOptions.replayLimit);
-        if (_benchReplay->load(_benchOptions.replayPath)) {
-            _benchReplay->setWarmPass(_benchOptions.replayWarm);
-            _benchReplay->setOffscreen4k(_benchOptions.replayOffscreen4k);
-            _benchReplay->setSkipChunkComplete(_benchOptions.replaySkipChunkComplete);
-            _benchReplay->setSkipFastRender(_benchOptions.replaySkipFastRender);
-            _benchReplay->setTimedProfile(_benchOptions.replayTimedProfile);
-            _benchReplay->setTimedProfilePeriodMs(_benchOptions.replayTimedProfilePeriodMs);
-            QTimer::singleShot(0, this, [this] { _benchReplay->run(*this); });
-        } else {
-            _benchReplay.reset();
-        }
-    } else if (!_benchOptions.recordPath.isEmpty()) {
-        _benchRecorder = std::make_unique<RenderBenchRecorder>(_benchOptions.recordPath);
-    }
 }
 
 // Destructor
@@ -4086,10 +4063,6 @@ void CWindow::closeEvent(QCloseEvent* event)
         return;
     }
     _destroyingWindow = true;
-    // Flush a render-bench recording (if any) before teardown.
-    if (_benchRecorder && _benchRecorder->attached()) {
-        _benchRecorder->save();
-    }
     // Tell ViewerManager to stop maintaining the SurfacePatchIndex. The
     // CState teardown below iterates every tracked surface and sets it to
     // nullptr, which would otherwise trigger an O(N) rtree->remove() per
@@ -4988,35 +4961,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
         _surfacePanel->applyFilters();
     }
 
-
-    maybeAttachBenchRecorder();
-}
-
-void CWindow::maybeAttachBenchRecorder()
-{
-    if (!_benchRecorder || _benchRecorder->attached())
-        return;
-    auto* viewer = segmentationViewer();
-    if (!viewer || !viewer->currentVolume() || !viewer->currentSurface())
-        return;
-
-    RenderBenchRecorder::Header h;
-    // The replay driver reopens via OpenVolume(), which wants the .volpkg.json
-    // file path (vpkg()->path()), not the parent directory vpkgPath() returns.
-    auto vpkg = _state ? _state->vpkg() : nullptr;
-    h.volpkgPath = vpkg ? QString::fromStdString(vpkg->path().string()) : QString();
-    h.volumeId = QString::fromStdString(viewer->currentVolume()->id());
-    h.volpkgIsRemote = viewer->currentVolume()->isRemote();
-    h.segmentId = QString::fromStdString(viewer->surfName() == "segmentation"
-                                             ? _state->activeSurfaceId()
-                                             : viewer->surfName());
-    if (auto* gv = viewer->graphicsView()) {
-        h.viewportW = gv->viewport()->width();
-        h.viewportH = gv->viewport()->height();
-    }
-    h.cacheSizeGB = _cacheSizeBytes / (1024ULL * 1024ULL * 1024ULL);
-    h.vc3dCommit = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
-    _benchRecorder->attach(viewer, std::move(h));
 }
 
 void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)

@@ -116,11 +116,6 @@ public:
     // on it. Enforced in syncCameraTransform(), i.e. before any render is
     // submitted or repainted, so no frame is ever shown off the pinned row.
     void setPinnedSurfaceY(std::optional<float> surfaceY);
-    void applyCameraStateForReplayRepaint(const CameraState& state);
-    // Render-bench helpers: true when no render is running/queued/pending; count of
-    // remote chunk fetches still outstanding. Used by replay to settle each frame.
-    bool isRenderQuiescent() const;
-    std::size_t chunkFetchesInFlight() const;
     int datasetScaleIndex() const override { return _dsScaleIdx; }
     float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
