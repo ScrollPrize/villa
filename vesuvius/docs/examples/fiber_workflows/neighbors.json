@@ -2,7 +2,7 @@
   "fiber_neighbor_expansion": {
     "seed_solve": "/data/fiber-layout/results/joint/solve",
     "parent_tensors": "/data/fiber-layout/whole-sources/tensors.npz",
-    "afv": "/data/fiber-layout/sources.afv",
+    "fibers": "/data/fiber-layout/sources.vcobj",
     "gt_root": "/data/fiber-layout/gt",
     "z_range": [30000, 50000],
     "extract_template": "/configs/fiber-layout/extract.json",

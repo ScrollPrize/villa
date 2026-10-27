@@ -6,7 +6,6 @@
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
@@ -279,7 +278,13 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // Regular volume chunks use the process service. Derived surface tiles
     // remain local to each ViewerManager.
     _state = new CState(
-        this, _mainState && _mainState->debugDownloadQueueEnabled());
+        this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
+    connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
+        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attachment) {
+            cancelLineAnnotationDraft();
+            _trackedFiberPaths.clear();
+        }
+    });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
@@ -429,13 +434,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::inputWorkspaceReleased, this, [this]() {
         cancelLineAnnotationDraft();
-        if (_lineAnnotationController)
-            for (const auto& directory : _managedFiberDirectories)
-                _lineAnnotationController->unregisterExternalFiberSource(directory.toStdString());
-        _managedFiberDirectories.clear();
+        _trackedFiberPaths.clear();
         _managedPatchCopies.clear();
-        _inputFiberDirectories.clear();
-        _externalFiberSource.clear();
     });
     connect(_service, &SpiralServiceManager::inputEditorRequested, this,
             [this](const QJsonObject& input, const QString& path) {
@@ -449,20 +449,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _managedPatchCopies[path] = id;
                     emit patchEditorRequested(id, path);
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
-                    const auto directory = QFileInfo(path).absolutePath();
-                    const auto previous = _inputFiberDirectories.value(id);
-                    if (!previous.isEmpty() && previous != directory) {
-                        _lineAnnotationController->unregisterExternalFiberSource(previous.toStdString());
-                        _managedFiberDirectories.remove(previous);
+                    auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                    if (!fiber) {
+                        QString error;
+                        if (!_lineAnnotationController->importFibersFromPath(path.toStdString(), &error)) {
+                            statusBar()->showMessage(tr("Cannot import service fiber: %1").arg(error), 15000);
+                            return;
+                        }
+                        fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
                     }
-                    QString error;
-                    if (_lineAnnotationController->registerExternalFiberSource(directory.toStdString(), &error, true)) {
-                        const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
-                        _inputFiberDirectories[id] = directory;
-                        _externalFiberSource = directory;
-                        _managedFiberDirectories.insert(QDir(directory).absolutePath());
-                        if (fiber) _lineAnnotationController->openFiber(fiber);
-                    } else statusBar()->showMessage(error, 15000);
+                    if (fiber) {
+                        stageFiberInputs({fiber});
+                        _lineAnnotationController->openFiber(fiber);
+                    }
+                    else statusBar()->showMessage(tr("The imported fiber could not be opened."), 15000);
                 } else if (kind == QStringLiteral("pcl")) {
                     const auto role = vc3d::spiral::pclRoleFromName(input.value(QStringLiteral("role")).toString());
                     QFile file(path);
@@ -484,6 +484,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 }
             });
     connect(_service, &SpiralServiceManager::inputDraftDiscarded, this, [this](const QString& alias) {
+        _trackedFiberPaths.remove(alias);
         _brush->discardDraft(alias);
         _pendingBrushPatches.remove(alias);
         _pendingPointCollectionPaths.remove(alias);
@@ -782,10 +783,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 emit spiralSessionActiveChanged(active);
                 if (active || !_service->inputWorkspaceId().isEmpty()) return;
                 cancelLineAnnotationDraft();
-                if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-                    _lineAnnotationController->unregisterExternalFiberSource(
-                        _externalFiberSource.toStdString());
-                _externalFiberSource.clear();
                 for (auto& state : _pclOverlays) {
                     state.manifestPath.clear();
                     state.baseShapeZYX.reset();
@@ -805,52 +802,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _sessionPaths = paths;
                 _sessionRunConfig = request.value(QStringLiteral("run")).toObject()
                     .value(QStringLiteral("config")).toObject();
-                if (_externalFiberSource.isEmpty()) {
-                const QString fibersServicePath = paths.value(
-                    QStringLiteral("fibers")).toString();
-                const QString sourceFibersPath = fibersServicePath.isEmpty()
-                    ? QString() : mapServicePath(fibersServicePath);
-                QString workingCopyError;
-                const bool savesDrained = !_lineAnnotationController
-                    || _lineAnnotationController->flushFiberSavesForDestinationChange(&workingCopyError);
-                if (!workingCopyError.isEmpty()) statusBar()->showMessage(workingCopyError, 15000);
-                if (!sourceFibersPath.isEmpty() && savesDrained) {
-                    const QPointer<SpiralWorkspace> workspace(this);
-                    const auto fiberGeneration = _lineAnnotationController
-                        ? _lineAnnotationController->fiberDataGeneration() : 0;
-                    _service->workingCopyAsync(sourceFibersPath,
-                        [workspace, sourceFibersPath, fiberGeneration](const QString& localPath, const QString& copyError) {
-                            if (!workspace) return;
-                            if (!copyError.isEmpty()) {
-                                workspace->statusBar()->showMessage(copyError, 15000);
-                                return;
-                            }
-                            auto* controller = workspace->_lineAnnotationController;
-                            if (!controller || !workspace->_externalFiberSource.isEmpty()) return;
-                            QString error;
-                            if (!controller->flushFiberSavesForDestinationChange(&error)
-                                || controller->fiberDataGeneration() != fiberGeneration) {
-                                workspace->_service->invalidateWorkingCopy(sourceFibersPath);
-                                workspace->statusBar()->showMessage(error.isEmpty()
-                                    ? tr("Fibers changed while copying. Reconnect to prepare a fresh working copy.")
-                                    : error, 15000);
-                                return;
-                            }
-                            if (controller->redirectFiberSource(sourceFibersPath.toStdString(),
-                                                               localPath.toStdString(), &error)) {
-                                workspace->_externalFiberSource = localPath;
-                                workspace->_managedFiberDirectories.insert(QDir(localPath).absolutePath());
-                            } else workspace->statusBar()->showMessage(error, 15000);
-                        });
-                }
-                }
                 _previewSource.reset();
                 _previewBaseShapeZYX.reset();
                 _fiberBaseShapeZYX.reset();
                 _previewToFiberBaseScale.reset();
-                _fiberBaseToPreviewFactor.reset();
                 _previewCoordinateError.clear();
-                emit fiberBaseToPreviewFactorChanged(1.0, false);
                 _previewComponents.clear();
                 _previewWindingIds.release();
                 _previewRunDiffImagePath.clear();
@@ -1151,17 +1107,10 @@ void SpiralWorkspace::updateSurfaceIntersections()
 
 void SpiralWorkspace::setLineAnnotationController(LineAnnotationController* controller)
 {
-    if (_lineAnnotationController == controller) return;
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-        _lineAnnotationController->unregisterExternalFiberSource(
-            _externalFiberSource.toStdString());
+    if (_lineAnnotationController) disconnect(_lineAnnotationController, nullptr, this, nullptr);
     _lineAnnotationController = controller;
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty()) {
-        QString error;
-        if (!_lineAnnotationController->registerExternalFiberSource(
-                _externalFiberSource.toStdString(), &error))
-            statusBar()->showMessage(error, 15000);
-    }
+    if (controller) connect(controller, &LineAnnotationController::fibersChanged,
+                            this, &SpiralWorkspace::refreshTrackedFibers);
 }
 
 bool SpiralWorkspace::isFlattenedViewer(const VolumeViewerBase* viewer) const
@@ -1180,21 +1129,14 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
         return _previewCoordinateError.isEmpty()
             ? tr("Spiral preview and fiber coordinates have not been paired")
             : _previewCoordinateError;
-    const QString servicePath = _sessionPaths.value(QStringLiteral("fibers")).toString();
-    const QString localPath = _externalFiberSource;
-    if (localPath.isEmpty())
-        return tr("paths.fibers is unavailable through the current service-path mapping");
-    const QFileInfo info(localPath);
-    const QFileInfo parent(info.absolutePath());
-    if ((info.exists() && (!info.isDir() || !info.isWritable())) ||
-        (!info.exists() && !parent.isWritable()))
-        return tr("The mapped paths.fibers directory is not writable");
     return {};
 }
 
 void SpiralWorkspace::startLineAnnotationDraft()
 {
-    const QString reason = lineAnnotationDraftUnavailableReason();
+    QString reason = lineAnnotationDraftUnavailableReason();
+    if (reason.isEmpty() && !_state->objectStoreSession()->attachment())
+        reason = tr("Attach an object store before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
         return;
@@ -1317,19 +1259,16 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
 {
     _fiberBaseShapeZYX.reset();
     _previewToFiberBaseScale.reset();
-    _fiberBaseToPreviewFactor.reset();
     _previewCoordinateError.clear();
     if (!_previewBaseShapeZYX) {
         _previewCoordinateError = tr(
             "Spiral preview metadata has no base_shape_zyx; publish a new preview");
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     QString error;
     const auto fiberShape = resolveFiberBaseShape(&error);
     if (!fiberShape) {
         _previewCoordinateError = error;
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     try {
@@ -1337,13 +1276,10 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
             *_previewBaseShapeZYX, *fiberShape, 5);
         _fiberBaseShapeZYX = fiberShape;
         _previewToFiberBaseScale = previewToFiber;
-        _fiberBaseToPreviewFactor = 1.0 / previewToFiber;
-        emit fiberBaseToPreviewFactorChanged(*_fiberBaseToPreviewFactor, true);
     } catch (const std::exception& ex) {
         _previewCoordinateError = tr(
             "Spiral preview and fiber base shapes are incompatible: %1")
                                       .arg(QString::fromUtf8(ex.what()));
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
     }
 }
 
@@ -1500,19 +1436,11 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
             }
         }
     }
-    const QString destinationService = _sessionPaths.value(QStringLiteral("fibers")).toString();
-    const QString destination = _externalFiberSource;
-    if (destination.isEmpty()) {
-        statusBar()->showMessage(tr(
-            "paths.fibers is unavailable through the current path mapping"), 15000);
-        return;
-    }
     _lineAnnotationDraft->optimizing = true;
     statusBar()->showMessage(tr("Optimizing 2D line annotation…"));
     LineAnnotationController::HeadlessFiberOptimizationRequest request;
     request.controlPointsL0 = std::move(controls);
     request.inputs = std::move(*inputs);
-    request.destinationFiberSource = destination.toStdString();
     const auto saveAllowed = _lineAnnotationDraft->saveAllowed;
     request.shouldSave = [saveAllowed]() { return saveAllowed && saveAllowed->load(); };
     QPointer<SpiralWorkspace> self(this);
@@ -1527,6 +1455,7 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
                 return;
             }
             self->cancelLineAnnotationDraft();
+            self->stageFiberInputs({fiberId});
             if (self->_lineAnnotationController)
                 self->_lineAnnotationController->openFiber(fiberId);
             self->statusBar()->showMessage(
@@ -1550,35 +1479,47 @@ void SpiralWorkspace::addPatchToCurrentFit(
     _service->applyInputDrafts();
 }
 
-void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
+void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
+{
+    if (stageFiberInputs(fiberIds)) _service->applyInputDrafts();
+}
+
+bool SpiralWorkspace::stageFiberInputs(const std::vector<uint64_t>& fiberIds)
+{
+    if (!_service || !_lineAnnotationController || fiberIds.empty()) return false;
+    try {
+        const auto paths = _lineAnnotationController->fiberTransportPaths(fiberIds);
+        for (const auto& [uuid, path] : paths) {
+            const auto id = QString::fromStdString(uuid);
+            const auto source = QString::fromStdString(path.string());
+            if (_trackedFiberPaths.value(id) == source) continue;
+            _trackedFiberPaths[id] = source;
+            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
+        }
+        return true;
+    } catch (const std::exception& error) {
+        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
+        return false;
+    }
+}
+
+void SpiralWorkspace::refreshTrackedFibers()
+{
+    if (!_service || !_lineAnnotationController || _trackedFiberPaths.isEmpty()) return;
+    std::vector<uint64_t> ids;
+    for (const auto& uuid : _trackedFiberPaths.keys()) {
+        const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());
+        if (id && _lineAnnotationController->fiberPin(id)) ids.push_back(id);
+        else noteFiberRetired(uuid);
+    }
+    stageFiberInputs(ids);
+}
+
+void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
 {
     if (!_service) return;
-    const auto inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (inputId.isEmpty()) return;
-    _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-    _service->applyInputDrafts();
-}
-
-void SpiralWorkspace::noteTrackedFiberSaved(uint64_t, const QString& fiberJsonPath)
-{
-    if (!_service || !hasActiveSpiralSession()) return;
-    if (!_managedFiberDirectories.contains(QFileInfo(fiberJsonPath).absolutePath())) return;
-    const QString inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (!inputId.isEmpty())
-        _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-}
-
-void SpiralWorkspace::noteFiberRemoved(const QString& path)
-{
-    if (!_service || !_managedFiberDirectories.contains(QFileInfo(path).absolutePath())) return;
-    const auto alias = QFileInfo(path).completeBaseName();
-    for (const auto& value : _service->inputDraftStatus()) {
-        const auto input = value.toObject();
-        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")
-            && (QFileInfo(input.value(QStringLiteral("source")).toString()).completeBaseName() == alias
-                || input.value(QStringLiteral("name")).toString() == alias))
-            _service->removeInputDraft(input.value(QStringLiteral("id")).toString());
-    }
+    _trackedFiberPaths.remove(objectUuid);
+    _service->removeInputDraft(objectUuid);
 }
 
 bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface)
@@ -1804,11 +1745,7 @@ void SpiralWorkspace::discardBrushWork()
 
 void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
 {
-    QString saveError;
-    if (_lineAnnotationController && !_lineAnnotationController->flushFiberSavesForDestinationChange(&saveError)) {
-        statusBar()->showMessage(saveError, 15000);
-        return;
-    }
+    _state->objectStoreSession()->finalize();
     auto exit = [this, continuation]() { _service->releaseInputWorkspace(continuation); };
     if (!hasPendingBrushWork()) {
         exit();
@@ -1866,9 +1803,6 @@ SpiralWorkspace::~SpiralWorkspace()
 {
     _shuttingDown = true;
     cancelLineAnnotationDraft();
-    if (_lineAnnotationController && !_externalFiberSource.isEmpty())
-        _lineAnnotationController->unregisterExternalFiberSource(
-            _externalFiberSource.toStdString());
     if (_viewerManager) _viewerManager->beginShutdown();
     // Disconnecting never terminates a service VC3D did not launch; only an
     // owned local process is stopped.

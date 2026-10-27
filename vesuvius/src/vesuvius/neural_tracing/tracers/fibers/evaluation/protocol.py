@@ -8,9 +8,9 @@ geometric outcomes, by source and split. Comparisons pair identical seeds and re
 fibers. The final group never enters operating-point selection.
 
 Sources come from the checkpoint's dataset configuration (``--dataset-config`` overrides it).
-Paris 4 uses its frozen monitor/calibration/final seeds; each AFV source uses its own
+Paris 4 uses its frozen monitor/calibration/final seeds; each fiber-store source uses its own
 seeded validation manifest (the same seeds the trainer writes as ``validation_<name>.json``).
-AFV holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
+Fiber-store holdouts carry a neighbor detector over their own catalog; Paris 4 has no neighbor paths,
 so its held-out identity coverage is reported as absent.
 
   python -m vesuvius.neural_tracing.tracers.fibers.evaluation.protocol calibrate --checkpoint CK --out DIR
@@ -233,9 +233,9 @@ DATASET_CONFIG = Path(__file__).parents[1]/'configs'/'datasets'/'paris50.json'
 def dataset_sources(args, config=None):
     """The held-out sources of the checkpoint's own dataset configuration, or of ``config`` /
     ``args.dataset_config`` when given."""
-    from vesuvius.neural_tracing.tracers.fibers.data.afv_neighbors import AFVBank
+    from vesuvius.neural_tracing.tracers.fibers.data.fiber_bank import FiberBank
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import (
-        load_primary_dataset, open_afv_source, parse_dataset_config, read_dataset_config, validation_manifest)
+        load_primary_dataset, open_fiber_source, parse_dataset_config, read_dataset_config, validation_manifest)
     from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import BankSwitchDetector
     _, _, _, paris_spec, checkpoint = load_checkpoint(args.checkpoint, 'cpu')
     config = config or getattr(args, 'dataset_config', None)
@@ -255,9 +255,9 @@ def dataset_sources(args, config=None):
             _, _, validation, manifest = load_primary_dataset(document, spec)
             detector = None
         else:
-            _, validation, spec, _ = open_afv_source(source, document['cache_dir'], normalization)
+            _, validation, spec = open_fiber_source(source, document['cache_dir'], normalization)
             manifest = validation_manifest(validation, spec, source['validation']['seed'])
-            detector = BankSwitchDetector([AFVBank(validation)])
+            detector = BankSwitchDetector([FiberBank(validation)])
         # Every annotation source on the same CT and trace grid (neighbour fibers for tube_scoring switch labels).
         same_volume = [s for s in document['sources'] if str(s['ct']).rstrip('/') == str(source['ct']).rstrip('/')
                        and float(s.get('grid_scale', 8.)) == float(source.get('grid_scale', 8.))]

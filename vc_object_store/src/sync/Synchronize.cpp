@@ -6,6 +6,7 @@
 #include "sync/GeometryTransfer.hpp"
 #include "sync/Baselines.hpp"
 #include "internal/History.hpp"
+#include "sync/Apply.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -24,59 +25,6 @@ Json snapshot(ObjectStore& store, const Txn& txn) {
         result[id] = syncRecord(store, txn, id);
     }
     return result;
-}
-Json at(const Json& state, const std::string& id) { return state.value(id, Json()); }
-Json head(const Json& record) { return record.is_object() ? record.value("geometry", Json::object()).value("revision_uuid", Json()) : Json(); }
-bool object(const Json& record) { return record.is_object() && record.at("record_type") == "objects"; }
-void applyObjects(ObjectStore& store, WriteTxn& txn, const Json& before, const Json& merged) {
-    auto* db = ObjectStoreImplAccess::conn(txn);
-    // Remove changed edges first so deletions and identity swaps cannot transiently collide.
-    for (const auto& [id, record] : before.items())
-        if (!object(record) && record != at(merged, id)) store.removeEdge(txn, id);
-    for (const auto& [id, record] : before.items())
-        if (object(record) && !merged.contains(id)) store.deleteObject(txn, id);
-    // Release track identity constraints for all changed records before restoring details.
-    for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
-        execute(db, "DELETE FROM tracks WHERE object_id=(SELECT id FROM objects WHERE uuid=?)", parseUuid(id));
-    }
-    for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
-        auto value = objectFromJson(record); commonFromJson(record, value);
-        // The head is copied after its owner exists. Restore managed fields once installed.
-        if (!store.currentGeometry(txn, id) && head(record) != nullptr) value.storageKind.clear();
-        upsertObjectImpl(db, store.author(), store.hostname(), value, true, "sync");
-    }
-}
-void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, const Json& merged) {
-    auto* db = ObjectStoreImplAccess::conn(txn);
-    for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
-        if (head(record) != nullptr) {
-            execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
-                parseUuid(id), parseUuid(head(record).get<std::string>()));
-            if (head(record) != head(at(before, id))) {
-                detail::materializeGeometry(db, id, head(record).get<std::string>());
-                detail::refreshGeometryBounds(db, id);
-            }
-        }
-        Statement storage(db, "UPDATE objects SET storage_kind=?,storage_ref=?,data_generation=?,data_checksum=? WHERE uuid=?",
-            record.at("storage_kind").get<std::string>(), record.at("storage_ref").get<std::string>(),
-            record.at("data_generation").get<int64_t>());
-        if (record.contains("data_checksum")) storage.bind(4, record.at("data_checksum").get<std::string>()); else storage.bindNull(4);
-        storage.bind(5, parseUuid(id)); storage.stepDone();
-    }
-    for (const auto& [id, record] : merged.items()) if (!object(record) && record != at(before, id)) {
-        auto edge = edgeFromJson(record);
-        addEdgeImpl(db, store.author(), store.hostname(), edge, true, "sync");
-        const auto actual = *store.edgeByUuid(txn, id);
-        const bool swap = actual.aUuid != edge.aUuid;
-        const auto epochs = record.value("lifecycle_bindings", Json::object());
-        bindLifecycle(db, actual, epochs.value(swap ? "b" : "a", ""), epochs.value(swap ? "a" : "b", ""));
-        const auto bindings = record.value("geometry_bindings", Json::object());
-        const auto a = bindings.value(swap ? "b" : "a", Json()), b = bindings.value(swap ? "a" : "b", Json());
-        Statement put(db, "UPDATE edge_geometry_bindings SET a_revision=?,b_revision=? WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
-        if (a.is_null()) put.bindNull(1); else put.bind(1, parseUuid(a.get<std::string>()));
-        if (b.is_null()) put.bindNull(2); else put.bind(2, parseUuid(b.get<std::string>()));
-        put.bind(3, parseUuid(id)); put.stepDone();
-    }
 }
 }
 
@@ -141,22 +89,17 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                 if (!b.is_null()) base[id] = b;
                 for (const auto* record : {&l, &r, &b}) {
                     identityPeers(localDb, *record, ids); identityPeers(remoteDb, *record, ids);
-                    if (!record->is_null() && !object(*record)) {
+                    if (!record->is_null() && !isObjectRecord(*record)) {
                         ids.insert(record->at("a").get<std::string>()); ids.insert(record->at("b").get<std::string>());
                     }
                 }
                 // Metadata-only edits need no graph walk. Endpoint deletions or
                 // geometry changes must check even unchanged incident edges.
-                if (changed.contains(id) && (object(l) || object(r) || object(b)) &&
-                    (l.is_null() || r.is_null() || head(l) != head(b) || head(r) != head(b) ||
+                if (changed.contains(id) && (isObjectRecord(l) || isObjectRecord(r) || isObjectRecord(b)) &&
+                    (l.is_null() || r.is_null() || recordHead(l) != recordHead(b) || recordHead(r) != recordHead(b) ||
                      l.value("lifecycle_epoch", "") != (b.is_object() ? b.value("lifecycle_epoch", "") : "") ||
                      r.value("lifecycle_epoch", "") != (b.is_object() ? b.value("lifecycle_epoch", "") : ""))) {
-                    for (auto* db : {localDb, remoteDb}) {
-                        Statement edges(db, "SELECT uuid FROM edges WHERE a_id=(SELECT id FROM objects WHERE uuid=?1) "
-                                            "OR b_id=(SELECT id FROM objects WHERE uuid=?1)",
-                            parseUuid(id));
-                        while (edges.row()) ids.insert(formatUuid(edges.blob16(0)));
-                    }
+                    for (auto* db : {localDb, remoteDb}) incidentEdges(db, id, ids);
                 }
             }
         }
@@ -173,10 +116,10 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
             throw std::invalid_argument("sync: invalid record resolution");
     auto merged = Json::object();
     auto conflict = [&](const std::string& id, const std::string& reason) {
-        report.conflicts.push_back({id, reason, at(base, id).dump(), at(local, id).dump(), at(remote, id).dump()});
+        report.conflicts.push_back({id, reason, recordAt(base, id).dump(), recordAt(local, id).dump(), recordAt(remote, id).dump()});
     };
     for (const auto& id : ids) {
-        const auto b = at(base, id), l = at(local, id), r = at(remote, id);
+        const auto b = recordAt(base, id), l = recordAt(local, id), r = recordAt(remote, id);
         Json chosen;
         if (options.resolutions.contains(id)) chosen = options.resolutions.at(id) == "local" ? l : r;
         else if (l == r) chosen = l;
@@ -190,19 +133,19 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
     // from otherwise independent endpoint deletions and edge additions.
     std::map<std::string, std::string> identities;
     for (const auto& id : ids) {
-        const auto chosen = at(merged, id);
+        const auto chosen = recordAt(merged, id);
         for (const auto* side : {&local, &remote}) {
-            const auto old = at(*side, id);
-            if (!old.is_null() && !chosen.is_null() && object(old) != object(chosen)) conflict(id, "object/edge UUID collision");
-            if (!object(old)) continue;
-            if (object(chosen) && old.at("kind") != chosen.at("kind"))
+            const auto old = recordAt(*side, id);
+            if (!old.is_null() && !chosen.is_null() && isObjectRecord(old) != isObjectRecord(chosen)) conflict(id, "object/edge UUID collision");
+            if (!isObjectRecord(old)) continue;
+            if (isObjectRecord(chosen) && old.at("kind") != chosen.at("kind"))
                 conflict(id, "object kind cannot change; assign distinct UUIDs before synchronizing");
-            if (head(old) != nullptr && (chosen.is_null() || head(chosen) == nullptr))
+            if (recordHead(old) != nullptr && (chosen.is_null() || recordHead(chosen) == nullptr))
                 conflict(id, "retained geometry cannot be deleted; select the replica containing geometry");
 
         }
         if (chosen.is_null()) continue;
-        if (object(chosen)) {
+        if (isObjectRecord(chosen)) {
             if (chosen.contains("track") && chosen["track"]["external_key"] != "") {
                 const auto identity = Json::array({"track", chosen["track"]["dataset_ref"], chosen["track"]["external_key"]}).dump();
                 auto [it, added] = identities.emplace(identity, id);
@@ -210,8 +153,8 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
             }
         } else {
             for (const auto* endpoint : {"a", "b"}) {
-                const auto target = at(merged, chosen.at(endpoint).get<std::string>());
-                if (!object(target)) conflict(id, "edge endpoint was deleted or is not an object");
+                const auto target = recordAt(merged, chosen.at(endpoint).get<std::string>());
+                if (!isObjectRecord(target)) conflict(id, "edge endpoint was deleted or is not an object");
             }
             const auto identity = edgeIdentity(edgeFromJson(chosen));
             auto [it, added] = identities.emplace(identity, id);
@@ -230,36 +173,26 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
             return detail::dependencyGeometry(peer, remoteTxn, *revision);
         return std::nullopt;
     };
-    for (const auto& [id, edge] : merged.items()) if (!object(edge)) {
-        const auto binding = edge.value("geometry_bindings", Json::object());
-        for (const auto* endpoint : {"a", "b"}) {
-            const auto bound = binding.value(endpoint, Json());
-            const auto current = head(merged.at(edge.at(endpoint).get<std::string>()));
-            if (bound == current) continue;
-            const auto before = geometryFor(bound), after = geometryFor(current);
-            const auto anchor = anchorFromJson(edge.at(std::string(endpoint) + "_anchor"));
-            if (!before || !after || detail::dependenciesChanged(anchor, *before, *after))
-                conflict(id, "geometry requires an explicit relationship retain/update/remove decision before synchronization");
-        }
-    }
+    for (const auto& id : undecidedRelationships(merged, geometryFor))
+        conflict(id, "geometry requires an explicit relationship retain/update/remove decision before synchronization");
     if (!report.conflicts.empty()) return report;
     for (const auto& id : ids) {
-        if (at(local, id) != at(merged, id)) ++report.localChanges;
-        if (at(remote, id) != at(merged, id)) ++report.remoteChanges;
+        if (recordAt(local, id) != recordAt(merged, id)) ++report.localChanges;
+        if (recordAt(remote, id) != recordAt(merged, id)) ++report.remoteChanges;
     }
     if (options.dryRun) return report;
     if (shared.incremental && ids.empty()) {
         first.commit(); second.commit(); report.applied = true; return report;
     }
     applyObjects(*this, localTxn, local, merged); applyObjects(peer, remoteTxn, remote, merged);
-    for (const auto& [id, record] : merged.items()) if (object(record)) {
+    for (const auto& [id, record] : merged.items()) if (isObjectRecord(record)) {
         detail::transferGeometry(localDb, remoteDb, id, shared.incremental ? shared.localCursor.geometry : 0);
         detail::transferGeometry(remoteDb, localDb, id, shared.incremental ? shared.remoteCursor.geometry : 0);
     }
     applyHeadsAndEdges(*this, localTxn, local, merged); applyHeadsAndEdges(peer, remoteTxn, remote, merged);
     // Verify exactly the records in the merge and its dependency closure.
     for (const auto& id : ids)
-        if (syncRecord(*this, localTxn, id) != at(merged, id) || syncRecord(peer, remoteTxn, id) != at(merged, id))
+        if (syncRecord(*this, localTxn, id) != recordAt(merged, id) || syncRecord(peer, remoteTxn, id) != recordAt(merged, id))
             throw std::runtime_error("sync: applied state differs from merge; both transactions rolled back");
     // Validate/materialize both local history publications before either store
     // commits. Sync merges current records, not the peer's historical timeline.

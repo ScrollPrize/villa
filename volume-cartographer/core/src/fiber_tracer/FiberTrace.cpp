@@ -2313,15 +2313,25 @@ template <typename LossAt>
         sampleTraceWidths(predictions,{point},sampled,request.config);
         if (sampled.size() != 1)
             throw std::runtime_error("invalid committed width sample count");
+        // Missing presence-valid interpolation support is a confidence stop,
+        // not an infrastructure error or a sample for the running width mean.
+        if (!std::isfinite(sampled.front()) || sampled.front() <= 0)
+            return false;
         width.add(sampled.front());
         request.config.widthReferenceMean = width.mean();
+        return true;
     };
     if (updateWidth) {
         if (request.config.initialWidthMean > 0) {
             width.add(request.config.initialWidthMean);
             request.config.widthReferenceMean = width.mean();
         } else {
-            addWidth(start);
+            if (!addWidth(start)) {
+                FiberTraceOneWayResult result;
+                result.points = {request.startPoint};
+                result.reason = "invalid_width";
+                return result;
+            }
         }
     }
     const TraceVec target = toTraceVec(request.targetPoint);
@@ -2432,6 +2442,7 @@ template <typename LossAt>
     // Only points shared by every surviving beam are irrevocable. The best
     // frontier can change branches; it must not bias the running width mean.
     auto observedPath = initial.path;
+    bool invalidCommittedWidth = false;
     const auto observeThrough = [&](std::shared_ptr<const BeamState::PathNode> path) {
         if (!updateWidth && !committedStep) return true;
         std::vector<std::shared_ptr<const BeamState::PathNode>> pending;
@@ -2442,7 +2453,10 @@ template <typename LossAt>
         if (!path)
             throw std::logic_error("fiber trace attempted to retract a committed prefix");
         for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
-            if (updateWidth) addWidth((*it)->point);
+            if (updateWidth && !addWidth((*it)->point)) {
+                invalidCommittedWidth = true;
+                return false;
+            }
             if (observedWidthMean) *observedWidthMean = request.config.widthReferenceMean;
             observedPath = *it;
             if (committedModulatedPresence) *committedModulatedPresence = observedPath->modulatedPresence;
@@ -2458,7 +2472,7 @@ template <typename LossAt>
         FiberTraceOneWayResult result;
         result.points = beamPathPoints(stopped);
         result.steps = static_cast<int>(result.points.size() - 1);
-        result.reason = "observer_stop";
+        result.reason = invalidCommittedWidth ? "invalid_width" : "observer_stop";
         if (request.config.widthRelativeTolerance > 0) {
             result.widthMean = request.config.widthReferenceMean;
             result.widthSamples = width.count;
@@ -3724,6 +3738,7 @@ public:
             option.nx = vc::lasagna::bindLasagnaChannel(manifest, channels[1]);
             option.ny = vc::lasagna::bindLasagnaChannel(manifest, channels[2]);
             const bool cornerCompatible =
+                option.presence.array->metadata().dtype == utils::ZarrDtype::uint8 &&
                 vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.nx) &&
                 vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.ny);
             if (cornerCompatible) {
@@ -3749,9 +3764,11 @@ public:
         if (enableWidth) {
             auto width = vc::lasagna::bindLasagnaChannel(manifest, "width", true);
             const auto& lattice = options_.front().presence;
-            if (width.array->metadata().dtype != utils::ZarrDtype::float32 ||
+            const bool baseWidth = manifest.raw.value("width_encoding", std::string{}) == "uint8-base-voxels";
+            if ((!baseWidth && width.array->metadata().dtype != utils::ZarrDtype::float32) ||
                 width.spacing != lattice.spacing || width.shapeZYX != lattice.shapeZYX)
                 throw std::runtime_error("width channel must be float32 on the prediction lattice");
+            widthToWorking_ = baseWidth ? 1.0 / manifest.workingToBaseScale : 1.0;
             width_.push_back(std::move(width));
         }
         if (canonicalOptionIndex_.has_value()) {
@@ -3938,7 +3955,7 @@ public:
         vc::lasagna::sampleLasagnaVectorBatch(width_, points, values, false, &options_.front().presence, region);
         widths.resize(values.size());
         for (size_t i = 0; i < values.size(); ++i)
-            widths[i] = values[i].empty() ? 0 : values[i][0];
+            widths[i] = values[i].empty() ? 0 : values[i][0] * widthToWorking_;
     }
 
     void materializeGroupedPredictionCorners(
@@ -5030,6 +5047,7 @@ private:
     FiberPredictionReadinessGate readinessGate_;
     std::vector<vc::lasagna::LasagnaChannelBinding> embeddings_;
     std::vector<vc::lasagna::LasagnaChannelBinding> width_;
+    double widthToWorking_ = 1.0;
     bool sourceScaleExplicit_ = false;
     std::optional<size_t> canonicalOptionIndex_;
     FiberPredictionGridInfo canonicalGridInfo_;

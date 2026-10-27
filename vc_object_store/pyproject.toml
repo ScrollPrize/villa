@@ -14,7 +14,28 @@ license = {text = "MIT"}
 [tool.scikit-build]
 cmake.version = ">=3.22"
 wheel.packages = []
+# Only the Python module; the C++ headers, archives and CMake packages of the store,
+# vc_reader and vc_delta3d belong to `cmake --install`, not the wheel.
+install.components = ["python"]
 
 [tool.scikit-build.cmake.define]
 VC_OBJECT_STORE_BUILD_PYTHON = "ON"
 VC_OBJECT_STORE_BUILD_TOOLS = "OFF"
+VC_OBJECT_STORE_BUILD_TESTS = "OFF"
+VC_READER_SHARED_READER = "OFF"
+
+# Editable installs copy the compiled module once; rebuild it on `uv sync` whenever
+# the native sources it is built from change (including the vc_reader it embeds).
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/**" },
+    { file = "include/**" },
+    { file = "src/**" },
+    { file = "python/**/*.{cpp,hpp,py,txt}" },
+    { file = "../vc_reader/CMakeLists.txt" },
+    { file = "../vc_reader/cmake/**" },
+    { file = "../vc_reader/include/**" },
+    { file = "../vc_reader/src/cpp/**" },
+]

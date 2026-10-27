@@ -40,25 +40,6 @@ Json pointAttributes(Json& attributes, const std::string& key, size_t count)
     attributes.erase(key);
     return result;
 }
-void fiber(const Snapshot& s, Json attributes, const fs::path& path)
-{
-    attributes["uuid"] = s.revision.objectUuid;
-    attributes["type"] = "vc3d_fiber";
-    for (const auto* name : {"control_points", "line_points"}) {
-        const auto values = s.values<double>(name);
-        const auto extras = pointAttributes(attributes, std::string(name) + "_attributes", values.size() / 3);
-        auto points = Json::array();
-        for (size_t i = 0; i < values.size() / 3; ++i) {
-            Json xyz = {values[3*i], values[3*i+1], values[3*i+2]};
-            if ((!extras.is_null() && extras[i].is_object()) ||
-                (std::string_view(name) == "control_points" && attributes.value("version", 1) >= 3)) {
-                auto entry = !extras.is_null() && extras[i].is_object() ? extras[i] : Json::object(); entry["position"] = std::move(xyz); points.push_back(std::move(entry));
-            } else points.push_back(std::move(xyz));
-        }
-        attributes[name] = std::move(points);
-    }
-    writeJson(path, attributes);
-}
 void collection(const Snapshot& s, Json attributes, const fs::path& path)
 {
     const auto xyz = s.values<double>("points");
@@ -145,7 +126,9 @@ void track(const Snapshot& s, const Json& attributes, const fs::path& path)
     auto field = [&](size_t offset, uint64_t value, int size) { for (int i = 0; i < size; ++i) header[offset+i] = static_cast<uint8_t>(value >> (8*i)); };
     field(8, 1, 4); field(12, 64, 4); field(16, 1, 8); field(24, count, 8);
     writeArray(path / "header.bin", std::move(header));
-    writeJson(path / "metadata.json", {{"version", 1}, {"track_count", 1}, {"point_count", count},
+    auto metadata = attributes;
+    metadata.update(Json{{"version", 1}, {"track_count", 1}, {"point_count", count},
         {"graph_object_uuid", s.revision.objectUuid}, {"graph_revision_uuid", s.revision.uuid}});
+    writeJson(path / "metadata.json", metadata);
 }
 }

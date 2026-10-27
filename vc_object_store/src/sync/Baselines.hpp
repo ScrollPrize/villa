@@ -1,12 +1,14 @@
 #pragma once
+#include "internal/RecordSql.hpp"
 #include "internal/RecordJson.hpp"
+#include "internal/EdgeSql.hpp"
 #include "geometry/GeometryInternal.hpp"
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
 
 struct SyncCursor { int64_t journal = 0, geometry = 0; };
-SyncCursor syncCursor(sqlite3* db) {
+inline SyncCursor syncCursor(sqlite3* db) {
     Statement row(db, "SELECT coalesce((SELECT max(seq) FROM journal),0),"
                       "coalesce((SELECT max(rowid) FROM geometry_revisions),0)");
     (void)row.row(); return {row.i64(0), row.i64(1)};
@@ -20,7 +22,7 @@ struct SharedBaseline {
     bool incremental = false;
 };
 
-SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string& localPeer, const std::string& remotePeer) {
+inline SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string& localPeer, const std::string& remotePeer) {
     SharedBaseline result;
     Statement ours(local, "SELECT seq,token FROM sync_baselines WHERE peer=? ORDER BY seq DESC", localPeer);
     Statement theirs(remote, "SELECT seq,state FROM sync_baselines WHERE peer=? AND token=?");
@@ -47,19 +49,19 @@ SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string
     return result;
 }
 
-Json baselineRecord(sqlite3* db, const std::string& peer, int64_t seq, const std::string& id) {
+inline Json baselineRecord(sqlite3* db, const std::string& peer, int64_t seq, const std::string& id) {
     Statement row(db, "SELECT state FROM sync_baseline_records WHERE peer=? AND record_uuid=? AND baseline_seq<=? "
                       "ORDER BY baseline_seq DESC LIMIT 1", peer, id, seq);
     return row.row() ? Json::parse(row.text(0)) : Json();
 }
 
-void changedRecords(sqlite3* db, SyncCursor after, std::set<std::string>& ids) {
+inline void changedRecords(sqlite3* db, SyncCursor after, std::set<std::string>& ids) {
     Statement rows(db, "SELECT DISTINCT record_uuid FROM journal WHERE seq>? UNION "
                        "SELECT object_uuid FROM geometry_revisions WHERE rowid>?", after.journal, after.geometry);
     while (rows.row()) ids.insert(formatUuid(rows.blob16(0)));
 }
 
-Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
+inline Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
     if (const auto object = store.objectByUuid(txn, id)) {
         auto record = objectToJson(*object); record["record_type"] = "objects";
         if (const auto geometry = store.currentGeometry(txn, id))
@@ -85,7 +87,7 @@ Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
 }
 
 // Include competing identities even if that competing record did not change.
-void identityPeers(sqlite3* db, const Json& record, std::set<std::string>& ids) {
+inline void identityPeers(sqlite3* db, const Json& record, std::set<std::string>& ids) {
     if (record.is_null()) return;
     if (record.at("record_type") == "objects") {
         if (!record.contains("track") || record["track"]["external_key"] == "") return;
@@ -107,7 +109,7 @@ void identityPeers(sqlite3* db, const Json& record, std::set<std::string>& ids) 
 
 // An order-independent fingerprint lets both replicas compare a complete
 // baseline without serializing it. Each hashed record includes its UUID.
-void toggleDigest(std::string& digest, const Json& record) {
+inline void toggleDigest(std::string& digest, const Json& record) {
     if (record.is_null()) return;
     const auto text = record.dump();
     const auto hash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
@@ -118,7 +120,7 @@ void toggleDigest(std::string& digest, const Json& record) {
     }
 }
 
-void saveBaseline(sqlite3* db, const std::string& peer, const std::string& token, const std::string& digest,
+inline void saveBaseline(sqlite3* db, const std::string& peer, const std::string& token, const std::string& digest,
                   const Json& merged, std::set<std::string> ids, bool full) {
     Statement latest(db, "SELECT coalesce(max(seq),0) FROM sync_baselines WHERE peer=?", peer); (void)latest.row(); const auto previous = latest.i64(0);
     if (full) {

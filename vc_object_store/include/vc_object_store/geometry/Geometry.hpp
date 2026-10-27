@@ -26,7 +26,7 @@ struct PointCollection {
 
 struct Fiber {
     std::vector<Point> controlPoints, linePoints;
-    std::vector<PointId> controlPointIds; // optional before first structural edit
+    std::vector<PointId> controlPointIds; // encode allocates IDs for a new value when omitted
     void validate() const;
     // Sampled line if present, otherwise the control polyline.
     double length() const;

@@ -9,6 +9,7 @@
 #include <thread>
 #include <optional>
 #include <QSettings>
+#include <QTimer>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -181,10 +182,23 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(QObject* parent, bool debugDownloadQueue)
+CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwner)
     : QObject(parent)
     , _debugDownloadQueue(debugDownloadQueue)
 {
+    _objectStoreOwner = objectStoreOwner;
+    _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
+                                          : std::make_shared<vc::objects::ObjectStoreSession>();
+    qRegisterMetaType<vc::objects::StoreSessionEvent>();
+    if(objectStoreOwner) {
+        connect(objectStoreOwner, &CState::objectStoreChanged, this, &CState::objectStoreChanged);
+        connect(objectStoreOwner, &CState::objectStoreObservationFailed, this, &CState::objectStoreObservationFailed);
+    } else {
+        auto* journalTimer = new QTimer(this);
+        journalTimer->setInterval(250);
+        connect(journalTimer, &QTimer::timeout, this, &CState::pollObjectStoreChanges);
+        journalTimer->start();
+    }
     _pointCollection = new VCCollection(this);
 
     setSurface("xy plane",
@@ -195,7 +209,41 @@ CState::CState(QObject* parent, bool debugDownloadQueue)
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
 }
 
-CState::~CState() = default;
+CState::~CState()
+{
+    if (!_objectStoreOwner) { try { _objectStoreSession->detach(); } catch (...) {} }
+}
+
+void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
+{
+    vc::objects::OpenOptions options;
+    options.author = author.toStdString();
+    options.readOnly = readOnly;
+    _objectStoreSession->attach(path.toStdString(), options);
+    pollObjectStoreChanges();
+}
+
+void CState::detachObjectStore()
+{
+    _objectStoreSession->detach();
+    pollObjectStoreChanges();
+}
+
+void CState::pollObjectStoreChanges()
+{
+    if(_objectStoreOwner) { _objectStoreOwner->pollObjectStoreChanges(); return; }
+    try {
+        const auto events = _objectStoreSession->takeEvents();
+        _objectStoreObservationError.clear();
+        for (const auto& event : events) emit objectStoreChanged(event);
+    } catch (const std::exception& error) {
+        const auto message = QString::fromUtf8(error.what());
+        if (_objectStoreObservationError != message) {
+            _objectStoreObservationError = message;
+            emit objectStoreObservationFailed(message);
+        }
+    }
+}
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 

@@ -76,7 +76,7 @@ async def vc3d_fiber_launch(
 
 @mcp.tool()
 async def vc3d_fiber_list() -> dict[str, Any]:
-    """List saved fibers of the open volume package: fiberId (string), name,
+    """List fibers of the attached object store: fiberId (string), name,
     control/line point counts, length, automatic/manual HV tags, tags, and
     per-span summaries; plus knownTags (every tag in use)."""
     return await _call("fiber.list", {})
@@ -88,13 +88,17 @@ async def vc3d_fiber_open(
     control_point_index: Optional[int] = None,
     line_point_index: Optional[int] = None,
     span: Optional[list[int]] = None,
+    editable: bool = False,
 ) -> dict[str, Any]:
     """Open a saved fiber in the line-annotation workspace, optionally focused
     at a control point, a line-point index, or a [first, second] control-index
-    span. Pass at most one selector. Requires a manifest-backed Lasagna
-    dataset (a "lasagna"-kind catalog representation, NOT a "normal_grids"
-    store and NOT the vc3d_lasagna_* fit service) resolvable for the currently
-    selected volume; otherwise fails -32005 with detail."""
+    span. Pass at most one selector. The workspace opens read-only, so opening
+    never re-solves or rewrites the fiber; pass editable=True to enable editing
+    (as the workspace's Enable editing button does). Editing requires a
+    manifest-backed Lasagna dataset (a "lasagna"-kind catalog representation,
+    NOT a "normal_grids" store and NOT the vc3d_lasagna_* fit service)
+    resolvable for the currently selected volume; otherwise fails -32005 with
+    detail."""
     return await _call(
         "fiber.open",
         _strip_none(
@@ -103,6 +107,7 @@ async def vc3d_fiber_open(
                 "controlPointIndex": control_point_index,
                 "linePointIndex": line_point_index,
                 "span": span,
+                "editable": editable,
             }
         ),
     )
@@ -174,6 +179,7 @@ async def vc3d_fiber_import(path: str) -> dict[str, Any]:
     """Import fibers from `path`: a single vc3d_fiber JSON, a
     vc3d_fiber_collection bundle, or a directory of fiber JSONs (headless; no
     dialog). Coordinates and grid shapes are preserved. Imported fibers are
-    saved into the package's fibers directory and the fiber list reloads.
+    committed to the attached writable object store. Only version-4 fibers with
+    explicit UUIDs are accepted; the fiber list reloads after the transaction.
     Returns {"imported", "skipped"}."""
     return await _call("fiber.import", {"path": path})

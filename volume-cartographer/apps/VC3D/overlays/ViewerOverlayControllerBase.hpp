@@ -427,7 +427,7 @@ protected:
     // Invalidates the surface-coordinate projections retained by
     // renderPointChain(). Controllers must call this whenever their source
     // chain storage is replaced or mutated.
-    void clearPointChainProjectionCache();
+    void clearPointChainProjectionCache() const;
 
     // Projects a chain onto the viewer's surface with per-point opacity;
     // cached — see clearPointChainProjectionCache(). `breakDistance`, when
