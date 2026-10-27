@@ -65,7 +65,8 @@ static void ensureDialogWidthForEdits(QDialog* dlg, const QList<QLineEdit*>& edi
 
 // ================= RenderParamsDialog =================
 RenderParamsDialog::RenderParamsDialog(QWidget* parent,
-                                       const QString& volumePath,
+                                       const QVector<VolumeSelector::VolumeOption>& volumes,
+                                       const QString& volumeId,
                                        const QString& surfaceName,
                                        const QString& outputPattern,
                                        double scale,
@@ -81,7 +82,9 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     auto basic = new QFormLayout(basicBox);
     basicBox->setLayout(basic);
 
-    QWidget* volPick = pathPicker(this, edtVolume_, "Select OME-Zarr volume", true);
+    volume_ = new VolumeSelector(this);
+    volume_->setLabelVisible(false);
+    volume_->setVolumes(volumes, volumeId);
     QWidget* outPick = pathPicker(this, edtOutput_, "Select output (.zarr or tif pattern)", false);
     spScale_ = new QDoubleSpinBox(this); spScale_->setDecimals(3); spScale_->setRange(0.0001, 10000.0);
     spGroup_ = new QSpinBox(this); spGroup_->setRange(0, 10);
@@ -89,13 +92,12 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     edtThreads_ = new QLineEdit(this); edtThreads_->setPlaceholderText("optional");
     edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
 
-    edtVolume_->setText(volumePath);
     edtOutput_->setText(outputPattern);
     spScale_->setValue(scale);
     spGroup_->setValue(groupIdx);
     spSlices_->setValue(numSlices);
 
-    basic->addRow("Volume:", volPick);
+    basic->addRow("Volume:", volume_);
     basic->addRow("Surface:", new QLabel(surfaceName, this));
     chkIncludeTifs_ = new QCheckBox("Also write TIFF slices (Zarr)", this);
     chkIncludeTifs_->setChecked(false);
@@ -171,7 +173,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     updateIncludeTifsEnabled();
     connect(edtOutput_, &QLineEdit::textChanged, this, [updateIncludeTifsEnabled](const QString&){ updateIncludeTifsEnabled(); });
 
-    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtOutput_ });
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtOutput_ });
 
     // Apply saved defaults to optional controls, then session overrides
     applySavedDefaults();
@@ -187,7 +189,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
 }
 
-QString RenderParamsDialog::volumePath() const { return edtVolume_->text(); }
+QString RenderParamsDialog::volumeId() const { return volume_->selectedVolumeId(); }
 QString RenderParamsDialog::outputPattern() const { return edtOutput_->text(); }
 double RenderParamsDialog::scale() const { return spScale_->value(); }
 int RenderParamsDialog::groupIdx() const { return spGroup_->value(); }
@@ -772,7 +774,8 @@ bool AlphaCompRefineDialog::s_inPlace = false;
 int AlphaCompRefineDialog::s_ompThreads = -1;
 
 AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
-                                             const QString& volumePath,
+                                             const QVector<VolumeSelector::VolumeOption>& volumes,
+                                             const QString& volumeId,
                                              const QString& srcSurfaceName,
                                              const QString& defaultOutputName)
     : QDialog(parent)
@@ -784,13 +787,13 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
     auto paths = new QFormLayout(pathsBox);
     pathsBox->setLayout(paths);
 
-    QWidget* volPick = pathPicker(this, edtVolume_, tr("Select OME-Zarr volume"), true);
+    volume_ = new VolumeSelector(this);
+    volume_->setLabelVisible(false);
+    volume_->setVolumes(volumes, volumeId);
     edtDst_ = new QLineEdit(defaultOutputName, this);
     edtDst_->setToolTip(tr("Name of the refined surface."));
 
-    edtVolume_->setText(volumePath);
-
-    paths->addRow(tr("Volume:"), volPick);
+    paths->addRow(tr("Volume:"), volume_);
     paths->addRow(tr("Source:"), new QLabel(srcSurfaceName, this));
     paths->addRow(tr("Output name:"), edtDst_);
 
@@ -849,7 +852,7 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
 AlphaCompRefineRequest AlphaCompRefineDialog::request() const
 {
     AlphaCompRefineRequest result;
-    result.volumePath = edtVolume_->text().trimmed();
+    result.volumeId = volume_->selectedVolumeId();
     result.outputName = edtDst_->text().trimmed();
     result.inPlace = chkInPlace_->isChecked();
     result.refine = chkRefine_->isChecked();

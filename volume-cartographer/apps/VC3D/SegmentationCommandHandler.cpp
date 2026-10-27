@@ -1292,28 +1292,6 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
     return commandPathForVolume(_state->currentVolume());
 }
 
-QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUrlOut) const
-{
-    if (remoteUrlOut) {
-        remoteUrlOut->clear();
-    }
-
-    auto volume = _state ? _state->currentVolume() : nullptr;
-    if (!volume) {
-        return QString();
-    }
-
-    if (volume->isRemote()) {
-        const QString remoteUrl = QString::fromStdString(volume->remoteLocator());
-        if (remoteUrlOut) {
-            *remoteUrlOut = remoteUrl;
-        }
-        return remoteUrl;
-    }
-
-    return QString::fromStdString(volume->path().string());
-}
-
 namespace {
 // Whole-surface transforms rewrite every channel: load the ones still in the store.
 void loadAllChannels(QuadSurface& surface)
@@ -1522,9 +1500,6 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
-    auto renderVolume = _state ? _state->currentVolume() : nullptr;
-    QString remoteVolumeUrl;
-    const QString volumePath = getCurrentRenderVolumePath(&remoteVolumeUrl);
     QString artifacts;
     try {
         auto* catalog = _surfacePanel->catalog();
@@ -1538,7 +1513,9 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     const int layers = 31;
     const QString outputPattern = QDir(artifacts).filePath(QStringLiteral("layers"));
 
-    RenderParamsDialog dlg(_parentWidget, volumePath, stored->name, outputPattern, scale, resolution, layers);
+    QString defaultVolumeId;
+    const auto volumes = buildVolumeOptionList(&defaultVolumeId);
+    RenderParamsDialog dlg(_parentWidget, volumes, defaultVolumeId, stored->name, outputPattern, scale, resolution, layers);
     if (dlg.exec() != QDialog::Accepted) {
         emit statusMessage(tr("Render cancelled"), 3000);
         return;
@@ -1570,26 +1547,24 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
             ? CommandLineToolRunner::RenderOutputFormat::Zarr
             : CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
+    // The surface is read in the rendered volume's voxels through the store.
+    const auto renderVolume = _state && _state->vpkg() && _state->vpkg()->hasVolume(dlg.volumeId().toStdString())
+        ? _state->vpkg()->volume(dlg.volumeId().toStdString())
+        : nullptr;
+    if (!renderVolume) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Choose a volume of the open project to render."));
+        return;
+    }
     _cmdRunner->setRenderVoxelSize(
         renderVolume ? renderVolume->voxelSize() : 0.0,
         renderVolume &&
             (renderVolume->baseScaleLevel() > 0 ||
              renderVolume->hasExplicitVoxelSizeOverride()));
-    // The surface is read in the rendered volume's voxels through the store.
-    std::string renderVolumeId;
-    if (_state && _state->vpkg())
-        for (const auto& id : _state->vpkg()->volumeIDs())
-            if (commandPathForVolume(_state->vpkg()->volume(id)) == dlg.volumePath()) renderVolumeId = id;
-    if (renderVolumeId.empty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Render a volume of the open package: %1").arg(dlg.volumePath()));
-        return;
-    }
-    _cmdRunner->setRenderVolume(QString::fromStdString(renderVolumeId));
+    _cmdRunner->setRenderVolume(dlg.volumeId());
     _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    _cmdRunner->setVolumePath(dlg.volumePath());
-    const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
-    _cmdRunner->setRemoteVolumeUrl(useRemoteVolume ? remoteVolumeUrl : QString());
-    if (useRemoteVolume && renderVolume && renderVolume->isRemote()) {
+    _cmdRunner->setVolumePath(commandPathForVolume(renderVolume));
+    _cmdRunner->setRemoteVolumeUrl(renderVolume->isRemote() ? commandPathForVolume(renderVolume) : QString());
+    if (renderVolume->isRemote()) {
         const auto& auth = renderVolume->remoteAuth();
         _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
                                         QString::fromStdString(auth.secret_key),
@@ -2924,21 +2899,10 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
 {
     const auto stored = requireStoredSurface(segmentId, true, true);
     if (!stored) return;
-    if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
-        QMessageBox::warning(
-            _parentWidget, tr("Unsupported Remote Volume"),
-            tr("Alpha-comp refinement accepts only local volumes. The remote "
-               "locator was not modified or passed to the tool."));
-        return;
-    }
 
-    QString volumePath = getCurrentVolumePath();
-    if (volumePath.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot refine surface: Unable to determine volume path"));
-        return;
-    }
-
-    AlphaCompRefineDialog dlg(_parentWidget, volumePath, stored->name, stored->name + QStringLiteral("_refined"));
+    QString defaultVolumeId;
+    const auto volumes = buildVolumeOptionList(&defaultVolumeId);
+    AlphaCompRefineDialog dlg(_parentWidget, volumes, defaultVolumeId, stored->name, stored->name + QStringLiteral("_refined"));
     if (dlg.exec() != QDialog::Accepted) {
         emit statusMessage(tr("Alpha-comp refinement cancelled"), 3000);
         return;
@@ -3003,10 +2967,16 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
     if (_cmdRunner->isRunning()) {
         return fail(tr("A command line tool is already running."), CommandLaunchError::Busy);
     }
-    if (_state->currentVolume()->isRemote()) {
-        return fail(tr("Alpha-comp refinement accepts only local volumes."),
-                    CommandLaunchError::RemoteVolume);
+    // The surface is read in the voxels of the volume the refinement samples.
+    const std::string sampledVolume = params.volumeId.isEmpty() ? _state->currentVolumeId() : params.volumeId.toStdString();
+    if (!_state->vpkg()->hasVolume(sampledVolume)) {
+        return fail(tr("%1 is not a volume of this project.").arg(QString::fromStdString(sampledVolume)));
     }
+    const auto sampled = _state->vpkg()->volume(sampledVolume);
+    if (sampled->isRemote()) {
+        return fail(tr("Alpha-comp refinement accepts only local volumes."), CommandLaunchError::RemoteVolume);
+    }
+    const QString volumePath = commandPathForVolume(sampled);
     // Return a typed launch error before the runner reaches its interactive
     // missing-tool warning. Tool::AlphaCompRefine launches vc_objrefine.
     const QString toolPath =
@@ -3014,24 +2984,6 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
     if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
         return fail(tr("vc_objrefine not found or not executable: %1").arg(toolPath),
                     CommandLaunchError::ToolUnavailable);
-    }
-
-    const QString volumePath = params.volumePath.isEmpty()
-        ? getCurrentVolumePath()
-        : params.volumePath;
-    if (volumePath.isEmpty()) {
-        return fail(tr("Unable to determine volume path."));
-    }
-    // The surface is read in the voxels of the volume the refinement samples.
-    std::string sampledVolume;
-    for (const auto& id : _state->vpkg()->volumeIDs()) {
-        const auto volume = _state->vpkg()->volume(id);
-        if (volume && QFileInfo(QString::fromStdString(volume->path().string())).canonicalFilePath() ==
-                          QFileInfo(volumePath).canonicalFilePath())
-            sampledVolume = id;
-    }
-    if (sampledVolume.empty()) {
-        return fail(tr("%1 is not a volume of this project.").arg(volumePath));
     }
 
     // The output is a new surface's name, or the source's UUID to refine in place.

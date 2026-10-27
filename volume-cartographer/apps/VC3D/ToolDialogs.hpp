@@ -19,23 +19,25 @@
 #include <optional>
 
 #include "AlphaCompRefineRequest.hpp"
+#include "elements/VolumeSelector.hpp"
 
 class JsonProfileEditor;
-class VolumeSelector;
 class QGroupBox;
 
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
 public:
+    // `volumes`: the open project's volumes, `volumeId` chosen first.
     RenderParamsDialog(QWidget* parent,
-                       const QString& volumePath,
+                       const QVector<VolumeSelector::VolumeOption>& volumes,
+                       const QString& volumeId,
                        const QString& surfaceName,
                        const QString& outputPattern,
                        double scale,
                        int groupIdx,
                        int numSlices);
 
-    QString volumePath() const;
+    QString volumeId() const;
     QString outputPattern() const;
     double scale() const;
     int groupIdx() const;
@@ -72,7 +74,7 @@ private:
     void saveDefaults() const; // persist optional-only to VC.ini
     void updateSessionFromUI();
 
-    QLineEdit* edtVolume_{nullptr};
+    VolumeSelector* volume_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QDoubleSpinBox* spScale_{nullptr};
     QSpinBox* spGroup_{nullptr};
@@ -390,7 +392,8 @@ class AlphaCompRefineDialog : public QDialog {
     Q_OBJECT
 public:
     AlphaCompRefineDialog(QWidget* parent,
-                          const QString& volumePath,
+                          const QVector<VolumeSelector::VolumeOption>& volumes,
+                          const QString& volumeId,
                           const QString& srcSurfaceName,
                           const QString& defaultOutputName);
 
@@ -421,7 +424,7 @@ private:
     static bool   s_inPlace;
     static int    s_ompThreads;
 
-    QLineEdit* edtVolume_{nullptr};
+    VolumeSelector* volume_{nullptr};
     QLineEdit* edtDst_{nullptr};
     QLineEdit* edtScaleGroup_{nullptr};
     QLineEdit* edtThreads_{nullptr};

@@ -16,8 +16,8 @@ struct AlphaCompRefineRequest {
     QString scaleGroup{QStringLiteral("1")};
     int ompThreads{-1};
 
-    // Empty => the current volume.
-    QString volumePath;
+    // The volume of the open project it samples; empty => the current volume.
+    QString volumeId;
     // The refined surface's name; empty => <source name>_refined.
     QString outputName;
     // Refine the source surface itself instead of creating a new one.
