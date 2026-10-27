@@ -60,6 +60,8 @@ add_library(vc_objects ${_vc_store_library_type}
     Spatial.cpp
     GeometryRegion.cpp
     SurfaceProximity.cpp
+    SurfaceDrafts.cpp
+    spatial/SurfaceTiles.cpp
     ObjectCopy.cpp
     VolumeUmbilicus.cpp
     UmbilicusFile.cpp

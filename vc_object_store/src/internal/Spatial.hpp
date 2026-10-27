@@ -24,6 +24,9 @@ void updateEditedGeometryBounds(sqlite3*, int64_t objectId, const std::string& r
                                 const std::vector<GeometryArrayEdit>&,
                                 const std::optional<EditedSurfaceCells>& before = std::nullopt);
 std::string spatialOverlapSql(int firstParameter = 1);
+// The query-space box of a slab (validated orthonormal axes), with a margin of
+// a few ulps so inclusive overlap tests never miss geometry on its faces.
+Bounds slabBounds(const RegionSlice&);
 // Surfaces whose geometry is not local yet (catalog placeholders) whose record
 // bounds overlap `bounds` (source XYZ), filtered like a geometry query: optional
 // JSON id list and exact coordinate declaration. UUID order.

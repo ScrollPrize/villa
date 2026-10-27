@@ -3,12 +3,16 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include <chrono>
 #include <initializer_list>
 #include <string_view>
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <map>
+#include <span>
 
 namespace vc::objects {
 
@@ -41,8 +45,11 @@ struct StoreSessionEvent {
     // reports the old one's Detached before the new one's Attached).
     // Hub: that attachment's hubStatus() changed.
     // A fetched object's geometry arriving is a Committed event.
-    enum class Kind { Attached, Detached, Committed, Hub };
+    enum class Kind { Attached, Detached, Committed, Hub, Draft };
     Kind kind = Kind::Attached;
+    // Draft: this session's drafts of the objects in `changes` (recordUuid,
+    // kind) were set, edited or cleared; `attachment` is empty for drafts
+    // without one.
     // Generations are unique within a session and increase on every attach,
     // including reattachment of the same file/UUID.
     AttachmentIdentity attachment;
@@ -50,8 +57,8 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
-    // Whether it may have changed records of these kinds: a commit touching
-    // one, or any attachment or hub event.
+    // Whether it may have changed records of these kinds: a commit or draft
+    // touching one, or any attachment or hub event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
 };
 
@@ -83,7 +90,7 @@ struct HubSessionStatus {
     std::vector<HubLease> leases;       // as of the last hub contact
 };
 
-namespace detail { struct HubLeaseCounts; class HubWorker; }
+namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; }
 
 // Keeps objects leased while it lives. Leases are renewed in the background;
 // once no hold remains and the object's changes are pushed, the lease is released.
@@ -204,6 +211,27 @@ public:
     std::vector<std::vector<AttachedHit>> nearestSurfaces(const std::vector<AttachmentIdentity>& order,
                                                           const SurfaceProximityQuery&,
                                                           const std::vector<std::array<double, 3>>& points);
+    // Drafts: surface geometry not committed anywhere, held in this session's
+    // memory only (never written, synced or seen by another session). A draft
+    // stands in for its object's committed geometry, in every attachment, in
+    // this session's geometryRegion and nearestSurfaces, which treat it by the
+    // same tile and triangle rules as stored surfaces; an object need not exist
+    // yet. Runs and hits from a draft have an empty revisionUuid and report the
+    // draft's attachment (an empty identity when it has none). Drafts are
+    // filtered like stored surfaces by uuids, coordinates and volume; a volume
+    // target places a draft through the query's transforms, else those of its
+    // attachment, else of the first attachment queried. Each change is a Draft event.
+    // Set (or replace) the draft of `objectUuid`: its whole grid, the coordinates
+    // it is declared in (geometryCoordinates) and the attachment it belongs to.
+    void setDraft(const std::string& objectUuid, const vc::geometry::Surface&, const CoordinateJson& coordinates,
+                  const std::optional<AttachmentIdentity>& attachment = std::nullopt);
+    // Replace a rows x columns rectangle (row-major) of a draft's vertices at
+    // row, column, and their valid channel unless `validity` is empty.
+    void updateDraft(const std::string& objectUuid, int64_t row, int64_t column, int64_t rows, int64_t columns,
+                     std::span<const vc::geometry::SurfacePoint> points, std::span<const uint8_t> validity = {});
+    // Drop a draft (e.g. after committing it, or abandoning the edit). No-op without one.
+    void clearDraft(const std::string& objectUuid);
+    bool hasDraft(const std::string& objectUuid) const;
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory
@@ -256,5 +284,10 @@ private:
     std::vector<std::shared_ptr<Attachment>> attached_;
     uint64_t generation_ = 0;
     std::vector<StoreSessionEvent> events_;
+    using Drafts = std::map<std::string, std::shared_ptr<const detail::SurfaceDraft>>;
+    // Guarded by mutex_; queries take a snapshot.
+    Drafts drafts_;
+    Drafts drafts() const;
+    void draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>&);
 };
 }
