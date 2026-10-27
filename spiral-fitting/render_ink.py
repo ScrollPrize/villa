@@ -26,7 +26,7 @@ full-scroll tifxyz (concat/wLLL-HHH), which is then flattened with the lasagna f
 flattener (../lasagna/fit.py, config flatten_fast_nofilter.json plus a generated
 overlay that points external_surfaces at the concat) rather than flatboi. The flattened
 tifxyz is written as a top-level mesh at concat/wLLL-HHH_flat (meta.json + x/y/z.tif),
-trimmed to its valid-cell bounding box with vc_tifxyz_trim (dropping the flatten's invalid
+trimmed in place to its valid-cell bounding box (dropping the flatten's invalid
 output-margin border, unless --no-full-scroll-trim), and ink-rendered. The rendered ink
 strip is chopped (no downsampling) into fixed-width jpg tiles ink/wLLL-HHH_flat.NNN.jpg of
 at most --max-strip-width px each.
@@ -287,6 +287,49 @@ def lasagna_flatten(concat_path, flat_path, lasagna_dir, lasagna_config, lasagna
     return flat_abs
 
 
+def trim_tifxyz_to_valid(tifxyz_path):
+    """Crop a tifxyz in place to the bounding box of its valid cells (x != -1).
+
+    x/y/z.tif and every sibling .tif channel whose size is an integer multiple
+    of the grid are cropped in lockstep (other channels are left as they are);
+    meta.json keeps its identity and gets a recomputed bbox. Returns the
+    (old_hw, new_hw) grid shapes, or None when there is nothing to keep.
+    """
+    axes = {a: np.array(Image.open(os.path.join(tifxyz_path, f'{a}.tif')), dtype=np.float32)
+            for a in 'xyz'}
+    valid = axes['x'] != -1
+    if not valid.any():
+        return None
+    rows = np.flatnonzero(valid.any(axis=1))
+    cols = np.flatnonzero(valid.any(axis=0))
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    h, w = valid.shape
+    if (r0, r1, c0, c1) == (0, h, 0, w):
+        return (h, w), (h, w)
+
+    for name in sorted(os.listdir(tifxyz_path)):
+        stem, ext = os.path.splitext(name)
+        if ext != '.tif':
+            continue
+        path = os.path.join(tifxyz_path, name)
+        data = axes[stem] if stem in axes else np.array(Image.open(path))
+        ch, cw = data.shape[:2]
+        if ch % h or cw % w:
+            print(f'{name}: {cw}x{ch} is not a multiple of the {w}x{h} grid, left untrimmed')
+            continue
+        sy, sx = ch // h, cw // w
+        Image.fromarray(np.ascontiguousarray(data[r0 * sy:r1 * sy, c0 * sx:c1 * sx])).save(path)
+
+    meta_path = os.path.join(tifxyz_path, 'meta.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
+    xyz = np.stack([axes[a][r0:r1, c0:c1] for a in 'xyz'], axis=-1)[valid[r0:r1, c0:c1]]
+    meta['bbox'] = [xyz.min(axis=0).tolist(), xyz.max(axis=0).tolist()]
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=4)
+    return (h, w), (int(r1 - r0), int(c1 - c0))
+
+
 def max_composite(tif_paths):
     composite = None
     for tif_path in tif_paths:
@@ -384,9 +427,8 @@ def publish_render_tifs(per_mesh_ink, tif_paths):
 @click.option('--strips/--no-strips', default=False, show_default=True, help='Build the per-winding-range strip concats (concat/wLLL-HHH), flatboi-flatten them (per --flatten), and ink-render them. Off by default: only the full-scroll concat is rendered')
 @click.option('--full-scroll/--no-full-scroll', default=True, show_default=True, help='Concatenate ALL windings into one full-scroll mesh, flatten it with the lasagna forward flattener (not flatboi), and ink-render it')
 @click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
-@click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands) with vc_tifxyz_trim')
+@click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands)')
 @click.option('--fail-on-empty/--no-fail-on-empty', default=True, show_default=True, help='Fail (exit 1) if any rendered strip is entirely zero, which almost always means the mesh does not intersect --volume (wrong frame/resolution; see --scale-segmentation, --scale, --group-idx). --no-fail-on-empty restores writing the black strip with a warning')
-@click.option('--tifxyz-trim-bin', default='vc_tifxyz_trim', show_default=True, help='Path to the vc_tifxyz_trim binary (crops a tifxyz to its valid-cell bbox in place)')
 @click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
 @click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
 @click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
@@ -396,7 +438,7 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
          flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
          keep_largest, flatboi_threads,
          openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
-         fail_on_empty, tifxyz_trim_bin, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+         fail_on_empty, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
     meshes = sorted(
         (winding_idx(name), name)
         for name in os.listdir(meshes_dir)
@@ -522,13 +564,6 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
         print(f'Lasagna-flattening full-scroll concat via {l_fit} (config {l_cfg})')
         flat_name = full_name + '_flat'
         flat_dest = os.path.join(concat_dir, flat_name)
-        # If the trim bin wasn't given explicitly, look for it next to --vc-render-bin
-        # (both live in build/bin), so callers passing a full vc-render path get it free.
-        trim_bin = tifxyz_trim_bin
-        if trim_bin == 'vc_tifxyz_trim' and os.sep in vc_render_bin:
-            sibling = os.path.join(os.path.dirname(vc_render_bin), 'vc_tifxyz_trim')
-            if os.path.exists(sibling):
-                trim_bin = sibling
         try:
             flat_path = lasagna_flatten(full_concat, flat_dest, l_dir, l_cfg, l_fit, lasagna_device)
             print(f'lasagna-flattened {full_name} -> {flat_path}')
@@ -538,15 +573,13 @@ def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentatio
             flat_path = None
         if flat_path is not None:
             # The flatten pads its output with an invalid-cell margin that renders as black
-            # bands; trim the flattened tifxyz to its valid-cell bbox in place (VC3D tool).
-            # A trim failure is non-fatal: fall back to rendering the untrimmed flatten.
+            # bands; trim the flattened tifxyz to its valid-cell bbox in place.
             if full_scroll_trim:
-                try:
-                    subprocess.run([trim_bin, flat_path], check=True)
-                    print(f'trimmed {flat_name} to valid bbox')
-                except subprocess.CalledProcessError as e:
-                    print(f'{flat_name}: WARNING vc_tifxyz_trim failed ({e.cmd[0]} exit '
-                          f'{e.returncode}), rendering untrimmed')
+                shapes = trim_tifxyz_to_valid(flat_path)
+                if shapes is None:
+                    print(f'{flat_name}: WARNING no valid cells, rendering untrimmed')
+                else:
+                    print(f'trimmed {flat_name} to valid bbox {shapes[0]} -> {shapes[1]}')
             full_items.append((flat_name, flat_path))
 
     render_items = chunks + full_items
