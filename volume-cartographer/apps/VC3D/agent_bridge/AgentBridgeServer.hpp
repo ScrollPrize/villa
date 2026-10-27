@@ -270,10 +270,9 @@ private:
                                  QString* outputName)>& launch);
 
     // Per-segment mesh operations live in AgentBridgeHandlers_surfaceops.cpp.
-    // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /
+    // Sync: crop_bounds. Async source:"tool": reoptimize /
     // refine_alpha_comp (mirror render.tifxyz).
     QJsonObject handleSegmentCropBounds(const QJsonValue& params);
-    QJsonObject handleSegmentRecalcArea(const QJsonValue& params);
     QJsonObject handleSegmentReoptimize(const QJsonValue& params);
     QJsonObject handleSegmentRefineAlphaComp(const QJsonValue& params);
 

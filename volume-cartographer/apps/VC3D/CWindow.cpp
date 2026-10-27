@@ -155,7 +155,6 @@
 #include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
-#include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
@@ -3143,35 +3142,6 @@ void CWindow::CreateWidgets(void)
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
         });
-    connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
-            this, [this](const QStringList& segmentIds) {
-                if (segmentIds.isEmpty()) return;
-                std::vector<std::string> ids;
-                ids.reserve(segmentIds.size());
-                for (const auto& id : segmentIds) {
-                    ids.push_back(id.toStdString());
-                }
-                // The panel shows the new areas from the commit events.
-                auto results = SurfaceAreaCalculator::calculateAreas(*_surfaceCatalog, ids);
-                int okCount = 0, failCount = 0;
-                QStringList skippedIds;
-                for (const auto& r : results) {
-                    if (r.success) {
-                        ++okCount;
-                    } else {
-                        ++failCount;
-                        skippedIds << QString::fromStdString(r.segmentId + " (" + r.errorReason + ")");
-                    }
-                }
-                if (okCount > 0) {
-                    showStatusBarMessage(
-                        tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
-                }
-                if (failCount > 0) {
-                    QMessageBox::warning(this, tr("Area Recalculation"),
-                        tr("Updated: %1\nSkipped: %2\n\n%3").arg(okCount).arg(failCount).arg(skippedIds.join("\n")));
-                }
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
                 showStatusBarMessage(message, timeoutMs);

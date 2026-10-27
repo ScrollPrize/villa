@@ -34,20 +34,6 @@ void AgentBridgeServer::registerSurfaceOpsHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segment.recalc_area"),
-            .params = {
-                Params::requiredArray(
-                    QStringLiteral("segmentIds"),
-                    Params::requiredString(QString())),
-            },
-            .errors = {-32602, -32000, -32001},
-            .mcp =
-                Mcp::snakeCase(QStringLiteral("vc3d_recalc_segment_area")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentRecalcArea(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("segment.reoptimize"),
             .params = {
                 Params::requiredString(QStringLiteral("segmentId")),

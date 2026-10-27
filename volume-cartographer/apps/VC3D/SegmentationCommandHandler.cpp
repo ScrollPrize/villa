@@ -3,7 +3,6 @@
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
 #include "SurfaceCatalog.hpp"
-#include "SurfaceAreaCalculator.hpp"
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataManifest.hpp"
@@ -67,7 +66,6 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfaceArea.hpp"
 #include "ToolDialogs.hpp"
 #include "ToolExecutable.hpp"
 #include "ToolProcess.hpp"
@@ -637,8 +635,6 @@ public:
         // and "[it n]" lines; 0: indeterminate, the label follows the output.
         int iterations = 0;
         bool modal = false;
-        // Recompute the created surface's area (the surface list's column).
-        bool computeArea = false;
     };
 
     FlattenJob(QWidget* parentWidget, SegmentationCommandHandler* handler, SurfaceCatalog* catalog, Spec spec,
@@ -725,12 +721,6 @@ private:
             report_(false, detail, QString(), QObject::tr("%1 failed").arg(spec_.title));
             if (!suppressDialogs_) QMessageBox::critical(parentWidget_, QObject::tr("%1 Failed").arg(spec_.title), detail);
             return;
-        }
-        if (spec_.computeArea && catalog_) {
-            for (const auto& area : SurfaceAreaCalculator::calculateAreas(*catalog_, {created.toStdString()}))
-                if (!area.success)
-                    std::cout << "[" << spec_.kind.toStdString() << "] warning: no area for " << created.toStdString()
-                              << ": " << area.errorReason << std::endl;
         }
         const QString done = QObject::tr("%1 complete: %2").arg(spec_.title, spec_.outputName);
         report_(true, done, created, done);
@@ -1393,7 +1383,7 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
 
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
                    {flatboiExe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
-                    outputName, iters, /*modal=*/true, /*computeArea=*/true},
+                    outputName, iters, /*modal=*/true},
                    /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
@@ -2774,11 +2764,10 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     QMap<QString, MergePatchDialog::Choice> available;
     for (const auto* row : toolSurfaces()) {
         const auto& record = row->record;
-        const auto meta = nlohmann::json::parse(record.meta.empty() ? std::string("{}") : record.meta, nullptr, false);
-        const auto area = meta.is_object() ? meta.find("area_vx2") : meta.end();
+        // The store's area; tool inputs are stored in the volume's voxels.
         available.insert(QString::fromStdString(record.uuid),
                          {QString::fromStdString(record.name.empty() ? record.uuid : record.name),
-                          meta.is_object() && area != meta.end() && area->is_number() ? area->get<double>() : -1.0});
+                          record.surface && record.surface->area > 0 ? record.surface->area : -1.0});
     }
     if (available.size() < 2) {
         QMessageBox::warning(_parentWidget, tr("Patch Surface"),

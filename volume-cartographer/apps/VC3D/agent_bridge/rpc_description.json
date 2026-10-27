@@ -2036,33 +2036,6 @@
         "type": "object"
       }
     },
-    "segment.recalc_area": {
-      "errors": [
-        -32602,
-        -32000,
-        -32001
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentIds": "segment_ids"
-        },
-        "tool": "vc3d_recalc_segment_area"
-      },
-      "params": {
-        "properties": {
-          "segmentIds": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "segmentIds"
-        ],
-        "type": "object"
-      }
-    },
     "segment.refine_alpha_comp": {
       "errors": [
         -32602,

@@ -153,7 +153,6 @@ signals:
     void slimFlattenRequested(const QString& segmentId);
     void straightenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
-    void recalcAreaRequested(const QStringList& segmentIds);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void mergeSurfacesRequested(const QStringList& segmentIds);

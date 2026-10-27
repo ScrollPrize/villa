@@ -16,14 +16,13 @@
 #include "CWindow.hpp"
 #include "CState.hpp"
 #include "SegmentationCommandHandler.hpp"
-#include "SurfaceAreaCalculator.hpp"
 #include "CommandLineToolRunner.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
 // ===========================================================================
-// Per-segment mesh operations. Sync dialog-free ops (crop, recalc_area) call a
+// Per-segment mesh operations. Sync dialog-free ops (crop) call a
 // SegmentationCommandHandler / SurfaceAreaCalculator entry directly; async ops
 // drive a headless start* launcher tracked as a job; external-tool ones share
 // the source:"tool" slot like render.tifxyz.
@@ -67,56 +66,6 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
     QJsonObject result;
     result["cropped"] = true;
     result["segmentId"] = segmentId;
-    return result;
-}
-
-
-// ---------------------------------------------------------------------------
-// segment.recalc_area
-// ---------------------------------------------------------------------------
-
-QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-
-    const QJsonArray idsArr = p.value("segmentIds").toArray();
-    if (idsArr.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentIds";
-        throw AgentBridgeError{-32602, "segmentIds must not be empty", data};
-    }
-
-    std::vector<std::string> ids;
-    ids.reserve(static_cast<size_t>(idsArr.size()));
-    for (const QJsonValue& v : idsArr)
-        ids.push_back(v.toString().toStdString());
-
-    // Pure computation, no UI: per-segment results carry their own success flag,
-    // so an unknown/invalid id is reported in-band (success:false) rather than
-    // failing the whole call.
-    const std::vector<AreaResult> results =
-        SurfaceAreaCalculator::calculateAreas(*_window->_surfaceCatalog, ids);
-
-    QJsonArray out;
-    for (const AreaResult& r : results) {
-        QJsonObject o;
-        o["segmentId"] = QString::fromStdString(r.segmentId);
-        o["areaVx2"] = r.areaVx2;
-        o["areaCm2"] = r.areaCm2;
-        o["success"] = r.success;
-        o["errorReason"] = r.errorReason.empty()
-            ? QJsonValue(QJsonValue::Null)
-            : QJsonValue(QString::fromStdString(r.errorReason));
-        out.append(o);
-    }
-
-    QJsonObject result;
-    result["results"] = out;
     return result;
 }
 

@@ -189,7 +189,6 @@ void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const Surfa
     const auto meta = row_meta(row);
     const QString name = display_name(row);
     const QString longId = long_id(meta);
-    const double areaCm2 = number_or(meta, "area_cm2", -1.0);
     const double avgCost = number_or(meta, "avg_cost", -1.0);
     item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(row.record.uuid));
     item->setData(SURFACE_ID_COLUMN, kUnboundRole, !row.bound());
@@ -200,9 +199,14 @@ void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const Surfa
         .arg(source.is_string()?QString::fromStdString(source.get<std::string>()):tr("Unknown"))
         .arg(row.mapping?tr("Available in the open volume"):tr("No resolved mapping to the open volume")));
     item->setText(SURFACE_LONG_ID_COLUMN, longId);
-    // A surface whose voxel size was unknown has no area_cm2 at all, and "-"
-    // is honest where "-1.000" is not.
-    item->setText(SURFACE_AREA_COLUMN, areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-"));
+    // The store's area (stored units squared) in the open volume, in cm²: "-"
+    // without geometry, a mapping or a voxel size.
+    const auto volume = _catalog ? _catalog->volume() : nullptr;
+    const double voxelUm = volume ? volume->voxelSize() : 0.0;
+    const bool areaKnown = row.record.surface && row.record.surface->area > 0 && row.mapping && voxelUm > 0;
+    const double areaCm2 = areaKnown
+        ? row.record.surface->area * std::pow(row.mapping->lengthScale(), 2) * voxelUm * voxelUm * 1e-8 : 0.0;
+    item->setText(SURFACE_AREA_COLUMN, areaKnown ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-"));
     item->setText(SURFACE_AVG_COST_COLUMN, avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-"));
     item->setText(TIMESTAMP_COLUMN, QString::fromStdString(row.record.changedAt));
     item->updateItemIcon(has_tag(row, "approved"), has_tag(row, "defective"));
@@ -567,12 +571,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     contextMenu.addSeparator();
-
-    QAction* recalcAreaAction = contextMenu.addAction(tr("Recalculate Area"));
-    recalcAreaAction->setEnabled(allUsable);
-    connect(recalcAreaAction, &QAction::triggered, this, [this, targets]() {
-        emit recalcAreaRequested(targets);
-    });
 
     const QString deleteText = targets.size() > 1 ?
         tr("Delete %1 Surfaces").arg(targets.size()) :

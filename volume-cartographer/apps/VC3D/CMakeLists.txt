@@ -76,8 +76,6 @@ set(srcs
     OpenDataNormalGrids.hpp
     VolumeRegistrations.cpp
     VolumeRegistrations.hpp
-    SurfaceAreaCalculator.cpp
-    SurfaceAreaCalculator.hpp
     CommandLaunchError.hpp
     FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp

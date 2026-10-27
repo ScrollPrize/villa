@@ -5,7 +5,7 @@ small in-process fake Agent Bridge (AF_UNIX, newline-delimited JSON-RPC 2.0),
 asserting:
   * method + params land on the wire with None stripped and snake_case mapped to
     the RPC's camelCase keys;
-  * synchronous ops (crop, recalc_area) pass their result straight through;
+  * the synchronous crop passes its result straight through;
   * async "tool" ops (reoptimize, refine) honor wait vs no-wait, mirroring the
     run_trace / grow idiom (wait=True polls job.status to a terminal state).
 
@@ -24,7 +24,6 @@ from tests.support import FakeBridgeServer
 from vc3d_mcp import core
 from vc3d_mcp.tools.surface_ops import (
     vc3d_crop_segment_bounds,
-    vc3d_recalc_segment_area,
     vc3d_refine_segment_alpha_comp,
     vc3d_reoptimize_segment,
 )
@@ -54,13 +53,6 @@ class SurfaceOpsBridge(FakeBridgeServer):
             else:
                 await self.reply(writer, req_id,
                                   result={"cropped": True, "segmentId": params.get("segmentId")})
-        elif method == "segment.recalc_area":
-            results = [
-                {"segmentId": sid, "areaVx2": 100.0, "areaCm2": 1.5,
-                 "success": True, "errorReason": None}
-                for sid in params.get("segmentIds", [])
-            ]
-            await self.reply(writer, req_id, result={"results": results})
         elif method == "segment.reoptimize":
             job_id = "job-ro"
             self._jobs[job_id] = {"jobId": job_id, "kind": "segment.reoptimize"}
@@ -114,14 +106,6 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["cropped"])
         self.assertEqual(result["segmentId"], "seg-1")
         self.assertEqual(self.bridge.params_for("segment.crop_bounds"), {"segmentId": "seg-1"})
-
-    async def test_recalc_area_passthrough(self) -> None:
-        result = await vc3d_recalc_segment_area(["seg-1", "seg-2"])
-        self.assertEqual(len(result["results"]), 2)
-        self.assertEqual(result["results"][0]["segmentId"], "seg-1")
-        self.assertTrue(result["results"][0]["success"])
-        self.assertEqual(self.bridge.params_for("segment.recalc_area"),
-                         {"segmentIds": ["seg-1", "seg-2"]})
 
     # Async external-tool operations
 

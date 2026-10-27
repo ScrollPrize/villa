@@ -2,7 +2,6 @@
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
 #include "SurfaceCatalog.hpp"
-#include "SurfaceAreaCalculator.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
@@ -239,11 +238,10 @@ int main(int argc, char** argv)
         });
         pump([&]{return catalog.row(other)&&catalog.row(other)->mapping.has_value();},"registration commits refresh compatible surfaces");
         {
-            // Area: area_vx2 in the bound volume's voxels (vol2: the 2x2 unit grid),
-            // area_cm2 physical from the open volume, where the shear doubles x.
-            const auto areas=SurfaceAreaCalculator::calculateAreas(catalog,{other});
-            require(areas.size()==1&&areas.front().success&&areas.front().areaVx2==4.0,
-                    "area_vx2 is measured in the bound volume's voxels");
+            // Area: the store's, in stored units (vol2: the 2x2 unit grid); the
+            // open volume, where the shear doubles x, sees twice it.
+            require(catalog.row(other)->record.surface&&catalog.row(other)->record.surface->area==4.0,
+                    "the store keeps the area in stored units");
             require(std::abs(vc::surface::computeSurfaceAreaVox2(*catalog.open(other).surface)-8.0)<1e-9,
                     "the open volume sees the sheared area");
         }

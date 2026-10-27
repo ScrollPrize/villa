@@ -1,4 +1,4 @@
-"""Per-segment mesh operations (crop, area, reoptimize, refine)."""
+"""Per-segment mesh operations (crop, reoptimize, refine)."""
 
 from __future__ import annotations
 
@@ -22,21 +22,6 @@ async def vc3d_crop_segment_bounds(segment_id: str) -> dict[str, Any]:
     "cropped" from "already at tightest bounds" -- both report cropped:true.
     """
     return await _call("segment.crop_bounds", {"segmentId": segment_id})
-
-
-@mcp.tool()
-async def vc3d_recalc_segment_area(segment_ids: list[str]) -> dict[str, Any]:
-    """Recompute surface area for one or more segments (pure computation, no UI),
-    the headless twin of the surface-panel area recalculation. Synchronous.
-
-    segment_ids: non-empty list of segment ids to measure.
-
-    Requires a loaded volume package and current volume. Returns
-    {"results": [{"segmentId", "areaVx2", "areaCm2", "success", "errorReason"}]}.
-    A bad/unknown id is reported in-band (success:false) rather than failing the
-    whole call.
-    """
-    return await _call("segment.recalc_area", {"segmentIds": segment_ids})
 
 
 @mcp.tool()
