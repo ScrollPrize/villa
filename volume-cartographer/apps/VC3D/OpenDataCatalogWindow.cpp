@@ -381,11 +381,6 @@ QString catalogTabStyle(const QPalette& palette)
              cssColor(inactiveBackground.lighter(112)));
 }
 
-QString manifestJsonError(const std::exception& e)
-{
-    return QStringLiteral("Could not parse cached open-data manifest: %1").arg(QString::fromUtf8(e.what()));
-}
-
 } // namespace
 
 OpenDataCatalogWindow::OpenDataCatalogWindow(QWidget* parent)
@@ -943,12 +938,10 @@ void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
     if (!std::filesystem::is_regular_file(path)) {
         return;
     }
-    try {
-        auto manifest = vcr::catalog::loadOpenDataManifestFile(path, std::string(vcr::catalog::kDefaultManifestUrl));
-        applyManifest(std::move(manifest), qstr(path.string()), true);
-    } catch (const std::exception& e) {
-        setStatus(manifestJsonError(e));
-    }
+    if (const auto manifest = cachedCatalog())
+        applyManifest(*manifest, qstr(path.string()), true);
+    else
+        setStatus(tr("Could not parse cached open-data manifest %1").arg(qstr(path.string())));
 }
 
 void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache)
