@@ -41,14 +41,20 @@ def test_default_selection_reads_every_active_object_in_uuid_order(db):
     patches = sorted(put_patch(db, _grid(z)) for z in (10.0, 20.0, 30.0))
     pcl = put_pcl(db, {3: ([20.0, 14.0, 14.0], None)})
     fiber = put_fiber(db, _line(), [0, 5])
-    db.upsert_object({'kind': 'patch', 'name': 'placeholder'})
+    db.upsert_object({'kind': 'surface', 'name': 'placeholder'})
     snapshot = osi.read_snapshot(db, request())
-    assert [obj.uuid for obj in snapshot.objects_of('patch')] == patches
+    assert [obj.uuid for obj in snapshot.objects_of('surface')] == patches
     assert [obj.uuid for obj in snapshot.objects_of('point_collection')] == [pcl]
     assert [obj.uuid for obj in snapshot.objects_of('fiber')] == [fiber]
     assert snapshot.volume_uuid == VOLUME
     assert snapshot.volume_source == 'inferred'
-    assert snapshot.notes == ['skipped 1 patches without geometry']
+    assert snapshot.notes == ['skipped 1 surfaces without geometry']
+
+
+def test_unknown_selector_kind_is_refused():
+    # Store kind "patch" became "surface"; a stale key must not select everything.
+    with pytest.raises(ValueError, match='unknown object kinds'):
+        request(patch={'uuids': ()})
 
 
 def test_explicit_selectors_tags_and_empty_matches(db):
@@ -56,9 +62,9 @@ def test_explicit_selectors_tags_and_empty_matches(db):
     b = put_patch(db, _grid(20.0))
     put_patch(db, _grid(30.0))
     snapshot = osi.read_snapshot(db, request(
-        patch={'uuids': (b,), 'tags': ('keep',)},
+        surface={'uuids': (b,), 'tags': ('keep',)},
         fiber={'tags': ('absent',)}, volume=VOLUME))
-    assert [obj.uuid for obj in snapshot.objects_of('patch')] == sorted([a, b])
+    assert [obj.uuid for obj in snapshot.objects_of('surface')] == sorted([a, b])
     # A selector matching nothing selects nothing, never everything.
     assert snapshot.objects_of('fiber') == []
     assert snapshot.manifest()['selection']['fiber']['count'] == 0
@@ -66,13 +72,13 @@ def test_explicit_selectors_tags_and_empty_matches(db):
 
 def test_explicit_selection_problems_are_reported_together(db):
     missing = '00000000-0000-4000-8000-00000000dead'
-    empty = db.upsert_object({'kind': 'patch', 'name': 'placeholder'})
+    empty = db.upsert_object({'kind': 'surface', 'name': 'placeholder'})
     pcl = put_pcl(db, {0: ([20.0, 14.0, 14.0], None)})
     with pytest.raises(osi.ObjectStoreInputError) as error:
-        osi.read_snapshot(db, request(patch={'uuids': (missing, pcl)}))
+        osi.read_snapshot(db, request(surface={'uuids': (missing, pcl)}))
     assert len(error.value.problems) == 2
     with pytest.raises(osi.ObjectStoreInputError, match='has no geometry'):
-        osi.read_snapshot(db, request(patch={'uuids': (empty,)}))
+        osi.read_snapshot(db, request(surface={'uuids': (empty,)}))
 
 
 def test_volume_inference(db):
@@ -150,7 +156,7 @@ def test_relationship_filtering_and_endpoint_order(db):
     ordinary = branch(db, b, 30, a, 20)
     branch(db, a, 10, b, 40, adjacent=True)
 
-    snapshot = osi.read_snapshot(db, request(patch={'uuids': (patch,)}))
+    snapshot = osi.read_snapshot(db, request(surface={'uuids': (patch,)}))
     consumed = {rel.uuid: rel for rel in snapshot.relationships}
     assert set(consumed) == {pending, approved, ordinary}
     assert outside not in consumed
@@ -163,7 +169,7 @@ def test_relationship_filtering_and_endpoint_order(db):
     assert (fiber_edge.a, fiber_edge.b) == tuple(sorted([a, b]))
 
     approved_only = osi.read_snapshot(db, request(
-        patch={'uuids': (patch,)}, approved=True))
+        surface={'uuids': (patch,)}, approved=True))
     assert [rel.uuid for rel in approved_only.relationships] == [approved]
     assert approved_only.exclusions['pending (approved-only)'] == 2
 

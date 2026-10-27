@@ -51,7 +51,7 @@ def _uuids(path):
                 for record in db.objects_by_kind(kind)}
 
 
-def _edges(path, kind='point-patch'):
+def _edges(path, kind='point-surface'):
     with ObjectStore.open(path, read_only=True) as db:
         return sorted((edge['uuid'], edge['a'], edge['b'], edge['approval_state'],
                        edge['generation'], edge['changed_at'])
@@ -196,7 +196,7 @@ def test_input_toggles_select_nothing_and_pcl_roles_must_agree(store_path):
     config = fit_config(store_path, input_use_verified_patches=False,
                         input_use_fibers=False)
     request = osi.request_from_config(config)
-    assert request.selector('patch') == osi.Selector(uuids=())
+    assert request.selector('surface') == osi.Selector(uuids=())
     assert request.selector('fiber') == osi.Selector(uuids=())
     assert request.selector('point_collection').is_default
     with pytest.raises(osi.ObjectStoreInputError, match='role toggles must all agree'):

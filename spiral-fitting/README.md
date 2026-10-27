@@ -198,7 +198,7 @@ runs, one per frame:
 ```sh
 NS=<dataset uuid namespace>   # e.g. python3 -c 'import uuid; print(uuid.uuid4())', once
 ingest="vc_object_ingest --db dataset.vcobj --author $USER --derive-uuids $NS --volume-uuid VOLUME"
-patches=(); for p in dataset/verified_patches/*/; do patches+=(--patch "$p"); done
+patches=(); for p in dataset/verified_patches/*/; do patches+=(--surface "$p"); done
 $ingest --scale-factor 1 --renumber-point-ids "${patches[@]}" \
     --point-collections dataset/abs_winding.json \
     --point-collections dataset/relative_windings.json \
@@ -213,8 +213,9 @@ instead of 4. The two repair flags handle the 2026-10 Spiral dataset's defects
 (branches to fiber files that do not exist; `same_windings.json` collections
 that each number their points from 0) and are recorded on the objects.
 
-What the ingest covers: tifxyz patches (`--patch`, one directory each), the
-PCL role documents, and the fiber directory with its same-winding branches
+What the ingest covers: tifxyz patches (`--surface`, one directory each,
+stored as kind `surface`), the PCL role documents, and the fiber directory with
+its same-winding branches
 (which become `fiber_branch` relationships; adjacent branches are kept but
 never used by the fit). A collection is absolute-winding when its
 `meta.source.winding_is_absolute` is true, which the ingest sets for a

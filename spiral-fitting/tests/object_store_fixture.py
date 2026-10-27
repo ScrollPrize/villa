@@ -30,14 +30,18 @@ def put(db, kind, arrays, attributes=None, *, coordinates=None, meta=None,
     return uid
 
 
-def put_patch(db, zyxs, scale=(1, 1), *, coordinates=frame(), **record):
-    """A patch from a (rows, cols, 3) fit-frame ZYX grid; -1 rows stay invalid."""
+def put_patch(db, zyxs, scale=(1, 1), *, coordinates=frame(), valid=None, **record):
+    """A patch from a (rows, cols, 3) fit-frame ZYX grid; -1 rows stay invalid.
+    ``valid`` (rows, cols) is stored as the surface validity channel."""
     zyxs = np.asarray(zyxs, dtype=np.float64)
     factor = (coordinates or {}).get('scale_factor') or 1
     invalid = np.all(zyxs == -1, axis=-1)
     xyz = zyxs[..., ::-1] * factor
     xyz[invalid] = -1
-    return put(db, 'patch', [array('points', xyz, '<f4')],
+    arrays = [array('points', xyz, '<f4')]
+    if valid is not None:
+        arrays.append(array('valid', np.where(valid, 255, 0), '|u1'))
+    return put(db, 'surface', arrays,
                {'scale': [s / factor for s in scale]},
                coordinates=coordinates, **record)
 
@@ -85,26 +89,26 @@ def branch(db, a, a_control_id, b, b_control_id, *, adjacent=False, **record):
 
 
 def pcl_patch_edge(db, pcl, point_id, patch, ij, winding=None, **record):
-    """An explicit point-patch edge at patch grid (row, col) ``ij``."""
+    """An explicit point-surface edge at surface grid (row, col) ``ij``."""
     row, col = (int(np.floor(v)) for v in ij)
     return db.add_edge({
-        'kind': 'point-patch', 'a': pcl, 'b': patch,
+        'kind': 'point-surface', 'a': pcl, 'b': patch,
         'a_anchor': {'points': [{'array': 'point_ids', 'index': [point_id]}]},
         'b_anchor': {'points': [{'array': 'points', 'index': [row, col]}]},
-        'meta': {'point_collection_patch': {
+        'meta': {'point_collection_surface': {
             'ij': [float(v) for v in ij], 'winding_annotation': winding}},
         **record})
 
 
 def fiber_patch_edge(db, fiber, line_index, patch, ij, **record):
-    """An explicit fiber-patch contact at patch grid (row, col) ``ij``."""
+    """An explicit fiber-surface contact at surface grid (row, col) ``ij``."""
     row, col = (int(np.floor(v)) for v in ij)
     return db.add_edge({
         'kind': 'same-surface', 'a': fiber, 'b': patch,
         'a_anchor': {'points': [{'array': 'line_points', 'index': [line_index]}]},
         'b_anchor': {'points': [{'array': 'points', 'index': [row, col]}]},
-        'meta': {'fiber_patch': {'median_line_index': line_index,
-                                 'patch_grid': [float(ij[1]), float(ij[0])]}},
+        'meta': {'fiber_surface': {'median_line_index': line_index,
+                                   'surface_grid': [float(ij[1]), float(ij[0])]}},
         **record})
 
 

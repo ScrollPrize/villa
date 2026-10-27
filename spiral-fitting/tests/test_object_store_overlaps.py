@@ -41,7 +41,7 @@ def _put(db, grid, scale=1, uuid=None, **record):
 
 
 def _detect(db, expected=1):
-    report = db.link_patch_overlaps(volume_uuid=VOLUME, min_inliers=16)
+    report = db.link_surface_overlaps(volume_uuid=VOLUME, min_inliers=16)
     assert report['edges_created'] == expected and not report['failed'], report
     return db.edges_by_kind('same-surface')
 

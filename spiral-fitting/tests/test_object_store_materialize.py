@@ -107,6 +107,17 @@ def test_patch_frames_invalid_vertices_and_erosion(db, scale):
     assert inputs.patches[b].valid_vertex_mask.all()
 
 
+def test_surface_validity_channel_marks_holes(db):
+    # Ingested mask.tif: a masked vertex keeps its coordinates but is a hole.
+    valid = np.ones(_grid().shape[:2], dtype=bool)
+    valid[2, 5] = False
+    uid = put_patch(db, _grid(), (0.25, 0.25), valid=valid,
+                    meta={'source': {'spiral_patch_erode_cells': 0}})
+    patch = materialize(db).patches[uid]
+    np.testing.assert_array_equal(patch.valid_vertex_mask.numpy(), valid)
+    assert (patch.zyxs.numpy()[2, 5] == -1).all()
+
+
 def test_patches_outside_the_z_window_are_dropped(db):
     put_patch(db, _grid(z0=200.0))
     inputs = materialize(db)
@@ -161,7 +172,7 @@ def test_detected_role_must_match_the_metadata(db):
     pcl = put_pcl(db, {0: _point(0, 3.0)}, absolute=True)
     edge = pcl_patch_edge(db, pcl, 0, patch, (1.0, 1.0))
     record = db.edge(edge)
-    record['meta']['point_collection_patch']['winding_is_absolute'] = False
+    record['meta']['point_collection_surface']['winding_is_absolute'] = False
     with db.write() as tx:
         tx.update_edge(record)
     with pytest.raises(osi.ObjectStoreInputError, match='detected as relative'):

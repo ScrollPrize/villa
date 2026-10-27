@@ -34,17 +34,18 @@ from collections import Counter
 
 import numpy as np
 
-KINDS = ('patch', 'point_collection', 'fiber')
-KIND_LABELS = {'patch': 'patches', 'point_collection': 'point collections',
+KINDS = ('surface', 'point_collection', 'fiber')
+KIND_LABELS = {'surface': 'surfaces', 'point_collection': 'point collections',
                'fiber': 'fibers'}
 
 # Relationship families the fitter consumes, keyed by (edge kind, endpoint
-# kinds in KINDS order). Patch overlaps and fiber-patch contacts share the
-# detectors' 'same-surface' edge kind and differ by endpoint kinds.
+# kinds in KINDS order). Surface overlaps and fiber-surface contacts share the
+# detectors' 'same-surface' edge kind and differ by endpoint kinds. Family
+# names are Spiral's roles and keep the fitter's "patch" vocabulary.
 FAMILIES = {
-    ('point-patch', ('patch', 'point_collection')): 'pcl_patch',
-    ('same-surface', ('patch', 'fiber')): 'fiber_patch',
-    ('same-surface', ('patch', 'patch')): 'patch_overlap',
+    ('point-surface', ('surface', 'point_collection')): 'pcl_patch',
+    ('same-surface', ('surface', 'fiber')): 'fiber_patch',
+    ('same-surface', ('surface', 'surface')): 'patch_overlap',
     ('fiber_branch', ('fiber', 'fiber')): 'fiber_branch',
 }
 
@@ -100,6 +101,13 @@ class InputRequest:
     selectors: dict = dataclasses.field(default_factory=dict)
     fit_volume_uuid: str = None
     approved_links_only: bool = False
+
+    def __post_init__(self):
+        # An unknown key would otherwise leave its kind unselected-by-default:
+        # every active object.
+        unknown = sorted(set(self.selectors) - set(KINDS))
+        if unknown:
+            raise ValueError(f'unknown object kinds {unknown}; expected {list(KINDS)}')
 
     def selector(self, kind):
         return self.selectors.get(kind) or Selector()
@@ -415,12 +423,13 @@ def read_snapshot(store, request, uuids=None):
 # Geometry reads (pinned by geometry revision, so independent of later heads)
 # ---------------------------------------------------------------------------
 
-def read_geometry(store, geometry_revision, names):
-    """``({name: ndarray}, attributes)`` of an immutable geometry revision."""
+def read_geometry(store, geometry_revision, names, optional=()):
+    """``({name: ndarray}, attributes)`` of an immutable geometry revision.
+    Arrays named in ``optional`` are returned only when stored."""
     descriptor = store.geometry_revision(geometry_revision)
     arrays = {array['name']: array for array in descriptor['arrays']}
     result = {}
-    for name in names:
+    for name in [*names, *(name for name in optional if name in arrays)]:
         if name not in arrays:
             raise ObjectStoreInputError(
                 [f'geometry {geometry_revision} has no {name!r} array'])
@@ -516,13 +525,21 @@ def materialize_patches(store, snapshot, *, z_begin, z_end, z_margin,
     from tifxyz import Patch
 
     patches, counts = {}, Counter()
-    for obj in snapshot.objects_of('patch'):
-        arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'])
+    for obj in snapshot.objects_of('surface'):
+        arrays, attributes = read_geometry(store, obj.geometry_revision, ['points'],
+                                           optional=['valid'])
         points = arrays['points']
         if points.ndim != 3 or points.shape[-1] != 3:
             raise ObjectStoreInputError(
                 [f'patch {obj.uuid} points have shape {points.shape}'])
         invalid = np.all(points == -1, axis=-1)
+        if 'valid' in arrays:
+            # The store's per-vertex validity channel (ingested from mask.tif):
+            # zero marks a hole even where coordinates remain.
+            if arrays['valid'].shape != invalid.shape:
+                raise ObjectStoreInputError(
+                    [f'patch {obj.uuid} validity has shape {arrays["valid"].shape}'])
+            invalid |= arrays['valid'] == 0
         zyxs = obj.frame.xyz_to_fit_zyx(points, invalid)
         valid_quads = (~invalid[:-1, :-1] & ~invalid[1:, :-1]
                        & ~invalid[:-1, 1:] & ~invalid[1:, 1:])
@@ -559,7 +576,7 @@ def pcl_role(obj, relationships):
             f'point collection {obj.uuid} ({obj.name!r}) has a non-boolean '
             f'winding_is_absolute {value!r}'])
     for rel in relationships:
-        recorded = (rel.meta.get('point_collection_patch') or {}).get(
+        recorded = (rel.meta.get('point_collection_surface') or {}).get(
             'winding_is_absolute')
         if recorded is not None and recorded != value:
             raise ObjectStoreInputError([
@@ -608,10 +625,10 @@ def _pcl_attachment(rel, patches):
     """``(point id, on_patch)`` of a pcl-patch edge, or (point id, None) when
     its patch is not fitted; raises when the edge cannot be materialized."""
     point_id = _anchor_index(rel.b_anchor, 'point_ids')
-    ij = (rel.meta.get('point_collection_patch') or {}).get('ij')
+    ij = (rel.meta.get('point_collection_surface') or {}).get('ij')
     if point_id is None or not isinstance(ij, list) or len(ij) != 2:
         raise ObjectStoreInputError([
-            f'point-patch edge {rel.uuid} lacks a point ID anchor or patch ij'])
+            f'point-surface edge {rel.uuid} lacks a point ID anchor or surface ij'])
     if rel.a not in patches:
         return point_id, None
     return point_id, {'id': rel.a, 'ij': [float(ij[0]), float(ij[1])],
@@ -623,7 +640,7 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
     """Regular PCLs of the snapshot, keyed by resident id in UUID order.
 
     Points are keyed by their stable IDs and carry fit-frame ZYX and their
-    aligned ``wind_a`` annotation. Each consumed point-patch edge attaches its
+    aligned ``wind_a`` annotation. Each consumed point-surface edge attaches its
     point to its patch at the recorded (row, col); edges to patches dropped
     from the fit are counted and ignored. An attachment on a quad the losses
     do not sample (on_retained_quad) leaves its point unattached and is appended to ``dropped`` as
@@ -660,7 +677,7 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
                 continue
             point = points.get(point_id)
             if point is None:
-                problems.append(f'point-patch edge {rel.uuid} names point '
+                problems.append(f'point-surface edge {rel.uuid} names point '
                                 f'{point_id}, absent from {obj.uuid}')
             elif attachment is None:
                 counts['pcl attachments to unfitted patches'] += 1
@@ -699,13 +716,13 @@ def materialize_point_collections(store, snapshot, patches, first_id=0,
 
 
 def _fiber_contact(rel):
-    """``(raw line index, ij)`` of a fiber-patch edge's representative contact."""
+    """``(raw line index, ij)`` of a fiber-surface edge's representative contact."""
     line_index = _anchor_index(rel.b_anchor, 'line_points')
-    grid = (rel.meta.get('fiber_patch') or {}).get('patch_grid')
+    grid = (rel.meta.get('fiber_surface') or {}).get('surface_grid')
     if line_index is None or not isinstance(grid, list) or len(grid) != 2:
         raise ObjectStoreInputError([
-            f'fiber-patch edge {rel.uuid} lacks a line-point anchor or patch_grid'])
-    # patch_grid is (column, row); attachments use (row, column).
+            f'fiber-surface edge {rel.uuid} lacks a line-point anchor or surface_grid'])
+    # surface_grid is (column, row); attachments use (row, column).
     return line_index, [float(grid[1]), float(grid[0])]
 
 
@@ -1113,9 +1130,9 @@ def empty_family_warnings(snapshot):
     """Constraint families the selection could hold but that consume nothing."""
     count = Counter(obj.kind for obj in snapshot.objects.values())
     expected = {
-        'pcl_patch': count['patch'] and count['point_collection'],
-        'fiber_patch': count['patch'] and count['fiber'],
-        'patch_overlap': count['patch'] > 1,
+        'pcl_patch': count['surface'] and count['point_collection'],
+        'fiber_patch': count['surface'] and count['fiber'],
+        'patch_overlap': count['surface'] > 1,
     }
     families = Counter(rel.family for rel in snapshot.relationships)
     excluded = sum(snapshot.exclusions.values())
@@ -1144,7 +1161,7 @@ class LinkRefreshError(ObjectStoreInputError):
     """Startup link refresh failed; the fit must not train."""
 
 
-_SELECTOR_CONFIG = {'patch': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber'}
+_SELECTOR_CONFIG = {'surface': 'patch', 'point_collection': 'pcl', 'fiber': 'fiber'}
 _NONE = Selector(uuids=())
 
 
@@ -1163,7 +1180,7 @@ def request_from_config(config):
         selectors[kind] = Selector(None if uuids is None else tuple(uuids),
                                    None if tags is None else tuple(tags))
     if not config['input_use_verified_patches'] or config['input_disable_patches']:
-        selectors['patch'] = _NONE
+        selectors['surface'] = _NONE
     if not config['input_use_fibers']:
         selectors['fiber'] = _NONE
     roles = {key: config[key] for key in (
@@ -1248,9 +1265,9 @@ def fiber_normal_source(config, lasagna=None, volume_uuid=None):
 
 # Detectors the refresh runs, with the object kinds each needs selected.
 DETECTORS = (
-    ('pcl_patch', ('patch', 'point_collection')),
-    ('fiber_patch', ('patch', 'fiber')),
-    ('patch_overlap', ('patch',)),
+    ('pcl_patch', ('surface', 'point_collection')),
+    ('fiber_patch', ('surface', 'fiber')),
+    ('patch_overlap', ('surface',)),
 )
 
 
@@ -1307,19 +1324,19 @@ def refresh_links(store, snapshot, config, normal_source, cache_directory=None):
     selected = {kind: [obj.uuid for obj in snapshot.objects_of(kind)] for kind in KINDS}
     volume = snapshot.volume_uuid
     run = {
-        'pcl_patch': lambda: store.link_point_collections_to_patches(
+        'pcl_patch': lambda: store.link_point_collections_to_surfaces(
             volume_uuid=volume, collection_uuids=selected['point_collection'],
-            patch_uuids=selected['patch'],
+            surface_uuids=selected['surface'],
             tolerance=float(config['pcl_link_distance_tolerance']),
             window_points=int(config['pcl_link_window_points']),
             window_min_points=int(config['pcl_link_window_min_points'])),
-        'fiber_patch': lambda: store.link_fibers_to_patches(
+        'fiber_patch': lambda: store.link_fibers_to_surfaces(
             normal_source.ct_volume, volume_uuid=volume,
-            fiber_uuids=selected['fiber'], patch_uuids=selected['patch'],
+            fiber_uuids=selected['fiber'], surface_uuids=selected['surface'],
             **dict(normal_source.parameters),
             **({'cache_directory': cache_directory} if cache_directory else {})),
-        'patch_overlap': lambda: store.link_patch_overlaps(
-            volume_uuid=volume, patch_uuids=selected['patch']),
+        'patch_overlap': lambda: store.link_surface_overlaps(
+            volume_uuid=volume, surface_uuids=selected['surface']),
     }
     outcomes = []
     for detector, kinds in DETECTORS:
@@ -1373,7 +1390,7 @@ def _startup_phase(config, request, lasagna, cache_directory, log):
         if normal.note:
             log(normal.note)
         if (normal.kind == 'none' and snapshot.objects_of('fiber')
-                and snapshot.objects_of('patch')):
+                and snapshot.objects_of('surface')):
             log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
                 'loads no lasagna normals (input_use_normals with normal_x/normal_y '
                 'stores) and object_store_normal_ct_path is unset')
@@ -1562,7 +1579,7 @@ def _parse_args(argv):
     parser.add_argument('store')
     parser.add_argument('--volume', help='fit volume UUID (default: inferred)')
     parser.add_argument('--approved-only', action='store_true')
-    for kind, flag in (('patch', 'patch'), ('point_collection', 'pcl'),
+    for kind, flag in (('surface', 'patch'), ('point_collection', 'pcl'),
                        ('fiber', 'fiber')):
         parser.add_argument(f'--{flag}-uuid', action='append', dest=f'{kind}_uuids')
         parser.add_argument(f'--{flag}-tag', action='append', dest=f'{kind}_tags')

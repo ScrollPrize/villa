@@ -524,7 +524,7 @@ class Config:
         self.pcl_sampling_weights = None
         self.pcl_fiber_min_point_spacing = 40.0
         self.pcl_unattached_pcl_min_point_spacing = 16.0
-        # The object store's point-patch link detector, run by the startup
+        # The object store's point-surface link detector, run by the startup
         # link refresh (object_store_inputs.refresh_links; see
         # descriptions.json): a point attaches to a patch surface within this
         # many reference-volume voxels; window_min_points > 1 additionally
