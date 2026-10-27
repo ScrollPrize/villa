@@ -24,7 +24,6 @@
 
 #include <QSettings>
 #include <QMessageBox>
-#include <QProcess>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -45,9 +44,7 @@
 #include <QFile>
 #include <QTextStream>
 #include <QtGlobal>
-#include <QProcessEnvironment>
 #include <QProgressDialog>
-#include <QFutureWatcher>
 #include <QPointer>
 #include <QTimer>
 #include <QTemporaryFile>
@@ -59,7 +56,6 @@
 #include <QLineEdit>
 #include <QCheckBox>
 #include <QComboBox>
-#include <QtConcurrent/QtConcurrentRun>
 #include <QToolButton>
 #include <QVector3D>
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
@@ -72,10 +68,9 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
-#include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include "ToolExecutable.hpp"
-#include "ToolOutput.hpp"
+#include "ToolProcess.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
@@ -623,549 +618,140 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     return true;
 }
 
-// Owns the lifecycle for the async SLIM run; deletes itself on finish/cancel
-// SLIM flattening of a stored surface: flatboi reads it from the store and
-// creates the flattened surface object (no OBJ files).
-class SlimJob : public QObject {
+// A flattening tool run on a stored surface (SLIM by flatboi, ABF++ by
+// vc_flatten, vc_straighten): the tool reads the surface from the store and
+// creates the result there. Shows a progress dialog, reports the run through
+// flattenJobStarted/flattenJobFinished exactly once (an empty message means
+// cancelled), and deletes itself.
+class FlattenJob : public QObject {
 public:
-    SlimJob(QWidget* parentWidget,
-            SegmentationCommandHandler* handler,
-            SurfaceCatalog* catalog,
-            const QString& flatboiExe,
-            const QStringList& args,
-            const QString& outputName,
-            int iters,
-            bool suppressDialogs = false)
-    : QObject(handler)
-    , parentWidget_(parentWidget)
-    , handler_(handler)
-    , catalog_(catalog)
-    , outputName_(outputName)
-    , iters_(iters > 0 ? iters : 20)
-    , suppressDialogs_(suppressDialogs)
-    , proc_(new QProcess(this))
-    , progress_(new QProgressDialog(QObject::tr("Running SLIM (flatboi)..."), QObject::tr("Cancel"), 0, 0, parentWidget))
-    , itRe_(R"(^\s*\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption)
-    , progRe_(R"(^\s*PROGRESS\s+(\d+)\s*/\s*(\d+)\s*$)", QRegularExpression::CaseInsensitiveOption)
-    {
-        proc_->setProcessChannelMode(QProcess::MergedChannels);
+    struct Spec {
+        QString tool;         // executable path
+        QStringList args;
+        QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
+        QString title;        // "SLIM-flatten", "ABF++ flatten", "Straighten"
+        QString running;      // the progress dialog's first label
+        QString outputName;
+        // A determinate bar over this many iterations, fed by "PROGRESS n / m"
+        // and "[it n]" lines; 0: indeterminate, the label follows the output.
+        int iterations = 0;
+        bool modal = false;
+        // Recompute the created surface's area (the surface list's column).
+        bool computeArea = false;
+    };
 
-        progress_->setWindowModality(Qt::WindowModal);
+    FlattenJob(QWidget* parentWidget, SegmentationCommandHandler* handler, SurfaceCatalog* catalog, Spec spec,
+               bool suppressDialogs)
+        : QObject(handler)
+        , parentWidget_(parentWidget)
+        , handler_(handler)
+        , catalog_(catalog)
+        , spec_(std::move(spec))
+        , suppressDialogs_(suppressDialogs)
+        , run_(new vc3d::ToolProcess(this))
+        , progress_(new QProgressDialog(spec_.running, QObject::tr("Cancel"), 0, 0, parentWidget))
+    {
+        progress_->setWindowModality(spec_.modal ? Qt::WindowModal : Qt::NonModal);
         progress_->setAutoClose(false);
-        progress_->setAutoReset(true);
         // Suppressed dialogs use a huge minimum duration so the auto-show timer
         // never fires. Updates below remain harmless.
         progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
-        progress_->setMaximum(iters_ + 1);
-        progress_->setValue(0);
+        progress_->setRange(0, spec_.iterations > 0 ? spec_.iterations + 1 : 0);
         progress_->setAttribute(Qt::WA_DeleteOnClose);
-
-        QObject::connect(progress_, &QProgressDialog::canceled, this, &SlimJob::onCanceled_);
-        QObject::connect(proc_, &QProcess::readyReadStandardOutput, this, &SlimJob::onStdout_);
-        QObject::connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                         this, &SlimJob::onFinished_);
-        QObject::connect(proc_, &QProcess::errorOccurred, this, &SlimJob::onProcError_);
+        connect(progress_, &QProgressDialog::canceled, run_, &vc3d::ToolProcess::cancel);
+        connect(run_, &vc3d::ToolProcess::output, this, [](const QString& chunk) { std::cout << chunk.toStdString() << std::flush; });
+        connect(run_, &vc3d::ToolProcess::line, this, [this](const QString& line) { onLine_(line.trimmed()); });
+        connect(run_, &vc3d::ToolProcess::finished, this, [this](const vc3d::ToolProcess::Result& result) { onFinished_(result); });
 
         if (handler_) {
-            emit handler_->statusMessage(QObject::tr("Running SLIM (flatboi)..."), 0);
-            // Publish the shared flattening lifecycle.
-            emit handler_->flattenJobStarted(QStringLiteral("flatten.slim"), outputName_);
+            emit handler_->statusMessage(spec_.running, 0);
+            emit handler_->flattenJobStarted(spec_.kind, spec_.outputName);
         }
-        ioLog_ += QStringLiteral("Running: %1 %2\n").arg(flatboiExe, args.join(' '));
-        std::cout << "[slim-flatten] launching: " << flatboiExe.toStdString()
-                  << " " << args.join(' ').toStdString() << std::endl;
-        proc_->start(flatboiExe, args);
+        vc3d::ToolProcess::Launch launch;
+        launch.tool = spec_.tool;
+        launch.args = spec_.args;
+        if (!run_->start(launch)) {
+            vc3d::ToolProcess::Result failed;
+            failed.error = run_->error();
+            onFinished_(failed);
+            return;
+        }
+        std::cout << "[" << spec_.kind.toStdString() << "] launching: " << run_->command().toStdString() << std::endl;
     }
 
 private:
-    void onCanceled_() {
-        if (proc_->state() != QProcess::NotRunning) {
-            proc_->kill();
-            proc_->waitForFinished(3000);
-            // Ensure the process is actually terminated before proceeding
-            if (proc_->state() != QProcess::NotRunning) return;
-        }
-        done_ = true;
-        if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten cancelled"), 5000);
-        emitFinishedOnce_(false, QString(), QString());  // empty msg => cancel
-        cleanupAndDelete_();
-    }
-
-    void onStdout_() {
-        const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
-        ioLog_ += chunk;
-        std::cout << chunk.toStdString() << std::flush;
-        handleLines_(lines_.add(chunk));
-    }
-
-    void handleLines_(const QStringList& lines) {
-        for (const QString& raw : lines) {
-            const QString line = raw.trimmed();
-            if (auto m = progRe_.match(line); m.hasMatch()) {
-                const int cur = m.captured(1).toInt();
-                const int tot = m.captured(2).toInt();
-                if (tot > 0 && tot != iters_) {
-                    iters_ = tot;
-                    progress_->setMaximum(iters_ + 1);
-                }
-                progress_->setLabelText(QObject::tr("SLIM iterations: %1 / %2").arg(cur).arg(iters_));
-                progress_->setValue(std::clamp(cur, 0, iters_));
-            } else if (auto m = itRe_.match(line); m.hasMatch()) {
-                lastIterSeen_ = std::max(lastIterSeen_, m.captured(1).toInt());
-                progress_->setLabelText(QObject::tr("SLIM iterations: %1 / %2").arg(lastIterSeen_).arg(iters_));
-                progress_->setValue(std::clamp(lastIterSeen_, 0, iters_));
-            } else if (line.startsWith("Final stretch")) {
-                progress_->setLabelText(QObject::tr("Creating the flattened surface..."));
-                if (handler_) emit handler_->statusMessage(line, 0);
-            } else if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty()) {
-                created_ = uuid;
+    void onLine_(const QString& line) {
+        if (line.isEmpty() || !progress_) return;
+        static const QRegularExpression progressRe(R"(^PROGRESS\s+(\d+)\s*/\s*(\d+)$)", QRegularExpression::CaseInsensitiveOption);
+        static const QRegularExpression iterationRe(R"(^\[it\s+(\d+)\])", QRegularExpression::CaseInsensitiveOption);
+        if (spec_.iterations <= 0) {
+            progress_->setLabelText(line);
+            if (handler_) emit handler_->statusMessage(line, 0);
+        } else if (const auto m = progressRe.match(line); m.hasMatch()) {
+            const int total = m.captured(2).toInt();
+            if (total > 0 && total != spec_.iterations) {
+                spec_.iterations = total;
+                progress_->setMaximum(total + 1);
             }
+            showIteration_(m.captured(1).toInt());
+        } else if (const auto m = iterationRe.match(line); m.hasMatch()) {
+            lastIteration_ = std::max(lastIteration_, m.captured(1).toInt());
+            showIteration_(lastIteration_);
+        } else if (line.startsWith(QStringLiteral("Final stretch"))) {
+            progress_->setLabelText(QObject::tr("Creating the flattened surface..."));
+            if (handler_) emit handler_->statusMessage(line, 0);
         }
     }
 
-    void onProcError_(QProcess::ProcessError e) {
-        // A crash is reported through finished(); only the hard start failure
-        // needs handling here.
-        if (e != QProcess::FailedToStart || done_) return;
-        fail_(QObject::tr("flatboi could not be started."));
+    void showIteration_(int iteration) {
+        progress_->setLabelText(QObject::tr("Iterations: %1 / %2").arg(iteration).arg(spec_.iterations));
+        progress_->setValue(std::clamp(iteration, 0, spec_.iterations));
     }
 
-    void onFinished_(int exitCode, QProcess::ExitStatus st) {
-        if (done_) return;
-        onStdout_();
-        handleLines_(lines_.finish());
-        if (st != QProcess::NormalExit || exitCode != 0 || created_.isEmpty()) {
-            fail_(QObject::tr("flatboi failed (exit code %1).").arg(exitCode));
-            return;
-        }
-        done_ = true;
-        // The surface list's area column reflects the new geometry.
-        if (catalog_) {
-            for (const auto& result : SurfaceAreaCalculator::calculateAreas(*catalog_, {created_.toStdString()})) {
-                if (!result.success) {
-                    std::cout << "[slim-flatten] warning: no area for " << created_.toStdString() << ": "
-                              << result.errorReason << std::endl;
-                }
-            }
-        }
-        if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten complete: %1").arg(outputName_), 5000);
-        emitFinishedOnce_(true, QObject::tr("Flattened surface %1 (%2)").arg(outputName_, created_), created_);
-        if (suppressDialogs_) {
-            cleanupAndDelete_();
-            return;
-        }
+    void onFinished_(const vc3d::ToolProcess::Result& result) {
         if (progress_) progress_->close();
-        auto* box = new QMessageBox(QMessageBox::Information, QObject::tr("SLIM-flatten"),
-                                    QObject::tr("Flattened surface created: %1").arg(outputName_),
-                                    QMessageBox::Ok, parentWidget_);
-        box->setAttribute(Qt::WA_DeleteOnClose);
-        QObject::connect(box, &QMessageBox::finished, this, [this]() { cleanupAndDelete_(); });
-        box->open();
-    }
-
-    void fail_(const QString& why) {
-        done_ = true;
-        const QString err = ioLog_.trimmed();
-        const QString detail = why + (err.isEmpty() ? QString() : ("\n\n" + err));
-        emitFinishedOnce_(false, detail, QString());
-        if (handler_) emit handler_->statusMessage(QObject::tr("SLIM-flatten failed"), 5000);
-        if (suppressDialogs_) {
-            cleanupAndDelete_();
+        const QString created = result.surfaces.isEmpty() ? QString() : result.surfaces.back();
+        if (result.cancelled) {
+            report_(false, QString(), QString(), QObject::tr("%1 cancelled").arg(spec_.title));
             return;
         }
-        if (progress_) progress_->close();
-        auto* box = new QMessageBox(QMessageBox::Critical, QObject::tr("Error"), detail, QMessageBox::Ok, parentWidget_);
-        box->setAttribute(Qt::WA_DeleteOnClose);
-        QObject::connect(box, &QMessageBox::finished, this, [this]() { cleanupAndDelete_(); });
-        box->open();
+        if (!result.ok || created.isEmpty()) {
+            const QString why = result.ok ? QObject::tr("%1 reported no surface.").arg(QFileInfo(spec_.tool).baseName())
+                                          : result.error;
+            const QString detail = why + (result.tail.isEmpty() ? QString() : "\n\n" + result.tail);
+            report_(false, detail, QString(), QObject::tr("%1 failed").arg(spec_.title));
+            if (!suppressDialogs_) QMessageBox::critical(parentWidget_, QObject::tr("%1 Failed").arg(spec_.title), detail);
+            return;
+        }
+        if (spec_.computeArea && catalog_) {
+            for (const auto& area : SurfaceAreaCalculator::calculateAreas(*catalog_, {created.toStdString()}))
+                if (!area.success)
+                    std::cout << "[" << spec_.kind.toStdString() << "] warning: no area for " << created.toStdString()
+                              << ": " << area.errorReason << std::endl;
+        }
+        const QString done = QObject::tr("%1 complete: %2").arg(spec_.title, spec_.outputName);
+        report_(true, done, created, done);
+        if (!suppressDialogs_)
+            QMessageBox::information(parentWidget_, QObject::tr("%1 Complete").arg(spec_.title),
+                                     QObject::tr("Surface created: %1").arg(spec_.outputName));
     }
 
-    void cleanupAndDelete_() {
-        if (progress_) { progress_->close(); progress_->deleteLater(); }
-        QTimer::singleShot(0, this, [this](){ this->deleteLater(); });
-    }
-
-    // Emit exactly one terminal event from every completion path.
-    void emitFinishedOnce_(bool success, const QString& message, const QString& created) {
-        if (finishedEmitted_) return;
-        finishedEmitted_ = true;
-        if (handler_) emit handler_->flattenJobFinished(success, message, created);
+    void report_(bool success, const QString& message, const QString& created, const QString& status) {
+        if (handler_) {
+            emit handler_->statusMessage(status, 5000);
+            emit handler_->flattenJobFinished(success, message, created);
+        }
+        deleteLater();
     }
 
     QPointer<QWidget> parentWidget_;
     QPointer<SegmentationCommandHandler> handler_;
     QPointer<SurfaceCatalog> catalog_;
-    QString outputName_;
-    QString created_;     // the flattened surface's UUID
-    vc3d::ToolOutputLines lines_;
-    int iters_ = 20;
-    int lastIterSeen_ = 0;
-    bool suppressDialogs_ = false;   // capture failures without presenting UI
-    bool finishedEmitted_ = false;   // guards single flattenJobFinished emit
-    bool done_ = false;
-    QProcess* proc_ = nullptr;
-    QPointer<QProgressDialog> progress_;
-    QRegularExpression itRe_;
-    QRegularExpression progRe_;
-    QString ioLog_;   // buffered output for error reporting
-};
-
-using ProgressCallback = std::function<void(const QString&)>;
-
-struct ABFFlattenTaskConfig {
-    std::shared_ptr<vc::objects::ObjectStoreSession> session;
-    vc::objects::AttachmentIdentity attachment;
-    std::string volume;
-    std::string uuid;
-    int iterations{10};
-    int downsampleFactor{1};
-    std::shared_ptr<std::atomic_bool> cancelFlag;
-};
-
-struct ABFFlattenResult {
-    bool success{false};
-    bool canceled{false};
-    QString errorMsg;
-    std::shared_ptr<QuadSurface> flattened;
-};
-
-static ABFFlattenResult runAbfFlattenTask(const ABFFlattenTaskConfig& cfg, const ProgressCallback& onProgress)
-{
-    auto emitProgress = [&](const QString& msg) {
-        if (onProgress) onProgress(msg);
-    };
-    auto isCanceled = [&]() -> bool {
-        return cfg.cancelFlag && cfg.cancelFlag->load(std::memory_order_relaxed);
-    };
-
-    ABFFlattenResult result;
-    try {
-        if (isCanceled()) {
-            result.canceled = true;
-            return result;
-        }
-
-        emitProgress(QObject::tr("Loading surface..."));
-        const auto surf = SurfaceCatalog::open(cfg.session, cfg.attachment, cfg.volume, cfg.uuid).surface;
-
-        if (isCanceled()) {
-            result.canceled = true;
-            return result;
-        }
-
-        emitProgress(QObject::tr("Running ABF++ flattening..."));
-        vc::ABFConfig config;
-        config.maxIterations = static_cast<std::size_t>(std::max(1, cfg.iterations));
-        config.downsampleFactor = std::max(1, cfg.downsampleFactor);
-        config.useABF = true;
-        config.scaleToOriginalArea = true;
-
-        result.flattened.reset(vc::abfFlattenToNewSurface(*surf, config));
-        if (!result.flattened) {
-            result.errorMsg = QObject::tr("ABF++ flattening failed");
-            return result;
-        }
-
-        if (isCanceled()) {
-            result.canceled = true;
-            return result;
-        }
-
-        result.success = true;
-    } catch (const std::exception& e) {
-        result.errorMsg = QObject::tr("Error: %1").arg(e.what());
-    }
-
-    return result;
-}
-
-// ABF++ runs in-process on a worker; the flattened surface becomes a new
-// store object on the UI thread.
-class ABFJob : public QObject {
-    Q_OBJECT
-public:
-    ABFJob(QWidget* parentWidget, SurfaceCatalog* catalog,
-           SegmentationCommandHandler* handler,
-           const std::string& surfaceUuid, const QString& outputName,
-           int iterations, int downsampleFactor = 1,
-           bool suppressDialogs = false)
-        : QObject(handler)
-        , parentWidget_(parentWidget)
-        , handler_(handler)
-        , catalog_(catalog)
-        , uuid_(surfaceUuid)
-        , outputName_(outputName)
-        , iterations_(std::max(1, iterations))
-        , downsampleFactor_(std::max(1, downsampleFactor))
-        , suppressDialogs_(suppressDialogs)
-        , cancelFlag_(std::make_shared<std::atomic_bool>(false))
-        , watcher_(this)
-        , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
-    {
-        progress_->setWindowModality(Qt::NonModal);
-        // Suppressed dialogs must not be auto-shown.
-        progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
-        progress_->setRange(0, 0); // indeterminate
-        progress_->setAttribute(Qt::WA_DeleteOnClose);
-
-        connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceledRequested_);
-        connect(&watcher_, &QFutureWatcher<ABFFlattenResult>::finished, this, &ABFJob::onFinished_);
-
-        // Publish the shared flattening lifecycle.
-        if (handler_)
-            emit handler_->flattenJobStarted(QStringLiteral("flatten.abf"), outputName_);
-
-        startTask_();
-    }
-
-    ~ABFJob() override {
-        if (cancelFlag_) {
-            cancelFlag_->store(true, std::memory_order_relaxed);
-        }
-    }
-
-private slots:
-    void onCanceledRequested_() {
-        if (cancelFlag_) {
-            cancelFlag_->store(true, std::memory_order_relaxed);
-        }
-        if (progress_) {
-            progress_->setLabelText(QObject::tr("Canceling..."));
-        }
-    }
-
-    void onFinished_() {
-        if (progress_) {
-            progress_->close();
-        }
-
-        if (!watcher_.isFinished()) {
-            deleteLater();
-            return;
-        }
-
-        ABFFlattenResult result = watcher_.result();
-
-        if (result.canceled) {
-            if (handler_) {
-                emit handler_->statusMessage(QObject::tr("ABF++ flatten cancelled"), 5000);
-            }
-            emitFinishedOnce_(false, QString(), QString());  // empty msg => cancel
-            deleteLater();
-            return;
-        }
-
-        QString created;
-        if (result.success) {
-            try {
-                if (!catalog_) throw std::runtime_error("the surface list is gone");
-                const vc::objects::SurfaceProvenance provenance{
-                    "vc3d-abf-flatten",
-                    {{"iterations", iterations_}, {"downsample_factor", downsampleFactor_}},
-                    {uuid_}};
-                created = QString::fromStdString(catalog_->create(*result.flattened, outputName_.toStdString(), provenance));
-            } catch (const std::exception& e) {
-                result.success = false;
-                result.errorMsg = QObject::tr("Could not store the flattened surface: %1").arg(e.what());
-            }
-        }
-
-        if (!result.success) {
-            const QString errorMsg = result.errorMsg.isEmpty()
-                ? QObject::tr("ABF++ flattening failed")
-                : result.errorMsg;
-            emitFinishedOnce_(false, errorMsg, QString());
-            if (handler_) {
-                emit handler_->statusMessage(QObject::tr("ABF++ flatten failed"), 5000);
-                if (!suppressDialogs_)
-                    QMessageBox::critical(parentWidget_, QObject::tr("ABF++ Flatten Failed"), errorMsg);
-            }
-            deleteLater();
-            return;
-        }
-
-        emitFinishedOnce_(true,
-                          QObject::tr("ABF++ flatten complete: %1").arg(outputName_),
-                          created);
-        if (handler_) {
-            emit handler_->statusMessage(QObject::tr("ABF++ flatten complete: %1").arg(outputName_), 5000);
-            if (!suppressDialogs_)
-                QMessageBox::information(parentWidget_, QObject::tr("ABF++ Flatten Complete"),
-                    QObject::tr("Flattened surface created: %1").arg(outputName_));
-        }
-
-        deleteLater();
-    }
-
-private:
-    void startTask_() {
-        const ABFFlattenTaskConfig cfg{
-            catalog_->session(),
-            *catalog_->attachment(),
-            catalog_->volume()->id(),
-            uuid_,
-            iterations_,
-            downsampleFactor_,
-            cancelFlag_
-        };
-
-        QPointer<ABFJob> guard(this);
-        auto progressCb = [guard](const QString& msg) {
-            if (!guard) return;
-            QMetaObject::invokeMethod(guard, [guard, msg]() {
-                if (guard && guard->progress_) {
-                    guard->progress_->setLabelText(msg);
-                }
-            }, Qt::QueuedConnection);
-        };
-
-        watcher_.setFuture(QtConcurrent::run([cfg, progressCb]() {
-            return runAbfFlattenTask(cfg, progressCb);
-        }));
-    }
-
-    void emitFinishedOnce_(bool success, const QString& message,
-                           const QString& outputPath) {
-        if (finishedEmitted_) return;
-        finishedEmitted_ = true;
-        if (handler_) emit handler_->flattenJobFinished(success, message, outputPath);
-    }
-
-    QWidget* parentWidget_ = nullptr;
-    QPointer<SegmentationCommandHandler> handler_;
-    QPointer<SurfaceCatalog> catalog_;
-    std::string uuid_;
-    QString outputName_;
-    int iterations_;
-    int downsampleFactor_;
+    Spec spec_;
     bool suppressDialogs_ = false;
-    bool finishedEmitted_ = false;
-    std::shared_ptr<std::atomic_bool> cancelFlag_;
-    QFutureWatcher<ABFFlattenResult> watcher_;
+    int lastIteration_ = 0;
+    vc3d::ToolProcess* run_ = nullptr;
     QPointer<QProgressDialog> progress_;
-};
-
-// vc_straighten reads the stored surface and creates the straightened one
-// (no OBJ round-trip), so this is a single subprocess: stream its stdout into
-// the progress label. The new surface reaches the panel through commit events.
-class StraightenJob : public QObject {
-    Q_OBJECT
-public:
-    StraightenJob(QWidget* parentWidget,
-                  SegmentationCommandHandler* handler, const QString& straightenExe,
-                  const QString& storePath, const QString& surfaceUuid, const QString& volumeUuid,
-                  const QString& outputName, const QStringList& extraArgs,
-                  bool suppressDialogs = false)
-        : QObject(handler)
-        , parentWidget_(parentWidget)
-        , handler_(handler)
-        , outputName_(outputName)
-        , suppressDialogs_(suppressDialogs)
-        , proc_(new QProcess(this))
-        , progress_(new QProgressDialog(QObject::tr("Straightening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
-    {
-        progress_->setWindowModality(Qt::NonModal);
-        // Suppressed dialogs must not be auto-shown.
-        progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
-        progress_->setRange(0, 0); // indeterminate; vc_straighten emits no PROGRESS
-        progress_->setAttribute(Qt::WA_DeleteOnClose);
-        connect(progress_, &QProgressDialog::canceled, this, &StraightenJob::onCanceled_);
-
-        proc_->setProcessChannelMode(QProcess::MergedChannels);
-        connect(proc_, &QProcess::readyReadStandardOutput, this, &StraightenJob::onStdout_);
-        connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                this, &StraightenJob::onFinished_);
-        connect(proc_, &QProcess::errorOccurred, this, &StraightenJob::onProcError_);
-
-        QStringList args;
-        args << QStringLiteral("--store") << storePath << QStringLiteral("--volume-uuid") << volumeUuid
-             << QStringLiteral("--surface") << surfaceUuid << QStringLiteral("--name") << outputName << extraArgs;
-        std::cout << "[straighten] launching: " << straightenExe.toStdString()
-                  << " " << args.join(' ').toStdString() << std::endl;
-        if (handler_) {
-            emit handler_->statusMessage(QObject::tr("Running vc_straighten..."), 0);
-            // Publish the shared flattening lifecycle.
-            emit handler_->flattenJobStarted(QStringLiteral("flatten.straighten"), outputName_);
-        }
-        proc_->start(straightenExe, args);
-    }
-
-private slots:
-    void onStdout_() {
-        handleLines_(lines_.add(QString::fromLocal8Bit(proc_->readAllStandardOutput())));
-    }
-
-    void handleLines_(const QStringList& lines) {
-        for (const QString& raw : lines) {
-            const QString line = raw.trimmed();
-            if (line.isEmpty()) continue;
-            std::cout << "[straighten] " << line.toStdString() << std::endl;
-            if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty()) created_ = uuid;
-            if (progress_) progress_->setLabelText(line);
-            if (handler_) emit handler_->statusMessage(line, 0);
-        }
-    }
-
-    void onCanceled_() {
-        if (proc_ && proc_->state() != QProcess::NotRunning) proc_->kill();
-    }
-
-    void onProcError_(QProcess::ProcessError e) {
-        // A crash is reported through finished(); only the hard start failure
-        // needs handling here.
-        if (e != QProcess::FailedToStart || done_) return;
-        done_ = true;
-        const QString msg = QObject::tr("Could not launch vc_straighten.");
-        emitFinishedOnce_(false, msg, QString());
-        if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
-        if (progress_) progress_->close();
-        if (!suppressDialogs_)
-            QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"), msg);
-        deleteLater();
-    }
-
-    void onFinished_(int code, QProcess::ExitStatus status) {
-        if (done_) return;
-        done_ = true;
-        if (progress_) progress_->close();
-        onStdout_();
-        handleLines_(lines_.finish());
-        if (status != QProcess::NormalExit || code != 0 || created_.isEmpty()) {
-            const QString msg = QObject::tr("vc_straighten exited with code %1.\nSee the console for details.").arg(code);
-            emitFinishedOnce_(false, msg, QString());
-            if (handler_) emit handler_->statusMessage(QObject::tr("Straighten failed"), 5000);
-            if (!suppressDialogs_)
-                QMessageBox::critical(parentWidget_, QObject::tr("Straighten Failed"), msg);
-            deleteLater();
-            return;
-        }
-        emitFinishedOnce_(true,
-                          QObject::tr("Straighten complete: %1").arg(outputName_), created_);
-        if (handler_) emit handler_->statusMessage(QObject::tr("Straighten complete: %1").arg(outputName_), 5000);
-        if (!suppressDialogs_)
-            QMessageBox::information(parentWidget_, QObject::tr("Straighten Complete"),
-                QObject::tr("Straightened surface created: %1").arg(outputName_));
-        deleteLater();
-    }
-
-private:
-    void emitFinishedOnce_(bool success, const QString& message,
-                           const QString& outputPath) {
-        if (finishedEmitted_) return;
-        finishedEmitted_ = true;
-        if (handler_) emit handler_->flattenJobFinished(success, message, outputPath);
-    }
-
-    QWidget* parentWidget_ = nullptr;
-    QPointer<SegmentationCommandHandler> handler_;
-    QString outputName_;
-    vc3d::ToolOutputLines lines_;
-    QString created_;
-    bool suppressDialogs_ = false;
-    bool finishedEmitted_ = false;
-    QProcess* proc_ = nullptr;
-    QPointer<QProgressDialog> progress_;
-    bool done_ = false;
 };
 
 } // -------------------- end anonymous namespace ------------------------------
@@ -1804,9 +1390,10 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     if (params.tolerance > 0.0) args << QStringLiteral("--tol=%1").arg(params.tolerance, 0, 'g', 8);
     args << QString::number(iters) << params.energyType;
 
-    // The job reports completion through flattenJobFinished and self-deletes.
-    new SlimJob(_parentWidget, this, _surfacePanel->catalog(), flatboiExe, args, outputName, iters,
-                /*suppressDialogs=*/!interactive);
+    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
+                   {flatboiExe, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
+                    outputName, iters, /*modal=*/true, /*computeArea=*/true},
+                   /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;
@@ -1828,14 +1415,27 @@ bool SegmentationCommandHandler::startAbfFlattenImpl(const std::string& segmentI
                                                      CommandLaunchError* error,
                                                      QString* resolvedOutputName)
 {
+    const CommandLaunchErrorSetter setErr{error};
     const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
-    // ABF++ runs in-process and reports completion through flattenJobFinished.
+    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_flatten"));
+    if (exe.isEmpty()) {
+        setErr(tr("Could not find the 'vc_flatten' executable (known locations and PATH). "
+                  "Set it in VC.ini [tools] vc_flatten, or put it on PATH."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
     const QString outputName = stored->name + QStringLiteral("_abf");
-    new ABFJob(_parentWidget, _surfacePanel->catalog(), this, stored->uuid, outputName,
-               std::max(1, iterations), std::max(1, downsampleFactor),
-               /*suppressDialogs=*/!interactive);
+    const QStringList args{QStringLiteral("--store"), stored->store,
+                           QStringLiteral("--volume-uuid"), stored->volumeUuid,
+                           QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
+                           QStringLiteral("--name"), outputName,
+                           QStringLiteral("--iterations"), QString::number(std::max(1, iterations)),
+                           QStringLiteral("--downsample"), QString::number(std::max(1, downsampleFactor))};
+    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
+                   {exe, args, QStringLiteral("flatten.abf"), tr("ABF++ flatten"), tr("ABF++ Flattening..."), outputName},
+                   /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;
@@ -1874,8 +1474,13 @@ bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentI
     const QStringList args = straightenArgs(params);
     std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
               << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
-    new StraightenJob(_parentWidget, this, exe, stored->store, QString::fromStdString(stored->uuid),
-                      stored->volumeUuid, outputName, args, /*suppressDialogs=*/!interactive);
+    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
+                   {exe,
+                    QStringList{QStringLiteral("--store"), stored->store, QStringLiteral("--volume-uuid"), stored->volumeUuid,
+                                QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
+                                QStringLiteral("--name"), outputName} + args,
+                    QStringLiteral("flatten.straighten"), tr("Straighten"), tr("Running vc_straighten..."), outputName},
+                   /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;
@@ -3655,6 +3260,3 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
 
     emit statusMessage(tr("Add ignore label started at level 0..."), 0);
 }
-
-// Include the MOC file for Q_OBJECT classes in anonymous namespace
-#include "SegmentationCommandHandler.moc"

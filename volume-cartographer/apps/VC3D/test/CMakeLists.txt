@@ -352,6 +352,8 @@ add_executable(test_command_line_tool_runner
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolExecutable.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolProcess.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolProcess.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/ProgressUtil.cpp

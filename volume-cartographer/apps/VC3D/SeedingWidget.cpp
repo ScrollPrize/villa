@@ -9,8 +9,6 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QMessageBox>
-#include <QProcess>
-#include <QProcessEnvironment>
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFileInfo>
@@ -19,7 +17,6 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
-#include <QStandardPaths>
 #include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
@@ -970,7 +967,6 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchPoints = std::move(allPoints);
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchProcessTail.clear();
     _batchStore = *store;
     _batchConfigJson = seedJsonPath;
     _batchWorkingDir = QString::fromStdString(projectDir.string());
@@ -1029,16 +1025,6 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
     }
 
     const auto& point = _batchPoints[pointIndex];
-    QProcess* process = new QProcess(this);
-    process->setProcessChannelMode(QProcess::MergedChannels);
-    process->setWorkingDirectory(_batchWorkingDir);
-
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    if (_batchOmpThreads > 0) {
-        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
-    }
-    process->setProcessEnvironment(env);
-
     const QStringList toolArgs = QStringList()
                   << QStringLiteral("-v") << _batchVolumePath
                   << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
@@ -1048,34 +1034,29 @@ void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
                   << QString::number(point.p[1])
                   << QString::number(point.p[2]);
 
-    std::cout << "Starting seeding job " << pointIndex << ": "
-              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
-              << std::endl;
-
-    launchBatchProcess(process, pointIndex, toolArgs);
+    std::cout << "Starting seeding job " << pointIndex << std::endl;
+    launchBatchProcess(pointIndex, toolArgs);
 }
 
-void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int exitCode,
-                                               QProcess::ExitStatus exitStatus, bool failedToStart)
+void SeedingWidget::handleBatchProcessFinished(vc3d::ToolProcess* run, int index,
+                                               const vc3d::ToolProcess::Result& result)
 {
     if (!jobsRunning) {
         return;
     }
 
     const bool isExpand = (_batch.kind() == QLatin1String("expand"));
-    const bool crashed = (exitStatus != QProcess::NormalExit);
 
-    // Aggregate the outcome, deduping on the stable child index — not the QProcess*
-    // itself, since process->deleteLater() below frees each finished child mid-batch and
-    // a later QProcess can be allocated at the same address, misreading as already-terminal.
+    // Aggregate the outcome, deduping on the stable child index — not the run
+    // itself, since run->deleteLater() below frees each finished child mid-batch and
+    // a later one can be allocated at the same address, misreading as already-terminal.
     const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
                                    : tr("Segmentation for point %1").arg(index);
-    if (!_batch.recordTerminal(index, failedToStart, crashed, exitCode,
-                               _batchProcessTail.value(process), label)) {
+    if (!_batch.recordTerminal(index, result.failedToStart, result.crashed, result.exitCode, result.tail, label)) {
         return;
     }
 
-    const bool failed = failedToStart || crashed || exitCode != 0;
+    const bool failed = !result.ok;
     if (failed) {
         std::cerr << _batch.failureMessages().constLast().toStdString() << std::endl;
     } else {
@@ -1087,10 +1068,8 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     progressUtil->updateProgress(_batch.completed());
     emit seedingBatchProgressChanged(_batch.kind(), _batch.completed(), _batch.total());
 
-    // Remove from running list (QPointer handles null checking)
-    runningProcesses.removeOne(process);
-    _batchProcessTail.remove(process);
-    process->deleteLater();
+    runningProcesses.removeOne(run);
+    run->deleteLater();
 
     // Continue the remaining batch after an individual failure unless canceled.
     if (_batchNextIndex < _batch.total() && jobsRunning && !_batch.cancelRequested()) {
@@ -1153,7 +1132,6 @@ void SeedingWidget::finalizeSeedingBatch()
     // (_batch retains its finalized outcome for idempotency; begin() resets it.)
     _batchPoints.clear();
     _batchPoints.shrink_to_fit();
-    _batchProcessTail.clear();
 
     if (!kind.isEmpty()) {
         emit seedingBatchFinished(kind, success, canceled, completed, total, message);
@@ -1979,7 +1957,6 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchPoints.clear();
     _batchNextIndex = 0;
     _batchOmpThreads = ompThreads;
-    _batchProcessTail.clear();
     _batchStore = *store;
     _batchConfigJson = expandJsonPath;
     _batchWorkingDir = QString::fromStdString(projectDir.string());
@@ -2014,83 +1991,37 @@ void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
         return;
     }
 
-    QProcess* process = new QProcess(this);
-    process->setProcessChannelMode(QProcess::MergedChannels);
-    process->setWorkingDirectory(_batchWorkingDir);
-
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    if (_batchOmpThreads > 0) {
-        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
-    }
-    process->setProcessEnvironment(env);
-
     const QStringList toolArgs = QStringList()
                   << QStringLiteral("-v") << _batchVolumePath
                   << QStringLiteral("-p") << QString::fromStdString(_batchConfigJson.string())
                   << _batchStore;
 
-    std::cout << "Starting expansion job " << iterationIndex << ": "
-              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
-              << std::endl;
-
-    launchBatchProcess(process, iterationIndex, toolArgs);
+    std::cout << "Starting expansion job " << iterationIndex << std::endl;
+    launchBatchProcess(iterationIndex, toolArgs);
 }
 
 
-void SeedingWidget::launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs)
+void SeedingWidget::launchBatchProcess(int index, const QStringList& toolArgs)
 {
-    // Drain merged child output continuously so the QProcess buffer never grows
-    // unbounded; retain a bounded per-child tail for terminal failure diagnostics.
-    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
-        const QByteArray chunk = process->readAllStandardOutput();
-        QString& tail = _batchProcessTail[process];
-        tail += QString::fromLocal8Bit(chunk);
-        constexpr int kTailMax = 2048;
-        if (tail.size() > kTailMax)
-            tail = tail.right(kTailMax);
-    });
-
-    // finished() carries the exit code/status; errorOccurred(FailedToStart) never
-    // emits finished(), so route it through the same completion path (once) so a
-    // missing nice/ionice/tool fails the batch instead of stranding it.
-    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-        [this, process, index](int exitCode, QProcess::ExitStatus exitStatus) {
-            handleBatchProcessFinished(process, index, exitCode, exitStatus, /*failedToStart=*/false);
-        });
-    connect(process, &QProcess::errorOccurred, this,
-        [this, process, index](QProcess::ProcessError err) {
-            if (err == QProcess::FailedToStart)
-                handleBatchProcessFinished(process, index, /*exitCode=*/-1,
-                                           QProcess::CrashExit, /*failedToStart=*/true);
-        });
-
-    // Track before start() so synchronous FailedToStart is handled as part of
-    // this batch.
-    runningProcesses.append(QPointer<QProcess>(process));
-
-    // Resolve the priority wrappers: nice/ionice may be absent (macOS has no
-    // ionice at all). Fall back to launching vc_grow_seg_from_seed directly.
-    // FailedToStart is handled on every path by the connection above.
-#if defined(Q_OS_UNIX)
-    const QString nicePath = QStandardPaths::findExecutable(QStringLiteral("nice"));
-#if defined(Q_OS_LINUX)
-    const QString ionicePath = QStandardPaths::findExecutable(QStringLiteral("ionice"));
-#else
-    const QString ionicePath;
-#endif
-    if (!nicePath.isEmpty()) {
-        QStringList args;
-        args << QStringLiteral("-n") << QStringLiteral("19");
-        if (!ionicePath.isEmpty())
-            args << ionicePath << QStringLiteral("-c") << QStringLiteral("3");
-        args << executablePath << toolArgs;
-        process->start(nicePath, args);
-    } else {
-        process->start(executablePath, toolArgs);
+    auto* run = new vc3d::ToolProcess(this);
+    connect(run, &vc3d::ToolProcess::finished, this,
+            [this, run, index](const vc3d::ToolProcess::Result& result) { handleBatchProcessFinished(run, index, result); });
+    // Tracked before start() so a failed start is handled as part of this batch.
+    runningProcesses.append(QPointer<vc3d::ToolProcess>(run));
+    vc3d::ToolProcess::Launch launch;
+    launch.tool = executablePath;
+    launch.args = toolArgs;
+    launch.ompThreads = _batchOmpThreads;
+    launch.workingDirectory = _batchWorkingDir;
+    launch.lowPriority = true;
+    if (!run->start(launch)) {
+        vc3d::ToolProcess::Result failed;
+        failed.failedToStart = true;
+        failed.error = run->error();
+        handleBatchProcessFinished(run, index, failed);
+        return;
     }
-#else
-    process->start(executablePath, toolArgs);
-#endif
+    std::cout << "  " << run->command().toStdString() << std::endl;
 }
 
 void SeedingWidget::cancelSeedingBatchHeadless()
@@ -2103,28 +2034,11 @@ void SeedingWidget::cancelSeedingBatchHeadless()
     jobsRunning = false;
     _batch.requestCancel();
 
-    // using qpointer here to avoid dangling pointers
-    for (const QPointer<QProcess>& processPtr : runningProcesses) {
-        if (processPtr) {
-            QProcess* process = processPtr.data();
-
-            // Disconnect all signals to prevent callbacks after cancellation
-            process->disconnect();
-
-            // Terminate the process if it's still running
-            if (process->state() != QProcess::NotRunning) {
-                process->terminate();
-                // Give it a chance to terminate gracefully (bounded, ~1s)
-                if (!process->waitForFinished(1000)) {
-                    // Force kill if it didn't terminate
-                    process->kill();
-                    process->waitForFinished(1000);
-                }
-            }
-
-            // Schedule deletion
-            process->deleteLater();
-        }
+    // No callbacks after cancellation; deleting a run kills its process (bounded wait).
+    for (const QPointer<vc3d::ToolProcess>& run : runningProcesses) {
+        if (!run) continue;
+        run->disconnect(this);
+        delete run.data();
     }
     runningProcesses.clear();
 

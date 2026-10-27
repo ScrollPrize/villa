@@ -10,7 +10,7 @@
 #include <QProgressBar>
 #include <QHBoxLayout>
 #include <QLineEdit>
-#include <QProcess>
+#include "ToolProcess.hpp"
 #include <QPointer>
 #include <QToolButton>
 #include <QFutureWatcher>
@@ -132,17 +132,13 @@ private:
     // call returns before the batch finishes. One batch (run OR expand) at a time.
     void startSegmentationProcessForPoint(int pointIndex);
     void startExpansionProcessForIteration(int iterationIndex);
-    // Shared child launch: drains merged output (bounded tail), wires finished +
-    // errorOccurred(FailedToStart), and falls back to vc_grow_seg_from_seed directly if
-    // the nice/ionice wrappers are absent. Appends to runningProcesses before start() so a
-    // synchronous FailedToStart is still tracked.
-    void launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs);
-    // A single QProcess reaches its terminal state exactly once here (deduped by the
-    // tracker keyed on process identity) since finished() and errorOccurred() may both
-    // fire. failedToStart routes FailedToStart through the same path so a missing
-    // wrapper/tool fails the batch rather than stranding it.
-    void handleBatchProcessFinished(QProcess* process, int index, int exitCode,
-                                    QProcess::ExitStatus exitStatus, bool failedToStart);
+    // Shared child launch: one vc_grow_seg_from_seed run at low priority. Appends to
+    // runningProcesses before start() so a failed start is still tracked.
+    void launchBatchProcess(int index, const QStringList& toolArgs);
+    // A child reaches its terminal state exactly once here (deduped by the tracker
+    // on the child index), a failed start included, so it fails the batch rather
+    // than stranding it.
+    void handleBatchProcessFinished(vc3d::ToolProcess* run, int index, const vc3d::ToolProcess::Result& result);
     void finalizeSeedingBatch();
     // Relative winding annotation helpers
     void finalizePathLabelWraps(bool shiftHeld);
@@ -208,17 +204,16 @@ private:
     double _relWindingPatchTolerance{1.0};
     
     // Process management
-    QList<QPointer<QProcess>> runningProcesses;
+    QList<QPointer<vc3d::ToolProcess>> runningProcesses;
     bool jobsRunning;
 
     // Async seeding batch state (run/expand), promoted from onRun/onExpand locals so the
-    // QProcess finished callbacks read stable members, not dangling captures. Only one
+    // Child finished callbacks read stable members, not dangling captures. Only one
     // batch is active at a time (gated by jobsRunning). Outcome aggregation lives in
     // SeedingBatchTracker _batch; only process-lifecycle bookkeeping stays here.
     int _batchNextIndex{0};
     int _batchOmpThreads{0};
     SeedingBatchTracker _batch;
-    QHash<QProcess*, QString> _batchProcessTail; // bounded per-child output tail for diagnostics
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
     // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored
     // volume, or the remote locator for a streaming-only volume (issue #1188). QString,

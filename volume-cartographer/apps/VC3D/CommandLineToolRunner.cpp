@@ -16,47 +16,6 @@
 #include <utility>
 
 
-namespace {
-
-QString quoteArg(const QString& arg)
-{
-    if (arg.isEmpty())
-        return "\"\"";
-
-    bool needsQuotes = false;
-    for (const QChar& ch : arg) {
-        if (ch.isSpace() || ch == '"' || ch == '\'' || ch == '\\') {
-            needsQuotes = true;
-            break;
-        }
-    }
-
-    if (!needsQuotes) {
-        return arg;
-    }
-
-    QString escaped = arg;
-    escaped.replace('\\', "\\\\");
-    escaped.replace('"', "\\\"");
-    return "\"" + escaped + "\"";
-}
-
-QString formatCommand(const QString& program, const QStringList& args, int ompThreads)
-{
-    QStringList quotedArgs;
-    quotedArgs.reserve(args.size());
-    for (const auto& arg : args) {
-        quotedArgs << quoteArg(arg);
-    }
-
-    QString base = QString("%1 %2").arg(program, quotedArgs.join(' '));
-    if (ompThreads > 0) {
-        return QString("OMP_NUM_THREADS=%1 %2").arg(ompThreads).arg(base);
-    }
-    return base;
-}
-
-} // namespace
 
 CommandLineToolRunner::CommandLineToolRunner(
     QStatusBar* statusBar,
@@ -65,14 +24,11 @@ CommandLineToolRunner::CommandLineToolRunner(
     : QObject(parent)
     , _currentVolumePath(std::move(currentVolumePath))
     , _progressUtil(new ProgressUtil(nullptr, this))
-    , _process(nullptr)
     , _consoleOutput(new ConsoleOutputWidget())
     , _consoleDialog(new QDialog(nullptr, Qt::Window))
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
-    , _logFile(nullptr)
-    , _logStream(nullptr)
 {
     _consoleDialog->setWindowTitle(tr("Command Output"));
     _consoleDialog->resize(700, 500);
@@ -84,24 +40,7 @@ CommandLineToolRunner::CommandLineToolRunner(
 
 CommandLineToolRunner::~CommandLineToolRunner()
 {
-    if (_process) {
-        if (_process->state() != QProcess::NotRunning) {
-            _process->terminate();
-            _process->waitForFinished(3000);
-        }
-        delete _process;
-    }
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
+    delete _run;
     delete _consoleDialog;
     // _consoleOutput is deleted by _consoleDialog
 }
@@ -232,7 +171,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
             QMessageBox::warning(nullptr, title, message);
         }
     };
-    if (_process && _process->state() != QProcess::NotRunning) {
+    if (isRunning()) {
         warn(tr("Warning"), tr("A tool is already running."));
         return false;
     }
@@ -244,17 +183,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         return false;
     }
 
-    QString toolCmd = isCustom ? _customCommand : toolName(tool);
-    QFileInfo toolInfo(toolCmd);
-    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
-        QString errorMsg = tr("Tool executable not found or not executable: %1").arg(toolCmd);
-        _consoleOutput->appendOutput(errorMsg);
-        if (options.showConsole) {
-            showConsoleOutput();
-        }
-        warn(tr("Error"), errorMsg);
-        return false;
-    }
+    const QString toolCmd = isCustom ? _customCommand : toolName(tool);
 
     // vc_merge_tifxyz and vc_merge_patch only read and write stored surfaces;
     // no volume required.
@@ -340,120 +269,77 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         }
     }
 
+    vc3d::ToolProcess::Launch launch;
+    launch.tool = toolCmd;
+    launch.args = isCustom ? _customArgs : buildArguments(tool);
+    launch.ompThreads = ompThreads;
+    if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
+        launch.environment.insert(QStringLiteral("AWS_ACCESS_KEY_ID"), _remoteAccessKey);
+        launch.environment.insert(QStringLiteral("AWS_SECRET_ACCESS_KEY"), _remoteSecretKey);
+        launch.secretVariables << QStringLiteral("AWS_ACCESS_KEY_ID") << QStringLiteral("AWS_SECRET_ACCESS_KEY");
+        if (!_remoteSessionToken.isEmpty()) {
+            launch.environment.insert(QStringLiteral("AWS_SESSION_TOKEN"), _remoteSessionToken);
+            launch.secretVariables << QStringLiteral("AWS_SESSION_TOKEN");
+        }
+        if (!_remoteRegion.isEmpty()) launch.environment.insert(QStringLiteral("AWS_DEFAULT_REGION"), _remoteRegion);
+    }
+    const QString toolLabel = isCustom && !_customLabel.isEmpty() ? _customLabel : QFileInfo(toolCmd).baseName();
+    launch.logPath = QStringLiteral("%1/%2_%3.txt")
+        .arg(QDir::tempPath(), QFileInfo(toolCmd).baseName(),
+             QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+
+    delete _run;
+    _run = new vc3d::ToolProcess(this);
+    connect(_run, &vc3d::ToolProcess::started, this, [this, toolLabel] {
+        if (_progressUtil) _progressUtil->startAnimation(tr("Running %1...").arg(toolLabel));
+    });
+    connect(_run, &vc3d::ToolProcess::output, this, [this](const QString& chunk) {
+        _consoleOutput->appendOutput(chunk);
+        emit consoleOutputReceived(chunk);
+    });
+    connect(_run, &vc3d::ToolProcess::line, this, [this](const QString& line) {
+        if (line.trimmed().startsWith(QStringLiteral("obj:"))) _exportedObj = line.trimmed().mid(4).trimmed();
+    });
+    connect(_run, &vc3d::ToolProcess::finished, this, [this, toolLabel](const vc3d::ToolProcess::Result& result) {
+        _createdSurfaces = result.surfaces;
+        if (result.ok) {
+            const QString message = tr("%1 completed successfully").arg(toolLabel);
+            const QString outputPath = getOutputPath();
+            // A render's output directory goes to the clipboard to open it quickly.
+            const bool copyToClipboard = _currentTool == Tool::RenderTifXYZ;
+            if (copyToClipboard) QApplication::clipboard()->setText(outputPath);
+            if (_progressUtil)
+                _progressUtil->stopAnimation(copyToClipboard ? message + tr(" - Path copied to clipboard") : message);
+            finishExecution(true, message, outputPath, copyToClipboard);
+            return;
+        }
+        const QString message = result.cancelled ? tr("%1 cancelled").arg(toolLabel) : result.error;
+        _consoleOutput->appendOutput(message);
+        if (_executionOptions.showConsole) showConsoleOutput();
+        if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
+        finishExecution(false, message);
+    });
+
     _currentTool = tool;
     _createdSurfaces.clear();
     _exportedObj.clear();
-    _outputLines = {};
     _executionOptions = options;
     _terminalReported = false;
-    _pendingProcessError.clear();
-
-    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString toolBaseName = QFileInfo(toolCmd).baseName();
-    QString logFilePath = QString("%1/%2_%3.txt")
-        .arg(QDir::tempPath()).arg(toolBaseName).arg(timestamp);
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
+    if (!_run->start(launch)) {
+        _consoleOutput->appendOutput(_run->error());
+        if (options.showConsole) showConsoleOutput();
+        warn(tr("Error"), _run->error());
+        _terminalReported = true;
+        _executionOptions = {};
+        return false;
     }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
-    _logFile = new QFile(logFilePath);
-    if (_logFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
-        _logStream = new QTextStream(_logFile);
-        _logStream->setAutoDetectUnicode(true);
-
-        *_logStream << "Tool: " << toolCmd << Qt::endl;
-        *_logStream << "Started: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        QStringList argsForLog = isCustom ? _customArgs : buildArguments(tool);
-        *_logStream << "Arguments: " << argsForLog.join(" ") << Qt::endl;
-        *_logStream << "===================================" << Qt::endl << Qt::endl;
-        _logStream->flush();
-
-        _consoleOutput->appendOutput(tr("Logging output to: %1\n").arg(logFilePath));
-    } else {
-        _consoleOutput->appendOutput(tr("Warning: Failed to create log file: %1\n").arg(logFilePath));
-    }
-
-    if (!_process) {
-        _process = new QProcess(this);
-        _process->setProcessChannelMode(QProcess::MergedChannels);
-
-        connect(_process, &QProcess::started, this, &CommandLineToolRunner::onProcessStarted);
-        connect(_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                this, &CommandLineToolRunner::onProcessFinished);
-        connect(_process, &QProcess::errorOccurred, this, &CommandLineToolRunner::onProcessError);
-        connect(_process, &QProcess::readyRead, this, &CommandLineToolRunner::onProcessReadyRead);
-    }
-
-    // Apply per-run environment variables (e.g., OMP_NUM_THREADS)
-    {
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
-            if (_logStream) {
-                *_logStream << "ENV: OMP_NUM_THREADS=" << ompThreads << Qt::endl;
-                _logStream->flush();
-            }
-        }
-        if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
-            env.insert("AWS_ACCESS_KEY_ID", _remoteAccessKey);
-            env.insert("AWS_SECRET_ACCESS_KEY", _remoteSecretKey);
-            if (!_remoteSessionToken.isEmpty()) {
-                env.insert("AWS_SESSION_TOKEN", _remoteSessionToken);
-            }
-            if (!_remoteRegion.isEmpty()) {
-                env.insert("AWS_DEFAULT_REGION", _remoteRegion);
-            }
-            if (_logStream) {
-                *_logStream << "ENV: AWS_ACCESS_KEY_ID=<set>" << Qt::endl;
-                *_logStream << "ENV: AWS_SECRET_ACCESS_KEY=<set>" << Qt::endl;
-                if (!_remoteSessionToken.isEmpty()) {
-                    *_logStream << "ENV: AWS_SESSION_TOKEN=<set>" << Qt::endl;
-                }
-                if (!_remoteRegion.isEmpty()) {
-                    *_logStream << "ENV: AWS_DEFAULT_REGION=" << _remoteRegion << Qt::endl;
-                }
-                _logStream->flush();
-            }
-        }
-        _process->setProcessEnvironment(env);
-    }
-
-    QStringList args = isCustom ? _customArgs : buildArguments(tool);
-    QString toolCommand = toolCmd;
-    QString formattedCommand = formatCommand(toolCommand, args, ompThreads);
-
-    QString startMessage;
-    const QString toolLabel = isCustom
-                              ? (_customLabel.isEmpty() ? QFileInfo(toolCommand).baseName()
-                                                       : _customLabel)
-                              : QFileInfo(toolCommand).baseName();
-
-    startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
-                           : tr("Starting %1 for: %2")
-                                 .arg(toolLabel)
-                                 .arg(_surfaceUuid.isEmpty() ? _sourceSurfaceUuid : _surfaceUuid);
-    emit toolStarted(_currentTool, startMessage);
-
+    emit toolStarted(_currentTool, isCustom ? tr("Starting %1").arg(toolLabel)
+                                            : tr("Starting %1 for: %2")
+                                                  .arg(toolLabel, _surfaceUuid.isEmpty() ? _sourceSurfaceUuid : _surfaceUuid));
     _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
-    _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
-    if (_logStream) {
-        *_logStream << "Command: " << formattedCommand << Qt::endl;
-        _logStream->flush();
-    }
-
-    if (options.showConsole) {
-        showConsoleOutput();
-    }
-
-    _process->start(toolCommand, args);
-
+    _consoleOutput->appendOutput(tr("Logging output to: %1\n").arg(launch.logPath));
+    _consoleOutput->appendOutput(tr("Command: %1\n").arg(_run->command()));
+    if (options.showConsole) showConsoleOutput();
     return true;
 }
 
@@ -470,14 +356,12 @@ bool CommandLineToolRunner::executeCustomCommand(const QString& command,
 
 void CommandLineToolRunner::cancel()
 {
-    if (_process && _process->state() != QProcess::NotRunning) {
-        _process->terminate();
-    }
+    if (_run) _run->cancel();
 }
 
 bool CommandLineToolRunner::isRunning() const
 {
-    return (_process && _process->state() != QProcess::NotRunning);
+    return _run && _run->running();
 }
 
 void CommandLineToolRunner::showConsoleOutput()
@@ -486,54 +370,6 @@ void CommandLineToolRunner::showConsoleOutput()
         _consoleDialog->show();
         _consoleDialog->raise();
         _consoleDialog->activateWindow();
-    }
-}
-
-void CommandLineToolRunner::onProcessReadyRead()
-{
-    if (_process) {
-        QByteArray output = _process->readAll();
-        QString outputText = QString::fromUtf8(output);
-
-        _consoleOutput->appendOutput(outputText);
-
-        if (_logStream) {
-            *_logStream << outputText;
-            _logStream->flush();
-        }
-
-        parseReportLines(_outputLines.add(outputText));
-        emit consoleOutputReceived(outputText);
-    }
-}
-
-void CommandLineToolRunner::parseReportLines(const QStringList& lines)
-{
-    for (const QString& raw : lines) {
-        const QString line = raw.trimmed();
-        if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty())
-            _createdSurfaces << uuid;
-        else if (line.startsWith(QStringLiteral("obj:")))
-            _exportedObj = line.mid(4).trimmed();
-    }
-}
-
-void CommandLineToolRunner::onProcessStarted()
-{
-    QString message = tr("Running %1...").arg(toolName(_currentTool));
-    if (_progressUtil) _progressUtil->startAnimation(message);
-}
-
-void CommandLineToolRunner::closeLog()
-{
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
     }
 }
 
@@ -556,103 +392,6 @@ void CommandLineToolRunner::finishExecution(bool success,
     emit toolFinished(
         _currentTool, success, message, outputPath, copyToClipboard);
     _deliveringCompletion = false;
-}
-
-void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
-{
-    if (_terminalReported) {
-        return;
-    }
-    // Report lines may still be buffered or unterminated.
-    onProcessReadyRead();
-    parseReportLines(_outputLines.finish());
-    if (_logStream) {
-        *_logStream << Qt::endl << "===================================" << Qt::endl;
-        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        *_logStream << "Exit code: " << exitCode << Qt::endl;
-        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
-        _logStream->flush();
-    }
-
-    closeLog();
-
-    if (_pendingProcessError.isEmpty() &&
-        exitCode == 0 &&
-        exitStatus == QProcess::NormalExit) {
-        QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
-        QString outputPath = getOutputPath();
-
-        // the runner can copy the output of a process to the clipboard, currently this only makes sense for rendering
-        // so the user can quickly open the output dir
-        bool copyToClipboard = (_currentTool == Tool::RenderTifXYZ);
-
-        if (copyToClipboard) {
-            QApplication::clipboard()->setText(outputPath);
-            if (_progressUtil) _progressUtil->stopAnimation(message + tr(" - Path copied to clipboard"));
-        } else {
-            if (_progressUtil) _progressUtil->stopAnimation(message);
-        }
-
-        finishExecution(true, message, outputPath, copyToClipboard);
-    } else {
-        const QString errorMessage = _pendingProcessError.isEmpty()
-            ? tr("%1 failed with exit code: %2")
-                  .arg(toolName(_currentTool))
-                  .arg(exitCode)
-            : _pendingProcessError;
-
-        if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
-
-        finishExecution(false, errorMessage);
-    }
-}
-
-void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
-{
-    QString errorMessage = tr("Error running %1: ").arg(toolName(_currentTool));
-
-    switch (error) {
-        case QProcess::FailedToStart:
-            errorMessage += tr("failed to start - Tool executable not found or not executable. Command: %1").arg(toolName(_currentTool));
-            break;
-        case QProcess::Crashed: errorMessage += tr("crashed"); break;
-        case QProcess::Timedout: errorMessage += tr("timed out"); break;
-        case QProcess::WriteError: errorMessage += tr("write error"); break;
-        case QProcess::ReadError: errorMessage += tr("read error"); break;
-        default: errorMessage += tr("unknown error"); break;
-    }
-
-    QStringList args = buildArguments(_currentTool);
-    errorMessage += tr("\nArguments: %1").arg(args.join(" "));
-    _pendingProcessError = errorMessage;
-
-    if (_logStream) {
-        *_logStream << Qt::endl << "ERROR: " << errorMessage << Qt::endl;
-        _logStream->flush();
-    }
-
-    const bool showConsole = _executionOptions.showConsole;
-
-    if (_consoleOutput) {
-        _consoleOutput->appendOutput(errorMessage);
-    }
-
-    if (showConsole) {
-        showConsoleOutput();
-    }
-
-    // Crashes and other runtime errors are followed by finished(); let that
-    // signal own terminal delivery. FailedToStart is the exception: Qt does not
-    // emit finished() when the process never launched.
-    if (error != QProcess::FailedToStart) {
-        return;
-    }
-
-    closeLog();
-    if (_progressUtil) {
-        _progressUtil->stopAnimation(tr("Process failed"));
-    }
-    finishExecution(false, errorMessage);
 }
 
 QStringList CommandLineToolRunner::buildArguments(Tool tool)

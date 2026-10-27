@@ -279,6 +279,8 @@ set(srcs
     CommandLineToolRunner.hpp
     ToolExecutable.cpp
     ToolExecutable.hpp
+    ToolProcess.cpp
+    ToolProcess.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp

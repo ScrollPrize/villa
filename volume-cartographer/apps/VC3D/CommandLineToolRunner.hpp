@@ -1,14 +1,12 @@
 #pragma once
 
-#include "ToolOutput.hpp"
+#include "ToolProcess.hpp"
 #include <functional>
 
 #include <QObject>
 #include <QString>
 #include <QStringList>
-#include <QProcess>
 #include <QDialog>
-#include <QFile>
 
 #include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
@@ -181,19 +179,10 @@ signals:
     void toolFinished(Tool tool, bool success, const QString& message, const QString& outputPath, bool copyToClipboard = false);
     void consoleOutputReceived(const QString& output);
 
-private slots:
-    void onProcessStarted();
-    void onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
-    void onProcessError(QProcess::ProcessError error);
-    void onProcessReadyRead();
-
 private:
     QStringList buildArguments(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
-    // Collects the tool's `surface_uuid:` and `obj:` report lines.
-    void parseReportLines(const QStringList& lines);
-    void closeLog();
     void finishExecution(bool success,
                          const QString& message,
                          const QString& outputPath = {},
@@ -202,7 +191,7 @@ private:
     std::function<QString()> _currentVolumePath;
     ProgressUtil* _progressUtil;
     
-    QProcess* _process;
+    vc3d::ToolProcess* _run = nullptr;
     ConsoleOutputWidget* _consoleOutput;
     QDialog* _consoleDialog;
     
@@ -254,21 +243,16 @@ private:
     QStringList _customArgs;
     QString _customLabel;
 
-    QFile* _logFile;
-    QTextStream* _logStream;
-
     int _nextOmpThreads{-1};
     bool _explicitVolumePath{false};
     ExecutionOptions _executionOptions;
     ExecutionOptions _completionOptions;
     bool _deliveringCompletion{false};
     bool _terminalReported{true};
-    QString _pendingProcessError;
 
     QString _refineName;  // the refined surface's name; empty: refined in place
     QStringList _createdSurfaces;
     QString _exportedObj;
-    vc3d::ToolOutputLines _outputLines;
 
     // vc_merge_tifxyz parameters
     QString _mergeJsonPath;
