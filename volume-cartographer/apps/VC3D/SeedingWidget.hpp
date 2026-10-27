@@ -120,7 +120,6 @@ private:
     
     void setupUI();
     void computeDistanceTransform();
-    QString findExecutablePath();
     void updateParameterPreview();
     void updateModeUI();
     void analyzePaths();

@@ -74,40 +74,10 @@
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
+#include "ToolExecutable.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
-
-// --------- locate executables (unified helper) --------------------------------
-
-static bool isExecutableFile(const QString& path)
-{
-    QFileInfo fi(path);
-    return fi.exists() && fi.isFile() && fi.isExecutable();
-}
-
-static QStringList applicationRelativeExecutablePaths(const QString& name)
-{
-#ifdef _WIN32
-    const QString executableName = name.endsWith(QStringLiteral(".exe"), Qt::CaseInsensitive)
-        ? name
-        : name + QStringLiteral(".exe");
-#else
-    const QString executableName = name;
-#endif
-
-    const QString appDir = QCoreApplication::applicationDirPath();
-    QStringList candidates{
-        QDir(appDir).filePath(executableName),
-        QDir(appDir).filePath(QStringLiteral("../") + executableName),
-        QDir(appDir).filePath(QStringLiteral("../bin/") + executableName),
-        QDir(appDir).filePath(QStringLiteral("../../bin/") + executableName),
-        QDir(appDir).filePath(QStringLiteral("../libexec/") + executableName),
-        QDir(appDir).filePath(QStringLiteral("../Resources/bin/") + executableName),
-    };
-    candidates.removeDuplicates();
-    return candidates;
-}
 
 static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
 {
@@ -132,66 +102,9 @@ struct CommandLaunchErrorSetter {
     }
 };
 
-static QString findExecutable(
-    const QString& name,
-    const QStringList& extraPaths = {},
-    const QString& envVar = {})
-{
-    // 1. Environment variable override (if provided)
-    if (!envVar.isEmpty()) {
-        const QByteArray envVal = qgetenv(envVar.toUtf8().constData());
-        if (!envVal.isEmpty()) {
-            const QString envPath = QString::fromLocal8Bit(envVal);
-            if (isExecutableFile(envPath))
-                return QFileInfo(envPath).absoluteFilePath();
-        }
-    }
-
-    // 2. INI settings (tools/<name>_path, tools/<name>)
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const QString key1 = QStringLiteral("tools/%1_path").arg(name);
-        const QString key2 = QStringLiteral("tools/%1").arg(name);
-        const QString iniPath =
-            settings.value(key1, settings.value(key2)).toString().trimmed();
-        if (!iniPath.isEmpty() && isExecutableFile(iniPath)) {
-            return QFileInfo(iniPath).absoluteFilePath();
-        }
-    }
-
-    // 3. Extra hard-coded paths (caller-supplied)
-    for (const QString& p : extraPaths) {
-        if (isExecutableFile(p))
-            return QFileInfo(p).absoluteFilePath();
-    }
-
-    // 4. Binaries colocated with the GUI app or common install layouts
-    for (const QString& p : applicationRelativeExecutablePaths(name)) {
-        if (isExecutableFile(p))
-            return QFileInfo(p).absoluteFilePath();
-    }
-
-    // 5. QStandardPaths / manual PATH walk
-#if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
-    const QString onPath = QStandardPaths::findExecutable(name);
-    if (!onPath.isEmpty()) return onPath;
-#else
-    const QStringList pathDirs =
-        QProcessEnvironment::systemEnvironment().value("PATH")
-            .split(QDir::listSeparator(), Qt::SkipEmptyParts);
-    for (const QString& dir : pathDirs) {
-        const QString candidate = QDir(dir).filePath(name);
-        QFileInfo fi(candidate);
-        if (fi.exists() && fi.isFile() && fi.isExecutable())
-            return fi.absoluteFilePath();
-    }
-#endif
-    return {};
-}
-
 static QString findFlatboiExecutable()
 {
-    return findExecutable(
+    return vc3d::findToolExecutable(
         QStringLiteral("flatboi"),
         {QStringLiteral("/usr/local/bin/flatboi"),
          QStringLiteral("/home/builder/vc-dependencies/bin/flatboi")},
@@ -1596,7 +1509,7 @@ void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
     const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
-    const QString exe = findExecutable(QStringLiteral("vc_straighten"));
+    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
     if (exe.isEmpty()) {
         QMessageBox::critical(_parentWidget, tr("Error"),
             tr("Could not find the 'vc_straighten' executable.\n"
@@ -1805,12 +1718,8 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     }
 
     // Return missing-tool errors before execute() reaches its dialog path.
-    const QString toolPath =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_render_tifxyz");
-    QFileInfo toolInfo(toolPath);
-    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
-        setErr(tr("vc_render_tifxyz not found or not executable: %1").arg(toolPath),
-               CommandLaunchError::ToolUnavailable);
+    if (vc3d::findToolExecutable(QStringLiteral("vc_render_tifxyz")).isEmpty()) {
+        setErr(tr("vc_render_tifxyz not found or not executable"), CommandLaunchError::ToolUnavailable);
         return false;
     }
 
@@ -1967,7 +1876,7 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
     const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
-    const QString exe = findExecutable(QStringLiteral("vc_straighten"));
+    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
     if (exe.isEmpty()) {
         setErr(tr("vc_straighten not found or not executable."),
                CommandLaunchError::ToolUnavailable);
@@ -2059,11 +1968,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         return;
     }
 
-    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
-        const auto paths = _state->vpkg()->normalGridPaths();
-        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
-    }
+    // The normal grids paired with the open volume (CWindow's catalog-aware lookup).
+    const QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
 
     QJsonObject refine;
     refine["normal_grid_path"] = normalGridPath;
@@ -2128,11 +2034,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
 
 QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
 {
-    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
-        const auto paths = _state->vpkg()->normalGridPaths();
-        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
-    }
+    // The normal grids paired with the open volume (CWindow's catalog-aware lookup).
+    const QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
 
     QJsonObject params;
     params["normal_grid_path"] = normalGridPath;
@@ -2292,11 +2195,8 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
     }
     // Return a typed launch error before the runner reaches its interactive
     // missing-tool warning. Tool::NeighborCopy launches vc_grow_seg_from_seed.
-    const QString toolPath =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_grow_seg_from_seed");
-    if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
-        return fail(tr("vc_grow_seg_from_seed not found or not executable: %1").arg(toolPath),
-                    CommandLaunchError::ToolUnavailable);
+    if (vc3d::findToolExecutable(QStringLiteral("vc_grow_seg_from_seed")).isEmpty()) {
+        return fail(tr("vc_grow_seg_from_seed not found or not executable"), CommandLaunchError::ToolUnavailable);
     }
     if (_neighborCopyJob) {
         return fail(tr("A neighbor copy request is already active."), CommandLaunchError::Busy);
@@ -2406,7 +2306,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         return fail(tr("A GrowPatch seed run is already active."), CommandLaunchError::Busy);
     }
 
-    const QString executable = findExecutable(QStringLiteral("vc_grow_seg_from_seed"));
+    const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_grow_seg_from_seed"));
     if (executable.isEmpty()) {
         return fail(tr("Could not find the 'vc_grow_seg_from_seed' executable."),
                     CommandLaunchError::ToolUnavailable);
@@ -2434,13 +2334,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
                     CommandLaunchError::VolumeNotFound);
     }
 
-    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty()) {
-        const auto paths = _state->vpkg()->normalGridPaths();
-        if (!paths.empty()) {
-            normalGridPath = QString::fromStdString(paths.front().string());
-        }
-    }
+    // The normal grids paired with the open volume (CWindow's catalog-aware lookup).
+    const QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
     if (normalGridPath.isEmpty()) {
         return fail(tr("No normal grid is available for GrowPatch."),
                     CommandLaunchError::InvalidState);
@@ -2598,7 +2493,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         return;
     }
 
-    if (findExecutable(QStringLiteral("vc_grow_seg_from_seed")).isEmpty()) {
+    if (vc3d::findToolExecutable(QStringLiteral("vc_grow_seg_from_seed")).isEmpty()) {
         QMessageBox::critical(_parentWidget, tr("Error"),
             tr("Could not find the 'vc_grow_seg_from_seed' executable.\n"
                "Looked in known locations and PATH.\n\n"
@@ -2952,11 +2847,8 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
     const QString volumePath = commandPathForVolume(sampled);
     // Return a typed launch error before the runner reaches its interactive
     // missing-tool warning. Tool::AlphaCompRefine launches vc_objrefine.
-    const QString toolPath =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/vc_objrefine");
-    if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
-        return fail(tr("vc_objrefine not found or not executable: %1").arg(toolPath),
-                    CommandLaunchError::ToolUnavailable);
+    if (vc3d::findToolExecutable(QStringLiteral("vc_objrefine")).isEmpty()) {
+        return fail(tr("vc_objrefine not found or not executable"), CommandLaunchError::ToolUnavailable);
     }
 
     // The output is a new surface's name, or the source's UUID to refine in place.
@@ -3097,7 +2989,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         return;
     }
 
-    const QString executable = findExecutable(QStringLiteral("vc_tifxyz2zarr_sparse"));
+    const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_tifxyz2zarr_sparse"));
     if (executable.isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"),
                              tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
@@ -3539,7 +3431,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         return;
     }
 
-    const QString executable = findExecutable(QStringLiteral("vc_add_ignore_label"));
+    const QString executable = vc3d::findToolExecutable(QStringLiteral("vc_add_ignore_label"));
     if (executable.isEmpty()) {
         QMessageBox::warning(_parentWidget,
                              tr("Error"),

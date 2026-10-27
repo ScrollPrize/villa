@@ -178,6 +178,10 @@ struct TracerGrowthResult {
     std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
 };
 
+// Give a surface without a "generations" channel one (every vertex generation
+// 1), which tracer growth resumes from; false for a surface without points.
+bool ensureGenerationsChannel(QuadSurface* surface);
+
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
 TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,

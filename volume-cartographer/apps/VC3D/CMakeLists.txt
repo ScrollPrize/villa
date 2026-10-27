@@ -279,6 +279,8 @@ set(srcs
     elements/ProgressUtil.hpp
     CommandLineToolRunner.cpp
     CommandLineToolRunner.hpp
+    ToolExecutable.cpp
+    ToolExecutable.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp

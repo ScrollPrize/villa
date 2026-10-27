@@ -64,32 +64,6 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
-// NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
-// return value. These two live in separate anonymous namespaces (different TUs) and
-// cannot easily be merged without a shared header; keep them in sync if modified.
-void ensureGenerationsChannel(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        return;
-    }
-
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return;
-    }
-
-    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
-    surface->setChannel("generations", seeded);
-}
-
-
-
-
 std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
                                                           const cv::Vec3f& worldPos,
                                                           cv::Vec3f& pointerSeed,

@@ -1,4 +1,5 @@
 #include "CommandLineToolRunner.hpp"
+#include "ToolExecutable.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QStatusBar>
@@ -798,28 +799,32 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
 
 QString CommandLineToolRunner::toolName(Tool tool) const
 {
-    QString basePath = QCoreApplication::applicationDirPath() + "/";
+    // The resolved executable, or its bare name (the launch then reports it missing).
+    const auto resolved = [](const QString& name) {
+        const QString path = vc3d::findToolExecutable(name);
+        return path.isEmpty() ? name : path;
+    };
     switch (tool) {
         case Tool::RenderTifXYZ:
-            return basePath + "vc_render_tifxyz";
+            return resolved(QStringLiteral("vc_render_tifxyz"));
 
         case Tool::GrowSegFromSegment:
-            return basePath + "vc_grow_seg_from_segments";
+            return resolved(QStringLiteral("vc_grow_seg_from_segments"));
 
         case Tool::tifxyz2obj:
-            return basePath + "vc_tifxyz2obj";
+            return resolved(QStringLiteral("vc_tifxyz2obj"));
 
         case Tool::AlphaCompRefine:
-            return basePath + "vc_objrefine";
+            return resolved(QStringLiteral("vc_objrefine"));
 
         case Tool::NeighborCopy:
-            return basePath + "vc_grow_seg_from_seed";
+            return resolved(QStringLiteral("vc_grow_seg_from_seed"));
 
         case Tool::MergeTifxyz:
-            return basePath + "vc_merge_tifxyz";
+            return resolved(QStringLiteral("vc_merge_tifxyz"));
 
         case Tool::MergePatch:
-            return basePath + "vc_merge_patch";
+            return resolved(QStringLiteral("vc_merge_patch"));
 
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;

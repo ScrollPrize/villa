@@ -1,4 +1,5 @@
 #include "SeedingWidget.hpp"
+#include "ToolExecutable.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "SurfaceCatalog.hpp"
 #include <iostream>
@@ -270,7 +271,7 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWid
     }
     
     // Automatically find the executable path
-    executablePath = findExecutablePath();
+    executablePath = vc3d::findToolExecutable(QStringLiteral("vc_grow_seg_from_seed"));
 }
 
 SeedingWidget::~SeedingWidget()
@@ -1182,23 +1183,6 @@ void SeedingWidget::onResetPointsClicked()
     // Redraw to clear points and paths
     updatePointsDisplay();
     displayPaths();
-}
-
-QString SeedingWidget::findExecutablePath()
-{
-    // vc_grow_seg_from_seed should be in the same directory as the VC3D application
-    QString execPath = QCoreApplication::applicationDirPath() + "/vc_grow_seg_from_seed";
-#ifdef Q_OS_WIN
-    execPath += QStringLiteral(".exe");
-#endif
-
-    QFileInfo fileInfo(execPath);
-    if (fileInfo.exists() && fileInfo.isExecutable()) {
-        return fileInfo.absoluteFilePath();
-    }
-    
-    // If not found, return empty string
-    return QString();
 }
 
 void SeedingWidget::updateParameterPreview()

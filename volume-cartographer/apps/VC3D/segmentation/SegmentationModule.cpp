@@ -64,17 +64,6 @@ float averageScale(const cv::Vec2f& scale)
     return (avg > 1e-4f) ? avg : 1.0f;
 }
 
-void ensureSurfaceMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-    surface->meta = utils::Json::object();
-}
-
 std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* viewer,
                                                            const QPointF& scenePos,
                                                            int rows,
@@ -2763,8 +2752,6 @@ void SegmentationModule::performAutosave()
         }
         return;
     }
-
-    ensureSurfaceMetaObject(surfacePtr.get());
 
     if (_pendingAutosaveVertexUpdates.empty() && _editManager && _editManager->hasSession()
         && _editManager->hasPendingChanges()) {

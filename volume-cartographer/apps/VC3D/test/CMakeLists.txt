@@ -351,6 +351,7 @@ add_executable(test_command_line_tool_runner
     test_command_line_tool_runner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolExecutable.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/ProgressUtil.cpp
@@ -367,7 +368,8 @@ target_compile_definitions(test_command_line_tool_runner PRIVATE VC_TESTING)
 target_link_libraries(test_command_line_tool_runner PRIVATE
     Qt6::Core
     Qt6::Test
-    Qt6::Widgets)
+    Qt6::Widgets
+    vc_core)
 
 add_test(NAME command_line_tool_runner COMMAND test_command_line_tool_runner)
 vc_register_test_target(test_command_line_tool_runner)

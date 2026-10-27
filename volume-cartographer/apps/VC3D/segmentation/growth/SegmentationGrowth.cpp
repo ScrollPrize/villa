@@ -51,26 +51,6 @@ private:
     int _previousThreadCount{1};
 };
 
-bool ensureGenerationsChannel(QuadSurface* surface)
-{
-    if (!surface) {
-        return false;
-    }
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        return true;
-    }
-
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return false;
-    }
-
-    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
-    surface->setChannel("generations", seeded);
-    return true;
-}
-
 void preserveApprovalMask(QuadSurface* oldSurface, QuadSurface* newSurface)
 {
     if (!oldSurface || !newSurface) {
@@ -333,6 +313,27 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     return params;
 }
 } // namespace
+
+bool ensureGenerationsChannel(QuadSurface* surface)
+{
+    if (!surface) {
+        return false;
+    }
+    cv::Mat generations = surface->channel("generations");
+    if (!generations.empty()) {
+        return true;
+    }
+
+    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return false;
+    }
+
+    cv::Mat_<uint16_t> seeded(points->rows, points->cols, static_cast<uint16_t>(1));
+    surface->setChannel("generations", seeded);
+    return true;
+}
+
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context)
