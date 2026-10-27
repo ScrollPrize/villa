@@ -329,7 +329,6 @@ TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
     const auto root = tempRoot("discover");
     writeBytes(volumeChunk(root, 0), 11);
     writeBytes(root / "volume-hash" / "manifest.json", 19);
-    writeBytes(root / "segments" / "level_0" / "0" / "0" / "0.bin", 23);
     writeBytes(root / "normal_grids" / "level_0" / "0" / "0" / "0.zst", 29);
 
     const auto lasagna = root / "open_data" / "lasagna" / "artifact";

@@ -91,11 +91,6 @@ public:
     SurfaceCache(const SurfaceCache&) = delete;
     SurfaceCache& operator=(const SurfaceCache&) = delete;
 
-    // Concurrent tile fills the process-wide pool can run. Callers sizing a
-    // chunk pool for the filler need this: one round of fills is what has to be
-    // resident at once.
-    [[nodiscard]] static std::size_t fillWorkerCount();
-
     [[nodiscard]] int levels() const;
     [[nodiscard]] int wMin() const;
     [[nodiscard]] int wCount() const;
