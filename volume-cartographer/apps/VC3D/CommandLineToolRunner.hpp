@@ -157,7 +157,6 @@ public:
     const QStringList& createdSurfaces() const { return _createdSurfaces; }
     
     void showConsoleOutput();
-    void hideConsoleOutput();
     void setIncludeTifs(bool include);
     // Applies to the next execute() attempt only.
     void setNextOmpThreads(int threads);

@@ -7,7 +7,6 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 
 #include <QApplication>
 #include <QCheckBox>

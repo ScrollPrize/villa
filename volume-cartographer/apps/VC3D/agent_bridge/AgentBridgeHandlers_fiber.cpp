@@ -469,9 +469,6 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     QString err;
     int exported = 0;
@@ -500,9 +497,6 @@ QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    if (p.contains("scale"))
-        throw AgentBridgeError{-32602,
-            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     const std::filesystem::path importPath(pathStr.toStdString());
     std::error_code ec;

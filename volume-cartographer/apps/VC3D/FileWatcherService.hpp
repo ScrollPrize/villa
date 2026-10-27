@@ -27,7 +27,6 @@ public:
     void stopWatching();
 
 signals:
-    void statusMessage(const QString& text, int timeout);
     void volumeCatalogChanged(const QString& preferredVolumeId);
 
 #ifdef __linux__

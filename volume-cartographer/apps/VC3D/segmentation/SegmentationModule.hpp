@@ -78,7 +78,6 @@ public:
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
     [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
-    [[nodiscard]] bool annotateMode() const { return _annotateMode; }
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
@@ -182,7 +181,6 @@ public:
     [[nodiscard]] SegmentationCorrectionsPayload buildCorrectionsPayload(bool onlyActiveCollection = false) const;
     void clearPendingCorrections();
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
-    [[nodiscard]] bool hoverPreviewEnabled() const { return _hoverPreviewEnabled; }
     bool ensureHoverTarget();
 
     struct HoverInfo
@@ -364,7 +362,6 @@ private:
     void updatePointMoveDrag(const cv::Vec3f& worldPos);
     void finishPointMoveDrag();
 
-    void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
@@ -434,15 +431,12 @@ private:
 
     void updateHover(VolumeViewerBase* viewer, const cv::Vec3f& worldPos, const QPointF& scenePos);
     [[nodiscard]] bool isNearRotationHandle(VolumeViewerBase* viewer, const cv::Vec3f& worldPos) const;
-    SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
-    void resetHoverLookupDetail();
     bool recoverHoverPointerFromCursor();
     void recordPointerSample(VolumeViewerBase* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
     void stopAllPushPull();
-    bool applyPushPullStep();
 
     void markAutosaveNeeded(bool immediate = false);
     void performAutosave();
@@ -551,15 +545,6 @@ private:
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 
-    struct HoverLookupMetrics
-    {
-        bool initialized{false};
-        cv::Vec3f lastWorld{0.0f, 0.0f, 0.0f};
-        float smoothedWorldUnitsPerSecond{0.0f};
-        QElapsedTimer timer;
-    };
-
-    HoverLookupMetrics _hoverLookup;
     struct HoverPointerSample
     {
         bool valid{false};

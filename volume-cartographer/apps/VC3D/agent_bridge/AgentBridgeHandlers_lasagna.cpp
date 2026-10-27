@@ -311,29 +311,29 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleLasagnaSelectOutputSegment(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    const QString name = p.value("name").toString();
-    if (name.isEmpty()) {
+    const QString segmentId = p.value("segmentId").toString();
+    if (segmentId.isEmpty()) {
         QJsonObject data;
-        data["param"] = "name";
-        throw AgentBridgeError{-32602, "name is required", data};
+        data["param"] = "segmentId";
+        throw AgentBridgeError{-32602, "segmentId is required", data};
     }
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     SurfacePanelController* panel = _window->_surfacePanel.get();
-    if (!panel || !panel->selectSurfaceById(name.toStdString())) {
+    if (!panel || !panel->selectSurfaceById(segmentId.toStdString())) {
         QJsonObject data;
         data["kind"] = "segment";
-        data["id"] = name;
+        data["id"] = segmentId;
         throw AgentBridgeError{-32007,
-                               QStringLiteral("Unknown or unselectable segment: %1").arg(name),
+                               QStringLiteral("Unknown or unselectable segment: %1").arg(segmentId),
                                data};
     }
 
     QJsonObject result;
     result["selected"] = true;
-    result["name"] = name;
+    result["segmentId"] = segmentId;
     return result;
 }
 

@@ -53,7 +53,6 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     }
     stopAllPushPull();
     clearUndoStack();
-    resetHoverLookupDetail();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     if (!_editManager->beginSession(surface)) {
@@ -115,7 +114,6 @@ void SegmentationModule::endEditingSession()
         _surfaceMaskTool->setActive(false);
     }
     _lineDrawKeyActive = false;
-    resetHoverLookupDetail();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     refreshOverlay();

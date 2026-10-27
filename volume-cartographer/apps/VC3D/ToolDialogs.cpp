@@ -652,9 +652,6 @@ void TraceParamsDialog::saveDefaults() const {
 bool   ConvertToObjDialog::s_haveSession = false;
 bool   ConvertToObjDialog::s_normUV = false;
 bool   ConvertToObjDialog::s_alignGrid = false;
-int    ConvertToObjDialog::s_decimate = 0;
-bool   ConvertToObjDialog::s_clean = false;
-double ConvertToObjDialog::s_cleanK = 5.0;
 int    ConvertToObjDialog::s_ompThreads = -1;
 
 ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
@@ -670,20 +667,13 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
     edtObj_->setToolTip("File name in the surface's artifact directory.");
     chkNormalize_ = new QCheckBox("Normalize UV to [0,1]", this);
     chkAlign_ = new QCheckBox("Align grid (flatten Z per row)", this);
-    spDecimate_ = new QSpinBox(this); spDecimate_->setRange(0, 10); spDecimate_->setValue(0);
-    chkClean_ = new QCheckBox("Clean surface outliers", this);
-    spCleanK_ = new QDoubleSpinBox(this); spCleanK_->setRange(0.0, 1000.0); spCleanK_->setDecimals(2); spCleanK_->setSingleStep(0.25); spCleanK_->setValue(5.0);
-    spCleanK_->setEnabled(false);
     edtThreads_ = new QLineEdit(this); edtThreads_->setPlaceholderText("optional");
     edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
 
     form->addRow("Surface:", new QLabel(surfaceName, this));
     form->addRow("OBJ name:", edtObj_);
-    form->addRow("Decimate iters:", spDecimate_);
     form->addRow("", chkNormalize_);
     form->addRow("", chkAlign_);
-    form->addRow("", chkClean_);
-    form->addRow("Clean K (sigma):", spCleanK_);
     form->addRow("OMP threads:", edtThreads_);
 
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -701,7 +691,6 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
     ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtObj_ });
 
     // Enable/disable K based on clean checkbox
-    connect(chkClean_, &QCheckBox::toggled, spCleanK_, &QWidget::setEnabled);
 
     // Apply saved defaults, then session overrides
     applySavedDefaults();
@@ -721,9 +710,6 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
 QString ConvertToObjDialog::objName() const { return edtObj_->text().trimmed(); }
 bool ConvertToObjDialog::normalizeUV() const { return chkNormalize_->isChecked(); }
 bool ConvertToObjDialog::alignGrid() const { return chkAlign_->isChecked(); }
-int ConvertToObjDialog::decimateIterations() const { return spDecimate_->value(); }
-bool ConvertToObjDialog::cleanSurface() const { return chkClean_->isChecked(); }
-double ConvertToObjDialog::cleanK() const { return spCleanK_->value(); }
 int ConvertToObjDialog::ompThreads() const {
     const QString t = edtThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
@@ -733,10 +719,6 @@ int ConvertToObjDialog::ompThreads() const {
 void ConvertToObjDialog::applyCodeDefaults() {
     chkNormalize_->setChecked(false);
     chkAlign_->setChecked(false);
-    spDecimate_->setValue(0);
-    chkClean_->setChecked(false);
-    spCleanK_->setValue(5.0);
-    spCleanK_->setEnabled(chkClean_->isChecked());
     edtThreads_->setText("");
 }
 
@@ -745,10 +727,6 @@ void ConvertToObjDialog::applySavedDefaults() {
     s.beginGroup("toobj/defaults");
     chkNormalize_->setChecked(s.value("normalize_uv", chkNormalize_->isChecked()).toBool());
     chkAlign_->setChecked(s.value("align_grid", chkAlign_->isChecked()).toBool());
-    spDecimate_->setValue(s.value("decimate_iters", spDecimate_->value()).toInt());
-    chkClean_->setChecked(s.value("clean_surface", chkClean_->isChecked()).toBool());
-    spCleanK_->setValue(s.value("clean_k", spCleanK_->value()).toDouble());
-    spCleanK_->setEnabled(chkClean_->isChecked());
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
     s.endGroup();
@@ -758,10 +736,6 @@ void ConvertToObjDialog::applySessionDefaults() {
     if (!s_haveSession) return;
     chkNormalize_->setChecked(s_normUV);
     chkAlign_->setChecked(s_alignGrid);
-    spDecimate_->setValue(s_decimate);
-    chkClean_->setChecked(s_clean);
-    spCleanK_->setValue(s_cleanK);
-    spCleanK_->setEnabled(chkClean_->isChecked());
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
 }
 
@@ -770,9 +744,6 @@ void ConvertToObjDialog::saveDefaults() const {
     s.beginGroup("toobj/defaults");
     s.setValue("normalize_uv", chkNormalize_->isChecked());
     s.setValue("align_grid", chkAlign_->isChecked());
-    s.setValue("decimate_iters", spDecimate_->value());
-    s.setValue("clean_surface", chkClean_->isChecked());
-    s.setValue("clean_k", spCleanK_->value());
     const int th = ompThreads();
     s.setValue("omp_threads", th);
     s.endGroup();
@@ -782,9 +753,6 @@ void ConvertToObjDialog::updateSessionFromUI() {
     s_haveSession = true;
     s_normUV = chkNormalize_->isChecked();
     s_alignGrid = chkAlign_->isChecked();
-    s_decimate = spDecimate_->value();
-    s_clean = chkClean_->isChecked();
-    s_cleanK = spCleanK_->value();
     s_ompThreads = ompThreads();
 }
 
@@ -1277,98 +1245,6 @@ int NeighborCopyDialog::neighborSpikeWindow() const
     return spSpikeWindow_ ? spSpikeWindow_->value() : 2;
 }
 
-// ================= ExportChunksDialog =================
-ExportChunksDialog::ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale)
-    : QDialog(parent)
-{
-    setWindowTitle(tr("Export Width Chunks"));
-    auto main = new QVBoxLayout(this);
-
-    // Info label about the surface
-    const int realWidth = scale > 0 ? static_cast<int>(surfaceWidth / scale) : surfaceWidth;
-    auto infoLabel = new QLabel(tr("Surface width: %1 px (real)").arg(realWidth), this);
-    main->addWidget(infoLabel);
-
-    auto form = new QFormLayout();
-    main->addLayout(form);
-
-    // Load defaults from settings
-    using namespace vc3d::settings;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int defaultChunkWidth = settings.value(export_::CHUNK_WIDTH_PX, export_::CHUNK_WIDTH_PX_DEFAULT).toInt();
-    const int defaultOverlap = settings.value(export_::CHUNK_OVERLAP_PX, export_::CHUNK_OVERLAP_PX_DEFAULT).toInt();
-    const bool defaultOverwrite = settings.value(export_::OVERWRITE, export_::OVERWRITE_DEFAULT).toBool();
-
-    spChunkWidth_ = new QSpinBox(this);
-    spChunkWidth_->setRange(100, 1000000);
-    spChunkWidth_->setSingleStep(1000);
-    spChunkWidth_->setValue(defaultChunkWidth);
-    spChunkWidth_->setSuffix(tr(" px"));
-    spChunkWidth_->setToolTip(tr("Width of each exported chunk in real (output) pixels"));
-    form->addRow(tr("Chunk width:"), spChunkWidth_);
-
-    spOverlap_ = new QSpinBox(this);
-    spOverlap_->setRange(0, 100000);
-    spOverlap_->setSingleStep(500);
-    spOverlap_->setValue(defaultOverlap);
-    spOverlap_->setSuffix(tr(" px"));
-    spOverlap_->setToolTip(tr("Overlap per side in real pixels.\n"
-                              "Each chunk extends this far into adjacent chunks.\n"
-                              "First chunk has no left overlap, last has no right overlap."));
-    form->addRow(tr("Overlap (per side):"), spOverlap_);
-
-    chkOverwrite_ = new QCheckBox(tr("Overwrite existing exports"), this);
-    chkOverwrite_->setChecked(defaultOverwrite);
-    form->addRow(chkOverwrite_);
-
-    // Preview info that updates when values change
-    auto previewLabel = new QLabel(this);
-    auto updatePreview = [this, previewLabel, realWidth, scale]() {
-        const int chunkW = spChunkWidth_->value();
-        const int overlap = spOverlap_->value();
-        // Step is chunk width (so overlap extends beyond)
-        const int step = chunkW;
-        int nChunks = 0;
-        if (step > 0 && realWidth > 0) {
-            // Each chunk covers [i*step - overlap, i*step + chunkW + overlap]
-            // But first starts at 0 and last ends at realWidth
-            nChunks = (realWidth + step - 1) / step;
-        }
-        previewLabel->setText(tr("Estimated chunks: %1").arg(nChunks));
-    };
-    connect(spChunkWidth_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
-    connect(spOverlap_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
-    updatePreview();
-    main->addWidget(previewLabel);
-
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(buttons, &QDialogButtonBox::accepted, this, [this, &settings]() {
-        // Save settings for next time
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        s.setValue("export/chunk_width_px", spChunkWidth_->value());
-        s.setValue("export/chunk_overlap_px", spOverlap_->value());
-        s.setValue("export/overwrite", chkOverwrite_->isChecked());
-        accept();
-    });
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    main->addWidget(buttons);
-}
-
-int ExportChunksDialog::chunkWidth() const
-{
-    return spChunkWidth_ ? spChunkWidth_->value() : 40000;
-}
-
-int ExportChunksDialog::overlapPerSide() const
-{
-    return spOverlap_ ? spOverlap_->value() : 0;
-}
-
-bool ExportChunksDialog::overwrite() const
-{
-    return chkOverwrite_ ? chkOverwrite_->isChecked() : true;
-}
-
 // ================= ABFFlattenDialog =================
 bool ABFFlattenDialog::s_haveSession = false;
 int ABFFlattenDialog::s_iterations = 10;
@@ -1829,7 +1705,7 @@ void VisLasagnaObjDialog::updateSessionFromUI()
 }
 
 // ============================================================================
-// MergeTifxyzDialog
+// MergeSurfacesDialog
 //
 // Edits a 2D grid of stored surfaces plus the RANSAC tunables for
 // vc_merge_tifxyz and exposes its merge.json + tunables to the caller. Each
@@ -1846,17 +1722,17 @@ void VisLasagnaObjDialog::updateSessionFromUI()
 #include <algorithm>
 #include <fstream>
 
-bool   MergeTifxyzDialog::s_haveSession = false;
-int    MergeTifxyzDialog::s_iters       = 3000;
-double MergeTifxyzDialog::s_min         = 5.0;
-double MergeTifxyzDialog::s_max         = 10.0;
-double MergeTifxyzDialog::s_madK        = 3.0;
-int    MergeTifxyzDialog::s_seed        = 0;
-int    MergeTifxyzDialog::s_anchorCap   = 0;
-int    MergeTifxyzDialog::s_stripCols   = 0;
-int    MergeTifxyzDialog::s_lastRows    = 0;
-int    MergeTifxyzDialog::s_lastCols    = 0;
-int    MergeTifxyzDialog::s_ompThreads  = -1;
+bool   MergeSurfacesDialog::s_haveSession = false;
+int    MergeSurfacesDialog::s_iters       = 3000;
+double MergeSurfacesDialog::s_min         = 5.0;
+double MergeSurfacesDialog::s_max         = 10.0;
+double MergeSurfacesDialog::s_madK        = 3.0;
+int    MergeSurfacesDialog::s_seed        = 0;
+int    MergeSurfacesDialog::s_anchorCap   = 0;
+int    MergeSurfacesDialog::s_stripCols   = 0;
+int    MergeSurfacesDialog::s_lastRows    = 0;
+int    MergeSurfacesDialog::s_lastCols    = 0;
+int    MergeSurfacesDialog::s_ompThreads  = -1;
 
 namespace {
 
@@ -1873,7 +1749,7 @@ QPair<int, int> defaultGridShape(int n)
 
 }
 
-MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
+MergeSurfacesDialog::MergeSurfacesDialog(QWidget* parent,
                                      const QStringList& seedSegmentIds,
                                      const QMap<QString, QString>& availableSurfaces)
     : QDialog(parent),
@@ -2020,7 +1896,7 @@ MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
     resize(720, 600);
 }
 
-void MergeTifxyzDialog::applyCodeDefaults()
+void MergeSurfacesDialog::applyCodeDefaults()
 {
     spIters_->setValue(3000);
     spMin_->setValue(5.0);
@@ -2032,7 +1908,7 @@ void MergeTifxyzDialog::applyCodeDefaults()
     edtThreads_->setText(QString());
 }
 
-void MergeTifxyzDialog::applySessionDefaults()
+void MergeSurfacesDialog::applySessionDefaults()
 {
     if (!s_haveSession) return;
     spIters_->setValue(s_iters);
@@ -2045,7 +1921,7 @@ void MergeTifxyzDialog::applySessionDefaults()
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : QString());
 }
 
-void MergeTifxyzDialog::updateSessionFromUI()
+void MergeSurfacesDialog::updateSessionFromUI()
 {
     s_haveSession = true;
     s_iters       = spIters_->value();
@@ -2060,7 +1936,7 @@ void MergeTifxyzDialog::updateSessionFromUI()
     s_ompThreads  = ompThreads();
 }
 
-void MergeTifxyzDialog::resizeGrid(int newRows, int newCols)
+void MergeSurfacesDialog::resizeGrid(int newRows, int newCols)
 {
     newRows = std::max(1, newRows);
     newCols = std::max(1, newCols);
@@ -2077,7 +1953,7 @@ void MergeTifxyzDialog::resizeGrid(int newRows, int newCols)
     updateRefCombo();
 }
 
-void MergeTifxyzDialog::seedGrid(const QStringList& seedSegmentIds)
+void MergeSurfacesDialog::seedGrid(const QStringList& seedSegmentIds)
 {
     QStringList seeds;
     for (const auto& s : seedSegmentIds) if (!s.isEmpty()) seeds << s;
@@ -2106,7 +1982,7 @@ void MergeTifxyzDialog::seedGrid(const QStringList& seedSegmentIds)
     updateRefCombo();
 }
 
-void MergeTifxyzDialog::promptAddSegments()
+void MergeSurfacesDialog::promptAddSegments()
 {
     // Open a small modal that lists every available segment; chosen
     // names are appended into the first empty cells (row-major).
@@ -2174,7 +2050,7 @@ void MergeTifxyzDialog::promptAddSegments()
     updateRefCombo();
 }
 
-QStringList MergeTifxyzDialog::collectGridNames() const
+QStringList MergeSurfacesDialog::collectGridNames() const
 {
     QStringList out;
     for (int r = 0; r < tblGrid_->rowCount(); ++r) {
@@ -2186,7 +2062,7 @@ QStringList MergeTifxyzDialog::collectGridNames() const
     return out;
 }
 
-QString MergeTifxyzDialog::mergeJsonText() const
+QString MergeSurfacesDialog::mergeJsonText() const
 {
     const int rows = tblGrid_->rowCount();
     const int cols = tblGrid_->columnCount();
@@ -2260,7 +2136,7 @@ QString MergeTifxyzDialog::mergeJsonText() const
     return out;
 }
 
-void MergeTifxyzDialog::rebuildPreview()
+void MergeSurfacesDialog::rebuildPreview()
 {
     lblPreview_->setText(mergeJsonText());
     // vc_merge_tifxyz names the merge after the grid's first surface.
@@ -2272,7 +2148,7 @@ void MergeTifxyzDialog::rebuildPreview()
         : tr("new surface %1_merged").arg(_availableSurfaces.value(first, first)));
 }
 
-void MergeTifxyzDialog::updateRefCombo()
+void MergeSurfacesDialog::updateRefCombo()
 {
     QString prev = cmbRef_->currentData().toString();
     QStringList names = collectGridNames();
@@ -2291,21 +2167,21 @@ void MergeTifxyzDialog::updateRefCombo()
     cmbRef_->blockSignals(false);
 }
 
-QString MergeTifxyzDialog::refSurface()    const { return cmbRef_->currentData().toString(); }
-int     MergeTifxyzDialog::ransacIters()   const { return spIters_->value(); }
-double  MergeTifxyzDialog::ransacMinThresh() const { return spMin_->value(); }
-double  MergeTifxyzDialog::ransacMaxThresh() const { return spMax_->value(); }
-double  MergeTifxyzDialog::ransacMadK()    const { return spMadK_->value(); }
-int     MergeTifxyzDialog::ransacSeed()    const { return spSeed_->value(); }
-int     MergeTifxyzDialog::anchorCap()     const { return spAnchorCap_->value(); }
-int     MergeTifxyzDialog::stripCols()     const { return spStripCols_->value(); }
-int     MergeTifxyzDialog::ompThreads() const {
+QString MergeSurfacesDialog::refSurface()    const { return cmbRef_->currentData().toString(); }
+int     MergeSurfacesDialog::ransacIters()   const { return spIters_->value(); }
+double  MergeSurfacesDialog::ransacMinThresh() const { return spMin_->value(); }
+double  MergeSurfacesDialog::ransacMaxThresh() const { return spMax_->value(); }
+double  MergeSurfacesDialog::ransacMadK()    const { return spMadK_->value(); }
+int     MergeSurfacesDialog::ransacSeed()    const { return spSeed_->value(); }
+int     MergeSurfacesDialog::anchorCap()     const { return spAnchorCap_->value(); }
+int     MergeSurfacesDialog::stripCols()     const { return spStripCols_->value(); }
+int     MergeSurfacesDialog::ompThreads() const {
     const QString t = edtThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
     bool ok = false; int v = t.toInt(&ok); return (ok && v > 0) ? v : -1;
 }
 
-void MergeTifxyzDialog::accept()
+void MergeSurfacesDialog::accept()
 {
     // --- validate grid -----------------------------------------------------
     QStringList names = collectGridNames();
@@ -2377,7 +2253,7 @@ MergePatchDialog::MergePatchDialog(QWidget* parent,
     : QDialog(parent),
       _availableSurfaces(availableSurfaces)
 {
-    setWindowTitle(tr("Patch tifxyz"));
+    setWindowTitle(tr("Patch Surface"));
     auto main = new QVBoxLayout(this);
 
     // --- Surface pickers -------------------------------------------------
@@ -2684,17 +2560,17 @@ void MergePatchDialog::accept()
     const QString idA = surfaceA();
     const QString idB = surfaceB();
     if (idA.isEmpty() || idB.isEmpty()) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("Pick two surfaces before proceeding."));
         return;
     }
     if (idA == idB) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("Parent and child must be different surfaces."));
         return;
     }
     if (spMin_->value() >= spMax_->value()) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("RANSAC min threshold must be strictly less than max."));
         return;
     }

@@ -61,5 +61,4 @@ public:
         setContextMenuPolicy(Qt::CustomContextMenu);
     }
     
-    SurfaceTreeWidgetItem* findItemForSurface(std::string id);
 };

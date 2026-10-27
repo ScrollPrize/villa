@@ -151,7 +151,7 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
     rp.ompThreads = p.value("ompThreads").toInt(rp.ompThreads);
     rp.paramOverrides = p.value("paramOverrides").toObject();
 
-    // Reoptimize runs vc_grow_seg_from_segments via the runner: the "tool" source.
+    // Reoptimize runs vc_grow_seg_from_seed (a local resume) via the runner: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
 
     SegmentationCommandHandler* handler = _window->_segmentationCommandHandler.get();

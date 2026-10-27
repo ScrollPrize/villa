@@ -85,7 +85,6 @@ public:
                            std::function<CChunkedVolumeViewer*()> segmentationViewerProvider,
                            QObject* parent = nullptr);
 
-    bool hasSurfaces() const;
 
     void configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection);
     void configureTags(const TagUiRefs& tags);
@@ -157,9 +156,9 @@ signals:
     void recalcAreaRequested(const QStringList& segmentIds);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
-    void mergeTifxyzRequested(const QStringList& segmentIds);
+    void mergeSurfacesRequested(const QStringList& segmentIds);
     // Emitted when the user right-clicks two selected segments and picks
-    // "Patch tifxyz...". CWindow wires this to
+    // "Patch surface...". CWindow wires this to
     // SegmentationCommandHandler::onMergePatch.
     void mergePatchRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
@@ -207,7 +206,7 @@ private:
     void updateTagCheckboxStates(const SurfaceCatalog::Row* row);
     void setTagCheckboxEnabled(bool enabled);
     void applyHighlightSelection(const std::string& id, bool enabled);
-    void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
+    void applyBindingStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
 
     UiRefs _ui;
@@ -231,7 +230,6 @@ private:
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
-    QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
 
     // Proximity filter answers: the query they answer and the surfaces it found.

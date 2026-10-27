@@ -84,24 +84,6 @@ inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection d
     return QStringLiteral("All");
 }
 
-inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
-{
-    switch (value) {
-    case static_cast<int>(SegmentationGrowthDirection::Up):
-        return SegmentationGrowthDirection::Up;
-    case static_cast<int>(SegmentationGrowthDirection::Down):
-        return SegmentationGrowthDirection::Down;
-    case static_cast<int>(SegmentationGrowthDirection::Left):
-        return SegmentationGrowthDirection::Left;
-    case static_cast<int>(SegmentationGrowthDirection::Right):
-        return SegmentationGrowthDirection::Right;
-    case static_cast<int>(SegmentationGrowthDirection::Fill):
-        return SegmentationGrowthDirection::Fill;
-    default:
-        return SegmentationGrowthDirection::All;
-    }
-}
-
 enum class SegmentationDirectionFieldOrientation {
     Normal = 0,
     Horizontal = 1,

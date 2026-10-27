@@ -14,11 +14,8 @@ public:
     explicit SegmentationHeaderRow(QWidget* parent = nullptr);
 
     void setEditingChecked(bool checked);
-    [[nodiscard]] bool isEditingChecked() const;
     void setAnnotateChecked(bool checked);
-    [[nodiscard]] bool isAnnotateChecked() const;
     void setDrawMaskChecked(bool checked);
-    [[nodiscard]] bool isDrawMaskChecked() const;
     void setStatusText(const QString& text);
 
 signals:

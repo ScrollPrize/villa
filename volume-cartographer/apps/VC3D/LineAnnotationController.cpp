@@ -401,15 +401,6 @@ using vc3d::line_annotation::kNeedsReoptimizationTag;
 constexpr double kMinimumControlPointSpacingBaseVoxels =
     vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
 
-std::optional<vc3d::opendata::CoordinateIdentity> coordinateIdentityForState(
-    const CState* state)
-{
-    if (!state || !state->vpkg() || state->currentVolumeId().empty())
-        return std::nullopt;
-    return vc3d::opendata::coordinateIdentityForVolume(
-        *state->vpkg(), state->currentVolumeId());
-}
-
 constexpr double kLineSegmentLength = 32.0;
 // Quiet window between a control-point edit and the solve it dispatches;
 // rapid placement coalesces into one solve over the union of dirty spans.

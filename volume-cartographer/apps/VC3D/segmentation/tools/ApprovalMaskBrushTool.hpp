@@ -78,7 +78,6 @@ public:
 
     void setHoverWorldPos(const cv::Vec3f& pos, float brushRadius, const QPointF& surfacePos,
                           const std::optional<cv::Vec3f>& planeNormal = std::nullopt);
-    void clearHoverWorldPos() { _hoverWorldPos = std::nullopt; _hoverEffectiveRadius = 0.0f; _hoverSurfacePos = std::nullopt; _hoverPlaneNormal = std::nullopt; }
 
     void cancel() { clear(); }
     [[nodiscard]] bool isActive() const { return brushActive() || strokeActive(); }

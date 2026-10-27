@@ -526,8 +526,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     SegmentationCommandHandler::RenderSegmentParams rp;
 
-    // outputFormat: required; the headline new capability over the GUI (which is
-    // hardcoded to a per-slice TIFF stack).
+    // outputFormat: "zarr", otherwise a per-slice TIFF stack.
     const QString outputFormat = p.value("outputFormat").toString();
     if (outputFormat == QLatin1String("zarr")) {
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::Zarr;

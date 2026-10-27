@@ -93,7 +93,7 @@ void AgentBridgeServer::registerLasagnaHandlers()
         {
             .name = QStringLiteral("lasagna.select_output_segment"),
             .params = {
-                Params::requiredString(QStringLiteral("name")),
+                Params::requiredString(QStringLiteral("segmentId")),
             },
             .errors = {-32602, -32000, -32007},
             .mcp = Mcp::exact(QStringLiteral("vc3d_lasagna_select_output")),

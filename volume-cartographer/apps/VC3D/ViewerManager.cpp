@@ -1232,9 +1232,6 @@ void ViewerManager::setIntersectionMaxSurfaces(int limit)
         return;
     }
     _intersectionMaxSurfaces = limit;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, limit);
 }
 
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
@@ -1375,7 +1372,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
 
     // The live index already covers exactly this surface set at the current
-    // stride (e.g. a reload that only changed folder colors): nothing to do.
+    // stride (e.g. a reload that only changed tags or colors): nothing to do.
     if (!hadRunningBuild && !_surfacePatchIndexNeedsRebuild && !_deferredIndexSwap &&
         !_surfacePatchIndex.empty() &&
         _surfacePatchIndex.samplingStride() == _surfacePatchSamplingStride &&

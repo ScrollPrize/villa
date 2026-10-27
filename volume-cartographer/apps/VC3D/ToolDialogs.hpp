@@ -181,9 +181,6 @@ public:
     QString objName() const;
     bool normalizeUV() const;
     bool alignGrid() const;
-    int decimateIterations() const;
-    bool cleanSurface() const;
-    double cleanK() const;
     int ompThreads() const; // -1 if unset
 
 private:
@@ -191,9 +188,6 @@ private:
     static bool   s_haveSession;
     static bool   s_normUV;
     static bool   s_alignGrid;
-    static int    s_decimate;
-    static bool   s_clean;
-    static double s_cleanK;
     static int    s_ompThreads; // -1 if unset
 
     void applyCodeDefaults();
@@ -206,26 +200,23 @@ private:
     QLineEdit* edtThreads_{nullptr};
     QCheckBox* chkNormalize_{nullptr};
     QCheckBox* chkAlign_{nullptr};
-    QSpinBox* spDecimate_{nullptr};
-    QCheckBox* chkClean_{nullptr};
-    QDoubleSpinBox* spCleanK_{nullptr};
 };
 
 class QTableWidget;
 class QPushButton;
 class QLabel;
 
-// MergeTifxyzDialog
+// MergeSurfacesDialog
 //
 // Edits a 2D grid of stored surfaces and the RANSAC tunables for
 // vc_merge_tifxyz and builds its merge.json. The grid layout encodes the surface adjacency that
 // the merge tool RANSAC-aligns; empty cells are allowed; selection in
 // the segment list is used as the seed but the user can edit / append.
-class MergeTifxyzDialog : public QDialog {
+class MergeSurfacesDialog : public QDialog {
     Q_OBJECT
 public:
     // The grid holds surface UUIDs; `availableSurfaces` maps UUID -> name.
-    MergeTifxyzDialog(QWidget* parent,
+    MergeSurfacesDialog(QWidget* parent,
                       const QStringList& seedSegmentIds,
                       const QMap<QString, QString>& availableSurfaces);
 
@@ -298,7 +289,7 @@ class QCheckBox;
 
 // MergePatchDialog
 //
-// Two-input cousin of MergeTifxyzDialog: picks a parent + child stored
+// Two-input cousin of MergeSurfacesDialog: picks a parent + child stored
 // surface, exposes vc_merge_patch's tunables (border-cells, blend-cells,
 // idw-k, RANSAC set, anchor-cap, OMP threads), and surfaces the role
 // auto-detect / explicit-override the binary supports. The binary edits the
@@ -503,21 +494,6 @@ private:
     QSpinBox* spInterpWindow_{nullptr};
     QSpinBox* spGenerations_{nullptr};
     QSpinBox* spSpikeWindow_{nullptr};
-};
-
-class ExportChunksDialog : public QDialog {
-    Q_OBJECT
-public:
-    ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale);
-
-    int chunkWidth() const;
-    int overlapPerSide() const;
-    bool overwrite() const;
-
-private:
-    QSpinBox* spChunkWidth_{nullptr};
-    QSpinBox* spOverlap_{nullptr};
-    QCheckBox* chkOverwrite_{nullptr};
 };
 
 class ABFFlattenDialog : public QDialog {

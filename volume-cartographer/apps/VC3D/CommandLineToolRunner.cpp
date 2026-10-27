@@ -487,13 +487,6 @@ void CommandLineToolRunner::showConsoleOutput()
     }
 }
 
-void CommandLineToolRunner::hideConsoleOutput()
-{
-    if (_consoleDialog) {
-        _consoleDialog->hide();
-    }
-}
-
 void CommandLineToolRunner::onProcessReadyRead()
 {
     if (_process) {

@@ -50,11 +50,6 @@ void SegmentationHeaderRow::setEditingChecked(bool checked)
     _chkEditing->setChecked(checked);
 }
 
-bool SegmentationHeaderRow::isEditingChecked() const
-{
-    return _chkEditing && _chkEditing->isChecked();
-}
-
 void SegmentationHeaderRow::setAnnotateChecked(bool checked)
 {
     if (!_chkAnnotate) {
@@ -64,11 +59,6 @@ void SegmentationHeaderRow::setAnnotateChecked(bool checked)
     _chkAnnotate->setChecked(checked);
 }
 
-bool SegmentationHeaderRow::isAnnotateChecked() const
-{
-    return _chkAnnotate && _chkAnnotate->isChecked();
-}
-
 void SegmentationHeaderRow::setDrawMaskChecked(bool checked)
 {
     if (!_chkDrawMask) {
@@ -76,11 +66,6 @@ void SegmentationHeaderRow::setDrawMaskChecked(bool checked)
     }
     const QSignalBlocker blocker(_chkDrawMask);
     _chkDrawMask->setChecked(checked);
-}
-
-bool SegmentationHeaderRow::isDrawMaskChecked() const
-{
-    return _chkDrawMask && _chkDrawMask->isChecked();
 }
 
 void SegmentationHeaderRow::setStatusText(const QString& text)

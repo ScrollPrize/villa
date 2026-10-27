@@ -1025,12 +1025,12 @@
       },
       "params": {
         "properties": {
-          "name": {
+          "segmentId": {
             "type": "string"
           }
         },
         "required": [
-          "name"
+          "segmentId"
         ],
         "type": "object"
       }

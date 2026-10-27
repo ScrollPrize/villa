@@ -33,8 +33,8 @@ class QFileInfo;
 /**
  * SegmentationCommandHandler
  *
- * Handles all segment operation slots previously defined in CWindowContextMenu.cpp.
- * Designed to be created by CWindow and wired up to the context menu signals.
+ * Runs the segment operations (command-line tools, their dialogs and jobs)
+ * requested from the surface panel, menus and agent bridge. Created by CWindow.
  */
 class SegmentationCommandHandler : public QObject
 {
@@ -203,9 +203,9 @@ public slots:
     void onStraighten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
     void onRasterizeSegments(const QStringList& segmentIds);
-    // Open the MergeTifxyzDialog seeded with `segmentIds` (empty = open
+    // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
     // dialog with empty grid for the user to populate via "Add segments").
-    void onMergeTifxyz(const QStringList& segmentIds);
+    void onMergeSurfaces(const QStringList& segmentIds);
     // Open the MergePatchDialog. When invoked from the surface context
     // menu we receive exactly two segment IDs; from the top menu the list
     // is empty and the user picks both via the dialog combos.

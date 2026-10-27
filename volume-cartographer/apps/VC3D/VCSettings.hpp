@@ -146,8 +146,6 @@ namespace viewer {
     constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
     constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
 
-    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
-
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
@@ -361,21 +359,6 @@ namespace line_annotation {
     constexpr auto FIBER_FOLLOW_CHECKPOINT = "lineAnnotation/fiber_follow_checkpoint";
     // Empty: the Python environment VC3D was started from.
     constexpr auto FIBER_FOLLOW_PYTHON = "lineAnnotation/fiber_follow_python";
-}
-
-// -----------------------------------------------------------------------------
-// Export Settings
-// -----------------------------------------------------------------------------
-namespace export_ {  // underscore because 'export' is reserved keyword
-    constexpr auto CHUNK_WIDTH_PX = "export/chunk_width_px";
-    constexpr auto CHUNK_OVERLAP_PX = "export/chunk_overlap_px";
-    constexpr auto OVERWRITE = "export/overwrite";
-    constexpr auto DIR = "export/dir";
-
-    constexpr int CHUNK_WIDTH_PX_DEFAULT = 40000;
-    constexpr int CHUNK_OVERLAP_PX_DEFAULT = 0;
-    constexpr bool OVERWRITE_DEFAULT = true;
-    constexpr auto DIR_DEFAULT = "";
 }
 
 // -----------------------------------------------------------------------------

@@ -149,17 +149,18 @@ async def vc3d_lasagna_cancel(job_id: Optional[str] = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_lasagna_select_output(name: str) -> dict[str, Any]:
-    """Activate a Lasagna output segment by name -- the programmatic twin of
-    picking a lasagna output in the panel. Requires a volume package to be open.
+async def vc3d_lasagna_select_output(segment_id: str) -> dict[str, Any]:
+    """Activate a Lasagna output segment -- the programmatic twin of picking a
+    lasagna output in the panel. Requires a volume package to be open.
 
-    name: the output segment id/name; must be non-empty (empty fails -32602).
+    segment_id: the output surface's UUID (as vc3d_list_segments reports it);
+    must be non-empty (empty fails -32602).
 
-    Returns {"selected": true, "name": str}. Errors: -32000 (no volume package),
-    -32602 (empty name), -32007 (data.kind:"segment" -- unknown or unselectable
-    segment).
+    Returns {"selected": true, "segmentId": str}. Errors: -32000 (no volume
+    package), -32602 (empty segmentId), -32007 (data.kind:"segment" -- unknown or
+    unselectable segment).
     """
-    return await _call("lasagna.select_output_segment", {"name": name})
+    return await _call("lasagna.select_output_segment", {"segmentId": segment_id})
 
 
 @mcp.tool()

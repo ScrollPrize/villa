@@ -634,14 +634,9 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 // Returns NAN if surface is null, "d" channel is missing, or coords are out of bounds.
 float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
-std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
-
 // Control CUDA usage in GrowPatch (space_tracing_quad_phys). Default is true.
 void set_space_tracing_use_cuda(bool enable);
 
 // Surface containment tests
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
 bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
-bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);

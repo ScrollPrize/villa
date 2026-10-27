@@ -49,7 +49,6 @@ public:
     bool start(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stop(int direction);
     void stopAll();
-    bool applyStep();
 
     void cancel() override { stopAll(); }
     [[nodiscard]] bool isActive() const override { return _ppState.active; }

@@ -455,9 +455,9 @@ QString SegmentationWidget::volumeZarrPath() const { return _neuralTracerPanel->
 int SegmentationWidget::neuralVolumeScale() const { return _neuralTracerPanel->neuralVolumeScale(); }
 int SegmentationWidget::neuralBatchSize() const { return _neuralTracerPanel->neuralBatchSize(); }
 NeuralTracerModelType SegmentationWidget::neuralModelType() const { return _neuralTracerPanel->neuralModelType(); }
-DenseTtaMode SegmentationWidget::denseTtaMode() const { return _neuralTracerPanel->denseTtaMode(); }
-QString SegmentationWidget::denseTtaMergeMethod() const { return _neuralTracerPanel->denseTtaMergeMethod(); }
-double SegmentationWidget::denseTtaOutlierDropThresh() const { return _neuralTracerPanel->denseTtaOutlierDropThresh(); }
+TtaMode SegmentationWidget::ttaMode() const { return _neuralTracerPanel->ttaMode(); }
+QString SegmentationWidget::ttaMergeMethod() const { return _neuralTracerPanel->ttaMergeMethod(); }
+double SegmentationWidget::ttaOutlierDropThresh() const { return _neuralTracerPanel->ttaOutlierDropThresh(); }
 QString SegmentationWidget::copyCheckpointPath() const { return _neuralTracerPanel->copyCheckpointPath(); }
 
 void SegmentationWidget::setNeuralTracerEnabled(bool enabled) { _neuralTracerPanel->setNeuralTracerEnabled(enabled); }
@@ -466,9 +466,9 @@ void SegmentationWidget::setNeuralPythonPath(const QString& path) { _neuralTrace
 void SegmentationWidget::setNeuralVolumeScale(int scale) { _neuralTracerPanel->setNeuralVolumeScale(scale); }
 void SegmentationWidget::setNeuralBatchSize(int size) { _neuralTracerPanel->setNeuralBatchSize(size); }
 void SegmentationWidget::setNeuralModelType(NeuralTracerModelType type) { _neuralTracerPanel->setNeuralModelType(type); }
-void SegmentationWidget::setDenseTtaMode(DenseTtaMode mode) { _neuralTracerPanel->setDenseTtaMode(mode); }
-void SegmentationWidget::setDenseTtaMergeMethod(const QString& method) { _neuralTracerPanel->setDenseTtaMergeMethod(method); }
-void SegmentationWidget::setDenseTtaOutlierDropThresh(double threshold) { _neuralTracerPanel->setDenseTtaOutlierDropThresh(threshold); }
+void SegmentationWidget::setTtaMode(TtaMode mode) { _neuralTracerPanel->setTtaMode(mode); }
+void SegmentationWidget::setTtaMergeMethod(const QString& method) { _neuralTracerPanel->setTtaMergeMethod(method); }
+void SegmentationWidget::setTtaOutlierDropThresh(double threshold) { _neuralTracerPanel->setTtaOutlierDropThresh(threshold); }
 void SegmentationWidget::setCopyCheckpointPath(const QString& path) { _neuralTracerPanel->setCopyCheckpointPath(path); }
 void SegmentationWidget::setVolumeZarrPath(const QString& path) { _neuralTracerPanel->setVolumeZarrPath(path); }
 

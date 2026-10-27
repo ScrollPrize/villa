@@ -435,7 +435,7 @@ struct CopyDisplacementJob
     QString volumeZarrPath;
     int volumeScale{0};
     QString checkpointPath;
-    DenseTtaMode ttaMode{DenseTtaMode::Mirror};
+    TtaMode ttaMode{TtaMode::Mirror};
     QString ttaMergeMethod{QStringLiteral("vector_geomedian")};
     double ttaOutlierDropThresh{1.25};
     utils::Json customParams;
@@ -510,14 +510,14 @@ TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
     request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
 
     switch (job.ttaMode) {
-    case DenseTtaMode::Rotate3:
+    case TtaMode::Rotate3:
         request["tta"] = true;
         request["tta_transform"] = "rotate3";
         break;
-    case DenseTtaMode::None:
+    case TtaMode::None:
         request["tta"] = false;
         break;
-    case DenseTtaMode::Mirror:
+    case TtaMode::Mirror:
     default:
         request["tta"] = true;
         request["tta_transform"] = "mirror";
@@ -585,11 +585,6 @@ SegmentationGrower::SegmentationGrower(Context context,
 void SegmentationGrower::updateContext(Context context)
 {
     _context = std::move(context);
-}
-
-void SegmentationGrower::updateUiCallbacks(UiCallbacks callbacks)
-{
-    _callbacks = std::move(callbacks);
 }
 
 void SegmentationGrower::setSurfacePanel(SurfacePanelController* panel)
@@ -1088,19 +1083,6 @@ void SegmentationGrower::finalize(bool ok)
     _activeRequest.reset();
 }
 
-void SegmentationGrower::handleFailure(const QString& message)
-{
-    auto showStatus = [&](const QString& text, int timeout) {
-        if (_callbacks.showStatus) {
-            _callbacks.showStatus(text, timeout);
-        }
-    };
-    if (!message.isEmpty()) {
-        showStatus(message, kStatusLong);
-    }
-    finalize(false);
-}
-
 bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 {
     auto showStatus = [&](const QString& text, int timeout) {
@@ -1162,9 +1144,9 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     const QString pythonPath = _context.widget->neuralPythonPath();
     const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
     const int volumeScale = _context.widget->neuralVolumeScale();
-    const DenseTtaMode ttaMode = _context.widget->denseTtaMode();
-    const QString ttaMergeMethod = _context.widget->denseTtaMergeMethod().trimmed();
-    const double ttaOutlierDropThresh = _context.widget->denseTtaOutlierDropThresh();
+    const TtaMode ttaMode = _context.widget->ttaMode();
+    const QString ttaMergeMethod = _context.widget->ttaMergeMethod().trimmed();
+    const double ttaOutlierDropThresh = _context.widget->ttaOutlierDropThresh();
     const bool usingCopyLatestPreset = copyCheckpointPath == kCopyLatestSentinel;
 
     if (copyCheckpointPath.isEmpty()) {

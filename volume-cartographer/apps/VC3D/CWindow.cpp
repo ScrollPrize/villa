@@ -1052,8 +1052,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
     _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
-    connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
-            this, &CWindow::onShowStatusMessage);
     connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
             this, [this](const QString& preferredVolumeId) {
                 refreshCurrentVolumePackageUi(preferredVolumeId);
@@ -1336,12 +1334,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
-    // Wire the Actions -> Merge tifxyz... menu entry to the handler.
+    // Wire the Actions -> Merge Surfaces... menu entry to the handler.
     // Has to happen here (not inside CreateWidgets) because
     // _menuController is created after CreateWidgets() returns.
-    connect(_menuController.get(), &MenuActionController::mergeTifxyzFromMenuRequested,
+    connect(_menuController.get(), &MenuActionController::mergeSurfacesFromMenuRequested,
             this, [this]() {
-                _segmentationCommandHandler->onMergeTifxyz(QStringList{});
+                _segmentationCommandHandler->onMergeSurfaces(QStringList{});
             });
     connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
             this, [this]() {
@@ -3150,15 +3148,15 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergeTifxyzRequested,
+    connect(_surfacePanel.get(), &SurfacePanelController::mergeSurfacesRequested,
             this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergeTifxyz(segmentIds);
+                _segmentationCommandHandler->onMergeSurfaces(segmentIds);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
             this, [this](const QStringList& segmentIds) {
                 _segmentationCommandHandler->onMergePatch(segmentIds);
             });
-    // Note: the Actions -> Merge tifxyz... menu wiring lives in the
+    // Note: the Actions -> Merge Surfaces... menu wiring lives in the
     // constructor after _menuController is initialized -- _menuController
     // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,

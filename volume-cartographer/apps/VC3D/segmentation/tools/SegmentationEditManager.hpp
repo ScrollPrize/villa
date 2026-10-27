@@ -112,11 +112,6 @@ public:
                               const std::vector<GridKey>& editedVertices,
                               bool markAsPendingEdit,
                               std::optional<cv::Rect>* outDiffBounds = nullptr);
-    bool setResizedPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                                 const cv::Mat_<cv::Vec3f>& originalPoints,
-                                 const std::vector<GridKey>& editedVertices,
-                                 bool markAsPendingEdit,
-                                 std::optional<cv::Rect>* outDiffBounds = nullptr);
     bool restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points);
 
     void resetPreview();
@@ -145,8 +140,6 @@ public:
 
     void markNextEditsAsGrowth();
 
-    void bakePreviewToOriginal();
-    bool invalidateRegion(int centerRow, int centerCol, int radius);
     bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
 

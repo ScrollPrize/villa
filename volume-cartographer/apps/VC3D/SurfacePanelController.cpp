@@ -102,12 +102,8 @@ nlohmann::json row_meta(const SurfaceCatalog::Row& row)
 
 QString long_id(const nlohmann::json& meta)
 {
-    for (const char* key : {"segment_long_id", "long_id", "longId"}) {
-        const auto found = meta.find(key);
-        if (found != meta.end() && found->is_string() && !found->get<std::string>().empty()) {
-            return QString::fromStdString(found->get<std::string>());
-        }
-    }
+    const auto found = meta.find("segment_long_id");
+    if (found != meta.end() && found->is_string()) return QString::fromStdString(found->get<std::string>());
     return {};
 }
 
@@ -170,11 +166,6 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
     }
 }
 
-bool SurfacePanelController::hasSurfaces() const
-{
-    return _ui.treeWidget && _ui.treeWidget->topLevelItemCount() > 0;
-}
-
 SurfaceTreeWidgetItem* SurfacePanelController::itemFor(const std::string& id) const
 {
     if (!_ui.treeWidget || id.empty()) {
@@ -213,7 +204,7 @@ void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const Surfa
     item->setText(SURFACE_AVG_COST_COLUMN, avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-"));
     item->setText(TIMESTAMP_COLUMN, QString::fromStdString(row.record.changedAt));
     item->updateItemIcon(has_tag(row, "approved"), has_tag(row, "defective"));
-    applyTransformWarningStyle(item);
+    applyBindingStyle(item);
 }
 
 void SurfacePanelController::syncTree()
@@ -558,7 +549,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     if (selectedSegmentIds.size() >= 2 && allUsable) {
         QAction* mergeAction = contextMenu.addAction(tr("Merge surfaces..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
-            emit mergeTifxyzRequested(selectedSegmentIds);
+            emit mergeSurfacesRequested(selectedSegmentIds);
         });
     }
     // Patch is exactly-2-input; gate to exactly 2 selected surfaces so the
@@ -1122,21 +1113,17 @@ void SurfacePanelController::setSelectionLocked(bool locked)
     }
 }
 
-void SurfacePanelController::applyTransformWarningStyle(SurfaceTreeWidgetItem* item)
+void SurfacePanelController::applyBindingStyle(SurfaceTreeWidgetItem* item)
 {
     if (!item) {
         return;
     }
 
-    const bool warning = !_transformWarningText.isEmpty();
     const bool unbound = item->data(SURFACE_ID_COLUMN, kUnboundRole).toBool();
-    const QBrush foreground = warning ? QBrush(QColor(QStringLiteral("#c62828")))
-                            : unbound ? QBrush(QColor(Qt::gray)) : QBrush();
+    const QBrush foreground = unbound ? QBrush(QColor(Qt::gray)) : QBrush();
     for (int column = SURFACE_ID_COLUMN; column <= TIMESTAMP_COLUMN; ++column) {
         item->setForeground(column, foreground);
-        if (warning) {
-            item->setToolTip(column, _transformWarningText);
-        } else if (unbound) {
+        if (unbound) {
             item->setToolTip(column, tr("Not bound to the current volume"));
         } else if (column == SURFACE_ID_COLUMN || column == SURFACE_LONG_ID_COLUMN) {
             item->setToolTip(column, item->text(column));
@@ -1863,14 +1850,6 @@ void SurfacePanelController::applyFiltersInternal()
         emit visibleSurfacesChanged(_visibleSurfaceIds);
     }
 
-    if (_viewerManager) {
-        const std::set<std::string> intersects{"segmentation"};
-        _viewerManager->forEachBaseViewer([&intersects](VolumeViewerBase* viewer) {
-            if (viewer && viewer->surfName() != "segmentation") {
-                viewer->setIntersects(intersects);
-            }
-        });
-    }
 
     emit filtersApplied(filterCounter);
 }

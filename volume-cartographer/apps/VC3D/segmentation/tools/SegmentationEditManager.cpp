@@ -320,68 +320,6 @@ bool SegmentationEditManager::setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& po
     return true;
 }
 
-bool SegmentationEditManager::setResizedPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
-                                                        const cv::Mat_<cv::Vec3f>& originalPoints,
-                                                        const std::vector<GridKey>& editedVertices,
-                                                        bool markAsPendingEdit,
-                                                        std::optional<cv::Rect>* outDiffBounds)
-{
-    if (outDiffBounds) {
-        outDiffBounds->reset();
-    }
-    auto* preview = previewPointsPtr();
-    if (!preview || points.empty() || originalPoints.empty() ||
-        points.rows != originalPoints.rows || points.cols != originalPoints.cols) {
-        return false;
-    }
-
-    _preResizeOriginalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(preview->clone());
-    points.copyTo(*preview);
-    _originalPoints = std::make_unique<cv::Mat_<cv::Vec3f>>(originalPoints.clone());
-    _editedVertices.clear();
-    _recentTouched.clear();
-    _recentTouched.reserve(editedVertices.size());
-
-    bool diffFound = false;
-    int minRow = points.rows;
-    int maxRow = -1;
-    int minCol = points.cols;
-    int maxCol = -1;
-
-    for (const auto& key : editedVertices) {
-        if (key.row < 0 || key.row >= points.rows || key.col < 0 || key.col >= points.cols) {
-            continue;
-        }
-        const cv::Vec3f& original = originalPoints(key.row, key.col);
-        const cv::Vec3f& current = points(key.row, key.col);
-        if (original[0] == current[0] && original[1] == current[1] && original[2] == current[2]) {
-            continue;
-        }
-        diffFound = true;
-        minRow = std::min(minRow, key.row);
-        maxRow = std::max(maxRow, key.row);
-        minCol = std::min(minCol, key.col);
-        maxCol = std::max(maxCol, key.col);
-        _recentTouched.push_back(key);
-        _editedVertices[key] = VertexEdit{key.row, key.col, original, current, _pendingGrowthMarking};
-        queueEditSurfacePatchIndexVertex(key.row, key.col);
-    }
-
-    if (_baseSurface) {
-        _baseSurface->invalidateCache();
-    }
-    _hasPendingEdits = markAsPendingEdit && !_editedVertices.empty();
-    if (_pendingGrowthMarking && !_editedVertices.empty()) {
-        _pendingGrowthMarking = false;
-    }
-    resetPointerSeed();
-
-    if (outDiffBounds && diffFound) {
-        *outDiffBounds = cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
-    }
-    return true;
-}
-
 bool SegmentationEditManager::restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points)
 {
     auto* preview = previewPointsPtr();
@@ -933,58 +871,6 @@ std::optional<cv::Rect> SegmentationEditManager::recentTouchedBounds() const
 void SegmentationEditManager::markNextEditsAsGrowth()
 {
     _pendingGrowthMarking = true;
-}
-
-void SegmentationEditManager::bakePreviewToOriginal()
-{
-    auto* preview = previewPointsPtr();
-    if (!preview || !_originalPoints) {
-        return;
-    }
-
-    preview->copyTo(*_originalPoints);
-    _editedVertices.clear();
-    _recentTouched.clear();
-    clearActiveDrag();
-    _hasPendingEdits = false;
-}
-
-bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int radius)
-{
-    auto* preview = previewPointsPtr();
-    if (!_originalPoints || !preview) {
-        return false;
-    }
-    if (radius <= 0) {
-        return false;
-    }
-
-    const int rows = preview->rows;
-    const int cols = preview->cols;
-    const int rowStart = std::max(0, centerRow - radius);
-    const int rowEnd = std::min(rows - 1, centerRow + radius);
-    const int colStart = std::max(0, centerCol - radius);
-    const int colEnd = std::min(cols - 1, centerCol + radius);
-
-    bool changed = false;
-
-    for (int r = rowStart; r <= rowEnd; ++r) {
-        for (int c = colStart; c <= colEnd; ++c) {
-            const cv::Vec3f& original = (*_originalPoints)(r, c);
-            if (!vc::geometry::validSurfacePoint(original)) {
-                continue;
-            }
-            (*preview)(r, c) = original;
-            recordVertexEdit(r, c, original);
-            changed = true;
-        }
-    }
-
-    if (changed) {
-        _hasPendingEdits = true;
-    }
-
-    return changed;
 }
 
 bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, float radiusSteps)

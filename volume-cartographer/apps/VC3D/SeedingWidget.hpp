@@ -120,9 +120,6 @@ private:
     
     void setupUI();
     void computeDistanceTransform();
-    void castRays();
-    void findPeaksAlongRay(const cv::Vec2f& rayDir, const cv::Vec3f& startPoint);
-    void runSegmentation();
     QString findExecutablePath();
     void updateParameterPreview();
     void updateModeUI();
@@ -155,7 +152,6 @@ private:
     QColor generatePathColor();
     void displayPaths();
     void updatePointsDisplay();
-    void updateInfoLabel();
     void updateButtonStates();
     
 private:

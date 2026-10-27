@@ -72,7 +72,6 @@
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
-#include <QTemporaryDir>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
@@ -209,11 +208,11 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
     connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
 
-    _mergeTifxyzAct = new QAction(QObject::tr("Merge tifxyz..."), this);
-    connect(_mergeTifxyzAct, &QAction::triggered,
-            this, &MenuActionController::mergeTifxyzFromMenuRequested);
+    _mergeSurfacesAct = new QAction(QObject::tr("Merge Surfaces..."), this);
+    connect(_mergeSurfacesAct, &QAction::triggered,
+            this, &MenuActionController::mergeSurfacesFromMenuRequested);
 
-    _mergePatchAct = new QAction(QObject::tr("Patch tifxyz..."), this);
+    _mergePatchAct = new QAction(QObject::tr("Patch Surface..."), this);
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
@@ -298,7 +297,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_mergeTifxyzAct);
+    _actionsMenu->addAction(_mergeSurfacesAct);
     _actionsMenu->addAction(_mergePatchAct);
     _actionsMenu->addAction(_growTrackPatchesAct);
     _actionsMenu->addSeparator();
@@ -401,14 +400,6 @@ void MenuActionController::updateRecentVolpkgList(const QString& path)
     while (files.size() > MAX_RECENT_VOLPKG) {
         files.removeLast();
     }
-    saveRecentPaths(files);
-    refreshRecentMenu();
-}
-
-void MenuActionController::removeRecentVolpkgEntry(const QString& path)
-{
-    QStringList files = loadRecentPaths();
-    files.removeAll(path);
     saveRecentPaths(files);
     refreshRecentMenu();
 }

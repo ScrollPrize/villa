@@ -296,7 +296,6 @@ void SegmentationModule::setHoverPreviewEnabled(bool enabled)
         return;
     }
     _hoverPreviewEnabled = enabled;
-    resetHoverLookupDetail();
     if (!enabled && _hover.valid) {
         _hover.clear();
     }
@@ -595,7 +594,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
-        resetHoverLookupDetail();
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
         if (_autosaveState.pending() && _editManager && _editManager->hasSession()) {
@@ -1114,7 +1112,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
         setAnnotateMode(false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
-        resetHoverLookupDetail();
     } else if (_editingEnabled && _hoverPreviewEnabled && !_hover.valid) {
         recoverHoverPointerFromCursor();
         ensureHoverTarget();
@@ -1471,14 +1468,6 @@ void SegmentationModule::handleCorrectionPointRemove(const cv::Vec3f& worldPos)
 {
     if (_corrections) {
         _corrections->handlePointRemoved(worldPos);
-    }
-}
-
-void SegmentationModule::pruneMissingCorrections()
-{
-    if (_corrections) {
-        _corrections->pruneMissing();
-        _corrections->refreshWidget();
     }
 }
 
@@ -2507,65 +2496,6 @@ bool SegmentationModule::isNearRotationHandle(VolumeViewerBase* viewer, const cv
     return _rotationHandleHitTester(viewer, worldPos);
 }
 
-SegmentationEditManager::GridSearchResolution SegmentationModule::hoverLookupDetail(const cv::Vec3f& worldPos)
-{
-    if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
-        resetHoverLookupDetail();
-        return SegmentationEditManager::GridSearchResolution::High;
-    }
-
-    if (!_hoverLookup.initialized) {
-        _hoverLookup.initialized = true;
-        _hoverLookup.lastWorld = worldPos;
-        _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
-        _hoverLookup.timer.start();
-        return SegmentationEditManager::GridSearchResolution::High;
-    }
-
-    const qint64 elapsedNs = _hoverLookup.timer.nsecsElapsed();
-    _hoverLookup.timer.restart();
-    double dtSec = static_cast<double>(elapsedNs) / 1e9;
-    if (dtSec <= 1e-4) {
-        dtSec = 1e-4;
-    }
-
-    const cv::Vec3f delta = worldPos - _hoverLookup.lastWorld;
-    _hoverLookup.lastWorld = worldPos;
-
-    const float distance = cv::norm(delta);
-    const float instantaneousSpeed = distance / static_cast<float>(dtSec);
-
-    constexpr float kSmoothing = 0.2f;
-    if (_hoverLookup.smoothedWorldUnitsPerSecond <= 0.0f) {
-        _hoverLookup.smoothedWorldUnitsPerSecond = instantaneousSpeed;
-    } else {
-        _hoverLookup.smoothedWorldUnitsPerSecond =
-            _hoverLookup.smoothedWorldUnitsPerSecond * (1.0f - kSmoothing) +
-            instantaneousSpeed * kSmoothing;
-    }
-
-    constexpr float kMediumThreshold = 4.0f;
-    constexpr float kLowThreshold = 12.0f;
-
-    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kLowThreshold) {
-        return SegmentationEditManager::GridSearchResolution::Low;
-    }
-    if (_hoverLookup.smoothedWorldUnitsPerSecond >= kMediumThreshold) {
-        return SegmentationEditManager::GridSearchResolution::Medium;
-    }
-    return SegmentationEditManager::GridSearchResolution::High;
-}
-
-void SegmentationModule::resetHoverLookupDetail()
-{
-    if (_hoverLookup.timer.isValid()) {
-        _hoverLookup.timer.invalidate();
-    }
-    _hoverLookup.initialized = false;
-    _hoverLookup.smoothedWorldUnitsPerSecond = 0.0f;
-    _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
-}
-
 bool SegmentationModule::recoverHoverPointerFromCursor()
 {
     const QPoint globalCursor = QCursor::pos();
@@ -2634,7 +2564,6 @@ void SegmentationModule::recordPointerSample(VolumeViewerBase* viewer, const cv:
 
     // Detect viewer change and reset stale cached state
     if (_hoverPointer.valid && _hoverPointer.viewer != viewer) {
-        resetHoverLookupDetail();           // Reset velocity tracking
         _editManager->resetPointerSeed();   // Reset pointTo() seed
         _hover.clear();                     // Invalidate stale hover
     }
@@ -2671,12 +2600,9 @@ void SegmentationModule::updateHover(VolumeViewerBase* viewer,
     };
 
     if (_growthInProgress) {
-        resetHoverLookupDetail();
     } else if (!_editingEnabled || !_hoverPreviewEnabled) {
-        resetHoverLookupDetail();
         clearHover();
     } else if (!_editManager || !_editManager->hasSession()) {
-        resetHoverLookupDetail();
         clearHover();
     } else {
         if (!targetViewer || !isSegmentationViewer(targetViewer)) {
@@ -2768,11 +2694,6 @@ SegmentationModule::AutosaveStatus SegmentationModule::autosaveStatus() const
     status.saveInProgress = _autosaveState.saveInProgress();
     status.dirtyAfterSave = _autosaveState.dirtyAfterSave();
     return status;
-}
-
-bool SegmentationModule::applyPushPullStep()
-{
-    return _pushPullTool ? _pushPullTool->applyStep() : false;
 }
 
 void SegmentationModule::markAutosaveNeeded(bool immediate)

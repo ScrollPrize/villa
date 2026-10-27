@@ -53,9 +53,6 @@ public:
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool growthInProgress);
 
-    // Group accessors (still needed for expand/collapse state persistence by coordinator)
-    CollapsibleSettingsGroup* editingGroup() const { return _groupEditing; }
-
 signals:
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);

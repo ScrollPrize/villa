@@ -385,8 +385,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     // Manual-add is an interactive editing mode, not a grow invocation.
     // Feeding SegmentationGrowthMethod::ManualAdd through
     // onGrowSegmentationSurface from the bridge would bypass the mode's session
-    // state, so the RPC rejects it and points at the future manual_add RPCs.
-    // The C++ enum value itself is untouched (the in-app apply path still uses it).
+    // state, so the RPC rejects it and points at the segmentation.manual_add RPCs.
     if (methodStr == QLatin1String("manual_add")) {
         QJsonObject data;
         data["param"] = "method";

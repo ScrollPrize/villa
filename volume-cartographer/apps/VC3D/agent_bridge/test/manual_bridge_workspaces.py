@@ -74,15 +74,15 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
         call_expect_error("lasagna.cancel (unknown job id)", "lasagna.cancel",
                            {"jobId": "job-999999"}, -32007)
 
-        # 5. select_output_segment: unknown name, then a real existing segment.
+        # 5. select_output_segment: unknown id, then a real existing segment.
         call_expect_error("lasagna.select_output_segment (unknown)",
                            "lasagna.select_output_segment",
-                           {"name": "agent-bridge-nonexistent-segment"}, -32007)
+                           {"segmentId": "agent-bridge-nonexistent-segment"}, -32007)
         segs = call_checked("segments.list (for lasagna select_output_segment)", "segments.list")
         real_seg = (segs or {}).get("segments", [{}])[0].get("id") if segs else None
         if real_seg:
             call_checked("lasagna.select_output_segment (real segment)",
-                         "lasagna.select_output_segment", {"name": real_seg})
+                         "lasagna.select_output_segment", {"segmentId": real_seg})
 
         # 6. repeat_last with nothing configured -> clean -32005, NOT a hang.
         # This is the exact call that used to hang forever (see docstring).

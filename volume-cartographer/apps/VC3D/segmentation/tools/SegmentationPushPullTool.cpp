@@ -651,11 +651,6 @@ void SegmentationPushPullTool::stopAll()
     _lastAlphaStartFailure.clear();
 }
 
-bool SegmentationPushPullTool::applyStep()
-{
-    return applyStepInternal();
-}
-
 bool SegmentationPushPullTool::applyStepInternal()
 {
     if (!_ppState.active || !_editManager || !_editManager->hasSession()) {

@@ -190,12 +190,6 @@ static QString findExecutable(
     return {};
 }
 
-// Convenience wrappers matching the old signatures
-static QString findVcTool(const char* name)
-{
-    return findExecutable(QString::fromLatin1(name));
-}
-
 static QString findFlatboiExecutable()
 {
     return findExecutable(
@@ -1701,7 +1695,7 @@ void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
     const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
-    const QString exe = findVcTool("vc_straighten");
+    const QString exe = findExecutable(QStringLiteral("vc_straighten"));
     if (exe.isEmpty()) {
         QMessageBox::critical(_parentWidget, tr("Error"),
             tr("Could not find the 'vc_straighten' executable.\n"
@@ -2072,7 +2066,7 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
     const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
-    const QString exe = findVcTool("vc_straighten");
+    const QString exe = findExecutable(QStringLiteral("vc_straighten"));
     if (exe.isEmpty()) {
         setErr(tr("vc_straighten not found or not executable."),
                CommandLaunchError::ToolUnavailable);
@@ -2511,7 +2505,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         return fail(tr("A GrowPatch seed run is already active."), CommandLaunchError::Busy);
     }
 
-    const QString executable = findVcTool("vc_grow_seg_from_seed");
+    const QString executable = findExecutable(QStringLiteral("vc_grow_seg_from_seed"));
     if (executable.isEmpty()) {
         return fail(tr("Could not find the 'vc_grow_seg_from_seed' executable."),
                     CommandLaunchError::ToolUnavailable);
@@ -2710,7 +2704,7 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
         return;
     }
 
-    if (findVcTool("vc_grow_seg_from_seed").isEmpty()) {
+    if (findExecutable(QStringLiteral("vc_grow_seg_from_seed")).isEmpty()) {
         QMessageBox::critical(_parentWidget, tr("Error"),
             tr("Could not find the 'vc_grow_seg_from_seed' executable.\n"
                "Looked in known locations and PATH.\n\n"
@@ -2823,7 +2817,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         return fail(tr("Select surface %1 first.").arg(QString::fromStdString(segmentId)));
     }
     if (_editingDestinationResolver && !_editingDestinationResolver(surf))
-        return fail(tr("Could not prepare a managed working copy"));
+        return fail(tr("Could not prepare the surface for editing"));
     QuadSurface* surface = surf.get();
 
     cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
@@ -3232,7 +3226,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         return;
     }
 
-    const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
+    const QString executable = findExecutable(QStringLiteral("vc_tifxyz2zarr_sparse"));
     if (executable.isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"),
                              tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
@@ -3395,7 +3389,7 @@ std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces
     return rows;
 }
 
-void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
+void SegmentationCommandHandler::onMergeSurfaces(const QStringList& segmentIds)
 {
     if (!_cmdRunner) {
         QMessageBox::warning(_parentWidget, tr("Merge TIFXYZ"),
@@ -3426,7 +3420,7 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
         return;
     }
 
-    MergeTifxyzDialog dlg(_parentWidget, segmentIds, available);
+    MergeSurfacesDialog dlg(_parentWidget, segmentIds, available);
     if (dlg.exec() != QDialog::Accepted) {
         emit statusMessage(tr("Merge cancelled"), 3000);
         return;
@@ -3471,19 +3465,19 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
 void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
 {
     if (!_cmdRunner) {
-        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
                              tr("Command runner is not initialized."));
         return;
     }
     if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
                              tr("A command-line tool is already running."));
         return;
     }
     CommandLaunchError error;
     const auto store = storeForTools(&error);
     if (!store) {
-        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"), error.message);
+        QMessageBox::warning(_parentWidget, tr("Patch Surface"), error.message);
         return;
     }
 
@@ -3497,7 +3491,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
                           meta.is_object() && area != meta.end() && area->is_number() ? area->get<double>() : -1.0});
     }
     if (available.size() < 2) {
-        QMessageBox::warning(_parentWidget, tr("Patch tifxyz"),
+        QMessageBox::warning(_parentWidget, tr("Patch Surface"),
                              tr("The current volume has fewer than 2 surfaces; "
                                 "patch needs a parent + child."));
         return;
@@ -3547,7 +3541,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         if (success) {
             emit statusMessage(tr("Patch applied to %1").arg(outputPath), 5000);
         } else {
-            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
+            QMessageBox::critical(_parentWidget, tr("Patch Surface"),
                                   tr("vc_merge_patch failed.\n%1").arg(message));
             emit statusMessage(tr("Patch failed"), 5000);
         }
@@ -3720,7 +3714,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         return;
     }
 
-    const QString executable = findVcTool("vc_add_ignore_label");
+    const QString executable = findExecutable(QStringLiteral("vc_add_ignore_label"));
     if (executable.isEmpty()) {
         QMessageBox::warning(_parentWidget,
                              tr("Error"),

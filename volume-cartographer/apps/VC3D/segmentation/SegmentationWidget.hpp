@@ -70,9 +70,9 @@ public:
     [[nodiscard]] int neuralVolumeScale() const;
     [[nodiscard]] int neuralBatchSize() const;
     [[nodiscard]] NeuralTracerModelType neuralModelType() const;
-    [[nodiscard]] DenseTtaMode denseTtaMode() const;
-    [[nodiscard]] QString denseTtaMergeMethod() const;
-    [[nodiscard]] double denseTtaOutlierDropThresh() const;
+    [[nodiscard]] TtaMode ttaMode() const;
+    [[nodiscard]] QString ttaMergeMethod() const;
+    [[nodiscard]] double ttaOutlierDropThresh() const;
     [[nodiscard]] QString copyCheckpointPath() const;
 
     void setPendingChanges(bool pending);
@@ -155,9 +155,9 @@ public:
     void setNeuralVolumeScale(int scale);
     void setNeuralBatchSize(int size);
     void setNeuralModelType(NeuralTracerModelType type);
-    void setDenseTtaMode(DenseTtaMode mode);
-    void setDenseTtaMergeMethod(const QString& method);
-    void setDenseTtaOutlierDropThresh(double threshold);
+    void setTtaMode(TtaMode mode);
+    void setTtaMergeMethod(const QString& method);
+    void setTtaOutlierDropThresh(double threshold);
     void setCopyCheckpointPath(const QString& path);
 
     /**

@@ -28,13 +28,13 @@ const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 const QString kCopyPresetSettingKey = QStringLiteral("neural_copy_checkpoint_preset");
 const QString kCopyPresetLatest = QStringLiteral("latest");
 const QString kCopyPresetCustom = QStringLiteral("custom");
-const QString kDenseTtaModeSettingKey = QStringLiteral("neural_dense_tta_mode");
-const QString kDenseTtaMergeMethodSettingKey = QStringLiteral("neural_dense_tta_merge_method");
-const QString kDenseTtaOutlierDropThreshSettingKey = QStringLiteral("neural_dense_tta_outlier_drop_thresh");
-const QString kDenseTtaMergeMethodDefault = QStringLiteral("vector_geomedian");
-constexpr double kDenseTtaOutlierDropThreshDefault = 1.25;
+const QString kTtaModeSettingKey = QStringLiteral("neural_tta_mode");
+const QString kTtaMergeMethodSettingKey = QStringLiteral("neural_tta_merge_method");
+const QString kTtaOutlierDropThreshSettingKey = QStringLiteral("neural_tta_outlier_drop_thresh");
+const QString kTtaMergeMethodDefault = QStringLiteral("vector_geomedian");
+constexpr double kTtaOutlierDropThreshDefault = 1.25;
 
-QString normalizeDenseTtaMergeMethod(const QString& method)
+QString normalizeTtaMergeMethod(const QString& method)
 {
     const QString normalized = method.trimmed().toLower();
     static const std::array<const char*, 5> kSupportedMethods = {
@@ -49,7 +49,7 @@ QString normalizeDenseTtaMergeMethod(const QString& method)
             return normalized;
         }
     }
-    return kDenseTtaMergeMethodDefault;
+    return kTtaMergeMethodDefault;
 }
 } // namespace
 
@@ -84,37 +84,37 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
     });
 
     _groupNeuralTracer->addRow(tr("TTA Type:"), [&](QHBoxLayout* row) {
-        _comboDenseTtaMode = new QComboBox(neuralParent);
-        _comboDenseTtaMode->addItem(tr("Mirror TTA"), static_cast<int>(DenseTtaMode::Mirror));
-        _comboDenseTtaMode->addItem(tr("Rotate3 TTA"), static_cast<int>(DenseTtaMode::Rotate3));
-        _comboDenseTtaMode->addItem(tr("None"), static_cast<int>(DenseTtaMode::None));
-        _comboDenseTtaMode->setToolTip(
+        _comboTtaMode = new QComboBox(neuralParent);
+        _comboTtaMode->addItem(tr("Mirror TTA"), static_cast<int>(TtaMode::Mirror));
+        _comboTtaMode->addItem(tr("Rotate3 TTA"), static_cast<int>(TtaMode::Rotate3));
+        _comboTtaMode->addItem(tr("None"), static_cast<int>(TtaMode::None));
+        _comboTtaMode->setToolTip(
             tr("Displacement test-time augmentation mode. Mirror is default."));
-        row->addWidget(_comboDenseTtaMode);
+        row->addWidget(_comboTtaMode);
         row->addStretch(1);
     });
 
     _groupNeuralTracer->addRow(tr("TTA merge:"), [&](QHBoxLayout* row) {
-        _comboDenseTtaMergeMethod = new QComboBox(neuralParent);
-        _comboDenseTtaMergeMethod->addItem(tr("Vector geomedian"), QStringLiteral("vector_geomedian"));
-        _comboDenseTtaMergeMethod->addItem(tr("Vector medoid"), QStringLiteral("vector_medoid"));
-        _comboDenseTtaMergeMethod->addItem(tr("Median"), QStringLiteral("median"));
-        _comboDenseTtaMergeMethod->addItem(tr("Trimmed mean"), QStringLiteral("trimmed_mean"));
-        _comboDenseTtaMergeMethod->addItem(tr("Mean"), QStringLiteral("mean"));
-        _comboDenseTtaMergeMethod->setToolTip(
+        _comboTtaMergeMethod = new QComboBox(neuralParent);
+        _comboTtaMergeMethod->addItem(tr("Vector geomedian"), QStringLiteral("vector_geomedian"));
+        _comboTtaMergeMethod->addItem(tr("Vector medoid"), QStringLiteral("vector_medoid"));
+        _comboTtaMergeMethod->addItem(tr("Median"), QStringLiteral("median"));
+        _comboTtaMergeMethod->addItem(tr("Trimmed mean"), QStringLiteral("trimmed_mean"));
+        _comboTtaMergeMethod->addItem(tr("Mean"), QStringLiteral("mean"));
+        _comboTtaMergeMethod->setToolTip(
             tr("How to merge TTA displacement predictions."));
-        row->addWidget(_comboDenseTtaMergeMethod);
+        row->addWidget(_comboTtaMergeMethod);
 
         auto* threshLabel = new QLabel(tr("Outlier thresh:"), neuralParent);
-        _spinDenseTtaOutlierDropThresh = new QDoubleSpinBox(neuralParent);
-        _spinDenseTtaOutlierDropThresh->setDecimals(2);
-        _spinDenseTtaOutlierDropThresh->setRange(0.01, 100.0);
-        _spinDenseTtaOutlierDropThresh->setSingleStep(0.05);
-        _spinDenseTtaOutlierDropThresh->setToolTip(
+        _spinTtaOutlierDropThresh = new QDoubleSpinBox(neuralParent);
+        _spinTtaOutlierDropThresh->setDecimals(2);
+        _spinTtaOutlierDropThresh->setRange(0.01, 100.0);
+        _spinTtaOutlierDropThresh->setSingleStep(0.05);
+        _spinTtaOutlierDropThresh->setToolTip(
             tr("Outlier threshold multiplier for dropping inconsistent TTA variants."));
         row->addSpacing(12);
         row->addWidget(threshLabel);
-        row->addWidget(_spinDenseTtaOutlierDropThresh);
+        row->addWidget(_spinTtaOutlierDropThresh);
         row->addStretch(1);
     });
 
@@ -191,17 +191,17 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         setNeuralModelType(type);
     });
 
-    connect(_comboDenseTtaMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        auto mode = static_cast<DenseTtaMode>(_comboDenseTtaMode->itemData(index).toInt());
-        setDenseTtaMode(mode);
+    connect(_comboTtaMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        auto mode = static_cast<TtaMode>(_comboTtaMode->itemData(index).toInt());
+        setTtaMode(mode);
     });
 
-    connect(_comboDenseTtaMergeMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        setDenseTtaMergeMethod(_comboDenseTtaMergeMethod->itemData(index).toString());
+    connect(_comboTtaMergeMethod, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        setTtaMergeMethod(_comboTtaMergeMethod->itemData(index).toString());
     });
 
-    connect(_spinDenseTtaOutlierDropThresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        setDenseTtaOutlierDropThresh(value);
+    connect(_spinTtaOutlierDropThresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setTtaOutlierDropThresh(value);
     });
 
     connect(_comboCopyCheckpointPreset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -210,7 +210,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
                      _copyCheckpointPreset == CopyCheckpointPreset::CopyLatest
                          ? kCopyPresetLatest
                          : kCopyPresetCustom);
-        updateDenseUiState();
+        updateTtaUiState();
     });
 
     connect(_neuralCheckpointEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -294,7 +294,7 @@ SegmentationNeuralTracerPanel::SegmentationNeuralTracerPanel(const QString& sett
         }
     });
 
-    updateDenseUiState();
+    updateTtaUiState();
 }
 
 void SegmentationNeuralTracerPanel::writeSetting(const QString& key, const QVariant& value)
@@ -326,7 +326,7 @@ void SegmentationNeuralTracerPanel::setNeuralTracerEnabled(bool enabled)
         _chkNeuralTracerEnabled->setChecked(enabled);
     }
 
-    updateDenseUiState();
+    updateTtaUiState();
     emit neuralTracerEnabledChanged(enabled);
 }
 
@@ -407,56 +407,56 @@ void SegmentationNeuralTracerPanel::setNeuralModelType(NeuralTracerModelType typ
             _comboNeuralModelType->setCurrentIndex(idx);
         }
     }
-    updateDenseUiState();
+    updateTtaUiState();
 }
 
-void SegmentationNeuralTracerPanel::setDenseTtaMode(DenseTtaMode mode)
+void SegmentationNeuralTracerPanel::setTtaMode(TtaMode mode)
 {
-    if (_denseTtaMode == mode) {
+    if (_ttaMode == mode) {
         return;
     }
-    _denseTtaMode = mode;
-    writeSetting(kDenseTtaModeSettingKey, static_cast<int>(_denseTtaMode));
+    _ttaMode = mode;
+    writeSetting(kTtaModeSettingKey, static_cast<int>(_ttaMode));
 
-    if (_comboDenseTtaMode) {
-        const QSignalBlocker blocker(_comboDenseTtaMode);
-        int idx = _comboDenseTtaMode->findData(static_cast<int>(_denseTtaMode));
+    if (_comboTtaMode) {
+        const QSignalBlocker blocker(_comboTtaMode);
+        int idx = _comboTtaMode->findData(static_cast<int>(_ttaMode));
         if (idx >= 0) {
-            _comboDenseTtaMode->setCurrentIndex(idx);
+            _comboTtaMode->setCurrentIndex(idx);
         }
     }
 }
 
-void SegmentationNeuralTracerPanel::setDenseTtaMergeMethod(const QString& method)
+void SegmentationNeuralTracerPanel::setTtaMergeMethod(const QString& method)
 {
-    const QString normalized = normalizeDenseTtaMergeMethod(method);
-    if (_denseTtaMergeMethod == normalized) {
+    const QString normalized = normalizeTtaMergeMethod(method);
+    if (_ttaMergeMethod == normalized) {
         return;
     }
-    _denseTtaMergeMethod = normalized;
-    writeSetting(kDenseTtaMergeMethodSettingKey, _denseTtaMergeMethod);
+    _ttaMergeMethod = normalized;
+    writeSetting(kTtaMergeMethodSettingKey, _ttaMergeMethod);
 
-    if (_comboDenseTtaMergeMethod) {
-        const QSignalBlocker blocker(_comboDenseTtaMergeMethod);
-        const int idx = _comboDenseTtaMergeMethod->findData(_denseTtaMergeMethod);
+    if (_comboTtaMergeMethod) {
+        const QSignalBlocker blocker(_comboTtaMergeMethod);
+        const int idx = _comboTtaMergeMethod->findData(_ttaMergeMethod);
         if (idx >= 0) {
-            _comboDenseTtaMergeMethod->setCurrentIndex(idx);
+            _comboTtaMergeMethod->setCurrentIndex(idx);
         }
     }
 }
 
-void SegmentationNeuralTracerPanel::setDenseTtaOutlierDropThresh(double threshold)
+void SegmentationNeuralTracerPanel::setTtaOutlierDropThresh(double threshold)
 {
     const double sanitized = std::max(0.01, threshold);
-    if (qFuzzyCompare(_denseTtaOutlierDropThresh + 1.0, sanitized + 1.0)) {
+    if (qFuzzyCompare(_ttaOutlierDropThresh + 1.0, sanitized + 1.0)) {
         return;
     }
-    _denseTtaOutlierDropThresh = sanitized;
-    writeSetting(kDenseTtaOutlierDropThreshSettingKey, _denseTtaOutlierDropThresh);
+    _ttaOutlierDropThresh = sanitized;
+    writeSetting(kTtaOutlierDropThreshSettingKey, _ttaOutlierDropThresh);
 
-    if (_spinDenseTtaOutlierDropThresh) {
-        const QSignalBlocker blocker(_spinDenseTtaOutlierDropThresh);
-        _spinDenseTtaOutlierDropThresh->setValue(_denseTtaOutlierDropThresh);
+    if (_spinTtaOutlierDropThresh) {
+        const QSignalBlocker blocker(_spinTtaOutlierDropThresh);
+        _spinTtaOutlierDropThresh->setValue(_ttaOutlierDropThresh);
     }
 }
 
@@ -482,7 +482,7 @@ void SegmentationNeuralTracerPanel::setCopyCheckpointPath(const QString& path)
     if (nextPreset == CopyCheckpointPreset::CustomPath) {
         setNeuralCheckpointPath(trimmed);
     }
-    updateDenseUiState();
+    updateTtaUiState();
 }
 
 void SegmentationNeuralTracerPanel::setVolumeZarrPath(const QString& path)
@@ -510,22 +510,22 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
     } else {
         _neuralModelType = NeuralTracerModelType::Heatmap;
     }
-    const int ttaModeValue = settings.value(kDenseTtaModeSettingKey,
-                                            static_cast<int>(DenseTtaMode::Mirror)).toInt();
-    if (ttaModeValue == static_cast<int>(DenseTtaMode::Rotate3)) {
-        _denseTtaMode = DenseTtaMode::Rotate3;
-    } else if (ttaModeValue == static_cast<int>(DenseTtaMode::None)) {
-        _denseTtaMode = DenseTtaMode::None;
+    const int ttaModeValue = settings.value(kTtaModeSettingKey,
+                                            static_cast<int>(TtaMode::Mirror)).toInt();
+    if (ttaModeValue == static_cast<int>(TtaMode::Rotate3)) {
+        _ttaMode = TtaMode::Rotate3;
+    } else if (ttaModeValue == static_cast<int>(TtaMode::None)) {
+        _ttaMode = TtaMode::None;
     } else {
-        _denseTtaMode = DenseTtaMode::Mirror;
+        _ttaMode = TtaMode::Mirror;
     }
-    _denseTtaMergeMethod = normalizeDenseTtaMergeMethod(
-        settings.value(kDenseTtaMergeMethodSettingKey, kDenseTtaMergeMethodDefault).toString());
-    _denseTtaOutlierDropThresh = settings.value(
-        kDenseTtaOutlierDropThreshSettingKey,
-        kDenseTtaOutlierDropThreshDefault).toDouble();
-    if (_denseTtaOutlierDropThresh <= 0.0) {
-        _denseTtaOutlierDropThresh = kDenseTtaOutlierDropThreshDefault;
+    _ttaMergeMethod = normalizeTtaMergeMethod(
+        settings.value(kTtaMergeMethodSettingKey, kTtaMergeMethodDefault).toString());
+    _ttaOutlierDropThresh = settings.value(
+        kTtaOutlierDropThreshSettingKey,
+        kTtaOutlierDropThreshDefault).toDouble();
+    if (_ttaOutlierDropThresh <= 0.0) {
+        _ttaOutlierDropThresh = kTtaOutlierDropThreshDefault;
     }
     const QString copyPresetValue = settings.value(kCopyPresetSettingKey, kCopyPresetLatest).toString();
     if (copyPresetValue == kCopyPresetCustom) {
@@ -576,23 +576,23 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboNeuralModelType->setCurrentIndex(idx);
         }
     }
-    if (_comboDenseTtaMode) {
-        const QSignalBlocker blocker(_comboDenseTtaMode);
-        int idx = _comboDenseTtaMode->findData(static_cast<int>(_denseTtaMode));
+    if (_comboTtaMode) {
+        const QSignalBlocker blocker(_comboTtaMode);
+        int idx = _comboTtaMode->findData(static_cast<int>(_ttaMode));
         if (idx >= 0) {
-            _comboDenseTtaMode->setCurrentIndex(idx);
+            _comboTtaMode->setCurrentIndex(idx);
         }
     }
-    if (_comboDenseTtaMergeMethod) {
-        const QSignalBlocker blocker(_comboDenseTtaMergeMethod);
-        int idx = _comboDenseTtaMergeMethod->findData(_denseTtaMergeMethod);
+    if (_comboTtaMergeMethod) {
+        const QSignalBlocker blocker(_comboTtaMergeMethod);
+        int idx = _comboTtaMergeMethod->findData(_ttaMergeMethod);
         if (idx >= 0) {
-            _comboDenseTtaMergeMethod->setCurrentIndex(idx);
+            _comboTtaMergeMethod->setCurrentIndex(idx);
         }
     }
-    if (_spinDenseTtaOutlierDropThresh) {
-        const QSignalBlocker blocker(_spinDenseTtaOutlierDropThresh);
-        _spinDenseTtaOutlierDropThresh->setValue(_denseTtaOutlierDropThresh);
+    if (_spinTtaOutlierDropThresh) {
+        const QSignalBlocker blocker(_spinTtaOutlierDropThresh);
+        _spinTtaOutlierDropThresh->setValue(_ttaOutlierDropThresh);
     }
     if (_comboCopyCheckpointPreset) {
         const QSignalBlocker blocker(_comboCopyCheckpointPreset);
@@ -601,10 +601,10 @@ void SegmentationNeuralTracerPanel::syncUiState()
             _comboCopyCheckpointPreset->setCurrentIndex(idx);
         }
     }
-    updateDenseUiState();
+    updateTtaUiState();
 }
 
-void SegmentationNeuralTracerPanel::updateDenseUiState()
+void SegmentationNeuralTracerPanel::updateTtaUiState()
 {
     const bool copyMode = _neuralModelType == NeuralTracerModelType::DisplacementCopy;
     const bool usingLatestCheckpoint = copyMode && _copyCheckpointPreset == CopyCheckpointPreset::CopyLatest;
@@ -619,8 +619,8 @@ void SegmentationNeuralTracerPanel::updateDenseUiState()
         _comboCopyCheckpointPreset->setVisible(copyMode);
     }
     // Displacement TTA applies to the copy model.
-    for (QWidget* widget : {static_cast<QWidget*>(_comboDenseTtaMode), static_cast<QWidget*>(_comboDenseTtaMergeMethod),
-                            static_cast<QWidget*>(_spinDenseTtaOutlierDropThresh)}) {
+    for (QWidget* widget : {static_cast<QWidget*>(_comboTtaMode), static_cast<QWidget*>(_comboTtaMergeMethod),
+                            static_cast<QWidget*>(_spinTtaOutlierDropThresh)}) {
         if (widget) {
             widget->setEnabled(copyMode);
             widget->setVisible(copyMode);

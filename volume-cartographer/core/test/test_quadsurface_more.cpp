@@ -1,6 +1,6 @@
 // More coverage for QuadSurface.cpp: gridNormal, center, ptrToGrid, loc_raw,
 // resample, unloadCaches, computeZOrientationAngle, orientZUp,
-// surface_diff/union/intersection, contains/contains_any, overlap, lookupDepthIndex.
+// contains, overlap, lookupDepthIndex.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -297,46 +297,6 @@ TEST_CASE("contains (vector overload): empty list is true")
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
     std::vector<cv::Vec3f> empty;
     CHECK(contains(qs, empty));
-}
-
-TEST_CASE("contains_any: empty list is false")
-{
-    auto pts = makePlanarGrid(8, 8);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    std::vector<cv::Vec3f> empty;
-    CHECK_FALSE(contains_any(qs, empty));
-}
-
-TEST_CASE("contains_any: list with one far point returns false")
-{
-    auto pts = makePlanarGrid(8, 8);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    std::vector<cv::Vec3f> far = {cv::Vec3f(1e6f, 1e6f, 1e6f)};
-    CHECK_FALSE(contains_any(qs, far));
-}
-
-TEST_CASE("surface_diff with disjoint surfaces returns a non-null result")
-{
-    auto pa = makePlanarGrid(8, 8);
-    auto pb = makeOffsetGrid(8, 8, cv::Vec3f(1000, 1000, 1000));
-    QuadSurface a(pa, cv::Vec2f(1.f, 1.f));
-    QuadSurface b(pb, cv::Vec2f(1.f, 1.f));
-    auto r = surface_diff(&a, &b, 2.0f);
-    // Any pointer result (including null) is acceptable — we're hitting the path.
-    (void)r;
-    CHECK(true);
-}
-
-TEST_CASE("surface_union / intersection paths run on disjoint inputs")
-{
-    auto pa = makePlanarGrid(8, 8);
-    auto pb = makeOffsetGrid(8, 8, cv::Vec3f(500, 500, 500));
-    QuadSurface a(pa, cv::Vec2f(1.f, 1.f));
-    QuadSurface b(pb, cv::Vec2f(1.f, 1.f));
-    auto u = surface_union(&a, &b, 2.0f);
-    auto i = surface_intersection(&a, &b, 2.0f);
-    (void)u; (void)i;
-    CHECK(true);
 }
 
 TEST_CASE("lookupDepthIndex returns finite value or NAN; no crash")
