@@ -85,6 +85,7 @@
 #include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QDir>
 #include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
@@ -2542,6 +2543,19 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _persistentCacheWarningBanner, &QWidget::hide);
     _persistentCacheWarningBanner->hide();
     workspaceLayout->addWidget(_persistentCacheWarningBanner);
+    // Sheet-stitch mode banner (shown across the very top while stitching).
+    _sheetStitchBanner = new QFrame(workspaceContainer);
+    _sheetStitchBanner->setObjectName(QStringLiteral("sheetStitchBanner"));
+    _sheetStitchBanner->setStyleSheet(
+        QStringLiteral("QFrame#sheetStitchBanner { background: #0b5394; color: #ffffff; border-bottom: 1px solid #073763; }"));
+    auto* stitchLayout = new QHBoxLayout(_sheetStitchBanner);
+    stitchLayout->setContentsMargins(10, 5, 8, 5);
+    _sheetStitchBannerText = new QLabel(_sheetStitchBanner);
+    _sheetStitchBannerText->setObjectName(QStringLiteral("sheetStitchBannerText"));
+    _sheetStitchBannerText->setWordWrap(true);
+    stitchLayout->addWidget(_sheetStitchBannerText, 1);
+    _sheetStitchBanner->hide();
+    workspaceLayout->insertWidget(0, _sheetStitchBanner);
     workspaceLayout->addWidget(_workspaceTabs, 1);
     setCentralWidget(workspaceContainer);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
@@ -3623,6 +3637,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                 viewer,
                                 scenePoint,
                                 globalPos)) {
+                            return;
+                        }
+
+                        if (_sheetCollection &&
+                            _sheetCollection->maybeShowStitchMenu(viewer, scenePoint, globalPos)) {
                             return;
                         }
 
@@ -11400,4 +11419,114 @@ void CWindow::promptHubConflicts()
     box.exec();
     if (box.clickedButton() == useHub) session->resolveHubConflicts("hub");
     else if (box.clickedButton() == keepMine) session->resolveHubConflicts("local");
+}
+
+// --- sheet stitch mode -------------------------------------------------------
+
+namespace
+{
+QString sanitizeSegmentName(const QString& in)
+{
+    QString out;
+    for (QChar ch : in) {
+        if (ch.isLetterOrNumber() || ch == '_' || ch == '-')
+            out.append(ch);
+        else
+            out.append('_');
+    }
+    if (out.isEmpty())
+        out = QStringLiteral("stitch");
+    return out;
+}
+}  // namespace
+
+void CWindow::sheetStitchSetBanner(const QString& text)
+{
+    if (!_sheetStitchBanner || !_sheetStitchBannerText)
+        return;
+    _sheetStitchBannerText->setText(text);
+    _sheetStitchBanner->show();
+}
+
+void CWindow::sheetStitchHideBanner()
+{
+    if (_sheetStitchBanner)
+        _sheetStitchBanner->hide();
+}
+
+void CWindow::sheetStitchEnterLayout()
+{
+    auto* grid = mainViewerSplitGrid(ui.tabSegment);
+    if (!grid)
+        return;
+    if (!_sheetStitchInLayout) {
+        for (int i = 0; i < 4; ++i)
+            _sheetStitchPrevHidden[i] = grid->paneHidden(i);
+        _sheetStitchInLayout = true;
+    }
+    grid->exitFullSize();
+    for (int i = 0; i < 4; ++i)
+        grid->setPaneHidden(i, false);  // 3 slices + flattened surface pane
+}
+
+void CWindow::sheetStitchExitLayout()
+{
+    if (auto* grid = mainViewerSplitGrid(ui.tabSegment); grid && _sheetStitchInLayout)
+        for (int i = 0; i < 4; ++i)
+            grid->setPaneHidden(i, _sheetStitchPrevHidden[i]);
+    _sheetStitchInLayout = false;
+}
+
+void CWindow::sheetStitchShowPreview(const std::shared_ptr<QuadSurface>& surf)
+{
+    if (!surf || !_state)
+        return;
+    _state->setSurface("segmentation", surf, false, false);
+}
+
+QString CWindow::sheetStitchSaveSegment(const std::shared_ptr<QuadSurface>& surf,
+                                        const QString& baseName, QString& err)
+{
+    if (!surf) {
+        err = tr("no surface to save");
+        return {};
+    }
+    auto pkg = _state ? _state->vpkg() : nullptr;
+    if (!pkg) {
+        err = tr("no volume package is open");
+        return {};
+    }
+
+    std::string volId = _state->currentVolumeId();
+    const QString volName = sanitizeSegmentName(
+        volId.empty() ? QStringLiteral("volume") : QString::fromStdString(volId));
+    const QString baseDir = QDir::homePath() + QStringLiteral("/.VC3D/hercuvit/segments/") + volName;
+    if (!QDir().mkpath(baseDir)) {
+        err = tr("could not create %1").arg(baseDir);
+        return {};
+    }
+    const std::string dir = baseDir.toStdString();
+
+    // Attach that segments dir to the project exactly once, then select it as the
+    // output segments dir so the saved segment registers there.
+    if (!pkg->matchingSegmentsEntry(dir).has_value())
+        pkg->attachSegmentsEntry(dir, {}, /*select=*/true);
+    else
+        pkg->setOutputSegments(dir);
+
+    const QString san = sanitizeSegmentName(baseName);
+    QString id = san;
+    for (int n = 1; QDir(baseDir + "/" + id).exists(); ++n)
+        id = san + "_" + QString::number(n);
+
+    try {
+        surf->saveAsNew(std::filesystem::path((baseDir + "/" + id).toStdString()), false);
+    } catch (const std::exception& e) {
+        err = QString::fromUtf8(e.what());
+        return {};
+    }
+    pkg->addSingleSegmentation(id.toStdString());
+    if (_surfacePanel)
+        _surfacePanel->refreshSurfaceList();
+    return id;
 }

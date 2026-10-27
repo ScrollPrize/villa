@@ -2,9 +2,16 @@
 
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
+#include "CWindow.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/types/SheetStitch.hpp"
+
+#include <QAction>
+#include <QMenu>
 
 #include <QCheckBox>
 #include <QColor>
@@ -258,6 +265,7 @@ struct SheetCollectionController::View {
 SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMainWindow* window)
     : ViewerOverlayControllerBase("sheet-collection", window), manager_(manager)
 {
+    cwin_ = dynamic_cast<CWindow*>(window);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     dock_ = new QDockWidget(tr("Automated Sheet Volume"), window);
@@ -575,6 +583,7 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     auto current = slice(viewer);
     const qreal dpr = viewer->graphicsView() ? viewer->graphicsView()->viewport()->devicePixelRatioF() : 1.0;
     built_[viewer] = Built{current, drawRevision_, dpr};
+    installInteractions(viewer);  // connect mouse/menu once this viewer is actually drawn on
     if (!reader_ || !current)
         return;
 
@@ -610,6 +619,8 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     // thousands of round-capped segments.
     std::array<std::vector<QPolygonF>, kRainbowBuckets> rainbow;
     std::vector<QPolygonF> plain;
+    std::vector<QPolygonF> sheetPolys, stitchPolys, seedPolys;  // stitch highlight buckets
+    std::vector<SheetHit> localHits;                            // for click hit-testing
     std::array<Point, 2> seg;
     std::vector<std::pair<QPointF, QPointF>> sheetSegs;
     size_t drawn = 0;
@@ -632,8 +643,20 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         if (sheetSegs.empty())
             continue;
         ++drawn;
-        chainInto(sheetSegs, useRainbow ? rainbow[bucketOf(sm.id)] : plain);
+        sheetPolys.clear();
+        chainInto(sheetSegs, sheetPolys);
+        localHits.push_back(SheetHit{sm.id, sheetPolys});
+        if (stitchMode_ && stitched_.count(sm.id)) {
+            auto& dst = (sm.id == seedId_) ? seedPolys : stitchPolys;
+            dst.insert(dst.end(), sheetPolys.begin(), sheetPolys.end());
+        } else if (useRainbow) {
+            auto& dst = rainbow[bucketOf(sm.id)];
+            dst.insert(dst.end(), sheetPolys.begin(), sheetPolys.end());
+        } else {
+            plain.insert(plain.end(), sheetPolys.begin(), sheetPolys.end());
+        }
     }
+    hits_[viewer] = std::move(localHits);
 
     // Rasterise the curves into one image sized to the visible rect, then hand the base
     // a pixmap. Repaints (CT tiles, cursor, other overlays) then blit it instead of
@@ -661,6 +684,16 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
                 strokePolys(p, rainbow[b], hueOf(b));
         else
             strokePolys(p, plain, QColor("#40c0ff"));
+        // Stitch highlight drawn on top: members yellow, the seed magenta, both thicker.
+        auto strokeHi = [&](const std::vector<QPolygonF>& polys, const QColor& c, qreal w) {
+            if (polys.empty()) return;
+            p.setPen(QPen(c, w, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            for (const auto& poly : polys) p.drawPolyline(poly);
+        };
+        strokeHi(stitchPolys, QColor("#000000"), width + 5.0);   // halo
+        strokeHi(seedPolys, QColor("#ffffff"), width + 8.0);     // halo (seed extra bold)
+        strokeHi(stitchPolys, QColor("#ffee00"), width + 3.0);   // members: yellow
+        strokeHi(seedPolys, QColor("#ff30ff"), width + 5.0);     // seed: magenta
         p.end();
         builder.addImage(raster, QPixmap::fromImage(raster), rect.topLeft(), 1, 1, 1, 45);
     } else {
@@ -683,6 +716,16 @@ void SheetCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
             QPainterPath pp = toPath(plain);
             if (!pp.isEmpty()) { style.penColor = QColor("#40c0ff"); builder.addPainterPath(pp, style); }
         }
+        auto addHi = [&](const std::vector<QPolygonF>& polys, const QColor& c, qreal w) {
+            QPainterPath pp = toPath(polys);
+            if (pp.isEmpty()) return;
+            style.penColor = c; style.penWidth = w;
+            builder.addPainterPath(pp, style);
+        };
+        addHi(stitchPolys, QColor("#000000"), width + 5.0);
+        addHi(seedPolys, QColor("#ffffff"), width + 8.0);
+        addHi(stitchPolys, QColor("#ffee00"), width + 3.0);
+        addHi(seedPolys, QColor("#ff30ff"), width + 5.0);
     }
 }
 
@@ -694,5 +737,222 @@ void SheetCollectionController::detachViewer(VolumeViewerBase* viewer)
         views_.erase(it);
     }
     built_.erase(viewer);
+    hits_.erase(viewer);
+    if (wired_.erase(viewer)) {
+        if (auto* chunked = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject()))
+            disconnect(chunked, nullptr, this, nullptr);
+    }
     ViewerOverlayControllerBase::detachViewer(viewer);
+}
+
+// --- manual sheet stitching -------------------------------------------------
+
+void SheetCollectionController::installInteractions(VolumeViewerBase* viewer)
+{
+    if (!viewer || wired_.count(viewer))
+        return;
+    auto* chunked = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+    if (!chunked)
+        return;
+    wired_.insert(viewer);
+    // Left-click a sheet to toggle its membership while stitching. (Plain right-click
+    // is pan in VC3D and the Ctrl+right menu is routed via CWindow's context seam.)
+    connect(chunked, &CChunkedVolumeViewer::sendMousePressVolume, this,
+            [this, viewer](cv::Vec3f, cv::Vec3f, Qt::MouseButton button, Qt::KeyboardModifiers mods, QPointF scenePos) {
+                if (button == Qt::LeftButton && mods == Qt::NoModifier)
+                    onSheetLeftPress(viewer, scenePos);
+            });
+}
+
+namespace
+{
+// Distance from scene point p to segment (a, b).
+double segDist(const QPointF& p, const QPointF& a, const QPointF& b)
+{
+    const QPointF ab = b - a, ap = p - a;
+    const double len2 = ab.x() * ab.x() + ab.y() * ab.y();
+    double t = len2 > 0 ? (ap.x() * ab.x() + ap.y() * ab.y()) / len2 : 0.0;
+    t = std::clamp(t, 0.0, 1.0);
+    const QPointF q = a + t * ab;
+    const QPointF d = p - q;
+    return std::sqrt(d.x() * d.x() + d.y() * d.y());
+}
+}  // namespace
+
+int64_t SheetCollectionController::sheetAt(VolumeViewerBase* viewer, QPointF scenePos, double tolScene) const
+{
+    const auto it = hits_.find(viewer);
+    if (it == hits_.end())
+        return 0;
+    int64_t best = 0;
+    double bestD = tolScene;
+    for (const auto& h : it->second)
+        for (const auto& poly : h.curves)
+            for (int i = 0; i + 1 < poly.size(); ++i) {
+                const double d = segDist(scenePos, poly[i], poly[i + 1]);
+                if (d < bestD) { bestD = d; best = h.id; }
+            }
+    return best;
+}
+
+double SheetCollectionController::clickToleranceScene(VolumeViewerBase* viewer) const
+{
+    const double m = (viewer && viewer->graphicsView()) ? viewer->graphicsView()->transform().m11() : 1.0;
+    return 7.0 / std::max(m, 1e-6);  // ~7 px, independent of zoom
+}
+
+bool SheetCollectionController::maybeShowStitchMenu(VolumeViewerBase* viewer, QPointF scenePos, QPoint globalPos)
+{
+    if (!reader_)
+        return false;
+    const int64_t hit = sheetAt(viewer, scenePos, clickToleranceScene(viewer));
+    if (!stitchMode_ && !hit)
+        return false;  // nothing of ours here; let VC3D's own menu handle it
+
+    QMenu menu;
+    if (!stitchMode_) {
+        QAction* a = menu.addAction(tr("Stitch into segment"));
+        connect(a, &QAction::triggered, this, [this, hit]() { enterStitch(hit); });
+    } else {
+        QAction* save = menu.addAction(tr("Save stitched segment (%1 sheets)").arg(int(stitched_.size())));
+        connect(save, &QAction::triggered, this, [this]() { saveStitch(); });
+        if (hit && stitched_.count(hit) && hit != seedId_) {
+            QAction* rem = menu.addAction(tr("Remove sheet from stitch"));
+            connect(rem, &QAction::triggered, this, [this, hit]() { toggleSheet(hit); });
+        } else if (hit && !stitched_.count(hit)) {
+            QAction* add = menu.addAction(tr("Add sheet to stitch"));
+            connect(add, &QAction::triggered, this, [this, hit]() { toggleSheet(hit); });
+        }
+        menu.addSeparator();
+        QAction* cancel = menu.addAction(tr("Cancel stitching"));
+        connect(cancel, &QAction::triggered, this, [this]() { exitStitch(); });
+    }
+    menu.exec(globalPos);
+    return true;
+}
+
+void SheetCollectionController::onSheetLeftPress(VolumeViewerBase* viewer, QPointF scenePos)
+{
+    if (!stitchMode_)
+        return;
+    const int64_t hit = sheetAt(viewer, scenePos, clickToleranceScene(viewer));
+    if (hit)
+        toggleSheet(hit);
+}
+
+void SheetCollectionController::toggleSheet(int64_t id)
+{
+    if (!id)
+        return;
+    if (stitched_.count(id)) {
+        if (stitched_.size() <= 1)
+            return;  // keep at least one sheet in the stitch
+        stitched_.erase(id);
+        if (id == seedId_)
+            seedId_ = *stitched_.begin();  // keep a valid seed for naming/anchor
+    } else {
+        stitched_.insert(id);
+    }
+    updateStitchBanner();
+    rebuildStitchPreview();
+    invalidateDraw();  // repaint the highlight
+}
+
+void SheetCollectionController::updateStitchBanner()
+{
+    if (!cwin_ || !stitchMode_)
+        return;
+    cwin_->sheetStitchSetBanner(
+        tr("Stitching into segment — seed sheet #%1 (magenta), %2 sheet(s) selected.  "
+           "Left-click a sheet to add/remove · Ctrl+right-click to save or cancel.")
+            .arg(seedId_)
+            .arg(int(stitched_.size())));
+}
+
+void SheetCollectionController::enterStitch(int64_t seedId)
+{
+    if (!seedId)
+        return;
+    stitchMode_ = true;
+    seedId_ = seedId;
+    stitched_ = {seedId};
+    if (cwin_) {
+        cwin_->sheetStitchEnterLayout();
+        updateStitchBanner();
+    }
+    rebuildStitchPreview();
+    invalidateDraw();
+}
+
+void SheetCollectionController::exitStitch()
+{
+    if (!stitchMode_)
+        return;
+    stitchMode_ = false;
+    stitched_.clear();
+    seedId_ = 0;
+    if (cwin_) {
+        cwin_->sheetStitchHideBanner();
+        cwin_->sheetStitchExitLayout();
+    }
+    invalidateDraw();
+}
+
+std::shared_ptr<QuadSurface> SheetCollectionController::blendSelected() const
+{
+    if (!reader_ || stitched_.empty())
+        return nullptr;
+    std::vector<vc::sheets::Mesh> meshes;
+    meshes.reserve(stitched_.size());
+    for (int64_t id : stitched_) {
+        try {
+            vc::sheets::Mesh m = reader_->mesh(id);
+            if (!m.verts.empty())
+                meshes.push_back(std::move(m));
+        } catch (...) {}
+    }
+    if (meshes.empty())
+        return nullptr;
+    const vc::sheets::StitchResult r = vc::sheets::stitchSheets(meshes);
+    if (!r.ok())
+        return nullptr;
+    // Native-L0 XYZ -> QuadSurface grid (invalid cells = (-1,-1,-1)); scale = 1/cell.
+    cv::Mat_<cv::Vec3f> pts(r.rows, r.cols, cv::Vec3f(-1.f, -1.f, -1.f));
+    for (int rr = 0; rr < r.rows; ++rr)
+        for (int cc = 0; cc < r.cols; ++cc)
+            if (r.validAt(rr, cc)) {
+                const vc::sheets::Point& p = r.at(rr, cc);
+                pts(rr, cc) = cv::Vec3f(float(p[0] * nativeToViewer_),
+                                        float(p[1] * nativeToViewer_),
+                                        float(p[2] * nativeToViewer_));
+            }
+    const float s = float(1.0 / r.cell);
+    return std::make_shared<QuadSurface>(pts, cv::Vec2f(s, s));
+}
+
+void SheetCollectionController::rebuildStitchPreview()
+{
+    if (!stitchMode_ || !cwin_)
+        return;
+    if (auto surf = blendSelected())
+        cwin_->sheetStitchShowPreview(surf);
+}
+
+void SheetCollectionController::saveStitch()
+{
+    if (!cwin_)
+        return;
+    auto surf = blendSelected();
+    if (!surf) {
+        status_->setText(tr("Nothing to save — no usable sheets selected."));
+        return;
+    }
+    QString err;
+    const QString id = cwin_->sheetStitchSaveSegment(surf, QStringLiteral("stitch_%1").arg(seedId_), err);
+    if (id.isEmpty())
+        status_->setText(tr("Save failed: %1").arg(err));
+    else {
+        status_->setText(tr("Saved stitched segment %1 (%2 sheets).").arg(id).arg(int(stitched_.size())));
+        exitStitch();
+    }
 }

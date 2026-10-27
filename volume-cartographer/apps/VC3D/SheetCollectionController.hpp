@@ -3,10 +3,15 @@
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/SheetCollection.hpp"
 
+#include <QPolygonF>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 class QDockWidget;
 class QLabel;
@@ -17,6 +22,8 @@ class QTimer;
 class QMainWindow;
 class ViewerManager;
 class VolumeViewerBase;
+class CWindow;
+class QuadSurface;
 
 // Read-only viewer for an Automated Sheet Volume (.asv): draws, on each planar CT
 // view, the curves where the sheets crossing the slice meet it. Unlike the fibre
@@ -40,6 +47,11 @@ public:
     QDockWidget* dock() const { return dock_; }
     // Attach a .asv to the session (read-only). An empty/failed path clears it.
     void openCollection(const QString& path);
+
+    // Context-menu seam (called from CWindow's Ctrl+right handler before its own
+    // menu): if a sheet is under the click, or a stitch is in progress, pops the
+    // stitch menu and returns true; otherwise returns false so VC3D's menu runs.
+    bool maybeShowStitchMenu(VolumeViewerBase* viewer, QPointF scenePos, QPoint globalPos);
 
 signals:
     // Emitted after openCollection: the attached path, or empty when cleared/failed.
@@ -69,6 +81,26 @@ private:
     void scheduleControlsApply(bool needQuery);
     // Minimum vertex count equivalent to the mm^2 size filter (area ~ verts*grid^2).
     int64_t minVertsThreshold() const;
+
+    // --- manual sheet stitching ---------------------------------------------
+    // One drawn sheet's slice crossing in scene coords, kept so a click can be
+    // hit-tested back to a sheet id (the overlay is render-only; we hit-test what
+    // we drew, like the sibling overlays do).
+    struct SheetHit { int64_t id{}; std::vector<QPolygonF> curves; };
+
+    void installInteractions(VolumeViewerBase* viewer);  // connect mouse/menu once per viewer
+    void onSheetContextMenu(VolumeViewerBase* viewer, QPointF scenePos, QPoint globalPos);
+    void onSheetLeftPress(VolumeViewerBase* viewer, QPointF scenePos);
+    // Nearest drawn sheet to a scene point within tolerance (px); 0 if none.
+    int64_t sheetAt(VolumeViewerBase* viewer, QPointF scenePos, double tolScene) const;
+    double clickToleranceScene(VolumeViewerBase* viewer) const;  // ~7 px in scene units
+    void enterStitch(int64_t seedId);
+    void exitStitch();
+    void updateStitchBanner();     // seed id + selection count + controls
+    void toggleSheet(int64_t id);
+    void rebuildStitchPreview();   // re-blend the selected sheets -> pane-0 preview
+    void saveStitch();             // write the blended surface as a VC3D segment
+    std::shared_ptr<QuadSurface> blendSelected() const;  // nullptr if nothing usable
 
     ViewerManager* manager_{};
     QDockWidget* dock_{};
@@ -100,4 +132,12 @@ private:
     };
     std::unordered_map<VolumeViewerBase*, Built> built_;
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> views_;
+
+    // Stitch mode state.
+    CWindow* cwin_{};                 // for banner / 4-panel layout / save, if available
+    bool stitchMode_{false};
+    int64_t seedId_{0};               // the sheet that started the stitch
+    std::unordered_set<int64_t> stitched_;  // sheets currently in the stitch
+    std::set<VolumeViewerBase*> wired_;     // viewers whose mouse/menu are connected
+    std::unordered_map<VolumeViewerBase*, std::vector<SheetHit>> hits_;  // per-viewer hit geometry
 };
