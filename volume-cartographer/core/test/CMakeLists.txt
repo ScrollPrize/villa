@@ -386,6 +386,13 @@ set_tests_properties(test_grow_seg_store_mode PROPERTIES
 
 vc_add_test(NAME test_surface_meshing)
 
+# Outputs of the mesh tools (OBJ export, OBJ rasterization, ABF++ flattening)
+# on small fixed inputs.
+vc_add_test(NAME test_mesh_tool_outputs)
+add_dependencies(test_mesh_tool_outputs vc_tifxyz2obj vc_obj2tifxyz vc_obj2tifxyz_legacy vc_flatten)
+set_tests_properties(test_mesh_tool_outputs PROPERTIES
+    ENVIRONMENT "VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_FLATTEN_BIN=$<TARGET_FILE:vc_flatten>")
+
 # Store modes of the command-line tools, compared with their tifxyz modes.
 vc_add_test(NAME test_tool_store_modes)
 if(TARGET flatboi)
