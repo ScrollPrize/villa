@@ -25,15 +25,15 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    added or updated whenever a drag mutates a vertex. No falloff data is cached;
    neighbours are recomputed on demand.
 3. **Interaction loop** – The module listens to mouse events from every
-   `CVolumeViewer`, resolves the nearest vertex via
+   `VolumeViewerBase`, resolves the nearest vertex via
    `SegmentationEditManager::worldToGridIndex`, and drives the drag lifecycle:
    * `beginActiveDrag` snapshots the local neighbourhood inside the configured
      radius.
    * `updateActiveDrag` applies the Gaussian falloff to that sample set.
    * `commitActiveDrag` clears temporary caches once the drag ends.
-   The module pushes preview updates back to `CSurfaceCollection` so the viewers
-   render changes in real time.
-4. **Overlay feedback** – `SegmentationOverlayController` now renders a single
+   The module republishes the edited surface as the `segmentation` surface of
+   `CState` so the viewers render changes in real time.
+4. **Overlay feedback** – `SegmentationOverlayController` renders a single
    active marker plus the currently affected neighbours (as reported by
    `SegmentationEditManager::recentTouched`). During a drag it projects the
    Gaussian radius into viewer space so users understand the footprint.
@@ -56,7 +56,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 | `SegmentationWidget` | Minimal Qt sidebar with an editing toggle, Gaussian controls (radius/sigma in grid steps), and Apply/Reset/Stop affordances. Growth volume selection is still exposed for downstream tooling. |
 | `SegmentationModule` | Binds the widget, edit manager, overlay, and viewers. Routes input events, maintains drag/hover state, updates overlays, and exposes helper signals (status messages, growth requests). |
 | `SegmentationEditManager` | Owns the undo snapshot (`_originalPoints`), the in-place preview pointer, vertex edit map, Gaussian sampling cache for active drags, and dirty tracking. Provides helpers to map world coordinates to grid indices and to query vertex positions. |
-| `SegmentationOverlayController` | Draws the active vertex marker, affected neighbours, optional mask overlay points, and the projected Gaussian radius. |
+| `SegmentationOverlayController` | Draws the active vertex marker, affected neighbours, the surface mask tool's points, and the projected Gaussian radius. |
 | `QuadSurface` (core layer) | Stores the dense `cv::Mat_<cv::Vec3f>` grid and metadata that represent the segmentation patch. |
 
 
@@ -105,11 +105,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
   move and the overlay highlights the active footprint.
 - **Left click release** – Commits the drag and leaves the surface in its new
   state. Escape cancels the drag and restores the touched vertices.
-- **Mouse wheel** – Adjusts the radius in quarter-step increments while showing
+- **Ctrl + mouse wheel** – Adjusts the radius in quarter-step increments while showing
   a transient status message. The overlay radius indicator updates immediately.
-
-Ctrl/Alt modifiers previously reserved for handle management are currently
-unused.
 
 ### Keyboard
 
@@ -118,15 +115,18 @@ unused.
 
 ## Overlay Behaviour
 
-`SegmentationOverlayController` receives:
+`SegmentationModule::refreshOverlay` builds a
+`SegmentationOverlayController::State` and hands it to `applyState`, which
+skips the redraw when the state is unchanged. The fields used by Gaussian
+editing are:
 
-- `setActiveVertex(optional<VertexMarker>)` – Active or hovered vertex (row,
-  col, world).
-- `setTouchedVertices(vector<VertexMarker>)` – The neighbours that were updated
-  during the last drag frame.
-- `setGaussianParameters(radiusSteps, sigmaSteps, gridStepWorld)` – Used to
+- `activeMarker` – Active or hovered vertex (row, col, world).
+- `neighbours` – The vertices updated during the last drag frame (from
+  `SegmentationEditManager::recentTouched`).
+- `gaussianRadiusSteps`, `gaussianSigmaSteps`, `gridStepWorld` – Used to
   project the radius indicator when an active drag is present.
-- Optional mask overlay data for tooling parity.
+- `surfaceMaskPoints` – The surface mask tool's points, in surface
+  coordinates.
 
 The controller renders simple filled circles for neighbours, a highlighted circle
 for the active vertex, and (during drag) an outline representing the world-space
