@@ -50,6 +50,7 @@
 #include <QVector>
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 
 namespace {
@@ -155,7 +156,7 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
         connect(_catalog, &SurfaceCatalog::rowsChanged, this, [this]() {
             syncTree();
             rebuildRecordTagFilterModel();
-            refreshProximityFilters();
+            refreshStoreFilters();
             applyFilters();
         });
         connect(_catalog, &SurfaceCatalog::errorChanged, this, [this](const QString& error) {
@@ -964,7 +965,7 @@ void SurfacePanelController::configureTags(const TagUiRefs& tags)
 void SurfacePanelController::refreshPointSetFilterOptions()
 {
     rebuildPointSetFilterModel();
-    refreshProximityFilters();
+    refreshStoreFilters();
     applyFilters();
 }
 
@@ -1347,7 +1348,7 @@ void SurfacePanelController::connectFilterSignals()
 
     if (_filters.focusPoints) {
         connect(_filters.focusPoints, &QCheckBox::toggled, this, [this]() {
-            refreshProximityFilters();
+            refreshStoreFilters();
             applyFilters();
         });
         if (_filters.focusPointDistance) {
@@ -1360,13 +1361,13 @@ void SurfacePanelController::connectFilterSignals()
         connect(_filters.focusPointDistance,
                 QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                 this,
-                [this](double) { refreshProximityFilters(); applyFilters(); });
+                [this](double) { refreshStoreFilters(); applyFilters(); });
     }
 
     if (_state) {
         connect(_state, &CState::poiChanged, this, [this](const std::string& name, POI*) {
             if (name == "focus" && _filters.focusPoints && _filters.focusPoints->isChecked()) {
-                refreshProximityFilters();
+                refreshStoreFilters();
             }
         });
     }
@@ -1380,6 +1381,7 @@ void SurfacePanelController::connectFilterSignals()
                         const QSignalBlocker blocker(_filters.zUpperBound);
                         _filters.zUpperBound->setValue(value);
                     }
+                    refreshStoreFilters();
                     applyFilters();
                 });
     }
@@ -1393,6 +1395,7 @@ void SurfacePanelController::connectFilterSignals()
                         const QSignalBlocker blocker(_filters.zLowerBound);
                         _filters.zLowerBound->setValue(value);
                     }
+                    refreshStoreFilters();
                     applyFilters();
                 });
     }
@@ -1422,7 +1425,7 @@ void SurfacePanelController::connectFilterSignals()
                 model->setData(model->index(row, 0), state, Qt::CheckStateRole);
             }
         }
-        refreshProximityFilters();
+        refreshStoreFilters();
         applyFilters();
     };
     if (_filters.pointSetAll) {
@@ -1434,7 +1437,7 @@ void SurfacePanelController::connectFilterSignals()
 
     if (_pointCollection) {
         auto pointSetsChanged = [this]() {
-            refreshProximityFilters();
+            refreshStoreFilters();
             applyFilters();
         };
         connect(_pointCollection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>&) {
@@ -1443,12 +1446,12 @@ void SurfacePanelController::connectFilterSignals()
         });
         connect(_pointCollection, &VCCollection::collectionRemoved, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
-            refreshProximityFilters();
+            refreshStoreFilters();
             applyFilters();
         });
         connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
-            refreshProximityFilters();
+            refreshStoreFilters();
             applyFilters();
         });
         connect(_pointCollection, &VCCollection::pointAdded, this, [pointSetsChanged](const ColPoint&) { pointSetsChanged(); });
@@ -1522,7 +1525,7 @@ void SurfacePanelController::rebuildPointSetFilterModel()
         this,
         [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
             if (roles.contains(Qt::CheckStateRole)) {
-                refreshProximityFilters();
+                refreshStoreFilters();
                 applyFilters();
             }
         });
@@ -1587,13 +1590,19 @@ std::vector<QString> checkedNames(QComboBox* box)
 }
 }
 
-void SurfacePanelController::refreshProximityFilters()
+void SurfacePanelController::refreshStoreFilters()
 {
-    const auto generation = ++_proximityGeneration;
+    const auto generation = ++_storeFilterGeneration;
     if (!_catalog || _catalog->sources().empty() || !_catalog->volume()) {
         _focusAnswer.reset();
         _pointSetAnswer.reset();
+        _zRangeAnswer.reset();
         return;
+    }
+    // The Z-range filter: the surfaces whose bounds in the open volume reach the range.
+    std::optional<std::array<double, 2>> zRange;
+    if (z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound)) {
+        zRange = std::array<double, 2>{_filters.zLowerBound->value(), _filters.zUpperBound->value()};
     }
     // The questions: one point set for the focus point, one per checked collection.
     std::vector<std::vector<std::array<double, 3>>> focus, pointSets;
@@ -1610,21 +1619,23 @@ void SurfacePanelController::refreshProximityFilters()
             pointSets.push_back(std::move(points));
         }
     }
-    struct Answers { ProximityAnswer focus, pointSets; };
+    struct Answers { ProximityAnswer focus, pointSets; std::optional<ZRangeAnswer> zRange; };
     vc3d::store::background<Answers>(this,
         [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), focus, pointSets,
-         focusRadius]() {
+         focusRadius, zRange]() {
             auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
                 result.pointSets = sets;
                 result.tolerance = tolerance;
+                vc::objects::SurfaceProximityQuery query;
+                query.tolerance = tolerance;
+                query.volume = volume;
                 for (const auto& points : sets) {
                     std::set<std::string> any, all;
                     bool first = true;
-                    for (const auto& point : points) {
+                    for (const auto& hits : session->nearestSurfaces(sources, query, points)) {
                         std::set<std::string> near;
-                        for (const auto& hit : SurfaceCatalog::nearest(*session, sources, volume, point, tolerance))
-                            near.insert(hit.objectUuid);
+                        for (const auto& [attachment, hit] : hits) near.insert(hit.objectUuid);
                         any.insert(near.begin(), near.end());
                         if (first) all = near;
                         else std::erase_if(all, [&](const std::string& uuid) { return !near.contains(uuid); });
@@ -1638,16 +1649,29 @@ void SurfacePanelController::refreshProximityFilters()
             Answers answers;
             answers.focus = answer(focus, focusRadius);
             answers.pointSets = answer(pointSets, kPointSetTolerance);
+            if (zRange) {
+                constexpr double kUnbounded = std::numeric_limits<double>::max();
+                vc::objects::ObjectSelection selection;
+                selection.kind = "surface";
+                selection.volume = volume;
+                selection.bbox = std::array<double, 6>{-kUnbounded, -kUnbounded, (*zRange)[0],
+                                                       kUnbounded, kUnbounded, (*zRange)[1]};
+                ZRangeAnswer reached{*zRange, {}};
+                for (const auto& [attachment, record] : session->selectObjects(sources, selection))
+                    reached.surfaces.insert(record.uuid);
+                answers.zRange = std::move(reached);
+            }
             return answers;
         },
         [this, generation](vc3d::store::Outcome<Answers> result) {
-            if (generation != _proximityGeneration) return;
+            if (generation != _storeFilterGeneration) return;
             if (!result.error.isEmpty()) {
                 emit statusMessageRequested(tr("Surface filter query failed: %1").arg(result.error), 8000);
                 return;
             }
             _focusAnswer = std::move(result.value.focus);
             _pointSetAnswer = std::move(result.value.pointSets);
+            _zRangeAnswer = std::move(result.value.zRange);
             applyFilters();
         });
 }
@@ -1813,12 +1837,9 @@ void SurfacePanelController::applyFiltersInternal()
             }
         }
         if (show && hasZRangeFilter) {
-            const auto& bbox = row->record.surface ? row->record.surface->bbox : std::nullopt;
-            show = bbox && row->mapping;
-            if(show) {
-                const auto transformed=vc::objects::transformBounds(*bbox,*row->mapping);
-                show=transformed[2]<=zUpperBound&&transformed[5]>=zLowerBound;
-            }
+            // Until the store answers this range, the filter shows nothing.
+            show = _zRangeAnswer && _zRangeAnswer->range == std::array<double, 2>{zLowerBound, zUpperBound} &&
+                   _zRangeAnswer->surfaces.contains(id);
         }
         if (show && isChecked(_filters.unreviewed)) {
             show = !has_tag(*row, "reviewed");

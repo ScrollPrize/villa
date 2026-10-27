@@ -112,16 +112,6 @@ public:
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
 
-    // Surfaces (among `uuids`, all when nullopt) within `tolerance` voxels of a
-    // volume point, nearest first. Synchronous.
-    std::vector<vc::objects::SurfaceProximityHit> nearest(const std::array<double, 3>& point, double tolerance,
-        const std::optional<std::vector<std::string>>& uuids = std::nullopt) const;
-    // The same over explicit sources, for worker threads.
-    static std::vector<vc::objects::SurfaceProximityHit> nearest(vc::objects::ObjectStoreSession& session,
-        const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
-        const std::array<double, 3>& point, double tolerance,
-        const std::optional<std::vector<std::string>>& uuids = std::nullopt);
-
     // Where tools launched for the open volume read and write: the user's store
     // file (a hosted replica's local file) and the volume's id. Throws without a
     // writable attachment and an open volume.

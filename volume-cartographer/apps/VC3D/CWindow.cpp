@@ -2987,8 +2987,13 @@ void CWindow::CreateWidgets(void)
     if (_viewerManager) {
         _viewerManager->setSurfacePicker([this](const cv::Vec3f& point, float tolerance) -> std::optional<std::string> {
             const auto active = _state->surface("segmentation");
-            for (const auto& hit : _surfaceCatalog->nearest({point[0], point[1], point[2]}, tolerance,
-                                                            _surfacePanel->visibleSurfaceIds()))
+            if (!_surfaceCatalog->volume()) return std::nullopt;
+            vc::objects::SurfaceProximityQuery query;
+            query.point = {point[0], point[1], point[2]};
+            query.tolerance = tolerance;
+            query.uuids = _surfacePanel->visibleSurfaceIds();
+            query.volume = _surfaceCatalog->volume()->id();
+            for (const auto& [attachment, hit] : _surfaceCatalog->session()->nearestSurfaces(_surfaceCatalog->sources(), query))
                 if (!active || hit.objectUuid != active->id) return hit.objectUuid;
             return std::nullopt;
         });

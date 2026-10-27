@@ -273,25 +273,3 @@ SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, co
     return crossings;
 }
 
-std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double, 3>& point, double tolerance,
-                                                         const std::optional<std::vector<std::string>>& uuids) const
-{
-    if (!volume_) return {};
-    return nearest(*session_, sources(), volume_->id(), point, tolerance, uuids);
-}
-
-std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(ObjectStoreSession& session,
-                                                         const std::vector<AttachmentIdentity>& sources,
-                                                         const std::string& volume, const std::array<double, 3>& point,
-                                                         double tolerance,
-                                                         const std::optional<std::vector<std::string>>& uuids)
-{
-    SurfaceProximityQuery query;
-    query.point = point;
-    query.tolerance = tolerance;
-    query.uuids = uuids;
-    query.volume = volume;
-    std::vector<SurfaceProximityHit> hits;
-    for (auto& [attachment, hit] : session.nearestSurfaces(sources, query)) hits.push_back(std::move(hit));
-    return hits;
-}

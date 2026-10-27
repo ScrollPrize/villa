@@ -469,21 +469,39 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
 std::vector<AttachedHit> ObjectStoreSession::nearestSurfaces(const std::vector<AttachmentIdentity>& order,
                                                              const SurfaceProximityQuery& query)
 {
-    std::vector<AttachedHit> result;
+    return std::move(nearestSurfaces(order, query, {query.point}).front());
+}
+
+std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const std::vector<AttachmentIdentity>& order,
+                                                                          const SurfaceProximityQuery& query,
+                                                                          const std::vector<std::array<double, 3>>& points)
+{
+    std::vector<std::vector<AttachedHit>> result(points.size());
     std::vector<AttachmentIdentity> earlier;
     for (const auto& attachment : order) {
-        std::vector<SurfaceProximityHit> hits;
-        read(attachment, [&](const auto& store, const auto& txn, const auto&) { hits = store.nearestSurfaces(txn, query); });
+        std::vector<std::vector<SurfaceProximityHit>> hits(points.size());
+        read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+            auto around = query;
+            if (around.volume && !around.transforms)
+                around.transforms = std::make_shared<VolumeTransforms>(store.volumeTransforms(txn));
+            for (std::size_t i = 0; i < points.size(); ++i) {
+                around.point = points[i];
+                hits[i] = store.nearestSurfaces(txn, around);
+            }
+        });
         std::set<std::string> uuids;
-        for (const auto& hit : hits) uuids.insert(hit.objectUuid);
+        for (const auto& near : hits)
+            for (const auto& hit : near) uuids.insert(hit.objectUuid);
         const auto hidden = heldBy(*this, earlier, uuids);
-        for (auto& hit : hits)
-            if (!hidden.contains(hit.objectUuid)) result.push_back({attachment, std::move(hit)});
+        for (std::size_t i = 0; i < points.size(); ++i)
+            for (auto& hit : hits[i])
+                if (!hidden.contains(hit.objectUuid)) result[i].push_back({attachment, std::move(hit)});
         earlier.push_back(attachment);
     }
-    std::stable_sort(result.begin(), result.end(), [](const AttachedHit& a, const AttachedHit& b) {
-        return a.hit.distance != b.hit.distance ? a.hit.distance < b.hit.distance : a.hit.objectUuid < b.hit.objectUuid;
-    });
+    for (auto& near : result)
+        std::stable_sort(near.begin(), near.end(), [](const AttachedHit& a, const AttachedHit& b) {
+            return a.hit.distance != b.hit.distance ? a.hit.distance < b.hit.distance : a.hit.objectUuid < b.hit.objectUuid;
+        });
     return result;
 }
 

@@ -209,6 +209,11 @@ public:
     std::vector<AttachedRegion> geometryRegion(const std::vector<AttachmentIdentity>& order, const RegionSlice&,
                                                const RegionOptions&, const RegionCancel& = {});
     std::vector<AttachedHit> nearestSurfaces(const std::vector<AttachmentIdentity>& order, const SurfaceProximityQuery&);
+    // The same around each of `points` (the query's own point is ignored), in
+    // one read per attachment: the hits per point.
+    std::vector<std::vector<AttachedHit>> nearestSurfaces(const std::vector<AttachmentIdentity>& order,
+                                                          const SurfaceProximityQuery&,
+                                                          const std::vector<std::array<double, 3>>& points);
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory

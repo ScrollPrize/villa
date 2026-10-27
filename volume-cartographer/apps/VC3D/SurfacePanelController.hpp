@@ -198,9 +198,9 @@ private:
     void bindSurface(const std::string& id);
     void onTagCheckboxToggled();
     void applyFiltersInternal();
-    // Geometric filters (focus point, point sets) read surfaces near points
-    // from the store in the background; applyFilters() uses the last answer.
-    void refreshProximityFilters();
+    // Geometric filters (focus point, point sets, Z range) are store queries
+    // run in the background; applyFilters() uses the last answers.
+    void refreshStoreFilters();
     void updateFilterSummary();
     void updateTagSummary();
     void updateTagCheckboxStates(const SurfaceCatalog::Row* row);
@@ -240,5 +240,11 @@ private:
         std::vector<std::set<std::string>> any, all;
     };
     std::optional<ProximityAnswer> _focusAnswer, _pointSetAnswer;
-    uint64_t _proximityGeneration{0};
+    // The Z-range filter's answer: the range asked and the surfaces reaching it.
+    struct ZRangeAnswer {
+        std::array<double, 2> range{0, 0};
+        std::set<std::string> surfaces;
+    };
+    std::optional<ZRangeAnswer> _zRangeAnswer;
+    uint64_t _storeFilterGeneration{0};
 };

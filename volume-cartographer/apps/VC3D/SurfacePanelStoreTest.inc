@@ -9,6 +9,7 @@
 #include <vc_reader/registrations.hpp>
 #include <mutex>
 #include <QTreeWidget>
+#include <QDoubleSpinBox>
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
 // fetched catalog store (as an Open Data sample's) of a volume the open one
@@ -55,9 +56,12 @@ int runSurfacePanelStoreTests()
         tree.setColumnCount(TIMESTAMP_COLUMN + 1);
         SurfacePanelController panel({&tree}, &state, &catalog, nullptr, {});
         QCheckBox approvedTag, defectiveTag, reviewedTag, inspectTag, hideUnapproved;
+        QDoubleSpinBox zLower, zUpper;
         panel.configureTags({nullptr, &approvedTag, &defectiveTag, &reviewedTag, &inspectTag});
         SurfacePanelController::FilterUiRefs filters;
         filters.hideUnapproved = &hideUnapproved;
+        filters.zLowerBound = &zLower;
+        filters.zUpperBound = &zUpper;
         panel.configureFilters(filters, state.pointCollection());
         std::vector<std::shared_ptr<QuadSurface>> activated;
         QObject::connect(&panel, &SurfacePanelController::surfaceActivated,
@@ -79,6 +83,17 @@ int runSurfacePanelStoreTests()
         hideUnapproved.setChecked(true);
         require(visible() == std::vector<std::string>{approved}, "tag filters read record tags");
         hideUnapproved.setChecked(false);
+
+        // The Z-range filter asks the store for the surfaces whose bounds reach
+        // the range in the open volume (the grids lie at z = 2).
+        zUpper.setValue(10);
+        zLower.setValue(5);
+        pump([&] { return visible().empty(); }, "the Z range excludes surfaces below it");
+        zLower.setValue(1);
+        zUpper.setValue(3);
+        pump([&] { return visible() == sorted({approved, plain}); }, "the Z range keeps surfaces that reach it");
+        zLower.setValue(zLower.minimum());
+        zUpper.setValue(zUpper.maximum());
 
         QString error;
         require(panel.activateSurfaceById(plain, &error), "activating a bound surface opens it");
