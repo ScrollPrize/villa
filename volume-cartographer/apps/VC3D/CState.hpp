@@ -117,20 +117,6 @@ public:
     void setPOI(const std::string& name, POI* poi);
     POI* poi(const std::string& name);
 
-    // The umbilicus of the current volume: the one live umbilicus object in the
-    // attached store bound to it, with its points in the volume's voxels. Its frame
-    // was decided when it was stored. `error` says why there is none (nothing
-    // attached or bound, or several bound). `token` (uuid@revision, else the
-    // error) changes whenever the answer does.
-    struct StoredUmbilicus {
-        std::string uuid;
-        std::string name;
-        std::vector<cv::Vec3f> points;
-        std::string error;
-        std::string token;
-    };
-    StoredUmbilicus storedUmbilicus() const;
-
 signals:
     void objectStoreChanged(const vc::objects::StoreSessionEvent& event);
     void objectStoreObservationFailed(const QString& error);

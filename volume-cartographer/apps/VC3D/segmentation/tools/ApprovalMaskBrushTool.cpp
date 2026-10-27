@@ -874,7 +874,7 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(con
 
     // Check if the point at this location is valid
     const cv::Vec3f& point = (*points)(row, col);
-    if (!validSurfaceVertex(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         // Search nearby for a valid point (small radius since we have precise coordinates)
         constexpr int kSearchRadius = 3;
         for (int dr = -kSearchRadius; dr <= kSearchRadius; ++dr) {
@@ -882,7 +882,7 @@ std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(con
                 const int r = row + dr;
                 const int c = col + dc;
                 if (r >= 0 && r < points->rows && c >= 0 && c < points->cols) {
-                    if (!!validSurfaceVertex((*points)(r, c))) {
+                    if (!!vc::geometry::validSurfacePoint((*points)(r, c))) {
                         return std::make_pair(r, c);
                     }
                 }

@@ -126,9 +126,9 @@ std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     const cv::Vec3f surfOrigin = segment.coord(ptr, {0, 0, 0});
     const cv::Vec3f xDir = segment.coord(ptr, {1, 0, 0});
     const cv::Vec3f yDir = segment.coord(ptr, {0, 1, 0});
-    if (!validSurfaceVertex(surfOrigin) ||
-        !validSurfaceVertex(xDir) ||
-        !validSurfaceVertex(yDir)) {
+    if (!vc::geometry::validSurfacePoint(surfOrigin) ||
+        !vc::geometry::validSurfacePoint(xDir) ||
+        !vc::geometry::validSurfacePoint(yDir)) {
         return std::nullopt;
     }
 

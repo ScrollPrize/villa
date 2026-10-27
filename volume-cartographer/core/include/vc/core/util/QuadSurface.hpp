@@ -102,10 +102,6 @@ template<typename T>
 struct tuple_element<5, QuadRef<T>> { using type = T&; };
 }
 
-// Whether a grid vertex has coordinates, by the store's rule: missing vertices
-// are the (-1,-1,-1) sentinel (vc::geometry::validSurfacePoint).
-inline bool validSurfaceVertex(const cv::Vec3f& p) { return vc::geometry::validSurfacePoint({p[0], p[1], p[2]}); }
-
 // Range for iterating over valid points
 template<typename PointType>
 class ValidPointRange {

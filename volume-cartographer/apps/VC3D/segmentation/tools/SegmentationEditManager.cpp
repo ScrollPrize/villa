@@ -592,7 +592,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     const cv::Vec2f grid = _baseSurface->ptrToGrid(hit->ptr);
     const int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, cols - 1);
     const int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, rows - 1);
-    if (!validSurfaceVertex((*points)(row, col))) {
+    if (!vc::geometry::validSurfacePoint((*points)(row, col))) {
         if (warnOnFailure) {
             qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index hit invalid vertex"
                                         << "row" << row << "col" << col;
@@ -617,7 +617,7 @@ std::optional<cv::Vec3f> SegmentationEditManager::vertexWorldPosition(int row, i
         return std::nullopt;
     }
     const cv::Vec3f& world = (*preview)(row, col);
-    if (!validSurfaceVertex(world)) {
+    if (!vc::geometry::validSurfacePoint(world)) {
         return std::nullopt;
     }
     return world;
@@ -676,7 +676,7 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
     for (std::size_t i = 0; i < sampleCount; ++i) {
         const auto& sample = _activeDrag.samples[i];
         const cv::Vec3f& rawTarget = newWorldPositions[i];
-        if (!validSurfaceVertex(rawTarget)) {
+        if (!vc::geometry::validSurfacePoint(rawTarget)) {
             return false;
         }
 
@@ -736,7 +736,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
             return;
         }
         const cv::Vec3f& candidate = (*preview)(r, c);
-        if (!validSurfaceVertex(candidate)) {
+        if (!vc::geometry::validSurfacePoint(candidate)) {
             return;
         }
         region.insert(GridKey{r, c});
@@ -786,7 +786,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
             }
 
             const cv::Vec3f& current = currentIt->second;
-            if (!validSurfaceVertex(current)) {
+            if (!vc::geometry::validSurfacePoint(current)) {
                 continue;
             }
 
@@ -809,7 +809,7 @@ bool SegmentationEditManager::smoothRecentTouched(float strength, int iterations
                     neighbour = (*preview)(nr, nc);
                 }
 
-                if (!validSurfaceVertex(neighbour)) {
+                if (!vc::geometry::validSurfacePoint(neighbour)) {
                     continue;
                 }
 
@@ -971,7 +971,7 @@ bool SegmentationEditManager::invalidateRegion(int centerRow, int centerCol, int
     for (int r = rowStart; r <= rowEnd; ++r) {
         for (int c = colStart; c <= colEnd; ++c) {
             const cv::Vec3f& original = (*_originalPoints)(r, c);
-            if (!validSurfaceVertex(original)) {
+            if (!vc::geometry::validSurfacePoint(original)) {
                 continue;
             }
             (*preview)(r, c) = original;
@@ -1029,7 +1029,7 @@ bool SegmentationEditManager::markInvalidRegion(int centerRow, int centerCol, fl
             }
 
             cv::Vec3f& cell = (*previewMat)(r, c);
-            if (!validSurfaceVertex(cell)) {
+            if (!vc::geometry::validSurfacePoint(cell)) {
                 continue;
             }
 
@@ -1057,7 +1057,7 @@ void SegmentationEditManager::clearInvalidatedEdits()
 
     bool removed = false;
     for (auto it = _editedVertices.begin(); it != _editedVertices.end();) {
-        if (!validSurfaceVertex(it->second.currentWorld)) {
+        if (!vc::geometry::validSurfacePoint(it->second.currentWorld)) {
             it = _editedVertices.erase(it);
             removed = true;
         } else {
@@ -1107,7 +1107,7 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
     }
 
     const cv::Vec3f& centerWorld = (*preview)(centerRow, centerCol);
-    if (!validSurfaceVertex(centerWorld)) {
+    if (!vc::geometry::validSurfacePoint(centerWorld)) {
         return false;
     }
 
@@ -1145,7 +1145,7 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
         for (int c = colStart; c <= colEnd; ++c) {
             const cv::Vec3f& original = (*_originalPoints)(r, c);
             const cv::Vec3f& baseWorld = (*preview)(r, c);
-            if (!validSurfaceVertex(original) || !validSurfaceVertex(baseWorld)) {
+            if (!vc::geometry::validSurfacePoint(original) || !vc::geometry::validSurfacePoint(baseWorld)) {
                 continue;
             }
 
@@ -1221,7 +1221,7 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     }
 
     const cv::Vec3f& original = (*_originalPoints)(row, col);
-    if (!validSurfaceVertex(original)) {
+    if (!vc::geometry::validSurfacePoint(original)) {
         return;
     }
 

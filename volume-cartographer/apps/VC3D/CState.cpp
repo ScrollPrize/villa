@@ -22,7 +22,6 @@
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 
 namespace {
@@ -72,7 +71,7 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     }
 
     const cv::Vec3f point = (*points)(row, col);
-    if (!validSurfaceVertex(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         return std::nullopt;
     }
 
@@ -353,35 +352,6 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, volumeId);
     emit focusBoundsChanged();
-}
-
-CState::StoredUmbilicus CState::storedUmbilicus() const
-{
-    StoredUmbilicus result;
-    const auto attachment = objectStoreAttachment();
-    const auto volumeId = currentVolumeId();
-    if (!attachment || volumeId.empty()) {
-        result.error = "no object store or volume";
-        result.token = result.error;
-        return result;
-    }
-    try {
-        _objectStoreSession->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto umbilicus = vc::objects::volumeUmbilicus(db, txn, volumeId);
-            if (!umbilicus) {
-                result.error = "no umbilicus maps to volume " + volumeId;
-                return;
-            }
-            for (const auto& p : umbilicus->points) result.points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
-            result.uuid = umbilicus->uuid;
-            result.name = umbilicus->name;
-            result.token = umbilicus->uuid + "@" + umbilicus->objectRevision;
-        });
-    } catch (const std::exception& error) {
-        result.error = error.what();
-    }
-    if (result.token.empty()) result.token = result.error;
-    return result;
 }
 
 vc3d::annotation::AnnotationFrame CState::annotationFrame() const

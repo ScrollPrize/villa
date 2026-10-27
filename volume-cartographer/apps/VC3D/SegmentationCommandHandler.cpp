@@ -221,7 +221,7 @@ std::optional<cv::Rect> computeValidSurfaceBounds(const cv::Mat_<cv::Vec3f>& poi
 
     for (int r = 0; r < points.rows; ++r) {
         for (int c = 0; c < points.cols; ++c) {
-            if (!validSurfaceVertex(points(r, c))) {
+            if (!vc::geometry::validSurfacePoint(points(r, c))) {
                 continue;
             }
             minRow = std::min(minRow, r);

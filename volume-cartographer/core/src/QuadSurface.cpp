@@ -2790,7 +2790,7 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     for (int j=0;j<points->rows;++j)
         for (int i=0;i<points->cols;++i) {
             const cv::Vec3f& p = (*points)(j,i);
-            if (!vc::geometry::validTifxyzPoint({p[0], p[1], p[2]}))
+            if (!vc::geometry::validTifxyzPoint(p))
                 (*points)(j,i) = cv::Vec3f(-1.f,-1.f,-1.f);
         }
 

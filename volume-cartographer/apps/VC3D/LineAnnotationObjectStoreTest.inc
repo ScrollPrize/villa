@@ -112,9 +112,10 @@ int runObjectStoreControllerTests()
             int changed = 0, fibersChanged = 0;
             QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
             QObject::connect(&controller, &Controller::fibersChanged, [&] { ++fibersChanged; });
-            require(!state.storedUmbilicus().error.empty() && !controller.umbilicusStatus().available,
-                    "a volume without a stored umbilicus has none");
             const auto attachment = *state.objectStoreAttachment();
+            require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id()) &&
+                        !controller.umbilicusStatus().available,
+                    "a volume without a stored umbilicus has none");
             auto add = [&](const std::string& name) {
                 const auto uuid = vc::objects::util::newUuid();
                 state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
@@ -127,11 +128,11 @@ int runObjectStoreControllerTests()
                 return uuid;
             };
             const auto first = add("scroll");
-            const auto stored = state.storedUmbilicus();
+            const auto stored = vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id());
             require(changed > 0, "committing an umbilicus announces it");
             require(fibersChanged == 0, "a commit touching no fiber leaves the fiber caches alone");
-            require(stored.error.empty() && stored.uuid == first &&
-                    stored.points == std::vector<cv::Vec3f>{{4, 3, 0}, {4, 3, 15}},
+            require(stored && stored->uuid == first &&
+                    stored->points == std::vector<vc::geometry::Point>{{4, 3, 0}, {4, 3, 15}},
                     "the stored umbilicus is read in the volume's voxels");
             require(controller.umbilicusStatus().available && controller.umbilicusStatus().text == "scroll",
                     "the fiber map status names the stored umbilicus");
@@ -139,7 +140,7 @@ int runObjectStoreControllerTests()
             require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
             const auto token = controller.umbilicusFingerprint();
             add("second");
-            require(state.storedUmbilicus().error.find("several") != std::string::npos &&
+            require(controller.umbilicusStatus().text.contains("several") &&
                     controller.umbilicusFingerprint() != token,
                     "several umbilici bound to one volume are refused");
             state.detachObjectStore();

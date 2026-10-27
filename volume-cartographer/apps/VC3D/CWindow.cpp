@@ -561,7 +561,7 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     }
 
     const cv::Vec3f& point = (*points)(row, col);
-    if (!validSurfaceVertex(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         return std::nullopt;
     }
 

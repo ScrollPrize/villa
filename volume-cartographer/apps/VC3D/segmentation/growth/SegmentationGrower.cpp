@@ -1,3 +1,4 @@
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
 
@@ -123,7 +124,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     approxRow = std::clamp(approxRow, 0, rows - 1);
     approxCol = std::clamp(approxCol, 0, cols - 1);
 
-    if (!validSurfaceVertex((*points)(approxRow, approxCol))) {
+    if (!vc::geometry::validSurfacePoint((*points)(approxRow, approxCol))) {
         constexpr int kMaxRadius = 12;
         float bestDistSq = std::numeric_limits<float>::max();
         int bestRow = -1;
@@ -131,7 +132,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
 
         auto accumulateCandidate = [&](int r, int c) {
             const cv::Vec3f& candidate = (*points)(r, c);
-            if (!validSurfaceVertex(candidate)) {
+            if (!vc::geometry::validSurfacePoint(candidate)) {
                 return;
             }
             const cv::Vec3f diff = candidate - worldPos;
@@ -358,7 +359,7 @@ std::optional<CorrectionsBounds> computeCorrectionsBounds(
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& pt = (*points)(r, c);
-            if (!validSurfaceVertex(pt)) {
+            if (!vc::geometry::validSurfacePoint(pt)) {
                 continue;
             }
 
@@ -680,20 +681,30 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
 
         // The current volume's stored umbilicus, in its voxels (the tracer runs at level 0).
-        const auto umbilicus = _context.state->storedUmbilicus();
-        if (!umbilicus.points.empty()) {
+        std::optional<vc::objects::VolumeUmbilicus> umbilicus;
+        QString umbilicusProblem = tr("no object store or volume");
+        if (const auto attachment = _context.state->objectStoreAttachment();
+            attachment && !_context.state->currentVolumeId().empty()) {
+            try {
+                umbilicus = vc::objects::volumeUmbilicus(*_context.state->objectStoreSession(), *attachment,
+                                                         _context.state->currentVolumeId());
+                umbilicusProblem = tr("no umbilicus maps to the volume");
+            } catch (const std::exception& error) {
+                umbilicusProblem = QString::fromUtf8(error.what());
+            }
+        }
+        if (umbilicus) {
             auto points = utils::Json::array();
-            for (const auto& p : umbilicus.points) {
+            for (const auto& p : umbilicus->points) {
                 auto xyz = utils::Json::array();
-                xyz.push_back(p[0]);
-                xyz.push_back(p[1]);
-                xyz.push_back(p[2]);
+                xyz.push_back(float(p[0]));
+                xyz.push_back(float(p[1]));
+                xyz.push_back(float(p[2]));
                 points.push_back(std::move(xyz));
             }
             request.customParams["umbilicus_points"] = std::move(points);
         } else if (request.customParams.value("single wrap", false)) {
-            showStatus(tr("Single-wrap growth needs an umbilicus: %1").arg(QString::fromStdString(umbilicus.error)),
-                       kStatusLong);
+            showStatus(tr("Single-wrap growth needs an umbilicus: %1").arg(umbilicusProblem), kStatusLong);
             return false;
         }
 

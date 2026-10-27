@@ -274,7 +274,7 @@ SafeFocusProjection validateSafeFocusProjection(
     }
 
     result.coord = surface.coord(result.ptr);
-    if (!validSurfaceVertex(result.coord)) {
+    if (!vc::geometry::validSurfacePoint(result.coord)) {
         result.reason = "invalid_coord";
         return result;
     }
@@ -428,7 +428,7 @@ void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
         for (int x = 0; x < w; ++x) {
             cv::Vec3f& p = coordRow[x];
             const cv::Vec3f& n = normalRow[x];
-            if (!validSurfaceVertex(p) ||
+            if (!vc::geometry::validSurfacePoint(p) ||
                 !std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
                 continue;
             }
@@ -4850,7 +4850,7 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         float distance = dist;
         const cv::Vec3f surfCoord = quad->coord(ptr);
         const cv::Vec3f surfNormal = quad->normal(ptr);
-        if (validSurfaceVertex(surfCoord) && finiteVec3(surfNormal)) {
+        if (vc::geometry::validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
             w = (volPoint - surfCoord).dot(surfNormal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
@@ -6013,8 +6013,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                     (*points)(row + strideY, col + strideX),
                     (*points)(row + strideY, col),
                 };
-                if (!validSurfaceVertex(corners[0]) || !validSurfaceVertex(corners[1]) ||
-                    !validSurfaceVertex(corners[2]) || !validSurfaceVertex(corners[3])) {
+                if (!vc::geometry::validSurfacePoint(corners[0]) || !vc::geometry::validSurfacePoint(corners[1]) ||
+                    !vc::geometry::validSurfacePoint(corners[2]) || !vc::geometry::validSurfacePoint(corners[3])) {
                     markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                     continue;
