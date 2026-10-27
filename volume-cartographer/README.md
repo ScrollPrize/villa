@@ -186,29 +186,10 @@ must be a contiguous numeric, isotropic dyadic ZYX pyramid with zero coordinate
 translations. Query parameters remain part of the network URL and must precede
 the fragment, for example `volume.zarr?token=abc#vc-base-scale=2`.
 
-Coordinate-bearing artifacts created by VC3D retain the selected source view
-in their JSON metadata (surface records, point collections, and fibers). For
-example:
-
-```json
-{
-  "vc_open_data_coordinate_space": "PHerc1451/20260319101107@L2",
-  "vc_open_data_source_path": "s3://path/to/the/source/volume",
-  "vc_open_data_source_coordinate_level": 2,
-  "vc_open_data_source_coordinate_scale_factor": 4,
-  "vc_open_data_source_original_resolution": 2.4
-}
-```
-
-The source path identifies the native volume without the `#vc-base-scale`
-selector. The scale factor is `2^level`, and the original resolution is the
-native level-0 voxel size in micrometers.
-
 The selector is part of persistent volume identity but is never sent in HTTP
 requests. Tools that support remote volumes receive the complete portable
 locator. Local-only tools reject it instead of silently discarding the
-selector. Catalog surfaces, normal grids, and overlays are automatically paired
-only when their explicit coordinate-space tags match the selected view.
+selector.
 
 The meta.json contains the following information. The only real change from a standard VC meta.json is the inclusion of the `format:"zarr"` key.
 ```json
