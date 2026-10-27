@@ -57,7 +57,6 @@ class VCCollection;
 class ViewerManager;
 class QKeyEvent;
 class QTimer;
-class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
 class SurfaceMaskBrushTool;
@@ -85,8 +84,6 @@ public:
     [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
     void setDragSigma(float sigmaSteps);
-    void setLineRadius(float radiusSteps);
-    void setLineSigma(float sigmaSteps);
     void setPushPullRadius(float radiusSteps);
     void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
@@ -259,7 +256,6 @@ signals:
     void annotationPointFocused(vc::PointRef point);
 
 private:
-    friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
     friend class SurfaceMaskBrushTool;
@@ -269,7 +265,6 @@ private:
     enum class FalloffTool
     {
         Drag,
-        Line,
         PushPull
     };
 
@@ -384,7 +379,6 @@ private:
     bool handleManualAddMouseMove(VolumeViewerBase* viewer,
                                   Qt::MouseButtons buttons,
                                   const QPointF& scenePos);
-    void clearLineDragStroke();
 
     void handleMousePress(VolumeViewerBase* viewer,
                           const cv::Vec3f& worldPos,
@@ -457,8 +451,6 @@ private:
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
-    float _lineRadiusSteps{5.0f};
-    float _lineSigmaSteps{2.0f};
     float _pushPullRadiusSteps{2.0f};
     float _pushPullSigmaSteps{2.0f};
     FalloffTool _activeFalloff{FalloffTool::Drag};
@@ -484,10 +476,8 @@ private:
 
     std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> _rotationHandleHitTester;
 
-    bool _lineDrawKeyActive{false};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
 
-    std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;

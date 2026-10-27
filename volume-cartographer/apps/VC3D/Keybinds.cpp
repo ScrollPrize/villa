@@ -267,14 +267,6 @@ const KeyPressDef ManualAddToggle{
     Qt::ShiftModifier,
     true
 };
-const KeyPressDef LineDrawHold{
-    "line_draw_hold",
-    kSectionSegEditing,
-    "Line draw mode (hold)",
-    Qt::Key_S,
-    Qt::NoModifier,
-    true
-};
 const KeyPressDef GrowSegmentation{
     "grow_segmentation",
     kSectionSegGrowth,
@@ -517,7 +509,6 @@ QString buildKeybindsHelpText()
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
-        { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Anchor correction drag", HelpKeyType::Literal, nullptr, nullptr, "Hold G + Drag" },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },

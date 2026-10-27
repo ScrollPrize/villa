@@ -60,7 +60,6 @@ extern const KeyPressDef UnapprovalPaintToggle;
 extern const KeyPressDef ApprovalUndo;
 extern const KeyPressDef SegmentationUndo;
 extern const KeyPressDef ManualAddToggle;
-extern const KeyPressDef LineDrawHold;
 extern const KeyPressDef GrowSegmentation;
 extern const KeyPressDef CancelOperation;
 extern const KeyPressDef PushPullIn;

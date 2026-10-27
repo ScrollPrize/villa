@@ -81,10 +81,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::dragRadiusChanged);
     connect(_editingPanel, &SegmentationEditingPanel::dragSigmaChanged,
             this, &SegmentationWidget::dragSigmaChanged);
-    connect(_editingPanel, &SegmentationEditingPanel::lineRadiusChanged,
-            this, &SegmentationWidget::lineRadiusChanged);
-    connect(_editingPanel, &SegmentationEditingPanel::lineSigmaChanged,
-            this, &SegmentationWidget::lineSigmaChanged);
     connect(_editingPanel, &SegmentationEditingPanel::pushPullRadiusChanged,
             this, &SegmentationWidget::pushPullRadiusChanged);
     connect(_editingPanel, &SegmentationEditingPanel::pushPullSigmaChanged,
@@ -280,8 +276,6 @@ void SegmentationWidget::noteGrowthMethod(SegmentationGrowthMethod method)
 
 float SegmentationWidget::dragRadius() const { return _editingPanel->dragRadius(); }
 float SegmentationWidget::dragSigma() const { return _editingPanel->dragSigma(); }
-float SegmentationWidget::lineRadius() const { return _editingPanel->lineRadius(); }
-float SegmentationWidget::lineSigma() const { return _editingPanel->lineSigma(); }
 float SegmentationWidget::pushPullRadius() const { return _editingPanel->pushPullRadius(); }
 float SegmentationWidget::pushPullSigma() const { return _editingPanel->pushPullSigma(); }
 float SegmentationWidget::pushPullStep() const { return _editingPanel->pushPullStep(); }
@@ -293,8 +287,6 @@ bool SegmentationWidget::showHoverMarker() const { return _editingPanel->showHov
 
 void SegmentationWidget::setDragRadius(float value) { _editingPanel->setDragRadius(value); }
 void SegmentationWidget::setDragSigma(float value) { _editingPanel->setDragSigma(value); }
-void SegmentationWidget::setLineRadius(float value) { _editingPanel->setLineRadius(value); }
-void SegmentationWidget::setLineSigma(float value) { _editingPanel->setLineSigma(value); }
 void SegmentationWidget::setPushPullRadius(float value) { _editingPanel->setPushPullRadius(value); }
 void SegmentationWidget::setPushPullSigma(float value) { _editingPanel->setPushPullSigma(value); }
 void SegmentationWidget::setPushPullStep(float value) { _editingPanel->setPushPullStep(value); }

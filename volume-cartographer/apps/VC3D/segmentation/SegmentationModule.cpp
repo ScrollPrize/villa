@@ -8,7 +8,6 @@
 #include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
-#include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
@@ -157,8 +156,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_widget) {
         _dragRadiusSteps = _widget->dragRadius();
         _dragSigmaSteps = _widget->dragSigma();
-        _lineRadiusSteps = _widget->lineRadius();
-        _lineSigmaSteps = _widget->lineSigma();
         _pushPullRadiusSteps = _widget->pushPullRadius();
         _pushPullSigmaSteps = _widget->pushPullSigma();
         initialPushPullStep = std::clamp(_widget->pushPullStep(), 0.05f, 100.0f);
@@ -190,7 +187,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         }
     }
 
-    _lineTool = std::make_unique<SegmentationLineTool>(*this, _editManager, _state, _smoothStrength, _smoothIterations);
     _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _overlay, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
@@ -362,10 +358,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::setDragRadius);
     connect(_widget, &SegmentationWidget::dragSigmaChanged,
             this, &SegmentationModule::setDragSigma);
-    connect(_widget, &SegmentationWidget::lineRadiusChanged,
-            this, &SegmentationModule::setLineRadius);
-    connect(_widget, &SegmentationWidget::lineSigmaChanged,
-            this, &SegmentationModule::setLineSigma);
     connect(_widget, &SegmentationWidget::pushPullRadiusChanged,
             this, &SegmentationModule::setPushPullRadius);
     connect(_widget, &SegmentationWidget::pushPullSigmaChanged,
@@ -581,8 +573,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (!enabled) {
         resetManualAddState(true);
         stopAllPushPull();
-        clearLineDragStroke();
-        _lineDrawKeyActive = false;
         clearUndoStack();
         _hoverPointer.valid = false;
         _hoverPointer.viewer = nullptr;
@@ -765,7 +755,6 @@ void SegmentationModule::setEditApprovedMask(bool enabled)
         }
 
         // Deactivate regular editing tools
-        clearLineDragStroke();
         stopAllPushPull();
     } else if (!isEditingApprovalMask()) {
         // Exiting all approval mask editing - save to disk
@@ -827,7 +816,6 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
         }
 
         // Deactivate regular editing tools
-        clearLineDragStroke();
         stopAllPushPull();
     } else if (!isEditingApprovalMask()) {
         // Exiting all approval mask editing - save to disk
@@ -870,7 +858,6 @@ void SegmentationModule::setDrawMaskEnabled(bool enabled)
     }
 
     if (enabled) {
-        clearLineDragStroke();
         stopAllPushPull();
         cancelDrag();
     }
@@ -1049,7 +1036,6 @@ void SegmentationModule::resetEdits()
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
     cancelDrag();
-    clearLineDragStroke();
     _editManager->resetPreview();
     if (_state) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
@@ -1063,8 +1049,6 @@ void SegmentationModule::resetEdits()
 
 void SegmentationModule::stopTools()
 {
-    _lineDrawKeyActive = false;
-    clearLineDragStroke();
     cancelDrag();
     cancelCorrectionDrag();
     emit stopToolsRequested();
@@ -1101,8 +1085,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
     }
     if (running) {
         setAnnotateMode(false);
-        clearLineDragStroke();
-        _lineDrawKeyActive = false;
     } else if (_editingEnabled && _hoverPreviewEnabled && !_hover.valid) {
         recoverHoverPointerFromCursor();
         ensureHoverTarget();
@@ -1131,20 +1113,6 @@ void SegmentationModule::refreshOverlay()
     state.gaussianRadiusSteps = falloffRadius(_activeFalloff);
     state.gaussianSigmaSteps = falloffSigma(_activeFalloff);
     state.gridStepWorld = gridStepWorld();
-
-    const auto toFalloffMode = [](FalloffTool tool) {
-        using Mode = SegmentationOverlayController::State::FalloffMode;
-        switch (tool) {
-        case FalloffTool::Drag:
-            return Mode::Drag;
-        case FalloffTool::Line:
-            return Mode::Line;
-        case FalloffTool::PushPull:
-            return Mode::PushPull;
-        }
-        return Mode::Drag;
-    };
-    state.falloff = toFalloffMode(_activeFalloff);
 
     const bool hasSession = _editManager && _editManager->hasSession();
 
@@ -1236,40 +1204,17 @@ void SegmentationModule::refreshOverlay()
         }
     }
 
-    std::vector<cv::Vec3f> maskPoints;
-    std::size_t maskReserve = 0;
-    if (_lineTool) {
-        maskReserve += _lineTool->overlayPoints().size();
-    }
-    maskPoints.reserve(maskReserve);
-    if (_lineTool) {
-        const auto& linePts = _lineTool->overlayPoints();
-        maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
-    }
     if (_surfaceMaskTool) {
         state.surfaceMaskPoints = _surfaceMaskTool->overlaySurfacePoints();
     }
 
-    const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
-    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
     const bool surfaceMaskActive = _surfaceMaskTool && _surfaceMaskTool->active();
     const bool surfaceMaskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
-    state.maskPoints = std::move(maskPoints);
-    state.maskVisible = !state.maskPoints.empty() || !state.surfaceMaskPoints.empty();
-    state.hasLineStroke = hasLineStroke;
-    state.lineStrokeActive = lineStrokeActive;
-    state.brushActive = surfaceMaskActive;
-    state.brushStrokeActive = surfaceMaskStrokeActive;
     state.pushPullActive = pushPullActive;
 
-    FalloffTool overlayTool = _activeFalloff;
-    if (hasLineStroke) {
-        overlayTool = FalloffTool::Line;
-    } else if (pushPullActive) {
-        overlayTool = FalloffTool::PushPull;
-    }
+    const FalloffTool overlayTool = pushPullActive ? FalloffTool::PushPull : _activeFalloff;
 
     state.displayRadiusSteps = falloffRadius(overlayTool);
     if (surfaceMaskActive || surfaceMaskStrokeActive) {
@@ -1962,7 +1907,6 @@ bool SegmentationModule::beginManualAdd()
     }
 
     stopAllPushPull();
-    clearLineDragStroke();
     cancelDrag();
     cancelCorrectionDrag();
     setAnnotateMode(false);
@@ -2332,16 +2276,6 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
         refreshOverlay();
     }
     return true;
-}
-
-void SegmentationModule::clearLineDragStroke()
-{
-    if (_lineTool) {
-        _lineTool->clear();
-    }
-    if (!_lineDrawKeyActive && _activeFalloff == FalloffTool::Line) {
-        useFalloff(FalloffTool::Drag);
-    }
 }
 
 bool SegmentationModule::isSegmentationViewer(const VolumeViewerBase* viewer) const

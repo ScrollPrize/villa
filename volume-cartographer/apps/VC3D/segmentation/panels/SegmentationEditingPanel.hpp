@@ -25,8 +25,6 @@ public:
     // Getters
     [[nodiscard]] float dragRadius() const { return _dragRadiusSteps; }
     [[nodiscard]] float dragSigma() const { return _dragSigmaSteps; }
-    [[nodiscard]] float lineRadius() const { return _lineRadiusSteps; }
-    [[nodiscard]] float lineSigma() const { return _lineSigmaSteps; }
     [[nodiscard]] float pushPullRadius() const { return _pushPullRadiusSteps; }
     [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
@@ -39,8 +37,6 @@ public:
     // Setters
     void setDragRadius(float value);
     void setDragSigma(float value);
-    void setLineRadius(float value);
-    void setLineSigma(float value);
     void setPushPullRadius(float value);
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
@@ -56,8 +52,6 @@ public:
 signals:
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
-    void lineRadiusChanged(float value);
-    void lineSigmaChanged(float value);
     void pushPullRadiusChanged(float value);
     void pushPullSigmaChanged(float value);
     void pushPullStepChanged(float value);
@@ -78,13 +72,10 @@ private:
 
     CollapsibleSettingsGroup* _groupEditing{nullptr};
     CollapsibleSettingsGroup* _groupDrag{nullptr};
-    CollapsibleSettingsGroup* _groupLine{nullptr};
     CollapsibleSettingsGroup* _groupPushPull{nullptr};
 
     QDoubleSpinBox* _spinDragRadius{nullptr};
     QDoubleSpinBox* _spinDragSigma{nullptr};
-    QDoubleSpinBox* _spinLineRadius{nullptr};
-    QDoubleSpinBox* _spinLineSigma{nullptr};
     QDoubleSpinBox* _spinPushPullRadius{nullptr};
     QDoubleSpinBox* _spinPushPullSigma{nullptr};
     QDoubleSpinBox* _spinPushPullStep{nullptr};
@@ -109,8 +100,6 @@ private:
 
     float _dragRadiusSteps{5.75f};
     float _dragSigmaSteps{2.0f};
-    float _lineRadiusSteps{5.75f};
-    float _lineSigmaSteps{2.0f};
     float _pushPullRadiusSteps{5.75f};
     float _pushPullSigmaSteps{2.0f};
     float _pushPullStep{4.0f};

@@ -152,8 +152,6 @@ set(srcs
     segmentation/tools/ManualAddTool.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
-    segmentation/tools/SegmentationLineTool.cpp
-    segmentation/tools/SegmentationLineTool.hpp
     segmentation/tools/SegmentationPushPullTool.cpp
     segmentation/tools/SegmentationPushPullTool.hpp
     segmentation/tools/SegmentationTool.hpp

@@ -38,8 +38,6 @@ public:
     [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] float dragRadius() const;
     [[nodiscard]] float dragSigma() const;
-    [[nodiscard]] float lineRadius() const;
-    [[nodiscard]] float lineSigma() const;
     [[nodiscard]] float pushPullRadius() const;
     [[nodiscard]] float pushPullSigma() const;
     [[nodiscard]] float pushPullStep() const;
@@ -77,8 +75,6 @@ public:
     void setDrawMaskEnabled(bool enabled);
     void setDragRadius(float value);
     void setDragSigma(float value);
-    void setLineRadius(float value);
-    void setLineSigma(float value);
     void setPushPullRadius(float value);
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
@@ -188,8 +184,6 @@ signals:
     void drawMaskChanged(bool enabled);
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
-    void lineRadiusChanged(float value);
-    void lineSigmaChanged(float value);
     void pushPullRadiusChanged(float value);
     void pushPullSigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);

@@ -111,11 +111,9 @@ void SegmentationModule::endEditingSession()
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
-    clearLineDragStroke();
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setActive(false);
     }
-    _lineDrawKeyActive = false;
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     refreshOverlay();

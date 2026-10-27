@@ -55,24 +55,10 @@ public:
             int colLast{0};
         };
 
-        enum class FalloffMode
-        {
-            Drag,
-            Line,
-            PushPull
-        };
-
         std::optional<VertexMarker> activeMarker;
         std::vector<VertexMarker> neighbours;
-        std::vector<cv::Vec3f> maskPoints;
         std::vector<QPointF> surfaceMaskPoints;
-        bool maskVisible{false};
-        bool brushActive{false};
-        bool brushStrokeActive{false};
-        bool lineStrokeActive{false};
-        bool hasLineStroke{false};
         bool pushPullActive{false};
-        FalloffMode falloff{FalloffMode::Drag};
         float gaussianRadiusSteps{0.0f};
         float gaussianSigmaSteps{0.0f};
         float displayRadiusSteps{0.0f};
@@ -222,8 +208,6 @@ private:
     void buildSurfaceOverlapOverlay(VolumeViewerBase* viewer,
                                     ViewerOverlayControllerBase::OverlayBuilder& builder);
 
-    ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
-    bool shouldShowMask(const State& state) const;
 
     CState* _state{nullptr};
     SegmentationEditManager* _editManager{nullptr};

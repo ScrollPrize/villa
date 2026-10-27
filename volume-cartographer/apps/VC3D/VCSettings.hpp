@@ -394,7 +394,6 @@ namespace segmentation {
     // Tool group expansion states
     constexpr auto GROUP_EDITING_EXPANDED = "group_editing_expanded";
     constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
-    constexpr auto GROUP_LINE_EXPANDED = "group_line_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
     constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
     constexpr auto GROUP_APPROVAL_MASK_EXPANDED = "group_approval_mask_expanded";
@@ -402,7 +401,6 @@ namespace segmentation {
 
     constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_LINE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_APPROVAL_MASK_EXPANDED_DEFAULT = true;
@@ -415,8 +413,6 @@ namespace segmentation {
     constexpr auto SIGMA_STEPS = "sigma_steps";    // Legacy key
 
     // Line tool
-    constexpr auto LINE_RADIUS_STEPS = "line_radius_steps";
-    constexpr auto LINE_SIGMA_STEPS = "line_sigma_steps";
 
     // Push/Pull tool
     constexpr auto PUSH_PULL_RADIUS_STEPS = "push_pull_radius_steps";

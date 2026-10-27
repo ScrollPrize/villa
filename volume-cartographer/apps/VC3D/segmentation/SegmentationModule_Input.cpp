@@ -5,7 +5,6 @@
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "tools/SegmentationEditManager.hpp"
-#include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "SegmentationWidget.hpp"
 #include "../overlays/SegmentationOverlayController.hpp"
@@ -200,18 +199,6 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
     }
 
-    if (event->key() == vc3d::keybinds::keypress::LineDrawHold.key && !event->isAutoRepeat()) {
-        if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
-            _lineDrawKeyActive = true;
-            stopAllPushPull();
-            clearLineDragStroke();
-            cancelDrag();
-            event->accept();
-            return true;
-        }
-        _lineDrawKeyActive = false;
-    }
-
     if (!event->isAutoRepeat() && event->key() == vc3d::keybinds::keypress::GrowSegmentation.key &&
         event->modifiers() == vc3d::keybinds::keypress::GrowSegmentation.modifiers) {
         if (!_editingEnabled || _growthInProgress || !_widget || !_widget->isEditingEnabled()) {
@@ -384,15 +371,6 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         }
     }
 
-    if (event->key() == vc3d::keybinds::keypress::LineDrawHold.key && !event->isAutoRepeat()) {
-        _lineDrawKeyActive = false;
-        if (_lineTool && _lineTool->strokeActive()) {
-            _lineTool->finishStroke(_lineDrawKeyActive);
-        }
-        event->accept();
-        return true;
-    }
-
     if (event->key() == Qt::Key_Shift && !event->isAutoRepeat() && _shiftDrawMaskActive) {
         if (_surfaceMaskTool) {
             if (_surfaceMaskTool->strokeActive() || _surfaceMaskTool->hasPendingStroke()) {
@@ -556,17 +534,6 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         return;
     }
 
-    if (_lineDrawKeyActive) {
-        stopAllPushPull();
-        if (_drag.active) {
-            cancelDrag();
-        }
-        if (_lineTool) {
-            _lineTool->startStroke(worldPos);
-        }
-        return;
-    }
-
     stopAllPushPull();
     auto gridIndex = _editManager->worldToGridIndex(worldPos);
     if (!gridIndex) {
@@ -679,20 +646,6 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
         }
     }
 
-    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
-    if (lineStrokeActive) {
-        if (buttons.testFlag(Qt::LeftButton)) {
-            if (_lineTool) {
-                _lineTool->extendStroke(worldPos, false);
-            }
-        } else {
-            if (_lineTool) {
-                _lineTool->finishStroke(_lineDrawKeyActive);
-            }
-        }
-        return;
-    }
-
     if (_pointMoveDrag.active) {
         updatePointMoveDrag(worldPos);
         return;
@@ -781,15 +734,6 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
         return;
     }
 
-    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
-    if (lineStrokeActive && button == Qt::LeftButton) {
-        if (_lineTool) {
-            _lineTool->extendStroke(worldPos, true);
-            _lineTool->finishStroke(_lineDrawKeyActive);
-        }
-        return;
-    }
-
     if (_pointMoveDrag.active && button == Qt::LeftButton) {
         updatePointMoveDrag(worldPos);
         finishPointMoveDrag();
@@ -845,10 +789,7 @@ void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
     }
     const float step = deltaSteps * 0.25f;
     FalloffTool targetTool = FalloffTool::Drag;
-    const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
-    if (_lineDrawKeyActive || lineStrokeActive) {
-        targetTool = FalloffTool::Line;
-    } else if (_pushPullTool && _pushPullTool->isActive()) {
+    if (_pushPullTool && _pushPullTool->isActive()) {
         targetTool = FalloffTool::PushPull;
     }
 
@@ -858,9 +799,6 @@ void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
     switch (targetTool) {
     case FalloffTool::Drag:
         setDragRadius(newRadius);
-        break;
-    case FalloffTool::Line:
-        setLineRadius(newRadius);
         break;
     case FalloffTool::PushPull:
         setPushPullRadius(newRadius);
@@ -874,9 +812,6 @@ void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
     switch (targetTool) {
     case FalloffTool::Drag:
         label = tr("Drag brush radius");
-        break;
-    case FalloffTool::Line:
-        label = tr("Line brush radius");
         break;
     case FalloffTool::PushPull:
         label = tr("Push/Pull radius");
