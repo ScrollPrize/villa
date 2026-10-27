@@ -1,4 +1,7 @@
 #include "CWindow.hpp"
+#include "VolumeComboTooltip.hpp"
+
+#include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -108,6 +111,7 @@
 #include <QPointer>
 #include <QListView>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -138,8 +142,6 @@
 #include "WrapAnnotationWidget.hpp"
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
-#include "FiberAnnotationController.hpp"
-#include "overlays/FiberOverlayController.hpp"
 #include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
@@ -1338,6 +1340,8 @@ vc::atlas::FiberInput fiberInputFromSnapshot(const std::filesystem::path& fiberP
 {
     vc::atlas::FiberInput input;
     input.fiberPath = fiberPath;
+    input.storePin = fiber.storePin;
+    input.storeToAtlasScale = fiber.storeToQueryScale;
     input.controlPoints = fiber.controlPoints;
     input.linePoints = linePointsFromPolyline(fiber);
     vc::atlas::validateFiberInputControlPoints(input);
@@ -1490,7 +1494,8 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
     const std::optional<std::filesystem::path>& atlasDir,
     const vc::lasagna::LasagnaDataset& dataset,
     vc::lasagna::LasagnaNormalSampler& sampler,
-    const vc::atlas::FiberIntersectionProgressCallback& progressCallback)
+    const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     AtlasSearchSigningContext context;
     if (seedOrderedResults.empty()) {
@@ -1502,7 +1507,7 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 0, total);
         }
-        context.atlas = vc::atlas::Atlas::load(*atlasDir);
+        context.atlas = vc::atlas::Atlas::load(*atlasDir, store);
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
         }
@@ -1673,7 +1678,8 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
     const std::filesystem::path& lasagnaManifestPath,
     double workingToBaseScale,
     const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
-    bool debugSearch)
+    bool debugSearch,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     AtlasSearchWorkerResult workerResult;
     workerResult.rawResultCount = rawResults.size();
@@ -1694,7 +1700,7 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
                 lasagnaManifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         auto context = prepareAtlasSearchSigningContext(
-            rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback);
+            rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback, store);
         std::vector<AtlasSearchSignedResult> signedResults = signAtlasSearchResults(
             rawResults, snapshotsById, context, sampler, workerResult.skippedSigningCount);
         std::sort(signedResults.begin(), signedResults.end(), [](const auto& a, const auto& b) {
@@ -2644,12 +2650,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                             ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
                             : nullptr)
                         configureChunkedViewerConnections(chunked);
-                    if (_fiberOverlay && viewer) {
-                        _fiberOverlay->attachViewer(
+                    if (_fiberCollection && viewer) {
+                        _fiberCollection->attachViewer(
                             viewer, _spiralWorkspace->viewerManager());
-                        _fiberOverlay->setViewerBaseToViewerFactor(
-                            viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
-                                        .value_or(1.0));
                     }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
@@ -2664,17 +2667,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
-        connect(_spiralWorkspace,
-                &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
-                this, [this](double factor, bool valid) {
-                    if (!_fiberOverlay || !_spiralWorkspace ||
-                        !_spiralWorkspace->viewerManager()) return;
-                    const double applied = valid ? factor : 1.0;
-                    _spiralWorkspace->viewerManager()->forEachBaseViewer(
-                        [this, applied](VolumeViewerBase* viewer) {
-                            _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
-                        });
-                });
+
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
@@ -2683,6 +2676,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (_spiralWorkspace)
         _spiralWorkspace->setLineAnnotationController(
             _lineAnnotationController.get());
+    connect(_state, &CState::objectStoreChanged, this, [this](const auto&) {
+        if(_atlasSearchCancelFlag) _atlasSearchCancelFlag->store(true);
+        _fiberIntersectionCache.clear();
+        clearAtlasSearchPreviewState();
+    });
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
     connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
@@ -2701,16 +2699,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](uint64_t fiberId, uint64_t generation) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 scheduleAtlasSearchDockRefresh();
-                if (_spiralWorkspace && _lineAnnotationController) {
-                    const auto path = _lineAnnotationController->fiberFilePath(fiberId);
-                    if (!path.empty())
-                        _spiralWorkspace->noteTrackedFiberSaved(
-                            generation, QString::fromStdString(path.string()));
-                }
+
             });
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberFileRemoved,
+    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
             this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRemoved(path);
+                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2749,14 +2742,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
-    // Fiber annotation gets first refusal on volume clicks, then Automated
-    // Fiber Volume picking, before the shared Ctrl+click-to-focus policy runs.
+    // Automated Fiber Volume picking precedes the shared focus policy.
     _viewerManager->setVolumeClickInterceptor(
-        [this](const cv::Vec3f& volLoc, const cv::Vec3f& normal, Surface* surf,
+        [this](const cv::Vec3f&, const cv::Vec3f&, Surface*,
                Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-            return (_fiberController &&
-                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers)) ||
-                   (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+            return (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
                     _fiberCollection->handleVolumeClick(button, modifiers));
         });
     connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
@@ -2793,6 +2783,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheLowSpaceLabel->hide();
     statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
 
+    _hubStatusLabel = new QLabel(this);
+    _hubStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
+    _hubStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hubStatusLabel);
+    connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        if (event.kind != vc::objects::StoreSessionEvent::Kind::Committed) updateHubStatus();
+    });
+
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
     auto updatePersistentCacheSpace = [this]() {
@@ -2804,7 +2803,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (stats.lowSpace) {
             const double freeGiB = static_cast<double>(stats.freeBytes) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free; remote Zarr cache growth is paused.")
+            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
                                      .arg(freeGiB, 0, 'f', 1);
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();
@@ -2826,45 +2825,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
-    _fiberOverlay = std::make_unique<FiberOverlayController>(this);
-    _fiberOverlay->bindToViewerManager(_viewerManager.get());
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
-                _fiberOverlay->attachViewer(
+                _fiberCollection->attachViewer(
                     viewer, _spiralWorkspace->viewerManager());
-                _fiberOverlay->setViewerBaseToViewerFactor(
-                    viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
-                                .value_or(1.0));
             });
     }
-    const auto updateMainFiberViewerScales = [this]() {
-        double factor = 1.0;
-        if (_state && _state->vpkg()) {
-            if (const auto identity = vc3d::opendata::coordinateIdentityForVolume(
-                    *_state->vpkg(), _state->currentVolumeId())) {
-                factor = 1.0 / static_cast<double>(
-                    identity->sourceCoordinateScaleFactor);
-            }
-        }
-        if (_fiberOverlay && _viewerManager) {
-            _viewerManager->forEachBaseViewer([this, factor](VolumeViewerBase* viewer) {
-                _fiberOverlay->setViewerBaseToViewerFactor(viewer, factor);
-            });
-        }
-    };
-    updateMainFiberViewerScales();
-    connect(_state, &CState::volumeChanged, this,
-            [updateMainFiberViewerScales](const std::shared_ptr<Volume>&,
-                                          const std::string&) {
-                updateMainFiberViewerScales();
-            });
-    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this,
-            [this, updateMainFiberViewerScales](VolumeViewerBase*) {
-                updateMainFiberViewerScales();
-            });
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -3533,7 +3502,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
-        if (_fiberCollection) addDock(fiberMenu, _fiberCollection->dock());
     }
 }
 
@@ -3682,8 +3650,8 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QMenu menu(this);
 
-                        if (_fiberOverlay && _lineAnnotationController) {
-                            if (const auto hit = _fiberOverlay->hitTestControlPoint(
+                        if (_fiberCollection && _lineAnnotationController) {
+                            if (const auto hit = _fiberCollection->hitTestControlPoint(
                                     viewer, scenePoint, 12.0);
                                 hit && hit->fiberId != 0) {
                                 const uint64_t fiberId = hit->fiberId;
@@ -3721,16 +3689,18 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             spiralLineAction->setToolTip(reason);
                             connect(spiralLineAction, &QAction::triggered, this,
                                     [this]() {
-                                        if (_spiralWorkspace)
+                                        if (_spiralWorkspace && _menuController &&
+                                            _menuController->requireObjectStore(tr("Creating a fiber")))
                                             _spiralWorkspace->startLineAnnotationDraft();
                                     });
                             menu.addSeparator();
                         }
 
+                        // Enabled without a store: choosing it offers to create or attach one.
                         QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
                         newLineAnnotationAction->setEnabled(
                             _lineAnnotationController &&
-                            _lineAnnotationController->canLaunchFromViewer(viewer) &&
+                            _lineAnnotationController->viewerSupportsLaunch(viewer) &&
                             viewer->sampleSceneVolume(scenePoint).has_value());
 
                         QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
@@ -3942,13 +3912,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                         }
 
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == newLineAnnotationAction &&
-                            newLineAnnotationAction->isEnabled() &&
-                            _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
-                        } else if (selected == modelLineAnnotationAction &&
-                                   modelLineAnnotationAction->isEnabled() && _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint, true, true);
+                        const bool launch = (selected == newLineAnnotationAction ||
+                                             selected == modelLineAnnotationAction) &&
+                                            selected->isEnabled() && _lineAnnotationController &&
+                                            _menuController &&
+                                            _menuController->requireObjectStore(tr("Creating a fiber"));
+                        if (launch) {
+                            _lineAnnotationController->launchFromViewerAtPoint(
+                                viewer, scenePoint, true, selected == modelLineAnnotationAction);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);
@@ -4146,9 +4117,13 @@ ViewerManager* CWindow::activeWorkspaceViewerManager() const
 
 void CWindow::updateActiveWorkspaceViewerControls()
 {
+    const bool lineAnnotationActive =
+        _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget());
     if (_fiberCollection) {
-        _fiberCollection->setLineAnnotationActive(
-            _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget()));
+        _fiberCollection->setLineAnnotationActive(lineAnnotationActive);
+    }
+    for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
+        if (widget) widget->setLineAnnotationActive(lineAnnotationActive);
     }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
@@ -5078,12 +5053,13 @@ void CWindow::createAtlasWorkspace()
 
 void CWindow::refreshAtlasOverviewDocks()
 {
+    const auto store = _state->objectStoreSession();
     auto vpkg = _state ? _state->vpkg() : nullptr;
     const std::filesystem::path volpkgRoot = vpkg && !vpkg->path().empty()
         ? vpkg->path().parent_path()
         : std::filesystem::path{};
 
-    auto populate = [this, &volpkgRoot](QDockWidget* dock) {
+    auto populate = [this, &volpkgRoot, store](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
             return;
         }
@@ -5095,7 +5071,7 @@ void CWindow::refreshAtlasOverviewDocks()
         for (const auto& atlasInfo : vc::atlas::discoverAtlasDirectories(volpkgRoot)) {
             const std::filesystem::path& atlasDir = atlasInfo.path;
             try {
-                const auto atlas = vc::atlas::Atlas::load(atlasDir);
+                const auto atlas = vc::atlas::Atlas::load(atlasDir, store);
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlas.metadata.name));
                 item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
@@ -5147,6 +5123,7 @@ void CWindow::refreshAtlasOverviewDocks()
 
 void CWindow::updateAtlasFiberDocks()
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasWorkspaceFiberDock || !_atlasWorkspaceFiberDock->widget()) {
         return;
     }
@@ -5198,9 +5175,7 @@ void CWindow::updateAtlasFiberDocks()
                 ? std::filesystem::path(vpkg->getVolpkgDirectory())
                 : vpkg->path().parent_path();
         }
-        atlas = volpkgRoot.empty()
-            ? vc::atlas::Atlas::load(*_currentAtlasDir)
-            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot);
+        atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
     } catch (const std::exception& ex) {
         if (label) {
             label->setText(tr("Atlas: %1 (could not load: %2)")
@@ -5259,7 +5234,7 @@ void CWindow::updateAtlasFiberDocks()
         fiberItem->setText(1, tr("%1 controls").arg(static_cast<int>(mapping.controlAnchors.size())));
         fiberItem->setText(3, snapTotal < 0 ? tr("missing") : tr("%1/%2").arg(snapFound).arg(snapTotal));
         fiberItem->setText(6, snapTotal < 0 ? tr("missing") : tr("%1 records").arg(snapTotal));
-        fiberItem->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+        fiberItem->setText(8, fiberId == 0 ? tr("not in store") : QString::number(fiberId));
         fiberItem->setToolTip(0, QString::fromStdString(mapping.fiberPath.generic_string()));
         fiberItem->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
         fiberItem->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
@@ -5291,7 +5266,7 @@ void CWindow::updateAtlasFiberDocks()
                 : QStringLiteral("-"));
             row->setText(6, predSnapStatusLabel(snap));
             row->setText(7, predSnapStatusReason(snap));
-            row->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+            row->setText(8, fiberId == 0 ? tr("not in store") : QString::number(fiberId));
             row->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
             row->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
             row->setData(0, ATLAS_CONTROL_INDEX_ROLE, controlIndex);
@@ -5325,22 +5300,33 @@ void CWindow::scheduleAtlasSearchDockRefresh()
     });
 }
 
+bool CWindow::storeHasFibers() const
+{
+    const auto store = _state->objectStoreSession();
+    const auto attachment = store->attachment();
+    bool hasFibers = false;
+    if (attachment) {
+        store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            hasFibers = db.objectCount(txn, "fiber") > 0;
+        });
+    }
+    return hasFibers;
+}
+
 void CWindow::updateAtlasSearchDocks()
 {
-    const auto snapshots = _lineAnnotationController
-        ? _lineAnnotationController->fiberSnapshotsFromStorage()
-        : std::vector<vc::atlas::FiberPolyline>{};
+    const auto store = _state->objectStoreSession();
+    const bool hasSnapshots = storeHasFibers();
     int savedFiberCount = 0;
     QString atlasLoadError;
     if (_currentAtlasDir) {
         try {
-            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
             savedFiberCount = static_cast<int>(atlas.fibers.size());
         } catch (const std::exception& ex) {
             atlasLoadError = QString::fromStdString(ex.what());
         }
     }
-    const bool hasSnapshots = !snapshots.empty();
     const bool atlasUsable = _currentAtlasDir.has_value() && atlasLoadError.isEmpty();
     const QString atlasName = _currentAtlasDir
         ? QString::fromStdString(_currentAtlasName.empty()
@@ -5399,6 +5385,7 @@ void CWindow::updateAtlasSearchDocks()
 bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
                                       std::function<void(bool success, const QString& detail)> onFinished)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -5479,7 +5466,7 @@ bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
     });
 
     watcher->setFuture(QtConcurrent::run(
-        [atlasDir, volpkgRoot, manifestPath, workingToBaseScale]() -> QString {
+        [atlasDir, volpkgRoot, manifestPath, workingToBaseScale, store]() -> QString {
         std::cerr << "[atlas-remap] start"
                   << " atlas=" << atlasDir.string()
                   << " volpkg_root=" << volpkgRoot.string()
@@ -5489,7 +5476,7 @@ bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
             vc::lasagna::LasagnaDataset::open(manifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const vc::atlas::Atlas rebuilt =
-            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
+            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler, {}, store);
 
         std::ostringstream summary;
         summary.imbue(std::locale::classic());
@@ -5533,6 +5520,7 @@ void CWindow::remapCurrentAtlas()
 bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
                                                   std::function<void(const QString& detail)> onAsyncError)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -5753,7 +5741,7 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
         }
     });
 
-    prepareWatcher->setFuture(QtConcurrent::run([atlasDir,
+    prepareWatcher->setFuture(QtConcurrent::run([store = _state->objectStoreSession(), atlasDir,
                                                   volpkgRoot,
                                                   manifestPath,
                                                   workingToBaseScale]() {
@@ -5787,7 +5775,7 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
                     volpkgRoot,
                     manifestPath,
                     sampler,
-                    options);
+                    options, store);
             const size_t jobCount =
                 prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
             std::cerr << "[atlas-snap] prepare finished"
@@ -5962,7 +5950,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
 
     // No saved fibers: silent no-op in the interactive flow (unchanged: no dialog,
     // just refresh the docks).
-    if (_lineAnnotationController->fiberSnapshotsFromStorageWithPaths().empty()) {
+    if (!storeHasFibers()) {
         updateAtlasSearchDocks();
         return;
     }
@@ -5977,6 +5965,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
 bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                         QString* errorMessage)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -6019,7 +6008,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     bool haveAtlas = false;
     if (_currentAtlasDir) {
         try {
-            atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+            atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
             haveAtlas = true;
         } catch (const std::exception& ex) {
             return fail(tr("Could not load selected atlas: %1")
@@ -6064,7 +6053,12 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     for (const auto& snapshot : fiberSnapshots) {
         canonicalPaths.push_back(snapshot.fiberPath);
     }
-    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
+    vc::atlas::FiberRuntimeIdentityMap runtimeIds;
+    for(const auto& snapshot:fiberSnapshots) {
+        runtimeIds.canonicalPaths.push_back(snapshot.fiberPath);
+        runtimeIds.idByPathKey[vc::atlas::atlasFiberPathKey(snapshot.fiberPath)]=snapshot.storedFiberId;
+        runtimeIds.pathById[snapshot.storedFiberId]=snapshot.fiberPath;
+    }
     const auto searchSets = vc::atlas::atlasFiberSearchSets(atlas, runtimeIds);
     std::vector<vc::atlas::FiberPolyline> fibers;
     std::vector<uint64_t> sourceFiberIds = searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
@@ -6281,7 +6275,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     QPointer<CWindow> self(this);
     auto cancelFlag = _atlasSearchCancelFlag;
     const auto atlasDirForWorker = _currentAtlasDir;
-    watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
+    watcher->setFuture(QtConcurrent::run([store = _state->objectStoreSession(), fibers = std::move(fibers),
                                           sourceFiberIds = std::move(sourceFiberIds),
                                           targetFiberIds = std::move(targetFiberIds),
                                           fiberPathById = std::move(fiberPathById),
@@ -6363,7 +6357,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
                                                               ceres,
                                                               &windingSampler,
                                                               progressCallback,
-                                                              cancelCallback);
+                                                              cancelCallback, store);
         if (debugSearch) {
             qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
                 .arg(atlasSearchIdListString(sourceFiberIds),
@@ -6394,7 +6388,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
                                              lasagnaManifestPath,
                                              lasagnaWorkingToBaseScale,
                                              progressCallback,
-                                             debugSearch);
+                                             debugSearch, store);
     }));
     return true;
 }
@@ -6407,16 +6401,24 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
         double lengthVx = 0.0;
     };
     std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
-    if (_lineAnnotationController) {
-        for (const auto& fiber : _lineAnnotationController->fiberSummaries()) {
-            QString label = QString::number(fiber.id);
-            if (!fiber.name.empty()) {
-                label = tr("%1 (%2)")
-                    .arg(QString::fromStdString(fiber.name))
-                    .arg(fiber.id);
-            }
-            fiberInfo[fiber.id] = FiberDisplayInfo{label, fiber.lengthVx};
+    const auto store = _state->objectStoreSession();
+    if (const auto attachment = store->attachment(); attachment && _lineAnnotationController) {
+        std::set<uint64_t> fiberIds;
+        for (const auto& result : results) {
+            fiberIds.insert(result.sourceFiberId);
+            fiberIds.insert(result.targetFiberId);
         }
+        store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const uint64_t fiberId : fiberIds) {
+                const auto uuid = _lineAnnotationController->fiberUuidForId(fiberId);
+                const auto object = uuid.empty() ? std::nullopt : db.objectByUuid(txn, uuid);
+                if (!object || !object->fiber) continue;
+                const QString label = object->name.empty()
+                    ? QString::number(fiberId)
+                    : tr("%1 (%2)").arg(QString::fromStdString(object->name + ".json")).arg(fiberId);
+                fiberInfo[fiberId] = FiberDisplayInfo{label, object->fiber->length};
+            }
+        });
     }
 
     auto fiberLabel = [&fiberInfo](uint64_t fiberId) {
@@ -6684,6 +6686,7 @@ void CWindow::clearAtlasSearchPreviewState()
 
 void CWindow::updateAtlasSearchPreviewCandidates()
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasOverlay || !_currentAtlasDir || _atlasSearchResults.empty()) {
         if (_atlasOverlay) {
             _atlasOverlay->setSearchPreviewCandidates({});
@@ -6692,7 +6695,7 @@ void CWindow::updateAtlasSearchPreviewCandidates()
     }
 
     try {
-        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
         const std::filesystem::path basePath = *_currentAtlasDir / atlas.metadata.baseMeshPath;
         QuadSurface baseSurface(basePath);
         const auto* points = baseSurface.rawPointsPtr();
@@ -6818,6 +6821,7 @@ void CWindow::updateAtlasSearchPreviewRequests()
 
 void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
 {
+    const auto store = _state->objectStoreSession();
     if (sortedResultIndex < 0 ||
         sortedResultIndex >= static_cast<int>(_atlasSearchResults.size()) ||
         !_currentAtlasDir ||
@@ -6852,6 +6856,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
             });
 
     watcher->setFuture(QtConcurrent::run([
+        store = _state->objectStoreSession(),
         atlasDir = *_currentAtlasDir,
         manifestPath = *_atlasSearchLasagnaManifestPath,
         workingToBaseScale = _atlasSearchLasagnaWorkingToBaseScale,
@@ -6861,7 +6866,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
         sortedResultIndex
     ]() -> std::optional<AtlasOverlayController::SearchPreviewFiber> {
         try {
-            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir);
+            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir, store);
             const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
             auto baseSurface = std::make_shared<QuadSurface>(basePath);
             const auto* points = baseSurface->rawPointsPtr();
@@ -6950,6 +6955,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
 // Dialog-free atlas loading shared by the interactive and direct entry points.
 void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasWorkspaceWindow || !_atlasViewer) {
         createAtlasWorkspace();
     }
@@ -6969,15 +6975,15 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
         ? std::filesystem::path(vpkg->getVolpkgDirectory())
         : vpkg->path().parent_path();
-    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    auto atlas = vc::atlas::Atlas::load(atlasDir, store);
     vc::lasagna::LasagnaDataset dataset =
         vc::lasagna::LasagnaDataset::open(
             manifestPath,
             vc::lasagna::LasagnaDatasetOpenOptions{
                 resolvedLasagna->workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
-    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler, store);
+    atlas = vc::atlas::Atlas::load(atlasDir, store);
     _currentAtlasDir = atlasDir;
     _currentAtlasName = atlas.metadata.name;
     if (_lineAnnotationController) {
@@ -7076,6 +7082,7 @@ bool CWindow::displayAtlasFromDirectoryHeadless(const std::filesystem::path& atl
 
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
 {
+    const auto store = _state->objectStoreSession();
     try {
         loadAndDisplayAtlas(atlasDir);
     } catch (const std::exception& ex) {
@@ -7116,7 +7123,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                     throw std::runtime_error(
                         "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
                 }
-                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
+                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler, {}, store);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {
                 QMessageBox::warning(
@@ -7835,11 +7842,6 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
             _segmentationModule.get(), &SegmentationModule::clearSelectedAnnotationCollection);
 
-    // Create fiber annotation controller and dock
-    _fiberController = std::make_unique<FiberAnnotationController>(
-        _state, _state->pointCollection(), this);
-    _fiberController->setMdiArea(_fiberSliceMdiArea);
-
     _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
@@ -7851,71 +7853,14 @@ void CWindow::CreateWidgets(void)
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
     }
 
-    auto syncShowFiberChecks = [this](bool checked) {
-        if (_fiberWidget) {
-            _fiberWidget->setShowFibersChecked(checked);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setShowFibersChecked(checked);
+    auto forEachFiberWidget = [this](auto&& apply) {
+        for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
+            if (widget) apply(widget);
         }
     };
-    auto syncShowLinkedChecks = [this](bool checked) {
-        if (_fiberWidget) {
-            _fiberWidget->setShowLinkedChecked(checked);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setShowLinkedChecked(checked);
-        }
-    };
-    auto syncFiberViewDistances = [this](double distance) {
-        if (_fiberWidget) {
-            _fiberWidget->setFiberViewDistance(distance);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setFiberViewDistance(distance);
-        }
-    };
-    auto setFiberOverlayVisible = [this, syncShowFiberChecks](bool visible) {
-        if (!_fiberOverlay || !_fiberOverlay->hasChains()) {
-            visible = false;
-        }
-        if (_fiberOverlay) {
-            _fiberOverlay->setVisible(visible);
-        }
-        syncShowFiberChecks(visible);
-    };
-    auto setFiberOverlayShowLinked = [this, syncShowLinkedChecks](bool checked) {
-        if (_fiberOverlay) {
-            _fiberOverlay->setShowLinked(checked);
-        }
-        syncShowLinkedChecks(checked);
-    };
-    auto setFiberViewDistance = [this, syncFiberViewDistances](double distance) {
-        if (_fiberOverlay) {
-            _fiberOverlay->setViewDistance(distance);
-        }
-        syncFiberViewDistances(distance);
-    };
-    if (_fiberWidget) {
-        connect(_fiberWidget, &CFiberWidget::showFibersToggled,
-                this, setFiberOverlayVisible);
-        connect(_fiberWidget, &CFiberWidget::showLinkedToggled,
-                this, setFiberOverlayShowLinked);
-        connect(_fiberWidget, &CFiberWidget::fiberViewDistanceChanged,
-                this, setFiberViewDistance);
-    }
-    if (_fiberSliceWidget) {
-        connect(_fiberSliceWidget, &CFiberWidget::showFibersToggled,
-                this, setFiberOverlayVisible);
-        connect(_fiberSliceWidget, &CFiberWidget::showLinkedToggled,
-                this, setFiberOverlayShowLinked);
-        connect(_fiberSliceWidget, &CFiberWidget::fiberViewDistanceChanged,
-                this, setFiberViewDistance);
-    }
-    setFiberViewDistance(_fiberWidget->fiberViewDistance());
-    setFiberOverlayShowLinked(_fiberWidget->showLinkedChecked());
 
-    if (_lineAnnotationController) {
+    if (_lineAnnotationController && _fiberCollection) {
+        auto* collection = _fiberCollection.get();
         auto toFiberWidgetAlignment =
             [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
                 CFiberWidget::FiberEntry::AlignmentMetrics alignment;
@@ -7927,130 +7872,155 @@ void CWindow::CreateWidgets(void)
                 alignment.error = source.error;
                 return alignment;
             };
-        auto updateFiberList =
-            [this, toFiberWidgetAlignment, syncShowFiberChecks](
-                const std::vector<LineAnnotationController::FiberSummary>& fibers) {
-            std::vector<CFiberWidget::FiberEntry> entries;
-            entries.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                CFiberWidget::FiberEntry::AlignmentMetrics alignment =
-                    toFiberWidgetAlignment(fiber.alignment);
-
-                std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
-                spans.reserve(fiber.spans.size());
-                for (const auto& span : fiber.spans) {
-                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment =
-                        toFiberWidgetAlignment(span.alignment);
-                    spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
-                        span.spanIndex,
-                        span.firstControlIndex,
-                        span.secondControlIndex,
-                        span.controlPointCount,
-                        span.linePointCount,
-                        span.lengthVx,
-                        spanAlignment,
-                        span.interpMarker,
-                        span.fiberManifest,
-                    });
-                }
-
-                CFiberWidget::FiberEntry::TraceState traceState =
-                    CFiberWidget::FiberEntry::TraceState::Legacy;
-                switch (fiber.traceState) {
-                case vc3d::line_annotation::FiberTraceState::Predictions:
-                    traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
-                    break;
-                case vc3d::line_annotation::FiberTraceState::Mixed:
-                    traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
-                    break;
-                case vc3d::line_annotation::FiberTraceState::Legacy:
-                    break;
-                }
-                entries.push_back(CFiberWidget::FiberEntry{
-                    fiber.id,
-                    fiber.name,
-                    fiber.controlPointCount,
-                    fiber.linePointCount,
-                    fiber.annotatedLengthVx,
-                    alignment,
-                    spans,
-                    fiber.hvZDistance,
-                    fiber.hvFiberLength,
-                    fiber.horizontalScore,
-                    fiber.verticalScore,
-                    fiber.automaticCertainty,
-                    fiber.automaticHvTag,
-                    fiber.manualHvTag,
-                    fiber.tags,
-                    fiber.linkedFiberCount,
-                    fiber.pendingLinkCount,
-                    traceState,
+        // A store catalog row as the panels list it; details load on selection.
+        auto catalogEntry = [this](const FiberCollectionController::CatalogRow& row) {
+            CFiberWidget::FiberEntry entry;
+            entry.id = _lineAnnotationController->fiberIdForUuid(row.record.uuid);
+            entry.fileName = row.record.name + ".json";
+            entry.tags = row.record.tags;
+            if (const auto& fiber = row.record.fiber) {
+                entry.controlPointCount = static_cast<int>(fiber->controlPointCount);
+                entry.linePointCount = static_cast<int>(fiber->linePointCount);
+                entry.lengthVx = fiber->length;
+                (fiber->manualFamily ? entry.manualHvTag : entry.automaticHvTag) = fiber->family;
+            }
+            entry.linkedFiberCount = row.componentSize >= 2 ? row.componentSize : 0;
+            entry.pendingLinkCount = row.pendingLinks;
+            entry.detailsLoaded = false;
+            return entry;
+        };
+        auto detailEntry = [toFiberWidgetAlignment](const LineAnnotationController::FiberSummary& fiber) {
+            std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
+            spans.reserve(fiber.spans.size());
+            for (const auto& span : fiber.spans) {
+                spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
+                    span.spanIndex,
+                    span.firstControlIndex,
+                    span.secondControlIndex,
+                    span.controlPointCount,
+                    span.linePointCount,
+                    span.lengthVx,
+                    toFiberWidgetAlignment(span.alignment),
+                    span.interpMarker,
+                    span.fiberManifest,
                 });
             }
-            _fiberLengthVxById.clear();
-            _fiberLengthVxById.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
+            CFiberWidget::FiberEntry::TraceState traceState =
+                CFiberWidget::FiberEntry::TraceState::Legacy;
+            switch (fiber.traceState) {
+            case vc3d::line_annotation::FiberTraceState::Predictions:
+                traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Mixed:
+                traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Legacy:
+                break;
             }
-            // Unit first, so the rebuilt rows below are texted once in it.
-            updateFiberLengthUnits();
-            if (_fiberWidget) {
-                _fiberWidget->setFibers(entries);
-                _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setFibers(entries);
-                _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
-
-            const auto linkInfos = _lineAnnotationController->fiberLinkOverlayInfos();
-            std::unordered_map<uint64_t, const LineAnnotationController::FiberLinkOverlayInfo*>
-                linkInfoById;
-            linkInfoById.reserve(linkInfos.size());
-            for (const auto& info : linkInfos) {
-                linkInfoById.emplace(info.fiberId, &info);
-            }
-
-            std::vector<FiberOverlayController::Chain> chains;
-            for (const auto& snapshot : _lineAnnotationController->fiberSnapshots()) {
-                if (snapshot.controlPoints.empty()) {
-                    continue;
-                }
-                FiberOverlayController::Chain chain;
-                chain.id = snapshot.id;
-                chain.points.reserve(snapshot.controlPoints.size());
-                for (const cv::Vec3d& point : snapshot.controlPoints) {
-                    chain.points.emplace_back(static_cast<float>(point[0]),
-                                              static_cast<float>(point[1]),
-                                              static_cast<float>(point[2]));
-                }
-                if (const auto it = linkInfoById.find(snapshot.id); it != linkInfoById.end()) {
-                    chain.colorId = it->second->linkGroupId;
-                    chain.pointLinkStates.assign(chain.points.size(), 0);
-                    for (const auto& [cpIndex, pending] : it->second->linkedControlPoints) {
-                        if (cpIndex >= 0 &&
-                            cpIndex < static_cast<int>(chain.pointLinkStates.size())) {
-                            chain.pointLinkStates[cpIndex] = pending ? 1 : 2;
-                        }
-                    }
-                }
-                chains.push_back(std::move(chain));
-            }
-            const bool fibersAvailable = !chains.empty();
-            if (_fiberOverlay) {
-                _fiberOverlay->setChains(std::move(chains));
-            }
-            if (_fiberWidget) {
-                _fiberWidget->setShowFibersAvailable(fibersAvailable);
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setShowFibersAvailable(fibersAvailable);
-            }
-            if (!fibersAvailable) {
-                syncShowFiberChecks(false);
-            }
-            updateAtlasFiberDocks();
+            return CFiberWidget::FiberEntry{
+                fiber.id,
+                fiber.name,
+                fiber.controlPointCount,
+                fiber.linePointCount,
+                fiber.annotatedLengthVx,
+                toFiberWidgetAlignment(fiber.alignment),
+                std::move(spans),
+                fiber.hvZDistance,
+                fiber.hvFiberLength,
+                fiber.horizontalScore,
+                fiber.verticalScore,
+                fiber.automaticCertainty,
+                fiber.automaticHvTag,
+                fiber.manualHvTag,
+                fiber.tags,
+                fiber.linkedFiberCount,
+                fiber.pendingLinkCount,
+                traceState,
+                true,
+            };
         };
+
+        connect(collection, &FiberCollectionController::catalogChanged, this,
+                [this, forEachFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                    std::vector<CFiberWidget::FiberEntry> entries;
+                    entries.reserve(rows.size());
+                    for (const auto& row : rows) {
+                        entries.push_back(catalogEntry(row));
+                    }
+                    // Unit first, so the rebuilt rows below are texted once in it.
+                    updateFiberLengthUnits();
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    forEachFiberWidget([&](CFiberWidget* widget) {
+                        widget->setFibers(entries);
+                        widget->setKnownTags(tags);
+                        widget->setNextPageAvailable(morePages);
+                    });
+                });
+        connect(collection, &FiberCollectionController::fiberRevealed, this,
+                [forEachFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
+                    const auto entry = catalogEntry(row);
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->revealFiber(entry); });
+                });
+        connect(collection, &FiberCollectionController::statusChanged, this,
+                [forEachFiberWidget](bool attached, const QString& text) {
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setStoreStatus(attached, text); });
+                });
+        connect(collection, &FiberCollectionController::selectionChanged, this,
+                [forEachFiberWidget](const FiberCollectionController::Selection& selection) {
+                    forEachFiberWidget([&](CFiberWidget* widget) {
+                        widget->setTraceSelection(selection.text, selection.toolTip, selection.pointCount,
+                                                  selection.index, selection.openable);
+                    });
+                });
+        connect(collection, &FiberCollectionController::annotationStatusChanged, this,
+                [forEachFiberWidget](const QString& text) {
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setAnnotationStatus(text); });
+                });
+        connect(collection, &FiberCollectionController::panelRequested, this, [this]() {
+            if (_statusDockPanelHost) {
+                _statusDockPanelHost->showDock(_fiberWidget);
+            } else {
+                _fiberWidget->show();
+                _fiberWidget->raise();
+            }
+        });
+        connect(_lineAnnotationController.get(), &LineAnnotationController::fibersChanged, this,
+                [this, forEachFiberWidget]() {
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
+                    updateLineAnnotationLengthLabel();
+                    updateAtlasFiberDocks();
+                });
+
+        forEachFiberWidget([&](CFiberWidget* widget) {
+            widget->setDisplayOptions(collection->options());
+            connect(widget, &CFiberWidget::fiberDetailsRequested, this,
+                    [this, forEachFiberWidget, detailEntry](uint64_t fiberId) {
+                        const auto summary = _lineAnnotationController->fiberSummary(fiberId);
+                        if (!summary) return;
+                        const auto entry = detailEntry(*summary);
+                        forEachFiberWidget([&](CFiberWidget* listed) { listed->updateFiberDetails(entry); });
+                    },
+                    Qt::QueuedConnection);
+            connect(widget, &CFiberWidget::displayOptionsChanged, this,
+                    [collection, forEachFiberWidget](const FiberDisplayOptions& options) {
+                        collection->setOptions(options);
+                        forEachFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
+                    });
+            connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
+                if (_menuController) _menuController->attachObjectStore();
+            });
+            connect(widget, &CFiberWidget::detachStoreRequested, this, [this]() {
+                if (_menuController) _menuController->detachObjectStore();
+            });
+            connect(widget, &CFiberWidget::firstPageRequested, collection, &FiberCollectionController::firstPage);
+            connect(widget, &CFiberWidget::nextPageRequested, collection, &FiberCollectionController::nextPage);
+            connect(widget, &CFiberWidget::fiberActivated, collection,
+                    [collection](uint64_t fiberId) { collection->activateFiber(int64_t(fiberId)); });
+            connect(widget, &CFiberWidget::traceIndexChanged, collection, &FiberCollectionController::navigate);
+            connect(widget, &CFiberWidget::openInLineAnnotationRequested, collection,
+                    [collection](uint64_t fiberId) { collection->showInLineAnnotation(int64_t(fiberId)); });
+        });
         auto updateFiberMetricRows =
             [this, toFiberWidgetAlignment](
                 uint64_t fiberId,
@@ -8146,15 +8116,7 @@ void CWindow::CreateWidgets(void)
                         if (!_spiralWorkspace || !_lineAnnotationController) {
                             return;
                         }
-                        for (uint64_t fiberId : fiberIds) {
-                            const auto path = _lineAnnotationController->fiberFilePath(fiberId);
-                            if (path.empty()) {
-                                showStatusBarMessage(tr("Fiber %1 has no saved JSON file yet").arg(fiberId), 5000);
-                                continue;
-                            }
-                            _spiralWorkspace->addFiberToCurrentFit(
-                                QString::fromStdString(path.string()));
-                        }
+                        _spiralWorkspace->addFibersToCurrentFit(fiberIds);
                     });
             connect(widget,
                     &CFiberWidget::fiberSliceRequested,
@@ -8173,10 +8135,6 @@ void CWindow::CreateWidgets(void)
                     });
         };
         connect(_lineAnnotationController.get(),
-                &LineAnnotationController::fibersChanged,
-                this,
-                updateFiberList);
-        connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fiberAlignmentMetricsReset,
                 this,
                 setFiberMetricsPending);
@@ -8186,7 +8144,6 @@ void CWindow::CreateWidgets(void)
                 updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
-        updateFiberList(_lineAnnotationController->fiberSummaries());
         // The annotation frame (and so the cm conversion) follows the
         // current volume; the lengths themselves do not change.
         connect(_state, &CState::volumeChanged, this,
@@ -8194,12 +8151,6 @@ void CWindow::CreateWidgets(void)
                     updateFiberLengthUnits();
                 });
     }
-    connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
-            this, &CWindow::onFiberCrosshairModeChanged);
-    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
-            this, &CWindow::onFiberViewersRequested);
-    connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
-            this, &CWindow::onFiberAnnotationFinished);
 
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
@@ -8377,7 +8328,7 @@ void CWindow::CreateWidgets(void)
             .colormapSelect = ui.overlayColormapSelect,
             .samplingMethodSelect = ui.overlayInterpolationSelect,
             .opacitySpin = ui.overlayOpacitySpin,
-            .thresholdSpin = ui.overlayThresholdSpin,
+            .intensityAsAlphaCheck = ui.overlayIntensityAsAlphaCheck,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
             .compositeEnabledCheck = ui.chkOverlayComposite,
             .compositeMethodSelect = ui.cmbOverlayCompositeMethod,
@@ -8549,16 +8500,6 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    // Let fiber controller handle Escape first
-    if (event->key() == Qt::Key_Escape && _fiberController && _fiberController->handleEscape()) {
-        event->accept();
-        return;
-    }
-
-    // Fiber animation (P key)
-    if (_fiberController && _fiberController->handleKeyPress(event))
-        return;
-
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
@@ -8926,9 +8867,8 @@ void CWindow::updateLineAnnotationLengthLabel()
     const uint64_t fiberId = (dialog && _lineAnnotationController)
         ? _lineAnnotationController->fiberIdForDialog(dialog)
         : 0;
-    const auto it = fiberId != 0 ? _fiberLengthVxById.find(fiberId)
-                                 : _fiberLengthVxById.end();
-    if (it == _fiberLengthVxById.end()) {
+    const auto summary = fiberId != 0 ? _lineAnnotationController->fiberSummary(fiberId) : std::nullopt;
+    if (!summary) {
         _lineAnnotationLengthLabel->clear();
         _lineAnnotationLengthLabel->hide();
         return;
@@ -8938,7 +8878,7 @@ void CWindow::updateLineAnnotationLengthLabel()
     const std::optional<double> voxelSizeUm =
         _lineAnnotationController->annotationFrame().voxelSizeUm;
     _lineAnnotationLengthLabel->setText(
-        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(it->second, voxelSizeUm)));
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(summary->annotatedLengthVx, voxelSizeUm)));
     _lineAnnotationLengthLabel->show();
 }
 
@@ -9100,9 +9040,11 @@ bool CWindow::OpenVolume(const QString& path,
     return true;
 }
 
-void CWindow::openFiberCollection(const QString& path)
+void CWindow::attachObjectStore(const QString& path)
 {
-    _fiberCollection->openCollection(path);
+    const auto author = _menuController ? _menuController->objectStoreAuthor() : QString();
+    if (author.isEmpty()) return;
+    _fiberCollection->openCollection(path, author);
 }
 
 bool CWindow::openVolumePackage(const QString& path,
@@ -9482,13 +9424,15 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
+    const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
             const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
-                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr),
+                volumeSuffixes.value(idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
@@ -9571,10 +9515,12 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
             const int row = selector->count() - 1;
+            const auto sourcePath = vc3d::volumeDisplayPath(*_state->vpkg(), id.toStdString());
+            selector->setItemData(row, sourcePath, Qt::ToolTipRole);
             if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
                 selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
                 selector->setItemData(row,
-                                      tr("No segment transform is available for this volume."),
+                                      sourcePath + QStringLiteral("\n") + tr("No segment transform is available for this volume."),
                                       Qt::ToolTipRole);
             }
         }
@@ -9586,6 +9532,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             const int activeIndex = selector->findData(activeCandidate);
             selector->setCurrentIndex(activeIndex >= 0 ? activeIndex : 0);
         }
+        vc3d::refreshVolumeComboTooltip(selector);
     }
 
     QString activeId;
@@ -10543,6 +10490,16 @@ void CWindow::onManualLocationChanged()
 
 void CWindow::refreshFocusBoundsUi()
 {
+    if (_fiberMapWorkspace) {
+        auto bounds = _state ? _state->activeFocusBounds() : std::nullopt;
+        if (bounds && _state) {
+            // Viewer bounds index the current volume; map geometry indexes
+            // the annotation frame (which can be a different pyramid base).
+            bounds = vc3d::annotation::focusBoundsInAnnotationFrame(
+                bounds, _state->annotationFrame());
+        }
+        _fiberMapWorkspace->setFocusBounds(bounds);
+    }
     if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
         return;
     }
@@ -11357,87 +11314,54 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::Poi
     showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
 }
 
-// ---- Fiber annotation slots -------------------------------------------------
-
-void CWindow::onNewFiberRequested()
+void CWindow::updateHubStatus()
 {
-    if (_fiberController) {
-        _fiberController->beginNewFiber();
-    }
-}
-
-void CWindow::onFiberCrosshairModeChanged(bool active)
-{
-    if (!_viewerManager) return;
-    _viewerManager->forEachBaseViewer([active](VolumeViewerBase* v) {
-        if (v->graphicsView()) {
-            v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
-        }
-    });
-}
-
-void CWindow::onFiberViewersRequested()
-{
-    if (!_fiberController) return;
-
-    constexpr int N = FiberAnnotationController::kNumViews;
-    QMdiArea* targetMdiArea = _fiberSliceMdiArea ? _fiberSliceMdiArea : mdiArea;
-    if (!targetMdiArea) {
+    const auto status = _state->objectStoreSession()->hubStatus();
+    if (!status) {
+        _hubStatusLabel->hide();
+        _hubPromptedConflicts.clear();
         return;
     }
-
-    QMdiSubWindow* subWindows[N] = {};
-
-    for (int i = 0; i < N; ++i) {
-        QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
-
-        auto* baseViewer = newConnectedViewer(
-            FiberAnnotationController::fiberSurfaceName(i), title, targetMdiArea);
-        auto* viewer = baseViewer
-            ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
-            : nullptr;
-        if (!viewer) continue;
-
-        _fiberController->setFiberViewer(i, viewer);
-
-        // Isolate from segmentation module and global focus POI
-        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
-        if (_segmentationModule)
-            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
-
-        // Only the last view (annotation) handles clicks
-        if (i == N - 1) {
-            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
-                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
-        }
-
-        if (_state->currentVolume())
-            viewer->OnVolumeChanged(_state->currentVolume());
-
-        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
-        if (subWindows[i])
-            subWindows[i]->show();
+    QString text;
+    if (!status->conflicts.empty()) {
+        text = tr("Hub: %n conflict(s)", nullptr, int(status->conflicts.size()));
+    } else if (!status->error.empty()) {
+        text = tr("Hub: offline (%1)").arg(QString::fromStdString(status->error));
+    } else if (!status->pending.empty()) {
+        text = tr("Hub: %n pending", nullptr, int(status->pending.size()));
+    } else if (status->syncedAtUs) {
+        text = tr("Hub: synced %1").arg(QDateTime::fromMSecsSinceEpoch(*status->syncedAtUs / 1000)
+            .toString(QStringLiteral("HH:mm:ss")));
+    } else {
+        text = tr("Hub: connecting");
     }
-
-    // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
-    QRect area = targetMdiArea->contentsRect();
-    int colW = area.width() / 2;
-    int rowH = area.height();
-
-    for (int i = 0; i < N; ++i) {
-        if (!subWindows[i]) continue;
-        int x = area.x() + i * colW;
-        int y = area.y();
-        subWindows[i]->setGeometry(x, y, colW, rowH);
-    }
+    _hubStatusLabel->setText(text);
+    _hubStatusLabel->show();
+    // Ask about a set of conflicts once; Sync Now asks again.
+    std::vector<std::string> conflicts;
+    for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
+    if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
+    _hubPromptedConflicts = conflicts;
+    promptHubConflicts();
 }
 
-void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
+void CWindow::promptHubConflicts()
 {
-    if (_fiberWidget) {
-        _fiberWidget->selectFiber(fiberId);
-    }
-    if (_fiberSliceWidget) {
-        _fiberSliceWidget->selectFiber(fiberId);
-    }
+    const auto session = _state->objectStoreSession();
+    const auto status = session->hubStatus();
+    if (!status || status->conflicts.empty()) return;
+    QStringList uuids;
+    for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
+    QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
+        tr("%n record(s) changed both here and on the hub:", nullptr, int(uuids.size())) +
+            QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
+            (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
+            tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
+        QMessageBox::NoButton, this);
+    auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
+    auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
+    box.addButton(tr("Later"), QMessageBox::RejectRole);
+    box.exec();
+    if (box.clickedButton() == useHub) session->resolveHubConflicts("hub");
+    else if (box.clickedButton() == keepMine) session->resolveHubConflicts("local");
 }

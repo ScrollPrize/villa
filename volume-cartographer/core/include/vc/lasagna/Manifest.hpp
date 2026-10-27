@@ -92,6 +92,14 @@ struct LasagnaDatasetManifest {
         const std::filesystem::path& manifestPath = {});
 };
 
+// Lasagna arrays may be padded beyond their logical base-coordinate extent by
+// at most one storage chunk on each axis.
+[[nodiscard]] bool lasagnaChannelShapeCompatible(
+    const std::array<std::size_t, 3>& baseShapeZYX,
+    double baseSpacing,
+    const std::array<std::size_t, 3>& shapeZYX,
+    const std::array<std::size_t, 3>& chunksZYX) noexcept;
+
 // Return the power-of-two coordinate factor that maps points expressed in
 // ``fromShapeZYX`` into ``toShapeZYX``. Pyramid construction may round an odd
 // extent up or down, so both conventions are accepted on every axis. Shapes

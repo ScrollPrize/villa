@@ -103,6 +103,8 @@ required_formulae=(
   curl
   nlohmann-json
   sqlite
+  # vc_object_store links OpenSSL::Crypto; keg-only, see prefix loop below.
+  openssl@3
   lapack
   # OpenBLAS provides cblas_* with the legacy ILP32 symbol names PaStiX
   # expects. Accelerate.framework's BLAS hides those symbols when linked
@@ -191,8 +193,9 @@ fi
 
 # lapack and openblas are keg-only on macOS (Accelerate ships LAPACK but not
 # LAPACKE, which PaStiX requires; openblas would otherwise be masked by
-# Accelerate). Make both discoverable by pkg-config and cmake's find_package.
-for keg in lapack openblas; do
+# Accelerate). openssl@3 is keg-only and needed by vc_object_store. Make them
+# discoverable by pkg-config and cmake's find_package.
+for keg in lapack openblas openssl@3; do
   if [[ -d "$brew_prefix/opt/$keg" ]]; then
     export PKG_CONFIG_PATH="$brew_prefix/opt/$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"

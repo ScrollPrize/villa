@@ -1,5 +1,5 @@
-// Live S3 tests against the PHerc 0172 zarr to drive Volume / Zarr / VcDataset
-// coverage. Network-soft-skipped: set VC_TEST_REQUIRE_NETWORK=1 to make
+// Live S3 tests against PHerc 0172 and PHerc 0139 for Volume / Zarr / VcDataset
+// and catalog identity coverage. Set VC_TEST_REQUIRE_NETWORK=1 to make
 // failures hard.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -7,8 +7,13 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/objects/ObjectStore.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <string>
@@ -38,6 +43,112 @@ std::shared_ptr<Volume> openOrSkip()
 
 } // namespace
 
+TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity")
+{
+    const std::string url =
+        "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/"
+        "20260102150214-2.399um-0.2m-78keV-masked.zarr";
+    std::shared_ptr<Volume> untagged;
+    try {
+        untagged = Volume::NewFromUrl(url, {}, utils::Json::object(), false);
+    } catch (const std::exception& e) {
+        if (requireNetwork()) FAIL("PHerc0139 remote open failed: " << e.what());
+        MESSAGE("Skipping (network unavailable?): " << e.what());
+        return;
+    }
+    const nlohmann::json fiber = {
+        {"coordinates", {{"volume_uuid", "20260102150214"}, {"scale_factor", 1}}}};
+    // Reproduce the URL-derived identity mismatch before applying catalog tags.
+    CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *untagged).has_value());
+
+    struct TemporaryProject {
+        std::filesystem::path path = std::filesystem::temp_directory_path() /
+            ("vc-catalog-id-" + vc::objects::util::newUuid() + ".volpkg.json");
+        ~TemporaryProject() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } temporaryProject;
+    const auto& projectPath = temporaryProject.path;
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    deferred.failOnRemoteError = true;
+    auto project = VolumePkg::newDetached(deferred);
+    REQUIRE(project->addVolumeEntry(url, {
+        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
+        "vc-open-data-preferred-source", "vc-open-data-source-coordinate-level:0",
+        "vc-open-data-voxel-size-um:2.399000"}));
+    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {
+        "vc-remote-auth:anonymous", "vc-open-data-volume-id:20260102150214",
+        "vc-open-data-virtual-source", "vc-open-data-source-coordinate-level:2",
+        "vc-open-data-voxel-size-um:9.596000"}));
+    project->save(projectPath);
+    project = VolumePkg::load(projectPath, deferred);
+    project->resolveDeferredEntries();
+    const auto volume = project->volume("20260102150214");
+    REQUIRE(volume);
+    CHECK(volume->shape() == untagged->shape());
+    // Changing the annotation identity must reuse the pre-existing URL cache,
+    // including the process cache shared with manually opened remote volumes.
+    CHECK(untagged->remotePersistentCachePath() == untagged->remoteCacheRoot() / untagged->id());
+    CHECK(volume->remotePersistentCachePath() == untagged->remotePersistentCachePath());
+    const auto originalCache = untagged->sharedChunkCache();
+    const auto catalogCache = volume->sharedChunkCache();
+    CHECK(catalogCache->sourceId() == originalCache->sourceId());
+    // Populate the original disk cache, evict decoded RAM, and read through
+    // the catalog volume. The bytes must survive without a remote chunk fetch.
+    const int level = untagged->presentScaleLevels().back();
+    const auto shape = untagged->levelShape(level);
+    const auto chunk = untagged->chunkShape(level);
+    const std::array<int, 3> key{shape[0] / 2 / chunk[0], shape[1] / 2 / chunk[1], shape[2] / 2 / chunk[2]};
+    const auto before = originalCache->getChunkBlocking(level, key[0], key[1], key[2]);
+    REQUIRE(before.status != vc::render::ChunkStatus::Error);
+    originalCache->waitForPendingChunks();
+    originalCache->invalidate();
+    const auto fetches = std::make_shared<std::atomic_int>(0);
+    const auto listener = catalogCache->addRemoteFetchActivityListener(
+        [fetches](const auto&, bool active) { if (active) ++*fetches; });
+    const auto after = catalogCache->getChunkBlocking(level, key[0], key[1], key[2]);
+    catalogCache->removeRemoteFetchActivityListener(listener);
+    CHECK(fetches->load() == 0);
+    CHECK(after.status == before.status);
+    if (before.bytes) {
+        REQUIRE(after.bytes);
+        CHECK(*after.bytes == *before.bytes);
+    }
+    MESSAGE("Catalog cache reuse: " << (after.bytes ? after.bytes->size() : 0)
+            << " decoded bytes, " << fetches->load() << " remote chunk fetches");
+    CHECK(vc3d::geometryScaleForVolume(fiber, *volume) == 1.0);
+    CHECK(vc3d::coordinateBindingForVolume(*volume, 1).at("coordinates") == fiber.at("coordinates"));
+    REQUIRE(project->volumeIDs().size() == 2);
+    for (const auto& id : project->volumeIDs()) {
+        if (id != volume->id()) {
+            const auto rebased = project->volume(id);
+            CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *rebased).has_value());
+            CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
+            CHECK(rebased->remotePersistentCachePath() == rebased->remoteCacheRoot() / rebased->id());
+        }
+    }
+
+    // Optional read-only validation against a local replica of the PHerc0139 hub.
+    if (const char* path = std::getenv("VC_TEST_CATALOG_FIBER_STORE")) {
+        vc::objects::OpenOptions options;
+        options.readOnly = true;
+        auto store = vc::objects::ObjectStore::open(path, options);
+        auto txn = store.read();
+        vc::objects::ObjectSelection selection;
+        selection.kind = "fiber";
+        const auto all = store.selectObjects(txn, selection);
+        REQUIRE_FALSE(all.empty());
+        selection.volume = untagged->id();
+        CHECK(store.selectObjects(txn, selection).empty());
+        selection.volume = volume->id();
+        const auto matched = store.selectObjects(txn, selection);
+        CHECK(matched.size() == all.size());
+        CHECK(store.unboundObjectCount(txn, "fiber", volume->id()) == 0);
+        for (const auto& object : matched)
+            CHECK(vc3d::geometryScaleForVolume(nlohmann::json::parse(object.meta), *volume) == 1.0);
+        MESSAGE("Matched " << matched.size() << " real hub fibers to " << volume->id());
+    }
+}
+
 TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
 {
     auto v = openOrSkip();
@@ -45,6 +156,7 @@ TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
     CHECK(v->isRemote());
     CHECK_FALSE(v->remoteUrl().empty());
     CHECK_FALSE(v->id().empty());
+    CHECK(v->remotePersistentCachePath() == v->remoteCacheRoot() / v->id());
 }
 
 TEST_CASE("Volume::NewFromUrl: invalid credentials fall back to anonymous public S3")

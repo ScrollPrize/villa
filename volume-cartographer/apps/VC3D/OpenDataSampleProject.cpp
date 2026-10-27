@@ -1,5 +1,4 @@
 #include "OpenDataSampleProject.hpp"
-#include "ProjectFiberPaths.hpp"
 
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataLasagna.hpp"
@@ -443,7 +442,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         // Detached preparation must not overwrite the active project's autosave.
         // Reload the saved JSON to activate ordinary persistence and exercise
         // exactly the same entry resolution as reopening it later.
-        std::filesystem::create_directories(vc3d::projectFiberDirectory(newProject->path));
+
         pkg->save(newProject->path);
         vc::project::LoadOptions opts;
         opts.deferResolution = true;

@@ -180,26 +180,39 @@ class HeadingPredictor:
             raise ValueError('This checkpoint has no normal head')
         if not len(positions):
             return [], []
+        frames, out = self._predict_local(vol, positions, priors, paths, pool, families)
+        return self._world_normals(frames, out, priors)
+
+    def _predict_local(self, vol, positions, priors, paths, pool, families, *, non_blocking=False):
         frames = prior_frames(priors)
         patch, path = model_inputs(vol, self.model.cfg, positions, frames, paths, pool, crops=self.crops)
-        out = self.model.forward_outputs(patch.to(self.device), path.to(self.device), self._families(families))
+        def transfer(value):
+            if non_blocking and self.device.type == 'cuda' and value.device.type == 'cpu':
+                return value.pin_memory().to(self.device, non_blocking=True)
+            return value.to(self.device)
+        out = self.model.forward_outputs(transfer(patch), transfer(path), self._families(families, non_blocking=non_blocking))
+        return frames, out
+
+    @staticmethod
+    def _world_normals(frames, out, priors):
         heads, normals = (out[k].double().cpu().numpy() for k in ('heading', 'normal'))
         heads = [f @ h for f, h in zip(frames, heads)]
         return ([h if h @ np.asarray(p) >= 0 else -h for h, p in zip(heads, priors)],
                 [f @ n for f, n in zip(frames, normals)])
 
-    def _families(self, families):
+    def _families(self, families, *, non_blocking=False):
         from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import family_ids
         if not self.model.cfg.predict_frames:
             return None
         if families is None:
             raise ValueError('Supply H/V families for the frame model')
+        if non_blocking and self.device.type == 'cuda':
+            return family_ids(families).pin_memory().to(self.device, non_blocking=True)
         return family_ids(families, self.device)
 
     @torch.no_grad()
     def predict_frames(self, vol, positions, priors, paths, families, previous=None, pool=None):
         """World crop frames (u,v,forward); H/V supplied explicitly, optional previous frames prevent roll flips."""
-        from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import orthonormal_frame
         if not self.model.cfg.predict_frames:
             raise ValueError('This checkpoint is not a family-conditioned frame model')
         if not len(positions):
@@ -207,8 +220,41 @@ class HeadingPredictor:
         if previous is not None and len(previous) != len(positions):
             raise ValueError('Previous frames must match the position count')
         heads, normals = self.predict_with_normals(vol, positions, priors, paths, pool, families=families)
+        return self._world_frames(heads, normals, previous)
+
+    @staticmethod
+    def _world_frames(heads, normals, previous):
+        from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import orthonormal_frame
         anchors = np.stack([np.zeros(3) if f is None else np.asarray(f)[:, 0]
                             for f in (previous if previous is not None else [None]*len(heads))])
         frames = orthonormal_frame(torch.from_numpy(np.stack(heads)), torch.from_numpy(np.stack(normals)),
                                    torch.from_numpy(anchors))
         return list(frames.numpy())
+
+    @torch.no_grad()
+    def predict_frames_batched(self, vol, positions, priors, paths, families, previous=None, pool=None, *, chunk=64):
+        """Queue the same chunked forwards before waiting for their small outputs.
+
+        Crop/model/CPU frame batch sizes and arithmetic remain unchanged. Only
+        device-to-host transfers are combined, avoiding one wait per chunk.
+        """
+        if not self.model.cfg.predict_frames:
+            raise ValueError('This checkpoint is not a family-conditioned frame model')
+        if not len(positions):
+            return []
+        if previous is not None and len(previous) != len(positions):
+            raise ValueError('Previous frames must match the position count')
+        frames, outputs = [], []
+        for start in range(0, len(positions), chunk):
+            part = slice(start, start+chunk)
+            local_frames, out = self._predict_local(vol, positions[part], priors[part], paths[part], pool, families[part],
+                                                  non_blocking=True)
+            frames.extend(local_frames)
+            outputs.append(out)
+        out = {key: torch.cat([o[key] for o in outputs]) for key in ('heading', 'normal')}
+        heads, normals = self._world_normals(frames, out, priors)
+        result = []
+        for start in range(0, len(positions), chunk):
+            part = slice(start, start+chunk)
+            result.extend(self._world_frames(heads[part], normals[part], None if previous is None else previous[part]))
+        return result

@@ -13,6 +13,10 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/util/Rect3D.hpp"
+#include "AnnotationFrame.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+
+Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 
 class VolumePkg;
 class Volume;
@@ -36,8 +40,14 @@ class CState : public QObject
 
 public:
     explicit CState(QObject* parent = nullptr,
-                    bool debugDownloadQueue = false);
+                    bool debugDownloadQueue = false, CState* objectStoreOwner = nullptr);
     ~CState();
+
+    // One session for all object kinds; controllers share this handle.
+    std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
+    void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
+    void detachObjectStore();
+    void pollObjectStoreChanges();
 
     // --- VolumePkg ---
     std::shared_ptr<VolumePkg> vpkg() const;
@@ -49,8 +59,9 @@ public:
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
     void setCurrentVolume(std::shared_ptr<Volume> vol);
+    vc3d::annotation::AnnotationFrame annotationFrame() const;
 
-    // --- Session focus bounds (base-volume XYZ) ---
+    // Public bounds use current-volume XYZ; storage uses annotation-frame XYZ.
     std::optional<Rect3D> focusBounds() const;
     std::optional<Rect3D> activeFocusBounds() const;
     bool focusBoundsEnabled() const;
@@ -109,6 +120,8 @@ public:
     void notifyUmbilicusChanged() { emit umbilicusChanged(); }
 
 signals:
+    void objectStoreChanged(const vc::objects::StoreSessionEvent& event);
+    void objectStoreObservationFailed(const QString& error);
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
     void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
@@ -124,10 +137,13 @@ signals:
 private:
     void resolveCurrentVolumeId();
 
+    CState* _objectStoreOwner = nullptr;
+    std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
+    QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;
-    std::optional<Rect3D> _focusBounds;
+    std::optional<Rect3D> _focusBounds; // Annotation frame, independent of pyramid level.
     bool _focusBoundsEnabled = false;
     uint64_t _focusBoundsRevision = 0;
     std::string _segmentationGrowthVolumeId;

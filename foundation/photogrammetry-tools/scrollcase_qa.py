@@ -8,9 +8,10 @@ zero-volume slivers (left where the halves meet the divider) counted separately.
 the angle between the cavity's wide direction and the split plane, and the clearance from the
 scroll surface to each half; no scroll surface may lie inside case material. The wiggle is the gap
 from each scroll surface sample to the nearer half (near the lining offset everywhere for a snug fit).
-Each half must lift off the scroll along its side of the y axis without hitting it, stay within the
-caps' footprint, and not overlap the other; as they part along y, faces of the halves must not slide along each other in
-contact or pass within --sliding-mm sideways.
+Each half must lift off the scroll along its side of the pull axis without hitting it, stay within the
+caps' footprint, and not overlap the other; as they part along it, faces of the halves must not slide along each other in
+contact or pass within --sliding-mm sideways. The pull axis is y, turned with the split by scroll_summary.csv's
+"Split rotation (deg)" (anticlockwise about z) where the generator turned it for a flat fragment.
 
 --render writes cross-sections at five heights (scroll red, left half blue, right half green)
 above shaded views of the halves and the scroll.
@@ -85,13 +86,13 @@ def pull_blocked(scroll, half_path, direction, n=30000):
                for p in P)
 
 
-def half_contact(half, other, other_path, z_range, sliding_mm, n=60000):
+def half_contact(half, other, other_path, z_range, sliding_mm, pull, n=60000):
     """Contact between the halves beside the scroll (outside z_range the caps slide by design, right_cap_buffer
     above the base disc), from samples of one half's surface: those inside the other half; those pressed against
-    it (touching it on a face facing the other's, within 45 degrees) on a face within 30 degrees of the pull (y)
+    it (touching it on a face facing the other's, within 45 degrees) on a face within 30 degrees of the pull
     axis, which slides along the other half as they part, rather than meeting it at a seam; and those
     on such a face within sliding_mm of it with the other half beside them (the nearest point within 60
-    degrees of perpendicular to y), which pass that close as they part, not counting those within 1.5 mm of
+    degrees of perpendicular to the pull), which pass that close as they part, not counting those within 1.5 mm of
     where the halves touch (beside the joint's edge). Flush contact along the joint gives distances near 0, so only
     samples deeper than 0.05 mm are confirmed by winding number."""
     P, faces = trimesh.sample.sample_surface(half, n, seed=2)
@@ -105,13 +106,13 @@ def half_contact(half, other, other_path, z_range, sliding_mm, n=60000):
         n = mm_mesh.normal(r.mtp)
         d = np.array([q.x, q.y, q.z]) - p
         s[i] = r.dist
-        lateral[i] = abs(d[1]) < 0.5 * np.linalg.norm(d)
+        lateral[i] = abs(d @ pull) < 0.5 * np.linalg.norm(d)
         facing[i] = np.dot(normals[i], [n.x, n.y, n.z]) < -np.cos(np.radians(45))
     for i in np.flatnonzero(s < -0.05)[:500]:
         if winding_number(other, P[i]) < 0.5:
             s[i] = abs(s[i])
     touching = np.abs(s) < 0.02
-    steep = np.abs(normals[:, 1]) < 0.5
+    steep = np.abs(normals @ pull) < 0.5
     steep_contact = touching & steep & facing
     close = (s >= 0.05) & (s < sliding_mm) & lateral & steep
     joint = P[touching]
@@ -202,9 +203,13 @@ def main():
     parts = {k: trimesh.load(p, process=True) for k, p in paths.items()}
     for k, m in parts.items():
         print(f"{k:6s} {topology(m)}")
+    turn = np.radians(float(rows[0].get("Split rotation (deg)") or 0)) if rows else 0.0
+    split_dir = np.array([np.cos(turn), np.sin(turn)])
+    pull = np.array([-np.sin(turn), np.cos(turn), 0])
     xy = parts["scroll"].vertices[:, :2]
     w, E = np.linalg.eigh(np.cov(xy - xy.mean(0), rowvar=False))
-    print(f"cavity wide direction vs split plane (x): {np.degrees(np.arccos(abs(E[0, -1]))):.1f} deg")
+    print(f"cavity wide direction vs split plane ({np.degrees(turn):.1f} deg from x): "
+          f"{np.degrees(np.arccos(min(1, abs(E[:, -1] @ split_dir)))):.1f} deg")
     sd = {}
     for k in ("left", "right"):
         s, flagged = sd[k] = clearance(parts["scroll"], parts[k], paths[k])
@@ -218,25 +223,27 @@ def main():
     print(f"wiggle (gap to the nearer half) median {np.median(gap):.2f}, 95th percentile {np.percentile(gap, 95):.2f}, "
           f"99th {np.percentile(gap, 99):.2f}, max {gap.max():.2f} mm; samples over 3 mm {(gap > 3).mean():.1%}")
 
-    # The right half lies on the +y side of the divider and lifts off along +y, the left along -y.
-    up = 1.0 if parts["right"].centroid[1] > parts["left"].centroid[1] else -1.0
-    for k, pull in (("right", up), ("left", -up)):
-        blocked = pull_blocked(parts["scroll"], paths[k], (0, -pull, 0))
-        print(f"{k:6s} lifts off along {'+' if pull > 0 else '-'}y: scroll samples blocked by it {blocked}/30000")
+    # The right half lies on the +pull side of the divider and lifts off along +pull, the left along -pull.
+    up = 1.0 if (parts["right"].centroid - parts["left"].centroid) @ pull > 0 else -1.0
+    for k, sign in (("right", up), ("left", -up)):
+        blocked = pull_blocked(parts["scroll"], paths[k], -sign * pull)
+        print(f"{k:6s} lifts off along {'+' if sign > 0 else '-'}pull: scroll samples blocked by it {blocked}/30000")
     radius = float(rows[0]["Diameter (mm)"]) / 2 if rows else None
     if radius:
         # The lining (offset 2 + wall 2 by default) around the scroll; the caps start beyond it.
         z_range = parts["scroll"].bounds[:, 2] + [-4, 4]
-        # Square caps of half-width max(mount disc radius 56.25, lining radius) bound each half in y.
+        # Square caps of half-width max(mount disc radius 56.25, lining radius) bound each half across their
+        # bolt protrusions: along y, or x where they are turned to the sides nearest a turned split.
         cap = max(56.25, radius)
+        across = 0 if round(np.degrees(turn) / 90) % 2 else 1
         for k in ("left", "right"):
-            beyond = (np.abs(parts[k].vertices[:, 1]) > cap + 0.01).sum()
-            print(f"{k:6s} vertices beyond the caps' footprint (|y| > {cap:.2f}) {beyond}")
+            beyond = (np.abs(parts[k].vertices[:, across]) > cap + 0.01).sum()
+            print(f"{k:6s} vertices beyond the caps' footprint (|{'xy'[across]}| > {cap:.2f}) {beyond}")
         for k, other in (("left", "right"), ("right", "left")):
             inside, steep, close, nearest, n = half_contact(parts[k], parts[other], paths[other], z_range,
-                                                            args.sliding_mm)
+                                                            args.sliding_mm, pull)
             print(f"{k:6s} samples beside the scroll {n}: inside {other} {inside}; pressed against it on a face within 30 deg "
-                  f"of y {steep}; on such a face within {args.sliding_mm} mm of it sideways, off the joint {close}"
+                  f"of the pull {steep}; on such a face within {args.sliding_mm} mm of it sideways, off the joint {close}"
                   + (f" (nearest {nearest:.2f} mm)" if close else ""))
     if args.render:
         render(parts, args.render)

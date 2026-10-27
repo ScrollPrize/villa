@@ -82,6 +82,7 @@ def launch(
     env = dict(OFFSCREEN_ENV)
     if config_home is not None:
         env["XDG_CONFIG_HOME"] = config_home
+        env["VC3D_CONFIG_DIR"] = config_home
     return VC3DProcess(
         binary,
         args,
@@ -407,7 +408,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
             "viewer.set_overlay",
             {
                 "opacity": 7.5,
-                "threshold": 300,
+                "intensityAsAlpha": True,
                 "maxDisplayedResolution": 12,
                 "composite": {"layersFront": -7, "layersBehind": 100},
             },
@@ -415,7 +416,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         )
         for path, expected in {
             "opacity": 1,
-            "threshold": 255,
+            "intensityAsAlpha": True,
             "maxDisplayedResolution": 5,
             "composite.layersFront": 0,
             "composite.layersBehind": 64,
@@ -1509,48 +1510,35 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         results.record(
             "volume_open_broken_fibers_is_headless",
             opened.get("opened") is True,
-            "broken branch metadata was kept without opening a repair dialog",
+            "project fiber files are not loaded or repaired",
         )
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_broken_fibers_is_headless", False,
                        f"unexpected {type(e).__name__}: {e}")
 
     try:
-        saved, _ = client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        results.record("fiber_save_completion_response", saved.get("saved") is True,
-                       f"saved={saved.get('saved')}")
-    except Exception as e:  # noqa: BLE001
-        results.record("fiber_save_completion_response", False,
-                       f"unexpected {type(e).__name__}: {e}")
-
-
-UUID_TEXT = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
-
-def check_legacy_fiber_uuid(client: BridgeClient, results: Results,
-                            fiber_volpkg: str, fiber_file: Path) -> None:
-    """A fiber file without a uuid gets one persisted on load, and keeps it
-    across a save and a reopen (the identity must not change per load)."""
-    def stored_uuid() -> str | None:
-        return json.loads(fiber_file.read_text()).get("uuid")
-
-    try:
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        first = stored_uuid()
         client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        after_save = stored_uuid()
+        results.record("fiber_save_requires_attachment", False, "unexpected success without a store")
+    except BridgeError as error:
+        results.record("fiber_save_requires_attachment", error.code == -32000, str(error))
+
+
+def check_project_fiber_files_untouched(client: BridgeClient, results: Results,
+                                       fiber_volpkg: str, fiber_file: Path) -> None:
+    """Opening a project must neither load nor rewrite former fiber sources."""
+    try:
+        original = fiber_file.read_bytes()
         client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        after_reopen = stored_uuid()
-        results.record(
-            "legacy_fiber_uuid_persisted",
-            isinstance(first, str) and UUID_TEXT.fullmatch(first) is not None
-            and first == after_save == after_reopen,
-            f"on_load={first} after_save={after_save} after_reopen={after_reopen}",
-        )
-    except Exception as e:  # noqa: BLE001
-        results.record("legacy_fiber_uuid_persisted", False,
-                       f"unexpected {type(e).__name__}: {e}")
+        try:
+            client.call("fiber.list", {}, timeout=RPC_TIMEOUT)
+            results.record("fiber_list_requires_attachment", False, "unexpected success without a store")
+        except BridgeError as error:
+            results.record("fiber_list_requires_attachment", error.code == -32000, str(error))
+        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
+        results.record("project_fiber_files_untouched", fiber_file.read_bytes() == original,
+                       "project open/reopen preserves native source bytes")
+    except Exception as error:
+        results.record("project_fiber_files_untouched", False, str(error))
 
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
@@ -1774,10 +1762,16 @@ def main() -> int:
         # Use a separate clean project: broken-link fixtures deliberately
         # defer all load-time repair writes, including UUID backfills.
         legacy_fiber_volpkg = tmp_path / "legacy-fiber.volpkg.json"
-        legacy_fiber_volpkg.write_text(json.dumps({"name": "legacy-fiber", "version": 1}))
+        legacy_fiber_volpkg.write_text(json.dumps({
+            "name": "legacy-fiber",
+            "version": 1,
+            "volumes": ["volumes"],
+        }))
         legacy_fiber_dir = tmp_path / "fibers" / legacy_fiber_volpkg.name
         legacy_fiber_dir.mkdir(parents=True)
         legacy_fiber = legacy_fiber_dir / "fiber_legacy.json"
+        # Both fields are intentionally absent: package fibers load before
+        # volume activation, which must complete the deferred metadata save.
         legacy_fiber.write_text(json.dumps({
             "type": "vc3d_fiber",
             "version": 1,
@@ -1812,7 +1806,7 @@ def main() -> int:
             check_segments_attach(client, results, tmp_path, volpkg)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
-            check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),
+            check_project_fiber_files_untouched(client, results, str(legacy_fiber_volpkg),
                                     legacy_fiber)
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

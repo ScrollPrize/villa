@@ -1,3 +1,4 @@
+#include "vc_object_store/TrackCrossings.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -46,22 +47,7 @@ using Float64Vector = nb::ndarray<nb::numpy, const double,
 using FloatCoordinates = nb::ndarray<nb::numpy, const float,
                                      nb::shape<-1, 3>, nb::c_contig>;
 
-struct Event {
-    int32_t first;
-    int32_t second;
-    int32_t first_local;
-    int32_t second_local;
-};
-
-static_assert(sizeof(Event) == 16);
-
-struct EventBuffer {
-    std::vector<Event> events;
-
-    size_t size() const { return events.size(); }
-    size_t memory_bytes() const { return events.capacity() * sizeof(Event); }
-};
-
+using vc::track_crossings::EventBuffer;
 struct CrossingIndex {
     std::vector<int64_t> offsets;
     std::vector<int32_t> partners;
@@ -77,21 +63,6 @@ struct CrossingIndex {
                + partner_local.capacity() + track_lengths.capacity())
                 * sizeof(int32_t);
     }
-};
-
-struct PairRange {
-    size_t begin;
-    size_t end;
-};
-
-struct PairEdge {
-    int32_t first;
-    int32_t second;
-    int32_t first_local;
-    int32_t second_local;
-    double first_position;
-    double second_position;
-    double clearance;
 };
 
 template <typename T>
@@ -135,493 +106,58 @@ int effective_workers(int requested)
 #endif
 }
 
+vc::track_crossings::Progress crossing_progress(const nb::object& progress)
+{
+    return [progress](const char* phase, uint64_t done, uint64_t total) {
+        nb::gil_scoped_acquire acquire;
+        report(progress, phase, done, total);
+    };
+}
 nb::ndarray<nb::numpy, uint32_t, nb::ndim<1>> parallel_argsort(
     UInt64Vector packed, int workers, const nb::object& progress)
 {
-    workers = effective_workers(workers);
-    const size_t count = packed.shape(0);
-    if (count > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
-        throw std::runtime_error(
-            "native packed-key radix sort supports at most UINT32_MAX points");
-
-    constexpr unsigned radix_bits = 11;
-    constexpr size_t maximum_buckets = size_t{1} << radix_bits;
-    constexpr unsigned key_bits = 60;
-    constexpr unsigned passes = (key_bits + radix_bits - 1) / radix_bits;
-    std::vector<uint64_t> keys_a(count);
-    std::vector<uint64_t> keys_b(count);
-    std::vector<uint32_t> order_a(count);
-    std::vector<uint32_t> order_b(count);
-    const uint64_t* input = packed.data();
-
-    report(progress, "radix sorting packed voxel keys", 0, passes);
+    std::vector<uint32_t> order;
+    auto callback = crossing_progress(progress);
     {
         nb::gil_scoped_release release;
-#pragma omp parallel for schedule(static) num_threads(workers)
-        for (int64_t index = 0; index < static_cast<int64_t>(count); ++index) {
-            keys_a[index] = input[index];
-            order_a[index] = static_cast<uint32_t>(index);
-        }
+        order = vc::track_crossings::parallel_argsort(
+            {packed.data(), packed.size()}, workers, callback);
     }
-
-    for (unsigned pass = 0; pass < passes; ++pass) {
-        const unsigned shift = pass * radix_bits;
-        const unsigned bits = std::min(radix_bits, key_bits - shift);
-        const size_t bucket_count = size_t{1} << bits;
-        const uint64_t mask = bucket_count - 1;
-        std::vector<uint64_t> positions(
-            static_cast<size_t>(workers) * maximum_buckets, 0);
-
-        {
-            nb::gil_scoped_release release;
-#pragma omp parallel num_threads(workers)
-            {
-#ifdef _OPENMP
-                const int thread = omp_get_thread_num();
-#else
-                const int thread = 0;
-#endif
-                const size_t begin = count * static_cast<size_t>(thread) / workers;
-                const size_t end = count * static_cast<size_t>(thread + 1) / workers;
-                uint64_t* local = positions.data()
-                    + static_cast<size_t>(thread) * maximum_buckets;
-                for (size_t index = begin; index < end; ++index)
-                    ++local[(keys_a[index] >> shift) & mask];
-            }
-
-            uint64_t destination = 0;
-            for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
-                for (int thread = 0; thread < workers; ++thread) {
-                    uint64_t& slot = positions[
-                        static_cast<size_t>(thread) * maximum_buckets + bucket];
-                    const uint64_t bucket_size = slot;
-                    slot = destination;
-                    destination += bucket_size;
-                }
-            }
-
-#pragma omp parallel num_threads(workers)
-            {
-#ifdef _OPENMP
-                const int thread = omp_get_thread_num();
-#else
-                const int thread = 0;
-#endif
-                const size_t begin = count * static_cast<size_t>(thread) / workers;
-                const size_t end = count * static_cast<size_t>(thread + 1) / workers;
-                uint64_t* local = positions.data()
-                    + static_cast<size_t>(thread) * maximum_buckets;
-                for (size_t index = begin; index < end; ++index) {
-                    const size_t bucket = (keys_a[index] >> shift) & mask;
-                    const size_t output = static_cast<size_t>(local[bucket]++);
-                    keys_b[output] = keys_a[index];
-                    order_b[output] = order_a[index];
-                }
-            }
-        }
-        keys_a.swap(keys_b);
-        order_a.swap(order_b);
-        report(progress, "radix sorting packed voxel keys", pass + 1, passes);
-    }
-    return own_1d(std::move(order_a));
+    return own_1d(std::move(order));
 }
-
-struct Tangent {
-    double z = 0.0;
-    double y = 0.0;
-    double x = 0.0;
-    bool valid = false;
-};
-
-Tangent track_tangent(const int32_t* coordinates, const int64_t* offsets,
-                      int32_t track, int32_t local, double radius = 12.0)
-{
-    const int64_t begin = offsets[track];
-    const int64_t end = offsets[track + 1];
-    const int64_t center = begin + local;
-    int64_t left = center;
-    int64_t right = center;
-
-    auto distance_from_center = [&](int64_t index) {
-        const double dz = static_cast<double>(coordinates[3 * index])
-            - coordinates[3 * center];
-        const double dy = static_cast<double>(coordinates[3 * index + 1])
-            - coordinates[3 * center + 1];
-        const double dx = static_cast<double>(coordinates[3 * index + 2])
-            - coordinates[3 * center + 2];
-        return std::sqrt(dz * dz + dy * dy + dx * dx);
-    };
-
-    while (left > begin && distance_from_center(left) < radius)
-        --left;
-    while (right + 1 < end && distance_from_center(right) < radius)
-        ++right;
-    if (left == right)
-        return {};
-
-    const double dz = static_cast<double>(coordinates[3 * right])
-        - coordinates[3 * left];
-    const double dy = static_cast<double>(coordinates[3 * right + 1])
-        - coordinates[3 * left + 1];
-    const double dx = static_cast<double>(coordinates[3 * right + 2])
-        - coordinates[3 * left + 2];
-    const double norm = std::sqrt(dz * dz + dy * dy + dx * dx);
-    if (norm == 0.0)
-        return {};
-    return {dz / norm, dy / norm, dx / norm, true};
-}
-
 EventBuffer scan_crossing_events(
     Coordinates coordinates, Int64Vector offsets, Int8Vector family_codes,
-    UInt64Vector packed, UInt32Vector order, int workers,
-    const nb::object& progress)
+    UInt64Vector packed, UInt32Vector order, int workers, const nb::object& progress)
 {
-    workers = effective_workers(workers);
-    const size_t point_count = order.shape(0);
-    const size_t track_count = family_codes.shape(0);
-    if (coordinates.shape(0) != point_count || packed.shape(0) != point_count)
-        throw std::runtime_error("coordinates, packed keys, and order must be parallel");
-    if (offsets.shape(0) != track_count + 1
-        || static_cast<uint64_t>(offsets(track_count)) != point_count)
-        throw std::runtime_error("track offsets do not match coordinates");
-    if (track_count > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
-        throw std::runtime_error("native crossing scan supports at most INT32_MAX tracks");
-
-    const int32_t* coordinate_data = coordinates.data();
-    const int64_t* offset_data = offsets.data();
-    const int8_t* family_data = family_codes.data();
-    const uint64_t* packed_data = packed.data();
-    const uint32_t* order_data = order.data();
-
-    constexpr size_t chunk_size = 500'000;
-    std::vector<std::pair<size_t, size_t>> tasks;
-    for (size_t begin = 0; begin < point_count;) {
-        size_t end = std::min(begin + chunk_size, point_count);
-        while (end < point_count
-               && packed_data[order_data[end - 1]] == packed_data[order_data[end]])
-            ++end;
-        tasks.emplace_back(begin, end);
-        begin = end;
-    }
-
-    EventBuffer result;
-    const size_t tasks_per_batch = std::max<size_t>(workers * 2, 1);
-    const double angle_cutoff = std::cos(30.0 * std::acos(-1.0) / 180.0);
-    uint64_t completed = 0;
-    report(progress, "finding exact crossings", 0, point_count);
-
-    for (size_t batch_begin = 0; batch_begin < tasks.size();
-         batch_begin += tasks_per_batch) {
-        const size_t batch_end = std::min(
-            batch_begin + tasks_per_batch, tasks.size());
-        std::vector<std::vector<Event>> batch_events(batch_end - batch_begin);
-
-        {
-            nb::gil_scoped_release release;
-#pragma omp parallel for schedule(dynamic) num_threads(workers)
-            for (int64_t task_index = static_cast<int64_t>(batch_begin);
-                 task_index < static_cast<int64_t>(batch_end); ++task_index) {
-                const auto [position_begin, position_end] = tasks[task_index];
-                auto& local_events = batch_events[task_index - batch_begin];
-                std::vector<std::pair<int32_t, int32_t>> unique;
-                std::vector<Tangent> tangents;
-
-                for (size_t position = position_begin; position < position_end;) {
-                    size_t group_end = position + 1;
-                    const uint64_t key = packed_data[order_data[position]];
-                    while (group_end < position_end
-                           && packed_data[order_data[group_end]] == key)
-                        ++group_end;
-                    if (group_end - position < 2) {
-                        position = group_end;
-                        continue;
-                    }
-
-                    unique.clear();
-                    unique.reserve(group_end - position);
-                    for (size_t item = position; item < group_end; ++item) {
-                        const int64_t flat = order_data[item];
-                        const auto* found = std::upper_bound(
-                            offset_data + 1, offset_data + track_count + 1, flat);
-                        const int32_t track = static_cast<int32_t>(
-                            found - (offset_data + 1));
-                        if (family_data[track] < 0)
-                            continue;
-                        const int32_t local = static_cast<int32_t>(
-                            flat - offset_data[track]);
-                        unique.emplace_back(track, local);
-                    }
-                    std::sort(unique.begin(), unique.end());
-                    auto output = unique.begin();
-                    for (auto input = unique.begin(); input != unique.end();) {
-                        const int32_t track = input->first;
-                        int32_t local = input->second;
-                        do {
-                            local = std::min(local, input->second);
-                            ++input;
-                        } while (input != unique.end() && input->first == track);
-                        *output++ = {track, local};
-                    }
-                    unique.erase(output, unique.end());
-                    if (unique.size() < 2) {
-                        position = group_end;
-                        continue;
-                    }
-
-                    tangents.resize(unique.size());
-                    for (size_t index = 0; index < unique.size(); ++index) {
-                        tangents[index] = track_tangent(
-                            coordinate_data, offset_data,
-                            unique[index].first, unique[index].second);
-                    }
-                    for (size_t first = 0; first < unique.size(); ++first) {
-                        if (!tangents[first].valid)
-                            continue;
-                        for (size_t second = first + 1; second < unique.size(); ++second) {
-                            if (family_data[unique[first].first]
-                                    == family_data[unique[second].first]
-                                || !tangents[second].valid)
-                                continue;
-                            const double dot = tangents[first].z * tangents[second].z
-                                + tangents[first].y * tangents[second].y
-                                + tangents[first].x * tangents[second].x;
-                            if (std::abs(dot) > angle_cutoff)
-                                continue;
-                            local_events.push_back({
-                                unique[first].first, unique[second].first,
-                                unique[first].second, unique[second].second});
-                        }
-                    }
-                    position = group_end;
-                }
-            }
-        }
-
-        size_t added = 0;
-        for (const auto& events : batch_events)
-            added += events.size();
-        const size_t required = result.events.size() + added;
-        if (required > result.events.capacity()) {
-            const size_t grown = result.events.capacity()
-                + result.events.capacity() / 2;
-            result.events.reserve(std::max(required, grown));
-        }
-        for (auto& events : batch_events) {
-            result.events.insert(
-                result.events.end(),
-                std::make_move_iterator(events.begin()),
-                std::make_move_iterator(events.end()));
-        }
-        for (size_t task = batch_begin; task < batch_end; ++task)
-            completed += tasks[task].second - tasks[task].first;
-        report(progress, "finding exact crossings", completed, point_count);
-    }
-    return result;
+    auto callback = crossing_progress(progress);
+    nb::gil_scoped_release release;
+    return vc::track_crossings::scan_crossing_events(
+        {coordinates.data(), coordinates.size()}, {offsets.data(), offsets.size()},
+        {family_codes.data(), family_codes.size()}, {packed.data(), packed.size()},
+        {order.data(), order.size()}, workers, callback);
 }
-
 nb::dict consolidate_crossing_events(
     EventBuffer& buffer, Coordinates coordinates, Int64Vector offsets,
     UInt64Vector source_ids, int workers, const nb::object& progress)
 {
-    workers = effective_workers(workers);
-    const size_t track_count = source_ids.shape(0);
-    const size_t point_count = coordinates.shape(0);
-    if (offsets.shape(0) != track_count + 1
-        || static_cast<uint64_t>(offsets(track_count)) != point_count)
-        throw std::runtime_error("track offsets do not match coordinates");
-
-    auto event_less = [](const Event& left, const Event& right) {
-        return std::tie(left.first, left.second,
-                        left.first_local, left.second_local)
-            < std::tie(right.first, right.second,
-                       right.first_local, right.second_local);
-    };
-    report(progress, "sorting crossing events", 0, buffer.events.size());
+    vc::track_crossings::Crossings crossings;
+    auto callback = crossing_progress(progress);
     {
         nb::gil_scoped_release release;
-#if defined(__GLIBCXX__) && defined(_OPENMP)
-        const int previous_workers = omp_get_max_threads();
-        omp_set_num_threads(workers);
-        __gnu_parallel::sort(
-            buffer.events.begin(), buffer.events.end(), event_less,
-            __gnu_parallel::balanced_quicksort_tag());
-        omp_set_num_threads(previous_workers);
-#else
-        std::sort(buffer.events.begin(), buffer.events.end(), event_less);
-#endif
-    }
-    report(progress, "sorting crossing events",
-           buffer.events.size(), buffer.events.size());
-
-    std::vector<PairRange> ranges;
-    ranges.reserve(buffer.events.size());
-    for (size_t begin = 0; begin < buffer.events.size();) {
-        size_t end = begin + 1;
-        while (end < buffer.events.size()
-               && buffer.events[end].first == buffer.events[begin].first
-               && buffer.events[end].second == buffer.events[begin].second)
-            ++end;
-        ranges.push_back({begin, end});
-        begin = end;
-    }
-
-    report(progress, "computing track arclengths", 0, track_count);
-    auto arclength = std::make_unique_for_overwrite<double[]>(point_count);
-    const int32_t* coordinate_data = coordinates.data();
-    const int64_t* offset_data = offsets.data();
-    constexpr size_t track_batch = 1'000'000;
-    for (size_t batch_begin = 0; batch_begin < track_count;
-         batch_begin += track_batch) {
-        const size_t batch_end = std::min(batch_begin + track_batch, track_count);
-        {
-            nb::gil_scoped_release release;
-#pragma omp parallel for schedule(static) num_threads(workers)
-            for (int64_t track = static_cast<int64_t>(batch_begin);
-                 track < static_cast<int64_t>(batch_end); ++track) {
-                const int64_t begin = offset_data[track];
-                const int64_t end = offset_data[track + 1];
-                if (begin == end)
-                    continue;
-                arclength[begin] = 0.0;
-                for (int64_t point = begin + 1; point < end; ++point) {
-                    const double dz = static_cast<double>(coordinate_data[3 * point])
-                        - coordinate_data[3 * (point - 1)];
-                    const double dy = static_cast<double>(coordinate_data[3 * point + 1])
-                        - coordinate_data[3 * (point - 1) + 1];
-                    const double dx = static_cast<double>(coordinate_data[3 * point + 2])
-                        - coordinate_data[3 * (point - 1) + 2];
-                    arclength[point] = arclength[point - 1]
-                        + std::sqrt(dz * dz + dy * dy + dx * dx);
-                }
-            }
-        }
-        report(progress, "computing track arclengths", batch_end, track_count);
-    }
-
-    std::vector<PairEdge> pair_edges(ranges.size());
-    uint64_t accepted_events = 0;
-    report(progress, "consolidating track pairs", 0, ranges.size());
-    const size_t pair_batch = std::max<size_t>(workers * 100'000, 100'000);
-    for (size_t batch_begin = 0; batch_begin < ranges.size();
-         batch_begin += pair_batch) {
-        const size_t batch_end = std::min(batch_begin + pair_batch, ranges.size());
-        uint64_t batch_accepted_events = 0;
-        {
-            nb::gil_scoped_release release;
-#pragma omp parallel for schedule(static) num_threads(workers) reduction(+ : batch_accepted_events)
-            for (int64_t range_index = static_cast<int64_t>(batch_begin);
-                 range_index < static_cast<int64_t>(batch_end); ++range_index) {
-                const PairRange range = ranges[range_index];
-                Event best{};
-                std::tuple<double, double, double, int32_t, int32_t> best_key;
-                bool have_best = false;
-                uint64_t representatives = 0;
-
-                size_t cluster_begin = range.begin;
-                while (cluster_begin < range.end) {
-                    size_t cluster_end = cluster_begin + 1;
-                    while (cluster_end < range.end
-                           && std::abs(buffer.events[cluster_end].first_local
-                                       - buffer.events[cluster_end - 1].first_local) <= 4
-                           && std::abs(buffer.events[cluster_end].second_local
-                                       - buffer.events[cluster_end - 1].second_local) <= 4)
-                        ++cluster_end;
-                    const Event& candidate = buffer.events[
-                        cluster_begin + (cluster_end - cluster_begin) / 2];
-                    const int64_t first_point = offset_data[candidate.first]
-                        + candidate.first_local;
-                    const int64_t second_point = offset_data[candidate.second]
-                        + candidate.second_local;
-                    const double first_position = arclength[first_point];
-                    const double second_position = arclength[second_point];
-                    const double clearance = std::min({
-                        first_position,
-                        arclength[offset_data[candidate.first + 1] - 1]
-                            - first_position,
-                        second_position,
-                        arclength[offset_data[candidate.second + 1] - 1]
-                            - second_position,
-                    });
-                    const auto key = std::make_tuple(
-                        clearance, first_position, second_position,
-                        candidate.first_local, candidate.second_local);
-                    if (!have_best || key > best_key) {
-                        have_best = true;
-                        best = candidate;
-                        best_key = key;
-                    }
-                    ++representatives;
-                    cluster_begin = cluster_end;
-                }
-                batch_accepted_events += representatives;
-                pair_edges[range_index] = {
-                    best.first, best.second, best.first_local, best.second_local,
-                    std::get<1>(best_key), std::get<2>(best_key),
-                    std::get<0>(best_key)};
-            }
-        }
-        accepted_events += batch_accepted_events;
-        report(progress, "consolidating track pairs", batch_end, ranges.size());
-    }
-
-    std::vector<Event>().swap(buffer.events);
-    std::vector<PairRange>().swap(ranges);
-    arclength.reset();
-
-    report(progress, "encoding crossing CSR", 0, pair_edges.size());
-    std::vector<int64_t> csr_offsets(track_count + 1, 0);
-    for (const PairEdge& edge : pair_edges) {
-        ++csr_offsets[static_cast<size_t>(edge.first) + 1];
-        ++csr_offsets[static_cast<size_t>(edge.second) + 1];
-    }
-    for (size_t track = 0; track < track_count; ++track)
-        csr_offsets[track + 1] += csr_offsets[track];
-
-    const size_t partner_count = static_cast<size_t>(csr_offsets.back());
-    std::vector<int32_t> partners(partner_count);
-    std::vector<int32_t> self_local(partner_count);
-    std::vector<int32_t> partner_local(partner_count);
-    std::vector<double> positions(partner_count);
-    std::vector<double> clearances(partner_count);
-    std::vector<int64_t> cursor(csr_offsets.begin(), csr_offsets.end() - 1);
-
-    constexpr size_t encode_batch = 2'000'000;
-    for (size_t begin = 0; begin < pair_edges.size(); begin += encode_batch) {
-        const size_t end = std::min(begin + encode_batch, pair_edges.size());
-        for (size_t index = begin; index < end; ++index) {
-            const PairEdge& edge = pair_edges[index];
-            const size_t first_slot = static_cast<size_t>(cursor[edge.first]++);
-            partners[first_slot] = edge.second;
-            self_local[first_slot] = edge.first_local;
-            partner_local[first_slot] = edge.second_local;
-            positions[first_slot] = edge.first_position;
-            clearances[first_slot] = edge.clearance;
-
-            const size_t second_slot = static_cast<size_t>(cursor[edge.second]++);
-            partners[second_slot] = edge.first;
-            self_local[second_slot] = edge.second_local;
-            partner_local[second_slot] = edge.first_local;
-            positions[second_slot] = edge.second_position;
-            clearances[second_slot] = edge.clearance;
-        }
-        report(progress, "encoding crossing CSR", end, pair_edges.size());
-    }
-
-    uint64_t paired_track_count = 0;
-    for (size_t track = 0; track < track_count; ++track) {
-        if (csr_offsets[track + 1] != csr_offsets[track])
-            ++paired_track_count;
+        crossings = vc::track_crossings::consolidate_crossing_events(
+            buffer, {coordinates.data(), coordinates.size()}, {offsets.data(), offsets.size()},
+            {source_ids.data(), source_ids.size()}, workers, callback);
     }
     nb::dict result;
     result["source_ids"] = source_ids;
-    result["offsets"] = own_1d(std::move(csr_offsets));
-    result["partners"] = own_1d(std::move(partners));
-    result["self_local"] = own_1d(std::move(self_local));
-    result["partner_local"] = own_1d(std::move(partner_local));
-    result["positions"] = own_1d(std::move(positions));
-    result["clearances"] = own_1d(std::move(clearances));
-    result["accepted_events"] = accepted_events;
-    result["paired_tracks"] = paired_track_count;
+    result["offsets"] = own_1d(std::move(crossings.offsets));
+    result["partners"] = own_1d(std::move(crossings.partners));
+    result["self_local"] = own_1d(std::move(crossings.self_local));
+    result["partner_local"] = own_1d(std::move(crossings.partner_local));
+    result["positions"] = own_1d(std::move(crossings.positions));
+    result["clearances"] = own_1d(std::move(crossings.clearances));
+    result["accepted_events"] = crossings.accepted_events;
+    result["paired_tracks"] = crossings.paired_tracks;
     return result;
 }
 
