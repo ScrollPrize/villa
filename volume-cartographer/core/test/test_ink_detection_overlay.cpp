@@ -5,6 +5,7 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QCoreApplication>
@@ -176,6 +177,26 @@ TEST_CASE("CState batches surface catalog mutations into one notification")
 
     QObject::disconnect(changedConnection);
     QObject::disconnect(deleteConnection);
+}
+
+TEST_CASE("CState::closeAll clears the project's surfaces and keeps the view planes")
+{
+    for (const bool withProject : {false, true}) {
+        CState state;
+        if (withProject) state.setVpkg(VolumePkg::newEmpty());
+        state.setSurface("segmentation", makeSurface("segmentation"));
+        state.setSurface("other", makeSurface("other"));
+        const auto xy = state.surface("xy plane");
+        REQUIRE(xy);
+
+        state.closeAll();
+
+        CHECK(state.surface("segmentation") == nullptr);
+        CHECK(state.surface("other") == nullptr);
+        CHECK(state.surface("xy plane") == xy);
+        CHECK(state.surface("xz plane"));
+        CHECK(state.surface("yz plane"));
+    }
 }
 
 TEST_CASE("ink detection options follow the active catalog surface")

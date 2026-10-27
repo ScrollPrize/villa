@@ -480,15 +480,13 @@ void CState::closeAll()
 
     clearActiveSurface();
 
-    setSurface("segmentation", nullptr, true);
-    if (!_vpkg) {
-        auto names = surfaceNames();
-        for (const auto& name : names) {
-            if (name != "segmentation") {
-                setSurface(name, nullptr, true);
-            }
-        }
-    }
+    // Every surface except the view planes belongs to the closed project.
+    std::vector<std::string> closed;
+    for (const auto& [name, surf] : _surfs)
+        if (!std::dynamic_pointer_cast<PlaneSurface>(surf)) closed.push_back(name);
+    std::sort(closed.begin(), closed.end());
+    for (const auto& name : closed)
+        setSurface(name, nullptr, true);
 
     _currentVolume = nullptr;
     _segmentationGrowthVolumeId.clear();
@@ -625,15 +623,6 @@ std::vector<std::shared_ptr<Surface>> CState::surfaces()
     }
 
     return result;
-}
-
-std::vector<std::string> CState::surfaceNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _surfs)
-        keys.push_back(it.first);
-
-    return keys;
 }
 
 // --- POI methods (from CSurfaceCollection) ---

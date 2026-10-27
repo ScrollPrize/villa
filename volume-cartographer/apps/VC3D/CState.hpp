@@ -106,7 +106,6 @@ public:
     Surface* surfaceRaw(const std::string& name);
     std::string findSurfaceId(Surface* surf);
     std::vector<std::shared_ptr<Surface>> surfaces();
-    std::vector<std::string> surfaceNames();
     // Bumped on every setSurface() that changes the map (including
     // noSignalSend calls), so callers can cheaply detect that a cached view
     // of the surface map is stale.
