@@ -1,8 +1,11 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vc::objects {
 class ObjectStoreSession;
@@ -29,4 +32,27 @@ std::optional<nlohmann::json> attachedDocument(const ObjectStore&, const Txn&, c
 // The same, read from a session's attachment.
 std::optional<nlohmann::json> attachedDocument(ObjectStoreSession&, const AttachmentIdentity&,
                                                const std::string& objectUuid, const std::string& role);
+
+// Editable point collections attached to an object in a role (e.g. a surface's
+// corrections): each its points with stable ids, one annotation per point, and
+// the rest of it as record meta.source.
+struct AttachedCollection {
+    std::string uuid, name;
+    geometry::PointCollection points;
+    nlohmann::json annotations = nlohmann::json::array();
+    nlohmann::json source = nlohmann::json::object();
+};
+// The live collections attached to `objectUuid` in `role`, with their points in
+// `frame` when given (else as stored).
+std::vector<AttachedCollection> attachedCollections(ObjectStoreSession&, const AttachmentIdentity&,
+                                                    const std::string& objectUuid, const std::string& role,
+                                                    const std::optional<ViewFrame>& frame = std::nullopt);
+// Make the collections attached to `objectUuid` in `role` exactly
+// `collections` (by UUID) in one commit: new ones are created with
+// `coordinates` and attached; changed ones get a new geometry revision whose
+// remaining points keep their identity, and keep their attachment; the others
+// are detached and retired. Points are in `frame` when given.
+void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& objectUuid,
+                                const std::string& role, const std::vector<AttachedCollection>& collections,
+                                const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame = std::nullopt);
 }

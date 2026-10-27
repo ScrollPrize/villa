@@ -1,11 +1,9 @@
 #include "segmentation/SurfaceCorrections.hpp"
 
+#include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
-#include <vc_object_store/store/GeometryViews.hpp>
 #include "vc/core/types/Volume.hpp"
 
-#include <vc_object_store/objects/GeometryEdits.hpp>
-#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <nlohmann/json.hpp>
@@ -17,27 +15,13 @@ namespace {
 // Corrections are data attached to the surface, never graph links.
 constexpr const char* kRole = "corrections";
 
-// The correction relationships of a surface, by collection UUID.
-std::map<std::string, EdgeRecord> correctionEdges(const ObjectStore& db, const Txn& txn, const std::string& surfaceUuid)
+// A VCCollection as an attached collection: its points, one annotation per
+// point (the point's other fields), and the rest of it as meta.source.
+AttachedCollection toStore(uint64_t id, const Json& collection)
 {
-    std::map<std::string, EdgeRecord> edges;
-    for (auto& edge : db.attachments(txn, surfaceUuid, std::string(kRole))) {
-        const auto collection = edge.aUuid == surfaceUuid ? edge.bUuid : edge.aUuid;
-        edges.emplace(collection, std::move(edge));
-    }
-    return edges;
-}
-
-// A collection in store terms: its points, one annotation per point (the
-// point's other fields), and the rest of it as meta.source.
-struct Stored {
-    vc::geometry::PointCollection points;
-    Json annotations = Json::array();
-    Json source;
-};
-Stored toStore(uint64_t id, const Json& collection)
-{
-    Stored stored;
+    AttachedCollection stored;
+    stored.uuid = collection.at("uuid").get<std::string>();
+    stored.name = collection.value("name", std::string{});
     stored.source = collection;
     for (const auto* key : {"points", "uuid", "name"}) stored.source.erase(key);
     stored.source["source_collection_id"] = std::to_string(id);
@@ -58,32 +42,21 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
                                                         const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
     std::map<uint64_t, utils::Json> result;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        for (const auto& [uuid, edge] : correctionEdges(db, txn, surfaceUuid)) {
-            const auto object = db.objectByUuid(txn, uuid);
-            const auto head = object && !object->retired ? db.currentGeometry(txn, uuid) : std::nullopt;
-            if (!head) continue;
-            auto points = std::get<vc::geometry::PointCollection>(vc::geometry::decode(db.readGeometryData(txn, head->uuid)));
-            if (view) {
-                const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(uuid, view->volume, view->scale);
-                points.points = shown.points("points", 0, int64_t(points.points.size()));
-            }
-            const auto attributes = Json::parse(db.geometryPointAnnotations(txn, head->uuid, "points"));
-            auto collection = Json::parse(object->meta).value("source", Json::object());
-            const auto id = std::stoull(collection.value("source_collection_id", std::string("0")));
-            collection.erase("source_collection_id");
-            collection["uuid"] = object->uuid;
-            collection["name"] = object->name;
-            auto entries = Json::object();
-            for (size_t i = 0; i < points.ids.size(); ++i) {
-                auto entry = i < attributes.size() && attributes[i].is_object() ? attributes[i] : Json::object();
-                entry["p"] = points.points[i];
-                entries[std::to_string(points.ids[i])] = std::move(entry);
-            }
-            collection["points"] = std::move(entries);
-            result[id] = utils::Json::parse(collection.dump());
+    for (const auto& stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
+        auto collection = stored.source;
+        const auto id = std::stoull(collection.value("source_collection_id", std::string("0")));
+        collection.erase("source_collection_id");
+        collection["uuid"] = stored.uuid;
+        collection["name"] = stored.name;
+        auto entries = Json::object();
+        for (size_t i = 0; i < stored.points.ids.size(); ++i) {
+            auto entry = i < stored.annotations.size() && stored.annotations[i].is_object() ? stored.annotations[i] : Json::object();
+            entry["p"] = stored.points.points[i];
+            entries[std::to_string(stored.points.ids[i])] = std::move(entry);
         }
-    });
+        collection["points"] = std::move(entries);
+        result[id] = utils::Json::parse(collection.dump());
+    }
     return result;
 }
 
@@ -91,92 +64,10 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                               const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
                               const std::optional<vc::objects::ViewFrame>& view)
 {
-    std::map<std::string, std::pair<uint64_t, Json>> desired;
-    for (const auto& [id, json] : collections) {
-        auto collection = Json::parse(json.dump());
-        const auto uuid = util::canonicalUuid(collection.at("uuid").get<std::string>());
-        desired[uuid] = {id, std::move(collection)};
-    }
-    std::map<std::string, EdgeRecord> linked;
-    RevisionSelection pins, related;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        linked = correctionEdges(db, txn, surfaceUuid);
-        const auto surface = db.currentObjectRevision(txn, surfaceUuid);
-        if (!surface) throw std::runtime_error("surface not found: " + surfaceUuid);
-        related[surfaceUuid] = surface->uuid;
-        auto pin = [&](const std::string& uuid) {
-            const auto head = db.currentObjectRevision(txn, uuid);
-            pins[uuid] = head ? std::optional(head->uuid) : std::nullopt;
-        };
-        for (const auto& [uuid, edge] : linked) pin(uuid);
-        for (const auto& [uuid, collection] : desired) pin(uuid);
-    });
-    const auto coordinates = vc::objects::volumeCoordinates(volume.id(), 1);
-    session.editKeepingRelationships(attachment, pins, related, [&](auto& db, auto& txn, const auto&) {
-        for (const auto& [uuid, entry] : desired) {
-            const auto& [id, collection] = entry;
-            auto stored = toStore(id, collection);
-            const auto current = db.objectByUuid(txn, uuid);
-            if (current && current->retired) db.restoreObject(txn, uuid);
-            auto record = current ? *db.objectByUuid(txn, uuid) : ObjectRecord{};
-            auto meta = Json::parse(record.meta);
-            if (!current) {
-                record.uuid = uuid;
-                record.kind = "point_collection";
-                meta["coordinates"] = coordinates;
-                meta["role"] = kRole;
-            }
-            record.name = collection.value("name", std::string{});
-            const auto head = current ? db.currentGeometry(txn, uuid) : std::nullopt;
-            if (!head) {
-                // A new geometry consumes the points' annotations from meta.source.
-                meta["source"] = stored.source;
-                meta["source"]["point_attributes"] = stored.annotations;
-                record.meta = meta.dump();
-                db.upsertObject(txn, record);
-                db.putGeometry(txn, uuid, vc::geometry::encode(stored.points));
-            } else {
-                meta["source"] = stored.source;
-                record.meta = meta.dump();
-                db.upsertObject(txn, record);
-                if (view) {
-                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(uuid, view->volume, view->scale);
-                    stored.points = shown.canonicalPointCollection(stored.points);
-                }
-                const auto previous = std::get<vc::geometry::PointCollection>(vc::geometry::decode(db.readGeometryData(txn, head->uuid)));
-                const auto previousAnnotations = Json::parse(db.geometryPointAnnotations(txn, head->uuid, "points"));
-                if (previous.ids == stored.points.ids && previous.points == stored.points.points &&
-                    previousAnnotations == stored.annotations) {
-                    // Only the record changed: the correction relationship still applies.
-                    for (const auto& edge : db.edgesOf(txn, uuid)) db.retainRelationship(txn, edge.uuid);
-                } else {
-                    // Points that stay keep their identity (stable IDs); the correction
-                    // relationship applies to the edited geometry as before.
-                    auto retain = [&](const std::vector<EdgeRecord>& edges) {
-                        std::vector<GeometryEdgeEdit> decisions;
-                        for (const auto& edge : edges) {
-                            GeometryEdgeEdit decision;
-                            decision.edgeUuid = edge.uuid;
-                            decision.expectedGeneration = edge.generation;
-                            decision.action = "retain";
-                            if (const auto r = db.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
-                            if (const auto r = db.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
-                            decisions.push_back(std::move(decision));
-                        }
-                        return decisions;
-                    };
-                    updateGeometryArrays(db, txn, uuid, vc::geometry::encode(stored.points), head->uuid,
-                                         {{"points", stored.annotations.dump()}}, retain);
-                }
-            }
-            if (!linked.contains(uuid)) db.attach(txn, uuid, surfaceUuid, kRole);
-        }
-        for (const auto& [uuid, edge] : linked) {
-            if (desired.contains(uuid)) continue;
-            db.removeEdge(txn, edge.uuid);
-            db.retireObject(txn, uuid);
-        }
-    });
+    std::vector<AttachedCollection> stored;
+    for (const auto& [id, json] : collections) stored.push_back(toStore(id, Json::parse(json.dump())));
+    replaceAttachedCollections(session, attachment, surfaceUuid, kRole, stored,
+                               vc::objects::volumeCoordinates(volume.id(), 1), view);
 }
 
 std::string vc3d::corrections::writeGrowthAnnotation(ObjectStoreSession& session, const AttachmentIdentity& attachment,
