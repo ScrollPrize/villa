@@ -1,5 +1,6 @@
 #include "CommandLineToolRunner.hpp"
 #include "ToolExecutable.hpp"
+#include "ToolOutput.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QStatusBar>
@@ -342,7 +343,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     _currentTool = tool;
     _createdSurfaces.clear();
     _exportedObj.clear();
-    _partialLine.clear();
+    _outputLines = {};
     _executionOptions = options;
     _terminalReported = false;
     _pendingProcessError.clear();
@@ -501,20 +502,17 @@ void CommandLineToolRunner::onProcessReadyRead()
             _logStream->flush();
         }
 
-        parseReportLines(outputText);
+        parseReportLines(_outputLines.add(outputText));
         emit consoleOutputReceived(outputText);
     }
 }
 
-void CommandLineToolRunner::parseReportLines(const QString& output)
+void CommandLineToolRunner::parseReportLines(const QStringList& lines)
 {
-    // Output arrives in arbitrary chunks: keep the unterminated tail.
-    const QStringList lines = (_partialLine + output).split('\n');
-    _partialLine = lines.back();
-    for (qsizetype i = 0; i + 1 < lines.size(); ++i) {
-        const QString line = lines[i].trimmed();
-        if (line.startsWith(QStringLiteral("surface_uuid:")))
-            _createdSurfaces << line.mid(13).trimmed();
+    for (const QString& raw : lines) {
+        const QString line = raw.trimmed();
+        if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty())
+            _createdSurfaces << uuid;
         else if (line.startsWith(QStringLiteral("obj:")))
             _exportedObj = line.mid(4).trimmed();
     }
@@ -567,7 +565,7 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
     }
     // Report lines may still be buffered or unterminated.
     onProcessReadyRead();
-    if (!_partialLine.isEmpty()) parseReportLines(QStringLiteral("\n"));
+    parseReportLines(_outputLines.finish());
     if (_logStream) {
         *_logStream << Qt::endl << "===================================" << Qt::endl;
         *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;

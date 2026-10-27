@@ -75,6 +75,7 @@
 #include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include "ToolExecutable.hpp"
+#include "ToolOutput.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
@@ -694,7 +695,11 @@ private:
         const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
         ioLog_ += chunk;
         std::cout << chunk.toStdString() << std::flush;
-        for (const QString& raw : chunk.split('\n', Qt::SkipEmptyParts)) {
+        handleLines_(lines_.add(chunk));
+    }
+
+    void handleLines_(const QStringList& lines) {
+        for (const QString& raw : lines) {
             const QString line = raw.trimmed();
             if (auto m = progRe_.match(line); m.hasMatch()) {
                 const int cur = m.captured(1).toInt();
@@ -712,8 +717,8 @@ private:
             } else if (line.startsWith("Final stretch")) {
                 progress_->setLabelText(QObject::tr("Creating the flattened surface..."));
                 if (handler_) emit handler_->statusMessage(line, 0);
-            } else if (line.startsWith(QStringLiteral("surface_uuid:"))) {
-                created_ = line.mid(13).trimmed();
+            } else if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty()) {
+                created_ = uuid;
             }
         }
     }
@@ -728,6 +733,7 @@ private:
     void onFinished_(int exitCode, QProcess::ExitStatus st) {
         if (done_) return;
         onStdout_();
+        handleLines_(lines_.finish());
         if (st != QProcess::NormalExit || exitCode != 0 || created_.isEmpty()) {
             fail_(QObject::tr("flatboi failed (exit code %1).").arg(exitCode));
             return;
@@ -791,6 +797,7 @@ private:
     QPointer<SurfaceCatalog> catalog_;
     QString outputName_;
     QString created_;     // the flattened surface's UUID
+    vc3d::ToolOutputLines lines_;
     int iters_ = 20;
     int lastIterSeen_ = 0;
     bool suppressDialogs_ = false;   // capture failures without presenting UI
@@ -1085,13 +1092,15 @@ public:
 
 private slots:
     void onStdout_() {
-        const QString chunk = QString::fromLocal8Bit(proc_->readAllStandardOutput());
-        const QStringList lines = chunk.split('\n', Qt::SkipEmptyParts);
+        handleLines_(lines_.add(QString::fromLocal8Bit(proc_->readAllStandardOutput())));
+    }
+
+    void handleLines_(const QStringList& lines) {
         for (const QString& raw : lines) {
             const QString line = raw.trimmed();
             if (line.isEmpty()) continue;
             std::cout << "[straighten] " << line.toStdString() << std::endl;
-            if (line.startsWith(QStringLiteral("surface_uuid:"))) created_ = line.mid(13).trimmed();
+            if (const QString uuid = vc3d::reportedSurfaceUuid(line); !uuid.isEmpty()) created_ = uuid;
             if (progress_) progress_->setLabelText(line);
             if (handler_) emit handler_->statusMessage(line, 0);
         }
@@ -1120,6 +1129,7 @@ private slots:
         done_ = true;
         if (progress_) progress_->close();
         onStdout_();
+        handleLines_(lines_.finish());
         if (status != QProcess::NormalExit || code != 0 || created_.isEmpty()) {
             const QString msg = QObject::tr("vc_straighten exited with code %1.\nSee the console for details.").arg(code);
             emitFinishedOnce_(false, msg, QString());
@@ -1149,6 +1159,7 @@ private:
     QWidget* parentWidget_ = nullptr;
     QPointer<SegmentationCommandHandler> handler_;
     QString outputName_;
+    vc3d::ToolOutputLines lines_;
     QString created_;
     bool suppressDialogs_ = false;
     bool finishedEmitted_ = false;

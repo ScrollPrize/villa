@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ToolOutput.hpp"
 #include <functional>
 
 #include <QObject>
@@ -190,7 +191,7 @@ private:
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
     // Collects the tool's `surface_uuid:` and `obj:` report lines.
-    void parseReportLines(const QString& output);
+    void parseReportLines(const QStringList& lines);
     void closeLog();
     void finishExecution(bool success,
                          const QString& message,
@@ -266,7 +267,7 @@ private:
     QString _refineDst;
     QStringList _createdSurfaces;
     QString _exportedObj;
-    QString _partialLine;
+    vc3d::ToolOutputLines _outputLines;
 
     // vc_merge_tifxyz parameters
     QString _mergeJsonPath;
