@@ -1,4 +1,6 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/AtomicFile.hpp"
+#include "vc/core/util/Time.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/TriangleVoxelRaster.hpp"
@@ -1312,14 +1314,15 @@ static void writeSparseAttrs(const fs::path& outDir,
     vc::writeZarrAttributes(outDir, attrs);
 }
 
+// The volume's meta.json in `outDir`, named `uuid` (the published directory's name).
 static void writeVolumeMetadata(const fs::path& outDir,
+                               const std::string& uuid,
                                const Shape3& level0Shape,
                                const std::optional<fs::path>& sourceRef,
                                int sourceGroup,
                                double voxelSize,
                                const std::vector<std::string>& sourceSegments,
                                const std::vector<std::string>& sourceMeshes) {
-    const std::string uuid = outDir.filename().string();
     utils::Json meta;
     meta["type"] = "vol";
     meta["uuid"] = uuid;
@@ -1348,6 +1351,8 @@ static void writeVolumeMetadata(const fs::path& outDir,
         meta["source_mesh_count"] = static_cast<int64_t>(
             !sourceSegments.empty() ? sourceSegments.size() : sourceMeshes.size());
     }
+    meta["label_volume"] = "rasterized";
+    meta["rasterized_at"] = vc::core::util::nowIsoUtc();
     meta["rasterizer"] = "vc_tifxyz2zarr_sparse";
 
     const fs::path metaPath = outDir / "meta.json";
@@ -1602,16 +1607,17 @@ int main(int argc, char* argv[])
             throw std::runtime_error("no tifxyz meshes found: " + inputRoot.string());
         }
 
-        if (fs::exists(outRoot)) {
-            if (!overwrite) {
-                throw std::runtime_error("output exists; use --overwrite to replace: " + outRoot.string());
-            }
-            fs::remove_all(outRoot);
+        if (fs::exists(outRoot) && !overwrite) {
+            throw std::runtime_error("output exists; use --overwrite to replace: " + outRoot.string());
         }
+        // Written under a hidden name and published (replacing an overwritten
+        // output) only when complete.
+        vc::core::util::StagedDirectory staged(outRoot);
+        const fs::path& writeRoot = staged.path();
 
         fs::path spoolDir = vm.count("spool-dir")
                               ? vm["spool-dir"].as<std::string>()
-                              : outRoot.string() + "/." + kChunkSuffix;
+                              : writeRoot.string() + "/." + kChunkSuffix;
 
         Shape3 levelShape[1 + kPyramidLevels];
         Shape3 levelChunks[1 + kPyramidLevels];
@@ -1630,11 +1636,10 @@ int main(int argc, char* argv[])
                               std::min(x, chunkSize)};
         }
 
-        fs::create_directories(outRoot);
-        vc::createZarrDataset(outRoot, "0", toVector(levelShape[0]),
+        vc::createZarrDataset(writeRoot, "0", toVector(levelShape[0]),
                               toVector(levelChunks[0]), vc::VcDtype::uint8, "blosc");
         for (size_t l = 1; l <= kPyramidLevels; ++l) {
-            vc::createZarrDataset(outRoot, std::to_string(l), toVector(levelShape[l]),
+            vc::createZarrDataset(writeRoot, std::to_string(l), toVector(levelShape[l]),
                                   toVector(levelChunks[l]), vc::VcDtype::uint8, "blosc");
         }
 
@@ -1690,7 +1695,7 @@ int main(int argc, char* argv[])
         metrics.touchedChunks = touched.size();
 
         const auto materializeStart = std::chrono::steady_clock::now();
-        materializePhase(touched, shape, levelChunks[0], outRoot / "0",
+        materializePhase(touched, shape, levelChunks[0], writeRoot / "0",
                         spool, numThreads, hadError, metricsJson ? &uniqueLevel0Voxels : nullptr);
         metrics.materializeSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - materializeStart).count();
@@ -1712,7 +1717,7 @@ int main(int argc, char* argv[])
             if (verbose) {
                 std::cerr << "[pyramid] building level " << level << "\n";
             }
-            activeTouched = buildIsotropicPyramidLevel(outRoot,
+            activeTouched = buildIsotropicPyramidLevel(writeRoot,
                                                      static_cast<int>(level),
                                                      activeTouched,
                                                      numThreads,
@@ -1731,10 +1736,10 @@ int main(int argc, char* argv[])
         metrics.totalSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - totalStart).count();
 
-        writeSparseAttrs(outRoot, levelShape[0], levelChunks[0],
+        writeSparseAttrs(writeRoot, levelShape[0], levelChunks[0],
                         sourceRef ? &(*sourceRef) : nullptr,
                         sourceGroup, kPyramidLevels);
-        writeVolumeMetadata(outRoot, levelShape[0], sourceRef, sourceGroup,
+        writeVolumeMetadata(writeRoot, outRoot.filename().string(), levelShape[0], sourceRef, sourceGroup,
                            voxelSize, sourceSegments, sourceMeshes);
 
         if (!keepSpool) {
@@ -1742,6 +1747,7 @@ int main(int argc, char* argv[])
                 fs::remove_all(spoolDir);
             }
         }
+        staged.commit();
 
         if (metricsJson) {
             writeMetricsJson(*metricsJson, metrics);

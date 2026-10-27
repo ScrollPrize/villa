@@ -289,8 +289,6 @@ public:
 
 
     // Marks a rasterized label volume and records its source surfaces (UUIDs).
-    bool appendRasterizationMetadata(const QString& outputZarrPath,
-                                   const QStringList& segmentIds) const;
 
 private:
     /** Helper: get current volume path from state */

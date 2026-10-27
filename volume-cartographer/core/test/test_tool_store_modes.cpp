@@ -419,6 +419,13 @@ TEST_CASE("vc_tifxyz2zarr_sparse rasterizes stored surfaces like tifxyz folders"
         ++chunks;
     }
     CHECK(chunks > 0);
+    // The tool publishes the volume whole, named by its directory, as a label volume.
+    const auto meta = nlohmann::json::parse(readFile(f.dir / "store.zarr" / "meta.json"));
+    CHECK(meta.at("uuid") == "store.zarr");
+    CHECK(meta.at("label_volume") == "rasterized");
+    CHECK(meta.at("source_segments") == nlohmann::json::array({f.uuid}));
+    for (const auto& entry : fs::directory_iterator(f.dir))
+        CHECK(entry.path().filename().string().find(".partial-") == std::string::npos);
 }
 
 TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources")

@@ -406,33 +406,6 @@ static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
     return true;
 }
 
-static bool updateVolumeIdentityMetadata(const QString& volumePath)
-{
-    if (volumePath.isEmpty()) {
-        return false;
-    }
-
-    const QDir dir(volumePath);
-    if (!dir.exists()) {
-        return false;
-    }
-
-    const QString volumeId = QFileInfo(dir.path()).fileName();
-    if (volumeId.isEmpty()) {
-        return false;
-    }
-
-    const QString metaPath = dir.filePath(QStringLiteral("meta.json"));
-    QJsonObject meta = readJsonObject(metaPath);
-    if (meta.isEmpty()) {
-        return false;
-    }
-
-    meta.insert(QStringLiteral("uuid"), volumeId);
-    meta.insert(QStringLiteral("name"), volumeId);
-    return writeJsonObject(metaPath, meta);
-}
-
 static bool isRasterizedLabelVolumePath(const QString& volumePath)
 {
     if (volumePath.isEmpty()) {
@@ -3161,17 +3134,10 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         return;
     }
 
-    std::filesystem::path stagedOutputRoot =
-        volumesDir / (".vc3d_rasterize_" + timestamp.toStdString());
-    for (int suffix = 1; std::filesystem::exists(stagedOutputRoot, ec) && suffix < 1000; ++suffix) {
-        stagedOutputRoot = volumesDir /
-            QStringLiteral(".vc3d_rasterize_%1_%2").arg(timestamp).arg(suffix).toStdString();
-    }
-
-    const QString stagedOutputRootStr = QString::fromStdString(stagedOutputRoot.string());
+    // The tool publishes the volume (staged, then renamed) with its meta.json.
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
     QStringList args;
-    args << stagedOutputRootStr
+    args << finalOutputRootStr
          << QStringLiteral("--store") << store->store
          << QStringLiteral("--volume-uuid") << store->volumeUuid
          << QStringLiteral("--reference-zarr")
@@ -3201,8 +3167,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(runner, &CommandLineToolRunner::toolFinished,
                          this,
-                         [this, guard, connection, runner,
-                          stagedOutputRootStr, finalOutputRootStr,
+                         [this, guard, connection, runner, finalOutputRootStr,
                           validIds](CommandLineToolRunner::Tool tool,
                                                   bool success,
                                                   const QString& message,
@@ -3217,43 +3182,14 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
         disconnect(*connection);
 
-        bool finalizeOutput = false;
-        if (!success) {
-            emit statusMessage(tr("Rasterize failed"), 3000);
-        } else if (!appendRasterizationMetadata(stagedOutputRootStr, validIds)) {
-            emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
-            emit statusMessage(tr("Rasterize complete, but metadata update failed"), 5000);
+        // The runner's completion handler reports a failure.
+        if (success) {
+            emit statusMessage(tr("Rasterized %1 segment(s) -> %2")
+                                   .arg(validIds.size())
+                                   .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                               5000);
         } else {
-            std::error_code renameErr;
-            std::filesystem::rename(stagedOutputRootStr.toStdString(), finalOutputRootStr.toStdString(), renameErr);
-            if (renameErr) {
-                emit showWarning(tr("Warning"),
-                                 tr("Rasterization completed, but finalizing output folder failed: %1")
-                                     .arg(QString::fromStdString(renameErr.message())));
-                emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
-            } else {
-                finalizeOutput = true;
-                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
-                    emit showWarning(
-                        tr("Warning"),
-                        tr("Rasterized volume created, but updating meta.json identity failed."));
-                    emit statusMessage(
-                        tr("Rasterized volume created, but metadata update failed -> %1")
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
-                } else {
-                    emit statusMessage(
-                        tr("Rasterized %1 segment(s) -> %2")
-                            .arg(validIds.size())
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
-                }
-            }
-        }
-
-        std::error_code cleanupErr;
-        if (!finalizeOutput) {
-            std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
+            emit statusMessage(tr("Rasterize failed"), 3000);
         }
     });
 
@@ -3261,8 +3197,6 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         QObject::disconnect(*connection);
         QMessageBox::critical(_parentWidget, tr("Error"),
                               tr("Failed to start vc_tifxyz2zarr_sparse."));
-        std::error_code cleanupErr;
-        std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
         return;
     }
 
@@ -3651,35 +3585,14 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         return;
     }
 
+    // An existing output is updated in place; a new one the tool publishes
+    // (staged, then renamed) with its meta.json.
     const bool reuseExistingOutput = outputExists;
-    const bool useStaging = !reuseExistingOutput;
-
-    std::filesystem::path stagedOutputRoot;
-    if (useStaging) {
-        const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
-        stagedOutputRoot = volumesDir / (".vc3d_ignore_" + timestamp.toStdString());
-        for (int idx = 1; std::filesystem::exists(stagedOutputRoot, ec) && idx < 1000; ++idx) {
-            const QString candidate = QStringLiteral(".vc3d_ignore_%1_%2").arg(timestamp).arg(idx);
-            stagedOutputRoot = volumesDir / candidate.toStdString();
-        }
-        if (std::filesystem::exists(stagedOutputRoot, ec)) {
-            QMessageBox::critical(_parentWidget,
-                                  tr("Error"),
-                                  tr("Unable to reserve staging directory after retries: %1")
-                                      .arg(QString::fromStdString(stagedOutputRoot.string())));
-            return;
-        }
-    }
-
-    const QString stagedOutputRootStr = useStaging
-        ? QString::fromStdString(stagedOutputRoot.string())
-        : QString();
     const QString finalOutputRootStr = QString::fromStdString(finalOutputRoot.string());
-    const QString runOutputRootStr = useStaging ? stagedOutputRootStr : finalOutputRootStr;
 
     QStringList args;
     args << params.volumePath
-         << runOutputRootStr
+         << finalOutputRootStr
          << QStringLiteral("--mode") << QStringLiteral("chunk-alpha-wrap")
          << QStringLiteral("--chunk-alpha") << QString::number(params.chunkAlphaL0, 'g', 10)
          << QStringLiteral("--compute-level") << QStringLiteral("0")
@@ -3832,7 +3745,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
                           &CommandLineToolRunner::toolFinished,
                           this,
                           [this, guard, finishConnection, outputConnection, progressDialog,
-                           useStaging, stagedOutputRootStr, finalOutputRootStr]
+                           reuseExistingOutput, finalOutputRootStr]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -3849,58 +3762,14 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         disconnect(*finishConnection);
         disconnect(*outputConnection);
 
-        bool finalized = false;
+        // The runner's completion handler reports a failure.
         if (!success) {
-            if (progressDialog) {
-                progressDialog->close();
-            }
             emit statusMessage(tr("Add ignore label failed"), 3000);
-        } else if (useStaging) {
-            if (progressDialog) {
-                progressDialog->setRange(0, 0);
-                progressDialog->setLabelText(tr("Finalizing output..."));
-            }
-            std::error_code renameErr;
-            std::filesystem::rename(stagedOutputRootStr.toStdString(),
-                                    finalOutputRootStr.toStdString(),
-                                    renameErr);
-            if (renameErr) {
-                emit showWarning(tr("Warning"),
-                                 tr("Ignore label generation completed, but finalizing output folder failed: %1")
-                                     .arg(QString::fromStdString(renameErr.message())));
-                emit statusMessage(tr("Ignore label complete, but finalizing output failed"), 5000);
-            } else {
-                finalized = true;
-                if (!updateVolumeIdentityMetadata(finalOutputRootStr)) {
-                    emit showWarning(
-                        tr("Warning"),
-                        tr("Ignore label volume created, but updating meta.json identity failed."));
-                    emit statusMessage(
-                        tr("Ignore label volume created, but metadata update failed -> %1")
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
-                } else {
-                    emit statusMessage(
-                        tr("Ignore label volume created -> %1")
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
-                }
-            }
         } else {
-            if (progressDialog) {
-                progressDialog->setRange(0, 0);
-                progressDialog->setLabelText(tr("Finishing..."));
-            }
-            finalized = true;
-            emit statusMessage(
-                tr("Ignore label volume updated -> %1")
-                    .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                5000);
-        }
-
-        if (!finalized && useStaging) {
-            std::error_code cleanupErr;
-            std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
+            emit statusMessage((reuseExistingOutput ? tr("Ignore label volume updated -> %1")
+                                                    : tr("Ignore label volume created -> %1"))
+                                   .arg(QDir::toNativeSeparators(finalOutputRootStr)),
+                               5000);
         }
         if (progressDialog) {
             progressDialog->close();
@@ -3916,61 +3785,10 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
         QMessageBox::critical(_parentWidget,
                               tr("Error"),
                               tr("Failed to start vc_add_ignore_label."));
-        if (useStaging) {
-            std::error_code cleanupErr;
-            std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
-        }
         return;
     }
 
     emit statusMessage(tr("Add ignore label started at level 0..."), 0);
-}
-
-bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outputZarrPath,
-                                                           const QStringList& segmentIds) const
-{
-    if (outputZarrPath.isEmpty()) {
-        return false;
-    }
-
-    const QDir outDir(outputZarrPath);
-    if (!outDir.exists()) {
-        return false;
-    }
-
-    const QString metaJsonPath = outDir.filePath(QStringLiteral("meta.json"));
-
-    QJsonObject metaJson = readJsonObject(metaJsonPath);
-    if (metaJson.isEmpty()) {
-        metaJson["type"] = QStringLiteral("vol");
-        metaJson["uuid"] = outDir.dirName();
-        metaJson["name"] = outDir.dirName();
-        metaJson["width"] = 0;
-        metaJson["height"] = 0;
-        metaJson["slices"] = 0;
-        metaJson["voxelsize"] = 0.0;
-        metaJson["min"] = 0.0;
-        metaJson["max"] = 1.0;
-        metaJson["format"] = QStringLiteral("zarr");
-    }
-
-    QJsonArray idArray;
-    for (const QString& id : segmentIds) {
-        idArray.append(id);
-    }
-
-    const QJsonValue rasterizedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-    metaJson.insert(QStringLiteral("label_volume"), QStringLiteral("rasterized"));
-    metaJson.insert(QStringLiteral("source_segments"), idArray);
-    metaJson.insert(QStringLiteral("source_mesh_count"), static_cast<int>(segmentIds.size()));
-    metaJson.insert(QStringLiteral("rasterized_at"), rasterizedAt);
-    metaJson.insert(QStringLiteral("rasterizer"), QStringLiteral("vc_tifxyz2zarr_sparse"));
-
-    if (!writeJsonObject(metaJsonPath, metaJson)) {
-        return false;
-    }
-
-    return true;
 }
 
 // Include the MOC file for Q_OBJECT classes in anonymous namespace
