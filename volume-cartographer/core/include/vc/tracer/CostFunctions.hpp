@@ -154,30 +154,6 @@ struct StraightLoss {
     }
 };
 
-struct StraightLoss2 {
-    StraightLoss2(float w) : _w(w) {};
-    template <typename T>
-    bool operator()(const T* const a, const T* const b, const T* const c, T* residual) const {
-        T avg[3];
-        avg[0] = (a[0]+c[0])*T(0.5);
-        avg[1] = (a[1]+c[1])*T(0.5);
-        avg[2] = (a[2]+c[2])*T(0.5);
-        
-        residual[0] = T(_w)*(b[0]-avg[0]);
-        residual[1] = T(_w)*(b[1]-avg[1]);
-        residual[2] = T(_w)*(b[2]-avg[2]);
-        
-        return true;
-    }
-    
-    float _w;
-    
-    static ceres::CostFunction* Create(float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<StraightLoss2, 3, 3, 3, 3>(new StraightLoss2(w));
-    }
-};
-
 struct StraightLoss2D {
     StraightLoss2D(float w) : _w(w) {};
     template <typename T>
@@ -211,135 +187,6 @@ struct StraightLoss2D {
     {
         return new ceres::AutoDiffCostFunction<StraightLoss2D, 1, 2, 2, 2>(new StraightLoss2D(w));
     }
-};
-
-struct ParamMetricLoss2D {
-    ParamMetricLoss2D(double unit, double du0, double du1, double dv0, double dv1,
-                      double w, double min_area_ratio, double area_w,
-                      double eps_abs, double eps_rel)
-      : _unit(unit),
-        _du0(du0),
-        _du1(du1),
-        _dv0(dv0),
-        _dv1(dv1),
-        _w(w),
-        _min_area_ratio(min_area_ratio),
-        _area_w(area_w),
-        _eps_abs(eps_abs),
-        _eps_rel(eps_rel) {}
-
-    template <typename T>
-    bool operator()(const T* const p,
-                    const T* const pu,
-                    const T* const pv,
-                    T* residual) const
-    {
-        for (int i = 0; i < 2; ++i) {
-            if (!std::isfinite(val(p[i])) || !std::isfinite(val(pu[i])) || !std::isfinite(val(pv[i])) ||
-                val(p[i]) == -1.0 || val(pu[i]) == -1.0 || val(pv[i]) == -1.0) {
-                residual[0] = T(0);
-                residual[1] = T(0);
-                return true;
-            }
-        }
-
-        const T inv_unit = T(1.0) / T(_unit);
-        T eu[2] = { (pu[0]-p[0])*inv_unit, (pu[1]-p[1])*inv_unit };
-        T ev[2] = { (pv[0]-p[0])*inv_unit, (pv[1]-p[1])*inv_unit };
-
-        T a = eu[0]*eu[0] + eu[1]*eu[1];
-        T c = ev[0]*ev[0] + ev[1]*ev[1];
-        T b = eu[0]*ev[0] + eu[1]*ev[1];
-        if (!std::isfinite(val(a)) || !std::isfinite(val(b)) || !std::isfinite(val(c))) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-
-        const T ea = T(_du0 * _du0 + _du1 * _du1);
-        const T ec = T(_dv0 * _dv0 + _dv1 * _dv1);
-        const T eb = T(_du0 * _dv0 + _du1 * _dv1);
-        const T e_det = ea * ec - eb * eb;
-        if (val(e_det) <= 1e-12) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-
-        const T m00 = (ec * a - eb * b) / e_det;
-        const T m11 = (-eb * b + ea * c) / e_det;
-        const T m01 = (ec * b - eb * c) / e_det;
-        const T m10 = (-eb * a + ea * b) / e_det;
-        const T trM = m00 + m11;
-        const T detM = m00 * m11 - m01 * m10;
-        const T det_floor = T(_eps_abs) + T(_eps_rel) * ceres::abs(trM);
-        const T det_safe = detM + det_floor;
-
-        T E = trM + trM / det_safe;
-        if (!std::isfinite(val(E))) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-        residual[0] = T(_w) * (E - T(4.0));
-
-        // loc is stored as [row, col]. A regular cell has negative signed
-        // row/col cross product, so negate it to make the expected area positive.
-        T expected_area = T(std::abs(_du0 * _dv1 - _du1 * _dv0));
-        if (val(expected_area) <= 1e-12) {
-            residual[0] = T(0);
-            residual[1] = T(0);
-            return true;
-        }
-        T signed_area = -(eu[0]*ev[1] - eu[1]*ev[0]) / expected_area;
-        T deficit = T(_min_area_ratio) - signed_area;
-        if (val(deficit) > 0.0)
-            residual[1] = T(_area_w) * deficit;
-        else
-            residual[1] = T(0);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(double unit, double w = 1.0,
-                                       double min_area_ratio = 0.25,
-                                       double area_w = 2.0,
-                                       double eps_abs = 1e-8,
-                                       double eps_rel = 1e-2)
-    {
-        return new ceres::AutoDiffCostFunction<ParamMetricLoss2D, 2, 2, 2, 2>(
-            new ParamMetricLoss2D(unit, 0.0, 1.0, 1.0, 0.0,
-                                  w, min_area_ratio, area_w, eps_abs, eps_rel));
-    }
-
-    static ceres::CostFunction* Create(double unit,
-                                       const cv::Vec2i& du,
-                                       const cv::Vec2i& dv,
-                                       double w = 1.0,
-                                       double min_area_ratio = 0.25,
-                                       double area_w = 2.0,
-                                       double eps_abs = 1e-8,
-                                       double eps_rel = 1e-2)
-    {
-        return new ceres::AutoDiffCostFunction<ParamMetricLoss2D, 2, 2, 2, 2>(
-            new ParamMetricLoss2D(unit,
-                                  static_cast<double>(du[0]),
-                                  static_cast<double>(du[1]),
-                                  static_cast<double>(dv[0]),
-                                  static_cast<double>(dv[1]),
-                                  w, min_area_ratio, area_w, eps_abs, eps_rel));
-    }
-
-    double _unit;
-    double _du0;
-    double _du1;
-    double _dv0;
-    double _dv1;
-    double _w;
-    double _min_area_ratio;
-    double _area_w;
-    double _eps_abs;
-    double _eps_rel;
 };
 
 template<typename T, typename E, int C>
@@ -433,25 +280,6 @@ struct LinChkDistLoss {
 
 };
 
-struct ZCoordLoss {
-    ZCoordLoss(float z, float w) :  _z(z), _w(w) {};
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const {
-        residual[0] = T(_w)*(p[2] - T(_z));
-        
-        return true;
-    }
-    
-    float _z;
-    float _w;
-    
-    static ceres::CostFunction* Create(float z, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<ZCoordLoss, 1, 3>(new ZCoordLoss(z, w));
-    }
-    
-};
-
 template <typename V>
 struct ZLocationLoss {
     ZLocationLoss(const cv::Mat_<V> &m, float z, float w) :  _m(m), _z(z), _w(w) {};
@@ -480,30 +308,6 @@ struct ZLocationLoss {
         return new ceres::AutoDiffCostFunction<ZLocationLoss, 1, 2>(new ZLocationLoss(m, z, w));
     }
     
-};
-
-template <typename T, typename C>
-struct SpaceLossAcc {
-    SpaceLossAcc(Chunked3d<T,C> &t, float w) : _interpolator(std::make_unique<CachedChunked3dInterpolator<T,C>>(t)), _w(w) {};
-    template <typename E>
-    bool operator()(const E* const l, E* residual) const {
-        E v;
-
-        _interpolator->template Evaluate<E>(l[2], l[1], l[0], &v);
-
-        residual[0] = E(_w)*v;
-
-        return true;
-    }
-
-    float _w;
-    std::unique_ptr<CachedChunked3dInterpolator<T,C>> _interpolator;
-
-    static ceres::CostFunction* Create(Chunked3d<T,C> &t, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SpaceLossAcc<T,C>, 1, 3>(new SpaceLossAcc<T,C>(t, w));
-    }
-
 };
 
 template <typename T, typename C>
@@ -1109,33 +913,6 @@ struct NormalConstraintPlane {
         return d.x*d.x+d.y*d.y;
     }
 
-    static float seg_dist_sq(cv::Point2f p1, cv::Point2f p2, cv::Point2f p3, cv::Point2f p4) {
-        auto dot = [](cv::Point2f a, cv::Point2f b) { return a.x * b.x + a.y * b.y; };
-        auto dist_sq = [&](cv::Point2f p) { return p.x * p.x + p.y * p.y; };
-        cv::Point2f u = p2 - p1;
-        cv::Point2f v = p4 - p3;
-        cv::Point2f w = p1 - p3;
-        float a = dot(u, u); float b = dot(u, v); float c = dot(v, v);
-        float d = dot(u, w); float e = dot(v, w); float D = a * c - b * b;
-        float sc, sN, sD = D; float tc, tN, tD = D;
-        if (D < 1e-7) { sN = 0.0; sD = 1.0; tN = e; tD = c; }
-        else { sN = (b * e - c * d); tN = (a * e - b * d);
-            if (sN < 0.0) { sN = 0.0; tN = e; tD = c; }
-            else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
-        }
-        if (tN < 0.0) { tN = 0.0;
-            if (-d < 0.0) sN = 0.0; else if (-d > a) sN = sD;
-            else { sN = -d; sD = a; }
-        } else if (tN > tD) { tN = tD;
-            if ((-d + b) < 0.0) sN = 0.0; else if ((-d + b) > a) sN = sD;
-            else { sN = (-d + b); sD = a; }
-        }
-        sc = (std::abs(sN) < 1e-7 ? 0.0 : sN / sD);
-        tc = (std::abs(tN) < 1e-7 ? 0.0 : tN / tD);
-        cv::Point2f dP = w + (sc * u) - (tc * v);
-        return dist_sq(dP);
-    }
-
     static ceres::CostFunction* Create(const vc::core::util::NormalGridVolume& normal_grid_volume,
                                        int plane_idx,
                                        double w_normal,
@@ -1152,113 +929,6 @@ struct NormalConstraintPlane {
     bool direction_aware_;
 };
 
-
-struct PointCorrectionLoss2P {
-    PointCorrectionLoss2P(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int)
-        : correction_src_(correction_src), correction_tgt_(correction_tgt), grid_loc_int_(grid_loc_int) {}
-
-    template <typename T>
-    bool operator()(const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc, T* residual) const {
-        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int_[0]);
-        T v = grid_loc[1] - T(grid_loc_int_[1]);
-
-        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
-        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
-            residual[0] = T(0.0);
-            residual[1] = T(0.0);
-            return true;
-        }
-
-        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
-        T p_interp[3];
-        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
-        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
-        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
-
-        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
-        T dx_abs = p_interp[0] - T(correction_tgt_[0]);
-        T dy_abs = p_interp[1] - T(correction_tgt_[1]);
-        T dz_abs = p_interp[2] - T(correction_tgt_[2]);
-        residual[0] = T(100)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
-
-        // Residual 2: 3D point-to-line distance from the interpolated point to the line defined by src -> tgt.
-        T p1[3] = {T(correction_src_[0]), T(correction_src_[1]), T(correction_src_[2])};
-        T p2[3] = {T(correction_tgt_[0]), T(correction_tgt_[1]), T(correction_tgt_[2])};
-
-        T v_line[3] = {p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]};
-        T w_line[3] = {p_interp[0] - p1[0], p_interp[1] - p1[1], p_interp[2] - p1[2]};
-
-        T c1 = w_line[0] * v_line[0] + w_line[1] * v_line[1] + w_line[2] * v_line[2];
-        T c2 = v_line[0] * v_line[0] + v_line[1] * v_line[1] + v_line[2] * v_line[2];
-
-        T b = c1 / c2;
-        T pb[3] = {p1[0] + b * v_line[0], p1[1] + b * v_line[1], p1[2] + b * v_line[2]};
-
-        T dx_line = p_interp[0] - pb[0];
-        T dy_line = p_interp[1] - pb[1];
-        T dz_line = p_interp[2] - pb[2];
-
-        residual[1] = T(100)*ceres::sqrt(dx_line * dx_line + dy_line * dy_line + dz_line * dz_line);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int) {
-        return new ceres::AutoDiffCostFunction<PointCorrectionLoss2P, 2, 3, 3, 3, 3, 2>(
-            new PointCorrectionLoss2P(correction_src, correction_tgt, grid_loc_int)
-        );
-    }
-
-private:
-    const cv::Vec3f correction_src_;
-    const cv::Vec3f correction_tgt_;
-    const cv::Vec2i grid_loc_int_;
-};
-
-
-struct PointCorrectionLoss {
-    PointCorrectionLoss(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int)
-    : correction_src_(correction_src), correction_tgt_(correction_tgt), grid_loc_int_(grid_loc_int) {}
-
-    template <typename T>
-    bool operator()(const T* const p00, const T* const p01, const T* const p10, const T* const p11, const T* const grid_loc, T* residual) const {
-        // Calculate the local coordinates (u,v) within the quad by subtracting the integer grid location.
-        T u = grid_loc[0] - T(grid_loc_int_[0]);
-        T v = grid_loc[1] - T(grid_loc_int_[1]);
-
-        // If the grid location is outside this specific quad (i.e., u,v not in [0,1]), this loss is zero.
-        if (u < T(0.0) || u >= T(1.0) || v < T(0.0) || v >= T(1.0)) {
-            residual[0] = T(0.0);
-            return true;
-        }
-
-        // Bilinear interpolation to find the 3D point on the surface patch corresponding to the grid location.
-        T p_interp[3];
-        p_interp[0] = (T(1) - u) * (T(1) - v) * p00[0] + u * (T(1) - v) * p10[0] + (T(1) - u) * v * p01[0] + u * v * p11[0];
-        p_interp[1] = (T(1) - u) * (T(1) - v) * p00[1] + u * (T(1) - v) * p10[1] + (T(1) - u) * v * p01[1] + u * v * p11[1];
-        p_interp[2] = (T(1) - u) * (T(1) - v) * p00[2] + u * (T(1) - v) * p10[2] + (T(1) - u) * v * p01[2] + u * v * p11[2];
-
-        // Residual 1: 3D Euclidean distance between the interpolated point and the target correction point.
-        T dx_abs = p_interp[0] - T(correction_tgt_[0]);
-        T dy_abs = p_interp[1] - T(correction_tgt_[1]);
-        T dz_abs = p_interp[2] - T(correction_tgt_[2]);
-        residual[0] = T(100)*ceres::sqrt(dx_abs * dx_abs + dy_abs * dy_abs + dz_abs * dz_abs);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(const cv::Vec3f& correction_src, const cv::Vec3f& correction_tgt, const cv::Vec2i& grid_loc_int) {
-        return new ceres::AutoDiffCostFunction<PointCorrectionLoss, 1, 3, 3, 3, 3, 2>(
-            new PointCorrectionLoss(correction_src, correction_tgt, grid_loc_int)
-        );
-    }
-
-private:
-    const cv::Vec3f correction_src_;
-    const cv::Vec3f correction_tgt_;
-    const cv::Vec2i grid_loc_int_;
-};
 
 struct PointsCorrectionLoss {
     PointsCorrectionLoss(std::vector<cv::Vec3f> tgts, std::vector<cv::Vec2f> grid_locs, cv::Vec2i grid_loc_int, double w)
