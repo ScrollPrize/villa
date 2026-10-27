@@ -1602,24 +1602,15 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
                   << " outputName=" << rootName.toStdString() << "_off<N>" << std::endl;
     }
 
+    // The point collections go by UUID: the service reads them from the store.
     if (state && state->pointCollection()) {
         const auto& cols = state->pointCollection()->getAllCollections();
         if (!cols.empty()) {
-            utils::Json corrJson;
-            utils::Json colsJson = utils::Json::object();
-            for (const auto& [cid, col] : cols) {
-                utils::Json colJson;
-                to_json(colJson, col);
-                colsJson[std::to_string(cid)] = colJson;
-            }
-            corrJson["collections"] = colsJson;
-            QJsonDocument corrDoc = QJsonDocument::fromJson(
-                QByteArray::fromStdString(corrJson.dump()));
-            if (corrDoc.isObject()) {
-                config[QStringLiteral("corr_points")] = corrDoc.object();
-                std::cerr << "[lasagna] injected " << cols.size()
-                          << " point collection(s) as corr_points" << std::endl;
-            }
+            state->savePointCollections();
+            QJsonArray uuids;
+            for (const auto& [cid, col] : cols) uuids.append(QString::fromStdString(col.uuid));
+            config[QStringLiteral("corr_point_collections")] = uuids;
+            std::cerr << "[lasagna] sending " << cols.size() << " point collection(s) by UUID" << std::endl;
         }
     }
 

@@ -95,6 +95,9 @@ public:
 
     // --- Collections ---
     VCCollection* pointCollection() const;
+    // Write pending point-collection edits to the store now: the volume's,
+    // and (through pointCollectionsSaveRequested) the open surface's corrections.
+    void savePointCollections();
 
     bool debugDownloadQueueEnabled() const { return _debugDownloadQueue; }
 
@@ -128,6 +131,7 @@ signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
     // An umbilicus was committed, or a store was attached or detached.
     void umbilicusChanged();
+    void pointCollectionsSaveRequested();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void focusBoundsChanged();
     void surfacesLoaded();

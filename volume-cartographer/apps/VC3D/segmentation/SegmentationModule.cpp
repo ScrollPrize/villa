@@ -212,6 +212,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
+        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
     }
 
     if (_pointCollection) {

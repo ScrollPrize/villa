@@ -468,6 +468,12 @@ void CState::clearActiveSurface()
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
 
+void CState::savePointCollections()
+{
+    if (_pointCollectionSync) _pointCollectionSync->flush();
+    emit pointCollectionsSaveRequested();
+}
+
 void CState::closeAll()
 {
     emit volumeClosing();
