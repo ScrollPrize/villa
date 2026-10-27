@@ -407,13 +407,10 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
         return launch;
     }
     launch.args = buildArguments(tool);
-    // vc_tifxyz2obj takes its store options first, in fixed positions.
-    if (tool != Tool::tifxyz2obj) {
-        launch.store = _storePath;
-        launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
-                        : tool == Tool::MergePatch ? QString()
-                                                   : _volumeUuid;
-    }
+    launch.store = _storePath;
+    launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
+                    : tool == Tool::MergePatch ? QString()
+                                               : _volumeUuid;
     return launch;
 }
 
@@ -479,10 +476,8 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             break;
 
         case Tool::tifxyz2obj:
-            args << "--store" << _storePath
-                 << "--surface" << _surfaceUuid
-                 << _objPath
-                 << QStringLiteral("--volume-uuid=%1").arg(_volumeUuid);
+            args << "--surface" << _surfaceUuid
+                 << "--name" << _objPath;
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
             break;

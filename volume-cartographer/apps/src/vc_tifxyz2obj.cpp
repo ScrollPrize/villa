@@ -6,7 +6,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
@@ -265,30 +265,29 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
 
 int main(int argc, char *argv[])
 {
-    if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+    const auto usage = [&] {
         std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n"
-                  << "       " << argv[0] << " --store <store> --surface <uuid> <obj-name> [options]\n"
+                  << "       " << argv[0] << " --store <store> --surface <uuid> --name <obj-name> [--volume-uuid <id>] [options]\n"
                   << "  store mode writes the OBJ into the surface's artifact directory and prints obj: <path>\n"
-                  << "  --volume-uuid=<id> : store mode: export in that volume's voxels, through the store's view of the surface\n"
+                  << "  --volume-uuid <id> : store mode: export in that volume's voxels, through the store's view of the surface\n"
                   << "  --normalize-uv : Normalize UVs to [0,1] range\n"
                   << "  --align-grid   : Align grid Z only (flatten Z per row)\n"
                   << "  --keep=<p>     : Percent of source points to keep (1..100). 100 = no decimation. One pass; stride = round(1/sqrt(p/100)).\n"
                   << "  --clean [K]    : Remove outlier points far from surface using robust distance threshold; K is sigma multiplier (default 5.0)\n"
                   << "  --inpaint      : Fill isolated invalid cells via Ceres-smoothness solve before emitting OBJ. Off by default.\n"
                   << "  --no-inpaint   : Legacy alias (inpaint is off by default now).\n";
+    };
+    if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+        usage();
         return EXIT_SUCCESS;
     }
 
-    // Store mode: --store PATH --surface UUID NAME, then the same options.
-    const bool store_mode = argc > 1 && std::string(argv[1]) == "--store";
-    if (store_mode && (argc < 6 || std::string(argv[3]) != "--surface")) {
-        std::cerr << "error: store mode is --store <store> --surface <uuid> <obj-name> [options]\n";
-        return EXIT_FAILURE;
-    }
-    const int first_option = store_mode ? 6 : 3;
-    if (argc < 3) {
-    std::cerr << "error: too few arguments\n"
-                  << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n";
+    std::vector<std::string> args(argv + 1, argv + argc);
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::take(args, {.surfaces = true, .creates = false, .named = true});
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << "\n";
         return EXIT_FAILURE;
     }
 
@@ -298,11 +297,11 @@ int main(int argc, char *argv[])
     float clean_sigma_k = 5.0f; // default K
     float keep_percent = 100.0f; // 100 = no decimation
     bool inpaint_holes = false;
-    std::optional<std::string> volume_uuid; // store mode: export in this volume's voxels
+    std::vector<std::string> positional;
 
     // Parse optional arguments
-    for (int i = first_option; i < argc; ++i) {
-        std::string arg = argv[i];
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
         if (arg == "--normalize-uv") {
             normalize_uv = true;
         } else if (arg == "--align-grid") {
@@ -319,8 +318,6 @@ int main(int argc, char *argv[])
                 std::cerr << "error: --keep needs a numeric percent\n";
                 return EXIT_FAILURE;
             }
-        } else if (store_mode && arg.rfind("--volume-uuid=", 0) == 0) {
-            volume_uuid = arg.substr(14);
         } else if (arg == "--inpaint") {
             inpaint_holes = true;
         } else if (arg == "--no-inpaint") {
@@ -328,11 +325,10 @@ int main(int argc, char *argv[])
         } else if (arg == "--clean") {
             clean_surface = true;
             // Optional numeric K argument following --clean
-            if (i + 1 < argc) {
-                std::string next = argv[i + 1];
+            if (i + 1 < args.size()) {
                 try {
                     // Allow floats (e.g., 3, 3.5)
-                    float k = std::stof(next);
+                    float k = std::stof(args[i + 1]);
                     if (std::isfinite(k) && k >= 0.0f) {
                         clean_sigma_k = k;
                         ++i; // consume K
@@ -341,31 +337,40 @@ int main(int argc, char *argv[])
                     // Next token is not a number; keep default K
                 }
             }
-        } else {
+        } else if (arg.rfind("--", 0) == 0) {
             std::cerr << "error: unknown option '" << arg << "'\n";
             return EXIT_FAILURE;
+        } else {
+            positional.push_back(arg);
         }
+    }
+    if (store_options ? !positional.empty() || store_options->surfaces.size() != 1 || !store_options->name
+                      : positional.size() != 2) {
+        std::cerr << "error: give <tiffxyz> <obj>, or --store with one --surface and --name\n";
+        usage();
+        return EXIT_FAILURE;
     }
 
     std::unique_ptr<QuadSurface> surf;
     std::filesystem::path obj_path;
-    if (store_mode) {
-        const std::filesystem::path name = argv[5];
+    if (store_options) {
+        const std::filesystem::path name = *store_options->name;
+        const auto& uuid = store_options->surfaces.front();
         if (name.has_parent_path() || name.empty()) {
-            std::cerr << "error: <obj-name> is a file name inside the artifact directory\n";
+            std::cerr << "error: --name is a file name inside the artifact directory\n";
             return EXIT_FAILURE;
         }
         try {
-            StoreSurfaces store(argv[2], "vc_tifxyz2obj");
-            surf = store.load(argv[4], true, volume_uuid);
-            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), argv[4]) / name;
+            StoreSurfaces store(store_options->store, "vc_tifxyz2obj");
+            surf = store.load(uuid, true, store_options->volume);
+            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid) / name;
         } catch (const std::exception& error) {
-            std::cerr << "error when loading " << argv[4] << ": " << error.what() << std::endl;
+            std::cerr << "error when loading " << uuid << ": " << error.what() << std::endl;
             return EXIT_FAILURE;
         }
     } else {
-        const std::filesystem::path seg_path = argv[1];
-        obj_path = argv[2];
+        const std::filesystem::path seg_path = positional[0];
+        obj_path = positional[1];
         try {
             surf = load_quad_from_tifxyz(seg_path);
         }
@@ -376,7 +381,7 @@ int main(int argc, char *argv[])
     }
 
     surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
-    if (store_mode) std::cout << "obj: " << obj_path.string() << std::endl;
+    if (store_options) std::cout << "obj: " << obj_path.string() << std::endl;
 
     return EXIT_SUCCESS;
 }

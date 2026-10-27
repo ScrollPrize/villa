@@ -97,7 +97,7 @@ TEST_CASE("vc_tifxyz2obj writes the OBJ into the surface's artifact directory")
     Fixture f;
     const auto bin = tool("VC_TIFXYZ2OBJ_BIN");
     run(bin + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "file.obj").string() + "\" --normalize-uv", f.dir / "file.log");
-    const auto output = run(bin + " " + f.storeArgs() + " mesh.obj --normalize-uv", f.dir / "store.log");
+    const auto output = run(bin + " " + f.storeArgs() + " --name mesh.obj --normalize-uv", f.dir / "store.log");
     const auto stored = fs::path(f.store.string() + ".artifacts") / f.uuid / "mesh.obj";
     CHECK(output.find("obj: " + stored.string()) != std::string::npos);
     CHECK(readFile(stored) == readFile(f.dir / "file.obj"));
@@ -115,8 +115,8 @@ TEST_CASE("vc_tifxyz2obj with --volume-uuid exports through the store's view of 
         txn.commit();
     }
     const auto bin = tool("VC_TIFXYZ2OBJ_BIN");
-    run(bin + " " + f.storeArgs() + " full.obj", f.dir / "full.log");
-    run(bin + " " + f.storeArgs() + " half.obj --volume-uuid=half", f.dir / "half.log");
+    run(bin + " " + f.storeArgs() + " --name full.obj", f.dir / "full.log");
+    run(bin + " " + f.storeArgs() + " --name half.obj --volume-uuid=half", f.dir / "half.log");
     const auto artifacts = fs::path(f.store.string() + ".artifacts") / f.uuid;
     auto firstVertex = [](const fs::path& obj) {
         std::ifstream in(obj);
