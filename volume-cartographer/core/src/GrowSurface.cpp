@@ -10,6 +10,7 @@
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/GridIsometry.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
@@ -3558,6 +3559,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     vc::surface::storeAreaMeta(surf->meta,
                                static_cast<double>(area_est_vx2),
                                static_cast<double>(voxelsize));
+    vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
     surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
     if (resume_growth) {
         const int offset_col = grid_margin + expanded_left - used_area.x;

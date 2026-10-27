@@ -2,9 +2,11 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/GridIsometry.hpp"
 #include <opencv2/opencv.hpp>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -83,6 +85,7 @@ int main(int argc, char* argv[]) {
         ("rotate,r", po::value<float>(), "Rotate the point grid by a given angle in degrees.")
         ("resample,s", po::value<float>(), "Resample the surface by a scale factor (>1 increases density)")
         ("smooth", po::value<int>()->implicit_value(1), "Laplacian smooth the whole tifxyz grid for the given iterations (default: 1)")
+        ("isometry", "Compute the grid isometry block and write it into the segment's meta.json (backfill for an existing segment); the coordinate TIFFs are left untouched. Can be combined with a transform, in which case the block is written with the transformed surface")
         ("interpolation,i", po::value<std::string>()->default_value("bilinear"),
          "Interpolation method: nearest, bilinear (default), cubic, lanczos")
         ("paths,p", po::value<std::vector<std::string>>()->multitoken(), "Path arguments (currently unused).");
@@ -96,14 +99,14 @@ int main(int argc, char* argv[]) {
         po::store(po::command_line_parser(argc, argv).options(desc).positional(p).run(), vm);
 
         if (vm.count("help")) {
-            std::cout << "usage: " << argv[0] << " <tifxyz> [-r/--rotate angle_deg] [-s/--resample factor] [--smooth [iterations]] [-i/--interpolation method]\n" << desc << std::endl;
+            std::cout << "usage: " << argv[0] << " <tifxyz> [-r/--rotate angle_deg] [-s/--resample factor] [--smooth [iterations]] [--isometry] [-i/--interpolation method]\n" << desc << std::endl;
             return EXIT_SUCCESS;
         }
 
         po::notify(vm);
     } catch (const po::error &e) {
         std::cerr << "ERROR: " << e.what() << std::endl << std::endl;
-        std::cerr << "usage: " << argv[0] << " <tifxyz> [-r/--rotate angle_deg] [-s/--resample factor] [--smooth [iterations]] [-i/--interpolation method]\n" << desc << std::endl;
+        std::cerr << "usage: " << argv[0] << " <tifxyz> [-r/--rotate angle_deg] [-s/--resample factor] [--smooth [iterations]] [--isometry] [-i/--interpolation method]\n" << desc << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -113,8 +116,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Require at least one operation
-    if (!vm.count("rotate") && !vm.count("resample") && !vm.count("smooth")) {
-        std::cerr << "Error: At least one operation (--rotate, --resample, or --smooth) must be specified." << std::endl;
+    if (!vm.count("rotate") && !vm.count("resample") && !vm.count("smooth") && !vm.count("isometry")) {
+        std::cerr << "Error: At least one operation (--rotate, --resample, --smooth, or --isometry) must be specified." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -189,13 +192,54 @@ int main(int argc, char* argv[]) {
         suffix += "_smooth" + std::to_string(iterations);
     }
 
+    const bool has_transform = vm.count("resample") || vm.count("rotate") || vm.count("smooth");
+
+    if (surf->meta.is_null()) {
+        surf->meta = utils::Json::object();
+    }
+
+    if (vm.count("isometry") && has_transform) {
+        // Grid isometry block (#2279): how close the grid is to the step its
+        // meta.json scale promises. Written next to the area the writers store.
+        vc::surface::storeIsometryMeta(surf->meta, *surf);
+    }
+
+    if (!has_transform) {
+        // Backfill only: write the block into the existing meta.json and leave every
+        // other field (and all of x/y/z.tif) exactly as it was, so published segments
+        // can be stamped in place. save_meta() is deliberately not used: it rewrites
+        // `scale` through the surface's float32 copy, which would perturb the very
+        // step this block is measured against.
+        const auto meta_path = input_path / "meta.json";
+        utils::Json on_disk = utils::Json::parse_file(meta_path);
+        if (!on_disk.is_object()) {
+            on_disk = utils::Json::object();
+        }
+        vc::surface::storeIsometryMeta(on_disk, *surf);
+
+        const auto tmp_path = input_path / "meta.json.tmp";
+        {
+            std::ofstream o(tmp_path);
+            o << on_disk.dump(4) << std::endl;
+            if (!o) {
+                std::cerr << "Error: failed to write metadata: " << tmp_path << std::endl;
+                return EXIT_FAILURE;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, meta_path, ec);
+        if (ec) {
+            std::cerr << "Error: failed to replace " << meta_path << ": " << ec.message() << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::cout << "Updated grid isometry in: " << meta_path << std::endl;
+        return EXIT_SUCCESS;
+    }
+
     std::filesystem::path output_path = input_path.parent_path() / (input_path.stem().string() + suffix + input_path.extension().string());
 
     // Recalculate and update the surface area
     double area = vc::surface::computeSurfaceAreaVox2(surf->rawPoints());
-    if (surf->meta.is_null()) {
-        surf->meta = utils::Json::object();
-    }
     surf->meta["area"] = area;
 
     surf->saveAsNew(output_path, true);
