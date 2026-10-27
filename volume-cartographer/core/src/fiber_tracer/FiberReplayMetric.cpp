@@ -121,12 +121,6 @@ bool fiberReplayThresholdExceeded(
     return measurement.thresholdErrorBaseVoxels > normalThresholdBaseVoxels;
 }
 
-double fiberReplayTangentialThresholdBaseVoxels(
-    double normalThresholdBaseVoxels)
-{
-    return tangentialThreshold(normalThresholdBaseVoxels);
-}
-
 void validateFiberReplayThresholdMeasurement(
     const FiberReplayThresholdMeasurement& measurement,
     double normalThresholdBaseVoxels)

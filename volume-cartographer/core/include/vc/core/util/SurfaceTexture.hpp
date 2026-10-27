@@ -1,7 +1,5 @@
 #pragma once
 
-#include <filesystem>
-
 #include <opencv2/core/mat.hpp>
 
 class Volume;
@@ -15,8 +13,5 @@ namespace vc::core::util
     int textureLevel,
     int renderScale,
     const char* label);
-
-void writeUncompressedTextureTiff(
-    const std::filesystem::path& path, const cv::Mat& image);
 
 }  // namespace vc::core::util

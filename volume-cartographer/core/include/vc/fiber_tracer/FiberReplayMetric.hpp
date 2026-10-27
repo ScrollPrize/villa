@@ -41,9 +41,6 @@ struct FiberReplayThresholdMeasurement {
     const FiberReplayThresholdMeasurement& measurement,
     double normalThresholdBaseVoxels);
 
-[[nodiscard]] double fiberReplayTangentialThresholdBaseVoxels(
-    double normalThresholdBaseVoxels);
-
 void validateFiberReplayThresholdMeasurement(
     const FiberReplayThresholdMeasurement& measurement,
     double normalThresholdBaseVoxels);

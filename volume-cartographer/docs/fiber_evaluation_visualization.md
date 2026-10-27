@@ -15,11 +15,8 @@ They do not publish an evaluation bundle or start subprocesses.
   sections. Section centers map back to actual traced-line points; restart gaps
   are never interpolated into a continuous path. Breakoff/restart sections are
   retained even for singleton segments without longitudinal strips.
-- `writeFiberletCropBoxVisualization` (in
-  `vc/fiber_tracer/FiberletCropVisualization.hpp`) writes six CT TIFFs, six
-  textured OBJ faces and one MTL for a base-coordinate bounding box.
 
-All line and box coordinates are **base-volume XYZ voxels**. Normal and prediction
+All line coordinates are **base-volume XYZ voxels**. Normal and prediction
 samplers have their own declared working-to-base scale. Texture callbacks receive
 XYZ coordinates in the selected CT array's lattice, not in base coordinates.
 `validateFiberReplayStripCtVolume` accepts one local, concrete uint8 OME-Zarr
@@ -72,14 +69,12 @@ const auto inspection = vc::fiber_tracer::renderFiberReplayInspection(
     source, ct, presence, normalThresholdBaseVoxels, reverse, baseVoxelSizeUm);
 ```
 
-Create the output directory, then save `inspection.pages` using OpenCV or
-`writeUncompressedTextureTiff`, and save `inspection.metadata` as JSON.
+Create the output directory, then save `inspection.pages` using OpenCV and
+`inspection.metadata` as JSON.
 Pages are BGR images. JSON records page/row/column placements, reference arcs
 (base voxels and millimetres), original trace positions, section frames, and
 restart identities. This mapping is intended for interactive inspection;
-it is not a new evaluation score. The crop-face writer expects an existing
-output directory and uses base-coordinate mesh vertices, allowing overlays
-with the crop tracer's `pointsBaseXYZ` lines without rescaling.
+it is not a new evaluation score.
 
 ## Verification
 
@@ -92,16 +87,3 @@ ctest --test-dir build -R '^test_fiber_replay_visualization$' --output-on-failur
 
 The tests cover anisotropic transforms, metric ellipses, inverse strip mapping,
 restart gaps/singletons, modality alignment, pagination, and invalid CT sources.
-The optional real-data case reads these environment variables:
-
-- `LASAGNA_TEST_VOLUME`: concrete local uint8 CT array.
-- `VC_TEST_GRAPH_NORMALS`, `VC_TEST_GRAPH_PREDICTIONS`: normal/prediction manifests.
-- `VC_TEST_WIDTH_FIBER`: VC3D JSON reference fiber.
-- `VC_TEST_REPLAY_VIS_OUTPUT`: writable artifact directory.
-
-The real fixture expects Paris4 CT level 1 (base-to-array scale 0.5) and samples
-the first 128 base voxels of the reference. Prediction/normal working scale is 8.
-It runs a short CPU beam replay, verifies exact CT/presence coordinate equality,
-repeated image/metadata equality, nonempty data, and six correctly sized crop
-textures. This tests rendering integration, not trace accuracy or a speedup.
-No data, generated images or experiment runners are distributed with the API.
