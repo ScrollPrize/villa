@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Quality checks for a directory of VC3D fiber annotations.
+"""Quality checks for VC3D fibers.
 
-Reads vc3d_fiber JSON files (as written by VC3D's line annotation and synced
-by vc_sync.py) and reports, without changing any file:
+Reads native fiber JSON (`vc3d_fiber` files, as `vc_object_ingest --fiber`
+takes and `vc_object_export` writes, or a `vc3d_fiber_collection` file), or
+every active fiber of an object store, and reports, without changing
+anything:
 
-- load: what an unmodified VC3D would refuse or rewrite on load (control
-  points off the line, broken or one-sided links), via fiber_loader_check.
+- read: a file that is not readable JSON, a fiber without line_points or
+  control_points, or the same fiber (UUID, or file name for files without
+  one) given twice.
 - fold_back: the saved line reverses direction (a hairpin), usually where a
   trace overshot a control point and came back.
 - retrace: the saved line runs back over its own path for some length, so
   the fiber's length and any training target built from it count that
   stretch twice.
 - jump: one step of the saved line is far longer than its usual spacing.
-- duplicate: two fibers run along the same path for most of their length;
-  vc_sync's hfsync skips fibers tagged `possible_duplicate` by default, and
-  this lists the pairs that do not carry the tag yet.
+- duplicate: two fibers run along the same path for most of their length.
 - ends: fiber ends with no `kollesis_termination` or `break` tag (summary
   only; fiber evaluation scores length past such an end as unknown).
 
-Distances are in the files' own coordinate units (voxels of the volume the
+Distances are in the fibers' own coordinate units (voxels of the volume the
 fibers were drawn on). Run `python fiber_qa.py --help` for options; see
 volume-cartographer/docs/fiber_qa.md for what each check means.
 """
@@ -30,9 +31,8 @@ import sys
 
 import numpy as np
 
-from fiber_loader_check import loader_issues
-
 FIBER_TYPE = 'vc3d_fiber'
+COLLECTION_TYPE = 'vc3d_fiber_collection'
 DUPLICATE_TAG = 'possible_duplicate'
 END_TAGS = ('kollesis_termination', 'break')
 
@@ -56,43 +56,113 @@ def control_point_position(value):
     return value.get('position') if isinstance(value, dict) else value
 
 
-def load_fibers(paths):
-    """Return ({basename: doc}, [problems]) for every *.json under paths.
+def fiber_identity(name, doc):
+    """The store's identity: the UUID, else the file name (as ingest does)."""
+    uuid = doc.get('uuid')
+    return str(uuid).lower() if uuid else 'file:' + name
 
-    A file that does not parse, or is not a vc3d_fiber document, becomes a
-    problem instead of a fiber. Two files with the same basename in
-    different directories are reported, since links name fibers by basename.
+
+def read_json(path, name, problems):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        problems.append(finding(name, 'read', 'error',
+                                f'cannot read JSON: {exc}'))
+        return None
+
+
+def documents_in(root, problems):
+    """(file name, fiber document) pairs of a directory or a single file."""
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            if name.endswith('.json'):
+                doc = read_json(os.path.join(root, name), name, problems)
+                if isinstance(doc, dict) and doc.get('type') == FIBER_TYPE:
+                    yield name, doc
+        return
+    name = os.path.basename(root)
+    doc = read_json(root, name, problems)
+    if not isinstance(doc, dict):
+        return
+    if doc.get('type') == FIBER_TYPE:
+        yield name, doc
+    elif doc.get('type') == COLLECTION_TYPE:
+        # Members are named as an export would name their files.
+        for member in doc.get('point_collections') or []:
+            if isinstance(member, dict):
+                yield f"{member.get('uuid', '')}.json", member
+    else:
+        problems.append(finding(name, 'read', 'error',
+                                'not a vc3d_fiber or vc3d_fiber_collection '
+                                'document'))
+
+
+def load_fibers(paths):
+    """Return ({file name: doc}, [problems]) for the fibers under paths.
+
+    A file that does not parse becomes a problem instead of a fiber; other
+    JSON in a directory is skipped. The same fiber given twice is reported
+    once and checked once.
     """
-    docs, where, problems = {}, {}, []
+    docs, seen, problems = {}, {}, []
     for root in paths:
-        names = ([os.path.basename(root)] if os.path.isfile(root)
-                 else sorted(os.listdir(root)))
-        base = os.path.dirname(root) if os.path.isfile(root) else root
-        for name in names:
-            if not name.endswith('.json'):
-                continue
-            path = os.path.join(base, name)
-            try:
-                with open(path, encoding='utf-8') as handle:
-                    doc = json.load(handle)
-            except (OSError, ValueError) as exc:
-                problems.append(finding(name, 'load', 'error',
-                                        f'cannot read JSON: {exc}'))
-                continue
-            if not isinstance(doc, dict) or doc.get('type') != FIBER_TYPE:
-                continue
+        for name, doc in documents_in(root, problems):
             if (not isinstance(doc.get('line_points'), list) or
                     not isinstance(doc.get('control_points'), list)):
-                problems.append(finding(name, 'load', 'error',
+                problems.append(finding(name, 'read', 'error',
                                         'missing line_points or control_points'))
                 continue
-            if name in docs:
+            identity = fiber_identity(name, doc)
+            if identity in seen or name in docs:
                 problems.append(finding(
-                    name, 'load', 'error',
-                    f'same file name in {where[name]} and {base}; links '
-                    'cannot tell them apart'))
+                    name, 'read', 'error',
+                    f'the same fiber or file name is also given as {seen.get(identity, name)} '
+                    f'(in {root}); it is checked once'))
                 continue
-            docs[name], where[name] = doc, base
+            docs[name], seen[identity] = doc, root
+    return docs, problems
+
+
+def load_store(path):
+    """Read every active fiber of an object store, opened read only.
+
+    Needs the store's Python package (vc_object_store). Each fiber's current
+    line_points and control_points arrays and its per-control-point
+    annotations (tags) are read as an exported file would carry them; the
+    store's tags stand for the fiber's tags. Fibers are keyed as their
+    exported files would be named, UUID.json.
+    """
+    try:
+        from vc_object_store import ObjectStore
+    except ImportError as exc:
+        raise SystemExit('--store needs the vc_object_store Python package '
+                         f'(see vc_object_store/README.md): {exc}')
+    docs, problems = {}, []
+    with ObjectStore.open(str(path), read_only=True) as store:
+        for record in store.objects_by_kind('fiber'):
+            name = record['uuid'] + '.json'
+            revision = store.current_geometry(record['uuid'])['uuid']
+            try:
+                line, cps = (np.frombuffer(
+                    store.read_geometry_array(revision, array), '<f8'
+                ).reshape(-1, 3) for array in ('line_points', 'control_points'))
+            except (RuntimeError, ValueError) as exc:
+                problems.append(finding(name, 'read', 'error',
+                                        f'cannot read its geometry: {exc}'))
+                continue
+            notes = store.geometry_point_annotations(revision, 'control_points')
+            notes = notes if isinstance(notes, list) else []
+            docs[name] = {
+                'type': FIBER_TYPE, 'uuid': record['uuid'],
+                'name': record.get('name') or '',
+                'tags': list(record.get('tags') or []),
+                'line_points': line.tolist(),
+                'control_points': [
+                    dict(notes[i] if i < len(notes) and isinstance(notes[i], dict)
+                         else {}, position=list(p))
+                    for i, p in enumerate(cps.tolist())],
+            }
     return docs, problems
 
 
@@ -357,10 +427,6 @@ def duplicate_findings(docs, opts):
 
 def run_checks(docs, checks, opts):
     out = []
-    if 'load' in checks:
-        for issue in loader_issues(docs):
-            name, _, detail = issue.partition(': ')
-            out.append(finding(name, 'load', 'error', detail))
     for name, doc in docs.items():
         if 'shape' in checks:
             out.extend(shape_findings(name, doc, opts))
@@ -368,6 +434,13 @@ def run_checks(docs, checks, opts):
             out.extend(end_findings(name, doc))
     if 'duplicate' in checks:
         out.extend(duplicate_findings(docs, opts))
+    for f in out:
+        name = (docs.get(f['file']) or {}).get('name')
+        if name:
+            f['name'] = name
+        other = (docs.get(f.get('other')) or {}).get('name')
+        if other:
+            f['other_name'] = other
     out.sort(key=lambda f: (SEVERITY_ORDER[f['severity']], f['check'],
                             f['file'], f.get('line_index', -1)))
     return out
@@ -401,21 +474,28 @@ def print_report(summary, findings, show_info, out=None):
                      f"{f['arclength']}, near control point "
                      f"{f['control_point']}) {f['position']}")
         if f['check'] == 'duplicate':
-            place = f" with {f['other']}"
-        print(f"{f['severity'].upper():7} {f['check']:9} {f['file']}: "
+            place = f" with {f['other']}" + (
+                f" ({f['other_name']})" if f.get('other_name') else '')
+        label = f['file'] + (f" ({f['name']})" if f.get('name') else '')
+        print(f"{f['severity'].upper():7} {f['check']:9} {label}: "
               f"{f['detail']}{place}", file=out)
 
 
-ALL_CHECKS = ('load', 'shape', 'duplicate', 'ends')
+ALL_CHECKS = ('shape', 'duplicate', 'ends')
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description='Check VC3D fiber annotation files for load errors, '
-                    'fold-backs, retraced stretches, jumps and duplicates. '
-                    'Reads only; never changes a file.')
-    parser.add_argument('paths', nargs='+',
-                        help='fiber directories (or single fiber JSON files)')
+        description='Check VC3D fibers for fold-backs, retraced stretches, '
+                    'jumps, duplicates and unexplained ends. Reads only; '
+                    'never changes a file or a store.')
+    parser.add_argument('paths', nargs='*',
+                        help='folders of native fiber JSON, single fiber '
+                             'files or vc3d_fiber_collection files')
+    parser.add_argument('--store',
+                        help='an object store (.vcobj): check every active '
+                             'fiber in it (needs the vc_object_store Python '
+                             'package; opened read only)')
     parser.add_argument('--checks', default=','.join(ALL_CHECKS),
                         help='comma-separated subset of: '
                              + ', '.join(ALL_CHECKS))
@@ -443,8 +523,21 @@ def main(argv=None):
     if unknown:
         print(f"unknown check(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
+    if not args.paths and not args.store:
+        print('give fiber files or folders, or --store', file=sys.stderr)
+        return 2
     opts = {key: getattr(args, key) for key in DEFAULTS}
     docs, problems = load_fibers(args.paths)
+    if args.store:
+        stored, store_problems = load_store(args.store)
+        for name, doc in stored.items():
+            if name in docs:
+                problems.append(finding(name, 'read', 'error',
+                                        'given both as a file and in --store; '
+                                        'checked once'))
+            else:
+                docs[name] = doc
+        problems += store_problems
     findings = problems + run_checks(docs, checks, opts)
     summary = summarize(docs, findings)
     if args.json_out:

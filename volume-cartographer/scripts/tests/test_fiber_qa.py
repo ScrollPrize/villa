@@ -8,7 +8,6 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import fiber_merge
 import fiber_qa
 
 
@@ -164,47 +163,7 @@ def test_untagged_ends_reported_as_info():
     assert [(f['end'], f['severity']) for f in found] == [('end', 'info')]
 
 
-def test_load_check_reports_a_one_sided_link(tmp_path):
-    a = fiber(straight(40), name='a.json')
-    b = fiber(straight(40, start=(1160.0, 1900.0, 3000.0),
-                       direction=(0.0, 1.0, 0.0)), name='b.json')
-    pa = a['control_points'][2]['position']
-    pb = b['control_points'][1]['position']
-    entry = {
-        'control_point_index': 2, 'branch_fiber_id': 2,
-        'branch_control_point_index': 1, 'branch_file': 'b.json',
-        'control_point_direction': fiber_merge.endpoint_tangent(
-            a['line_points'], pa),
-        'branch_control_point_direction': fiber_merge.endpoint_tangent(
-            b['line_points'], pb),
-        'control_point_position': list(pa),
-        'branch_control_point_position': list(pb), 'pending': True,
-    }
-    a['branches'] = [entry]
-    for doc in (a, b):
-        (tmp_path / doc['filename']).write_text(json.dumps(doc))
-    docs, problems = fiber_qa.load_fibers([str(tmp_path)])
-    assert problems == []
-    found = fiber_qa.run_checks(docs, ['load'], opts())
-    assert len(found) == 1
-    assert found[0]['severity'] == 'error'
-    assert 'missing reciprocal branch' in found[0]['detail']
-    # With the reciprocal entry written, the pair loads cleanly.
-    back = copy.deepcopy(entry)
-    back.update({
-        'control_point_index': 1, 'branch_control_point_index': 2,
-        'branch_file': 'a.json',
-        'control_point_direction': entry['branch_control_point_direction'],
-        'branch_control_point_direction': entry['control_point_direction'],
-        'control_point_position': entry['branch_control_point_position'],
-        'branch_control_point_position': entry['control_point_position'],
-    })
-    b['branches'] = [back]
-    assert fiber_qa.run_checks({'a.json': a, 'b.json': b}, ['load'],
-                               opts()) == []
-
-
-def test_load_fibers_reports_bad_json_and_skips_other_types(tmp_path):
+def test_read_reports_bad_json_and_skips_other_types(tmp_path):
     (tmp_path / 'broken.json').write_text('{"type": ')
     (tmp_path / 'notes.json').write_text('{"type": "something_else"}')
     (tmp_path / 'readme.txt').write_text('hello')
@@ -212,7 +171,106 @@ def test_load_fibers_reports_bad_json_and_skips_other_types(tmp_path):
     (tmp_path / 'good.json').write_text(json.dumps(good))
     docs, problems = fiber_qa.load_fibers([str(tmp_path)])
     assert list(docs) == ['good.json']
-    assert [p['file'] for p in problems] == ['broken.json']
+    assert [(p['file'], p['check']) for p in problems] == [
+        ('broken.json', 'read')]
+
+
+def v4(doc, uuid, name):
+    out = copy.deepcopy(doc)
+    out.update({'version': 4, 'uuid': uuid, 'name': name})
+    out.pop('filename', None)
+    return out
+
+
+def test_same_uuid_in_two_folders_is_read_once(tmp_path):
+    doc = v4(fiber(straight(20)), '0b5c7a4e-0000-4000-8000-000000000001', 'f1')
+    for folder in ('one', 'two'):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / (doc['uuid'] + '.json')).write_text(json.dumps(doc))
+    other = dict(doc, uuid='0b5c7a4e-0000-4000-8000-000000000002')
+    (tmp_path / 'two' / 'renamed.json').write_text(json.dumps(other))
+    docs, problems = fiber_qa.load_fibers(
+        [str(tmp_path / 'one'), str(tmp_path / 'two')])
+    assert sorted(docs) == [doc['uuid'] + '.json', 'renamed.json']
+    assert [p['check'] for p in problems] == ['read']
+
+
+def test_collection_file_members_are_read(tmp_path):
+    a = v4(fiber(wavy(300)), '0b5c7a4e-0000-4000-8000-00000000000a', 'long')
+    b = v4(fiber([[x + 2.0, y - 1.0, z] for x, y, z in wavy(200)]),
+           '0b5c7a4e-0000-4000-8000-00000000000b', 'short')
+    path = tmp_path / 'collection.json'
+    path.write_text(json.dumps({'type': 'vc3d_fiber_collection', 'version': 1,
+                                'point_collections': [a, b]}))
+    docs, problems = fiber_qa.load_fibers([str(path)])
+    assert problems == []
+    assert sorted(docs) == [a['uuid'] + '.json', b['uuid'] + '.json']
+    found = fiber_qa.run_checks(docs, ['duplicate'], opts())
+    assert [(f['file'], f['name']) for f in found] == [
+        (b['uuid'] + '.json', 'short')]
+
+
+def test_store_fibers_are_exported_read_only(tmp_path, monkeypatch, capsys):
+    """--store opens the store read only and checks every exported fiber."""
+    out_leg = straight(60)
+    back_leg = straight(30, start=out_leg[-1], direction=(-1.0, 0.3, 0.0))[1:]
+    stored = {u: v4(fiber(line), u, n) for u, n, line in (
+        ('0b5c7a4e-0000-4000-8000-0000000000c1', 'hairpin', out_leg + back_leg),
+        ('0b5c7a4e-0000-4000-8000-0000000000c2', 'clean', wavy(200)))}
+    clean = stored['0b5c7a4e-0000-4000-8000-0000000000c2']
+    clean['control_points'][0]['tags'] = ['kollesis_termination']
+    calls = []
+
+    class Store:
+        @classmethod
+        def open(cls, path, read_only=False):
+            calls.append(('open', path, read_only))
+            return cls()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def objects_by_kind(self, kind):
+            calls.append(('kind', kind))
+            return [{'uuid': u, 'name': d['name'], 'tags': []}
+                    for u, d in stored.items()]
+
+        def current_geometry(self, uuid):
+            return {'uuid': 'rev-' + uuid}
+
+        def read_geometry_array(self, revision, array):
+            doc = stored[revision[4:]]
+            points = (doc['line_points'] if array == 'line_points' else
+                      [cp['position'] for cp in doc['control_points']])
+            return np.asarray(points, '<f8').tobytes()
+
+        def geometry_point_annotations(self, revision, array):
+            assert array == 'control_points'
+            return [{k: v for k, v in cp.items() if k != 'position'}
+                    for cp in stored[revision[4:]]['control_points']]
+
+    module = type(sys)('vc_object_store')
+    module.ObjectStore = Store
+    monkeypatch.setitem(sys.modules, 'vc_object_store', module)
+    report = tmp_path / 'report.json'
+    assert fiber_qa.main(['--store', 'fibers.vcobj', '--json', str(report)]) == 0
+    assert calls[:2] == [('open', 'fibers.vcobj', True), ('kind', 'fiber')]
+    payload = json.loads(report.read_text())
+    assert payload['summary']['fibers'] == 2
+    folds = [f for f in payload['findings'] if f['check'] == 'fold_back']
+    assert [f['name'] for f in folds] == ['hairpin']
+    assert 'hairpin' in capsys.readouterr().out
+    # The control point tags come through the store's point annotations.
+    ends = [(f['name'], f['end']) for f in payload['findings']
+            if f['check'] == 'ends']
+    assert ('clean', 'start') not in ends and ('clean', 'end') in ends
+
+
+def test_no_input_is_a_usage_error():
+    assert fiber_qa.main([]) == 2
 
 
 def test_cli_writes_json_and_exit_code(tmp_path, capsys):
