@@ -16,6 +16,8 @@ if ROOT not in sys.path:
 
 try:
 	from vc_object_store import ObjectStore
+	from vc_object_store.documents import attached_document
+	from vc_object_store.surfaces import create_surface
 except ImportError:  # pragma: no cover - the store bindings are an optional dependency
 	ObjectStore = None
 
@@ -86,7 +88,7 @@ class StoredSurfaceReadTest(unittest.TestCase):
 			xyz = np.full((1, 3, 3), 30.0, "<f4")
 			xyz[0, 0] = (5, -1, 30)
 			xyz[0, 1] = (6, 7, 0)
-			uid = stored_surfaces.create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
+			uid = create_surface(store, xyz, name="s", scale=1.0, volume=VOLUME, tool="test")
 			surface = stored_surfaces.read_surface(store, stored_surfaces.surface_ref(uid), volume=VOLUME)
 			self.assertEqual(surface.xyz[0, 0].tolist(), [-1.0, -1.0, -1.0])
 			self.assertEqual(surface.xyz[0, 1].tolist(), [6.0, 7.0, 0.0])
@@ -128,15 +130,6 @@ def _checkpoint(source_uuid: str) -> dict:
 	}
 
 
-def _attached(db, surface_uuid: str) -> dict[str, tuple[dict, list]]:
-	out = {}
-	for collection in db.neighbours(surface_uuid, edge_kind="attachment"):
-		record = db.object(collection)
-		annotations = db.geometry_point_annotations(db.current_geometry(collection)["uuid"], "points")
-		out[record["meta"]["role"]] = (record, annotations)
-	return out
-
-
 @unittest.skipIf(ObjectStore is None, "vc_object_store is not importable")
 class StoredExportTest(unittest.TestCase):
 	def test_export_creates_a_sourced_surface_with_attached_results_and_model_artifact(self) -> None:
@@ -166,14 +159,12 @@ class StoredExportTest(unittest.TestCase):
 
 				# Results hang off the surface as attached data, never as graph links.
 				self.assertEqual(db.neighbours(surface_uuid), [])
-				attached = _attached(db, surface_uuid)
-				corr_record, corr_points = attached[fit2tifxyz.CORR_RESULTS_ROLE]
-				atlas_record, atlas_points = attached[fit2tifxyz.ATLAS_RESULTS_ROLE]
-			self.assertEqual(corr_record["meta"]["source"]["document"], {"collection_avgs": {"7": 0.25}})
-			self.assertEqual([p["point_id"] for p in corr_points], [1, 2])
-			self.assertEqual(corr_points[0]["winding_err"], 0.25)
-			self.assertEqual(atlas_record["meta"]["source"]["list_key"], "records")
-			self.assertEqual(atlas_points[0]["target_xyz"], [1.0, 2.0, 3.0])
+			corr = attached_document(store, surface_uuid, fit2tifxyz.CORR_RESULTS_ROLE)
+			atlas = attached_document(store, surface_uuid, fit2tifxyz.ATLAS_RESULTS_ROLE)
+			self.assertEqual(corr["collection_avgs"], {"7": 0.25})
+			self.assertEqual([p["point_id"] for p in corr["points_list"]], [1, 2])
+			self.assertEqual(corr["points_list"][0]["winding_err"], 0.25)
+			self.assertEqual(atlas["records"][0]["target_xyz"], [1.0, 2.0, 3.0])
 
 			artifacts = Path(str(store) + ".artifacts") / surface_uuid
 			self.assertEqual((artifacts / "model.pt").read_bytes(), ckpt.read_bytes())
@@ -228,7 +219,7 @@ class ServiceStoreRequestTest(unittest.TestCase):
 			self.assertEqual(shared.store_uuid, fit_service._store.store_uuid)
 			self.assertEqual(shared.artifact_directory(self.source), fit_service._store.artifact_directory(self.source))
 			shared.sync()  # the owning session syncs; nothing to wait for here
-			created = stored_surfaces.create_surface(
+			created = create_surface(
 				shared.path, np.zeros((2, 2, 3), np.float32), name="written", scale=1.0, volume=VOLUME, tool="test")
 		finally:
 			shared.close()

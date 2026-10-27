@@ -316,7 +316,8 @@ def _write_atlas_control_results(written: _Written, results: dict | None, store:
 		return
 	# fibers regroups the records; readers rebuild it from them.
 	document = {key: value for key, value in results.items() if key != "fibers"}
-	stored_surfaces.attach_results(
+	from vc_object_store.documents import attach_document
+	attach_document(
 		store.session.path, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
 		position_key="target_xyz", name="atlas control points results", volume=store.volume,
 		author=store.session.author)
@@ -331,7 +332,8 @@ def _write_corr_points_results(written: _Written, results: dict | None, store: _
 		return
 	document = {key: value for key, value in results.items() if key != "points"}
 	document["points_list"] = _corr_points_result_list(results)
-	stored_surfaces.attach_results(
+	from vc_object_store.documents import attach_document
+	attach_document(
 		store.session.path, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
 		position_key="p", name="correction points results", volume=store.volume, author=store.session.author)
 
@@ -1094,7 +1096,8 @@ def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, 
 		meta["atlas_control_points_results"].pop("path", None)
 	channels = {Path(key).stem: value for key, value in channels.items()}
 	name = name[:-len(".tifxyz")] if name.endswith(".tifxyz") else name
-	surface_uuid = stored_surfaces.create_surface(
+	from vc_object_store.surfaces import create_surface
+	surface_uuid = create_surface(
 		store.session.path, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
 		meta=meta, channels=channels, tags=store.tags, author=store.session.author)
 	store.created.append(surface_uuid)

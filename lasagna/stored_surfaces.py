@@ -6,20 +6,18 @@ separately (``--store`` / ``--volume-uuid``). Geometry is a ``points`` array (ro
 missing vertex), an optional ``valid`` array and per-vertex channels (``d``, ``approval``, ...), as VC3D stores
 surfaces; coordinates are bound to a volume by ``meta.coordinates`` ({volume_uuid, scale_factor}).
 
-Fit results attached to a surface (correspondence and atlas-control results) are point collections with a record
-meta ``role`` hanging off the surface by an ``attachment`` relationship: data on the surface, never graph links.
+Surfaces are created with ``vc_object_store.surfaces.create_surface``; fit results (correspondence and
+atlas-control results) are attached to them with ``vc_object_store.documents.attach_document``.
 """
 from __future__ import annotations
 
 import getpass
-import math
 import uuid as uuidlib
 from pathlib import Path
 
 import numpy as np
 
 REF_PREFIX = "vcobj:"
-INVALID = -1.0
 
 
 def surface_ref(surface_uuid: str, geometry_revision: str | None = None) -> str:
@@ -111,52 +109,3 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSu
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
 	return StoredSurface(store, surface_uuid, read_grid(store, surface_uuid, volume=volume, geometry_revision=revision))
-
-
-def create_surface(store: str | Path, xyz: np.ndarray, *, name: str, scale: float, volume: str, tool: str,
-				   parameters: dict | None = None, sources: list[str] | tuple[str, ...] = (),
-				   meta: dict | None = None, channels: dict[str, np.ndarray] | None = None,
-				   tags: list[str] | tuple[str, ...] = (), author: str | None = None) -> str:
-	"""A new surface holding ``xyz`` ((H, W, 3) in voxels of ``volume``; non-finite or -1 vertices are missing),
-	bound to ``volume``, with per-vertex ``channels`` and provenance {tool, parameters, sources}. Returns its
-	UUID."""
-	from vc_object_store.surfaces import create_surface as create_grid
-	return create_grid(store, xyz, name=name, scale=scale, volume=volume, tool=tool, parameters=parameters,
-					   sources=sources, meta=meta, channels=channels, tags=tags,
-					   author=author or getpass.getuser())
-
-
-def _position(value: object) -> list[float]:
-	if isinstance(value, (list, tuple)) and len(value) >= 3:
-		try:
-			xyz = [float(value[0]), float(value[1]), float(value[2])]
-		except (TypeError, ValueError):
-			return [INVALID] * 3
-		if all(math.isfinite(v) for v in xyz):
-			return xyz
-	return [INVALID] * 3
-
-
-def attach_results(store: str | Path, surface_uuid: str, document: dict, *, role: str, list_key: str,
-				   position_key: str, name: str, volume: str, author: str | None = None) -> str:
-	"""Store a results document (records under ``list_key``, each positioned by ``position_key``) as a point
-	collection attached to the surface: one point per record (-1 when the record has no finite position) whose
-	annotation is the record, and the rest of the document in meta.source. Returns the collection's UUID."""
-	records = [r for r in document.get(list_key, []) if isinstance(r, dict)]
-	from vc_object_store import PointCollection
-	points = [list(_position(r.get(position_key))) for r in records]
-	collection_uuid = str(uuidlib.uuid4())
-	rest = {key: value for key, value in document.items() if key != list_key}
-	record = dict(uuid=collection_uuid, kind="point_collection", name=name,
-				  meta=dict(role=role, coordinates=dict(volume_uuid=str(volume), scale_factor=1),
-							source=dict(document=rest, list_key=list_key, position_key=position_key,
-										point_attributes=records)))
-	geometry = PointCollection(list(range(len(records))), points)
-	with open_store(store, read_only=False, author=author) as db:
-		surface_revision = db.current_object_revision(surface_uuid)
-		with db.write(expected_revisions={collection_uuid: None,
-										  surface_uuid: surface_revision["uuid"] if surface_revision else None}) as tx:
-			tx.upsert_object(record)
-			tx.put_geometry(collection_uuid, geometry)
-			tx.attach(collection_uuid, surface_uuid, role)
-	return collection_uuid
