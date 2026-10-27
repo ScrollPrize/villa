@@ -99,10 +99,6 @@ class _VolumeRecord:
         return f'_VolumeRecord({self.long_id or self.id!r})'
 
     @property
-    def scan(self) -> Scan | None:
-        return self.sample.scans.get(self.scan_id) if self.scan_id else None
-
-    @property
     def is_superseded(self) -> bool:
         return self.superseded_by_id is not None
 
@@ -139,7 +135,6 @@ class _SampleRecord:
         p = self.properties = native.properties
         self.type: str | None = native.type or None
         self.display_name: str | None = p.get('description')
-        self.legacy_data_url: str | None = p.get('legacy_data_url')
         self.aliases: tuple[str, ...] = tuple((a for a, sid in COMMUNITY_ALIASES.items() if sid == self.id))
         self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
         self.scans: dict[str, Scan] = {v.id: Scan(self, v) for v in native.scans}
@@ -166,12 +161,6 @@ class _SampleRecord:
         result = self.catalog._native.transform(self.id, _volume_id(from_volume), _volume_id(to_volume))
         return None if result is None else Affine.from_rows(result['matrix'], result['derivation_path'])
 
-    def same_frame(self, a: _VolumeRecord | str, b: _VolumeRecord | str) -> bool:
-        """True if ``a`` and ``b`` are the same volume or one supersedes the other."""
-        a, b = (_volume_id(a), _volume_id(b))
-        va, vb = (self.volumes.get(a), self.volumes.get(b))
-        return a == b or bool(va and va.superseded_by_id == b) or bool(vb and vb.superseded_by_id == a)
-
 class Catalog:
 
     def __init__(self, data: Mapping[str, Any], source: str | None=None):
@@ -179,7 +168,6 @@ class Catalog:
         data = self._native.raw
         self.raw = data
         self.source = source
-        self.schema_url: str | None = data.get('$schema')
         self.models: dict[str, Model] = {v.id: Model(v) for v in self._native.models}
         self._samples: dict[str, _SampleRecord] = {v.id: _SampleRecord(self, v) for v in self._native.samples}
         self._names = SampleNameIndex()
@@ -199,10 +187,6 @@ class Catalog:
             cache = os.fspath((_fetch.default_cache_dir() if cache_dir is None else __import__('pathlib').Path(cache_dir)) /
                               ('metadata-' + hashlib.sha256(src.encode()).hexdigest()[:16] + '.json'))
         return cls(_catalog.load(src, cache, refresh, max_age, timeout), source=src)
-
-    @classmethod
-    def from_file(cls, path: str | os.PathLike[str]) -> Catalog:
-        return cls(_catalog.load(os.fspath(path)), source=os.fspath(path))
 
     def __reduce__(self):
         return (Catalog, (self.raw, self.source))

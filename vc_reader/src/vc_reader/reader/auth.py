@@ -84,12 +84,6 @@ class S3Credentials:
     region: str | None = None
     endpoint_url: str | None = None
 
-    @classmethod
-    def from_environment(cls, profile: str | None = None) -> S3Credentials | None:
-        """A snapshot of the credentials ``auth="aws"`` would use (``profile`` overrides ``AWS_PROFILE``), or None."""
-        source = _AwsSource(profile)
-        return source.current()
-
 
 def _config_sections(path: Path) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None, strict=False)

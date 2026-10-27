@@ -7,7 +7,7 @@ Matrices retain float64 coefficients from the published registrations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 from . import _catalog
 
 Row = tuple[float, float, float, float]
@@ -52,9 +52,6 @@ class Affine:
     def apply(self, point: Sequence[float]) -> Point:
         return tuple(_catalog.affine_apply(self.matrix, tuple(point)))
 
-    def apply_many(self, points: Iterable[Sequence[float]]) -> list[Point]:
-        return [tuple(p) for p in _catalog.affine_apply_many(self.matrix, list(points))]
-
     def __matmul__(self, other: Affine) -> Affine:
         if not isinstance(other, Affine):
             return NotImplemented
@@ -63,12 +60,3 @@ class Affine:
     def inverse(self) -> Affine:
         return Affine.from_rows(_catalog.affine_inverse(self.matrix))
 
-    def to_numpy(self):
-        """The 3x4 matrix as a float64 ``numpy.ndarray`` (requires numpy)."""
-        import numpy as np
-
-        return np.array(self.matrix, dtype=np.float64)
-
-    def to_homogeneous(self) -> list[list[float]]:
-        """The 4x4 homogeneous matrix as nested lists."""
-        return [list(r) for r in self.matrix] + [[0.0, 0.0, 0.0, 1.0]]

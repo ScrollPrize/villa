@@ -70,11 +70,6 @@ _PYRAMID_GRID_LEVEL: dict[str, int | None] = {
 }
 
 
-def pyramid_sublevel(grid_level: int | None, volume_level: int) -> int | None:
-    """Catalog-convention sublevel; negative means finer than the artifact."""
-    return None if grid_level is None else volume_level - grid_level
-
-
 def join_url(root: str, path: str) -> str:
     return _catalog.join_url(root, path)
 
@@ -177,11 +172,6 @@ class Artifact:
     def path(self) -> str | None:
         """Path of the first origin (relative to its access root)."""
         return self.origins[0].path if self.origins else None
-
-    @property
-    def is_directory(self) -> bool:
-        """True for prefix artifacts (zarr stores, tifxyz folders, bundles)."""
-        return bool(self.path and self.path.endswith("/"))
 
     @property
     def target_volume_id(self) -> str | None:

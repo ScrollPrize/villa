@@ -229,7 +229,7 @@ class PublishedLabelMappingTests(unittest.TestCase):
         from pathlib import Path
         fixture = Path(__file__).resolve().parent / 'fixtures/training/catalog.json'
         with patch('urllib.request.urlopen', side_effect=AssertionError('metadata browsing requested I/O')):
-            c = Catalog.from_file(fixture)
+            c = Catalog.load(fixture, use_cache=False)
             label = c.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
             surface_volume = label.surface_volumes.zarr()
             self.assertEqual(surface_volume.artifact_kind, 'layers-zarr')

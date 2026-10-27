@@ -293,14 +293,6 @@ class ZarrGroup:
     def __iter__(self) -> Iterator[str]:
         return iter(self.keys())
 
-    def array_keys(self) -> list[str]:
-        """Names of immediate child arrays, sorted; same listing limits as keys()."""
-        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "array"]
-
-    def group_keys(self) -> list[str]:
-        """Names of immediate child groups, sorted; same listing limits as keys()."""
-        return [key for key in self.keys() if (node := self._node(key)) is not None and node[0] == "group"]
-
     def _list_s3(self) -> list[str]:
         """Immediate sub-prefixes of this group's S3 prefix (ListObjectsV2)."""
         from ..artifacts import to_s3

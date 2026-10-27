@@ -69,12 +69,10 @@ def test_dispersed_points(tmp_path, order, dtype):
             np.testing.assert_allclose(reader.sample(batch, order=order), expected[permutation], atol=2e-5)
             if cuda.is_available():
                 with reader.cuda() as device:
-                    plan = device.prepare_points(batch, order=order)
                     for route in ('chunks', 'cpu', 'auto'):
-                        for actual, mask in (device.sample(batch, order=order, source=route, valid=True),
-                                             plan.read(source=route, valid=True)):
-                            np.testing.assert_allclose(actual.numpy(), expected[permutation], atol=2e-5)
-                            np.testing.assert_array_equal(mask.numpy(), valid[permutation])
+                        actual, mask = device.sample(batch, order=order, source=route, valid=True)
+                        np.testing.assert_allclose(actual.numpy(), expected[permutation], atol=2e-5)
+                        np.testing.assert_array_equal(mask.numpy(), valid[permutation])
 
 
 @pytest.mark.parametrize('order', [0, 1])

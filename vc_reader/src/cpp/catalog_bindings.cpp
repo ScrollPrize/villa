@@ -105,7 +105,6 @@ NB_MODULE(_catalog,m) {
         });metadata(catalog);
     m.def("parse",[](const std::string& text){return parseOpenDataManifest(text);});
     m.def("parse_artifacts",[](const nb::object& entries){return parseCatalogArtifacts(json(entries));});
-    m.def("read_file",[](const std::string& path){return pyJson(nlohmann::json::parse(readCatalogFile(path)));});
     m.def("load",[](const std::string& source,const std::string& cache,bool refresh,double age,double timeout){
         CatalogLoadResult result;
         {nb::gil_scoped_release release;result=loadCatalog(source,{cache,refresh,age,timeout});}
@@ -119,10 +118,5 @@ NB_MODULE(_catalog,m) {
     });
     m.def("affine_inverse",[](const nb::object& rows){return pyJson(Affine::fromJson(json(rows)).inverse().json());});
     m.def("affine_compose",[](const nb::object& a,const nb::object& b){return pyJson((Affine::fromJson(json(a))*Affine::fromJson(json(b))).json());});
-    m.def("affine_apply_many",[](const nb::object& rows,std::vector<std::array<double,3>> points){
-        const auto matrix=Affine::fromJson(json(rows));
-        {nb::gil_scoped_release release;for(auto& point:points)point=matrix.apply(point);}
-        return points;
-    });
     m.def("affine_apply",[](const nb::object& rows,const std::array<double,3>& point){return Affine::fromJson(json(rows)).apply(point);});
 }
