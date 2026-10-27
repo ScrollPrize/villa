@@ -116,6 +116,20 @@ int main() try
             hits[0].hit.point == committedHits[0].hit.point && hits[0].hit.distance == committedHits[0].hit.distance,
             "a draft is found exactly where its stored geometry is");
 
+    // A tilted plane reaches every tile by its bounding box; both cut the same.
+    RegionSlice oblique;
+    oblique.origin = {10, 15, 10};
+    const double c = std::sqrt(0.5);
+    oblique.u = {c, 0, -c};
+    oblique.v = {0, 1, 0};
+    oblique.normal = {c, 0, c};
+    oblique.localBounds = {-100, -100, -0.5, 100, 100, 0.5};
+    session.clearDraft(stored);
+    const auto storedTilted = runsOf(session.geometryRegion(order, oblique, surfaces()));
+    session.setDraft(stored, tilted(0), coordinates, attachment);
+    require(!storedTilted.empty() && sameRuns(runsOf(session.geometryRegion(order, oblique, surfaces())), storedTilted),
+            "tilted cuts agree");
+
     // The draft replaces the stored geometry: lift it out of the slab.
     session.setDraft(stored, tilted(5), coordinates, attachment);
     drafted = runsOf(session.geometryRegion(order, slice, surfaces()));

@@ -147,7 +147,7 @@ bool draftRegion(const std::string& uuid, const SurfaceDraft& draft, const Draft
             request.poll();
             ++result.stats.candidateVisits;
             const auto& rect = tile.rect;
-            if (rect.rows < 2 || rect.columns < 2) continue;
+            if (rect.rows < 2 || rect.columns < 2 || !cut.reaches(*tile.bounds)) continue;
             result.stats.segmentTests += cut.add(tile.data->tile, rect.row, rect.column, rect.rows, rect.columns);
         }
         cut.pieces([&](int64_t segment, bool continues, const auto& start, const auto& end) {

@@ -42,6 +42,25 @@ SurfaceCut::SurfaceCut(const RegionSlice& view, const std::optional<VolumeAffine
     : view_(view), toTarget_(toTarget), columns_(columns),
       planeOffset_((view.localBounds[2] + view.localBounds[5]) / 2) {}
 
+bool SurfaceCut::reaches(const std::array<double, 6>& box) const
+{
+    bool below = false, above = false;
+    double magnitude = 1;
+    std::array<double, 8> distances;
+    for (int corner = 0; corner < 8; ++corner) {
+        Point p{box[corner & 1 ? 3 : 0], box[corner & 2 ? 4 : 1], box[corner & 4 ? 5 : 2]};
+        if (toTarget_) p = toTarget_->apply(p);
+        for (const double x : p) magnitude = std::max(magnitude, std::abs(x));
+        distances[corner] = normalDistance(view_, p) - planeOffset_;
+    }
+    const double margin = 1e-9 * magnitude;
+    for (const double d : distances) {
+        above |= d >= -margin;
+        below |= d < margin;
+    }
+    return above && below;
+}
+
 // The slot of `edge` (open addressing: no allocation per edge), and whether it was just added.
 std::pair<size_t, bool> SurfaceCut::insert(const GridEdge& edge)
 {

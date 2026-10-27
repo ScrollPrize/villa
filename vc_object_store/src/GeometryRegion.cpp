@@ -189,17 +189,23 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     // (SurfaceCut), clipped to u/v.
     // Every surface tile in the slab, by object in row/column order: one R-tree
     // search per query instead of scanning each surface's tiles.
-    std::optional<std::map<int64_t, std::vector<std::array<int64_t, 4>>>> surfaceTiles;
-    auto tilesOf = [&](int64_t id) -> const std::vector<std::array<int64_t, 4>>& {
+    struct Tile { int64_t row, column, rows, columns; Bounds box; };
+    std::optional<std::map<int64_t, std::vector<Tile>>> surfaceTiles;
+    auto tilesOf = [&](int64_t id) -> const std::vector<Tile>& {
         if (!surfaceTiles) {
             surfaceTiles.emplace();
-            Statement tiles(db, "SELECT b.object_id,b.row_start,b.col_start,b.row_count,b.col_count FROM spatial_regions_rtree r "
+            Statement tiles(db, "SELECT b.object_id,b.row_start,b.col_start,b.row_count,b.col_count,"
+                "b.min_x,b.min_y,b.min_z,b.max_x,b.max_y,b.max_z FROM spatial_regions_rtree r "
                 "CROSS JOIN spatial_regions b ON b.id=r.id WHERE b.array_name='points' AND " + spatialOverlapSql() +
                 " ORDER BY b.object_id,b.row_start,b.col_start");
             for (int i = 0; i < 6; ++i) tiles.bind(i + 1, bounds[i]);
-            while (tiles.row()) (*surfaceTiles)[tiles.i64(0)].push_back({tiles.i64(1), tiles.i64(2), tiles.i64(3), tiles.i64(4)});
+            while (tiles.row()) {
+                Tile tile{tiles.i64(1), tiles.i64(2), tiles.i64(3), tiles.i64(4), {}};
+                for (int i = 0; i < 6; ++i) tile.box[i] = tiles.f64(5 + i);
+                (*surfaceTiles)[tiles.i64(0)].push_back(tile);
+            }
         }
-        static const std::vector<std::array<int64_t, 4>> none;
+        static const std::vector<Tile> none;
         const auto found = surfaceTiles->find(id);
         return found == surfaceTiles->end() ? none : found->second;
     };
@@ -211,9 +217,9 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
         if (arrays.at("points").at("dtype") != kind.dtype) throw std::runtime_error("surface coordinates must be <f4");
         SurfaceCut cut(view, options.toTarget, shape.at(1));
-        for (const auto& [row0, col0, rows, cols] : tilesOf(id)) {
+        for (const auto& [row0, col0, rows, cols, box] : tilesOf(id)) {
             requestWork(&RegionStats::candidateVisits);
-            if (rows < 2 || cols < 2) continue;
+            if (rows < 2 || cols < 2 || !cut.reaches(box)) continue;
             result.stats.segmentTests += cut.add(surfaceTile(reader, row0, col0, rows, cols), row0, col0, rows, cols);
         }
         bool hit = false;

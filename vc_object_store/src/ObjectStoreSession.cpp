@@ -510,6 +510,19 @@ bool admits(const std::optional<std::vector<std::string>>& uuids, const std::str
 {
     return !uuids || std::any_of(uuids->begin(), uuids->end(), [&](const auto& u) { return util::canonicalUuid(u) == uuid; });
 }
+// A volume target places a draft from another volume through registrations.
+bool needsTransforms(const detail::SurfaceDraft& draft, const std::optional<std::string>& volume)
+{
+    const auto& source = draft.coordinates.at("volume_uuid");
+    return volume && !(source.is_string() && source.get<std::string>() == *volume);
+}
+// Every object a query asks for is drafted: the stores have nothing to add.
+template <class Drafts>
+bool onlyDrafts(const std::optional<std::vector<std::string>>& uuids, const Drafts& drafts)
+{
+    return uuids && std::all_of(uuids->begin(), uuids->end(),
+                                [&](const auto& u) { return drafts.contains(util::canonicalUuid(u)); });
+}
 }
 
 std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector<AttachmentIdentity>& order,
@@ -518,7 +531,8 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
     const auto drafts = options.kind == "surface" ? this->drafts() : Drafts{};
     std::vector<AttachedRegion> result;
     std::vector<AttachmentIdentity> earlier;
-    for (const auto& attachment : order) {
+    const bool stored = !(options.kind == "surface" && onlyDrafts(options.uuids, drafts));
+    for (const auto& attachment : stored ? order : std::vector<AttachmentIdentity>{}) {
         RegionResult region;
         read(attachment, [&](const auto& store, const auto& txn, const auto&) {
             region = store.geometryRegion(txn, slice, options, cancel);
@@ -545,7 +559,8 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
         const auto& [uuid, draft] = *entry;
         if (!admits(options.uuids, uuid)) continue;
         const auto placement = detail::placeDraft(*draft, options.coordinates, options.volume, options.targetScale,
-                                                  options.toTarget, options.volume ? transforms(*draft) : nullptr);
+                                                  options.toTarget,
+                                                  needsTransforms(*draft, options.volume) ? transforms(*draft) : nullptr);
         if (!placement) continue;
         const auto attachment = draftAttachment(*draft);
         auto group = std::find_if(drafted.begin(), drafted.end(), [&](const auto& g) { return g.attachment == attachment; });
@@ -573,7 +588,7 @@ std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const 
     const auto drafts = this->drafts();
     std::vector<std::vector<AttachedHit>> result(points.size());
     std::vector<AttachmentIdentity> earlier;
-    for (const auto& attachment : order) {
+    for (const auto& attachment : onlyDrafts(query.uuids, drafts) ? std::vector<AttachmentIdentity>{} : order) {
         std::vector<std::vector<SurfaceProximityHit>> hits(points.size());
         read(attachment, [&](const auto& store, const auto& txn, const auto&) {
             auto around = query;
@@ -598,7 +613,8 @@ std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const 
     for (const auto& [uuid, draft] : drafts) {
         if (!admits(query.uuids, uuid)) continue;
         const auto placement = detail::placeDraft(*draft, query.coordinates, query.volume, query.targetScale,
-                                                  query.toTarget, query.volume ? transforms(*draft) : nullptr);
+                                                  query.toTarget,
+                                                  needsTransforms(*draft, query.volume) ? transforms(*draft) : nullptr);
         if (!placement) continue;
         for (std::size_t i = 0; i < points.size(); ++i)
             if (auto hit = detail::draftNearest(uuid, *draft, *placement, points[i], query.tolerance))

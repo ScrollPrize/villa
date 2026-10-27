@@ -27,6 +27,11 @@ public:
     // A point of the cut and where it lies on the grid (column, row).
     struct Crossing { Point point; std::array<double, 2> grid; };
     SurfaceCut(const RegionSlice& view, const std::optional<VolumeAffine>& toTarget, int64_t columns);
+    // Whether a tile whose vertices lie in `box` (stored coordinates) can
+    // cross the plane: false when the whole box is on one side, so the tile
+    // need not be read. Exact up to a small margin; a tilted plane's AABB
+    // reaches every tile, this test only those it cuts.
+    bool reaches(const std::array<double, 6>& box) const;
     // Returns the triangles tested.
     uint64_t add(const SurfaceTile&, int64_t row, int64_t column, int64_t rows, int64_t columns);
     // The chained polylines clipped to the slice's u/v extent, one segment at a
