@@ -73,95 +73,6 @@ float clampFloat(float v, float lo, float hi)
     return std::max(lo, std::min(hi, v));
 }
 
-bool segmentTriangleIntersectionT(const cv::Vec3f& p0,
-                                  const cv::Vec3f& p1,
-                                  const std::array<cv::Vec3f, 3>& tri,
-                                  float& outT)
-{
-    constexpr float kEps = 1e-6f;
-    const cv::Vec3f dir = p1 - p0;
-    const cv::Vec3f edge1 = tri[1] - tri[0];
-    const cv::Vec3f edge2 = tri[2] - tri[0];
-    const cv::Vec3f h = dir.cross(edge2);
-    const float a = edge1.dot(h);
-    if (std::abs(a) < kEps) {
-        return false;
-    }
-
-    const float f = 1.0f / a;
-    const cv::Vec3f s = p0 - tri[0];
-    const float u = f * s.dot(h);
-    if (u < -kEps || u > 1.0f + kEps) {
-        return false;
-    }
-
-    const cv::Vec3f q = s.cross(edge1);
-    const float v = f * dir.dot(q);
-    if (v < -kEps || u + v > 1.0f + kEps) {
-        return false;
-    }
-
-    const float t = f * edge2.dot(q);
-    if (t < -kEps || t > 1.0f + kEps) {
-        return false;
-    }
-
-    outT = clampFloat(t, 0.0f, 1.0f);
-    return true;
-}
-
-float pointTriangleDistanceSq(const cv::Vec3f& p,
-                              const cv::Vec3f& a,
-                              const cv::Vec3f& b,
-                              const cv::Vec3f& c)
-{
-    const cv::Vec3f ab = b - a;
-    const cv::Vec3f ac = c - a;
-    const cv::Vec3f ap = p - a;
-    const float d1 = ab.dot(ap);
-    const float d2 = ac.dot(ap);
-    if (d1 <= 0.0f && d2 <= 0.0f) return (p - a).dot(p - a);
-
-    const cv::Vec3f bp = p - b;
-    const float d3 = ab.dot(bp);
-    const float d4 = ac.dot(bp);
-    if (d3 >= 0.0f && d4 <= d3) return (p - b).dot(p - b);
-
-    const float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-        const float v = d1 / (d1 - d3);
-        const cv::Vec3f proj = a + v * ab;
-        return (p - proj).dot(p - proj);
-    }
-
-    const cv::Vec3f cp = p - c;
-    const float d5 = ab.dot(cp);
-    const float d6 = ac.dot(cp);
-    if (d6 >= 0.0f && d5 <= d6) return (p - c).dot(p - c);
-
-    const float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-        const float w = d2 / (d2 - d6);
-        const cv::Vec3f proj = a + w * ac;
-        return (p - proj).dot(p - proj);
-    }
-
-    const float va = d3 * d6 - d5 * d4;
-    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        const cv::Vec3f proj = b + w * (c - b);
-        return (p - proj).dot(p - proj);
-    }
-
-    const cv::Vec3f n = ab.cross(ac);
-    const float n2 = n.dot(n);
-    if (n2 <= 1e-12f) {
-        return std::min({(p - a).dot(p - a), (p - b).dot(p - b), (p - c).dot(p - c)});
-    }
-    const float dist = (p - a).dot(n) / std::sqrt(n2);
-    return dist * dist;
-}
-
 SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
                                                 const cv::Vec3f& q1,
                                                 const cv::Vec3f& p2,
@@ -207,32 +118,6 @@ SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
     return {s, (c1 - c2).dot(c1 - c2), c1};
 }
 
-SegmentTriangleHit closestSegmentTriangleHit(const cv::Vec3f& p0,
-                                             const cv::Vec3f& p1,
-                                             const std::array<cv::Vec3f, 3>& tri)
-{
-    float t = 0.0f;
-    if (segmentTriangleIntersectionT(p0, p1, tri, t)) {
-        return {t, 0.0f, p0 + (p1 - p0) * t};
-    }
-
-    SegmentTriangleHit best{0.0f, pointTriangleDistanceSq(p0, tri[0], tri[1], tri[2]), p0};
-    const float endDistSq = pointTriangleDistanceSq(p1, tri[0], tri[1], tri[2]);
-    if (endDistSq < best.distanceSq) {
-        best = {1.0f, endDistSq, p1};
-    }
-
-    const std::array<std::pair<cv::Vec3f, cv::Vec3f>, 3> edges = {{
-        {tri[0], tri[1]}, {tri[1], tri[2]}, {tri[2], tri[0]}
-    }};
-    for (const auto& edge : edges) {
-        SegmentTriangleHit candidate = segmentSegmentClosestOnFirst(p0, p1, edge.first, edge.second);
-        if (candidate.distanceSq < best.distanceSq) {
-            best = candidate;
-        }
-    }
-    return best;
-}
 } // namespace
 
 
