@@ -46,7 +46,6 @@ add_library(vc_core
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp
-        src/surface_metrics.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/ScrollUmbilicus.cpp
