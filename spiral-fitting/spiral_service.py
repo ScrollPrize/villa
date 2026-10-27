@@ -182,6 +182,70 @@ def parse_session_name(value):
     return name
 
 
+class ObjectStoreBindingError(RuntimeError):
+    """The launch object store is unusable, and why."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectStoreBinding:
+    """The object store this service reads fit inputs from.
+
+    Bound once at launch (``--object-store``) and never chosen by a client:
+    patch, PCL and fiber inputs, and the links the startup refresh writes,
+    live in this one store. ``path`` is meaningful on the service host only;
+    clients identify the store by ``uuid``, which every replica of it shares.
+    ``author`` names the service in the store when it refreshes links.
+    """
+
+    path: str
+    uuid: str
+    author: str
+
+    def config(self):
+        """The service-owned configuration a session request receives."""
+        return {"object_store_path": self.path,
+                "object_store_author": self.author}
+
+    def advertisement(self):
+        return {"uuid": self.uuid, "path": self.path, "author": self.author}
+
+
+# Configuration keys the launch binding owns. A session request or --config
+# naming one is refused, as the scroll-specification keys are, rather than
+# quietly overruled: a client cannot repoint the inputs a service reads.
+SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author")
+
+
+def default_object_store_author():
+    return f"spiral-service@{socket.gethostname()}"
+
+
+def bind_object_store(path, author=None):
+    """Resolve and open the launch object store once; return its binding.
+
+    Raises ObjectStoreBindingError when the vc_object_store module is not
+    importable or the store cannot be opened, so startup fails with the
+    cause instead of the first fit failing later.
+    """
+    resolved = Path(path).expanduser().resolve(strict=False)
+    try:
+        from vc_object_store import ObjectStore
+    except ImportError as exc:
+        raise ObjectStoreBindingError(
+            f"the vc_object_store Python module is unavailable ({exc}); put "
+            "its build's python directory on PYTHONPATH") from exc
+    if not resolved.is_file():
+        raise ObjectStoreBindingError(f"no object store at {resolved}")
+    try:
+        with ObjectStore.open(str(resolved), read_only=True) as store:
+            uuid = store.uuid
+    except Exception as exc:
+        raise ObjectStoreBindingError(
+            f"cannot open the object store {resolved}: {exc}") from exc
+    return ObjectStoreBinding(str(resolved), str(uuid),
+                              author or default_object_store_author())
+
+
 def bind_service_paths(resolution, output_directory, cache_directory):
     """Attach the startup-resolved output/cache roots to the advertisement.
 
@@ -419,7 +483,7 @@ class ServiceState:
 
     def __init__(self, dataset_root=None, dataset_resolution=None,
                  service_name=None, session_name="", logs=None, events=None,
-                 gpu_ids=(0,), startup_run=None):
+                 gpu_ids=(0,), startup_run=None, object_store=None):
         self.lock = threading.RLock()
         self._workspace_condition = threading.Condition(self.lock)
         self._workspace_closing = False
@@ -453,6 +517,9 @@ class ServiceState:
         self.startup_run = dict(startup_run or {})
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
+        # ObjectStoreBinding of the launch --object-store; None only in
+        # tests that never build a fit.
+        self.object_store = object_store
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.events = events if events is not None else ServiceEventBuffer()
@@ -837,6 +904,15 @@ class ServiceState:
         # Descriptions are re-read per request, so edited text reaches a
         # client when it reconnects, without restarting the service.
         catalog = {**self._base(), **describe_catalog(self.config_catalog)}
+        if self.object_store is not None:
+            # The launch binding owns these: advertise its values, and mark
+            # them so a client shows them without sending them back.
+            fields = dict(catalog["schema"]["fields"])
+            for key in SERVICE_OWNED_CONFIG_KEYS:
+                fields[key] = {**fields[key], "service_owned": True}
+            catalog["schema"] = {**catalog["schema"], "fields": fields}
+            catalog["defaults"] = {**catalog["defaults"],
+                                   **self.object_store.config()}
         generic = self.config_catalog["defaults"]
         scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
         if scroll_defaults:
@@ -844,7 +920,7 @@ class ServiceState:
             # spiral-scroll.json reaches interactive fits as it reaches the
             # CLI. A preset still holding the generic value inherits it; one
             # that chose its own value keeps it.
-            catalog["defaults"] = {**generic, **scroll_defaults}
+            catalog["defaults"] = {**catalog["defaults"], **scroll_defaults}
             catalog["presets"] = {
                 name: {**preset, **{
                     key: value for key, value in scroll_defaults.items()
@@ -1009,6 +1085,7 @@ class ServiceState:
                       "message": (f"Owned by {SCROLL_SPEC_FILENAME} as "
                                   f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
                      for key in scroll_owned])
+            request = self._bind_service_owned_config(request)
             if self.dataset_resolution is not None:
                 request, input_config = self._dataset_session_request(
                     request, include_input_config=True)
@@ -1049,6 +1126,36 @@ class ServiceState:
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
+
+    def _bind_service_owned_config(self, request):
+        """Refuse client values for SERVICE_OWNED_CONFIG_KEYS, then set them
+        from the launch binding.
+
+        A client may leave them out, send them unset (a complete default
+        configuration) or echo the binding's own values back; any other
+        value is refused. Request overrides are applied after a resumed
+        checkpoint's stored cfg (spiral_runtime._resolve_session_config), so
+        the binding also wins over whatever store that checkpoint was
+        written against.
+        """
+        run = dict(request.get("run") or {})
+        config = dict(run.get("config") or {})
+        bound = self.object_store.config() if self.object_store else {}
+        owned = sorted(key for key in SERVICE_OWNED_CONFIG_KEYS
+                       if config.get(key) is not None
+                       and config[key] != bound.get(key))
+        if owned:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "This service is bound to its object store at launch; the "
+                "request must not carry these",
+                [{"field": f"run.config.{key}",
+                  "message": "Owned by the service's --object-store binding"}
+                 for key in owned])
+        if self.object_store is None:
+            return request
+        config.update(bound)
+        return {**request, "run": {**run, "config": config}}
 
     def startup_session_request(self):
         """The launch defaults used by explicit recovery rebuilds."""
@@ -1875,6 +1982,9 @@ class ServiceState:
         for key in ("z_begin", "z_end"):
             configuration[key] = current.get(
                 key, request_run.get(key, configuration[key]))
+        # Nor does it own the launch binding: the resident values stand.
+        for key in SERVICE_OWNED_CONFIG_KEYS:
+            configuration[key] = current.get(key, configuration[key])
         changes = {key: value for key, value in configuration.items()
                    if current.get(key) != value}
         fields = self.config_catalog["schema"]["fields"]
@@ -3046,6 +3156,14 @@ def main(argv=None):
                              "autosaves, previews, input revisions, upload "
                              "staging, uploaded checkpoints). Must resolve "
                              "outside the dataset root.")
+    parser.add_argument("--object-store", required=True, metavar="STORE",
+                        help="Object store (.vcobj) this service reads patch, "
+                             "PCL and fiber inputs from, and writes startup "
+                             "link refreshes to. Opened once at startup; "
+                             "clients cannot repoint it.")
+    parser.add_argument("--object-store-author", default=None, metavar="NAME",
+                        help="Author of the links this service's refresh "
+                             "writes (default: spiral-service@<host>)")
     parser.add_argument("--cache", default=None,
                         help="Directory for derived host caches; must resolve "
                              "outside the dataset root (default: "
@@ -3087,6 +3205,11 @@ def main(argv=None):
             parser.error(f"--config must be a JSON object: {exc}")
         if not isinstance(startup_config, dict):
             parser.error("--config must be a JSON object")
+        owned = sorted(key for key in SERVICE_OWNED_CONFIG_KEYS
+                       if key in startup_config)
+        if owned:
+            parser.error(f"--config must not set {', '.join(owned)}: "
+                         "--object-store binds the service's inputs")
         try:
             Config(startup_config)
         except (ValueError, AttributeError, TypeError) as exc:
@@ -3124,6 +3247,13 @@ def main(argv=None):
         print(f"SPIRAL_SERVICE_KEY_FILE {key_path}", flush=True)
         print(f"Spiral API key ({'generated' if created else 'reused'}; copy "
               f"into VC3D): {key}", flush=True)
+
+    try:
+        object_store = bind_object_store(args.object_store,
+                                         args.object_store_author)
+    except ObjectStoreBindingError as exc:
+        print(f"Refusing to start: {exc}", file=sys.stderr, flush=True)
+        return 2
 
     session_lease = None
     dataset_resolution = resolve_dataset_root(args.dataset)
@@ -3172,6 +3302,7 @@ def main(argv=None):
                          logs=logs,
                          events=events,
                          gpu_ids=args.gpus,
+                         object_store=object_store,
                          startup_run={"z_begin": args.z_begin,
                                       "z_end": args.z_end,
                                       "config": startup_config})
@@ -3206,6 +3337,8 @@ def main(argv=None):
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
     print(f"Spiral dataset root: {dataset_root}", flush=True)
+    print(f"Spiral object store: {object_store.path} ({object_store.uuid})",
+          flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
     if args.session_name:

@@ -3092,7 +3092,21 @@ class ServiceProcessTests(unittest.TestCase):
 
     def _dataset_arguments(self, temporary):
         dataset, output = self._make_dataset(temporary)
-        return ["--dataset", str(dataset), "--output", str(output)]
+        return ["--dataset", str(dataset), "--output", str(output),
+                "--object-store", self._make_store(temporary)]
+
+    @staticmethod
+    def _make_store(temporary):
+        """An empty object store: the launch binding every service needs."""
+        try:
+            from vc_object_store import ObjectStore
+        except ImportError:
+            raise unittest.SkipTest("the service launch needs vc_object_store")
+        path = Path(temporary) / "inputs.vcobj"
+        if not path.exists():
+            with ObjectStore.create(str(path), author="test", hostname="host"):
+                pass
+        return str(path)
 
     def _read_until_ready(self, process, deadline=30.0):
         lines = []
@@ -3194,6 +3208,7 @@ class ServiceProcessTests(unittest.TestCase):
             output_root = Path(temporary) / "output"
             process = self._launch(["--port", "0", "--api-key-file", str(key_file),
                                     "--dataset", str(empty),
+                                    "--object-store", self._make_store(temporary),
                                     "--output", str(output_root)], temporary)
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
@@ -3206,6 +3221,7 @@ class ServiceProcessTests(unittest.TestCase):
             self.assertEqual(process.returncode, 2)
             self.assertIn("--dataset", output)
             self.assertIn("--output", output)
+            self.assertIn("--object-store", output)
 
             dataset, _ = self._make_dataset(temporary)
             process = self._launch(["--port", "0", "--dataset", str(dataset)],
@@ -3220,6 +3236,7 @@ class ServiceProcessTests(unittest.TestCase):
             for inside in (dataset, dataset / "spiral_output"):
                 process = self._launch(["--port", "0",
                                         "--dataset", str(dataset),
+                                        "--object-store", self._make_store(temporary),
                                         "--output", str(inside)], temporary)
                 output, _ = process.communicate(timeout=30)
                 self.assertEqual(process.returncode, 2)
@@ -3231,6 +3248,7 @@ class ServiceProcessTests(unittest.TestCase):
             dataset, output_root = self._make_dataset(temporary)
             process = self._launch(["--port", "0",
                                     "--dataset", str(dataset),
+                                    "--object-store", self._make_store(temporary),
                                     "--output", str(output_root),
                                     "--cache", str(dataset / ".spiral-cache")],
                                    temporary)
@@ -3246,7 +3264,8 @@ class ServiceProcessTests(unittest.TestCase):
             xdg_cache = Path(temporary) / "xdg-cache"
             process = self._launch(
                 ["--port", "0", "--api-key-file", str(key_file),
-                 "--dataset", str(dataset), "--output", str(output_root)],
+                 "--dataset", str(dataset), "--output", str(output_root),
+                 "--object-store", self._make_store(temporary)],
                 temporary, env={"XDG_CACHE_HOME": str(xdg_cache)})
             try:
                 lines = self._read_until_ready(process)
@@ -3290,6 +3309,7 @@ class ServiceProcessTests(unittest.TestCase):
             arguments = [
                 "--port", "0", "--api-key-file", str(key_file),
                 "--dataset", str(dataset), "--output", str(output_root),
+                "--object-store", self._make_store(temporary),
                 "--session-name", "alice",
             ]
             first = self._launch(arguments, temporary)
