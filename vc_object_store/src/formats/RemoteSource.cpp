@@ -17,11 +17,6 @@ std::string httpLocation(std::string location)
 }
 }
 
-bool isRemoteSource(const std::string& location)
-{
-    return location.starts_with("http://") || location.starts_with("https://") || location.starts_with("s3://");
-}
-
 void fetchRemoteSurface(const std::string& location, const std::filesystem::path& directory)
 {
     const auto base = httpLocation(location);

@@ -4,9 +4,7 @@
 
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -61,8 +59,6 @@ void usage()
         << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
         << "  --surface-scale <factor>           surface XYZ -> working XYZ (default 1)\n"
         << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
-        << "  --import-json <path> import a vc_object_metadata JSON document\n"
-        << "  --export-json <path> write a vc_object_metadata JSON document (- for stdout)\n"
         << "Ingest geometry with vc_object_ingest before discovery.\n";
 }
 
@@ -70,7 +66,7 @@ void usage()
 
 int main(int argc, char** argv)
 try {
-    fs::path dbPath, importJsonPath, exportJsonPath;
+    fs::path dbPath;
     fs::path ctVolume;
     bool linkFibers = false, linkTrackSurfaces = false, linkPcl = false, linkOverlaps = false;
     vc::object_links::PointCollectionSurfaceParams pclParams;
@@ -137,8 +133,6 @@ try {
         else if (arg == "--working-to-base-scale") fiberSurfaceParams.workingToBaseScale = std::stod(next(arg.c_str()));
         else if (arg == "--strip-rows") fiberSurfaceParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
         else if (arg == "--anchor-contact") fiberSurfaceParams.anchorContact = std::stod(next(arg.c_str()));
-        else if (arg == "--import-json") importJsonPath = next("--import-json");
-        else if (arg == "--export-json") exportJsonPath = next("--export-json");
         else if (arg == "--help" || arg == "-h") {
             usage();
             return 0;
@@ -190,41 +184,6 @@ try {
     if (linkTrackSurfaces) run("Track to surface", "track-surfaces", "objects", trackSurfaceParams, linkTracksToSurfaces, ctVolume);
     if (linkFibers) run("Fiber to surface", "fiber-surfaces", "objects", fiberSurfaceParams, linkFibersToSurfaces, ctVolume);
     if (linkPcl) run("Point collections to surfaces", "pcl-surfaces", "objects", pclParams, linkPointCollectionsToSurfaces);
-    if (!importJsonPath.empty()) {
-        vc::objects::util::TerminalProgress progress("Import JSON", showProgress);
-        vc::objects::util::reportProgress(progress.callback(), "reading JSON");
-        std::ifstream in(importJsonPath);
-        if (!in) throw std::runtime_error("cannot read " + importJsonPath.string());
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        vc::objects::util::reportProgress(progress.callback(), "importing objects and edges");
-        auto w = db.write();
-        db.importJson(w, ss.str());
-        vc::objects::util::reportProgress(progress.callback(), "committing transaction");
-        w.commit();
-        progress.finish();
-        std::cout << "imported JSON from " << importJsonPath.string() << "\n";
-    }
-    if (!exportJsonPath.empty()) {
-        vc::objects::util::TerminalProgress progress("Export JSON", showProgress);
-        vc::objects::util::reportProgress(progress.callback(), "serializing object metadata");
-        std::string json;
-        {
-            auto r = db.read();
-            json = db.exportJson(r);
-        }
-        vc::objects::util::reportProgress(progress.callback(), "checkpointing database");
-        db.checkpoint();
-        vc::objects::util::reportProgress(progress.callback(), "writing JSON");
-        if (exportJsonPath == "-") {
-            std::cout << json << "\n";
-            progress.finish();
-        } else {
-            std::ofstream(exportJsonPath) << json << "\n";
-            progress.finish();
-            std::cout << "exported to " << exportJsonPath.string() << "\n";
-        }
-    }
     return linkFailed ? 1 : 0;
 } catch (const std::exception& e) {
     std::cerr << "vc_object_links: " << e.what() << "\n";

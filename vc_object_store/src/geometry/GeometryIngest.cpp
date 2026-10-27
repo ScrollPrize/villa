@@ -1,11 +1,9 @@
-#include "geometry/GeometryIngestBatch.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/TrackInput.hpp"
-#include "formats/RemoteSource.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <map>
@@ -30,7 +28,7 @@ Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
 }
 void ingestBatch(ObjectStore& db, std::vector<Prepared> batch,
     const std::map<std::string, Expected>& expectations, GeometryIngestReport& report,
-    const std::string& coordinateContext = "{}", bool registeredInitial = false)
+    const std::string& coordinateContext = "{}")
 {
     auto write = db.write();
     for (const auto& p : batch) {
@@ -41,7 +39,7 @@ void ingestBatch(ObjectStore& db, std::vector<Prepared> batch,
         if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
     }
     const auto count = batch.size();
-    const auto edges = detail::ingestGeometryBatch(db, write, std::move(batch), coordinateContext, registeredInitial);
+    const auto edges = ingestGeometryBatch(db, write, std::move(batch), coordinateContext);
     write.commit();
     report.ingested += count; report.edgesImported += edges;
 }
@@ -67,88 +65,6 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
     if (kind == "point_collection") return collections(source);
     if (kind == "umbilicus") return {formats::umbilicus(source)};
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
-}
-
-GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
-    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
-{
-    GeometryIngestReport report;
-    std::vector<ObjectRecord> objects;
-    std::map<std::string, Expected> expectations;
-    {
-        auto read = db.read();
-        if (objectUuids.empty()) {
-            for (const char* kind : {"surface", "fiber", "point_collection", "track"}) {
-                auto batch = db.objectsByKind(read, kind); objects.insert(objects.end(), batch.begin(), batch.end());
-            }
-        } else {
-            std::set<std::string> seen;
-            for (const auto& id : objectUuids) {
-                const auto object = db.objectByUuid(read, id);
-                if (!object) report.problems.push_back(id + ": object not found");
-                else if (seen.insert(object->uuid).second) objects.push_back(*object);
-            }
-        }
-        for (const auto& object : objects) expectations[object.uuid] = expectedAt(db, read, object.uuid);
-    }
-    std::map<fs::path, std::vector<Prepared>> pclCache;
-    std::map<fs::path, std::unique_ptr<PackedTrackStore>> trackCache;
-    std::vector<Prepared> prepared;
-    for (size_t i = 0; i < objects.size(); ++i) {
-        const auto& object = objects[i];
-        util::reportProgress(progress, "ingesting geometry", i, objects.size(), object.uuid);
-        try {
-            const auto e = expectations.at(object.uuid);
-            Prepared p;
-            if (object.kind == "track") {
-                if (!object.track) throw std::runtime_error("track detail missing");
-                fs::path path(object.track->datasetRef);
-                if (path.is_relative()) path = datasetRoot.value_or(db.path().parent_path()) / path;
-                const auto packed = resolvePackedTrackStore(path);
-                auto& store = trackCache[packed];
-                if (!store) store = std::make_unique<PackedTrackStore>(packed);
-                const auto id = detail::trackSourceId(object.track->externalKey);
-                const auto found = std::lower_bound(store->sourceIds().begin(), store->sourceIds().end(), id);
-                if (found == store->sourceIds().end() || *found != id) throw std::runtime_error("track source ID missing");
-                p = track(*store, found - store->sourceIds().begin(), object);
-                if (fs::exists(packed / "metadata.json")) p.source = readJson(packed / "metadata.json");
-            } else if (object.storageKind == "url") {
-                // Remote tifxyz: fetched once, decoded here, then held by the store.
-                if (object.kind != "surface" || !formats::isRemoteSource(object.storageRef))
-                    throw std::runtime_error("remote sources are tifxyz surfaces at http(s):// or s3:// URLs");
-                const auto staging = fs::temp_directory_path() / ("vc-object-fetch-" + util::newUuid());
-                fs::create_directory(staging);
-                try {
-                    formats::fetchRemoteSurface(object.storageRef, staging);
-                    p = surface(staging);
-                } catch (...) { std::error_code ignored; fs::remove_all(staging, ignored); throw; }
-                std::error_code ignored; fs::remove_all(staging, ignored);
-                // The registration, not the remote meta.json, is the identity.
-                p.object.uuid = object.uuid;
-            } else {
-                std::optional<fs::path> path;
-                { auto read = db.read(); path = db.resolveStoragePath(read, object.uuid, datasetRoot); }
-                if (!path) throw std::runtime_error("source not found by UUID");
-                if (object.kind == "surface") p = surface(*path);
-                else if (object.kind == "fiber") p = fiber(*path);
-                else if (object.kind == "point_collection") {
-                    if (!pclCache.contains(*path)) pclCache[*path] = collections(*path);
-                    auto& collections = pclCache.at(*path);
-                    const auto found = std::find_if(collections.begin(), collections.end(), [&](const auto& c) { return c.object.uuid == object.uuid; });
-                    if (found == collections.end()) throw std::runtime_error("collection disappeared");
-                    p = std::move(*found);
-                } else throw std::runtime_error("unsupported object kind");
-                if (p.object.uuid != object.uuid) throw std::runtime_error("source UUID changed during ingestion");
-            }
-            expectations[p.object.uuid] = e; prepared.push_back(std::move(p));
-        } catch (const std::exception& error) { problem(report, object.uuid, error); }
-    }
-    if (report.problems.empty()) {
-        try { ingestBatch(db, std::move(prepared), expectations, report, "{}", true); }
-        catch (const std::exception& error) { problem(report, "batch", error); }
-    }
-    util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());
-    return report;
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,

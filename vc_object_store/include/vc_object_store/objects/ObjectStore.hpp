@@ -74,7 +74,7 @@ struct ObjectRecord : RecordCommon {
     std::string name;
     int64_t formatVersion = 0;
     std::string storageKind;  // e.g. "file", "dataset", "" (db-only)
-    std::string storageRef;   // location hint relative to DB directory, or dataset URI; uuid is identity
+    std::string storageRef;   // where the object was imported from; uuid is identity
     int64_t dataGeneration = 0;
     std::optional<std::string> dataChecksum;
     std::optional<FiberDetail> fiber;
@@ -273,11 +273,6 @@ struct SpatialRegion {
     std::vector<int64_t> start, shape;
     std::array<double, 6> bbox;
 };
-struct JsonExportOptions {
-    ObjectSelection selection;
-    std::vector<std::string> fields; // top-level record fields; UUIDs/endpoints always retained
-};
-
 class ObjectStore;
 class GeometrySnapshot;
 struct ObjectStoreImplAccess;
@@ -575,17 +570,6 @@ public:
     // counts regions, ordered by object UUID, array name and start indices.
     // Managed geometry returns tiles/blocks; external objects return boxes.
     std::vector<SpatialRegion> spatialRegions(const Txn&, const ObjectSelection&) const;
-    // Metadata only, with geometry UUID/hash references; payloads stay in the store.
-    std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
-    void importJson(WriteTxn&, const std::string&);
-
-    // Resolve surface/fiber/point_collection source UUIDs: verify storageRef, then
-    // search datasetRoot (default: DB directory; also rebases relative hints).
-    // Read JSON only; skip hidden/Zarr directories and directory symlinks. No cache
-    // or writes. Return an absolute path or nullopt; ambiguity/traversal errors throw.
-    std::optional<std::filesystem::path> resolveStoragePath(
-        const Txn& txn, const std::string& objectUuid,
-        const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
 
     // Flush the WAL into the main DB file (safe copying). Must not be
     // called while a WriteTxn is live on this handle.

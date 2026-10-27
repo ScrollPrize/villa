@@ -28,14 +28,7 @@ Ingestion is **one-time**. Existing UUIDs (even unchanged or retired), duplicate
 and missing/ambiguous source-link targets fail. Fiber directories and PCL
 documents publish atomically; packed tracks use per-track transactions and can
 report partial success. Track identity is dataset reference plus external key.
-Always inspect `problems`.
-`ingest_registered_geometry` loads placeholders only if they have no geometry
-history, preserving unrelated metadata. Use store edits for subsequent changes.
-A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
-(public bucket) `storage_ref` is a remote tifxyz: ingestion downloads its
-`meta.json`, `x/y/z.tif` and, when present, `mask.tif`,
-decodes them like a local directory and stores the geometry, so the remote is
-read once. The placeholder, not the remote `meta.json`, supplies the identity.
+Always inspect `problems`. Use store edits for subsequent changes.
 
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
@@ -48,8 +41,7 @@ ordinary resolution reads only referenced chunks or metadata-snapshot buckets.
 Native export selects an immutable object revision and stages output before publication;
 existing destinations are kept unless `--overwrite` is given. Surfaces export their channels as
 sidecar TIFFs; other kinds reject auxiliary arrays.
-Directory export currently requires Linux `renameat2`. Metadata-only
-`export_json` supports filters and field projection; it is not a geometry backup.
+Directory export currently requires Linux `renameat2`.
 Typed detail counts, lengths, dimensions and boxes are import summaries: use
 current geometry descriptors and spatial queries after edits.
 

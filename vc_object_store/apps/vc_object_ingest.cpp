@@ -6,12 +6,10 @@ int main(int argc, char** argv)
 try {
     std::filesystem::path path;
     std::string author;
-    std::optional<std::filesystem::path> root;
-    std::vector<std::string> uuids;
     std::vector<std::pair<std::string, std::filesystem::path>> sources;
     struct Channel { std::string uuid, name; std::filesystem::path image; };
     std::vector<Channel> channels;
-    bool registered = false, showProgress = true;
+    bool showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -20,9 +18,6 @@ try {
         };
         if (arg == "--db") path = next();
         else if (arg == "--author") author = next();
-        else if (arg == "--dataset-root") root = next();
-        else if (arg == "--registered") registered = true;
-        else if (arg == "--uuid") { uuids.push_back(next()); registered = true; }
         else if (arg == "--surface") sources.emplace_back("surface", next());
         else if (arg == "--fiber") sources.emplace_back("fiber", next());
         else if (arg == "--point-collections") sources.emplace_back("point_collection", next());
@@ -35,9 +30,6 @@ try {
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
-                "  --registered              load initial geometry for registered placeholders\n"
-                "  --uuid UUID               load selected placeholders (flag repeatable)\n"
-                "  --dataset-root DIR        resolve registered source paths relative to DIR\n"
                 "  --surface DIR               import a new tifxyz surface\n"
                 "  --fiber PATH              import new fibers from JSON or a directory\n"
                 "  --point-collections FILE  import new collections from a JSON\n"
@@ -46,14 +38,14 @@ try {
                 "  --surface-channel UUID NAME TIFF\n"
                 "                            add or replace a channel of a stored surface\n"
                 "  --no-progress             suppress progress display\n"
-                "Fiber/collection sources and registered batches commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
+                "Fiber/collection sources commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
                 "Edit imported geometry, annotations and relationships through the object API.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
-    if (path.empty() || author.empty() || (!registered && sources.empty() && channels.empty()))
-        throw std::runtime_error("specify --db, --author and --registered/--uuid, source or channel flags; see --help");
+    if (path.empty() || author.empty() || (sources.empty() && channels.empty()))
+        throw std::runtime_error("specify --db, --author and source or channel flags; see --help");
     vc::objects::OpenOptions options; options.author = author;
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
@@ -65,11 +57,6 @@ try {
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);
         const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback());
-        progress.finish(); print(report);
-    }
-    if (registered) {
-        vc::objects::util::TerminalProgress progress("Ingest registered geometry", showProgress);
-        const auto report = vc::objects::ingestRegisteredGeometry(db, root, uuids, progress.callback());
         progress.finish(); print(report);
     }
     for (const auto& channel : channels) {

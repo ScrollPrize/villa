@@ -29,22 +29,14 @@ struct GeometryIngestReport {
     std::vector<std::string> problems;
 };
 
-// Read/validate files outside write transactions, then insert the selected batch
-// atomically, including native topology. Only registered placeholders that have
-// never had geometry are eligible. Existing/retired imports are errors, even if
-// unchanged. Source data must be stable during ingestion; edit imported objects
-// through the store APIs. There is no file refresh or reconciliation.
-GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
-    const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
-    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
-
 // Create new objects and ingest one source: a tifxyz surface directory,
 // vc3d_fiber JSON, collection or directory, vc_pointcollections JSON (all collections), or packed tracks
 // (.vctracks directory or DBM path with an existing packed mirror). Track
 // identity is (dataset_ref, external_key), within the object store. Fiber/collection
 // sources are inserted atomically; packed tracks are inserted individually with partial reports.
 // Existing identities (including retired objects) and duplicate UUIDs within a
-// batch are errors. Use ingestRegisteredGeometry for an initial placeholder load.
+// batch are errors. Source data must be stable during ingestion; edit imported
+// objects through the store APIs. There is no file refresh or reconciliation.
 // coordinateContext supplies {volume_uuid, scale_factor} for any geometry kind.
 // It fills unknown declarations and rejects source conflicts; XYZ is unchanged.
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind,

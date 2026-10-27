@@ -54,8 +54,6 @@ add_library(vc_objects ${_vc_store_library_type}
     Lifecycle.cpp
     Records.cpp
     Metadata.cpp
-    SourcePaths.cpp
-    Snapshots.cpp
     Queries.cpp
     Spatial.cpp
     GeometryRegion.cpp
