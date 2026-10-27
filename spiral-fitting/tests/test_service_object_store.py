@@ -43,7 +43,6 @@ def dataset(tmp_path):
         'schema_version': 1, 'name': 's1', 'voxel_size_um': 9.6,
         'spiral_outward_sense': 'CW'}))
     (root / 'umbilicus.json').write_text('{}')
-    (root / 'verified_patches').mkdir()
     output = tmp_path / 'output'
     output.mkdir()
     resolution = spiral_service.bind_service_paths(
@@ -408,3 +407,121 @@ def test_release_during_construction_closes_the_installed_fitter(dataset, store,
         releasing.result(5)
     assert closed.is_set() and state.session is None
     state.close()
+
+
+# ---------------------------------------------------------------------------
+# Discovery of the bound store's inputs (step 5)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def filled_store(tmp_path):
+    """Two patches, an absolute PCL attached to one, a fiber at scale 2."""
+    import numpy as np
+    from object_store_fixture import (frame, pcl_patch_edge, put_fiber,
+                                      put_patch, put_pcl)
+    path = tmp_path / 'filled.vcobj'
+    rows, cols = np.mgrid[:6, :6]
+    grid = np.stack([10.0 + rows, np.full(rows.shape, 50.0), 20.0 + cols], -1)
+    with ObjectStore.create(str(path), author='ingest', hostname='host') as db:
+        near = put_patch(db, grid, name='near')
+        put_patch(db, grid + [0, 30, 0], name='far')
+        pcl = put_pcl(db, {7: ([11, 50, 21], 3.0)}, absolute=True, name='abs')
+        pcl_patch_edge(db, pcl, 7, near, (1.0, 1.0))
+        put_fiber(db, [[10, 40, 20], [12, 40, 22], [14, 40, 24]], [0, 2],
+                  coordinates=frame(2), name='fiber')
+    return str(path)
+
+
+def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store):
+    state = service(dataset, filled_store)
+    advertised = state.dataset()
+    assert advertised['object_store'] == {
+        'uuid': state.object_store.uuid, 'path': state.object_store.path,
+        'author': 'spiral-test'}
+    assert advertised['capabilities'] == {
+        'input_source': 'object_store', 'inputs_frozen': True,
+        'input_reload_rebuild': True}
+    # The dataset no longer resolves or advertises patch, fiber or PCL files.
+    assert 'pcl_inputs' not in advertised
+    assert not {'verified_patches', 'fibers'} & set(advertised['resolved'])
+    inputs = advertised['inputs']
+    assert inputs['ok'] and inputs['volume_uuid'] == '20260411134726'
+    assert inputs['volume_source'] == 'inferred'
+    assert {kind: entry['count'] for kind, entry in inputs['selection'].items()} == {
+        'surface': 2, 'point_collection': 1, 'fiber': 1}
+    assert inputs['selection']['fiber']['scales'] == [[2.0, 1]]
+    assert inputs['selection']['surface']['description'] == 'all active'
+    assert inputs['relationships'] == {'pcl_patch': 1}
+    by_name = {entry['name']: entry for entry in inputs['objects']}
+    assert by_name['abs']['pcl_role'] == 'absolute'
+    assert 'pcl_role' not in by_name['near']
+    with ObjectStore.open(filled_store, read_only=True) as db:
+        geometry = db.current_geometry(by_name['fiber']['uuid'])['uuid']
+    assert by_name['fiber']['geometry_revision'] == geometry
+    assert by_name['fiber']['scale_factor'] == 2.0
+    assert all(entry['metadata_sha256'] and entry['object_revision']
+               for entry in inputs['objects'])
+    # Discovery writes nothing: no refresh ran.
+    with ObjectStore.open(filled_store, read_only=True) as db:
+        assert len(db.edges_by_kind('point-surface')) == 1
+
+
+def test_discovery_follows_store_changes_and_reports_refusals(dataset, filled_store):
+    state = service(dataset, filled_store)
+    first = state.startup_inputs()
+    assert state.startup_inputs() is first
+    with ObjectStore.open(filled_store, author='editor') as db:
+        uuid = db.select_objects(object_kind='surface', fields=['uuid'])[0]['uuid']
+        db.set_meta(uuid, 'coordinates', {'volume_uuid': 'another-volume',
+                                          'scale_factor': 1})
+    refused = state.startup_inputs()
+    assert refused['ok'] is False
+    assert 'selected objects declare different volumes' in refused['problems'][0]
+
+
+def test_validation_requires_no_patch_fiber_or_pcl_files(dataset, store):
+    state = service(dataset, store)
+    assert not (dataset.root / 'verified_patches').exists()
+    paths, run, _, _ = state._prepare_session_request(state.startup_session_request())
+    assert (paths.verified_patches, paths.fibers, paths.pcls) == ('', '', ())
+
+
+def test_starting_the_service_and_discovery_do_not_import_torch(dataset, filled_store,
+                                                                tmp_path):
+    import os
+    import socket
+    import subprocess
+    import sys
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    script = f"""
+import json, os, signal, sys, threading, time, urllib.request
+import spiral_service
+
+def probe():
+    for _ in range(200):
+        try:
+            request = urllib.request.Request(
+                'http://127.0.0.1:{port}/dataset',
+                headers={{'Authorization': 'Bearer ' + open({str(tmp_path / 'key')!r}).read().strip()}})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                dataset = json.loads(response.read())
+            break
+        except Exception:
+            time.sleep(0.05)
+    print('RESULT', json.dumps({{'torch': 'torch' in sys.modules,
+                               'ok': dataset['inputs']['ok']}}), file=sys.stderr, flush=True)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+threading.Thread(target=probe, daemon=True).start()
+sys.exit(spiral_service.main(sys.argv[1:]))
+"""
+    result = subprocess.run(
+        [sys.executable, '-c', script, '--port', str(port),
+         '--api-key-file', str(tmp_path / 'key'), '--dataset', str(dataset.root),
+         '--output', str(dataset.output / 'svc'), '--object-store', filled_store],
+        cwd=str(Path(spiral_service.__file__).parent), capture_output=True,
+        text=True, timeout=120, env=dict(os.environ))
+    line = next(line for line in result.stderr.splitlines() if line.startswith('RESULT'))
+    assert json.loads(line[len('RESULT '):]) == {'torch': False, 'ok': True}

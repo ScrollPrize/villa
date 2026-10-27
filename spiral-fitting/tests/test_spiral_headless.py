@@ -176,12 +176,10 @@ class DatasetResolverTests(unittest.TestCase):
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
             self.assertEqual(result.resolved["tracks_dbm"], str(root / "tracks" / "only.dbm"))
-            self.assertEqual(result.resolved["verified_patches"],
-                             str(root / "verified_patches"))
-            self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
-            self.assertEqual([item["role"] for item in result.pcl_inputs],
-                             ["absolute", "relative", "same_winding",
-                              "drawn_control_points"])
+            # Patches, fibers and PCLs come from the object store: the
+            # dataset's files are not inputs any more.
+            self.assertFalse({"verified_patches", "fibers"} & set(result.resolved))
+            self.assertFalse(hasattr(result, "pcl_inputs"))
             self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
                              str(root / "tracks" / "only.dbm"))
 

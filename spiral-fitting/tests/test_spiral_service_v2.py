@@ -870,32 +870,6 @@ class DatasetOwnershipTests(unittest.TestCase):
             response["resolved"]["output_directory"],
             str(self.output / "alice"))
 
-    def test_dataset_resolution_discovers_drawn_control_points(self):
-        drawn = self.root / "drawn_control_points.json"
-        drawn.write_text(json.dumps({
-            "vc_pointcollections_json_version": "1",
-            "collections": {"0": {"name": "drawn", "points": {}}},
-        }))
-        resolution = resolve_dataset_root(self.root)
-        entries = [entry for entry in resolution.pcl_inputs
-                   if entry["role"] == "drawn_control_points"]
-        self.assertEqual(entries, [{
-            "path": str(drawn), "role": "drawn_control_points", "required": False,
-        }])
-
-    def test_dataset_resolution_discovers_same_winding_collections(self):
-        same_winding = self.root / "same_windings.json"
-        same_winding.write_text(json.dumps({
-            "vc_pointcollections_json_version": "1",
-            "collections": {"0": {"name": "same_winding_0001", "points": {}}},
-        }))
-        resolution = resolve_dataset_root(self.root)
-        entries = [entry for entry in resolution.pcl_inputs
-                   if entry["role"] == "same_winding"]
-        self.assertEqual(entries, [{
-            "path": str(same_winding), "role": "same_winding", "required": False,
-        }])
-
     def test_generated_state_roots_live_under_the_output_root(self):
         # Every generated-state family hangs off the bound --output root and
         # never off the dataset.
@@ -1040,24 +1014,17 @@ class DatasetOwnershipTests(unittest.TestCase):
         request = self.state._dataset_session_request({
             "run": {"z_begin": 0, "z_end": 10},
         })
-        self.assertEqual(
-            request["paths"]["verified_patches"],
-            str(self.root / "verified_patches"))
+        # Patches, fibers and PCLs come from the object store, never from
+        # dataset paths.
+        self.assertFalse({"verified_patches", "fibers", "pcls"} & set(request["paths"]))
 
         disabled = self.state._dataset_session_request({
             "paths": {"tracks_dbm": "/not/an/advertised/store.dbm"},
             "run": {"z_begin": 0, "z_end": 10, "config": {
-                "input_use_verified_patches": False,
                 "input_use_tracks": False,
-                "input_use_pcl_absolute": False,
-                "input_use_pcl_relative": False,
-                "input_use_pcl_same_winding": False,
-                "input_use_pcl_drawn_control_points": False,
             }},
         })
-        self.assertEqual(disabled["paths"]["verified_patches"], "")
         self.assertEqual(disabled["paths"]["tracks_dbm"], "")
-        self.assertEqual(disabled["paths"]["pcls"], [])
 
     def test_omitted_spacing_mode_preserves_default_winding_input(self):
         winding = self.root / "winding_inference"
@@ -1173,9 +1140,9 @@ class DatasetOwnershipTests(unittest.TestCase):
         attached = response["session_request"]
         self.assertEqual(attached, self.state.status()["session_request"])
         self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
-        self.assertEqual(attached["paths"]["verified_patches"],
-                         str(self.root / "verified_patches"))
+        self.assertEqual(attached["paths"]["verified_patches"], "")
         self.assertEqual(attached["paths"]["fibers"], "")
+        self.assertEqual(attached["paths"]["pcls"], [])
         self.assertEqual(attached["run"]["z_begin"], 100)
         self.assertEqual(attached["run"]["z_end"], 900)
         for key in SCROLL_SPEC_OWNED_RUN_KEYS:

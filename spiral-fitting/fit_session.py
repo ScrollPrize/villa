@@ -120,7 +120,10 @@ from surface_orientation import spiral_outward_sense_for
 # /session/lease/claim and /release, token header X-Spiral-Session-Token;
 # status reports lease_id). The input-editing routes answer 409 with code
 # inputs_frozen, naming the full-input rebuild, and uploads accept only
-# checkpoints.
+# checkpoints. /dataset no longer resolves patch, fiber or PCL files
+# (pcl_inputs is gone); it advertises the store binding (object_store: uuid,
+# path, author), the launch configuration's selection from it (inputs) and
+# the service's capabilities.
 API_VERSION = 36
 
 
@@ -403,6 +406,12 @@ FIT_INPUT_CATALOG: tuple[FitInputSpec, ...] = (
 
 _FIT_INPUTS_BY_KEY = {spec.key: spec for spec in FIT_INPUT_CATALOG}
 
+# Inputs the object store supplies (object_store_inputs.load_fit_inputs):
+# dataset resolution does not look for them and request validation does not
+# require them. Their catalog entries only describe the path fields that the
+# file-input service read.
+STORE_INPUT_KEYS = frozenset({"verified_patches", "fibers", "pcls"})
+
 
 def fit_input(key: str) -> FitInputSpec | None:
     return _FIT_INPUTS_BY_KEY.get(key)
@@ -541,7 +550,6 @@ class SpiralPreviewConfig:
 class SpiralDatasetResolution:
     root: str
     resolved: dict[str, str] = field(default_factory=dict)
-    pcl_inputs: list[dict[str, Any]] = field(default_factory=list)
     missing_required: list[str] = field(default_factory=list)
     missing_optional: list[str] = field(default_factory=list)
     ambiguities: dict[str, list[str]] = field(default_factory=dict)
@@ -1167,9 +1175,10 @@ def resolve_dataset_root(
         result.scroll_spec = spec.manifest()
 
     for input_spec in FIT_INPUT_CATALOG:
-        # DBM inputs need backing-file probing (below) and PCL collections
-        # are per-role files; neither is a plain path probe.
-        if input_spec.kind in ("dbm", "pcl-set") or not input_spec.conventional_relative:
+        # DBM inputs need backing-file probing (below); patches, fibers and
+        # PCLs come from the object store.
+        if (input_spec.kind == "dbm" or input_spec.key in STORE_INPUT_KEYS
+                or not input_spec.conventional_relative):
             continue
         override = spec.path_override(input_spec.key) if spec is not None else ""
         candidate = Path(override) if override \
@@ -1182,17 +1191,6 @@ def resolve_dataset_root(
             result.missing_required.append(input_spec.key)
         else:
             result.missing_optional.append(input_spec.key)
-
-    for role, relative in PCL_ROLE_CONVENTIONS:
-        candidate = root / relative
-        if candidate.is_file() and os.access(candidate, os.R_OK):
-            result.pcl_inputs.append({
-                "path": _normalise_path(candidate),
-                "role": role.value,
-                "required": False,
-            })
-        else:
-            result.missing_optional.append(f"pcl:{role.value}")
 
     tracks_override = spec.path_override("tracks_dbm") if spec is not None else ""
     preferred = Path(tracks_override) if tracks_override \
@@ -1265,7 +1263,7 @@ def validate_session_request(
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
     def check_catalog_input(spec: FitInputSpec) -> None:
-        if not spec.enabled(run.config):
+        if spec.key in STORE_INPUT_KEYS or not spec.enabled(run.config):
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,

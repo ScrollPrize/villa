@@ -1167,31 +1167,76 @@ def derive_point_views(inputs, patches, config):
 # Report
 # ---------------------------------------------------------------------------
 
+def snapshot_summary(snapshot):
+    """The selection a snapshot holds, as data; snapshot_report prints it.
+
+    Per object its provenance (UUID, kind, name, revision pins, metadata
+    hash, scale) and, for point collections, the role its metadata
+    declares; then per-kind counts, consumed relationship families,
+    exclusions and the fit volume. Reads nothing beyond the snapshot, so a
+    service can describe a selection without refreshing or materializing.
+    """
+    selection = {}
+    for kind in KINDS:
+        objects = snapshot.objects_of(kind)
+        selector = snapshot.request.selector(kind)
+        selection[kind] = {
+            'selector': dataclasses.asdict(selector),
+            'description': selector.describe(),
+            'count': len(objects),
+            'scales': [[scale, count] for scale, count in sorted(
+                Counter(obj.frame.scale_factor for obj in objects).items())],
+        }
+    objects = []
+    for obj in snapshot.objects.values():
+        entry = obj.provenance()
+        entry['volume_uuid'] = obj.frame.volume_uuid
+        if obj.kind == 'point_collection':
+            absolute = (obj.meta.get('source') or {}).get('winding_is_absolute', False)
+            entry['pcl_role'] = 'absolute' if absolute is True else 'relative'
+        objects.append(entry)
+    return {
+        'store': {'path': snapshot.store_path, 'uuid': snapshot.store_uuid},
+        'volume_uuid': snapshot.volume_uuid,
+        'volume_source': snapshot.volume_source,
+        'units': FIT_UNITS,
+        'approved_links_only': snapshot.request.approved_links_only,
+        'selection': selection,
+        'objects': objects,
+        'relationships': dict(sorted(
+            Counter(rel.family for rel in snapshot.relationships).items())),
+        'excluded_relationships': dict(sorted(snapshot.exclusions.items())),
+        'notes': list(snapshot.notes),
+        'warnings': empty_family_warnings(snapshot),
+    }
+
+
 def snapshot_report(snapshot):
     """Human-readable lines describing the selection and its relationships."""
+    summary = snapshot_summary(snapshot)
     lines = [
-        f'object store {snapshot.store_path} ({snapshot.store_uuid})',
-        f'fit volume {snapshot.volume_uuid} ({snapshot.volume_source}); '
+        f'object store {summary["store"]["path"]} ({summary["store"]["uuid"]})',
+        f'fit volume {summary["volume_uuid"]} ({summary["volume_source"]}); '
         f'units: {FIT_UNITS}',
     ]
     for kind in KINDS:
-        objects = snapshot.objects_of(kind)
-        scales = Counter(obj.frame.scale_factor for obj in objects)
+        selected = summary['selection'][kind]
         scale_text = ', '.join(f'{count} at scale {scale:g}'
-                               for scale, count in sorted(scales.items()))
+                               for scale, count in selected['scales'])
         lines.append(
-            f'{KIND_LABELS[kind]}: {len(objects)} selected '
-            f'({snapshot.request.selector(kind).describe()})'
+            f'{KIND_LABELS[kind]}: {selected["count"]} selected '
+            f'({selected["description"]})'
             + (f'; {scale_text}' if scale_text else ''))
-    families = Counter(rel.family for rel in snapshot.relationships)
-    mode = 'approved only' if snapshot.request.approved_links_only else 'pending and approved'
+    mode = 'approved only' if summary['approved_links_only'] else 'pending and approved'
     lines.append(f'relationships consumed ({mode}): ' + (', '.join(
-        f'{family} {count}' for family, count in sorted(families.items())) or 'none'))
-    if snapshot.exclusions:
+        f'{family} {count}' for family, count in summary['relationships'].items())
+        or 'none'))
+    if summary['excluded_relationships']:
         lines.append('relationships excluded: ' + ', '.join(
-            f'{reason} {count}' for reason, count in sorted(snapshot.exclusions.items())))
-    lines.extend(snapshot.notes)
-    lines.extend(f'WARNING: {warning}' for warning in empty_family_warnings(snapshot))
+            f'{reason} {count}'
+            for reason, count in summary['excluded_relationships'].items()))
+    lines.extend(summary['notes'])
+    lines.extend(f'WARNING: {warning}' for warning in summary['warnings'])
     return lines
 
 
@@ -1674,6 +1719,20 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     if main:
         log(f'object-store inputs frozen: digest {inputs.digest[:16]}')
     return inputs
+
+
+def describe_selection(config):
+    """snapshot_summary of the selection a fit configuration names, read
+    from its store as it stands: read-only, without refreshing links or
+    materializing anything, and without importing Torch. A selection the
+    fitter would refuse reports its problems instead of raising."""
+    from vc_object_store import ObjectStore
+    try:
+        request = request_from_config(config)
+        with ObjectStore.open(config['object_store_path'], read_only=True) as store:
+            return {'ok': True, **snapshot_summary(read_snapshot(store, request))}
+    except ObjectStoreInputError as error:
+        return {'ok': False, 'problems': error.problems}
 
 
 def _report_config(args):

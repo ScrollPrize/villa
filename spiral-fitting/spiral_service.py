@@ -71,14 +71,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
-                         SCROLL_SPEC_OWNED_RUN_KEYS, PclRole, ScrollSpecError,
-                         SessionState, SpiralInputPaths, default_user_cache_dir,
-                         input_source_enabled, pcl_input_enabled,
+                         SCROLL_SPEC_OWNED_RUN_KEYS, STORE_INPUT_KEYS, PclRole,
+                         ScrollSpecError, SessionState, SpiralInputPaths,
+                         default_user_cache_dir, input_source_enabled,
                          winding_inference_enabled, load_scroll_spec,
                          scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
-from checkpoint_migrations import tolerate_config
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
@@ -233,6 +232,26 @@ class ObjectStoreBinding:
 # naming one is refused, as the scroll-specification keys are, rather than
 # quietly overruled: a client cannot repoint the inputs a service reads.
 SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author")
+
+
+# What /dataset tells a client this service supports, so it can enable or
+# explain controls before any session exists.
+SERVICE_CAPABILITIES = {
+    # Patches, PCLs and fibers are read from the bound object store.
+    "input_source": "object_store",
+    # A resident session's inputs never change; input-editing routes answer
+    # inputs_frozen.
+    "inputs_frozen": True,
+    # POST /session/rebuild {"inputs": "reload"} rereads the store.
+    "input_reload_rebuild": True,
+}
+
+
+def _stat_or_none(path):
+    try:
+        return path.stat()
+    except OSError:
+        return None
 
 
 def default_object_store_author():
@@ -538,6 +557,8 @@ class ServiceState:
         # ObjectStoreBinding of the launch --object-store; None only in
         # tests that never build a fit.
         self.object_store = object_store
+        self._startup_inputs = None
+        self._startup_inputs_lock = threading.Lock()
         self.service_name = service_name or socket.gethostname()
         self.session_name = str(session_name or "")
         self.events = events if events is not None else ServiceEventBuffer()
@@ -859,8 +880,37 @@ class ServiceState:
         return catalog
 
     def dataset(self):
-        return {**self._base(), **self.dataset_resolution.to_dict(),
-                "session_checkpoints": self.session_checkpoints()}
+        response = {**self._base(), **self.dataset_resolution.to_dict(),
+                    "session_checkpoints": self.session_checkpoints(),
+                    "capabilities": dict(SERVICE_CAPABILITIES)}
+        if self.object_store is not None:
+            response["object_store"] = self.object_store.advertisement()
+            response["inputs"] = self.startup_inputs()
+        return response
+
+    def startup_inputs(self):
+        """What the launch configuration selects from the bound store.
+
+        Patches, PCLs and fibers with their revision pins, labels, frames
+        and metadata PCL roles, plus counts, consumed relationship families,
+        exclusions and the fit volume (object_store_inputs.snapshot_summary).
+        Read-only: no link refresh, no materialization and no Torch. The
+        result is reused until the store's files change.
+        """
+        path = Path(self.object_store.path)
+        key = tuple((info.st_size, info.st_mtime_ns) if info else None
+                    for info in (_stat_or_none(path),
+                                 _stat_or_none(Path(f"{path}-wal"))))
+        with self._startup_inputs_lock:
+            cached = self._startup_inputs
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            from object_store_inputs import describe_selection
+            config = Config(self.startup_run.get("config") or {}).as_dict()
+            config.update(self.object_store.config())
+            summary = describe_selection(config)
+            self._startup_inputs = (key, summary)
+            return summary
 
     @property
     def scroll_spec(self):
@@ -928,10 +978,9 @@ class ServiceState:
                  for key in offending])
         paths = {"dataset_root": resolution["root"], "scroll_zarr": ""}
         for key in (*(spec.key for spec in FIT_INPUT_CATALOG
-                      if spec.kind != "pcl-set"),
+                      if spec.key not in STORE_INPUT_KEYS),
                     "output_directory", "cache_directory"):
             paths[key] = resolution["resolved"].get(key, "")
-        paths["pcls"] = resolution["pcl_inputs"]
         checkpoint = str(requested_paths.get("checkpoint") or "").strip()
         if checkpoint:
             allowed = set(resolution.get("detected_checkpoints", []))
@@ -959,8 +1008,6 @@ class ServiceState:
         # validating any client-selectable override so the manifest, validator,
         # and fitter all describe the same source set.
         selected_paths = {
-            "verified_patches": "verified_patches",
-            "fibers": "fibers",
             "outer_shell": "outer_shell",
             "tracks_dbm": "tracks_dbm",
             "normal_x": "normals",
@@ -973,10 +1020,6 @@ class ServiceState:
                 paths[path_key] = ""
         if not winding_inference_enabled(config):
             paths["winding_inference"] = ""
-        paths["pcls"] = [
-            spec for spec in paths["pcls"]
-            if pcl_input_enabled(config, spec.get("role"), spec.get("path", ""))
-        ]
 
         tracks = str(requested_paths.get("tracks_dbm") or "").strip()
         if not input_source_enabled(config, "tracks_dbm"):
@@ -2183,7 +2226,9 @@ class ServiceState:
         reports no configuration, which every caller treats as "no rebuild
         can help".
         """
+        # Both import Torch: the service does not until it reads a checkpoint.
         from checkpoint_io import load_checkpoint_cpu
+        from checkpoint_migrations import tolerate_config
         try:
             payload = load_checkpoint_cpu(path)
         except Exception:
