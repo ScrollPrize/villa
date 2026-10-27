@@ -8,38 +8,9 @@
 
 #include <opencv2/core/mat.hpp>
 
-namespace vc::core::util {
+namespace vc::objects { struct UmbilicusFile; }
 
-    // An umbilicus file's contents plus whatever frame metadata it declares.
-    // The optionals stay unset for legacy/unstamped files, which carry no
-    // statement about the grid their coordinates index.
-    struct UmbilicusFileInfo {
-        std::vector<cv::Vec3f> controlPoints;
-        // metadata.voxelsize_um: voxel size, in µm, of the grid the
-        // coordinates index. Authoritative and self-contained: to express the
-        // umbilicus in a target grid, multiply the coordinates by
-        // voxelsizeUm / targetVoxelsizeUm.
-        std::optional<double> voxelsizeUm;
-        // metadata.volume: volume store the umbilicus was annotated on.
-        // Provenance only.
-        std::optional<std::string> volume;
-        // metadata.volume_width / volume_height / volume_slices: the x, y and z
-        // voxel counts of the grid the coordinates index. Exact-integer
-        // provenance: a consumer can check that its own grid has the same
-        // dimensions, or derive a rescale precisely from the dimension ratios
-        // in cases where the µm sizes are rounded and therefore ambiguous.
-        std::optional<int> volumeWidth;
-        std::optional<int> volumeHeight;
-        std::optional<int> volumeSlices;
-        // One entry per metadata field that was present but rejected, so a typo
-        // is distinguishable from a legacy file that never declared the field.
-        // Each entry reads "<key>: <reason>, got <value-as-written>", e.g.
-        // `volume_width: expected a positive integer, got -5`. Parsing still
-        // succeeds and the points are still returned; callers that decide a
-        // frame refuse a file with errors, while callers that only want the
-        // polyline are unaffected.
-        std::vector<std::string> metadataErrors;
-    };
+namespace vc::core::util {
 
     class Umbilicus {
     public:
@@ -50,19 +21,13 @@ namespace vc::core::util {
             NegativeY
         };
 
+        // An umbilicus file (vc::objects::readUmbilicusFile) read as-is.
         static Umbilicus FromFile(const std::filesystem::path& path,
                                   const cv::Vec3i& volume_shape);
         static Umbilicus FromPoints(std::vector<cv::Vec3f> control_points,
                                     const cv::Vec3i& volume_shape);
-        // The raw control points of an umbilicus file (same formats as
-        // FromFile), for callers that need to reframe them before building.
-        static std::vector<cv::Vec3f> LoadControlPoints(
-            const std::filesystem::path& path);
-        // Same points plus the file's frame metadata. Text/CSV files and json
-        // files without a "metadata" object yield unset metadata, as does any
-        // individual metadata field that is missing or malformed; a malformed
-        // field additionally appends to UmbilicusFileInfo::metadataErrors.
-        static UmbilicusFileInfo LoadFileInfo(const std::filesystem::path& path);
+        // A file's points as control points (XYZ, float).
+        static std::vector<cv::Vec3f> PointsOf(const vc::objects::UmbilicusFile& file);
 
         const cv::Vec3i& volume_shape() const noexcept;
         const std::vector<cv::Vec3f>& centers() const noexcept;
@@ -83,10 +48,6 @@ namespace vc::core::util {
     private:
         Umbilicus(std::vector<cv::Vec3f> control_points,
                   const cv::Vec3i& volume_shape);
-
-        static UmbilicusFileInfo LoadFile(const std::filesystem::path& path);
-        static std::vector<cv::Vec3f> LoadTextFile(std::istream& stream);
-        static UmbilicusFileInfo LoadJsonFile(const std::filesystem::path& path);
 
         void interpolate_centers();
         cv::Vec3f interpolate_center(double z) const;

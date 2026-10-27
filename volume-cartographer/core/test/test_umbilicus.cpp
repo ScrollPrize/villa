@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/Umbilicus.hpp"
+#include <vc_object_store/objects/UmbilicusFile.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -285,7 +286,7 @@ TEST_CASE("control_points json format loads via the shared loader")
               R"({"x": 12, "y": 22, "z": 15, "score": 100}],)"
               R"("metadata": {"total_points": 2}})");
 
-    const auto points = Umbilicus::LoadControlPoints(path);
+    const auto points = Umbilicus::PointsOf(vc::objects::readUmbilicusFile(path));
     REQUIRE(points.size() == 2);
     CHECK(points[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
     CHECK(points[1] == cv::Vec3f(12.0f, 22.0f, 15.0f));
@@ -297,9 +298,9 @@ TEST_CASE("control_points json format loads via the shared loader")
     fs::remove(path);
 }
 
-// ------- LoadFileInfo (frame metadata) -------
+// ------- readUmbilicusFile (frame metadata) -------
 
-TEST_CASE("LoadFileInfo: stamped file reports every metadata field")
+TEST_CASE("readUmbilicusFile: stamped file reports every metadata field")
 {
     const auto path = tmpFile("info_stamped", ".json");
     writeFile(path,
@@ -310,12 +311,12 @@ TEST_CASE("LoadFileInfo: stamped file reports every metadata field")
               R"({"x": 10, "y": 20, "z": 5, "score": 100},)"
               R"({"x": 12, "y": 22, "z": 15, "score": 100}]})");
 
-    const auto info = Umbilicus::LoadFileInfo(path);
-    REQUIRE(info.controlPoints.size() == 2);
-    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 20.0f, 5.0f));
+    const auto info = vc::objects::readUmbilicusFile(path);
+    REQUIRE(info.points.size() == 2);
+    CHECK(info.points[0] == vc::geometry::Point{10.0f, 20.0f, 5.0f});
     CHECK(info.metadataErrors.empty());
-    REQUIRE(info.voxelsizeUm.has_value());
-    CHECK(*info.voxelsizeUm == doctest::Approx(9.6));
+    REQUIRE(info.voxelSizeUm.has_value());
+    CHECK(*info.voxelSizeUm == doctest::Approx(9.6));
     REQUIRE(info.volume.has_value());
     CHECK(*info.volume == "scroll.zarr");
     REQUIRE(info.volumeWidth.has_value());
@@ -328,16 +329,16 @@ TEST_CASE("LoadFileInfo: stamped file reports every metadata field")
     fs::remove(path);
 }
 
-TEST_CASE("LoadFileInfo: metadata without frame keys leaves every field unset")
+TEST_CASE("readUmbilicusFile: metadata without frame keys leaves every field unset")
 {
     const auto path = tmpFile("info_unstamped", ".json");
     writeFile(path,
               R"({"metadata": {"total_points": 1, "timestamp": "2026-04-20T13:16:29Z"},)"
               R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})");
 
-    const auto info = Umbilicus::LoadFileInfo(path);
-    REQUIRE(info.controlPoints.size() == 1);
-    CHECK_FALSE(info.voxelsizeUm.has_value());
+    const auto info = vc::objects::readUmbilicusFile(path);
+    REQUIRE(info.points.size() == 1);
+    CHECK_FALSE(info.voxelSizeUm.has_value());
     CHECK_FALSE(info.volume.has_value());
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());
@@ -348,15 +349,15 @@ TEST_CASE("LoadFileInfo: metadata without frame keys leaves every field unset")
     fs::remove(path);
 }
 
-TEST_CASE("LoadFileInfo: bare-array json parses points with no metadata")
+TEST_CASE("readUmbilicusFile: bare-array json parses points with no metadata")
 {
     const auto path = tmpFile("info_bare", ".json");
     writeFile(path, "[[0,5,10],[10,6,11]]");
 
-    const auto info = Umbilicus::LoadFileInfo(path);
-    REQUIRE(info.controlPoints.size() == 2);
-    CHECK(info.controlPoints[0] == cv::Vec3f(10.0f, 5.0f, 0.0f));
-    CHECK_FALSE(info.voxelsizeUm.has_value());
+    const auto info = vc::objects::readUmbilicusFile(path);
+    REQUIRE(info.points.size() == 2);
+    CHECK(info.points[0] == vc::geometry::Point{10.0f, 5.0f, 0.0f});
+    CHECK_FALSE(info.voxelSizeUm.has_value());
     CHECK_FALSE(info.volume.has_value());
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());
@@ -366,14 +367,14 @@ TEST_CASE("LoadFileInfo: bare-array json parses points with no metadata")
     fs::remove(path);
 }
 
-TEST_CASE("LoadFileInfo: text file parses points with no metadata")
+TEST_CASE("readUmbilicusFile: text file parses points with no metadata")
 {
     const auto path = tmpFile("info_text", ".txt");
     writeFile(path, "0, 5, 10\n10, 6, 11\n");
 
-    const auto info = Umbilicus::LoadFileInfo(path);
-    REQUIRE(info.controlPoints.size() == 2);
-    CHECK_FALSE(info.voxelsizeUm.has_value());
+    const auto info = vc::objects::readUmbilicusFile(path);
+    REQUIRE(info.points.size() == 2);
+    CHECK_FALSE(info.voxelSizeUm.has_value());
     CHECK_FALSE(info.volume.has_value());
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());
@@ -383,7 +384,7 @@ TEST_CASE("LoadFileInfo: text file parses points with no metadata")
     fs::remove(path);
 }
 
-TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absent")
+TEST_CASE("readUmbilicusFile: an incomplete dimension triplet is malformed, not absent")
 {
     const std::string points =
         R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
@@ -395,10 +396,10 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
                   R"({"metadata": {"volume_width": 8174, "volume_slices": 18946},)"
                       + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         // Points still parse: a caller wanting only the polyline must not lose its
         // umbilicus over a frame field it never reads.
-        CHECK(info.controlPoints.size() == 1);
+        CHECK(info.points.size() == 1);
         REQUIRE(info.metadataErrors.size() == 1);
         CHECK(info.metadataErrors[0] ==
               "volume dimensions: an incomplete triplet declares nothing; "
@@ -411,7 +412,7 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
         const auto path = tmpFile("info_one_dim", ".json");
         writeFile(path, R"({"metadata": {"volume_height": 8174},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         REQUIRE(info.metadataErrors.size() == 1);
         CHECK(info.metadataErrors[0] ==
               "volume dimensions: an incomplete triplet declares nothing; "
@@ -426,7 +427,7 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
                   R"({"metadata": {"volume_width": 8174, "volume_height": 8174,)"
                   R"( "volume_slices": 18946},)" + points);
 
-        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        CHECK(vc::objects::readUmbilicusFile(path).metadataErrors.empty());
         fs::remove(path);
     }
 
@@ -435,7 +436,7 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
         const auto path = tmpFile("info_no_dims", ".json");
         writeFile(path, R"({"metadata": {"voxelsize_um": 9.6},)" + points);
 
-        CHECK(Umbilicus::LoadFileInfo(path).metadataErrors.empty());
+        CHECK(vc::objects::readUmbilicusFile(path).metadataErrors.empty());
         fs::remove(path);
     }
 
@@ -446,7 +447,7 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
                   R"({"metadata": {"volume_width": -5, "volume_height": 8174},)"
                       + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         REQUIRE(info.metadataErrors.size() == 1);
         CHECK(info.metadataErrors[0] ==
               "volume_width: expected a positive integer, got -5");
@@ -454,7 +455,7 @@ TEST_CASE("LoadFileInfo: an incomplete dimension triplet is malformed, not absen
     }
 }
 
-TEST_CASE("LoadFileInfo: a malformed field only costs that field")
+TEST_CASE("readUmbilicusFile: a malformed field only costs that field")
 {
     const std::string points =
         R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100}]})";
@@ -467,8 +468,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"( "volume": "scroll.zarr", "volume_width": 8174,)"
                   R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
-        CHECK_FALSE(info.voxelsizeUm.has_value());
+        const auto info = vc::objects::readUmbilicusFile(path);
+        CHECK_FALSE(info.voxelSizeUm.has_value());
         CHECK(info.volume.value_or("") == "scroll.zarr");
         CHECK(info.volumeWidth.value_or(-1) == 8174);
         REQUIRE(info.metadataErrors.size() == 1);
@@ -484,8 +485,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"({"metadata": {"voxelsize_um": 0, "volume_width": 8174,)"
                   R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
-        CHECK_FALSE(info.voxelsizeUm.has_value());
+        const auto info = vc::objects::readUmbilicusFile(path);
+        CHECK_FALSE(info.voxelSizeUm.has_value());
         CHECK(info.volumeSlices.value_or(-1) == 18946);
         REQUIRE(info.metadataErrors.size() == 1);
         CHECK(info.metadataErrors[0] ==
@@ -501,8 +502,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"( "volume_width": 8174, "volume_height": 8174,)"
                   R"( "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
-        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        const auto info = vc::objects::readUmbilicusFile(path);
+        CHECK(info.voxelSizeUm.value_or(0.0) == doctest::Approx(2.4));
         CHECK_FALSE(info.volume.has_value());
         CHECK(info.volumeHeight.value_or(-1) == 8174);
         REQUIRE(info.metadataErrors.size() == 1);
@@ -518,7 +519,7 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"({"metadata": {"volume": "", "volume_width": 8174,)"
                   R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         CHECK_FALSE(info.volume.has_value());
         CHECK(info.volumeWidth.value_or(-1) == 8174);
         REQUIRE(info.metadataErrors.size() == 1);
@@ -535,8 +536,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"( "volume": "scroll.zarr", "volume_width": -5,)"
                   R"( "volume_height": 8174, "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
-        CHECK(info.voxelsizeUm.value_or(0.0) == doctest::Approx(2.4));
+        const auto info = vc::objects::readUmbilicusFile(path);
+        CHECK(info.voxelSizeUm.value_or(0.0) == doctest::Approx(2.4));
         CHECK(info.volume.value_or("") == "scroll.zarr");
         CHECK_FALSE(info.volumeWidth.has_value());
         CHECK(info.volumeHeight.value_or(-1) == 8174);
@@ -555,7 +556,7 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"( "volume": "scroll.zarr", "volume_width": 8174,)"
                   R"( "volume_height": 8174.5, "volume_slices": 18946},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         CHECK(info.volumeWidth.value_or(-1) == 8174);
         CHECK_FALSE(info.volumeHeight.has_value());
         CHECK(info.volumeSlices.value_or(-1) == 18946);
@@ -573,7 +574,7 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
                   R"( "volume": "scroll.zarr", "volume_width": 8174,)"
                   R"( "volume_height": 8174, "volume_slices": 0},)" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         CHECK(info.volumeWidth.value_or(-1) == 8174);
         CHECK(info.volumeHeight.value_or(-1) == 8174);
         CHECK_FALSE(info.volumeSlices.has_value());
@@ -588,8 +589,8 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
         const auto path = tmpFile("info_bad_metadata", ".json");
         writeFile(path, R"({"metadata": "nope", )" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
-        CHECK_FALSE(info.voxelsizeUm.has_value());
+        const auto info = vc::objects::readUmbilicusFile(path);
+        CHECK_FALSE(info.voxelSizeUm.has_value());
         CHECK_FALSE(info.volume.has_value());
         CHECK_FALSE(info.volumeWidth.has_value());
         CHECK_FALSE(info.volumeHeight.has_value());
@@ -607,10 +608,10 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
             const auto path = tmpFile("info_metadata_type", ".json");
             writeFile(path, std::string(R"({"metadata": )") + value + ", " + points);
 
-            const auto info = Umbilicus::LoadFileInfo(path);
+            const auto info = vc::objects::readUmbilicusFile(path);
             REQUIRE(info.metadataErrors.size() == 1);
             CHECK(info.metadataErrors[0].rfind("metadata: expected an object", 0) == 0);
-            CHECK(info.controlPoints.size() == 1);
+            CHECK(info.points.size() == 1);
             fs::remove(path);
         }
     }
@@ -620,15 +621,15 @@ TEST_CASE("LoadFileInfo: a malformed field only costs that field")
         const auto path = tmpFile("info_metadata_null", ".json");
         writeFile(path, R"({"metadata": null, )" + points);
 
-        const auto info = Umbilicus::LoadFileInfo(path);
+        const auto info = vc::objects::readUmbilicusFile(path);
         CHECK(info.metadataErrors.empty());
-        CHECK_FALSE(info.voxelsizeUm.has_value());
-        CHECK(info.controlPoints.size() == 1);
+        CHECK_FALSE(info.voxelSizeUm.has_value());
+        CHECK(info.points.size() == 1);
         fs::remove(path);
     }
 }
 
-TEST_CASE("LoadFileInfo: every malformed field is reported, points still load")
+TEST_CASE("readUmbilicusFile: every malformed field is reported, points still load")
 {
     const auto path = tmpFile("info_all_bad", ".json");
     writeFile(path,
@@ -638,11 +639,11 @@ TEST_CASE("LoadFileInfo: every malformed field is reported, points still load")
               R"("control_points": [{"x": 1, "y": 2, "z": 3, "score": 100},)"
               R"({"x": 4, "y": 5, "z": 6, "score": 100}]})");
 
-    const auto info = Umbilicus::LoadFileInfo(path);
+    const auto info = vc::objects::readUmbilicusFile(path);
     // Point-only consumers must not lose their umbilicus over frame fields.
-    REQUIRE(info.controlPoints.size() == 2);
-    CHECK(info.controlPoints[0] == cv::Vec3f(1.0f, 2.0f, 3.0f));
-    CHECK_FALSE(info.voxelsizeUm.has_value());
+    REQUIRE(info.points.size() == 2);
+    CHECK(info.points[0] == vc::geometry::Point{1.0f, 2.0f, 3.0f});
+    CHECK_FALSE(info.voxelSizeUm.has_value());
     CHECK_FALSE(info.volume.has_value());
     CHECK_FALSE(info.volumeWidth.has_value());
     CHECK_FALSE(info.volumeHeight.has_value());

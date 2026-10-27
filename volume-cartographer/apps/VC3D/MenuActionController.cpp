@@ -31,7 +31,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
+#include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "BindCoordinatesPrompt.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -39,7 +39,6 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/CatalogStore.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
-#include "vc/core/util/Umbilicus.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"
@@ -1795,67 +1794,43 @@ void MenuActionController::importUmbilicus()
         QObject::tr("Umbilicus (*.json *.txt *.csv)"));
     if (file.isEmpty()) return;
 
-    vc::core::util::UmbilicusFileInfo info;
+    vc::objects::UmbilicusFile umbilicus;
     try {
-        info = vc::core::util::Umbilicus::LoadFileInfo(std::filesystem::path(file.toStdString()));
+        umbilicus = vc::objects::readUmbilicusFile(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Import failed"),
             QObject::tr("%1 is not a valid umbilicus file:\n\n%2").arg(file, QString::fromUtf8(e.what())));
         return;
     }
-    if (!info.metadataErrors.empty()) {
-        QStringList errors;
-        for (const auto& error : info.metadataErrors) errors << QString::fromStdString(error);
-        QMessageBox::warning(_window, QObject::tr("Import failed"),
-            QObject::tr("%1 declares malformed frame metadata:\n\n%2")
-                .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
-        return;
-    }
 
-    // The frame is decided here, once: the file's stamp against the volume the
-    // umbilicus is bound to. A stamp naming an attached volume is checked against it.
-    const std::array<double, 3> volumeGridXyz{static_cast<double>(volume->sliceWidth()),
-                                              static_cast<double>(volume->sliceHeight()),
-                                              static_cast<double>(volume->numSlices())};
-    const double voxelSize = volume->voxelSize();
-    const auto derived = vc::core::util::deriveUmbilicusScale(
-        info, volumeGridXyz, std::isfinite(voxelSize) && voxelSize > 0 ? std::optional(voxelSize) : std::nullopt);
-    std::optional<std::string> contradiction;
-    if (info.volume && !info.volume->empty()) {
-        if (const auto named = attachedVolumeByStoreName(*state.vpkg(), *info.volume)) {
-            const double namedVoxel = named->voxelSize();
-            contradiction = vc::core::util::umbilicusStampContradiction(
-                info,
-                {static_cast<double>(named->sliceWidth()), static_cast<double>(named->sliceHeight()),
-                 static_cast<double>(named->numSlices())},
-                std::isfinite(namedVoxel) && namedVoxel > 0 ? std::optional(namedVoxel) : std::nullopt);
-        }
-    }
-    const auto action = vc::core::util::decideUmbilicusLoadAction(
-        derived, vc::core::util::umbilicusFrameClaim(info), true, contradiction.has_value());
-    if (contradiction) {
+    // The store decides the frame: the file's stamp against the volume the
+    // umbilicus is bound to, and against an attached volume the stamp names.
+    const auto grid = [](const Volume& v) {
+        const double voxelSize = v.voxelSize();
+        return vc::objects::UmbilicusTargetGrid{
+            {double(v.sliceWidth()), double(v.sliceHeight()), double(v.numSlices())},
+            std::isfinite(voxelSize) && voxelSize > 0 ? std::optional(voxelSize) : std::nullopt};
+    };
+    std::optional<vc::objects::UmbilicusTargetGrid> named;
+    if (umbilicus.volume)
+        if (const auto volumeNamed = attachedVolumeByStoreName(*state.vpkg(), *umbilicus.volume)) named = grid(*volumeNamed);
+    const auto binding = vc::objects::umbilicusBinding(umbilicus, grid(*volume), named);
+    if (binding.refusal) {
         QMessageBox::warning(_window, QObject::tr("Import failed"),
-            QObject::tr("%1: %2").arg(QFileInfo(file).fileName(), QString::fromStdString(*contradiction)));
+            QObject::tr("%1 does not fit volume %2: %3")
+                .arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id()), QString::fromStdString(*binding.refusal)));
         return;
     }
-    if (action == vc::core::util::UmbilicusLoadAction::Refuse) {
-        QMessageBox::warning(_window, QObject::tr("Import failed"),
-            QObject::tr("%1 states a frame that does not fit volume %2.")
-                .arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id())));
-        return;
-    }
-    // A stated frame is taken as stated; an inferred one is offered for
-    // confirmation, and a file stating nothing asks, like an unbound fiber.
-    double storedUnitsPerVoxel = derived ? 1.0 / derived->factor : 1.0;
-    if (action != vc::core::util::UmbilicusLoadAction::Apply ||
-        derived->source == vc::core::util::UmbilicusScaleSource::InferredFromGrid) {
-        const QString reason = derived
-            ? QObject::tr("Inferred from the points: %1").arg(QString::fromStdString(derived->description))
+    // An inferred frame is offered for confirmation, and a file stating
+    // nothing asks, like an unbound fiber.
+    double storedUnitsPerVoxel = binding.storedUnitsPerVoxel.value_or(1.0);
+    if (binding.confirm) {
+        const QString reason = binding.storedUnitsPerVoxel
+            ? QObject::tr("Inferred from the points: %1").arg(QString::fromStdString(binding.frame))
             : QObject::tr("The file states no frame.");
         const auto entered = vc3d::promptStoredUnitsPerVoxel(
             _window, QObject::tr("Bind Umbilicus Coordinates"), QStringLiteral("umbilicus"), *volume,
-            {{"file", QFileInfo(file).fileName().toStdString()}}, reason,
-            derived ? std::optional(storedUnitsPerVoxel) : std::nullopt);
+            {{"file", QFileInfo(file).fileName().toStdString()}}, reason, binding.storedUnitsPerVoxel);
         if (!entered) return;
         storedUnitsPerVoxel = *entered;
     }
@@ -1870,24 +1845,13 @@ void MenuActionController::importUmbilicus()
             != QMessageBox::Yes)
         return;
 
-    nlohmann::json meta{{"coordinates", vc::objects::volumeCoordinates(volume->id(), storedUnitsPerVoxel)}};
-    meta["provenance"] = {{"tool", "vc3d-import-umbilicus"},
-                          {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
-                                          {"frame", derived ? derived->description : std::string("entered")}}},
-                          {"sources", nlohmann::json::array()}};
-    vc::geometry::Umbilicus geometry;
-    for (const auto& p : info.controlPoints) geometry.points.push_back({p[0], p[1], p[2]});
-    vc::objects::ObjectRecord record;
-    record.uuid = vc::objects::util::newUuid();
-    record.kind = "umbilicus";
-    record.name = QFileInfo(file).completeBaseName().toStdString();
-    record.meta = meta.dump();
-    auto pins = replaced;
-    pins[record.uuid] = std::nullopt;
     try {
-        state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
-            vc::objects::setVolumeUmbilicus(db, txn, volume->id(), record, geometry);
-        });
+        vc::objects::importVolumeUmbilicus(*state.objectStoreSession(), *attachment, volume->id(), umbilicus,
+            storedUnitsPerVoxel, QFileInfo(file).completeBaseName().toStdString(),
+            {{"tool", "vc3d-import-umbilicus"},
+             {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
+                             {"frame", binding.frame.empty() ? std::string("entered") : binding.frame}}},
+             {"sources", nlohmann::json::array()}});
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("Import failed"), QString::fromUtf8(e.what()));
         return;

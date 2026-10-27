@@ -503,7 +503,7 @@ int main(int argc, char** argv)
         metadata["voxelsize_um"] = vm["voxelsize-um"].as<double>();
     }
     // The grid dimension triplet is stamped only when all three are given. Two of three is read
-    // by Umbilicus::LoadFileInfo as a malformed statement and refuses the file, and the tool
+    // by vc::objects::readUmbilicusFile as a malformed statement and refuses the file, and the tool
     // cannot supply the third itself: the grids state their extent in x and y but not the slice
     // count of the volume they came from, since a sparse or partial set of grid files is
     // indistinguishable from a short volume.

@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include <vc_object_store/objects/UmbilicusFile.hpp>
 
 #include <algorithm>
 #include <array>
@@ -18,10 +19,10 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-using vc::core::util::deriveUmbilicusScale;
-using vc::core::util::UmbilicusFileInfo;
-using vc::core::util::UmbilicusScaleSource;
-using vc::core::util::uniformRescaleFactor;
+using vc::objects::deriveUmbilicusScale;
+using vc::objects::UmbilicusFile;
+using vc::objects::UmbilicusScaleSource;
+using vc::objects::uniformRescaleFactor;
 
 namespace {
 
@@ -70,14 +71,14 @@ namespace {
 // 32693 x 32693 x 75784. Only z is an exact multiple of the stamp -- 32693/4 is
 // 8173.25, which the downsample rounded up to 8174 -- so the axes disagree by
 // 0.0092% and a tolerance is genuinely required here.
-UmbilicusFileInfo stampedPHercParis4()
+UmbilicusFile stampedPHercParis4()
 {
-    UmbilicusFileInfo info;
-    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    UmbilicusFile info;
+    info.points = {{1.0f, 2.0f, 3.0f}};
     info.volumeWidth = 8174;
     info.volumeHeight = 8174;
     info.volumeSlices = 18946;
-    info.voxelsizeUm = 9.6;
+    info.voxelSizeUm = 9.6;
     return info;
 }
 
@@ -193,21 +194,21 @@ TEST_CASE("uniformRescaleFactor: non-power-of-two factors, and unusable extents"
 
 TEST_CASE("deriveUmbilicusScale: dimensions that are not a uniform rescale say nothing")
 {
-    UmbilicusFileInfo info;
-    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
+    UmbilicusFile info;
+    info.points = {{1.0f, 2.0f, 3.0f}};
     info.volumeWidth = 8174;
     info.volumeHeight = 4000;   // a different aspect: not this grid at all
     info.volumeSlices = 18946;
-    info.voxelsizeUm = 9.6;     // must not be used as a consolation prize
+    info.voxelSizeUm = 9.6;     // must not be used as a consolation prize
 
     CHECK_FALSE(deriveUmbilicusScale(info, kPHercParis4AnnotationGrid, 2.4).has_value());
 }
 
 TEST_CASE("deriveUmbilicusScale: voxel sizes are used when dimensions are absent")
 {
-    UmbilicusFileInfo info;
-    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
-    info.voxelsizeUm = 9.6;
+    UmbilicusFile info;
+    info.points = {{1.0f, 2.0f, 3.0f}};
+    info.voxelSizeUm = 9.6;
 
     const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, 2.4);
     REQUIRE(scale.has_value());
@@ -217,9 +218,9 @@ TEST_CASE("deriveUmbilicusScale: voxel sizes are used when dimensions are absent
 
 TEST_CASE("deriveUmbilicusScale: an unstamped file is read off the grid it fills")
 {
-    UmbilicusFileInfo info;
+    UmbilicusFile info;
     // Spans nearly all of a grid four times coarser than the target.
-    info.controlPoints = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 18000.0f}};
+    info.points = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 18000.0f}};
 
     const auto scale = deriveUmbilicusScale(info, {32696.0, 32696.0, 75784.0}, std::nullopt);
     REQUIRE(scale.has_value());
@@ -227,8 +228,8 @@ TEST_CASE("deriveUmbilicusScale: an unstamped file is read off the grid it fills
     CHECK(scale->source == UmbilicusScaleSource::InferredFromGrid);
 
     // A short span fills no candidate grid, so nothing is claimed.
-    UmbilicusFileInfo shortSpan;
-    shortSpan.controlPoints = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 900.0f}};
+    UmbilicusFile shortSpan;
+    shortSpan.points = {{100.0f, 100.0f, 400.0f}, {120.0f, 120.0f, 900.0f}};
     CHECK_FALSE(
         deriveUmbilicusScale(shortSpan, {32696.0, 32696.0, 75784.0}, std::nullopt)
             .has_value());
@@ -236,20 +237,20 @@ TEST_CASE("deriveUmbilicusScale: an unstamped file is read off the grid it fills
 
 TEST_CASE("deriveUmbilicusScale: no target grid and no voxel size means no answer")
 {
-    UmbilicusFileInfo info;
-    info.controlPoints = {{1.0f, 2.0f, 3.0f}};
-    info.voxelsizeUm = 9.6;
+    UmbilicusFile info;
+    info.points = {{1.0f, 2.0f, 3.0f}};
+    info.voxelSizeUm = 9.6;
     CHECK_FALSE(deriveUmbilicusScale(info, {0.0, 0.0, 0.0}, std::nullopt).has_value());
 }
 
 TEST_CASE("umbilicusFrameClaim: a claim is what the file states, not what fits")
 {
-    using vc::core::util::umbilicusFrameClaim;
+    using vc::objects::umbilicusFrameClaim;
 
-    UmbilicusFileInfo none;
+    UmbilicusFile none;
     CHECK_FALSE(umbilicusFrameClaim(none).any());
 
-    UmbilicusFileInfo dimensionsOnly;
+    UmbilicusFile dimensionsOnly;
     dimensionsOnly.volumeWidth = 8174;
     dimensionsOnly.volumeHeight = 8174;
     dimensionsOnly.volumeSlices = 18946;
@@ -258,24 +259,24 @@ TEST_CASE("umbilicusFrameClaim: a claim is what the file states, not what fits")
     CHECK_FALSE(dims.voxelSize);
     CHECK(dims.any());
 
-    UmbilicusFileInfo voxelOnly;
-    voxelOnly.voxelsizeUm = 9.6;
+    UmbilicusFile voxelOnly;
+    voxelOnly.voxelSizeUm = 9.6;
     const auto voxel = umbilicusFrameClaim(voxelOnly);
     CHECK_FALSE(voxel.dimensions);
     CHECK(voxel.voxelSize);
     CHECK(voxel.any());
 
-    UmbilicusFileInfo both;
+    UmbilicusFile both;
     both.volumeWidth = 8174;
     both.volumeHeight = 8174;
     both.volumeSlices = 18946;
-    both.voxelsizeUm = 9.6;
+    both.voxelSizeUm = 9.6;
     CHECK(umbilicusFrameClaim(both).dimensions);
     CHECK(umbilicusFrameClaim(both).voxelSize);
 
     // Two of three counts describe no grid, so this is not a claim; treating it
     // as one would refuse a file over a typo.
-    UmbilicusFileInfo partial;
+    UmbilicusFile partial;
     partial.volumeWidth = 8174;
     partial.volumeSlices = 18946;
     CHECK_FALSE(umbilicusFrameClaim(partial).any());
@@ -283,7 +284,7 @@ TEST_CASE("umbilicusFrameClaim: a claim is what the file states, not what fits")
     // A stated frame that does not fit the target still counts as stated: that
     // pairing — no scale, but a claim — is what a consumer must refuse rather
     // than read as unstamped.
-    UmbilicusFileInfo mismatched;
+    UmbilicusFile mismatched;
     mismatched.volumeWidth = 8174;
     mismatched.volumeHeight = 4000;
     mismatched.volumeSlices = 18946;
@@ -294,10 +295,10 @@ TEST_CASE("umbilicusFrameClaim: a claim is what the file states, not what fits")
 
 TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
 {
-    using vc::core::util::decideUmbilicusLoadAction;
-    using vc::core::util::UmbilicusFrameClaim;
-    using vc::core::util::UmbilicusLoadAction;
-    using vc::core::util::UmbilicusScale;
+    using vc::objects::decideUmbilicusLoadAction;
+    using vc::objects::UmbilicusFrameClaim;
+    using vc::objects::UmbilicusLoadAction;
+    using vc::objects::UmbilicusScale;
 
     const UmbilicusFrameClaim noClaim;
     UmbilicusFrameClaim claimed;
@@ -344,14 +345,14 @@ TEST_CASE("decideUmbilicusLoadAction: refusal needs a claim and a target")
 
 TEST_CASE("umbilicusStampContradiction: a stamp is checked against the volume it names")
 {
-    using vc::core::util::umbilicusStampContradiction;
+    using vc::objects::umbilicusStampContradiction;
 
-    UmbilicusFileInfo info;
+    UmbilicusFile info;
     info.volume = "s1_2um_ds2.zarr";
     info.volumeWidth = 8174;
     info.volumeHeight = 8174;
     info.volumeSlices = 18946;
-    info.voxelsizeUm = 9.6;
+    info.voxelSizeUm = 9.6;
 
     // Consistent: the named volume is the stamped grid itself (factor 1), and
     // 9.6 um matches what it implies.
@@ -369,15 +370,15 @@ TEST_CASE("umbilicusStampContradiction: a stamp is checked against the volume it
 
     // A voxel size the named volume disproves contradicts it: implied is
     // 2.4 x 4 = 9.6, stamped says 19.2.
-    UmbilicusFileInfo wrongVoxel = info;
-    wrongVoxel.voxelsizeUm = 19.2;
+    UmbilicusFile wrongVoxel = info;
+    wrongVoxel.voxelSizeUm = 19.2;
     CHECK(umbilicusStampContradiction(
         wrongVoxel, {32693.0, 32693.0, 75784.0}, 2.4).has_value());
 
     // Within metadata round-trip slack is not a contradiction: 9.596 recorded
     // against an implied 9.6 differs by four parts in ten thousand.
-    UmbilicusFileInfo rounded = info;
-    rounded.voxelsizeUm = 9.6;
+    UmbilicusFile rounded = info;
+    rounded.voxelSizeUm = 9.6;
     CHECK_FALSE(umbilicusStampContradiction(
         rounded, {32693.0, 32693.0, 75784.0}, 2.399).has_value());
 
@@ -390,9 +391,9 @@ TEST_CASE("umbilicusStampContradiction: a stamp is checked against the volume it
     // alone: the difference is the conversion deriveUmbilicusScale()
     // applies, not evidence against the stamp. Only a dimension triplet
     // implying a different voxel size contradicts it (covered above).
-    UmbilicusFileInfo voxelOnly;
+    UmbilicusFile voxelOnly;
     voxelOnly.volume = "s1_8um.zarr";
-    voxelOnly.voxelsizeUm = 9.6;
+    voxelOnly.voxelSizeUm = 9.6;
     CHECK_FALSE(umbilicusStampContradiction(
         voxelOnly, {0.0, 0.0, 0.0}, 9.6).has_value());
     CHECK_FALSE(umbilicusStampContradiction(
@@ -403,10 +404,10 @@ TEST_CASE("umbilicusStampContradiction: a stamp is checked against the volume it
 
 TEST_CASE("decideUmbilicusLoadAction: a contradicted stamp refuses outright")
 {
-    using vc::core::util::decideUmbilicusLoadAction;
-    using vc::core::util::UmbilicusFrameClaim;
-    using vc::core::util::UmbilicusLoadAction;
-    using vc::core::util::UmbilicusScale;
+    using vc::objects::decideUmbilicusLoadAction;
+    using vc::objects::UmbilicusFrameClaim;
+    using vc::objects::UmbilicusLoadAction;
+    using vc::objects::UmbilicusScale;
 
     UmbilicusFrameClaim claimed;
     claimed.voxelSize = true;
