@@ -46,16 +46,6 @@ vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
 set_tests_properties(catalog_project_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
 
-add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
-set_target_properties(test_line_annotation_adjacent_links PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_line_annotation_adjacent_links PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_line_annotation_adjacent_links PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME line_annotation_adjacent_links COMMAND test_line_annotation_adjacent_links)
-vc_register_test_target(test_line_annotation_adjacent_links)
-vc_register_ctest(line_annotation_adjacent_links test_line_annotation_adjacent_links)
-
 add_executable(test_intersection_layer_item
     test_intersection_layer_item.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.cpp
@@ -179,22 +169,7 @@ add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
 vc_register_test_target(test_spiral_reload_comparison)
 vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
 
-add_executable(test_fiber_source_dedupe
-    test_fiber_source_dedupe.cpp)
 
-set_target_properties(test_fiber_source_dedupe PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_fiber_source_dedupe PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_fiber_source_dedupe PRIVATE
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME fiber_source_dedupe COMMAND test_fiber_source_dedupe)
-vc_register_test_target(test_fiber_source_dedupe)
-vc_register_ctest(fiber_source_dedupe test_fiber_source_dedupe)
 
 add_executable(test_spiral_artifact_pins
     test_spiral_artifact_pins.cpp)
@@ -340,8 +315,7 @@ vc_register_test_target(test_seeding_batch_tracker)
 vc_register_ctest(seeding_batch_tracker test_seeding_batch_tracker)
 
 add_executable(test_fiber_save_batch_tracker
-    test_fiber_save_batch_tracker.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp)
+    test_fiber_save_batch_tracker.cpp)
 
 set_target_properties(test_fiber_save_batch_tracker PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -357,23 +331,7 @@ add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
 vc_register_test_target(test_fiber_save_batch_tracker)
 vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 
-add_executable(test_fiber_runtime_ids
-    test_fiber_runtime_ids.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberRuntimeIds.hpp)
 
-set_target_properties(test_fiber_runtime_ids PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_fiber_runtime_ids PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_fiber_runtime_ids PRIVATE
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME fiber_runtime_ids COMMAND test_fiber_runtime_ids)
-vc_register_test_target(test_fiber_runtime_ids)
-vc_register_ctest(fiber_runtime_ids test_fiber_runtime_ids)
 
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
@@ -729,3 +687,13 @@ target_link_libraries(test_viewer_hud PRIVATE
 add_test(NAME viewer_hud COMMAND test_viewer_hud)
 vc_register_test_target(test_viewer_hud)
 vc_register_ctest(viewer_hud test_viewer_hud)
+# Exercise the production controller publication paths after Qt/state cleanup.
+# The VC3D app target only exists with VC_BUILD_APPS; CI runs this test from
+# the VC3D compile-and-smoke job.
+if(TARGET VC3D)
+    add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
+    set_tests_properties(object_store_vc3d_controller PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+    vc_register_test_target(VC3D)
+    vc_register_ctest(object_store_vc3d_controller VC3D)
+endif()

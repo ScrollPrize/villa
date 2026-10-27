@@ -1,11 +1,11 @@
 """Pack fiber-on-patch runs (sheets/scripts/match_fibers_to_patches.py JSON lines) into the sheet-strip index.
 
-Each run is a span of an AFV fiber that lies on one tifxyz patch: its fiber (AFV catalog index), patch, arc span on
+Each run is a span of a fiber-store fiber that lies on one tifxyz patch: its fiber (catalog index), patch, arc span on
 the fiber and per-sample patch grid position (row, col) and position (patch voxels). Runs are split by height: a run
 is validation when all its samples lie in the z band ``--val-z`` (patch voxels), training when all lie at least
 ``--val-margin`` outside it, else unused.
 
-    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --afv FIBERS.afv \\
+    python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.build_index --fibers FIBERS.vcobj \\
         --runs H_runs.jsonl V_runs.jsonl --patches-dir PATCHES --out INDEX_DIR
 
 Output (INDEX_DIR): ``runs_*.npy`` (one row per run, sorted by fiber then start), ``sample_*.npy`` (``run_samples``
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume, fibers_digest
 from vesuvius.neural_tracing.tracers.sheets import config as sheet_config
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 
@@ -29,10 +29,10 @@ SPLITS = dict(train=0, validation=1, unused=-1)
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--afv', required=True)
+    ap.add_argument('--fibers', required=True, help='fiber store (.vcobj)')
     ap.add_argument('--runs', nargs='+', required=True, help='match_fibers_to_patches.py outputs (any families)')
     ap.add_argument('--patches-dir', nargs='+', required=True, help='as given to match_fibers_to_patches.py')
-    ap.add_argument('--grid-scale', type=float, default=4., help='AFV voxels per patch voxel (as for matching)')
+    ap.add_argument('--grid-scale', type=float, default=4., help='fiber voxels per patch voxel (as for matching)')
     ap.add_argument('--val-z', type=float, nargs=2, default=(11250., 12125.),
                     help='validation z band, patch voxels (default: the fiber runs\' val_z 45000-48500 base voxels)')
     ap.add_argument('--val-margin', type=float, default=80.)
@@ -40,8 +40,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     index = build_index(args.patches_dir, sheet_config.OUTPUT/'cache')
     patch_id = {(info.root, info.name): i for i, info in enumerate(index)}
-    fibers = AFVFibers(args.afv, split='all')
-    catalog = {row[0]: i for i, row in enumerate(fibers.catalog)}
+    fibers = FiberStore(args.fibers, fiber_volume(args.fibers), split='all')
+    catalog = fibers.id_to_index
     rows, rc, xyz = [], [], []
     for path in args.runs:
         with open(path) as stream:
@@ -52,7 +52,10 @@ def main(argv=None):
                 lo, hi = args.val_z
                 split = ('validation' if ((z >= lo) & (z <= hi)).all() else
                          'train' if ((z < lo-args.val_margin) | (z > hi+args.val_margin)).all() else 'unused')
-                rows.append((catalog[run['fiber']], patch_id[(run['root'], run['patch'])], run['start'], run['end'],
+                kind, fiber = run['fiber'].split(':', 1)
+                if kind != 'fiber':
+                    raise ValueError(f"Run of {run['fiber']}: the index holds fiber-store fibers (fiber:<UUID>) only")
+                rows.append((catalog[fiber], patch_id[(run['root'], run['patch'])], run['start'], run['end'],
                              run['offset'], SPLITS[split]))
                 rc.append(np.asarray(run['rc'], np.int32))
                 xyz.append(points)
@@ -71,8 +74,9 @@ def main(argv=None):
     summary = {name: dict(runs=int((split == value).sum()), length=float(length[split == value].sum()),
                           fibers=len({rows[i][0] for i in order if rows[i][5] == value}))
                for name, value in SPLITS.items()}
-    meta = dict(afv=str(Path(args.afv).resolve()), afv_uuid=fibers.metadata.get('uuid'), runs=[str(Path(p).resolve()) for p in args.runs],
-                patches_dir=[str(Path(p).resolve()) for p in args.patches_dir], afv_per_patch_voxel=args.grid_scale,
+    meta = dict(fibers=str(Path(args.fibers).resolve()), fibers_digest=fibers_digest(args.fibers),
+                runs=[str(Path(p).resolve()) for p in args.runs],
+                patches_dir=[str(Path(p).resolve()) for p in args.patches_dir], fibers_per_patch_voxel=args.grid_scale,
                 val_z=list(args.val_z), val_margin=args.val_margin, splits=summary)
     (args.out/'meta.json').write_text(json.dumps(meta, indent=1))
     print(json.dumps(summary), flush=True)

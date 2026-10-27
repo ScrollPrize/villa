@@ -41,6 +41,7 @@ struct PredSnapSearchPolicy {
 
 struct Options {
     fs::path atlasDir;
+    fs::path objectStore;
     fs::path projectVolpkgJson;
     fs::path volpkgRoot;
     fs::path lasagnaManifest;
@@ -68,10 +69,11 @@ struct TraceStats {
 void printUsage(const char* argv0)
 {
     std::cerr
+        << "Object store: --object-store PATH (required for mapped fibers)\n"
         << "Usage: " << argv0
         << " <atlas_dir> <project.volpkg.json>"
         << " [--lasagna-manifest=manifest.lasagna.json]"
-        << " [--fiber=fibers/name.json]"
+        << " [--fiber=STORE_UUID/OBJECT_UUID]"
         << " [--debug-images-dir=dir]"
         << " [--dry-run] [--overwrite-manual] [--verbose] [--trace-samples]\n\n"
         << "Regenerates atlas pred-snap attachments and prints per-control search\n"
@@ -87,6 +89,8 @@ Options parseArgs(int argc, char** argv)
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--object-store" && i + 1 < argc) { options.objectStore = argv[++i]; continue; }
+        if (arg.starts_with("--object-store=")) { options.objectStore = arg.substr(15); continue; }
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             std::exit(0);
@@ -1025,6 +1029,11 @@ int main(int argc, char** argv)
         std::cout.imbue(std::locale::classic());
         Options options = parseArgs(argc, argv);
         resolveProjectContext(options);
+        auto store = std::make_shared<vc::objects::ObjectStoreSession>();
+        vc::objects::OpenOptions storeOptions; storeOptions.readOnly = true;
+        if (options.objectStore.empty()) throw std::invalid_argument("missing --object-store");
+        store->attach(options.objectStore, storeOptions);
+
 
         const auto dataset = vc::lasagna::LasagnaDataset::open(options.lasagnaManifest);
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
@@ -1039,7 +1048,7 @@ int main(int argc, char** argv)
         const double predDtStepVx = 0.5 * *predDtSpacing;
 
         vc::atlas::Atlas atlas =
-            vc::atlas::Atlas::load(options.atlasDir, options.volpkgRoot);
+            vc::atlas::Atlas::load(options.atlasDir, store);
         if (atlas.metadata.baseMeshPath.empty()) {
             throw std::runtime_error("atlas metadata is missing base_mesh_path");
         }

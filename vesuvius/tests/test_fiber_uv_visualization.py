@@ -4,10 +4,14 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_visualization import segments,progression,render_layout
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def fixture():
     d=dict(phase=np.array([.1,.2,.3]),z=np.array([1.,2.,3.]),family=np.array([0,1,0]),
         node_ds=np.array([[0.,-5.,-10.],[0.,10.,20.],[0.,5.,10.]]),
-        source_id=np.array([42,43,44]),start=np.zeros(3),end=np.array([10.,20.,10.]))
+        source_id=np.array([fid(42),fid(43),fid(44)]),start=np.zeros(3),end=np.array([10.,20.,10.]))
     state=np.zeros((3,9));state[:,:3]=np.log([[.6,.3,.1],[.2,.6,.2],[.1,.1,.8]])
     return d,state,np.array([100.,200.]),dict(layout_mode='shared_anchor',broken_threshold=.5,render_height=800)
 
@@ -162,6 +166,6 @@ def test_fresh_layout_only_without_gpu(tmp_path,monkeypatch):
         render_height=900,raster_map_only=True,solutions=[dict(label='test',run_root=str(root))]))
     assert reports[0]['confidence']['raster_size'][1]==900
     assert reports[0]['confidence']['retained_pieces']==2
-    np.savez(root/'solution.npz',state=s,widths=w,**dict({k:d[k] for k in ('start','end','family')},source_id=d['source_id']+1))
+    np.savez(root/'solution.npz',state=s,widths=w,**dict({k:d[k] for k in ('start','end','family')},source_id=np.roll(d['source_id'],1)))
     with pytest.raises(ValueError,match='identity mismatch'):
         vis.run(dict(output_root=str(tmp_path/'bad'),layout_only=True,solutions=[dict(label='test',run_root=str(root))]))

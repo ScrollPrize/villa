@@ -6,6 +6,7 @@
 #include "geometry/GeometryDelta.hpp"
 #include "internal/History.hpp"
 #include "geometry/SharedGeometry.hpp"
+#include "geometry/SequenceMetadata.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -213,18 +214,15 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
     if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
         historyConflict(db, "geometry: current revision changed; reload before committing");
-    if (current) {
-        GeometryReader existing(txn,current->uuid);
-        if (existing.manifest().contains("sequences") || identityManaged(db,objectUuid))
-            throw std::invalid_argument("identity-managed sequences require structural or sparse edits");
-        const auto source=nlohmann::json::parse(object->meta).value("source",nlohmann::json::object());
-        if (current->kind=="point_collection" && source.contains("point_attributes")) {
-            const auto ids=std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a) { return a.name=="point_ids"; });
-            if (ids!=data.arrays.end() && ids->bytes!=existing.read("point_ids",0))
-                throw std::invalid_argument("annotated point identities require structural editing");
-        }
+    if (current && data.kind != "patch")
+        throw std::invalid_argument("sequences require structural or sparse edits");
+    Savepoint savepoint(db);
+    auto source = nlohmann::json::parse(object->meta).value("source", nlohmann::json::object());
+    auto manifest = detail::geometryManifest(data, storage.patchTileSize);
+    if (data.kind != "patch") {
+        manifest["sequences"] = initialSequences(db, data, source);
+        setMeta(txn, objectUuid, "source", source.dump());
     }
-    const auto manifest = detail::geometryManifest(data, storage.patchTileSize);
     const auto manifestText = manifest.dump();
     if (geometryWork) geometryWork->manifestBytesWritten += manifestText.size();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
@@ -238,15 +236,15 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     }
     if (unchanged) {
         if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        savepoint.release();
         return current->uuid;
     }
     const auto after = detail::dependencyGeometry(data);
     const auto affected = affectedEdges(*this, txn, object->uuid, current, after);
     const auto decisions = validateEdgeEdits(*this, txn, db, object->uuid, after, affected, edgeEdits);
 
-    Savepoint savepoint(db);
     const auto revisionUuid = util::newUuid();
-    writeRevision(db, *this, *object, revisionUuid, current ? &*current : nullptr, contentHash, manifestText);
+    writeRevision(db, *this, *objectByUuid(txn, objectUuid), revisionUuid, current ? &*current : nullptr, contentHash, manifestText);
     writeArrays(db, revisionUuid, data.arrays, manifest);
 
     detail::clearGeometryMaterialization(db, objectUuid);
@@ -372,6 +370,29 @@ std::vector<EdgeRecord> ObjectStore::affectedGeometryEditEdges(const Txn& txn, c
     return affectedEdges(*this, txn, objectUuid, currentGeometry(txn, objectUuid), plan->after);
 }
 
+namespace {
+// Structural snapshots compare by array fingerprint: an edge whose arrays are
+// untouched is unaffected, even when it records a point that no longer exists.
+detail::DependencyGeometry structuralAfter(const GeometryData& data, const nlohmann::json& manifest)
+{
+    auto after=detail::dependencyGeometry(data);
+    after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
+    for(const auto& [name,a]:manifest.at("arrays").items())after.fingerprints[name]=a.dump();
+    return after;
+}
+}
+
+std::vector<EdgeRecord> detail::structuralSnapshotEdges(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
+    const GeometryData& data, const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds)
+{
+    DependencyScope scope;
+    const auto current=store.currentGeometry(txn,objectUuid);
+    if (!current) throw std::invalid_argument("structural edits require existing geometry");
+    auto manifest=geometryManifest(data,revisionPatchTileSize(txn,*current));
+    manifest["grid_origin"]=current->gridOrigin;
+    return affectedEdges(store,txn,objectUuid,current,structuralAfter(data,manifest),changedIds);
+}
+
 std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid,
     const GeometryData& data, nlohmann::json previous, const std::string& expected, const std::vector<GeometryEdgeEdit>& edgeEdits,
     const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds)
@@ -383,9 +404,7 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     if (!current || current->uuid != formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
     auto manifest=geometryManifest(data,revisionPatchTileSize(txn,*current));
     for(const auto* field:{"sequences","grid_origin"})if(previous.contains(field))manifest[field]=previous.at(field);
-    auto after=dependencyGeometry(data);
-    after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
-    for(const auto& [name,a]:manifest.at("arrays").items())after.fingerprints[name]=a.dump();
+    auto after=structuralAfter(data,manifest);
     bindSequenceIdentities(after,db,manifest);
     const auto affected=affectedEdges(store,txn,objectUuid,current,after,changedIds);
     const auto decisions=validateEdgeEdits(store,txn,db,objectUuid,after,affected,edgeEdits);
@@ -413,9 +432,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     DependencyScope scope;
     const auto currentRevision=currentGeometry(txn,objectUuid);
     if (!currentRevision || currentRevision->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-    const auto source=nlohmann::json::parse(objectByUuid(txn,objectUuid)->meta).value("source",nlohmann::json::object());
-    for (const auto& edit:edits) if ((edit.array=="point_ids" || edit.array=="control_point_ids") && !edit.bytes.empty() &&
-        (source.contains("point_attributes") || identityManaged(db,objectUuid)))
+    for (const auto& edit:edits) if ((edit.array=="point_ids" || edit.array=="control_point_ids") && !edit.bytes.empty())
         throw std::invalid_argument("annotated point identities require structural editing");
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     const auto current = *currentGeometry(txn, objectUuid);
@@ -560,3 +577,30 @@ std::string ObjectStore::editGeometryRectangle(WriteTxn& txn, const std::string&
 }
 
 } // namespace vc::objects
+
+namespace vc::objects {
+GeometryData ObjectStore::readGeometryData(const Txn& txn, const std::string& uuid, uint64_t budget) const
+{
+    const auto revision = geometryRevision(txn, uuid);
+    if (!revision) throw std::invalid_argument("geometry revision not found");
+    uint64_t total = 0;
+    for (const auto& array : revision->arrays) {
+        if (array.byteLength < 0 || uint64_t(array.byteLength) > budget - total)
+            throw std::runtime_error("geometry read exceeds byte budget; use bounded ranges");
+        total += uint64_t(array.byteLength);
+    }
+    GeometryData data; data.kind = revision->kind; data.formatVersion = revision->formatVersion;
+    data.coordinateSystem = revision->coordinateSystem; data.attributes = revision->attributes;
+    for (const auto& info : revision->arrays) {
+        GeometryArray array{info.name, info.dtype, info.shape, {}};
+        array.bytes.reserve(size_t(info.byteLength));
+        for (int64_t offset = 0; offset < info.byteLength;) {
+            const auto count = std::min<int64_t>(1024 * 1024, info.byteLength - offset);
+            auto bytes = readGeometryArray(txn, uuid, info.name, offset, count);
+            array.bytes.insert(array.bytes.end(), bytes.begin(), bytes.end()); offset += count;
+        }
+        data.arrays.push_back(std::move(array));
+    }
+    return data;
+}
+}

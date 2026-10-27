@@ -20,7 +20,7 @@ try {
         else if (arg == "--overwrite") overwrite = true;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_export --db objects.vcobj --uuid UUID --output PATH [options]\n"
-                "  --revision UUID  export a historical revision (default: current)\n"
+                "  --revision UUID  export a historical object revision (default: current)\n"
                 "  --overwrite      replace the entire destination atomically\n"
                 "Exports one patch directory, fiber JSON, single-collection JSON, or\n"
                 "single-track packed directory. The output parent must already exist.\n"

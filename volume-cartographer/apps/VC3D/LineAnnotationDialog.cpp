@@ -996,6 +996,23 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         settings.setValue(vc3d::settings::line_annotation::MIRROR_CURSOR_ACROSS_PANES, checked);
         applyLinkedCursorMirroringToPanes();
     });
+    auto* openEditableAction = annotationMenu->addAction(tr("Open fibers editable"));
+    openEditableAction->setCheckable(true);
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        openEditableAction->setChecked(
+            settings
+                .value(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE,
+                       vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE_DEFAULT)
+                .toBool());
+    }
+    openEditableAction->setToolTip(
+        tr("Checked: stored fibers open with editing enabled.\n"
+           "Unchecked: they open read-only until Enable editing is clicked."));
+    connect(openEditableAction, &QAction::toggled, this, [](bool checked) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::OPEN_FIBERS_EDITABLE, checked);
+    });
     _resetViewsAction = annotationMenu->addAction(tr("Reset views"));
     _resetViewsAction->setEnabled(false);
     connect(_resetViewsAction, &QAction::triggered, this, [this]() {
@@ -1164,6 +1181,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // The side-strip intersection query still runs (it feeds the fiber-
     // intersection X markers); we just no longer show a progress indicator.
     // _sideStripIntersectionProgress stays null and its setters no-op.
+    _enableEditingButton = new QPushButton(tr("Enable editing"), buttonRow);
+    _enableEditingButton->setObjectName(QStringLiteral("lineAnnotationEnableEditingButton"));
+    _enableEditingButton->setToolTip(
+        tr("Stored fibers open read-only, so opening one never re-solves or rewrites it. "
+           "Enable editing to change it, or check \"Open fibers editable\" in the menu."));
+    _enableEditingButton->hide();
+    buttonLayout->addWidget(_enableEditingButton);
+    connect(_enableEditingButton, &QPushButton::clicked, this, &LineAnnotationDialog::editingRequested);
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -1433,8 +1458,9 @@ void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
         const QSignalBlocker blocker(_controlAngleSpin);
         const double angle = _angleControlIndex
             ? _generatedViews.controlAngleOffsetsDegrees[*_angleControlIndex] * _displayTangentSign : 0;
-        if (_controlAngleSpin->isEnabled() != _angleControlIndex.has_value())
-            _controlAngleSpin->setEnabled(_angleControlIndex.has_value());
+        const bool angleEditable = _angleControlIndex.has_value() && !_readOnly;
+        if (_controlAngleSpin->isEnabled() != angleEditable)
+            _controlAngleSpin->setEnabled(angleEditable);
         if (std::abs(_controlAngleSpin->value() - angle) >= 0.005) _controlAngleSpin->setValue(angle);
     }
     for (size_t i = 0; i < _fiberGuides.size(); ++i) {
@@ -1710,7 +1736,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionProgress(const QStri
         tr("strip intersections: %1%").arg(value));
 }
 
-void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount)
+void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers)
 {
     if (_closing || !_sideStripIntersectionProgress) {
         return;
@@ -1719,7 +1745,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t marker
     _sideStripIntersectionProgress->setRange(0, 100);
     _sideStripIntersectionProgress->setValue(100);
     _sideStripIntersectionProgress->setFormat(
-        tr("strip intersections: %1").arg(markerCount));
+        unboundFibers ? tr("strip intersections: %1 (incomplete: %2 unbound fibers)").arg(markerCount).arg(unboundFibers) : tr("strip intersections: %1").arg(markerCount));
 }
 
 void LineAnnotationDialog::setGeneratedSideStripIntersectionError()
@@ -2109,6 +2135,20 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 {
     _closeAfterFinalizationAllowed = allowed;
+}
+
+void LineAnnotationDialog::setReadOnly(bool readOnly, bool canEdit)
+{
+    _readOnly = readOnly;
+    _enableEditingButton->setVisible(readOnly);
+    _enableEditingButton->setEnabled(canEdit);
+    if (!canEdit) {
+        _enableEditingButton->setToolTip(
+            tr("This fiber cannot be edited: the object store is attached read-only "
+               "or the fiber does not decode."));
+    }
+    _fiberWidthSpin->setEnabled(!readOnly);
+    if (_controlAngleSpin && readOnly) _controlAngleSpin->setEnabled(false);
 }
 
 void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)

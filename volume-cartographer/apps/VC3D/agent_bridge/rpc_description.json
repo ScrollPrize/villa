@@ -800,6 +800,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "editable": {
+            "default": false,
+            "type": "boolean"
+          },
           "fiberId": {
             "type": [
               "string",

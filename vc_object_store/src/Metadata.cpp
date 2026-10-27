@@ -1,5 +1,5 @@
 #include "internal/RecordSql.hpp"
-#include "internal/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -83,6 +83,8 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 
 void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
 {
+    if (key == "source")
+        validateGeometrySourceMetadata(static_cast<sqlite3*>(connection(txn)), recordUuid, nlohmann::json::parse(jsonValue));
     if (key == "coordinates") {
         const auto object = objectByUuid(txn, recordUuid);
         if (object && hasGeometryCoordinates(object->kind)) {
@@ -99,11 +101,18 @@ void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
 }
 
+int64_t ObjectStore::journalPosition(const Txn& txn) const
+{
+    Statement position(static_cast<sqlite3*>(connection(txn)), "SELECT COALESCE(MAX(seq),0) FROM journal");
+    position.row();
+    return position.i64(0);
+}
+
 std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afterSeq) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq",
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation,record_kind FROM journal WHERE seq>? ORDER BY seq",
         afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
@@ -120,6 +129,7 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
         e.approvedAt = s.optText(9);
         e.approvedHost = s.optText(10);
         if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
+        e.kind = s.text(12);
         out.push_back(std::move(e));
     }
     return out;
