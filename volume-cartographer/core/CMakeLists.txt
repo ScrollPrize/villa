@@ -32,7 +32,6 @@ add_library(vc_core
         src/QuadSurfaceStore.cpp
         src/StoreSurfaces.cpp
         src/SurfaceMeshing.cpp
-        src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
@@ -42,7 +41,6 @@ add_library(vc_core
         src/RemoteCacheSettings.cpp
         src/HttpFetch.cpp
         src/S3AuthFallback.cpp
-        src/PostProcess.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
         src/StoredCollection.cpp
@@ -54,7 +52,6 @@ add_library(vc_core
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
         src/render/PinnedChunkRegion.cpp
-        src/render/SamplingWaitProfile.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp

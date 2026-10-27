@@ -475,7 +475,7 @@ void readVolumeImpl(cv::Mat_<T>& out, IChunkedArray& cache, int level,
     const int w = coords.cols;
     // Bottom-of-stack contract enforcer: the inner loop relies on out.ptr<T>(y)
     // returning a valid row pointer, which is only true after create(). Higher
-    // layers (Volume::sample, Render.cpp helpers, callers) also size `out`, but
+    // layers (Volume::sample, callers) also size `out`, but
     // this guard keeps the invariant local to where it's depended on.
     if (out.size() != coords.size()) {
         out.create(coords.size());

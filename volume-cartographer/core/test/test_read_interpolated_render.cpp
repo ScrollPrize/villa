@@ -1,4 +1,4 @@
-// readInterpolated3D (under render_image_from_coords and Volume::sample) with
+// readInterpolated3D (under Volume::sample) with
 // an empty output Mat: the pixel-write loop must size it before writing rows,
 // or out.ptr<T>(y) on the empty Mat faults on the first row.
 //

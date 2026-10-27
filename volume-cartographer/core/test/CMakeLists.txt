@@ -67,13 +67,6 @@ endfunction()
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
-vc_add_test(NAME test_sampling_wait_profile)
-add_test(NAME test_sampling_wait_profile_enabled
-    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
-        $<TARGET_FILE:test_sampling_wait_profile>)
-vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
-
-
 vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
@@ -708,10 +701,6 @@ vc_add_test(NAME test_quadsurface_save_paths)
 
 
 vc_add_test(NAME test_chunked_tensor_meta LIBS doctest::doctest vc_tracer)
-
-vc_add_test(NAME test_post_process_util)
-
-vc_add_test(NAME test_render)
 
 vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer
