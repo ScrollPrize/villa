@@ -609,11 +609,64 @@ VC3D build directory had tests enabled).
   smoke). `ctest -R spiral`: 10 passed, including `spiral_store_inputs` and
   `spiral_service_protocol`.
 
-Not run, because the GPU was held by another job throughout: stage 0's
-1,000-step GPU fit, the real short session of step 1 (preview manifest and
-checkpoint provenance keys), and step 14's real-data service fit inspected in
-VC3D. The VC3D workspace was built and its logic tested, but not driven
-interactively.
+Not run at step 12, because the GPU was held by another job: stage 0's
+1,000-step GPU fit and the real short session of step 1 (preview manifest
+and checkpoint provenance keys). Step 14's service fit below covers both
+on the same data. The VC3D workspace was built and its logic tested, but not
+driven interactively.
+
+### Stage 1 steps 13-14 record (2026-10-27)
+
+Step 13 landed as `58b5aab71` (service: editing workspace, publication,
+live input batches and input uploads removed; `MutationCoordinator` and
+`ClientLease` moved to `service_mutations.py`) and `7d9eeea69` (VC3D:
+staging, working copies, `SpiralInputDraft`/`SpiralInputCopy` and their
+test, the workspace's upload/commit bookkeeping, the "pending patches only"
+display and the panel's per-input actions removed; the brush and point
+editors kept, listed as local drafts). `spiral_service_protocol` no longer
+checks a frozen-input refusal through the client, which has no input-change
+call left; the service's 404 for the removed routes is tested in
+`test_service_object_store.py`. `VC3D --test-object-store` imports a
+transported fiber component directly instead of through the workspace.
+Suites after step 13: spiral-fitting 935 passed, 77 skipped, 11 failed (the
+known CpuTrackStorage/track-crossing tests and `test_grow_track_store`'s
+`area_cm2` KeyError, all failing before stage 1); `ctest -R spiral` 9
+passed; `VC3D --test-object-store` passed.
+
+Step 14: README "Object store and frozen inputs" and "Connecting from VC3D",
+launch commands with `--object-store`, and `volume-cartographer/docs`.
+Real-data service fit (one RTX 3090, shared with an inference endpoint),
+from `spiral-fitting/`: `spiral_service.py --dataset DIR --object-store
+STORE --object-store-author stage1-acceptance --output OUT --api-key-file
+KEY`, where DIR holds only `spiral-scroll.json`, `umbilicus.json`,
+`lasagna_inputs/`, `outer_shell/` and `fiber_directions.npz` and STORE is a
+copy of the stage 0 acceptance store; an HTTP client claimed the lease,
+initialized with `{"run": {"z_begin": 8900, "z_end": 9300, "config":
+{"optimizer_num_training_steps": 1000, "dense_spacing_mode": "grad_mag",
+"loss_weight_dense_spacing_density": 0, "loss_weight_dense_normals": 0,
+"loss_weight_dense_spacing": 0}}}`, ran 1,000 iterations, saved a
+checkpoint, exported a preview and released the lease.
+
+- Startup refresh: 553 PCL-patch, 6 fiber-patch, 444 overlap links
+  created. Selection 181 surfaces, 662 point collections, 111 fibers;
+  relationships fiber_branch 100, fiber_patch 6, patch_overlap 444,
+  pcl_patch 553; 100 fiber links in 11 components.
+- Loss 1747 -> 474 -> 125 -> 38 -> 28 at steps 0/200/400/600/800, 89 at
+  1,000, all finite. Build, 1,000 steps, save and published preview: 121 s.
+- Digest `1835418770f6...` in status, the `spiral-input-manifest` artifact,
+  the checkpoint's `input_manifest.object_store_digest`, the autosave
+  metadata and the preview index entry of the published preview (model
+  state `c4a9d8aae29f...`, source iteration 1,000, pinned by both the
+  checkpoint and the autosave).
+- VC3D's pinned reader (`SPIRAL_STORE_INPUTS_DUMP`) resolved all 954
+  objects of the published input manifest in the store at their pins.
+- The same fit on z 9000-9100 trained (finite losses, 1,000 steps) but its
+  preview did not publish: "Lasagna correspondence mapped no preview
+  windings". The 21-row surface keeps 12 vertices after
+  `_prepare_cleaned_lasagna_surface`'s 3-cell erosion and largest
+  component; 400 slices keep 40.5%. Stage 1 did not change preview export
+  or Lasagna publication: narrow windows need a fix there, outside this
+  plan.
 
 Stage 2 has its own sequence (below), after the stage 1 gate. It depends on
 step 2's replica-independent identities, step 4's lease, step 10's pinned

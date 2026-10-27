@@ -47,9 +47,10 @@ the fitting variables say.
 
 ## Editing input snapshots
 
-The service snapshots patch directories, fiber JSON files and point collections
-when claiming a dataset editing workspace. `input_snapshot.py` tries Linux
-`FICLONE` or macOS `clonefile` for independent copy-on-write files. Unsupported
+`input_snapshot.py` snapshots directory trees (it served the file-input editing
+workspace, which the object store replaced; the service no longer calls it).
+It tries Linux `FICLONE` or macOS `clonefile` for independent copy-on-write
+files. Unsupported
 filesystems and cross-filesystem copies fall back to a streamed copy; other I/O
 errors propagate. Hard links are never used.
 
@@ -65,9 +66,7 @@ Run the focused tests using the existing environment, from the repository root:
 
 ```sh
 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_input_snapshot.py \
-  spiral-fitting/tests/test_service_editing.py \
-  spiral-fitting/tests/test_service_editing_http.py
+  spiral-fitting/tests/test_input_snapshot.py
 ```
 
 Benchmark real patches (temporary copies are removed; sources stay unchanged):
@@ -508,14 +507,6 @@ validate this particular sampled-median rule or its combination with Adam.
 
 ## Spiral service host setup
 
-> **The service cannot currently run a fit.** The fitter now reads patches,
-> fibers and point collections only from an object store (see
-> [Object-store inputs](#object-store-inputs)), and the service has not been
-> migrated: it still hands the fitter dataset files and editing-workspace
-> input bindings, which the fitter no longer accepts. Use the command-line
-> fit until the service is ported. The setup below describes the service as
-> it will run again after that migration.
-
 VC3D connects to a Spiral service in one of three modes, all speaking the same
 authenticated HTTP protocol:
 
@@ -533,14 +524,53 @@ authenticated HTTP protocol:
   service's auto-generated API key. No reverse proxies, VPNs, or manual
   tunnels are ever required.
 
-In every mode the service — not the client — owns the base inputs: it is
-launched with `--dataset` (inputs) and `--output` (all generated state),
-resolves the dataset once at startup, and advertises the result through
-`/dataset`. `--output` must resolve outside the dataset root; the optional
-`--cache` (derived host caches) defaults to the documented user cache,
-`$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients can add
-ephemeral inputs, commit them, and change run parameters, but cannot repoint
-the session at different host paths.
+In every mode the service — not the client — owns the inputs: it is launched
+with `--dataset` (umbilicus, scroll specification, tracks, Lasagna volumes and
+the outer shell), `--object-store` (patches, point collections, fibers and
+their links; see [Object-store inputs](#object-store-inputs)) and `--output`
+(all generated state), resolves them once at startup, and advertises the
+result through `/dataset`. `--output` must resolve outside the dataset root;
+the optional `--cache` (derived host caches) defaults to the documented user
+cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
+run parameters but cannot repoint the session at other host paths or another
+object store.
+
+### Object store and frozen inputs
+
+`--object-store STORE.vcobj` binds the service to one store for its lifetime;
+`--object-store-author NAME` names the author of the links its startup
+refresh writes (default `spiral-service@<host>`). `object_store_path` and
+`object_store_author` are service-owned configuration: `/configuration` lists
+them under `service_owned`, a request that leaves them out or repeats the
+bound values is accepted, and a request naming another store is refused.
+VC3D removes them from saved profiles before sending a request.
+
+Each build (Initialize Fit, a full Rebuild Fit, a startup resume) selects
+inputs with the `object_store_*` selection keys exactly as the command-line
+fit does, refreshes links unless `object_store_refresh_links` is false, and
+freezes the result. A resident fit's inputs never change: the service has no
+route that adds, edits or removes them, and runs, pauses, checkpoint loads and
+model-only rebuilds keep them. To fit current store content, rebuild with
+`POST /session/rebuild {"inputs": "reload"}` (VC3D: *Rebuild Fit* →
+*Rebuild with Current Inputs*), which tears the session down and rereads the
+store. Without `"inputs"` a rebuild that changes only model configuration
+keeps the frozen inputs and one that changes anything else rereads them; the
+response's `inputs` says which happened.
+
+Status carries `input_digest` (the replica-independent digest of the frozen
+selection) and `input_summary` (counts per kind and relationship, the volume,
+whether links were refreshed). Every build publishes the selection, with each
+object's and relationship's revision pins, as an `input_manifest` artifact
+(`object_store_inputs.json`). Previews, the preview index and autosave
+metadata record the digest of the inputs they were made from. A checkpoint
+whose recorded inputs differ from the session's is refused with the
+differences, the `{"inputs": "reload"}` remedy and the
+`object_store_allow_changed_inputs` override.
+
+Only one client changes a session at a time: mutating requests carry the
+`X-Spiral-Session-Token` of the client holding the session lease
+(`/session/lease/claim`, `/session/lease/release`), and one service holds the
+lease file under its output directory. Uploads accept resume checkpoints only.
 
 ### Creating the Spiral Python environment
 
@@ -613,12 +643,12 @@ Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
 tmux new -s spiral-alice 'python spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
-    --gpus 0 --session-name alice'
+    --dataset /data/scrolls/s1 --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 0 --session-name alice'
 
 tmux new -s spiral-bob 'python spiral_service.py --port 8766 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 \
-    --gpus 1 --session-name bob'
+    --dataset /data/scrolls/s1 --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 1 --session-name bob'
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
@@ -627,15 +657,16 @@ host-side list:
 
 ```sh
 python spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1 --gpus 0,1,2,3
+    --dataset /data/scrolls/s1 --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1 --gpus 0,1,2,3
 ```
 
 Multi-GPU sessions run one fitter rank per listed device and split the configured
 per-step sample counts across those ranks by default. The device list is fixed for
 the lifetime of the service; restart it to change the selection.
 
-A named service writes autosaves, previews, artifacts, uploaded checkpoints,
-Lasagna output, and ephemeral inputs beneath `<output>/<session-name>/`, held
+A named service writes autosaves, previews, artifacts, uploaded checkpoints
+and Lasagna output beneath `<output>/<session-name>/`, held
 under an exclusive lease: two live services cannot own the same
 output/session-name pair. Launches without `--session-name` use `<output>/`
 directly. Permanent dataset inputs and the shared user cache stay untouched —
@@ -692,7 +723,8 @@ attached terminal is not disconnected.
 
 ```sh
 python spiral_service.py --bind 0.0.0.0 --port 8765 \
-    --dataset /data/scrolls/s1 --output /data/spiral-output/s1
+    --dataset /data/scrolls/s1 --object-store /data/scrolls/s1.vcobj \
+    --output /data/spiral-output/s1
 ```
 
 Copy the API key printed at startup into the *Remote (LAN)* profile's API key
@@ -719,13 +751,13 @@ validation and never ignores certificate errors.
 
 `--dataset` must point at a dataset root containing at least `umbilicus.json`
 and `spiral-scroll.json`; the service refuses to start when either is missing.
-Verified patches are required when their default-on input toggle is active,
-but a patch-free fit can initialize with that source disabled. The dataset
-holds inputs only.
+Patches, point collections and fibers are not read from the dataset: they
+come from `--object-store`, and a `verified_patches` or `fibers` path override
+left in `spiral-scroll.json` is ignored. The dataset holds inputs only.
 
 `--output` is required and must resolve outside the dataset root. Every piece
 of generated state — run directories, autosaves, previews, published
-artifacts, ephemeral inputs, upload staging, and uploaded checkpoints — lives
+artifacts, upload staging, and uploaded checkpoints — lives
 under it (under `<output>/<session-name>` for a named service). Make sure its
 filesystem has room for checkpoints and previews.
 
@@ -735,8 +767,8 @@ datasets). It defaults to `$XDG_CACHE_HOME/vc3d/spiral`
 headless `fit_spiral.py` CLI accepts the same `--cache` with the same default
 (`FIT_SPIRAL_CACHE_DIR` still overrides it for the CLI).
 
-If the dataset root is read-only the fit still works, but *Commit current
-inputs* is unavailable (committing writes inputs into the dataset).
+The service never writes the dataset; its only store writes are the startup
+link refresh, as `--object-store-author`.
 
 ### Connecting from VC3D
 
@@ -750,11 +782,24 @@ parameters (z range, iterations, advanced config) stay editable and persist
 per profile. Generated previews, geometry, and
 checkpoints transfer through the artifact API into a local cache — no shared
 filesystem is needed. Optional: set the profile's **Local dataset path** if
-this machine mounts the same dataset, so input surface overlays
-(verified patches/shell) can be displayed locally. It is assumed to
-correspond to the dataset root the service advertises, which is the prefix
-service paths are translated from; without it those overlays are simply marked
-unavailable.
+this machine mounts the same dataset, so the outer shell overlay can be
+displayed locally. It is assumed to correspond to the dataset root the
+service advertises, which is the prefix service paths are translated from;
+without it that overlay is simply marked unavailable.
+
+The fit's patches and point collections are displayed from the object store
+attached in VC3D, never from service files. A local profile launches its
+service with `--object-store` set to the attached store; for a remote profile,
+attach a replica of the store the service was started with. The panel's
+*Object store* row compares the store UUIDs: when they differ, or no store is
+attached, the fit's inputs are not displayed. When they match, VC3D downloads
+the session's input manifest and reads each fitted surface and collection at
+its pinned revision, so the overlays show what was fitted even after the
+store moves on. *Fit inputs* lists the digest, the counts per kind and the
+links; it notes inputs missing from the attached store, fitted inputs edited
+in the store before or after the view loaded, and other store changes a
+rebuild's selection may include, and points to *Rebuild Fit* to read them.
+Pinned fibers are read but not drawn yet.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
 name and voxel resolution and of the Lasagna store layout (zarr groups,
@@ -779,125 +824,61 @@ the outer shell. For example:
 ```
 
 Every role switch requires a whole-fit rebuild: the switches select the
-fit's frozen object-store inputs. Disabled roles retain their accepted workspace
-content, and enabling a role restores that desired content. Disabling a
-prerequisite also disables its dependent supervision: winding inference
-needs the outer shell.
+fit's frozen object-store inputs, and a disabled role's store content is
+simply not selected. Disabling a prerequisite also disables its dependent
+supervision: winding inference needs the outer shell.
 
-The API 33 client and service use one revisioned input workspace per dataset.
-One service holds the dataset editing lease and one client owns that workspace;
-other connections can observe. Disconnecting retains ownership, drafts and
-command receipts. Reconnect with the same client resumes them. A fit rebuild
-replays desired inputs without replacing the editing workspace. Reconnect and
-rebuild also discover newly added dataset inputs, preserving their collection
-IDs and any existing workspace edits. A restarted service replaces a clean
-client catalog; pending edits or commands stay tied to their original workspace.
-
-**Add/Apply changes** captures the selected local revisions and applies the
-whole validated batch at a worker boundary, including while idle or after the
-final step. **Commit current inputs** first applies the selected revisions,
-then persists those exact revisions. Editing can continue during either action;
-a response for an older revision leaves newer edits dirty. Failed transfers or
-publication can be retried with the retained command and bytes.
+Patches, point collections and fibers cannot be added to or edited in a
+resident fit from VC3D: *Add* and *Commit* stay disabled and say why. Edit
+them in the store and rebuild with current inputs. The drawing tools below
+still work and keep their drawings in VC3D, listed as local drafts in the
+input list (Remove discards one), for store-backed editing to submit; leaving
+the workspace with drawings asks before discarding them.
 
 In the flattened Spiral preview, tap `Ctrl` to toggle patch painting: left-drag
 paints, right-drag erases, and `Escape` exits. Ctrl+wheel changes brush size
 without toggling the mode; Shift+right-drag draws control-point lines. Starting
 a stroke on a session-drawn selection extends that patch in its original color.
-Drawn selections remain brush-editable after Apply and Commit, including across
-preview updates when their original surface can be projected onto the new one.
-Finalization keeps the largest edge-connected component of complete quads;
-selections with no complete quad remain editable and report an error.
-
-Drawn patches use the same editing workspace as other inputs. Add/Apply and
-Commit capture their current selections; an edit made while an older snapshot
-is being saved stays dirty. Erasing a previously staged patch completely stages
-a deletion on the next Add/Apply. The input list shows local brush errors and
-colors; Remove on a local brush edit discards that edit. Dataset patches use
-the existing managed patch editor.
+Drawn selections remain brush-editable across preview updates when their
+original surface can be projected onto the new one. Finalization keeps the
+largest edge-connected component of complete quads; selections with no
+complete quad remain editable and report an error.
 
 Brush regression checks use the existing build and Python environment:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_input_workflow test_spiral_input_draft test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
-AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|input_workflow|input_draft|point_placement_mode|point_collection_edit)$' --output-on-failure
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target VC3D test_spiral_brush_patch test_spiral_point_placement_mode test_spiral_point_collection_edit -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen ctest --test-dir volume-cartographer/build -R '^spiral_(brush_patch|point_placement_mode|point_collection_edit)$' --output-on-failure
 ```
 
 Set `SPIRAL_PATCH_REAL_INPUT` to a real tifxyz patch directory to include the
-read-only selection check and draft-copy validation. `SPIRAL_PATCH_EVIDENCE_DIR`
+read-only selection check. `SPIRAL_PATCH_EVIDENCE_DIR`
 optionally receives before/after selection-mask images. These checks cover CPU
 geometry and the editing workflow; they do not run GPU fitting.
 
 In the Spiral workspace, `Q` and `E` place same-winding and relative-winding
 points. Relative annotations count 0, 1, 2, ... in placement order; `F` reverses
-the chain and mirrors annotations. Existing collections remain editable after
-Apply. Shift+E prepares local drafts. Managed patch and fiber editors save to
-session working copies; successful saves update drafts and do not apply or
-commit automatically. Linked-fiber saves use working copies for their peers.
+the chain and mirrors annotations. Shift+E marks local drafts ready.
 
-The input list includes baseline dataset entries and additions, with a filter
-and selection checkboxes. Edit, Remove, Restore, Retry and Discard Local Changes
-operate on individual drafts. Applying Remove stops future supervision;
-Commit deletes the managed dataset entry. Restore remains available before
-committing a deletion. Baseline restores reference the retained service revision
-and do not require access to the service filesystem. Removal cannot reverse
-completed optimizer steps.
-Invalid selected drafts keep the batch unapplied and remain editable. Scoped
-external-source conflicts offer Use Current, Apply Local After Review, or Save
-Local as New; unrelated PCL collection changes are merged during publication.
-
-Editing workspaces are disposable session storage. **Discard and Exit** drops
-local drafts and releases the workspace directly. **Commit** exits only after
-publication succeeds, then releases temporary copies. Release and service
-shutdown stop file users and remove the entire `editing-workspaces/<id>`
-directory, including baseline snapshots, revisions and uploads. Reconnect,
-Stop, and Rebuild keep the workspace and its drafts. The next claim snapshots
-only committed dataset inputs.
-
-New workspaces carry versioned ownership metadata and a lifetime advisory lock.
-Startup reclaims marked directories whose owner has exited, including after a
-crash or forced termination. Live owners, symlinks, unrecognized markers and
-legacy folders without markers are left untouched; legacy storage requires
-manual cleanup. Dataset inputs, saved fit outputs, exports and shared caches
-are preserved. Interrupted Commit recovery directories (`.spiral-publication-*`
-beside dataset targets) are retained and their paths logged. Cleanup errors are
-reported with the workspace path; when a reader or worker cannot stop, files
-and ownership remain intact for a release retry or later startup reclamation.
-
-Cleanup regression checks (no installation needed):
+Protocol and acceptance checks for the store-backed service (from the
+repository root; `vc_object_store`'s Python module on `PYTHONPATH`):
 
 ```bash
-AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -m pytest -q \
+AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:<store-build>/python spiral-fitting/.venv/bin/python -m pytest -q \
+  spiral-fitting/tests/test_service_object_store.py \
+  spiral-fitting/tests/test_runtime_object_store.py \
+  spiral-fitting/tests/test_service_mutations.py \
   spiral-fitting/tests/test_workspace_cleanup.py \
-  spiral-fitting/tests/test_service_editing.py \
-  spiral-fitting/tests/test_service_editing_http.py \
   spiral-fitting/tests/test_spiral_service_v2.py
+AGENTS_AGENT_MODE=1 cmake --build volume-cartographer/build --target test_spiral_store_inputs test_spiral_service_protocol -j 4
+AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
+  PYTHONPATH=<store-build>/python ctest --test-dir volume-cartographer/build -R '^spiral_' --output-on-failure
 ```
 
-Set `SPIRAL_REAL_PCL=/path/to/real/abs_winding.json` for the real-scroll
-close/reopen check. It edits a temporary dataset copy and verifies that both the
-source bytes and committed copy remain unchanged; it uses a resident test double
-and does not run GPU fitting.
-
-Regression checks for this workflow (using existing environments/builds):
-
-```bash
-# From the repository root:
-AGENTS_AGENT_MODE=1 spiral-fitting/.venv/bin/python -m pytest -q \
-  spiral-fitting/tests/test_service_editing.py spiral-fitting/tests/test_service_editing_http.py \
-  spiral-fitting/tests/test_revisioned_runtime.py
-AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build test_spiral_input_draft test_spiral_input_workflow -j 2
-AGENTS_AGENT_MODE=1 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" ctest --test-dir volume-cartographer/build -R '^spiral_input_(draft|workflow)$' --output-on-failure
-```
-
-The workflow tests start a loopback HTTP service and cover remote baseline
-restore, service restart, and edits made while a submission is running.
-The service suite includes transfer, revision, conflict, and publication recovery
-checks; the runtime tests cover worker boundaries.
-
-Input uploads only transfer immutable bytes. The editing workspace owns
-acceptance, application, and persistence; there is no separate ephemeral-input
-ledger or automatic commit on editor save. Checkpoint uploads remain service-scoped.
+`spiral_service_protocol` starts `spiral_service.py` on a real store (its
+runtime faked by `tests/protocol_client_service.py`) and drives
+`SpiralServiceManager` through the lease, store binding, input manifest and
+reload rebuild; it is skipped without `SPIRAL_TEST_PYTHON`.
 
 Directional DT timing is an independent control on every interactive Run.
 When **Restrict DT losses to final** is unchecked, the Run adds no DT gate.
@@ -910,14 +891,6 @@ suppresses DT for the whole Run and 100% adds no suppression. Stopping early
 does not recalculate the original window. The schedule is transient Run state,
 not advanced configuration or checkpoint state, and is cleared before the
 Run's autosave.
-
-Input-local validation failures reject the entire selected candidate without
-changing active supervision. Distributed ranks prepare the same candidate and
-must all agree before installation. Unexpected worker/device failures retain
-fail-stop behavior. Publication prepares all outputs before changing targets;
-a failure after publication starts retains the transaction and queues later
-mutations behind recovery. Recovery covers the running service, not crashes,
-and does not promise atomic visibility across multiple dataset files.
 
 **Checkpoints** are one panel section, and loading one is one button. It lists
 what the service advertises (checkpoints at the dataset root, and those under
@@ -938,9 +911,9 @@ from-scratch action.
 With an existing fit, *Load* replaces the resident model's weights, optimiser
 and RNG state in place. When the checkpoint does not match the live model the service refuses
 it and says what a rebuild would have to replace: rebuilding the **model only**
-keeps the loaded dataset inputs and everything already added to the fit, while
-a **whole-fit** rebuild re-reads the dataset and replays the workspace's desired
-revisions, including uncommitted additions. The panel reports the reasons and asks; a checkpoint no
+keeps the frozen inputs, while a **whole-fit** rebuild re-reads the dataset and
+the object store. A checkpoint fitted to other store inputs is refused with
+the differences and the reload rebuild as the remedy. The panel reports the reasons and asks; a checkpoint no
 rebuild can accept — one written against another dataset, or whose stored
 configuration holds a value the schema cannot interpret — is reported and
 nothing is offered. A checkpoint-backed session takes its durable configuration
