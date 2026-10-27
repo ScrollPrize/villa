@@ -298,34 +298,6 @@ def _upload_input(state, kind, input_id, files, role=None, base_revision=None,
     return upload_id
 
 
-def _commit_pcl_process(dataset, output, input_id, ready, start, result):
-    try:
-        state = ServiceState()
-        _attach_fake_session(state, output, dataset)
-        upload_id = _upload_input(
-            state, "pcl", input_id, PCL_FILES, role="relative")
-        state.finalize_upload(upload_id)
-        ready.put(input_id)
-        if not start.wait(10):
-            raise RuntimeError("timed out waiting for concurrent commit start")
-        state.commit_inputs()
-        result.put((input_id, "ok"))
-    except BaseException as exc:
-        result.put((input_id, f"{type(exc).__name__}: {exc}"))
-
-
-PATCH_FILES = {
-    "meta.json": json.dumps({"format": "tifxyz"}).encode(),
-    "x.tif": b"x-raster", "y.tif": b"y-raster", "z.tif": b"z-raster",
-}
-FIBER_FILES = {"fiber.json": json.dumps(
-    {"type": "vc3d_fiber", "control_points": [[0, 0, 0], [4, 4, 4]]}).encode()}
-PCL_FILES = {"pcls.json": json.dumps({
-    "vc_pointcollections_json_version": "1",
-    "collections": {"0": {"name": "c", "points": {}}},
-}).encode()}
-
-
 class ApiKeyTests(unittest.TestCase):
     def test_key_is_generated_with_owner_only_mode_and_reused(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -932,10 +904,6 @@ class DatasetOwnershipTests(unittest.TestCase):
                          self.output / ".spiral-upload-staging")
         self.assertEqual(self.state._checkpoint_upload_root(),
                          self.output / "uploaded-checkpoints")
-        _attach_fake_session(self.state, self.output, self.root)
-        ephemeral = self.state.editing().root
-        self.assertTrue(ephemeral.is_relative_to(self.output))
-        self.assertFalse(ephemeral.is_relative_to(self.root))
 
     def test_initialize_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
@@ -1792,10 +1760,10 @@ class ExplicitInitializationTests(HttpServiceFixture):
                                        daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
-        self.state.editing().claim("test-owner", "claim")
+        self.state.lease().claim("test-owner", "claim")
 
     def request(self, method, path, **kwargs):
-        kwargs['headers'] = {'X-Spiral-Workspace-Token': 'test-owner', **kwargs.get('headers', {})}
+        kwargs['headers'] = {'X-Spiral-Session-Token': 'test-owner', **kwargs.get('headers', {})}
         return super().request(method, path, **kwargs)
 
     def tearDown(self):
@@ -1972,157 +1940,26 @@ class UploadTests(unittest.TestCase):
     def _session(self):
         self.state.dataset_root = str(self.dataset)
         session = _attach_fake_session(self.state, self.output, self.dataset)
-        self.state.editing().claim('owner', 'claim')
+        self.state.lease().claim('owner', 'claim')
         return session
 
-    def test_upload_requires_an_active_session(self):
-        with self.assertRaises(ApiError) as caught:
-            self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p1",
-                                     "files": [{"name": "meta.json", "size": 1,
-                                                "sha256": "0" * 64}]})
-        self.assertEqual(caught.exception.status, 409)
-
-    def test_unsafe_identifiers_and_names_are_rejected(self):
-        self._session()
-        for bad_id in ("../p", "a/b", ".hidden", "", "a" * 200):
-            with self.assertRaises(ApiError, msg=bad_id):
-                self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": bad_id,
-                                         "files": [{"name": "meta.json", "size": 1,
-                                                    "sha256": "0" * 64}]})
-        for bad_name in ("../x", "/abs", "a//b", "a/../b", "..", "a\\b"):
-            with self.assertRaises(ApiError, msg=bad_name):
-                self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p1",
-                                         "files": [{"name": bad_name, "size": 1,
-                                                    "sha256": "0" * 64}]})
-
-    def test_finalize_verifies_content_and_publishes_atomically(self):
-        self._session()
-        upload_id = _upload_input(self.state, "patch", "patch-1", PATCH_FILES)
-        response = self.state.finalize_upload(upload_id)
-        record = response["input"]
-        self.assertEqual(record["state"], "uploaded")
-        published = Path(record["path"])
-        self.assertTrue((published / "meta.json").is_file())
-        self.assertTrue(published.is_relative_to(self.state.editing().root))
-        status = self.state.status()
-        self.assertEqual(self.state.editing().catalog.entries(), ())
-        self.assertEqual(status["default_advanced_config"]["optimizer_learning_rate"], 3e-5)
-        self.assertNotEqual(status["default_advanced_config"], status["run_config"])
-        # Finalize is idempotent.
-        self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
-                         "patch-1")
-
-    def test_upload_put_retries_are_content_addressed(self):
-        self._session()
-        data = PATCH_FILES["meta.json"]
-        upload_id = self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16),
-            "kind": "patch", "id": "retried", "files": [
-                {"name": name, "size": len(payload),
-                 "sha256": _digest(payload)}
-                for name, payload in PATCH_FILES.items()],
-        })["upload_id"]
-        staging = self.state.editing().uploads.staging_root() / upload_id
-
-        # An upload PUT carries no command ID: the manifest's size and digest
-        # decide the outcome, so repeating one is safe and converges.
-        for _ in range(3):
-            response = self.state.receive_upload_file(
-                upload_id, "meta.json", io.BytesIO(data), len(data))
-            self.assertEqual(response["received"], "meta.json")
-        self.assertEqual((staging / "meta.json").read_bytes(), data)
-
-        # A retry that delivers different bytes is refused and never replaces
-        # the staged copy that already matched the manifest.
-        corrupted = b"!" * len(data)
-        with self.assertRaisesRegex(ApiError, "SHA-256"):
-            self.state.receive_upload_file(
-                upload_id, "meta.json", io.BytesIO(corrupted), len(corrupted))
-        self.assertEqual((staging / "meta.json").read_bytes(), data)
-        self.assertEqual([path.name for path in staging.iterdir()],
-                         ["meta.json"])
-
-        for name in ("x.tif", "y.tif", "z.tif"):
-            payload = PATCH_FILES[name]
-            self.state.receive_upload_file(
-                upload_id, name, io.BytesIO(payload), len(payload))
-        record = self.state.finalize_upload(upload_id)["input"]
-        self.assertEqual(record["id"], "retried")
-
-    def test_finalize_is_idempotent_per_upload_id(self):
-        self._session()
-        upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
-        first = self.state.finalize_upload(upload_id)["input"]
-        second = self.state.finalize_upload(upload_id)["input"]
-        self.assertEqual(first, second)
-        # The replay publishes nothing a second time.
-        self.assertEqual(self.state.editing().catalog.entries(), ())
-        # A finalized upload is a session input, not a transfer any more.
-        with self.assertRaisesRegex(ApiError, "already finalized"):
-            self.state.receive_upload_file(
-                upload_id, "fiber.json",
-                io.BytesIO(FIBER_FILES["fiber.json"]),
-                len(FIBER_FILES["fiber.json"]))
-
-    def test_finalize_rejects_missing_files_and_digest_mismatch(self):
-        self._session()
-        data = PATCH_FILES["meta.json"]
-        request = {"upload_id": spiral_service.secrets.token_hex(16), "kind": "patch", "id": "p2", "files": [
-            {"name": "meta.json", "size": len(data), "sha256": _digest(data)},
-            {"name": "x.tif", "size": 4, "sha256": _digest(b"xxxx")},
-        ]}
-        upload_id = self.state.begin_upload(request)["upload_id"]
-        self.state.receive_upload_file(upload_id, "meta.json", io.BytesIO(data), len(data))
-        with self.assertRaisesRegex(ApiError, "missing declared files"):
-            self.state.finalize_upload(upload_id)
-        with self.assertRaisesRegex(ApiError, "SHA-256"):
-            self.state.receive_upload_file(upload_id, "x.tif", io.BytesIO(b"yyyy"), 4)
-        self.assertIsNone(self.state.editing().uploads.get(upload_id).record)
-        self.assertEqual(self.state.editing().catalog.entries(), ())
-
-    def test_finalize_rejects_invalid_patch_and_untyped_json(self):
-        self._session()
-        bad_patch = dict(PATCH_FILES)
-        bad_patch["meta.json"] = json.dumps({"format": "not-tifxyz"}).encode()
-        upload_id = _upload_input(self.state, "patch", "bad-patch", bad_patch)
-        with self.assertRaisesRegex(ApiError, "tifxyz"):
-            self.state.finalize_upload(upload_id)
-        untyped = {"fiber.json": json.dumps({"control_points": []}).encode()}
-        upload_id = _upload_input(self.state, "fiber", "bad-fiber", untyped)
-        with self.assertRaisesRegex(ApiError, "vc3d_fiber"):
-            self.state.finalize_upload(upload_id)
-        bad_pcl = {"pcl.json": json.dumps({"some": "json"}).encode()}
-        upload_id = _upload_input(self.state, "pcl", "bad-pcl", bad_pcl,
-                                  role="relative")
-        with self.assertRaisesRegex(ApiError, "vc_pointcollections"):
-            self.state.finalize_upload(upload_id)
-
-    def test_finalize_rejects_incomplete_v3_fibers_without_repair(self):
-        self._session()
-        incomplete = {
-            "type": "vc3d_fiber",
-            "version": 3,
-            "line_points": [[0, 0, 0], [1, 0, 0]],
-            "control_points": [{"position": [0, 0, 0]}, {"position": [1, 0, 0]}],
-        }
-        for suffix, mutation, message in (
-            ("mode", {}, "missing optimization_mode"),
-            ("segment", {"optimization_mode": "lasagna"}, "missing segment_to_next"),
-        ):
-            payload = {**incomplete, **mutation}
-            upload_id = _upload_input(
-                self.state,
-                "fiber",
-                f"bad-v3-{suffix}",
-                {"fiber.json": json.dumps(payload).encode()},
-            )
-            with self.assertRaisesRegex(ApiError, message):
-                self.state.finalize_upload(upload_id)
-
-    def test_pcl_uploads_require_a_role(self):
-        self._session()
-        with self.assertRaisesRegex(ApiError, "role"):
-            self.state.begin_upload({"upload_id": spiral_service.secrets.token_hex(16), "kind": "pcl", "id": "roleless", "files": [
-                {"name": "pcl.json", "size": 1, "sha256": "0" * 64}]})
+    def test_fit_inputs_are_never_uploaded(self):
+        # Patches, PCLs and fibers come from the bound object store and are
+        # frozen for a resident session, with or without one.
+        for session in (False, True):
+            if session:
+                self._session()
+            for kind in ("patch", "fiber", "pcl"):
+                with self.subTest(kind=kind, session=session), \
+                        self.assertRaises(ApiError) as caught:
+                    self.state.begin_upload({
+                        "upload_id": spiral_service.secrets.token_hex(16),
+                        "kind": kind, "id": "p1",
+                        "files": [{"name": "meta.json", "size": 1,
+                                   "sha256": "0" * 64}]})
+                self.assertEqual(caught.exception.status, 409)
+                self.assertEqual(caught.exception.payload["code"],
+                                 "inputs_frozen")
 
     def test_same_winding_artifact_advertises_revision_and_editability(self):
         self._session()

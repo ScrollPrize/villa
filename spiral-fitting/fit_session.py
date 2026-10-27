@@ -114,7 +114,14 @@ from surface_orientation import spiral_outward_sense_for
 # dt_loss_schedule object controls how much of the final Run window is DT
 # eligible and is transient rather than part of advanced configuration or a
 # checkpoint.
-API_VERSION = 35
+# Version 36 reads patch, PCL and fiber inputs from the object store bound at
+# launch (--object-store) and freezes them for a resident session. The
+# editing workspace is replaced by a session lease (POST
+# /session/lease/claim and /release, token header X-Spiral-Session-Token;
+# status reports lease_id). The input-editing routes answer 409 with code
+# inputs_frozen, naming the full-input rebuild, and uploads accept only
+# checkpoints.
+API_VERSION = 36
 
 
 class SessionState(str, Enum):

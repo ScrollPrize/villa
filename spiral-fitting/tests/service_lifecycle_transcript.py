@@ -17,7 +17,6 @@ of the file-input service or the session lease that replaced it.
 import argparse
 import inspect
 import json
-import os
 import sys
 import tempfile
 import threading

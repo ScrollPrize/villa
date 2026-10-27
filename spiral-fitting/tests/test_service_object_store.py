@@ -205,3 +205,206 @@ def test_a_run_keeps_the_resident_binding(dataset, store):
                'configuration': configuration,
                'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
     assert 'object_store_path' not in resident.kwargs['run_config']
+
+
+# ---------------------------------------------------------------------------
+# Session lease and frozen inputs (step 4)
+# ---------------------------------------------------------------------------
+
+class Http:
+    """The service over real HTTP, as a client sees it."""
+
+    def __init__(self, state):
+        self.state = state
+        self.server = spiral_service.SpiralServer(('127.0.0.1', 0), ['key'], state)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.commands = 0
+
+    def __call__(self, method, path, body=None, token=None):
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{self.server.server_port}{path}', method=method)
+        request.add_header('Authorization', 'Bearer key')
+        if token is not None:
+            request.add_header(spiral_service.LEASE_TOKEN_HEADER, token)
+        data = None if body is None else json.dumps(body).encode()
+        try:
+            with urllib.request.urlopen(request, data=data, timeout=30) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def command(self, path, body=None, token=None):
+        self.commands += 1
+        return self('POST', path, {**(body or {}), 'command_id': f'c{self.commands}'},
+                    token)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+@pytest.fixture()
+def http(dataset, store, monkeypatch):
+    import spiral_runtime
+    from service_lifecycle_transcript import FakeRuntime
+    built = []
+
+    def create_session(*args, **kwargs):
+        built.append(kwargs)
+        return FakeRuntime()
+    monkeypatch.setattr(spiral_runtime, 'create_session', create_session)
+    client = Http(service(dataset, store))
+    client.built = built
+    yield client
+    client.close()
+    client.state.close()
+
+
+def initialize_body():
+    return {'run': {'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)}}
+
+
+def test_one_client_holds_the_lease_and_gates_mutations(http):
+    status, refused = http.command('/session/stop', token='owner')
+    assert status == 403 and refused['error'] == 'Claim the session lease first'
+    status, claimed = http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    assert status == 200 and claimed['owned']
+    assert http('GET', '/session/status')[1]['lease_id'] == claimed['lease_id']
+    # Reconnecting with the same token keeps the lease; another token cannot
+    # take it or act through it.
+    again = http('POST', '/session/lease/claim', {'command_id': 'b'}, 'owner')[1]
+    assert again['lease_id'] == claimed['lease_id']
+    assert http('POST', '/session/lease/claim', {'command_id': 'c'}, 'other')[0] == 403
+    status, refused = http.command('/session/initialize', initialize_body(), 'other')
+    assert (status, refused['error']) == (403, 'This client does not own the session lease')
+    status, initialized = http.command('/session/initialize', initialize_body(), 'owner')
+    assert status == 200 and initialized['state'] == 'Idle'
+
+
+def test_a_repeated_initialize_command_builds_once(http):
+    http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    body = {**initialize_body(), 'command_id': 'init-1'}
+    first = http('POST', '/session/initialize', body, 'owner')
+    second = http('POST', '/session/initialize', body, 'owner')
+    assert first[0] == second[0] == 200
+    assert len(http.built) == 1
+    # Nothing binds inputs into the build: they come from the store.
+    assert 'input_bindings' not in http.built[0]
+
+
+@pytest.mark.parametrize('method,path', [
+    (method, path if isinstance(path, str) else
+     {'input_content': '/session/input-content/0123-ab/1',
+      'input_command': '/session/input-commands/x'}[operation])
+    for method, path, operation in spiral_service._FROZEN_INPUT_ROUTES])
+def test_input_editing_answers_inputs_frozen_to_every_client(http, method, path):
+    body = {'command_id': 'x'} if method == 'POST' else None
+    for token in (None, 'stranger'):
+        status, payload = http(method, path, body, token)
+        assert status == 409
+        assert payload['code'] == 'inputs_frozen'
+        assert payload['rebuild'] == {'inputs': 'reload'}
+    http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    status, payload = http(method, path, body, 'owner')
+    assert (status, payload['code']) == (409, 'inputs_frozen')
+
+
+def test_releasing_the_lease_tears_the_session_down(http):
+    http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    http.command('/session/initialize', initialize_body(), 'owner')
+    session, lease = http.state.session, http.state.session_lease
+    assert http('POST', '/session/lease/release', {'command_id': 'x'}, 'other')[0] == 403
+    status, released = http('POST', '/session/lease/release', {'command_id': 'r'}, 'owner')
+    assert (status, released) == (200, {'released': True})
+    assert session.state == SessionState.Closing
+    assert http.state.session_lease is None and http.state.session is None
+    assert http('GET', '/session/status')[1]['state'] == 'Uninitialized'
+    # The lease's file lock is free for the next owner.
+    fresh = http('POST', '/session/lease/claim', {'command_id': 'b'}, 'next')[1]
+    assert fresh['lease_id'] != lease.id
+
+
+@pytest.mark.parametrize('user', ['request', 'background', 'command'])
+def test_release_waits_for_every_user_of_the_service(dataset, store, user):
+    from concurrent.futures import ThreadPoolExecutor
+    state = service(dataset, store)
+    lease = state.lease()
+    lease.claim('owner', 'claim')
+    entered, finish = threading.Event(), threading.Event()
+
+    def work(*_):
+        entered.set()
+        assert finish.wait(5)
+
+    def request():
+        with state.service_use():
+            work()
+    with ThreadPoolExecutor(2) as pool:
+        if user == 'background':
+            state._start_background(target=work, name='test-construction')
+        elif user == 'command':
+            pool.submit(lease.coordinator.execute, 'slow', 'test', {}, work)
+        else:
+            pool.submit(request)
+        assert entered.wait(5)
+        releasing = pool.submit(state.release_lease, 'owner', 'release')
+        with state._service_condition:
+            assert state._service_condition.wait_for(lambda: state._closing, timeout=5)
+        assert not releasing.done()
+        with pytest.raises(ApiError):
+            with state.service_use():
+                pass
+        finish.set()
+        assert releasing.result(5) == {'released': True}
+    assert state.session_lease is None
+    state.close()
+
+
+def test_a_fitter_that_will_not_close_keeps_the_lease_for_a_retry(http, monkeypatch):
+    http('POST', '/session/lease/claim', {'command_id': 'a'}, 'owner')
+    http.command('/session/initialize', initialize_body(), 'owner')
+    session = http.state.session
+    close = session.close
+
+    def timeout(timeout=15.0):
+        raise TimeoutError('still reading inputs')
+    monkeypatch.setattr(session, 'close', timeout)
+    with pytest.raises(TimeoutError):
+        http.state.release_lease('owner', 'release')
+    assert http.state.session_lease is not None
+    monkeypatch.setattr(session, 'close', close)
+    assert http.state.release_lease('owner', 'release') == {'released': True}
+    assert http.state.session_lease is None
+
+
+def test_release_during_construction_closes_the_installed_fitter(dataset, store,
+                                                                 monkeypatch):
+    import sys
+    import types
+    state = service(dataset, store)
+    state.lease().claim('owner', 'claim')
+    entered, finish, closed = threading.Event(), threading.Event(), threading.Event()
+
+    def create(*args, **kwargs):
+        entered.set()
+        assert finish.wait(5)
+        return types.SimpleNamespace(close=closed.set)
+    monkeypatch.setitem(sys.modules, 'spiral_runtime',
+                        types.SimpleNamespace(create_session=create))
+    state._start_background(target=state._build,
+                            args=(state.session_id, None, None, None, None, None),
+                            name='test-build')
+    assert entered.wait(5)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(1) as pool:
+        releasing = pool.submit(state.release_lease, 'owner', 'release')
+        with state._service_condition:
+            assert state._service_condition.wait_for(lambda: state._closing, timeout=5)
+        finish.set()
+        releasing.result(5)
+    assert closed.is_set() and state.session is None
+    state.close()

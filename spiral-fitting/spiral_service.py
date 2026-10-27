@@ -16,11 +16,15 @@ available without importing the fitting runtime; ``POST /session/initialize``
 creates the first resident session, and ``POST /session/rebuild`` replaces an
 existing one.
 
+Patch, PCL and fiber inputs come from the object store bound at launch
+(``--object-store``) and are frozen for a resident session: changing them is
+an edit in the store followed by a full-input rebuild, never an upload. One
+client owns the mutation surface through the session lease
+(``POST /session/lease/claim``).
+
 Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
-through ``/artifacts/...`` instead of host filesystem paths. Session inputs
-(patches, fibers, PCL documents) can be uploaded into a dataset-scoped
-editing workspace and explicitly applied or committed into the dataset.
+through ``/artifacts/...`` instead of host filesystem paths.
 
 Host filesystem paths are the service's business. A client never invents
 one: a saved checkpoint is a name the service places under the session
@@ -40,8 +44,8 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from input_workspace import MutationCoordinator
+from session_lease import SessionLease
 from workspace_storage import reclaim_workspaces
-from service_editing import EditingWorkspace
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 import copy
@@ -59,7 +63,6 @@ import signal
 import socket
 import stat
 import sys
-import tempfile
 import threading
 import time
 from http import HTTPStatus
@@ -136,6 +139,22 @@ MAX_EVENT_READ_ENTRIES = 1000
 EVENT_COALESCE_SECONDS = 1.0
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# The stable code of a refused input change. Inputs are frozen for a resident
+# session; the remedy is an edit in the object store and a full-input
+# rebuild, which the refusal names.
+INPUTS_FROZEN = "inputs_frozen"
+LEASE_TOKEN_HEADER = "X-Spiral-Session-Token"
+
+
+def inputs_frozen_error():
+    return ApiError(
+        HTTPStatus.CONFLICT,
+        "Fit inputs are frozen for the resident session: patches, PCLs and "
+        "fibers come from the service's object store. Change them there, then "
+        "rebuild with inputs reloaded (POST /session/rebuild with "
+        "\"inputs\": \"reload\").",
+        payload={"code": INPUTS_FROZEN, "rebuild": {"inputs": "reload"}})
 
 # Base input paths are owned by the service (every launch carries --dataset);
 # a load request may only choose among service-advertised values for these
@@ -485,10 +504,10 @@ class ServiceState:
                  service_name=None, session_name="", logs=None, events=None,
                  gpu_ids=(0,), startup_run=None, object_store=None):
         self.lock = threading.RLock()
-        self._workspace_condition = threading.Condition(self.lock)
-        self._workspace_closing = False
+        self._service_condition = threading.Condition(self.lock)
+        self._closing = False
         self._service_closed = False
-        self._workspace_users = 0
+        self._service_users = 0
         self._background_jobs = set()
         self._retiring_sessions = []
         self._teardown_lock = threading.Lock()
@@ -497,9 +516,8 @@ class ServiceState:
             role: threading.Lock() for role in EDITABLE_PCL_ROLES
         }
         self.session = None
-        self.editing_workspace = None
-        self._input_content_artifacts = {}
-        self._input_content_artifact_lock = threading.Lock()
+        # The SessionLease of the client that owns this service, if any.
+        self.session_lease = None
         self.session_id = None
         self.session_paths = None
         self.session_request = None
@@ -565,199 +583,119 @@ class ServiceState:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def workspace_use(self):
-        with self._workspace_condition:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
-            self._workspace_users += 1
+    def service_use(self):
+        """Count one request or job that teardown must wait for."""
+        with self._service_condition:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
+            self._service_users += 1
         try:
             yield
         finally:
-            with self._workspace_condition:
-                self._workspace_users -= 1
-                self._workspace_condition.notify_all()
+            with self._service_condition:
+                self._service_users -= 1
+                self._service_condition.notify_all()
 
     def _start_background(self, *, target, args=(), name, daemon=True):
         def run():
             try:
                 target(*args)
             finally:
-                with self._workspace_condition:
+                with self._service_condition:
                     self._background_jobs.discard(threading.current_thread())
-                    self._workspace_condition.notify_all()
-        with self._workspace_condition:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
+                    self._service_condition.notify_all()
+        with self._service_condition:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
             thread = threading.Thread(target=run, name=name, daemon=daemon)
             self._background_jobs.add(thread)
             thread.start()
 
-    def release_editing(self, token, command_id):
+    def release_lease(self, token, command_id):
+        """Give up ownership and tear the resident session down."""
         def release(_):
             with self._teardown_lock:
-                workspace = self.editing_workspace
-                if workspace is None:
-                    raise ApiError(403, "This client does not own an editing workspace")
-                workspace.require(token)
-                self._teardown_workspace()
+                lease = self.session_lease
+                if lease is None:
+                    raise ApiError(403, "This client does not own the session lease")
+                lease.require(token)
+                self._teardown()
                 return {"released": True}
         return self._release_receipts.execute(command_id, 'release',
             {'token_digest': hashlib.sha256(str(token).encode()).hexdigest()},
             release, recoverable=lambda exc: isinstance(exc, (TimeoutError, OSError)))
 
-    def _teardown_workspace(self):
+    def _teardown(self):
         try:
-            self._drain_and_remove_workspace()
+            self._drain_and_close()
         except Exception:
-            root = self.editing_workspace.root if self.editing_workspace else self._output_root()
-            logging.exception("Spiral teardown failed; retained workspace %s", root)
+            logging.exception("Spiral teardown failed; the lease is retained")
             raise
 
-    def _drain_and_remove_workspace(self):
-        # Do not drop any references or locks until every file user has stopped.
-        with self._workspace_condition:
-            self._workspace_closing = True
-            self._workspace_condition.notify_all()
+    def _drain_and_close(self):
+        # Do not drop any references or locks until every user has stopped.
+        with self._service_condition:
+            self._closing = True
+            self._service_condition.notify_all()
             deadline = time.monotonic() + 15
-            while self._workspace_users or self._background_jobs:
+            while self._service_users or self._background_jobs:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Workspace users did not stop; files retained")
-                self._workspace_condition.wait(remaining)
-            workspace, session = self.editing_workspace, self.session
+                    raise TimeoutError("Service users did not stop; the lease is retained")
+                self._service_condition.wait(remaining)
+            lease, session = self.session_lease, self.session
             process = self._preview.process
-        if workspace is not None:
-            workspace.coordinator.shutdown(lambda: None)
         stop_process_group(process)
         if process is not None and process.poll() is None:
-            raise TimeoutError("Preview process did not stop; workspace retained")
+            raise TimeoutError("Preview process did not stop; the lease is retained")
         for retiring in tuple(self._retiring_sessions):
             retiring.close()
             self._retiring_sessions.remove(retiring)
         if session is not None:
             session.close()
-        if workspace is not None:
-            self.artifacts.retire_root(workspace.root)
-            # Publication recovery lives beside dataset targets, outside root.
-            for transaction in workspace.transactions.values():
-                for path in transaction.recovery_paths():
-                    self.logs.write('stderr', f'Retained Commit recovery: {path}\n')
-            workspace.close()
+        if lease is not None:
+            lease.close()
         with self.lock:
             self.session = None
             self.session_id = None
-            self.editing_workspace = None
-            self._input_content_artifacts.clear()
+            self.session_lease = None
             self._session_state = SessionState.Uninitialized
             self._session_phase = "Waiting for fit initialization"
             self._session_error = None
-            self._workspace_closing = False
+            self._closing = False
 
-    def editing(self, *, create=True):
-        """The dataset workspace survives resident generations and disconnects."""
+    def lease(self, *, create=True):
+        """The session lease; it survives resident generations and disconnects."""
         with self.lock:
-            if self._workspace_closing or self._service_closed:
-                raise ApiError(410, "The editing workspace is closing")
-            if self.editing_workspace is None:
+            if self._closing or self._service_closed:
+                raise ApiError(410, "The session lease is being released")
+            if self.session_lease is None:
                 if not create:
-                    raise ApiError(409, "Claim an editing workspace first")
-                if self.dataset_root is None or self._output_root() is None:
-                    raise ApiError(409, "A managed dataset and output are required")
-                sources = (self.dataset_resolution.to_dict()
-                           if self.dataset_resolution is not None else {})
-                self.editing_workspace = EditingWorkspace(
-                    self.dataset_root, self._output_root(), sources,
-                    self._editing_resident)
-            return self.editing_workspace
+                    raise ApiError(409, "Claim the session lease first")
+                if self._output_root() is None:
+                    raise ApiError(409, "A service output root is required")
+                self.session_lease = SessionLease(self._output_root())
+            return self.session_lease
 
-    def input_content_artifact(self, input_id, revision_number):
-        with self.workspace_use():
-            return self._input_content_artifact(input_id, revision_number)
+    def lease_lifecycle(self, token, operation, request, callback):
+        """Run one lifecycle command for the lease owner, at most once.
 
-    def _input_content_artifact(self, input_id, revision_number):
-        workspace = self.editing(create=False)
-        revision, = workspace._selection([{'id': input_id, 'revision': int(revision_number)}])
-        if revision.content is None:
-            raise ApiError(410, "This input revision is a deletion")
-        identity = workspace.catalog.entry(input_id).identity
-        siblings = ()
-        if identity.kind == 'fiber':
-            desired = tuple(r for r in workspace.catalog.desired()
-                            if r.content is not None and
-                            workspace.catalog.entry(r.id).identity.kind == 'fiber')
-            by_name = {Path(workspace.catalog.entry(r.id).identity.source).name: r
-                       for r in desired}
-            # Resolve the requested revision's links, including transitive and
-            # pending links, against immutable desired peers. Never substitute
-            # the current revision for the explicitly requested entry point.
-            selected = {input_id}
-            pending = [revision]
-            while pending:
-                current = pending.pop()
-                document = json.loads(Path(current.content.json()['path']).read_text())
-                for key in ('branches', 'adjacent_branches'):
-                    for branch in document.get(key, []):
-                        peer = by_name.get(branch.get('branch_file'))
-                        if peer is not None and peer.id not in selected:
-                            selected.add(peer.id)
-                            pending.append(peer)
-            siblings = tuple(r for r in desired if r.id in selected and r.id != input_id)
-        key = (input_id, revision.number, tuple((r.id, r.number) for r in siblings))
-        with self._input_content_artifact_lock:
-            if key not in self._input_content_artifacts:
-                content = revision.content.json()
-                source = Path(content['path'])
-                if source.is_dir():
-                    root, entry = source, 'meta.json'
-                    artifact = self.artifacts.register_directory(
-                        'input-content', workspace.id, revision.number, root, entry)
-                else:
-                    parent = workspace.root / 'artifacts' / input_id
-                    parent.mkdir(parents=True, exist_ok=True)
-                    root = Path(tempfile.mkdtemp(dir=parent))
-                    entry = Path(identity.source).name
-                    try:
-                        workspace._copy(source, root / entry)
-                        for sibling in siblings:
-                            name = Path(workspace.catalog.entry(sibling.id).identity.source).name
-                            workspace._copy(sibling.content.json()['path'], root / name)
-                        artifact = self.artifacts.register_directory(
-                            'input-content', workspace.id, revision.number, root, entry)
-                    except BaseException:
-                        shutil.rmtree(root)
-                        raise
-                self._input_content_artifacts[key] = artifact
-            return {'workspace_id': workspace.id, 'artifact': self._input_content_artifacts[key]}
-
-    def _editing_resident(self):
-        with self.lock:
-            if self.session is None or self._building:
-                raise ApiError(409, "Wait for the resident fit to finish loading")
-            return self.session
-
-    def input_upload_manager(self, upload_id):
-        if upload_id in self.checkpoint_uploads.uploads:
-            return self.checkpoint_uploads
-        return self.editing(create=False).uploads
-
-    def editing_lifecycle(self, token, operation, request, callback):
-        workspace = self.editing()
-        workspace.require(token)
+        Initialize and rebuild hold the request until the resident build
+        settles, so a construction failure is the command's answer.
+        """
+        lease = self.lease()
+        lease.require(token)
         def perform(captured):
-            workspace.require(token)
+            lease.require(token)
             rebuilding = operation in {"session_initialize", "session_rebuild"}
             command_id = captured.get("command_id")
-            if rebuilding and command_id in workspace.lifecycle_started:
-                response = workspace.lifecycle_started[command_id]
+            if rebuilding and command_id in lease.lifecycle_started:
+                response = lease.lifecycle_started[command_id]
             else:
-                if operation == "session_rebuild":
-                    workspace.refresh_clean(f'{command_id}:refresh')
                 response = callback(captured)
                 if rebuilding:
-                    workspace.lifecycle_started[command_id] = response
-            # Keep the coordinator until background construction and desired
-            # input replay finish. Read-only status remains responsive.
-            if operation in {"session_initialize", "session_rebuild"}:
+                    lease.lifecycle_started[command_id] = response
+            if rebuilding:
                 while True:
                     with self.lock:
                         building, session = self._building, self.session
@@ -767,13 +705,9 @@ class ServiceState:
                     time.sleep(0.05)
                 if state == SessionState.Error:
                     raise ApiError(409, "Resident construction failed", payload=self.status())
-                if session is not None:
-                    result = workspace.replay_resident(self.session_generation)
-                    if not result.get("applied"):
-                        raise ApiError(409, "Desired inputs could not be restored", payload=result)
                 response = {**self.status(), "accepted": True}
             return response
-        return workspace.coordinator.execute(request.get("command_id"), operation,
+        return lease.coordinator.execute(request.get("command_id"), operation,
             request, perform, recoverable=lambda exc: isinstance(exc, TimeoutError))
 
     def _base(self):
@@ -835,7 +769,8 @@ class ServiceState:
                     for key, value in response["progress"].items()
                     if key != "eta_seconds"
                 }
-            response["workspace_id"] = self.editing_workspace.id if self.editing_workspace else None
+            response["lease_id"] = (self.session_lease.id
+                                    if self.session_lease else None)
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview.artifact
             # Published separately from, and after, the surface: a client that
@@ -868,11 +803,6 @@ class ServiceState:
             if publishing is not None:
                 response["phase"] = publishing["stage_name"]
                 response["progress"] = publishing
-            available = (self.editing_workspace is not None
-                         and any(entry.accepted > entry.persisted
-                                 for entry in self.editing_workspace.catalog.entries()))
-            response["commit_available"] = available
-            response["commit_unavailable_reason"] = "" if available else "No uncommitted revisions"
             response["preview_exporting"] = self._preview_export_active
             return response
 
@@ -1283,9 +1213,8 @@ class ServiceState:
     def _begin_model_rebuild(self, paths, run, preview):
         """Publish the new request and rebuild the model off the HTTP thread.
 
-        The session object, its generation, and its resident inputs survive.
-        The editing workspace retains revisions across every rebuild; the
-        session reports ``Loading`` while the fitter thread works.
+        The session object, its generation, and its resident inputs survive;
+        the session reports ``Loading`` while the fitter thread works.
         """
         with self.lock:
             if self._building:
@@ -1320,10 +1249,6 @@ class ServiceState:
 
     def _begin_build(self, paths, run, preview, scroll):
         """Publish ``Loading`` and construct the runtime off the HTTP thread."""
-        # The build binds the workspace's unchanged baseline identities while
-        # it loads, so the replay after it does not relink the whole fit.
-        workspace = self.editing_workspace
-        bindings = workspace.build_bindings() if workspace is not None else []
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
@@ -1348,19 +1273,15 @@ class ServiceState:
             self._session_error = None
             self.status_generation += 1
             session_id = self.session_id
-            if workspace is not None:
-                workspace.note_build_bindings(self.session_generation, bindings)
         self._start_background(
             target=self._build,
-            args=(session_id, previous, paths, run,
-                  preview, scroll, bindings),
+            args=(session_id, previous, paths, run, preview, scroll),
             name="spiral-session-build", daemon=True)
         self._start_background(
             target=self._refresh_pcl_artifacts,
             name="spiral-pcl-artifact-publish", daemon=True)
 
-    def _build(self, session_id, previous, paths, run,
-               preview, scroll, bindings=()):
+    def _build(self, session_id, previous, paths, run, preview, scroll):
         """Close the old resident session, then construct the new one.
 
         A rebuild is an all-rank teardown and reconstruction: the previous
@@ -1377,8 +1298,7 @@ class ServiceState:
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
-                gpu_ids=self.gpu_ids, event_callback=self._session_event,
-                input_bindings=bindings)
+                gpu_ids=self.gpu_ids, event_callback=self._session_event)
         except BaseException as exc:
             self._fail_session(session_id, _cause(exc))
             return
@@ -2580,10 +2500,16 @@ class ServiceState:
         with self.lock:
             return self.session_paths.checkpoint if self.session_paths else ""
 
+    def input_upload_manager(self, upload_id):
+        if upload_id not in self.checkpoint_uploads.uploads:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Unknown upload")
+        return self.checkpoint_uploads
+
     def begin_upload(self, request):
-        manager = (self.checkpoint_uploads if request.get("kind") == "checkpoint"
-                   else self.editing().uploads)
-        return {**self._base(), **manager.begin(request)}
+        """Begin a checkpoint upload; fit inputs are never uploaded."""
+        if request.get("kind") in ("patch", "fiber", "pcl"):
+            raise inputs_frozen_error()
+        return {**self._base(), **self.checkpoint_uploads.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):
         received = self.input_upload_manager(upload_id).receive(
@@ -2594,24 +2520,10 @@ class ServiceState:
         finalized = self.input_upload_manager(upload_id).finalize(upload_id)
         return {**self._base(), "accepted": True, "input": finalized.record}
 
-    def commit_input_revisions(self, token, request):
-        result = self.editing().commit(token, request)
-        with self.lock:
-            if self.dataset_resolution is not None:
-                previous = self.dataset_resolution
-                self.dataset_resolution = bind_service_paths(
-                    resolve_dataset_root(previous.root),
-                    previous.resolved.get("output_directory", ""),
-                    previous.resolved.get("cache_directory", ""))
-        self._refresh_pcl_artifacts()
-        return {**self.status(), **result}
-
     def gc_uploads(self):
         try:
-            with self.workspace_use():
+            with self.service_use():
                 self.checkpoint_uploads.collect_garbage()
-                if self.editing_workspace is not None:
-                    self.editing_workspace.uploads.collect_garbage()
         except ApiError as exc:
             if exc.status != 410:
                 raise
@@ -2656,7 +2568,7 @@ class ServiceState:
         with self._teardown_lock:
             with self.lock:
                 self._service_closed = True
-            self._teardown_workspace()
+            self._teardown()
 
 
 class SpiralServer(ThreadingHTTPServer):
@@ -2780,34 +2692,36 @@ _UPLOAD_ID = r"[0-9a-f]{32}"
 # The whole HTTP surface, declared once. Dispatch walks this table; there is
 # no hand-written if-ladder, so a route's method, path, handler and retry
 # semantics are visible in one place.
+def _route_inputs_frozen(ctx):
+    raise inputs_frozen_error()
+
+
+# The input-editing surface of the file-input service. Inputs are frozen, so
+# each answers 409 inputs_frozen to any client, owner or not, rather than 404.
+_FROZEN_INPUT_ROUTES = (
+    ("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content"),
+    ("GET", "/session/input-catalog", "input_catalog"),
+    ("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command"),
+    ("POST", "/session/input-changes", "input_changes"),
+    ("POST", "/session/discard-inputs", "discard_inputs"),
+    ("POST", "/session/resolve-input", "resolve_input"),
+    ("POST", "/session/apply-inputs", "apply_inputs"),
+    ("POST", "/session/commit-inputs", "commit_inputs"),
+)
+_FROZEN_INPUT_OPERATIONS = frozenset(operation for *_, operation in _FROZEN_INPUT_ROUTES)
+_LEASE_OPERATIONS = frozenset({"lease_claim", "lease_release"})
+
 ROUTES = (
-    Route("POST", "/session/editing/claim", "editing_claim",
-          lambda ctx: ctx.state.editing().claim(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
-                                                ctx.body.get("command_id")),
+    Route("POST", "/session/lease/claim", "lease_claim",
+          lambda ctx: ctx.state.lease().claim(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
+                                              ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/editing/release", "editing_release",
-          lambda ctx: ctx.state.release_editing(ctx.handler.headers.get("X-Spiral-Workspace-Token"),
-                                                  ctx.body.get("command_id")),
+    Route("POST", "/session/lease/release", "lease_release",
+          lambda ctx: ctx.state.release_lease(ctx.handler.headers.get(LEASE_TOKEN_HEADER),
+                                              ctx.body.get("command_id")),
           Idempotency.NONE, reads_body=True),
-    Route("GET", re.compile(r"/session/input-content/([0-9a-f-]+)/([0-9]+)"), "input_content",
-          lambda ctx: ctx.state.input_content_artifact(ctx.args[0], ctx.args[1]), Idempotency.NONE),
-    Route("GET", "/session/input-catalog", "input_catalog",
-          lambda ctx: (ctx.state.editing_workspace.status() if ctx.state.editing_workspace else
-                       {"workspace_id": None, "ready": False, "inputs": [], "transactions": {}}), Idempotency.NONE),
-    Route("GET", re.compile(r"/session/input-commands/([^/]+)"), "input_command",
-          lambda ctx: ctx.state.editing(create=False).coordinator.outcome(ctx.args[0]), Idempotency.NONE),
-    Route("POST", "/session/input-changes", "input_changes",
-          lambda ctx: ctx.state.editing().change(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/discard-inputs", "discard_inputs",
-          lambda ctx: ctx.state.editing().discard(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/resolve-input", "resolve_input",
-          lambda ctx: ctx.state.editing().resolve_conflict(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
-    Route("POST", "/session/apply-inputs", "apply_inputs",
-          lambda ctx: ctx.state.editing().apply(ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body),
-          Idempotency.NONE, reads_body=True),
+    *(Route(method, path, operation, _route_inputs_frozen, Idempotency.NONE)
+      for method, path, operation in _FROZEN_INPUT_ROUTES),
     Route("GET", "/health", "health",
           lambda ctx: ctx.state.health(), Idempotency.NONE),
     Route("GET", "/configuration", "configuration",
@@ -2866,10 +2780,6 @@ ROUTES = (
     Route("POST", "/session/download-checkpoint", "download_checkpoint",
           lambda ctx: ctx.state.download_checkpoint(),
           Idempotency.COMMAND_ID, reads_body=True),
-    Route("POST", "/session/commit-inputs", "commit_inputs",
-          lambda ctx: ctx.state.commit_input_revisions(
-              ctx.handler.headers.get("X-Spiral-Workspace-Token"), ctx.body), Idempotency.NONE,
-          reads_body=True),
 )
 
 # Methods whose body is read before the route is resolved, so a malformed or
@@ -3013,9 +2923,9 @@ class SpiralHandler(BaseHTTPRequestHandler):
     def _dispatch(self):
         self._authorise()
         path = unquote(urlparse(self.path).path).rstrip("/")
-        if self.command == "POST" and path == "/session/editing/release":
+        if self.command == "POST" and path == "/session/lease/release":
             return self._dispatch_active()
-        with self.server.state.workspace_use():
+        with self.server.state.service_use():
             return self._dispatch_active()
 
     def _dispatch_active(self):
@@ -3035,18 +2945,20 @@ class SpiralHandler(BaseHTTPRequestHandler):
             body = self._body()
         context = RouteContext(self, state, args,
                                parse_qs(parsed_url.query), body)
-        workspace = state.editing_workspace
-        if (state.dataset_root is not None and workspace is None
+        if route.operation in _FROZEN_INPUT_OPERATIONS:
+            return route.handler(context)
+        lease = state.session_lease
+        if (state.dataset_root is not None and lease is None
                 and self.command != "GET"
-                and route.operation not in {"editing_claim", "editing_release"}):
-            raise ApiError(403, "Claim an editing workspace first")
-        if workspace is not None and self.command != "GET" and route.operation not in {"editing_claim", "editing_release"}:
-            token = self.headers.get("X-Spiral-Workspace-Token")
-            workspace.require(token)
+                and route.operation not in _LEASE_OPERATIONS):
+            raise ApiError(403, "Claim the session lease first")
+        if lease is not None and self.command != "GET" and route.operation not in _LEASE_OPERATIONS:
+            token = self.headers.get(LEASE_TOKEN_HEADER)
+            lease.require(token)
             if route.idempotency == Idempotency.COMMAND_ID:
-                return state.editing_lifecycle(token, route.operation, body or {},
-                                                lambda captured: route.handler(RouteContext(
-                                                    self, state, args, context.query, captured)))
+                return state.lease_lifecycle(token, route.operation, body or {},
+                                             lambda captured: route.handler(RouteContext(
+                                                 self, state, args, context.query, captured)))
         if route.idempotency == Idempotency.COMMAND_ID:
             return state.replay_command(
                 route.operation, (body or {}).get("command_id"),
