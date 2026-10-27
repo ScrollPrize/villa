@@ -135,7 +135,7 @@ private:
     QJsonObject handleSegmentsDelete(const QJsonValue& params);
     QJsonObject handleSegmentsRename(const QJsonValue& params);
     // Review-state-aware segment listing with optional server-side tag filters
-    // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
+    // (AgentBridgeHandlers_review.cpp); reads record tags without forcing a
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);

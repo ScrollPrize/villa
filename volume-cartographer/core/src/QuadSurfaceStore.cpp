@@ -133,10 +133,7 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
     surface->setComponents(surface_components(surface->meta));
     surface->meta["uuid"] = object->uuid;
     surface->meta["name"] = object->name;
-    // Record tags in the meta.json form core code reads ({"approved": {}, ...}).
-    auto tags = utils::Json::object();
-    for (const auto& tag : object->tags) tags[tag] = utils::Json::object();
-    surface->meta["tags"] = tags;
+    surface->tags = object->tags;
     if (!mask.empty()) surface->setChannel("mask", mask);
     for (const auto& array : revision->arrays)
         if (array.name != "points" && array.name != "valid") surface->setChannel(array.name, cv::Mat());

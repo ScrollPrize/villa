@@ -1511,10 +1511,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::ofstream approved_log(log_filename);
 
     for(auto &sm : surfs_v) {
-        const nlohmann::json meta = json_from_utils(sm->meta);
-        if (meta.contains("tags") && meta.at("tags").contains("approved"))
+        const auto tagged = [&](const char* tag) { return std::find(sm->tags.begin(), sm->tags.end(), tag) != sm->tags.end(); };
+        if (tagged("approved"))
             approved_sm.insert(sm);
-        if (!meta.contains("tags") || !meta.at("tags").contains("defective")) {
+        if (!tagged("defective")) {
             surfs[surface_name(sm)] = sm;
         }
     }

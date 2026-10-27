@@ -81,8 +81,9 @@ int runSurfacePanelStoreTests()
         require(visible() == sorted({approved, plain}), "unbound surfaces are listed but not drawn");
 
         hideUnapproved.setChecked(true);
-        require(visible() == std::vector<std::string>{approved}, "tag filters read record tags");
+        pump([&] { return visible() == std::vector<std::string>{approved}; }, "tag filters select record tags in the store");
         hideUnapproved.setChecked(false);
+        pump([&] { return visible() == sorted({approved, plain}); }, "clearing a tag filter shows the surfaces again");
 
         // The Z-range filter asks the store for the surfaces whose bounds reach
         // the range in the open volume (the grids lie at z = 2).
@@ -107,7 +108,7 @@ int runSurfacePanelStoreTests()
         pump([&] { const auto* row = catalog.row(plain); return row && row->record.tags == std::vector<std::string>{"approved"}; },
              "tag checkboxes commit record tags");
         hideUnapproved.setChecked(true);
-        require(visible() == sorted({approved, plain}), "filters follow committed tags");
+        pump([&] { return visible() == sorted({approved, plain}); }, "filters follow committed tags");
 
         require(panel.retireSurfaces({QString::fromStdString(approved)}, &error), "surfaces retire");
         pump([&] { return tree.topLevelItemCount() == 2; }, "retired surfaces leave the panel");

@@ -73,7 +73,14 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection, cons
         const auto parameter = "?" + std::to_string(filter.parameters.size() + 1);
         bind(coordinateFilterSql("o", parameter), coordinateFilterValue(*selection.coordinates));
     }
-    if (selection.tag) bind(" AND o.id IN (SELECT object_id FROM object_tags INDEXED BY object_tags_tag WHERE tag=?)", *selection.tag);
+    auto groups = selection.tagGroups;
+    if (selection.tag) groups.push_back({*selection.tag});
+    for (const auto& group : groups)
+        bind(" AND o.id IN (SELECT object_id FROM object_tags INDEXED BY object_tags_tag WHERE tag IN "
+             "(SELECT value FROM json_each(?)))", nlohmann::json(group).dump());
+    if (!selection.withoutTags.empty())
+        bind(" AND o.id NOT IN (SELECT object_id FROM object_tags INDEXED BY object_tags_tag WHERE tag IN "
+             "(SELECT value FROM json_each(?)))", nlohmann::json(selection.withoutTags).dump());
     if (selection.family) bind(" AND d.family=?", *selection.family);
     if (selection.minLength) bind(" AND d.length>=?", nlohmann::json(*selection.minLength).dump());
     if (frame && frame->unboundVolume) {
@@ -285,6 +292,7 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
 {
     auto filter = objectFilter(db, selection, frame);
     const bool candidates = selection.bbox || !selection.uuids.empty() || selection.connectedTo || selection.tag ||
+                            !selection.tagGroups.empty() ||
                             (frame && frame->unboundVolume && selection.kind);
     // Force primary-key candidate probes instead of scanning objects_kind_uuid
     // to avoid a sort when the R-tree returned only a few matches.

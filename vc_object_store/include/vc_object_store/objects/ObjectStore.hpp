@@ -218,6 +218,10 @@ struct ObjectSelection {
     // Excluded when minLength is positive. Not valid for spatialRegions.
     bool includeUnbound = false;
     std::shared_ptr<const VolumeTransforms> transforms;
+    // Objects with at least one tag of every group (`tag` is a group of one)
+    // and none of `withoutTags`.
+    std::vector<std::vector<std::string>> tagGroups;
+    std::vector<std::string> withoutTags;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;

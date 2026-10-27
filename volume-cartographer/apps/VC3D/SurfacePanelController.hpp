@@ -246,5 +246,19 @@ private:
         std::set<std::string> surfaces;
     };
     std::optional<ZRangeAnswer> _zRangeAnswer;
+    // The tag filters as one store selection (ObjectSelection::tagGroups,
+    // withoutTags) and its answer.
+    struct TagQuery {
+        std::vector<std::vector<std::string>> groups;
+        std::vector<std::string> without;
+        bool empty() const { return groups.empty() && without.empty(); }
+        bool operator==(const TagQuery&) const = default;
+    };
+    struct TagAnswer {
+        TagQuery query;
+        std::set<std::string> surfaces;
+    };
+    std::optional<TagAnswer> _tagAnswer;
+    TagQuery tagQuery() const;
     uint64_t _storeFilterGeneration{0};
 };

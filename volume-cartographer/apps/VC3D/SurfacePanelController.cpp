@@ -1322,12 +1322,19 @@ void SurfacePanelController::connectFilterSignals()
         }
         connect(box, &QCheckBox::toggled, this, [this]() { applyFilters(); });
     };
+    // Tag filters are a store selection (tagQuery).
+    auto connectTagToggle = [this](QCheckBox* box) {
+        if (!box) {
+            return;
+        }
+        connect(box, &QCheckBox::toggled, this, [this]() { refreshStoreFilters(); applyFilters(); });
+    };
 
-    connectToggle(_filters.unreviewed);
+    connectTagToggle(_filters.unreviewed);
     connectToggle(_filters.noExpansion);
-    connectToggle(_filters.noDefective);
-    connectToggle(_filters.hideUnapproved);
-    connectToggle(_filters.inspectOnly);
+    connectTagToggle(_filters.noDefective);
+    connectTagToggle(_filters.hideUnapproved);
+    connectTagToggle(_filters.inspectOnly);
     if (_filters.currentOnly) {
         connect(_filters.currentOnly, &QCheckBox::toggled, this, [this](bool checked) {
             QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -1342,6 +1349,7 @@ void SurfacePanelController::connectFilterSignals()
                 const QSignalBlocker blocker(_filters.showPartialReview);
                 _filters.showPartialReview->setChecked(false);
             }
+            refreshStoreFilters();
             applyFilters();
         });
     }
@@ -1406,6 +1414,7 @@ void SurfacePanelController::connectFilterSignals()
                 const QSignalBlocker blocker(_filters.partialReview);
                 _filters.partialReview->setChecked(false);
             }
+            refreshStoreFilters();
             applyFilters();
         });
     }
@@ -1548,8 +1557,14 @@ void SurfacePanelController::rebuildRecordTagFilterModel()
         }
     }
     std::set<std::string> tags;
-    for (const auto& [id, row] : _catalog->rows()) {
-        tags.insert(row.record.tags.begin(), row.record.tags.end());
+    for (const auto& source : _catalog->sources()) {
+        try {
+            _catalog->session()->read(source, [&](const auto& db, const auto& txn, const auto&) {
+                for (auto& tag : db.objectTags(txn, std::string("surface"))) tags.insert(std::move(tag));
+            });
+        } catch (const std::exception&) {
+            // A detached source lists no tags.
+        }
     }
     _configuringFilters = true;
     auto* model = new QStandardItemModel(_recordTagFilter);
@@ -1567,6 +1582,7 @@ void SurfacePanelController::rebuildRecordTagFilterModel()
     connect(model, &QStandardItemModel::dataChanged, this,
             [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
                 if (roles.contains(Qt::CheckStateRole)) {
+                    refreshStoreFilters();
                     applyFilters();
                 }
             });
@@ -1590,6 +1606,25 @@ std::vector<QString> checkedNames(QComboBox* box)
 }
 }
 
+SurfacePanelController::TagQuery SurfacePanelController::tagQuery() const
+{
+    auto checked = [](QCheckBox* box) { return box && box->isChecked(); };
+    TagQuery query;
+    std::vector<std::string> any;
+    for (const auto& name : checkedNames(_recordTagFilter)) any.push_back(name.toStdString());
+    if (!any.empty()) query.groups.push_back(std::move(any));
+    if (checked(_filters.hideUnapproved)) query.groups.push_back({"approved"});
+    if (checked(_filters.inspectOnly)) query.groups.push_back({"inspect"});
+    if (checked(_filters.showPartialReview)) query.groups.push_back({"partial_review", "reviewed"});
+    if (checked(_filters.unreviewed)) query.without.push_back("reviewed");
+    if (checked(_filters.noDefective)) query.without.push_back("defective");
+    if (checked(_filters.partialReview)) {
+        query.without.push_back("partial_review");
+        query.without.push_back("reviewed");
+    }
+    return query;
+}
+
 void SurfacePanelController::refreshStoreFilters()
 {
     const auto generation = ++_storeFilterGeneration;
@@ -1597,8 +1632,10 @@ void SurfacePanelController::refreshStoreFilters()
         _focusAnswer.reset();
         _pointSetAnswer.reset();
         _zRangeAnswer.reset();
+        _tagAnswer.reset();
         return;
     }
+    const auto tags = tagQuery();
     // The Z-range filter: the surfaces whose bounds in the open volume reach the range.
     std::optional<std::array<double, 2>> zRange;
     if (z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound)) {
@@ -1619,10 +1656,10 @@ void SurfacePanelController::refreshStoreFilters()
             pointSets.push_back(std::move(points));
         }
     }
-    struct Answers { ProximityAnswer focus, pointSets; std::optional<ZRangeAnswer> zRange; };
+    struct Answers { ProximityAnswer focus, pointSets; std::optional<ZRangeAnswer> zRange; std::optional<TagAnswer> tags; };
     vc3d::store::background<Answers>(this,
         [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), focus, pointSets,
-         focusRadius, zRange]() {
+         focusRadius, zRange, tags]() {
             auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
                 result.pointSets = sets;
@@ -1661,6 +1698,16 @@ void SurfacePanelController::refreshStoreFilters()
                     reached.surfaces.insert(record.uuid);
                 answers.zRange = std::move(reached);
             }
+            if (!tags.empty()) {
+                vc::objects::ObjectSelection selection;
+                selection.kind = "surface";
+                selection.tagGroups = tags.groups;
+                selection.withoutTags = tags.without;
+                TagAnswer tagged{tags, {}};
+                for (const auto& [attachment, record] : session->selectObjects(sources, selection))
+                    tagged.surfaces.insert(record.uuid);
+                answers.tags = std::move(tagged);
+            }
             return answers;
         },
         [this, generation](vc3d::store::Outcome<Answers> result) {
@@ -1672,6 +1719,7 @@ void SurfacePanelController::refreshStoreFilters()
             _focusAnswer = std::move(result.value.focus);
             _pointSetAnswer = std::move(result.value.pointSets);
             _zRangeAnswer = std::move(result.value.zRange);
+            _tagAnswer = std::move(result.value.tags);
             applyFilters();
         });
 }
@@ -1801,10 +1849,7 @@ void SurfacePanelController::applyFiltersInternal()
     const bool focusFilter = isChecked(_filters.focusPoints);
     const bool pointSetFilter = !checkedNames(_filters.pointSet).empty();
     const bool pointSetAny = !_filters.pointSetMode || _filters.pointSetMode->currentIndex() == 0;
-    std::set<std::string> recordTags;
-    for (const auto& name : checkedNames(_recordTagFilter)) {
-        recordTags.insert(name.toStdString());
-    }
+    const auto tags = tagQuery();
 
     int filterCounter = 0;
     std::vector<std::string> visible;
@@ -1820,9 +1865,9 @@ void SurfacePanelController::applyFiltersInternal()
                    item->text(SURFACE_ID_COLUMN).contains(idFilter, Qt::CaseInsensitive) ||
                    item->text(SURFACE_LONG_ID_COLUMN).contains(idFilter, Qt::CaseInsensitive);
         }
-        if (show && !recordTags.empty()) {
-            show = std::any_of(row->record.tags.begin(), row->record.tags.end(),
-                               [&](const std::string& tag) { return recordTags.contains(tag); });
+        if (show && !tags.empty()) {
+            // Until the store answers these tag filters, they show nothing.
+            show = _tagAnswer && _tagAnswer->query == tags && _tagAnswer->surfaces.contains(id);
         }
         if (show && focusFilter) {
             // Until the store answers, the focus filter shows nothing rather than everything.
@@ -1841,26 +1886,8 @@ void SurfacePanelController::applyFiltersInternal()
             show = _zRangeAnswer && _zRangeAnswer->range == std::array<double, 2>{zLowerBound, zUpperBound} &&
                    _zRangeAnswer->surfaces.contains(id);
         }
-        if (show && isChecked(_filters.unreviewed)) {
-            show = !has_tag(*row, "reviewed");
-        }
         if (show && isChecked(_filters.noExpansion)) {
             show = string_or(row_meta(*row), "vc_gsfs_mode") != "expansion";
-        }
-        if (show && isChecked(_filters.noDefective)) {
-            show = !has_tag(*row, "defective");
-        }
-        if (show && isChecked(_filters.partialReview)) {
-            show = !has_tag(*row, "partial_review") && !has_tag(*row, "reviewed");
-        }
-        if (show && isChecked(_filters.showPartialReview)) {
-            show = has_tag(*row, "partial_review") || has_tag(*row, "reviewed");
-        }
-        if (show && isChecked(_filters.hideUnapproved)) {
-            show = has_tag(*row, "approved");
-        }
-        if (show && isChecked(_filters.inspectOnly)) {
-            show = has_tag(*row, "inspect");
         }
 
         item->setHidden(!show);

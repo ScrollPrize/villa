@@ -1004,6 +1004,15 @@ static Rect3D rect_from_json(const utils::Json &json)
 }
 } // anonymous namespace
 
+std::vector<std::string> tifxyz_tags(const utils::Json& meta)
+{
+    std::vector<std::string> tags;
+    if (!meta.is_object() || !meta.contains("tags") || !meta["tags"].is_object()) return tags;
+    const auto& recorded = meta["tags"];
+    for (auto it = recorded.begin(); it != recorded.end(); ++it) tags.push_back(it.key());
+    return tags;
+}
+
 std::vector<std::pair<int, int>> surface_components(const utils::Json& meta)
 {
     std::vector<std::pair<int, int>> components;
@@ -1028,6 +1037,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
         _bbox = rect_from_json(meta["bbox"]);
 
     _components = surface_components(meta);
+    tags = tifxyz_tags(meta);
 
     const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
     _scale = geometry.scale;
@@ -1047,6 +1057,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
         _bbox = rect_from_json(json["bbox"]);
 
     _components = surface_components(json);
+    tags = tifxyz_tags(json);
 
     const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
     _scale = geometry.scale;

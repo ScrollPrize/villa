@@ -415,6 +415,9 @@ public:
     // require external synchronization.
     void unloadCaches();
 
+    // The surface's tags: its store record's, or a tifxyz meta.json's "tags" keys.
+    std::vector<std::string> tags;
+
     // Override disconnected component column ranges for an in-memory view.
     void setComponents(std::vector<std::pair<int, int>> components)
     {
@@ -586,6 +589,8 @@ private:
 // Column ranges [c0, c1) of disconnected components recorded as meta
 // "components" (Lasagna multi-component fits); empty for one component.
 std::vector<std::pair<int, int>> surface_components(const utils::Json& meta);
+// The tags a tifxyz meta.json records: the keys of its "tags" object.
+std::vector<std::string> tifxyz_tags(const utils::Json& meta);
 
 // A surface object's geometry revision (default: its current one). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.

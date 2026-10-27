@@ -97,7 +97,7 @@ TEST_CASE("QuadSurface round trip through the object store")
 
     auto loaded = store.load(uuid);
     CHECK(loaded->id == uuid);
-    CHECK(loaded->meta["tags"].contains("approved"));
+    CHECK(loaded->tags == std::vector<std::string>{"approved"});
     CHECK(loaded->_scale == cv::Vec2f(0.5f, 0.5f));
     const auto& p = *loaded->rawPointsPtr();
     CHECK(p(1, 1) == cv::Vec3f(1, 1, 10));

@@ -360,6 +360,26 @@ int main() try
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
             require(store.objectByUuid(txn, created).has_value(), "edits create objects pinned without a revision");
         });
+        // Tags of current records, kept relationships, and selections by tag sets.
+        session.tagObjects(replacement, {sheet, created}, {"approved", "reviewed"});
+        session.tagObjects(replacement, {created}, {"defective"}, {"approved"});
+        session.editRecords(replacement, {created}, [](ObjectRecord& record) { record.name = "renamed"; });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.edgeByUuid(txn, link).has_value(), "tagging keeps relationships as recorded");
+            const auto tags = store.objectByUuid(txn, created)->tags;
+            require(store.objectByUuid(txn, created)->name == "renamed" &&
+                        std::find(tags.begin(), tags.end(), "approved") == tags.end() &&
+                        std::find(tags.begin(), tags.end(), "defective") != tags.end(),
+                    "tag edits add and remove on the current record");
+            ObjectSelection selection;
+            selection.kind = "surface";
+            selection.tagGroups = {{"approved", "defective"}, {"reviewed"}};
+            require(store.selectObjects(txn, selection).size() == 2, "every tag group must be matched by one tag");
+            selection.withoutTags = {"defective"};
+            const auto kept = store.selectObjects(txn, selection);
+            require(kept.size() == 1 && kept[0].uuid == sheet, "objects with an excluded tag are left out");
+        });
+        mustFail([&] { session.tagObjects(replacement, {util::newUuid()}, {"approved"}); });
         session.takeEvents();
     }
     session.detach(replacement);
