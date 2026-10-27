@@ -774,7 +774,7 @@ int main(int argc, char** argv)
     desc.add_options()
         ("help,h", "show help")
         ("input", po::value<std::string>(&inPath), "input tifxyz dir")
-        ("output", po::value<std::string>(&outPath), "output tifxyz dir (must not exist); with --store, the new surface's name")
+        ("output", po::value<std::string>(&outPath), "output tifxyz dir (must not exist)")
         ("unbend", po::bool_switch(&doUnbend), "run the spine unbend stage")
         ("overlap-pairs", po::value<int>(&overlapCount), "run N overlap-pair passes")
         ("orthogonalize", po::bool_switch(&doOrtho), "run the column orthogonalize stage")
@@ -788,7 +788,8 @@ int main(int argc, char** argv)
         ("stride", po::value<int>(&op.stride)->default_value(2), "subsample stride for the KD-tree")
         ("trim-max-edge", po::value<double>(&trimMaxEdge)->default_value(100.0), "trim cells touching a 3D edge longer than this (voxels)")
         ("seed", po::value<unsigned>(&op.seed)->default_value(7), "RNG seed for the spacing estimate");
-    StoreToolOptions::add(desc, "object store: the input is a surface UUID and the result a new surface (prints surface_uuid:)");
+    StoreToolOptions::add(desc, "object store: the input is the stored --surface and the result a new surface (--name, "
+                                "prints surface_uuid:)", {.surfaces = true, .creates = true, .named = true});
     po::positional_options_description pos;
     pos.add("input", 1).add("output", 1);
     po::variables_map vm;
@@ -799,7 +800,7 @@ int main(int argc, char** argv)
         std::cerr << "error: " << e.what() << "\n" << desc << "\n";
         return 1;
     }
-    if (vm.count("help") || inPath.empty()) { std::cout << desc << "\n"; return vm.count("help") ? 0 : 1; }
+    if (vm.count("help")) { std::cout << desc << "\n"; return 0; }
 
     // Default pipeline when no stage flag is given.
     const bool anyStage = doUnbend || doOrtho || doTrim || overlapCount >= 0 || analyze;
@@ -813,10 +814,14 @@ int main(int argc, char** argv)
     try {
         storeOptions = StoreToolOptions::from(vm);
         if (storeOptions) {
+            if (!inPath.empty() || !outPath.empty() || storeOptions->surfaces.size() != 1)
+                throw std::runtime_error("store mode takes one --surface and no input or output directories");
+            inPath = storeOptions->surfaces.front();
             store.emplace(storeOptions->store, "vc_straighten");
             stored = store->load(inPath, true, storeOptions->volume);
             g = gridOf(*stored);
         } else {
+            if (inPath.empty()) { std::cout << desc << "\n"; return 1; }
             g = loadGrid(inPath);
         }
     }
@@ -845,8 +850,8 @@ int main(int argc, char** argv)
                     if (!g.valid(r, c)) P(r, c) = cv::Vec3f(-1, -1, -1);
             QuadSurface result(P, g.scale);
             result.meta = stored->meta;  // a straightened copy keeps the input's metadata
-            const std::string name = !outPath.empty() ? outPath
-                : (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight";
+            const std::string name = storeOptions->name.value_or(
+                (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight");
             const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
                                                {"orthogonalize", doOrtho}, {"trim", doTrim}};
             const auto uuid = store->create(result, name, parameters, {stored->id}, storeOptions->tags);

@@ -296,7 +296,6 @@ static int run_main(int argc, char *argv[])
             ("help,h", "produce help message")
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
             ("target-dir,t", po::value<std::string>(), "Target directory for output (tifxyz mode)")
-            ("surface", po::value<std::string>(), "Stored surface UUID to resume from or to project (store mode)")
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
@@ -308,7 +307,9 @@ static int run_main(int argc, char *argv[])
             ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
             ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
                                                     "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
-        StoreToolOptions::add(desc, "Object store (local or hosted replica) holding input and output surfaces");
+        StoreToolOptions::add(desc, "Object store (local or hosted replica) holding input and output surfaces; "
+                                    "--surface is the stored surface to resume from or to project",
+                              {.surfaces = true, .creates = true});
 
         po::variables_map vm;
         try {
@@ -345,11 +346,11 @@ static int run_main(int argc, char *argv[])
             std::cerr << "ERROR: specify exactly one of --store and --target-dir" << std::endl;
             return EXIT_FAILURE;
         }
-        if (vm.count("surface")) surface_uuid = vm["surface"].as<std::string>();
-        if (store_path.empty() && !surface_uuid.empty()) {
-            std::cerr << "ERROR: --surface requires --store" << std::endl;
+        if (store_options && store_options->surfaces.size() > 1) {
+            std::cerr << "ERROR: give at most one --surface" << std::endl;
             return EXIT_FAILURE;
         }
+        if (store_options && !store_options->surfaces.empty()) surface_uuid = store_options->surfaces.front();
         if (!store_path.empty() && vm.count("resume")) {
             std::cerr << "ERROR: in store mode, resume from --surface UUID" << std::endl;
             return EXIT_FAILURE;
@@ -368,7 +369,7 @@ static int run_main(int argc, char *argv[])
         }
 
         if (vm.count("correct")) {
-            if (!vm.count("resume") && !vm.count("surface")) {
+            if (!vm.count("resume") && surface_uuid.empty()) {
                 std::cerr << "ERROR: --correct can only be used with --resume or --surface" << std::endl;
                 return EXIT_FAILURE;
             }

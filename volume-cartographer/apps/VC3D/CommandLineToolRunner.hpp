@@ -108,9 +108,10 @@ public:
     void setToObjOptions(bool normalizeUV, bool alignGrid);
     // vc_objrefine: `dstSurface` is a new surface's name, or `srcSurface` to refine in place;
     // the surface is read in the voxels of `volumeUuid`, the volume at `volumePath`.
+    // `newName` names the refined surface; empty refines `srcSurface` in place.
     void setObjRefineParams(const QString& volumePath,
                             const QString& srcSurface,
-                            const QString& dstSurface,
+                            const QString& newName,
                             const QString& jsonParams,
                             const QString& volumeUuid);
     // vc_grow_seg_from_seed: grow from (resume) `resumeSurface` into a new surface
@@ -264,7 +265,7 @@ private:
     bool _terminalReported{true};
     QString _pendingProcessError;
 
-    QString _refineDst;
+    QString _refineName;  // the refined surface's name; empty: refined in place
     QStringList _createdSurfaces;
     QString _exportedObj;
     vc3d::ToolOutputLines _outputLines;

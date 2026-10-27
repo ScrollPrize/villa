@@ -11,7 +11,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -362,20 +362,21 @@ int process_tifxyz(const std::filesystem::path& src,
     return EXIT_SUCCESS;
 }
 
-// A stored surface, refined in place when `out` is its UUID, else into a new object named `out`.
-// With `volume` it is read in that volume's voxels (the zarr sampled), and a new object is bound to it.
-int process_stored(StoreSurfaces& store, const std::string& uuid, const std::string& out,
-                   const std::optional<std::string>& volume,
-                   const nlohmann::json& parameters, DSReader& reader, const RefinementConfig& cfg)
+// The stored --surface, refined in place, or into a new object named --name
+// (tagged --tag). With --volume-uuid it is read in that volume's voxels (the
+// zarr sampled), and a new object is bound to it.
+int process_stored(StoreSurfaces& store, const StoreToolOptions& options, const nlohmann::json& parameters,
+                   DSReader& reader, const RefinementConfig& cfg)
 {
+    const auto& uuid = options.surfaces.front();
     try {
-        auto surf = store.load(uuid, true, volume);
+        auto surf = store.load(uuid, true, options.volume);
         auto refined = refine_surface(*surf, reader, cfg);
         if (!refined) return EXIT_FAILURE;
-        if (out == surf->id || out == uuid) {
+        if (!options.name) {
             std::cout << "geometry_revision: " << store.update(surf->id, *refined) << std::endl;
         } else {
-            const auto created = store.create(*refined, out, parameters, {surf->id});
+            const auto created = store.create(*refined, *options.name, parameters, {surf->id}, options.tags);
             std::cout << "surface_uuid: " << created << std::endl;
         }
         store.objects().finish();
@@ -405,32 +406,32 @@ private:
 
 int main(int argc, char *argv[])
 {
-    // Store mode: --store=PATH (and --volume-uuid=ID) first, then the surface is
-    // a UUID and the output is that UUID (refine in place) or the name of a new surface.
-    std::optional<std::filesystem::path> store_path;
-    std::optional<std::string> volume_uuid;
-    if (argc > 1 && std::string(argv[1]).rfind("--store=", 0) == 0) {
-        store_path = std::string(argv[1]).substr(8);
-        ++argv; --argc;
-        if (argc > 1 && std::string(argv[1]).rfind("--volume-uuid=", 0) == 0) {
-            volume_uuid = std::string(argv[1]).substr(14);
-            ++argv; --argc;
-        }
+    // Store mode: the --surface is refined in place, or into a new surface
+    // when --name is given; with --volume-uuid it is read in that volume's
+    // voxels (the zarr's) through the store's view of it.
+    std::vector<std::string> args(argv + 1, argv + argc);
+    std::optional<StoreToolOptions> store;
+    try {
+        store = StoreToolOptions::take(args, {.surfaces = true, .creates = true, .named = true});
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return EXIT_FAILURE;
     }
-    if (argc != 5) {
-        std::cout << "usage: " << argv[0]
-                  << " [--store=<store> [--volume-uuid=<id>]] <zarr-volume> <src-surface> <out-surface> <json-params>"
-                  << std::endl
-                  << "  with --store the source is a surface UUID; the output is that UUID (refine in place)"
-                  << " or the name of a new surface; with --volume-uuid the surface is read in that volume's voxels"
-                  << " (the zarr's) through the store's view of it" << std::endl;
+    if (store ? args.size() != 2 || store->surfaces.size() != 1 : args.size() != 4) {
+        std::cout << "usage: " << argv[0] << " <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl
+                  << "   or: " << argv[0]
+                  << " --store <store> --surface <uuid> [--name <new surface>] [--volume-uuid <id>] [--tag <tag>]"
+                  << " <zarr-volume> <json-params>" << std::endl
+                  << "  in store mode the surface is refined in place, or into a new surface named --name; with"
+                  << " --volume-uuid it is read in that volume's voxels (the zarr's) through the store's view of it"
+                  << std::endl;
         return EXIT_SUCCESS;
     }
 
-    const std::filesystem::path vol_path    = argv[1];
-    const std::filesystem::path surface_src = argv[2];
-    const std::filesystem::path surface_dst = argv[3];
-    const std::filesystem::path params_path = argv[4];
+    const std::filesystem::path vol_path = args[0];
+    const std::filesystem::path surface_src = store ? store->surfaces.front() : args[1];
+    const std::filesystem::path surface_dst = store ? std::filesystem::path() : std::filesystem::path(args[2]);
+    const std::filesystem::path params_path = store ? std::filesystem::path(args[1]) : std::filesystem::path(args[3]);
 
     std::ifstream params_f(params_path);
     if (!params_f) {
@@ -469,10 +470,9 @@ int main(int argc, char *argv[])
 
     MeasureLife timer("processing surface ...\n");
 
-    if (store_path) {
-        StoreSurfaces store(*store_path, "vc_objrefine");
-        return process_stored(store, surface_src.string(), surface_dst.string(), volume_uuid,
-                              nlohmann::json::parse(params.dump()), reader, cfg);
+    if (store) {
+        StoreSurfaces surfaces(store->store, "vc_objrefine");
+        return process_stored(surfaces, *store, nlohmann::json::parse(params.dump()), reader, cfg);
     }
 
     int ret = EXIT_FAILURE;

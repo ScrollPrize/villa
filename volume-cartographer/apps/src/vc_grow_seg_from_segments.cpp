@@ -1007,7 +1007,6 @@ int main(int argc, char *argv[])
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
             ("src-dir,s", po::value<std::string>(), "Directory containing source segments (tifxyz mode)")
             ("target-dir,t", po::value<std::string>(), "Target directory for output traces (tifxyz mode)")
-            ("src-surface", po::value<std::string>(), "Stored surface UUID to grow from (store mode)")
             ("source-tag", po::value<std::string>(), "Only surfaces with this tag are sources (store mode; default all)")
             ("params,p", po::value<std::string>(), "JSON parameters file (required unless --sweep is used)")
             ("src-segment", po::value<std::string>(), "Source segment path to grow from")
@@ -1026,7 +1025,9 @@ int main(int argc, char *argv[])
             ("sweep-cutout-cm", po::value<double>()->default_value(5.0), "Center cutout edge length used as sweep seed")
             ("sweep-metric-tolerance", po::value<double>()->default_value(10.0), "Distance tolerance in voxels for sweep coverage metrics")
             ("sweep-max-distance-samples", po::value<int>()->default_value(20000), "Maximum sampled points per direction for sweep distance metrics");
-        StoreToolOptions::add(desc, "Object store: sources are its surfaces and outputs new surface objects (prints surface_uuid:)");
+        StoreToolOptions::add(desc, "Object store: sources are its surfaces and outputs new surface objects (prints surface_uuid:); "
+                                    "--surface is the stored surface to grow from",
+                              {.surfaces = true, .creates = true});
 
         po::variables_map vm;
         try {
@@ -1060,16 +1061,20 @@ int main(int argc, char *argv[])
         }
         if (store_options) {
             if (vm.count("src-dir") || vm.count("target-dir") || vm.count("src-segment") || vm.count("sweep")) {
-                std::cerr << "ERROR: store mode takes --src-surface/--seed-coord and no directories or --sweep" << std::endl;
+                std::cerr << "ERROR: store mode takes --surface/--seed-coord and no directories or --sweep" << std::endl;
                 return EXIT_FAILURE;
             }
             store_path = store_options->store;
-            if (vm.count("src-surface")) src_surface = vm["src-surface"].as<std::string>();
+            if (store_options->surfaces.size() > 1) {
+                std::cerr << "ERROR: give at most one --surface" << std::endl;
+                return EXIT_FAILURE;
+            }
+            if (!store_options->surfaces.empty()) src_surface = store_options->surfaces.front();
             if (vm.count("source-tag")) source_tag = vm["source-tag"].as<std::string>();
             volume_uuid = store_options->volume;
             output_tags = store_options->tags;
         } else {
-            if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("src-surface") || vm.count("source-tag")) {
+            if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("source-tag")) {
                 std::cerr << "ERROR: give --src-dir and --target-dir, or --store with its options" << std::endl;
                 return EXIT_FAILURE;
             }
@@ -1109,7 +1114,7 @@ int main(int argc, char *argv[])
         sweep_max_distance_samples = vm["sweep-max-distance-samples"].as<int>();
         const bool has_seed_coordinates = !seed_coord_values.empty() || !seed_coords_path.empty();
         if (sweep_target_path.empty() && src_path.empty() && src_surface.empty() && !has_seed_coordinates) {
-            std::cerr << "ERROR: --src-segment/--src-surface, --seed-coord/--seed-coords, or --sweep is required" << std::endl;
+            std::cerr << "ERROR: --src-segment/--surface, --seed-coord/--seed-coords, or --sweep is required" << std::endl;
             return EXIT_FAILURE;
         }
         if (sweep_target_path.empty() && params_path.empty()) {

@@ -3,7 +3,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
@@ -1179,9 +1179,6 @@ int main(int argc, char *argv[])
     optional.add_options()
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
-        ("store", po::value<std::string>(), "Object store holding the surface to render (with --surface)")
-        ("surface", po::value<std::string>(), "Stored surface UUID to render (with --store)")
-        ("volume-uuid", po::value<std::string>(), "Read the stored surface in this volume's voxels through the store's view of it (its binding or a registration); replaces --affine and --scale-segmentation")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch the chunks this render reads into the shared remote cache before rendering instead of streaming them during the render")
         ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
@@ -1255,6 +1252,10 @@ int main(int argc, char *argv[])
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
         ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
+    StoreToolOptions::add(optional, "Object store holding the --surface to render; with --volume-uuid it is read in "
+                                    "that volume's voxels through the store's view of it (its binding or a "
+                                    "registration), replacing --affine and --scale-segmentation",
+                          {.surfaces = true, .creates = false});
     // clang-format on
 
     po::options_description all("Usage");
@@ -1355,21 +1356,24 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    const bool store_mode = parsed.count("store") || parsed.count("surface");
-    if (store_mode ? !(parsed.count("store") && parsed.count("surface")) || parsed.count("segmentation")
-                   : !parsed.count("segmentation")) {
-        logPrintf(stderr, "Error: give --segmentation, or --store with --surface\n");
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::from(parsed);
+    } catch (const std::exception& e) {
+        logPrintf(stderr, "Error: %s\n", e.what());
         return EXIT_FAILURE;
     }
-    std::optional<std::string> view_volume;
-    if (parsed.count("volume-uuid")) {
-        if (!store_mode || parsed.count("affine") || parsed.count("affine-invert") || !parsed["scale-segmentation"].defaulted()) {
-            logPrintf(stderr, "Error: --volume-uuid needs --store and replaces --affine and --scale-segmentation\n");
-            return EXIT_FAILURE;
-        }
-        view_volume = parsed["volume-uuid"].as<std::string>();
+    const bool store_mode = store_options.has_value();
+    if (store_mode ? store_options->surfaces.size() != 1 || parsed.count("segmentation") : !parsed.count("segmentation")) {
+        logPrintf(stderr, "Error: give --segmentation, or --store with one --surface\n");
+        return EXIT_FAILURE;
     }
-    std::filesystem::path seg_path = store_mode ? parsed["surface"].as<std::string>() : parsed["segmentation"].as<std::string>();
+    const std::optional<std::string> view_volume = store_mode ? store_options->volume : std::nullopt;
+    if (view_volume && (parsed.count("affine") || parsed.count("affine-invert") || !parsed["scale-segmentation"].defaulted())) {
+        logPrintf(stderr, "Error: --volume-uuid replaces --affine and --scale-segmentation\n");
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path seg_path = store_mode ? store_options->surfaces.front() : parsed["segmentation"].as<std::string>();
 
     float tgt_scale = parsed["scale"].as<float>();
     int group_idx = parsed["group-idx"].as<int>();
@@ -1716,7 +1720,7 @@ int main(int argc, char *argv[])
 
         std::unique_ptr<QuadSurface> surf;
         try {
-            surf = store_mode ? StoreSurfaces(parsed["store"].as<std::string>(), "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
+            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
                               : load_quad_from_tifxyz(seg_folder);
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }

@@ -1464,7 +1464,6 @@ int main(int argc, char* argv[])
         desc.add_options()
             ("help,h", "Show help")
             ("input", po::value<std::string>(), "Input folder containing tifxyz meshes")
-            ("surface", po::value<std::vector<std::string>>()->composing(), "Stored surface UUID to rasterize (repeatable, with --store)")
             ("output", po::value<std::string>(), "Output OME-Zarr root")
             ("shape-z", po::value<size_t>(), "Output Z size")
             ("shape-y", po::value<size_t>(), "Output Y size")
@@ -1492,8 +1491,8 @@ int main(int argc, char* argv[])
             ("chunk-size-z", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-y", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size")
             ("chunk-size-x", po::value<size_t>(), "DEPRECATED: ignored; use --chunk-size");
-        StoreToolOptions::add(desc, "Object store holding the meshes (with --surface); the positional is then the output",
-                              false);
+        StoreToolOptions::add(desc, "Object store holding the meshes (the repeatable --surface); the positional is then "
+                                    "the output", {.surfaces = true, .creates = false});
 
         po::positional_options_description pos;
         pos.add("input", 1);
@@ -1509,7 +1508,7 @@ int main(int argc, char* argv[])
         const auto storeOptions = StoreToolOptions::from(vm);
         std::optional<StoreSurfaces> store;
         if (storeOptions) {
-            if (!vm.count("surface")) throw std::runtime_error("--store needs at least one --surface");
+            if (storeOptions->surfaces.empty()) throw std::runtime_error("--store needs at least one --surface");
             // The one positional is the output.
             if (vm.count("input") && !vm.count("output")) vm.insert({"output", vm["input"]});
             vm.erase("input");
@@ -1517,8 +1516,6 @@ int main(int argc, char* argv[])
             store.emplace(storeOptions->store, "vc_tifxyz2zarr_sparse");
             // Meshes are rasterized in the output volume's voxels.
             loadMesh = [&](const fs::path& uuid) { return store->load(uuid.string(), true, storeOptions->volume); };
-        } else if (vm.count("surface")) {
-            throw std::runtime_error("--surface needs --store");
         }
 
         if (vm.count("help") || !vm.count("input") || !vm.count("output")) {
@@ -1554,7 +1551,7 @@ int main(int argc, char* argv[])
         const size_t spoolMemMB = vm["spool-memory-mb"].as<size_t>();
         // Stored meshes are their own provenance.
         const auto sourceSegments = vm.count("source-segment") ? vm["source-segment"].as<std::vector<std::string>>()
-                                    : store ? vm["surface"].as<std::vector<std::string>>()
+                                    : store ? storeOptions->surfaces
                                             : std::vector<std::string>{};
         const auto sourceMeshes = vm.count("source-mesh")
                                      ? vm["source-mesh"].as<std::vector<std::string>>()
@@ -1601,7 +1598,7 @@ int main(int argc, char* argv[])
         const size_t numThreads = static_cast<size_t>(threadCount);
 
         std::vector<fs::path> meshes;
-        if (store) for (const auto& uuid : vm["surface"].as<std::vector<std::string>>()) meshes.emplace_back(uuid);
+        if (store) for (const auto& uuid : storeOptions->surfaces) meshes.emplace_back(uuid);
         else meshes = discoverTifxyzMeshes(inputRoot);
         if (meshes.empty()) {
             throw std::runtime_error("no tifxyz meshes found: " + inputRoot.string());

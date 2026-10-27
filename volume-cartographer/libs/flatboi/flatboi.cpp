@@ -38,7 +38,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/InpaintSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 #include <vc_object_store/Uuid.hpp>
 
@@ -1076,7 +1076,7 @@ static nlohmann::json parameters(const Options& opt)
 }
 
 // A stored surface into a new surface object; reports go to its artifact directory.
-static int run_store(const StoreOutputArgs& output, const std::string& source, const Options& opt)
+static int run_store(const StoreToolOptions& output, const std::string& source, const Options& opt)
 {
   StoreSurfaces store(output.store, "flatboi");
   // With --volume-uuid the surface is flattened in that volume's voxels.
@@ -1086,8 +1086,8 @@ static int run_store(const StoreOutputArgs& output, const std::string& source, c
   const auto flat = flatten(*surface, opt, report_dir / "slim.obj", source);
   if (!flat) return 3;
 
-  const std::string name = !output.name.empty() ? output.name
-      : (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi";
+  const std::string name = output.name.value_or(
+      (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi");
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
   const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
   for (const auto& entry : fs::directory_iterator(report_dir)) {
@@ -1132,8 +1132,8 @@ int main(int argc, char** argv) {
   auto print_usage = [&]() {
     std::cerr << "Usage: " << argv[0] << " <mesh.obj> [iters=50] [energy] [--tol=<x>]\n"
               << "       " << argv[0] << " <tifxyz-dir> --output=<dir> [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
-              << "       " << argv[0] << " --store=<store> --source-surface=<uuid> [--name=<name>] [--tag=<tag>]...\n"
-              << "                [--volume-uuid=<id>] [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
+              << "       " << argv[0] << " --store <store> --surface <uuid> [--name <name>] [--tag <tag>]...\n"
+              << "                [--volume-uuid <id>] [--keep=<p>] [--inpaint] [iters=50] [energy] [--tol=<x>]\n"
               << "  energy (optional): symmetric_dirichlet (default) or conformal\n"
               << "  --tol=<x>         relative-energy early-stop threshold (0 disables, default)\n"
               << "  a tifxyz surface (directory or stored) is flattened into a new surface: a tifxyz\n"
@@ -1142,23 +1142,20 @@ int main(int argc, char** argv) {
               << "  full grid, --inpaint fills interior holes first\n";
   };
 
-  StoreOutputArgs store_output;
-  std::string source_surface;
+  std::optional<StoreToolOptions> store_output;
   std::string tifxyz_output;
   float keep_percent = 100.0f;
   bool inpaint = false;
   std::vector<std::string> positional;
   try {
-    for (int i = 1; i < argc; ++i) {
-      std::string a = argv[i];
+    std::vector<std::string> args(argv + 1, argv + argc);
+    store_output = StoreToolOptions::take(args, {.surfaces = true, .creates = true, .named = true});
+    for (auto& a : args) {
       if (a.rfind("--tol=", 0) == 0) {
         conv_tol = std::atof(a.c_str() + 6);
       } else if (a == "--help" || a == "-h") {
         print_usage();
         return 0;
-      } else if (store_output.parse(a)) {
-      } else if (a.rfind("--source-surface=", 0) == 0) {
-        source_surface = a.substr(17);
       } else if (a.rfind("--output=", 0) == 0) {
         tifxyz_output = a.substr(9);
       } else if (a.rfind("--keep=", 0) == 0) {
@@ -1175,12 +1172,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  const bool store_mode = !store_output.store.empty();
-  if (store_mode != !source_surface.empty()) {
-    std::cerr << "--store and --source-surface go together\n"; return 1;
-  }
-  if (!store_mode && (!store_output.name.empty() || !store_output.tags.empty() || store_output.volume)) {
-    std::cerr << "--name, --tag and --volume-uuid need --store\n"; return 1;
+  const bool store_mode = store_output.has_value();
+  if (store_mode && store_output->surfaces.size() != 1) {
+    std::cerr << "--store takes one --surface\n"; return 1;
   }
   // The OBJ or tifxyz path, or nothing in store mode.
   if (store_mode) positional.insert(positional.begin(), std::string());
@@ -1236,7 +1230,7 @@ int main(int argc, char** argv) {
   if (store_mode || tifxyz_mode) {
     const surface_mode::Options options{iters, energy, energy_label, conv_tol, keep_percent, inpaint};
     try {
-      return store_mode ? surface_mode::run_store(store_output, source_surface, options)
+      return store_mode ? surface_mode::run_store(*store_output, store_output->surfaces.front(), options)
                         : surface_mode::run_tifxyz(obj_path, tifxyz_output, options);
     } catch (const std::exception& e) {
       std::cerr << "Error: " << e.what() << "\n";

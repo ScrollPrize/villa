@@ -2407,7 +2407,7 @@ int main(int argc, char** argv)
          "to single-pass.");
     StoreToolOptions::add(desc, "Object store: the merge.json grid names stored surface UUIDs and the merge is "
                                 "stored as a new surface (prints surface_uuid:); OBJ and summary go to its artifact "
-                                "directory");
+                                "directory", {.surfaces = false, .creates = true});
 
     po::variables_map vm;
     try {

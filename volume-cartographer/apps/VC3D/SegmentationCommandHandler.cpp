@@ -1078,8 +1078,8 @@ public:
         connect(proc_, &QProcess::errorOccurred, this, &StraightenJob::onProcError_);
 
         QStringList args;
-        args << surfaceUuid << outputName << QStringLiteral("--store") << storePath
-             << QStringLiteral("--volume-uuid") << volumeUuid << extraArgs;
+        args << QStringLiteral("--store") << storePath << QStringLiteral("--volume-uuid") << volumeUuid
+             << QStringLiteral("--surface") << surfaceUuid << QStringLiteral("--name") << outputName << extraArgs;
         std::cout << "[straighten] launching: " << straightenExe.toStdString()
                   << " " << args.join(' ').toStdString() << std::endl;
         if (handler_) {
@@ -1795,10 +1795,10 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
 
     const QString outputName = params.outputName.isEmpty() ? stored->name + QStringLiteral("_flatboi") : params.outputName;
     const int iters = params.iterations > 0 ? params.iterations : 50;
-    QStringList args{QStringLiteral("--store=%1").arg(stored->store),
-                     QStringLiteral("--source-surface=%1").arg(QString::fromStdString(stored->uuid)),
-                     QStringLiteral("--volume-uuid=%1").arg(stored->volumeUuid),
-                     QStringLiteral("--name=%1").arg(outputName)};
+    QStringList args{QStringLiteral("--store"), stored->store,
+                     QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
+                     QStringLiteral("--volume-uuid"), stored->volumeUuid,
+                     QStringLiteral("--name"), outputName};
     if (params.keepPercent < 100.0) args << QStringLiteral("--keep=%1").arg(params.keepPercent, 0, 'f', 4);
     if (params.inpaintHoles) args << QStringLiteral("--inpaint");
     if (params.tolerance > 0.0) args << QStringLiteral("--tol=%1").arg(params.tolerance, 0, 'g', 8);
@@ -2824,8 +2824,8 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         return fail(tr("vc_objrefine not found or not executable"), CommandLaunchError::ToolUnavailable);
     }
 
-    // The output is a new surface's name, or the source's UUID to refine in place.
-    const QString destination = params.inPlace ? QString::fromStdString(stored->uuid)
+    // The output is a new surface's name, or none to refine in place.
+    const QString newName = params.inPlace ? QString()
         : params.outputName.trimmed().isEmpty() ? stored->name + QStringLiteral("_refined")
                                                 : params.outputName.trimmed();
 
@@ -2854,7 +2854,7 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         });
 
     _cmdRunner->setStore(stored->store);
-    _cmdRunner->setObjRefineParams(volumePath, QString::fromStdString(stored->uuid), destination, paramsPath,
+    _cmdRunner->setObjRefineParams(volumePath, QString::fromStdString(stored->uuid), newName, paramsPath,
                                    QString::fromStdString(sampledVolume));
     _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive

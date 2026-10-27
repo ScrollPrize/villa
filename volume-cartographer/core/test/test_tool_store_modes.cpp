@@ -274,7 +274,8 @@ TEST_CASE("vc_merge_patch edits a stored parent like a tifxyz parent")
     }
     const auto bin = tool("VC_MERGE_PATCH_BIN") + " --ransac-seed 7 --border-cells 4 --blend-cells 2";
     run(bin + " --parent \"" + (f.dir / "parent").string() + "\" --child \"" + (f.dir / "child").string() + "\"", f.dir / "file.log");
-    const auto output = run(bin + " --store \"" + f.store.string() + "\" --parent " + parentUuid + " --child " + childUuid, f.dir / "store.log");
+    const auto output = run(bin + " --store \"" + f.store.string() + "\" --surface " + parentUuid + " --surface " + childUuid +
+                            " --explicit-roles", f.dir / "store.log");
     CHECK(output.find("geometry_revision: ") != std::string::npos);
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
@@ -341,9 +342,9 @@ TEST_CASE("vc_flatten flattens a stored surface and stores its uv channel")
     Fixture f;
     const auto bin = tool("VC_FLATTEN_BIN") + " --iterations 5";
     run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "flat").string() + "\"", f.dir / "file.log");
-    const auto flat = surfaceUuid(run(bin + " -i " + f.uuid + " --store \"" + f.store.string() + "\" --tag flat", f.dir / "store.log"));
+    const auto flat = surfaceUuid(run(bin + " " + f.storeArgs() + " --tag flat", f.dir / "store.log"));
     run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "uv").string() + "\" --uv-only", f.dir / "file-uv.log");
-    run(bin + " -i " + f.uuid + " --store \"" + f.store.string() + "\" --uv-only", f.dir / "store-uv.log");
+    run(bin + " " + f.storeArgs() + " --uv-only", f.dir / "store-uv.log");
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
     auto txn = db.read();
@@ -371,9 +372,9 @@ TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
     const std::string tail = " \"" + (f.dir / "params.json").string() + "\"";
     const std::string volume = " \"" + (f.dir / "volume.zarr").string() + "\" ";
     run(bin + volume + "\"" + f.tifxyz.string() + "\" \"" + (f.dir / "refined").string() + "\"" + tail, f.dir / "file.log");
-    const std::string store = bin + " --store=\"" + f.store.string() + "\"" + volume;
-    const auto created = surfaceUuid(run(store + f.uuid + " refined" + tail, f.dir / "store.log"));
-    run(store + f.uuid + " " + f.uuid + tail, f.dir / "inplace.log");
+    const std::string store = bin + " " + f.storeArgs();
+    const auto created = surfaceUuid(run(store + " --name refined" + volume + tail, f.dir / "store.log"));
+    run(store + volume + tail, f.dir / "inplace.log");
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
     auto txn = db.read();
@@ -391,7 +392,7 @@ TEST_CASE("vc_straighten stores its result as a new surface")
     Fixture f;
     const auto bin = tool("VC_STRAIGHTEN_BIN") + " --trim --trim-max-edge 4.03";
     run(bin + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "straight").string() + "\"", f.dir / "file.log");
-    const auto uuid = surfaceUuid(run(bin + " " + f.uuid + " --store \"" + f.store.string() + "\" --tag straight", f.dir / "store.log"));
+    const auto uuid = surfaceUuid(run(bin + " " + f.storeArgs() + " --tag straight", f.dir / "store.log"));
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
     auto txn = db.read();
@@ -456,7 +457,7 @@ TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources"
     std::ofstream(f.dir / "params.json") << R"({"generations": 3, "use_cuda": false})";
     const auto output = run(tool("VC_GROW_SEG_FROM_SEGMENTS_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
                             "\" --params \"" + (f.dir / "params.json").string() + "\" --store \"" + f.store.string() +
-                            "\" --src-surface " + uuidA + " --source-tag source --tag trace", f.dir / "store.log");
+                            "\" --surface " + uuidA + " --source-tag source --tag trace", f.dir / "store.log");
     const auto uuid = surfaceUuid(output);
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
@@ -485,9 +486,9 @@ TEST_CASE("flatboi flattens a surface like the OBJ chain it replaces")
     run(bin + " \"" + obj.string() + "\" 10", f.dir / "slim.log");
     run(tool("VC_OBJ2TIFXYZ_BIN") + " \"" + (f.dir / "mesh_flatboi.obj").string() + "\" \"" + (f.dir / "flat").string() +
         "\" --tifxyz-source=\"" + f.tifxyz.string() + "\"", f.dir / "tifxyz.log");
-    const std::string store = " --store=\"" + f.store.string() + "\" --source-surface=" + f.uuid;
+    const std::string store = " " + f.storeArgs();
     const auto uuid = surfaceUuid(run(bin + store + " --tag=flat 10", f.dir / "store.log"));
-    const auto coarse = surfaceUuid(run(bin + store + " --keep=50 --name=coarse 10", f.dir / "keep.log"));
+    const auto coarse = surfaceUuid(run(bin + store + " --keep=50 --name coarse 10", f.dir / "keep.log"));
     run(bin + " \"" + f.tifxyz.string() + "\" --output=\"" + (f.dir / "direct").string() + "\" 10", f.dir / "direct.log");
 
     OpenOptions options; options.author = "tool-store-test";

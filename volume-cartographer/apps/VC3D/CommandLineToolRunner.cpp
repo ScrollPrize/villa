@@ -714,7 +714,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             args << "--volume" << _volumePath
                  << "--params" << _jsonParams
                  << "--store" << _storePath
-                 << "--src-surface" << _sourceSurfaceUuid
+                 << "--surface" << _sourceSurfaceUuid
                  << "--volume-uuid" << _volumeUuid
                  << "--source-tag" << _sourceTag
                  << "--tag" << _outputTag;
@@ -729,12 +729,12 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             if (_optAlignGrid)   args << "--align-grid";
             break;
         case Tool::AlphaCompRefine:
-            args << QStringLiteral("--store=%1").arg(_storePath)
-                 << QStringLiteral("--volume-uuid=%1").arg(_volumeUuid)
-                 << _volumePath
-                 << _surfaceUuid
-                 << _refineDst
-                 << _jsonParams;
+            // Without a new name the surface is refined in place.
+            args << "--store" << _storePath
+                 << "--volume-uuid" << _volumeUuid
+                 << "--surface" << _surfaceUuid;
+            if (!_refineName.isEmpty()) args << "--name" << _refineName;
+            args << _volumePath << _jsonParams;
             break;
         case Tool::NeighborCopy:
             args << "-v" << _volumePath
@@ -767,16 +767,12 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--strip-cols"        << QString::number(_mergeStripCols);
             break;
         case Tool::MergePatch:
-            // Either positional (auto-detect roles by valid-cell count) or
-            // explicit --parent / --child when the user swapped via the
-            // dialog. The binary requires exactly one of these forms.
-            args << "--store" << _storePath;
-            if (_patchExplicitRoles) {
-                args << "--parent" << _patchParentSurface
-                     << "--child"  << _patchChildSurface;
-            } else {
-                args << _patchParentSurface << _patchChildSurface;
-            }
+            // Roles are auto-detected by valid-cell count unless the user
+            // swapped them in the dialog (the first surface is the parent).
+            args << "--store" << _storePath
+                 << "--surface" << _patchParentSurface
+                 << "--surface" << _patchChildSurface;
+            if (_patchExplicitRoles) args << "--explicit-roles";
             args << "--border-cells"      << QString::number(_patchBorderCells)
                  << "--blend-cells"       << QString::number(_patchBlendCells)
                  << "--idw-k"             << QString::number(_patchIdwK)
@@ -900,14 +896,14 @@ void CommandLineToolRunner::setMergePatchParams(const QString& parentSurface,
 
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& srcSurface,
-                                               const QString& dstSurface,
+                                               const QString& newName,
                                                const QString& jsonParams,
                                                const QString& volumeUuid)
 {
     setVolumePath(volumePath);
     _volumeUuid = volumeUuid;
     _surfaceUuid = srcSurface;
-    _refineDst = dstSurface;
+    _refineName = newName;
     _jsonParams = jsonParams;
 }
 

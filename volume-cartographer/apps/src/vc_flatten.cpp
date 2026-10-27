@@ -25,8 +25,7 @@ int main(int argc, char* argv[]) {
     po::options_description desc("vc_flatten - ABF++ mesh flattening\n\nUsage");
     desc.add_options()
         ("help,h", "Show this help message")
-        ("input,i", po::value<std::string>()->required(),
-            "Input TIFXYZ directory, or a surface UUID with --store")
+        ("input,i", po::value<std::string>(), "Input TIFXYZ directory")
         ("output,o", po::value<std::string>(),
             "Output TIFXYZ directory (default: <input>_flat)")
         ("iterations", po::value<int>()->default_value(10),
@@ -39,8 +38,9 @@ int main(int argc, char* argv[]) {
             "Don't scale output to match original 3D surface area")
         ("uv-only", po::bool_switch()->default_value(false),
             "Only compute and save UV channel, don't create new surface");
-    StoreToolOptions::add(desc, "Object store: the input is a stored surface; the flattened surface is stored as a "
-                                "new object (prints surface_uuid:), or --uv-only adds the uv channel to the input");
+    StoreToolOptions::add(desc, "Object store: the input is the stored --surface; the flattened surface is stored as a "
+                                "new object (--name, prints surface_uuid:), or --uv-only adds the uv channel to the input",
+                          {.surfaces = true, .creates = true, .named = true});
 
     po::positional_options_description pos;
     pos.add("input", 1);
@@ -70,7 +70,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    fs::path inputPath = vm["input"].as<std::string>();
+    fs::path inputPath;
     fs::path outputPath;
     std::optional<StoreToolOptions> storeOptions;
     std::optional<StoreSurfaces> store;
@@ -81,11 +81,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (storeOptions) {
-        if (vm.count("output")) {
-            std::cerr << "--output names a tifxyz directory; stored outputs are new objects" << std::endl;
+        if (vm.count("input") || vm.count("output") || storeOptions->surfaces.size() != 1) {
+            std::cerr << "store mode takes one --surface and no --input/--output (stored outputs are new objects)" << std::endl;
             return 1;
         }
+        inputPath = storeOptions->surfaces.front();
         store.emplace(storeOptions->store, "vc_flatten");
+    } else if (vm.count("input")) {
+        inputPath = vm["input"].as<std::string>();
+    } else {
+        std::cerr << "give --input, or --store with --surface" << std::endl;
+        return 1;
     }
 
     if (store) {
@@ -158,7 +164,8 @@ int main(int argc, char* argv[]) {
         std::cout << "  Valid quads: " << flatSurf->countValidQuads() << std::endl;
 
         if (store) {
-            const std::string name = (surf->meta.contains("name") ? surf->meta["name"].get_string() : surf->id) + "_flat";
+            const std::string name = storeOptions->name.value_or(
+                (surf->meta.contains("name") ? surf->meta["name"].get_string() : surf->id) + "_flat");
             const nlohmann::json parameters = {{"iterations", config.maxIterations}, {"downsample", config.downsampleFactor},
                                                {"abf", config.useABF}, {"scale_to_original_area", config.scaleToOriginalArea}};
             const auto uuid = store->create(*flatSurf, name, parameters, {surf->id}, storeOptions->tags);

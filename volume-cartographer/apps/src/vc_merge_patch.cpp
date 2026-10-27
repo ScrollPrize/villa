@@ -34,7 +34,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
@@ -1266,9 +1266,9 @@ int main(int argc, char** argv)
         "edits in VC3D)");
     desc.add_options()
         ("help,h", "print help")
-        ("store", po::value<std::string>(),
-            "Object store holding both surfaces; the inputs are then surface UUIDs and "
-            "the parent is edited in place (its revision history replaces backups)")
+        ("explicit-roles", po::bool_switch(),
+            "Store mode: the first --surface is the parent and the second the child "
+            "(otherwise detected as with positional inputs)")
         ("parent,p", po::value<std::string>(),
             "Parent tifxyz directory (explicit override). When both "
             "--parent and --child are set, auto-detection is skipped. "
@@ -1316,6 +1316,8 @@ int main(int argc, char** argv)
     po::options_description hidden;
     hidden.add_options()
         ("inputs", po::value<std::vector<std::string>>(), "tifxyz inputs (positional)");
+    StoreToolOptions::add(desc, "Object store holding both surfaces (two --surface); the parent is edited in place "
+                                "(its revision history replaces backups)", {.surfaces = true, .creates = false});
     po::positional_options_description pos;
     pos.add("inputs", -1);
     po::options_description all_opts;
@@ -1331,15 +1333,30 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    std::optional<StoreToolOptions> store_options;
+    try {
+        store_options = StoreToolOptions::from(vm);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
     const bool has_parent = vm.count("parent") > 0;
     const bool has_child  = vm.count("child")  > 0;
     const std::vector<std::string> positional = vm.count("inputs")
         ? vm["inputs"].as<std::vector<std::string>>()
         : std::vector<std::string>();
-    const bool explicit_roles = has_parent && has_child;
+    if (store_options && (has_parent || has_child || !positional.empty() || store_options->surfaces.size() != 2)) {
+        std::cerr << "store mode takes two --surface (and --explicit-roles), no paths\n";
+        return EXIT_FAILURE;
+    }
+    if (!store_options && vm["explicit-roles"].as<bool>()) {
+        std::cerr << "--explicit-roles needs --store; give --parent and --child instead\n";
+        return EXIT_FAILURE;
+    }
+    const bool explicit_roles = store_options ? vm["explicit-roles"].as<bool>() : has_parent && has_child;
 
     if (vm.count("help") ||
-        (!explicit_roles && positional.size() != 2) ||
+        (!store_options && !explicit_roles && positional.size() != 2) ||
         (has_parent != has_child) ||
         (explicit_roles && !positional.empty()))
     {
@@ -1366,7 +1383,10 @@ int main(int argc, char** argv)
     cfg.idw_k             = vm["idw-k"].as<int>();
 
     fs::path path_a, path_b;
-    if (explicit_roles) {
+    if (store_options) {
+        path_a = store_options->surfaces[0];
+        path_b = store_options->surfaces[1];
+    } else if (explicit_roles) {
         path_a = vm["parent"].as<std::string>();
         path_b = vm["child"].as<std::string>();
     } else {
@@ -1376,7 +1396,7 @@ int main(int argc, char** argv)
 
     try {
         std::optional<StoreSurfaces> store;
-        if (vm.count("store")) store.emplace(vm["store"].as<std::string>(), "vc_merge_patch");
+        if (store_options) store.emplace(store_options->store, "vc_merge_patch");
         else {
             if (!fs::is_directory(path_a))
                 throw std::runtime_error("not a directory: " + path_a.string());
