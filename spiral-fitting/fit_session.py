@@ -129,6 +129,11 @@ from surface_orientation import spiral_outward_sense_for
 # PCL display artifacts (same_winding_artifact, relative_winding_artifact)
 # are gone. Previews, autosave metadata and the preview index record the
 # input digest, and a published preview is re-shown only for the same inputs.
+# POST /session/rebuild takes "inputs": "reload" to reread the store under an
+# unchanged configuration and reports which it did ("inputs": "keep" for a
+# model-only rebuild). A checkpoint refused for its inputs says so in the 409's
+# "inputs" (legacy, problems, the reload rebuild and
+# object_store_allow_changed_inputs).
 API_VERSION = 36
 
 

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip('vc_object_store')
+from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
@@ -272,3 +273,97 @@ def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp
         assert rank['state'] == 'Error' and not rank['ever_idle']
         assert any('pcl_patch: FAILED' in line for line in rank['input_problems'])
     assert outcome[0]['input_problems'] == outcome[1]['input_problems']
+
+
+# ---------------------------------------------------------------------------
+# Rebuilds and checkpoints against frozen inputs (step 8)
+# ---------------------------------------------------------------------------
+
+def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
+        state, store_path, device_stubs):
+    request = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
+    state.initialize(request)
+    first = settle(state)['input_digest']
+    walk = next(entry['uuid'] for entry in state.dataset()['inputs']['objects']
+                if entry['name'] == 'walk')
+    with ObjectStore.open(store_path, author='editor') as db:
+        db.set_meta(walk, 'sampling_group', 'reviewed')
+    # The same configuration is a model-stage rebuild, which keeps the
+    # frozen inputs: it neither rereads the store nor sees the edit.
+    response = state.rebuild(request)
+    assert (response['stage'], response['inputs']) == ('model', 'keep')
+    assert settle(state)['input_digest'] == first
+    assert device_stubs == [True]
+    response = state.rebuild({**request, 'inputs': 'reload'})
+    assert (response['stage'], response['inputs']) == ('all', 'reload')
+    reloaded = settle(state)
+    assert reloaded['state'] == 'Idle'
+    assert reloaded['input_digest'] != first
+    assert len(device_stubs) == 2
+    with pytest.raises(spiral_service.ApiError, match='inputs must be'):
+        state.rebuild({**request, 'inputs': 'refresh'})
+
+
+def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
+    from config import OBJECT_STORE_PCL_KEYS, Config, rebuild_stage
+    keys = sorted(OBJECT_STORE_PCL_KEYS) + ['input_use_pcl_relative',
+                                            'input_use_pcl_same_winding']
+    for key in keys:
+        assert rebuild_stage({key}) == 'all', key
+    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    status = settle(state)
+    configuration = {**Config().as_dict(), **status['applied_config'],
+                     'pcl_link_window_points': 9}
+    with pytest.raises(spiral_service.ApiError, match='requires rebuilding'):
+        state.run({'iterations': 1, 'configuration': configuration,
+                   'expected_session_revision': state.session_revision,
+                   'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
+    response = state.rebuild({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+        **RUN, 'pcl_link_window_points': 9}}})
+    assert (response['stage'], response['inputs']) == ('all', 'reload')
+    assert settle(state)['applied_config']['pcl_link_window_points'] == 9
+    assert len(device_stubs) == 2
+
+
+def _checkpoint(path, cfg, input_manifest):
+    import torch
+    torch.save({'cfg': cfg, 'input_manifest': input_manifest}, path)
+    return str(path)
+
+
+def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stubs):
+    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    status = settle(state)
+    live = status['applied_config']
+    with open(status['input_manifest_path']) as stream:
+        manifest = json.load(stream)['manifest']
+
+    changed = json.loads(json.dumps(manifest))
+    changed['objects'][0]['geometry_revision'] = 'an-older-geometry'
+    # Written against another store path: that is the binding's to decide.
+    cfg = {**live, 'object_store_path': '/elsewhere.vcobj'}
+    path = _checkpoint(tmp_path / 'changed.ckpt', cfg,
+                       {'object_store': changed, 'dataset_root': state.dataset_root})
+    refusal = state._checkpoint_refusal(path, 'object-store inputs differ')
+    assert refusal.status == 409
+    assert refusal.payload['stage'] == 'all'
+    inputs = refusal.payload['inputs']
+    assert inputs['legacy'] is False
+    assert 'objects' in inputs['problems'][0]
+    assert inputs['rebuild'] == {'inputs': 'reload'}
+    assert inputs['allow_changed_inputs'] == 'object_store_allow_changed_inputs'
+
+    # The same inputs: only the configuration decides the stage, and the
+    # store path the checkpoint names is no difference.
+    path = _checkpoint(tmp_path / 'same.ckpt',
+                       {**cfg, 'model_num_flow_stages': live['model_num_flow_stages'] + 1},
+                       {'object_store': manifest, 'dataset_root': state.dataset_root})
+    refusal = state._checkpoint_refusal(path, 'model shape differs')
+    assert refusal.payload == {'reasons': ['model shape differs'], 'stage': 'model'}
+
+    path = _checkpoint(tmp_path / 'legacy.ckpt', live,
+                       {'dataset_root': state.dataset_root})
+    refusal = state._checkpoint_refusal(path, 'no object-store inputs')
+    assert refusal.payload['refused'] is True
+    assert refusal.payload['inputs']['legacy'] is True
+    assert 'object_store_allow_changed_inputs' in refusal.message

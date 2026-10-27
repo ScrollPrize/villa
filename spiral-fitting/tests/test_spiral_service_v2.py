@@ -1394,8 +1394,12 @@ class DatasetOwnershipTests(unittest.TestCase):
             # Checkpoints store the full configuration schema, and the
             # refusal analysis compares key sets against exactly that schema.
             "schema_version": 2, "cfg": dict(cfg),
-            "input_manifest": {"dataset_root": str(
-                self.root if dataset_root is None else dataset_root)},
+            "input_manifest": {
+                "dataset_root": str(
+                    self.root if dataset_root is None else dataset_root),
+                # Object-store inputs of some fit: the fake session has no
+                # manifest to compare them with, so the cfg alone decides.
+                "object_store": {"objects": [], "relationships": []}},
         }, path)
         return path
 

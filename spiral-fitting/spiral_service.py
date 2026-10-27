@@ -66,6 +66,7 @@ import sys
 import threading
 import time
 from http import HTTPStatus
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -982,7 +983,7 @@ class ServiceState:
             (request.get("run") or {}).get("config") or {})
         config = requested_config
         if checkpoint:
-            checkpoint_config, _, _ = self._checkpoint_durable_cfg(
+            checkpoint_config, *_ = self._checkpoint_durable_cfg(
                 paths["checkpoint"])
             if checkpoint_config is not None:
                 config = {**checkpoint_config, **requested_config}
@@ -1053,7 +1054,7 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            f"Malformed session request: {exc}") from exc
         if restore_checkpoint_z and paths.checkpoint:
-            _, _, checkpoint_z_range = self._checkpoint_durable_cfg(
+            _, _, checkpoint_z_range, _ = self._checkpoint_durable_cfg(
                 paths.checkpoint)
             if checkpoint_z_range is not None:
                 run = dataclasses.replace(
@@ -1148,7 +1149,12 @@ class ServiceState:
         A request that changes nothing but model configuration keeps the
         loaded host inputs and the brick pools and replaces the model stage
         alone (see ``_rebuild_stage_locked``); everything else is the full
-        teardown and reconstruction it has always been.
+        teardown and reconstruction it has always been, which rereads the
+        object store. ``{"inputs": "reload"}`` asks for that full rebuild
+        whatever the configuration change: it picks up new store revisions
+        under an unchanged configuration. The response's ``inputs`` says
+        whether the rebuild rereads the inputs ("reload") or keeps the frozen
+        ones ("keep").
         """
         request = dict(request or {})
         request.pop("command_id", None)
@@ -1157,6 +1163,10 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     "There is no fit session to rebuild; initialize it first")
+        inputs = request.pop("inputs", "keep")
+        if inputs not in ("keep", "reload"):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           'inputs must be "keep" or "reload"')
         defaults = request.pop("defaults", False)
         if not isinstance(defaults, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -1184,14 +1194,16 @@ class ServiceState:
                     HTTPStatus.CONFLICT,
                     f"A rebuild requires an idle or failed session (state is "
                     f"{SessionState(state).name})")
-            stage = ("all" if defaults
+            # Rereading the inputs is the whole build: a model-only rebuild
+            # keeps the frozen inputs it loaded.
+            stage = ("all" if defaults or inputs == "reload"
                      else self._rebuild_stage_locked(paths, run, preview, state))
         if stage == "model":
             self._begin_model_rebuild(paths, run, preview)
         else:
             self._begin_build(paths, run, preview, scroll)
         return {**self.status(), "accepted": True, "rebuilding": True,
-                "stage": stage}
+                "stage": stage, "inputs": "reload" if stage == "all" else "keep"}
 
     def _rebuild_stage_locked(self, paths, run, preview, state):
         """How much of the resident session this request has to replace.
@@ -2174,7 +2186,8 @@ class ServiceState:
                 "config_revision": result.get("config_revision")}
 
     def _checkpoint_durable_cfg(self, path):
-        """The durable configuration, dataset and z window a checkpoint records.
+        """The durable configuration, dataset, z window and input manifest a
+        checkpoint records: ``(cfg, dataset_root, z_range, input_manifest)``.
 
         CPU-only and read afresh: the same bytes an escalated rebuild would
         apply, so nothing here can go stale between the refusal and the
@@ -2188,10 +2201,10 @@ class ServiceState:
         try:
             payload = load_checkpoint_cpu(path)
         except Exception:
-            return None, "", None
+            return None, "", None, {}
         try:
             if not isinstance(payload, dict):
-                return None, "", None
+                return None, "", None, {}
             cfg = payload.get("cfg")
             if isinstance(cfg, Mapping):
                 # The same normalisation the preflight applies, so the
@@ -2220,7 +2233,8 @@ class ServiceState:
                 except (TypeError, ValueError):
                     pass
             return (dict(cfg) if isinstance(cfg, Mapping) else None,
-                    str(manifest.get("dataset_root") or ""), z_range)
+                    str(manifest.get("dataset_root") or ""), z_range,
+                    dict(manifest) if isinstance(manifest, Mapping) else {})
         finally:
             # A refusal must not leave a whole model + optimiser archive
             # mapped for the lifetime of the service.
@@ -2240,13 +2254,15 @@ class ServiceState:
         z_begin/z_end on this same path rather than through a special case.
         """
         reasons = [line for line in str(cause).splitlines() if line.strip()]
-        checkpoint_cfg, checkpoint_dataset, _ = \
+        checkpoint_cfg, checkpoint_dataset, _, checkpoint_inputs = \
             self._checkpoint_durable_cfg(path)
         with self.lock:
             status = self.session.status() if self.session else {}
             dataset_root = str(
                 getattr(self.session_paths, "dataset_root", "") or "")
         live = dict(status.get("applied_config") or {})
+        inputs = (None if live.get("object_store_allow_changed_inputs")
+                  else self._checkpoint_input_refusal(checkpoint_inputs, status))
         # What no rebuild can fix: a checkpoint from another dataset, or one
         # whose configuration is not this schema's at all.
         if checkpoint_cfg is None or set(checkpoint_cfg) != set(live):
@@ -2258,11 +2274,57 @@ class ServiceState:
             return ApiError(
                 HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
                 payload={"reasons": reasons, "refused": True})
+        if inputs is not None and inputs["legacy"]:
+            # Written before inputs came from the object store: no rebuild
+            # can recreate what it fitted, only the explicit opt-in resumes it.
+            return ApiError(
+                HTTPStatus.CONFLICT,
+                "Checkpoint refused: it records no object-store inputs (written "
+                "before the service read them from a store); only a rebuild with "
+                "object_store_allow_changed_inputs can resume it",
+                payload={"reasons": reasons, "refused": True, "inputs": inputs})
+        # The binding is the service's, whatever store the checkpoint was
+        # written against; it is not a difference a rebuild could apply.
         changed = {key for key, value in checkpoint_cfg.items()
-                   if live.get(key) != value}
+                   if live.get(key) != value
+                   and key not in SERVICE_OWNED_CONFIG_KEYS}
+        payload = {"reasons": reasons, "stage": rebuild_stage(changed)}
+        if inputs is not None:
+            # A full-input rebuild rereads the store, which is what resumes
+            # it if the store now holds the checkpoint's inputs; otherwise
+            # only object_store_allow_changed_inputs does.
+            payload.update(stage="all", inputs=inputs)
         return ApiError(
-            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}",
-            payload={"reasons": reasons, "stage": rebuild_stage(changed)})
+            HTTPStatus.CONFLICT, f"Checkpoint refused: {cause}", payload=payload)
+
+    def _checkpoint_input_refusal(self, checkpoint_inputs, status):
+        """How a checkpoint's object-store inputs differ from the session's.
+
+        None when they agree (or the session's manifest is not readable, in
+        which case the preflight's reasons stand alone); otherwise
+        ``{"legacy", "problems", "rebuild", "allow_changed_inputs"}``: whether
+        the checkpoint predates object-store inputs, what differs, the
+        full-input rebuild that rereads the store, and the configuration key
+        that resumes against changed inputs anyway.
+        """
+        remedies = {"rebuild": {"inputs": "reload"},
+                    "allow_changed_inputs": "object_store_allow_changed_inputs"}
+        if checkpoint_inputs.get("object_store") is None:
+            return {"legacy": True, "problems": [
+                "the checkpoint records no object-store inputs"], **remedies}
+        path = status.get("input_manifest_path")
+        try:
+            with open(path, encoding="utf-8") as stream:
+                current = json.load(stream)["manifest"]
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        from object_store_inputs import resume_problems
+        problems = resume_problems(
+            checkpoint_inputs, SimpleNamespace(manifest=current),
+            log=lambda line: None)
+        if not problems:
+            return None
+        return {"legacy": False, "problems": problems, **remedies}
 
     def _reject_overrides_the_checkpoint_contradicts(self, path, overrides):
         """Refuse a rebuild whose overrides fight the checkpoint it resumes.
@@ -2278,7 +2340,7 @@ class ServiceState:
         loss weights, sample counts, schedules — is a legitimate change to
         make while resuming, and the fit is built to take them.
         """
-        checkpoint_cfg, _, _ = self._checkpoint_durable_cfg(path)
+        checkpoint_cfg, *_ = self._checkpoint_durable_cfg(path)
         if not checkpoint_cfg:
             return
         conflicts = sorted(
@@ -2327,7 +2389,7 @@ class ServiceState:
             }
         paths["checkpoint"] = path
         run = dict(current.get("run") or {})
-        _, _, checkpoint_z_range = self._checkpoint_durable_cfg(path)
+        _, _, checkpoint_z_range, _ = self._checkpoint_durable_cfg(path)
         if checkpoint_z_range is not None:
             run["z_begin"], run["z_end"] = checkpoint_z_range
         run["config"] = {}
