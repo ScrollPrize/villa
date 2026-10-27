@@ -405,8 +405,6 @@ _Keybinds:_
 
 _Widget for creating initial segmentations which can be used for traces or later growth actions_
 
-<img src="docs/imgs/seeding-ui.png" style="height: 500px">
-
 - `Draw paths` : while on, a left-drag in a viewer draws a path
 - `Source Collection` : the source point collection to use as seed points (`Analyze Paths` writes its peaks to `seeding_peaks`; select it here to seed from them)
 - `Parallel processes` : the number of processes to run seeding with
