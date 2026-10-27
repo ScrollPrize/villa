@@ -177,6 +177,17 @@ public:
     // geometry edits. Returns the receipt.
     RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
         const RevisionSelection& related, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&);
+    // Edit the current revisions of these objects in one commit, keeping their
+    // recorded relationships: `edit` runs once per object. Throws when one is
+    // gone, or when one changed between the read and the commit.
+    void editCurrent(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
+                     const std::function<void(ObjectStore&, WriteTxn&, const std::string& objectUuid)>& edit);
+    // The same over each object's current record (name, tags, meta).
+    void editRecords(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
+                     const std::function<void(ObjectRecord&)>& change);
+    // Add, then remove, tags of these objects.
+    void tagObjects(const AttachmentIdentity&, const std::vector<std::string>& objectUuids,
+                    const std::vector<std::string>& add, const std::vector<std::string>& remove = {});
     // Copy an object's current record and geometry from one attachment into
     // another as a new object (objects/ObjectCopy.hpp) named `name` (empty: the
     // original's name), in one commit; returns its UUID.

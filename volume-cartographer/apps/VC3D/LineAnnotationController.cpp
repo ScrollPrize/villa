@@ -15763,9 +15763,8 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
     const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
-    connection->editKeepingRelationships(pin.attachment,{{fiber.uuid,pin.objectRevision}},{},[&](auto& db,auto& txn,const auto&){
-        db.bindGeometryCoordinates(txn,fiber.uuid,volume->id(),*scale);
-        db.keepRecordedRelationshipsOf(txn,fiber.uuid);
+    connection->editCurrent(pin.attachment,{fiber.uuid},[&](auto& db,auto& txn,const auto& uuid){
+        db.bindGeometryCoordinates(txn,uuid,volume->id(),*scale);
     });
     return true;
 }

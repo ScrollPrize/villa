@@ -240,15 +240,49 @@ void ObjectStoreSession::restoreImported(const AttachmentIdentity& identity, con
 {
     const auto uuid = util::canonicalUuid(objectUuid);
     std::vector<ObjectRevision> history;
-    std::optional<ObjectRevision> current;
+    read(identity, [&](const auto& store, const auto& txn, const auto&) { history = store.objectHistory(txn, uuid); });
+    if (history.empty()) throw std::runtime_error("object has no history: " + uuid);
+    editCurrent(identity, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, history.front().uuid); });
+}
+
+void ObjectStoreSession::editCurrent(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
+                                     const std::function<void(ObjectStore&, WriteTxn&, const std::string&)>& edit)
+{
+    RevisionSelection pins;
     read(identity, [&](const auto& store, const auto& txn, const auto&) {
-        history = store.objectHistory(txn, uuid);
-        current = store.currentObjectRevision(txn, uuid);
+        for (const auto& objectUuid : objectUuids) {
+            const auto uuid = util::canonicalUuid(objectUuid);
+            const auto current = store.currentObjectRevision(txn, uuid);
+            if (!current) throw std::runtime_error("object is not in the store: " + uuid);
+            pins[uuid] = current->uuid;
+        }
     });
-    if (history.empty() || !current) throw std::runtime_error("object has no history: " + uuid);
-    editKeepingRelationships(identity, {{uuid, current->uuid}}, {}, [&](auto& store, auto& txn, const auto&) {
-        store.restoreObject(txn, uuid, history.front().uuid);
-        store.keepRecordedRelationshipsOf(txn, uuid);
+    if (pins.empty()) return;
+    editKeepingRelationships(identity, pins, {}, [&](auto& store, auto& txn, const auto&) {
+        for (const auto& [uuid, revision] : pins) {
+            edit(store, txn, uuid);
+            store.keepRecordedRelationshipsOf(txn, uuid);
+        }
+    });
+}
+
+void ObjectStoreSession::editRecords(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
+                                     const std::function<void(ObjectRecord&)>& change)
+{
+    editCurrent(identity, objectUuids, [&](auto& store, auto& txn, const auto& uuid) {
+        auto record = *store.objectByUuid(txn, uuid);
+        change(record);
+        store.upsertObject(txn, record);
+    });
+}
+
+void ObjectStoreSession::tagObjects(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
+                                    const std::vector<std::string>& add, const std::vector<std::string>& remove)
+{
+    editRecords(identity, objectUuids, [&](ObjectRecord& record) {
+        for (const auto& tag : add)
+            if (std::find(record.tags.begin(), record.tags.end(), tag) == record.tags.end()) record.tags.push_back(tag);
+        for (const auto& tag : remove) std::erase(record.tags, tag);
     });
 }
 

@@ -812,7 +812,9 @@ QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
         throw AgentBridgeError{-32602, "newName is unchanged", data};
     }
     try {
-        _window->_surfaceCatalog->rename(row.record.uuid, newName.toStdString());
+        _window->_surfaceCatalog->session()->editRecords(
+            *_window->_surfaceCatalog->attachment(), {row.record.uuid},
+            [&](vc::objects::ObjectRecord& record) { record.name = newName.toStdString(); });
     } catch (const std::exception& error) {
         QJsonObject data;
         data["detail"] = QString::fromUtf8(error.what());

@@ -94,13 +94,11 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
 
     // Review tags are record tags of the surface in the user's store.
     const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
-    auto tags = row.record.tags;
-    const std::string tag = tagStr.toStdString();
-    const auto found = std::find(tags.begin(), tags.end(), tag);
-    if (enabled && found == tags.end()) tags.push_back(tag);
-    if (!enabled && found != tags.end()) tags.erase(found);
+    const std::vector<std::string> tag{tagStr.toStdString()};
     try {
-        _window->_surfaceCatalog->setTags(row.record.uuid, tags);
+        _window->_surfaceCatalog->session()->tagObjects(*_window->_surfaceCatalog->attachment(), {row.record.uuid},
+                                                         enabled ? tag : std::vector<std::string>{},
+                                                         enabled ? std::vector<std::string>{} : tag);
     } catch (const std::exception& error) {
         QJsonObject data;
         data["detail"] = QString::fromUtf8(error.what());

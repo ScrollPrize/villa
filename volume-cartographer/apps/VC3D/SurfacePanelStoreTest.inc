@@ -175,7 +175,7 @@ int runSurfacePanelStoreTests()
                                                "catalog-volume", "its first revision is the catalog version as stored");
             catalogVersion = history.front().uuid;
         });
-        catalog.rename(shown, "edited");
+        state.objectStoreSession()->editRecords(attachment, {shown}, [](ObjectRecord& record) { record.name = "edited"; });
         pump([&] { return catalog.row(shown)->record.name == "edited"; }, "the imported surface is edited in the user's store");
         const auto past = catalog.open(shown, catalogVersion);
         require(!past.current && !past.editable && past.surface->id == shown &&

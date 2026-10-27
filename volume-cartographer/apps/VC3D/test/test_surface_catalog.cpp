@@ -219,14 +219,14 @@ int main(int argc, char** argv)
             require(vc3d::corrections::read(*session, attachment, half).empty(), "annotations are not corrections");
         }
 
-        catalog.setTags(native, {"reviewed"});
-        catalog.rename(native, "renamed");
+        session->tagObjects(attachment, {native}, {"reviewed"}, {"approved"});
+        session->editRecords(attachment, {native}, [](ObjectRecord& record) { record.name = "renamed"; });
         pump([&] {
             const auto* row = catalog.row(native);
             return row && row->record.name == "renamed" && row->record.tags == std::vector<std::string>{"reviewed"};
         }, "record edits reach the rows through commit events");
         require(std::count(committed.begin(), committed.end(), native) >= 1, "commits name the edited surface");
-        catalog.retire({half});
+        session->editCurrent(attachment, {half}, [](auto& db, auto& txn, const auto& uuid) { db.retireObject(txn, uuid); });
         pump([&] { return !catalog.row(half) && catalog.rows().size() == 3; }, "retired surfaces leave the listing");
 
         // The store supplies registered views; the application only adapts their tiles.

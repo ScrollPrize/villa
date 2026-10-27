@@ -131,13 +131,6 @@ public:
     };
     ToolStore toolStore() const;
 
-    // Record edits: they commit at once and reach rows() through the commit events.
-    void setTags(const std::string& uuid, const std::vector<std::string>& tags);
-    // Bind the surface to the open volume: `storedUnitsPerVoxel` stored units per voxel.
-    void bind(const std::string& uuid, double storedUnitsPerVoxel);
-    void rename(const std::string& uuid, const std::string& name);
-    void updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change);
-    void retire(const std::vector<std::string>& uuids);
     // Edit a catalog surface in the user's store: imports it there as the same
     // surface (fetching it first), its catalog version the first revision, and
     // reads its row from there.
@@ -164,9 +157,6 @@ private:
     void schedule();
     // The sources changed: drop the rows and pending reads, list again.
     void restart();
-    void editRecord(const std::string& uuid, const std::function<void(vc::objects::ObjectRecord&)>& change);
-    // The surface's current object revision in the user's store; throws when it is gone.
-    std::string head(const std::string& uuid) const;
 
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;

@@ -40,10 +40,12 @@ std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(SurfaceCatalog& ca
                 throw std::runtime_error("non-finite area");
             }
             const auto areaCm2 = vc::surface::areaCm2FromVox2(viewedVx2, voxelSize);
-            catalog.updateMeta(id, [&](nlohmann::json& meta) {
+            catalog.session()->editRecords(*catalog.attachment(), {id}, [&](vc::objects::ObjectRecord& record) {
+                auto meta = nlohmann::json::parse(record.meta);
                 meta["area_vx2"] = areaVx2;
                 if (areaCm2) meta["area_cm2"] = *areaCm2;
                 else meta.erase("area_cm2");
+                record.meta = meta.dump();
             });
             result.areaVx2 = areaVx2;
             result.areaCm2 = areaCm2.value_or(0.0);

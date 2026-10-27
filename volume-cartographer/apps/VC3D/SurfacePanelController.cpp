@@ -607,7 +607,8 @@ void SurfacePanelController::renameSurface(const std::string& id)
         return;
     }
     try {
-        _catalog->rename(id, name.toStdString());
+        _catalog->session()->editRecords(*_catalog->attachment(), {id},
+                                         [&](vc::objects::ObjectRecord& record) { record.name = name.toStdString(); });
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Rename Failed"), QString::fromUtf8(error.what()));
     }
@@ -726,11 +727,9 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
         });
         if (!head) throw std::runtime_error("The surface is no longer in the object store");
         if (*head == revision) return true;
-        _catalog->session()->editKeepingRelationships(attachment, {{id, *head}}, {},
-            [&](auto& db, auto& txn, const auto&) {
-                db.restoreObject(txn, id, revision);
-                db.keepRecordedRelationshipsOf(txn, id);
-            });
+        _catalog->session()->editCurrent(attachment, {id}, [&](auto& db, auto& txn, const auto& uuid) {
+            db.restoreObject(txn, uuid, revision);
+        });
     } catch (const std::exception& error) {
         if (errorMessage) *errorMessage = QString::fromUtf8(error.what());
         return false;
@@ -799,7 +798,9 @@ void SurfacePanelController::bindSurface(const std::string& id)
         return;
     }
     try {
-        _catalog->bind(id, *scale);
+        _catalog->session()->editCurrent(*_catalog->attachment(), {id}, [&](auto& db, auto& txn, const auto& uuid) {
+            db.bindGeometryCoordinates(txn, uuid, volume->id(), *scale);
+        });
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
     }
@@ -839,8 +840,13 @@ bool SurfacePanelController::retireSurfaces(const QStringList& surfaceIds, QStri
     for (const auto& id : surfaceIds) {
         uuids.push_back(id.toStdString());
     }
+    if (!_catalog->attachment()) {
+        if (err) *err = tr("Attach an object store first");
+        return false;
+    }
     try {
-        _catalog->retire(uuids);
+        _catalog->session()->editCurrent(*_catalog->attachment(), uuids,
+                                         [](auto& db, auto& txn, const auto& uuid) { db.retireObject(txn, uuid); });
         return true;
     } catch (const std::exception& error) {
         if (err) *err = QString::fromUtf8(error.what());
@@ -1720,29 +1726,30 @@ void SurfacePanelController::onTagCheckboxToggled()
 
     const std::vector<std::pair<QCheckBox*, const char*>> boxes{
         {_tags.approved, "approved"}, {_tags.defective, "defective"}, {_tags.reviewed, "reviewed"}, {_tags.inspect, "inspect"}};
+    std::vector<std::string> add, remove;
+    for (const auto& [box, name] : boxes) {
+        if (box) (box->checkState() == Qt::Checked ? add : remove).push_back(name);
+    }
+    // The selected surfaces whose tags change; the store applies the change
+    // to their current records.
+    std::vector<std::string> changed;
     for (auto* item : _ui.treeWidget->selectedItems()) {
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
         const auto* row = _catalog->row(id);
         if (!row) {
             continue;
         }
-        auto tags = row->record.tags;
-        for (const auto& [box, name] : boxes) {
-            if (!box) {
-                continue;
-            }
-            const bool present = std::find(tags.begin(), tags.end(), name) != tags.end();
-            if (box->checkState() == Qt::Checked && !present) {
-                tags.push_back(name);
-            } else if (box->checkState() != Qt::Checked && present) {
-                std::erase(tags, std::string(name));
-            }
+        const auto has = [&](const std::string& tag) {
+            return std::find(row->record.tags.begin(), row->record.tags.end(), tag) != row->record.tags.end();
+        };
+        if (std::any_of(add.begin(), add.end(), [&](const auto& tag) { return !has(tag); }) ||
+            std::any_of(remove.begin(), remove.end(), has)) {
+            changed.push_back(id);
         }
-        if (tags == row->record.tags) {
-            continue;
-        }
+    }
+    if (!changed.empty() && _catalog->attachment()) {
         try {
-            _catalog->setTags(id, tags);
+            _catalog->session()->tagObjects(*_catalog->attachment(), changed, add, remove);
         } catch (const std::exception& error) {
             emit statusMessageRequested(tr("Cannot tag surface: %1").arg(QString::fromUtf8(error.what())), 8000);
         }

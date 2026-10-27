@@ -226,77 +226,11 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     return opened;
 }
 
-std::string SurfaceCatalog::head(const std::string& uuid) const
-{
-    if (!attachment_) throw std::runtime_error("Attach an object store first");
-    std::optional<std::string> revision;
-    session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
-        if (const auto current = db.currentObjectRevision(txn, uuid)) revision = current->uuid;
-    });
-    if (!revision) throw std::runtime_error("The surface is no longer in the object store");
-    return *revision;
-}
-
 SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
     if (!session_->writable(*attachment_)) throw std::runtime_error("The object store is read-only.");
     return {session_->path(*attachment_), volume_->id()};
-}
-
-void SurfaceCatalog::bind(const std::string& uuid, double storedUnitsPerVoxel)
-{
-    if (!volume_) throw std::runtime_error("Open a volume first");
-    session_->editKeepingRelationships(*attachment_, {{uuid, head(uuid)}}, {}, [&](auto& db, auto& txn, const auto&) {
-        db.bindGeometryCoordinates(txn, uuid, volume_->id(), storedUnitsPerVoxel);
-        db.keepRecordedRelationshipsOf(txn, uuid);
-    });
-}
-
-void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<void(ObjectRecord&)>& change)
-{
-    const auto revision = head(uuid);
-    session_->editKeepingRelationships(*attachment_, {{uuid, revision}}, {}, [&](auto& db, auto& txn, const auto&) {
-        auto record = *db.objectByUuid(txn, uuid);
-        change(record);
-        db.upsertObject(txn, record);
-        db.keepRecordedRelationshipsOf(txn, uuid);
-    });
-}
-
-void SurfaceCatalog::setTags(const std::string& uuid, const std::vector<std::string>& tags)
-{
-    editRecord(uuid, [&](ObjectRecord& record) { record.tags = tags; });
-}
-
-void SurfaceCatalog::rename(const std::string& uuid, const std::string& name)
-{
-    editRecord(uuid, [&](ObjectRecord& record) { record.name = name; });
-}
-
-void SurfaceCatalog::updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change)
-{
-    editRecord(uuid, [&](ObjectRecord& record) {
-        auto meta = nlohmann::json::parse(record.meta);
-        change(meta);
-        record.meta = meta.dump();
-    });
-}
-
-void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
-{
-    if (!attachment_) throw std::runtime_error("Attach an object store first");
-    RevisionSelection pins;
-    session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
-        for (const auto& uuid : uuids)
-            if (const auto current = db.currentObjectRevision(txn, uuid)) pins[uuid] = current->uuid;
-    });
-    session_->editKeepingRelationships(*attachment_, pins, {}, [&](auto& db, auto& txn, const auto&) {
-        for (const auto& [uuid, revision] : pins) {
-            db.retireObject(txn, uuid);
-            db.keepRecordedRelationshipsOf(txn, uuid);
-        }
-    });
 }
 
 void SurfaceCatalog::importCatalogSurface(const std::string& uuid)
