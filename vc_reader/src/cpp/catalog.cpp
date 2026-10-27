@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -688,6 +689,60 @@ const OpenDataSample* OpenDataManifest::findSample(std::string_view id) const no
         return sample.id == id;
     });
     return it == samples.end() ? nullptr : &*it;
+}
+
+std::string levelVolumeId(std::string_view volumeId, int level)
+{
+    return level == 0 ? std::string(volumeId) : std::string(volumeId) + "@L" + std::to_string(level);
+}
+
+std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view url, int baseLevel) const
+{
+    const auto trimmed = [](std::string value) {
+        while (!value.empty() && value.back() == '/') value.pop_back();
+        return value;
+    };
+    const auto wanted = trimmed(std::string(url));
+    if (wanted.empty()) return std::nullopt;
+    for (const auto& sample : samples)
+        for (const auto& volume : sample.volumes) {
+            const auto* source = preferredVolumeArtifact(volume);
+            for (const auto& artifact : volume.artifacts) {
+                if (artifact.url() != wanted && trimmed(artifact.sourcePath) != wanted) continue;
+                if (&artifact == source) return OpenDataVolumeView{sample.id, volume.id, baseLevel, true, &artifact};
+                if (!classifyDerivedRepresentation(artifact) || !artifact.sourceCoordinateLevel) continue;
+                return OpenDataVolumeView{sample.id, volume.id, baseLevel + *artifact.sourceCoordinateLevel, false, &artifact};
+            }
+        }
+    return std::nullopt;
+}
+
+std::shared_ptr<const OpenDataManifest> cachedManifest(const std::filesystem::path& cacheFile)
+{
+    struct Entry {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime;
+        std::shared_ptr<const OpenDataManifest> manifest;
+    };
+    static std::mutex mutex;
+    static std::map<std::filesystem::path, Entry> entries;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(cacheFile, error);
+    if (error) return nullptr;
+    const auto mtime = std::filesystem::last_write_time(cacheFile, error);
+    if (error) return nullptr;
+    std::lock_guard lock(mutex);
+    auto& entry = entries[cacheFile];
+    if (!entry.manifest || entry.size != size || entry.mtime != mtime) {
+        try {
+            entry.manifest = std::make_shared<const OpenDataManifest>(loadOpenDataManifestFile(cacheFile, std::string(kDefaultManifestUrl)));
+        } catch (const std::exception&) {
+            entry.manifest.reset();
+        }
+        entry.size = size;
+        entry.mtime = mtime;
+    }
+    return entry.manifest;
 }
 
 const OpenDataModel* OpenDataManifest::findModel(std::string_view id) const noexcept

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <array>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -319,6 +320,23 @@ struct OpenDataModel {
     nlohmann::json raw = nlohmann::json::object();
 };
 
+// The id of a catalog volume shown at a pyramid level: the volume's own id at
+// level 0, "<id>@L<level>" otherwise. Registration graphs built from the
+// catalog relate every level to its volume (RegistrationGraph::addSample).
+[[nodiscard]] std::string levelVolumeId(std::string_view volumeId, int level);
+
+// What an opened volume shows: a catalog volume of a sample at a pyramid level.
+struct OpenDataVolumeView {
+    std::string sampleId;
+    std::string volumeId;
+    int level = 0;
+    // The volume's own zarr (at a base level), not a dataset derived from it
+    // (prediction, normal grids, Lasagna) on its grid.
+    bool source = true;
+    const OpenDataArtifact* artifact = nullptr;
+    [[nodiscard]] std::string frameId() const { return levelVolumeId(volumeId, level); }
+};
+
 struct OpenDataManifest {
     std::string manifestUrl;
     std::vector<OpenDataSample> samples;
@@ -327,7 +345,16 @@ struct OpenDataManifest {
 
     [[nodiscard]] const OpenDataSample* findSample(std::string_view id) const noexcept;
     [[nodiscard]] const OpenDataModel* findModel(std::string_view id) const noexcept;
+    // The catalog volume a remote zarr shows when opened at pyramid
+    // `baseLevel`: a volume's preferred zarr, or a derived dataset (its
+    // parameters.level added to the base level). URLs compare without trailing
+    // slashes, as resolved or as published.
+    [[nodiscard]] std::optional<OpenDataVolumeView> volumeAt(std::string_view url, int baseLevel = 0) const;
 };
+
+// The manifest in a cache file (loadCatalog's cacheFile), parsed once per file
+// version and shared; nullptr when the file is missing or invalid.
+[[nodiscard]] std::shared_ptr<const OpenDataManifest> cachedManifest(const std::filesystem::path& cacheFile);
 
 [[nodiscard]] OpenDataManifest parseOpenDataManifest(
     std::string_view jsonText,

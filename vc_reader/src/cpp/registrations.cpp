@@ -1,5 +1,6 @@
 #include "vc_reader/registrations.hpp"
 #include "vc_reader/catalog.hpp"
+#include <cmath>
 #include <map>
 #include <set>
 #include <deque>
@@ -23,6 +24,10 @@ void RegistrationGraph::addSample(const OpenDataSample& s) {
         add({key,t.matrix.json().dump(),g.fromVolumeId,t.toVolumeId,t.matrix,t.derivationPath});
     }
     for(const auto& v:s.volumes) {
+        // Each pyramid level of a volume is a volume of its own (levelVolumeId).
+        for(int level=1;level<=5;++level)
+            add({"level:"+s.id+":"+v.id+":"+std::to_string(level),"1",v.id,levelVolumeId(v.id,level),
+                 Affine::scale(std::ldexp(1.0,-level)),"pyramid level "+std::to_string(level)});
         if(!v.supersededBy)continue;
         const auto& target=v.supersededBy->volumeId;
         if(target!=v.id&&!target.empty())add({"superseded:"+s.id+":"+v.id,target,v.id,target,Affine{},"superseded volume"});

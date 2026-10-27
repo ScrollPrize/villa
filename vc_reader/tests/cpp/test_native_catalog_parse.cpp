@@ -157,6 +157,26 @@ int main()
         require(findSampleVolumeTransform(*sample, "vol2", "vol1").has_value(), "inverse transform");
         require(!findSampleVolumeTransform(*sample, "vol1", "missing"), "unrelated volume");
 
+        // Opened volumes: the source zarr at a base level, a derived dataset at its level.
+        require(levelVolumeId("vol1", 0) == "vol1" && levelVolumeId("vol1", 2) == "vol1@L2", "level ids");
+        const auto zarrUrl =
+            std::string("https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/vol1.zarr");
+        const auto atL2 = manifest.volumeAt(zarrUrl + "/", 2);
+        require(atL2 && atL2->sampleId == "PHerc0139" && atL2->volumeId == "vol1" && atL2->level == 2 && atL2->source &&
+                    atL2->frameId() == "vol1@L2",
+                "source volume at a base level");
+        require(manifest.volumeAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr")->level == 0,
+                "published source path");
+        require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
+        RegistrationGraph levels;
+        levels.addSample(*sample);
+        const auto down = levels.resolve("vol1", "vol1@L2");
+        require(down.status == TransformStatus::Resolved && down.resolved().forward(0, 0) == 0.25, "level edge");
+        const auto across = levels.resolve("vol1@L1", "vol2@L1");
+        require(across.status == TransformStatus::Resolved && across.resolved().forward(0, 0) == 0.5 &&
+                    across.resolved().forward(0, 3) == 5,
+                "levels compose with registrations");
+
         // Segments.
         const auto& segment = sample->segments.front();
         require(segment.longId == "PHerc0139-seg-a" && segment.createdAt == "2026-03-11T00:00:00Z", "segment identity");
