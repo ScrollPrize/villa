@@ -96,10 +96,8 @@ public:
     void setCollectionMetadata(uint64_t collectionId, const CollectionMetadata& metadata);
     void setCollectionColor(uint64_t collectionId, const cv::Vec3f& color);
     void setCollectionAnchor2d(uint64_t collectionId, const std::optional<cv::Vec2f>& anchor);
-    std::optional<cv::Vec2f> getCollectionAnchor2d(uint64_t collectionId) const;
     void setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value);
     void removeCollectionTag(uint64_t collectionId, const std::string& key);
-    std::optional<std::string> getCollectionTag(uint64_t collectionId, const std::string& key) const;
     void setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds);
     std::optional<ColPoint> getPoint(vc::PointRef point) const;
     std::vector<vc::PointRef> findPointRefs(uint64_t pointId) const;
@@ -109,7 +107,6 @@ public:
     void resetWindingNumbers();
     void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
     WindingFillMode getAutoFillMode(uint64_t collectionId) const;
-    float getAutoFillConstant(uint64_t collectionId) const;
     float computeAutoFillValue(uint64_t collectionId) const;
 
    bool saveToJSON(const std::string& filename) const;

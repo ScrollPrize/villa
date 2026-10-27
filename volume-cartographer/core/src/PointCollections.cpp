@@ -347,14 +347,6 @@ void PointCollections::setCollectionAnchor2d(uint64_t collectionId, const std::o
     }
 }
 
-std::optional<cv::Vec2f> PointCollections::getCollectionAnchor2d(uint64_t collectionId) const
-{
-    if (_collections.count(collectionId)) {
-        return _collections.at(collectionId).anchor2d;
-    }
-    return std::nullopt;
-}
-
 void PointCollections::setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value)
 {
     if (_collections.count(collectionId)) {
@@ -369,16 +361,6 @@ void PointCollections::removeCollectionTag(uint64_t collectionId, const std::str
         _collections.at(collectionId).tags.erase(key);
         onCollectionChanged(collectionId);
     }
-}
-
-std::optional<std::string> PointCollections::getCollectionTag(uint64_t collectionId, const std::string& key) const
-{
-    if (_collections.count(collectionId)) {
-        const auto& tags = _collections.at(collectionId).tags;
-        auto it = tags.find(key);
-        if (it != tags.end()) return it->second;
-    }
-    return std::nullopt;
 }
 
 void PointCollections::setCollectionWindingsLinked(uint64_t collectionId, const std::vector<uint64_t>& linkedCollectionIds)
@@ -515,14 +497,6 @@ PointCollections::WindingFillMode PointCollections::getAutoFillMode(uint64_t col
         return _collections.at(collectionId).autoFillMode;
     }
     return WindingFillMode::None;
-}
-
-float PointCollections::getAutoFillConstant(uint64_t collectionId) const
-{
-    if (_collections.count(collectionId)) {
-        return _collections.at(collectionId).autoFillConstant;
-    }
-    return 0.0f;
 }
 
 float PointCollections::computeAutoFillValue(uint64_t collectionId) const

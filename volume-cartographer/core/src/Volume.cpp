@@ -840,107 +840,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     return vol;
 }
 
-std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata)
-{
-    if (!sourceFactory)
-        throw std::invalid_argument("prepared 3D volume source factory is required");
-    auto opened = sourceFactory();
-    if (opened.fetchers.empty() || opened.shapes.empty() || opened.fetchers.size() != opened.shapes.size() ||
-        opened.chunkShapes.size() != opened.shapes.size() ||
-        opened.storageChunkShapes.size() != opened.shapes.size()) {
-        throw std::invalid_argument("prepared 3D volume source is incomplete");
-    }
-    if (opened.transforms.size() != opened.shapes.size()) {
-        opened.transforms.resize(opened.shapes.size());
-        for (std::size_t level = 0; level < opened.transforms.size(); ++level) {
-            const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << level);
-            opened.transforms[level].scaleFromLevel0 = {invScale, invScale, invScale};
-        }
-    }
-    int firstPresentLevel = -1;
-    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
-        const auto& shape = opened.shapes[level];
-        const auto& chunks = opened.chunkShapes[level];
-        const bool missingLevel = shape[0] == 0 && shape[1] == 0 && shape[2] == 0;
-        if (chunks[0] <= 0 || chunks[1] <= 0 || chunks[2] <= 0) {
-            throw std::invalid_argument("prepared 3D volume source has an invalid chunk shape");
-        }
-        if (missingLevel) {
-            if (opened.fetchers[level])
-                throw std::invalid_argument("prepared 3D volume source has a fetcher for a missing level");
-            continue;
-        }
-        if (!opened.fetchers[level] || shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0) {
-            throw std::invalid_argument("prepared 3D volume source has an invalid level");
-        }
-        if (firstPresentLevel < 0)
-            firstPresentLevel = static_cast<int>(level);
-    }
-    if (firstPresentLevel < 0)
-        throw std::invalid_argument("prepared 3D volume source has no present levels");
-    if (!metadata.is_object() || !metadata.contains("uuid") || !metadata["uuid"].is_string() || metadata["uuid"].get_string().empty()) {
-        throw std::invalid_argument("prepared 3D volume metadata requires a uuid");
-    }
-
-    auto volume = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
-    volume->metadata_ = metadata;
-    volume->metadata_["type"] = "vol";
-    volume->metadata_["format"] = "zarr";
-    const auto& first = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
-    const auto metadataPositiveInt = [&](const char* key) -> std::optional<int> {
-        if (!volume->metadata_.contains(key) || !volume->metadata_[key].is_number())
-            return std::nullopt;
-        const int value = volume->metadata_[key].get_int();
-        if (value <= 0)
-            return std::nullopt;
-        return value;
-    };
-    const auto metadataSlices = metadataPositiveInt("slices");
-    const auto metadataHeight = metadataPositiveInt("height");
-    const auto metadataWidth = metadataPositiveInt("width");
-    if (metadataSlices && metadataHeight && metadataWidth) {
-        volume->_slices = *metadataSlices;
-        volume->_height = *metadataHeight;
-        volume->_width = *metadataWidth;
-    } else {
-        const size_t scale = size_t{1} << firstPresentLevel;
-        volume->_slices = static_cast<int>(static_cast<size_t>(first[0]) * scale);
-        volume->_height = static_cast<int>(static_cast<size_t>(first[1]) * scale);
-        volume->_width = static_cast<int>(static_cast<size_t>(first[2]) * scale);
-    }
-    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
-        const auto& shape = opened.shapes[level];
-        if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
-            continue;
-        }
-        const auto& storageChunkShape = opened.storageChunkShapes[level];
-        const int levelInt = static_cast<int>(level);
-        const int expectedSlices = ceilDivPow2(volume->_slices, levelInt);
-        const int expectedHeight = ceilDivPow2(volume->_height, levelInt);
-        const int expectedWidth = ceilDivPow2(volume->_width, levelInt);
-        if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
-            !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
-            !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
-            throw std::runtime_error(
-                "prepared zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
-                + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
-                + ") does not match expected downscaled metadata dimensions (slices=" + std::to_string(expectedSlices)
-                + ", height=" + std::to_string(expectedHeight) + ", width=" + std::to_string(expectedWidth) + ")");
-        }
-    }
-    volume->metadata_["slices"] = volume->_slices;
-    volume->metadata_["height"] = volume->_height;
-    volume->metadata_["width"] = volume->_width;
-    volume->zarrLevelShapes_ = opened.shapes;
-    volume->zarrLevelChunkShapes_ = opened.chunkShapes;
-    volume->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
-    volume->zarrDtype_ = opened.dtype;
-    volume->zarrFillValue_ = opened.fillValue;
-    volume->remoteNumScales_ = opened.shapes.size();
-    volume->preparedSourceFactory_ = std::move(sourceFactory);
-    return volume;
-}
-
 std::filesystem::path Volume::remotePersistentCachePath() const
 {
     if (!isRemote_ || remoteCacheRoot_.empty())
@@ -1112,9 +1011,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
     }
 
     vc::render::OpenedChunkedZarr opened;
-    if (preparedSourceFactory_) {
-        opened = preparedSourceFactory_();
-    } else if (isRemote_) {
+    if (isRemote_) {
         opened = baseScaleLevel_ > 0
             ? vc::render::openHttpZarrPyramid(
                   remoteUrl_, remoteAuth_, baseScaleLevel_)
@@ -1152,10 +1049,6 @@ std::string Volume::chunkCacheSourceIdentity() const
                 persistentPath.lexically_normal().generic_string();
         }
         return identity;
-    }
-    if (preparedSourceFactory_) {
-        return "prepared|" + id() + "|instance=" +
-               std::to_string(reinterpret_cast<std::uintptr_t>(this));
     }
     std::error_code ec;
     auto sourcePath = std::filesystem::weakly_canonical(path_, ec);

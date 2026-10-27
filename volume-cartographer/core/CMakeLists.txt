@@ -247,7 +247,6 @@ add_library(vc_tracer
     src/NeuralTracerConnection.cpp
     src/ChunkedTensor.cpp
     src/growth_strategies/CandidateOrdering.cpp
-    src/growth_strategies/ComponentPruning.cpp
     src/growth_strategies/GrowthConfig.cpp
 )
 target_link_libraries(vc_tracer PUBLIC vc_core Ceres::ceres)

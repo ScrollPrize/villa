@@ -72,14 +72,14 @@ TEST_CASE("tags and anchor2d + offset")
     const uint64_t cid = c.getCollectionId("a").value();
 
     c.setCollectionTag(cid, "k", "v");
-    CHECK(c.getCollectionTag(cid, "k") == std::optional<std::string>("v"));
+    CHECK(c.getAllCollections().at(cid).tags.at("k") == "v");
     c.removeCollectionTag(cid, "k");
-    CHECK_FALSE(c.getCollectionTag(cid, "k").has_value());
+    CHECK_FALSE(c.getAllCollections().at(cid).tags.contains("k"));
 
     c.setCollectionAnchor2d(cid, cv::Vec2f(10, 20));
-    REQUIRE(c.getCollectionAnchor2d(cid).has_value());
+    REQUIRE(c.getAllCollections().at(cid).anchor2d.has_value());
     c.applyAnchorOffset(5, -5);
-    auto a = c.getCollectionAnchor2d(cid);
+    auto a = c.getAllCollections().at(cid).anchor2d;
     REQUIRE(a.has_value());
     CHECK((*a)[0] == doctest::Approx(15));
     CHECK((*a)[1] == doctest::Approx(15));
@@ -151,7 +151,7 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 
     c.setAutoFillMode(cid, PointCollections::WindingFillMode::Constant, 4.0f);
     CHECK(c.getAutoFillMode(cid) == PointCollections::WindingFillMode::Constant);
-    CHECK(c.getAutoFillConstant(cid) == doctest::Approx(4.0f));
+    CHECK(c.getAllCollections().at(cid).autoFillConstant == doctest::Approx(4.0f));
     CHECK(c.computeAutoFillValue(cid) == doctest::Approx(4.0f));
 
     // Incremental → max existing winding + 1; none set yet → 1.
@@ -228,7 +228,7 @@ TEST_CASE("JSON round-trip preserves data")
     CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
-    CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+    CHECK(loaded.getAllCollections().at(la).tags.at("kind") == "correction");
     loaded.renameCollection(la, "renamed");
     CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
 }

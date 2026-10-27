@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,12 +59,6 @@ public:
         const vc::HttpAuth& auth = {},
         const utils::Json& metadata = {},
         bool discoverAwsCredentials = true);
-
-    // Construct a normal 3D Volume from a caller-prepared chunk source. The
-    // source factory is invoked again when a cache is recreated. It must return
-    // only 3D level descriptors; interpretation of higher-dimensional backing
-    // data belongs to the preparing module.
-    static std::shared_ptr<Volume> NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata);
 
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
@@ -234,5 +227,4 @@ protected:
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;
-    std::function<vc::render::OpenedChunkedZarr()> preparedSourceFactory_;
 };
