@@ -25,7 +25,7 @@
 namespace {
 using vcr::catalog::TransformStatus;
 
-QString statusText(const vc3d::registrations::Related& related)
+QString statusText(const vc::objects::VolumeTransforms::Related& related)
 {
     if (related.status == TransformStatus::Ambiguous) return QObject::tr("Ambiguous: choose a route");
     if (related.chosen) return QObject::tr("Chosen route");
@@ -99,7 +99,7 @@ void VolumeRegistrationsPanel::refresh()
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             const auto transforms = db.volumeTransforms(txn);
             _graph = transforms.graph;
-            _related = vc3d::registrations::related(transforms, volume->id());
+            _related = transforms.related(volume->id());
         });
         _status->setText(_related.empty() ? tr("No other volume maps into this one.") : QString());
     } catch (const std::exception& error) {
@@ -111,7 +111,7 @@ void VolumeRegistrationsPanel::refresh()
         item->setText(1, statusText(related));
         if (related.status == TransformStatus::Resolved) {
             const auto& path = related.chosen ? *related.chosen : related.routes.front().path;
-            item->setText(2, QString::fromStdString(vc3d::registrations::describeRoute(_graph, path)));
+            item->setText(2, QString::fromStdString(_graph.describe(path)));
         } else {
             item->setText(2, tr("%n route(s)", nullptr, int(related.routes.size())));
         }
@@ -167,8 +167,10 @@ void VolumeRegistrationsPanel::registerTransform()
     if (dialog.exec() != QDialog::Accepted) return;
     try {
         const auto affine = vc3d::registrations::parseAffine(matrix->toPlainText().toStdString());
-        vc3d::registrations::registerAffine(*_state->objectStoreSession(), *attachment, source->currentText().trimmed().toStdString(),
-                                            volume->id(), affine, name->text().trimmed().toStdString());
+        const auto from = source->currentText().trimmed().toStdString();
+        const auto label = name->text().trimmed().toStdString();
+        vc::objects::registerVolumeTransform(*_state->objectStoreSession(), *attachment, from, volume->id(), affine,
+                                             label.empty() ? from + " → " + volume->id() : label);
         _state->pollObjectStoreChanges();
     } catch (const std::exception& error) {
         QMessageBox::warning(this, tr("Register Transform"), QString::fromUtf8(error.what()));
@@ -186,7 +188,7 @@ void VolumeRegistrationsPanel::chooseRoute()
     int current = 0;
     for (size_t i = 0; i < related.routes.size(); ++i) {
         routes << QStringLiteral("%1. %2").arg(i + 1).arg(
-            QString::fromStdString(vc3d::registrations::describeRoute(_graph, related.routes[i].path)));
+            QString::fromStdString(_graph.describe(related.routes[i].path)));
         if (related.chosen && *related.chosen == related.routes[i].path) current = int(i);
     }
     bool accepted = false;
@@ -195,7 +197,7 @@ void VolumeRegistrationsPanel::chooseRoute()
         routes, current, false, &accepted);
     if (!accepted) return;
     try {
-        vc3d::registrations::chooseRoute(*_state->objectStoreSession(), *attachment, related.volume, volume->id(),
+        vc::objects::chooseVolumeTransform(*_state->objectStoreSession(), *attachment, related.volume, volume->id(),
                                          related.routes[size_t(routes.indexOf(picked))].path);
         _state->pollObjectStoreChanges();
     } catch (const std::exception& error) {

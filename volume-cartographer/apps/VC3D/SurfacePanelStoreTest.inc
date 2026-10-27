@@ -177,8 +177,8 @@ int runSurfacePanelStoreTests()
         auto* related = registrations.findChild<QTreeWidget*>();
         require(related && related->topLevelItemCount() == 1 && related->topLevelItem(0)->text(0) == "catalog-volume",
                 "the dock lists the catalog volume the open volume shows");
-        vc3d::registrations::registerAffine(*state.objectStoreSession(), attachment, "scan-b", "panel-volume",
-                                            vc::objects::VolumeAffine::scale(2), "test registration");
+        vc::objects::registerVolumeTransform(*state.objectStoreSession(), attachment, "scan-b", "panel-volume",
+                                             vc::objects::VolumeAffine::scale(2), "test registration");
         state.pollObjectStoreChanges();
         require(related->topLevelItemCount() == 2 && !related->findItems("scan-b", Qt::MatchExactly).isEmpty(),
                 "a committed registration appears in the Transforms dock");

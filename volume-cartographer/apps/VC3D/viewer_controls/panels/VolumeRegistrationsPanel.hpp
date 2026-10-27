@@ -35,5 +35,5 @@ private:
     QPushButton* _register{nullptr};
     QLabel* _status{nullptr};
     vcr::catalog::RegistrationGraph _graph;
-    std::vector<vc3d::registrations::Related> _related;
+    std::vector<vc::objects::VolumeTransforms::Related> _related;
 };
