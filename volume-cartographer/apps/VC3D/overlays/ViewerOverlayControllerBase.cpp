@@ -4,6 +4,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
+#include "../ObjectStoreRegions.hpp"
 
 #include <QGraphicsEllipseItem>
 #include <QGraphicsPathItem>
@@ -1152,6 +1153,18 @@ QRectF ViewerOverlayControllerBase::visibleSceneRect(VolumeViewerBase* viewer) c
     }
     auto* view = viewer->graphicsView();
     return view->mapToScene(view->viewport()->rect()).boundingRect();
+}
+
+std::optional<vc::fibers::ViewRegion> ViewerOverlayControllerBase::planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const
+{
+    if (!viewer || !dynamic_cast<PlaneSurface*>(viewer->currentSurface())) return std::nullopt;
+    const auto rect = visibleSceneRect(viewer);
+    if (rect.isEmpty()) return std::nullopt;
+    const auto corner = [&](const QPointF& scene) {
+        const auto p = viewer->sceneToVolume(scene);
+        return vc::fibers::Point{p[0], p[1], p[2]};
+    };
+    return vc3d::store::viewRegion(corner(rect.topLeft()), corner(rect.topRight()), corner(rect.bottomLeft()), halfDepth);
 }
 
 bool ViewerOverlayControllerBase::isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const

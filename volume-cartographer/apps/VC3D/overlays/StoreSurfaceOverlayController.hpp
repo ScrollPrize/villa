@@ -31,16 +31,18 @@ public:
     void setHighlighted(const std::vector<std::string>& uuids);
     void detachViewer(VolumeViewerBase* viewer) override;
 
+    // Where one surface crosses a view (volume voxels).
+    struct Run {
+        std::string uuid;
+        std::vector<std::array<double, 3>> points;
+    };
+
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     bool needsOverlayRebuild(VolumeViewerBase* viewer) const override;
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 
 private:
-    struct Run {
-        std::string uuid;
-        std::vector<std::array<double, 3>> points;
-    };
     struct View {
         vc3d::store::RegionRequests region;
         std::optional<vc3d::store::Region> displayed;
@@ -48,17 +50,13 @@ private:
         std::vector<Run> runs;
         bool dirty{true};
     };
-    std::optional<vc3d::store::Region> region(VolumeViewerBase* viewer) const;
     void request(VolumeViewerBase* viewer, const vc3d::store::Region& region);
     // Data changed: query every view again.
     void invalidate();
-    QColor colorFor(const std::string& uuid);
 
     CState* _state;
     SurfaceCatalog* _catalog;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
-    std::map<std::string, std::size_t> _colorIndex;
-    uint64_t _revision{0};
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> _views;
 };

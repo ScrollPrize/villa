@@ -214,7 +214,6 @@ public:
     virtual int surfacePatchSamplingStride() const = 0;
     virtual void setIntersectionOpacity(float opacity) = 0;
     virtual void setIntersectionThickness(float thickness) = 0;
-    virtual void setHighlightedSurfaceIds(const std::vector<std::string>& ids) = 0;
     virtual void setSurfacePatchSamplingStride(int stride) = 0;
 
     // --- Surface overlays ---

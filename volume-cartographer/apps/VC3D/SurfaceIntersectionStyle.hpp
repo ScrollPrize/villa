@@ -5,6 +5,8 @@
 #include <QRgb>
 #include <array>
 #include <cstddef>
+#include <functional>
+#include <string>
 
 namespace vc3d {
 
@@ -18,5 +20,10 @@ constexpr int kIntersectionZ = 100;
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
 inline QColor highlightedIntersectionColor() { return QColor(0, 220, 255); }
+// A surface's colour, the same in every viewer and overlay.
+inline QColor intersectionColor(const std::string& id)
+{
+    return QColor::fromRgba(kIntersectionPalette[std::hash<std::string>{}(id) % kIntersectionPalette.size()]);
+}
 
 } // namespace vc3d

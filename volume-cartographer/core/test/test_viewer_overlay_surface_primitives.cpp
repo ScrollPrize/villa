@@ -212,7 +212,6 @@ public:
     int surfacePatchSamplingStride() const override { return 1; }
     void setIntersectionOpacity(float) override {}
     void setIntersectionThickness(float) override {}
-    void setHighlightedSurfaceIds(const std::vector<std::string>&) override {}
     void setSurfacePatchSamplingStride(int) override {}
 
     bool surfaceOverlayEnabled() const override { return false; }

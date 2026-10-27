@@ -230,7 +230,6 @@ public:
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
-    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
     SurfacePatchIndex* surfacePatchIndexIfReady();
     SurfacePatchIndex* activeSegmentationEditSurfacePatchIndex() const;

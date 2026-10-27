@@ -121,9 +121,7 @@ constexpr int kSurfaceTileRenderDebounceMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kSurfaceCellTileSize = 64;
 
-using vc3d::kIntersectionPalette;
 using vc3d::kIntersectionZ;
-using vc3d::kHighlightedIntersectionZ;
 using vc3d::kActiveIntersectionZ;
 constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
@@ -6455,10 +6453,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         (std::hash<uint64_t>{}(useEditIndexForActive ? editPatchIndex->globalGeneration() : 0) +
          0x9e3779b9u);
     fp.activeSegHash = activeSeg ? std::hash<const void*>{}(activeSeg.get()) : 0;
-    size_t hh = 0;
-    for (const auto& id : _highlightedSurfaceIds)
-        hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
-    fp.highlightedSurfaceHash = hh;
     fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
     if (segCompositeActive) {
         fp.segSlabFrontQ = int(std::lround(segSlabFront * 1000.0f));
@@ -6512,7 +6506,6 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.targetHash == b.targetHash &&
                a.targetGenerationHash == b.targetGenerationHash &&
                a.activeSegHash == b.activeSegHash &&
-               a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
                a.segNormalOffsetQ == b.segNormalOffsetQ &&
                a.segSlabFrontQ == b.segSlabFrontQ &&
                a.segSlabBehindQ == b.segSlabBehindQ &&
@@ -6728,22 +6721,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             zValue = kActiveIntersectionZ;
             opacity *= kActiveIntersectionOpacityScale;
             penWidth = activeSegmentationIntersectionWidth(penWidth);
-        } else if (_highlightedSurfaceIds.count(target->id)) {
-            baseColor = vc3d::highlightedIntersectionColor();
-            zValue = kHighlightedIntersectionZ;
         } else {
-            const auto& id = target->id;
-            auto it = _surfaceColorAssignments.find(id);
-            size_t idx;
-            if (it != _surfaceColorAssignments.end()) {
-                idx = it->second;
-            } else if (_surfaceColorAssignments.size() < 500) {
-                idx = _nextColorIndex++;
-                _surfaceColorAssignments[id] = idx;
-            } else {
-                idx = std::hash<std::string>{}(id);
-            }
-            baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
+            baseColor = vc3d::intersectionColor(target->id);
         }
         baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
         if (baseColor.alpha() <= 0)
@@ -6953,25 +6932,6 @@ void CChunkedVolumeViewer::finishPlaneIntersectionCompute(
     // Clear the fp memo so the cache-hit early-out doesn't skip the scene-item build.
     _lastIntersectFp = {};
     renderIntersections("async intersection ready");
-}
-
-void CChunkedVolumeViewer::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
-{
-    if (_closing) {
-        return;
-    }
-    std::unordered_set<std::string> next;
-    next.reserve(ids.size());
-    for (const auto& id : ids) {
-        next.insert(id);
-    }
-    if (_highlightedSurfaceIds == next) {
-        return;
-    }
-    _highlightedSurfaceIds.clear();
-    _highlightedSurfaceIds = std::move(next);
-    _resolvedIntersectTargets = {};
-    renderIntersections("highlighted surface ids changed");
 }
 
 const VolumeViewerBase::ActiveSegmentationHandle& CChunkedVolumeViewer::activeSegmentationHandle() const

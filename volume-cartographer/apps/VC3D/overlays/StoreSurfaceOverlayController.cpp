@@ -19,13 +19,8 @@ constexpr double kHalfDepthVx = 1.0;
 // queries (verified chunks retained per connection) charge only what they read.
 constexpr uint64_t kProcessingBudget = uint64_t(1) << 30;
 
-vc::fibers::Point point(const cv::Vec3f& p)
-{
-    return {p[0], p[1], p[2]};
-}
-
 struct Listing {
-    std::vector<std::pair<std::string, std::vector<std::array<double, 3>>>> runs;
+    std::vector<StoreSurfaceOverlayController::Run> runs;
     bool complete = true;
 };
 }
@@ -74,7 +69,6 @@ void StoreSurfaceOverlayController::setHighlighted(const std::vector<std::string
 
 void StoreSurfaceOverlayController::invalidate()
 {
-    ++_revision;
     for (auto& [viewer, view] : _views) {
         view->region.reset();
         view->runs.clear();
@@ -93,15 +87,6 @@ void StoreSurfaceOverlayController::detachViewer(VolumeViewerBase* viewer)
     ViewerOverlayControllerBase::detachViewer(viewer);
 }
 
-std::optional<vc3d::store::Region> StoreSurfaceOverlayController::region(VolumeViewerBase* viewer) const
-{
-    if (!dynamic_cast<PlaneSurface*>(viewer->currentSurface())) return std::nullopt;
-    const auto rect = visibleSceneRect(viewer);
-    if (rect.isEmpty()) return std::nullopt;
-    return vc3d::store::viewRegion(point(viewer->sceneToVolume(rect.topLeft())), point(viewer->sceneToVolume(rect.topRight())),
-                                   point(viewer->sceneToVolume(rect.bottomLeft())), kHalfDepthVx);
-}
-
 bool StoreSurfaceOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
     return viewer && !_surfaces.empty() && !_catalog->sources().empty() && _catalog->volume() &&
@@ -114,57 +99,40 @@ bool StoreSurfaceOverlayController::needsOverlayRebuild(VolumeViewerBase* viewer
     const auto found = _views.find(viewer);
     if (found == _views.end()) return true;
     const auto& v = *found->second;
-    return v.dirty || v.displayed != region(viewer) || v.displayedRect != visibleSceneRect(viewer);
+    return v.dirty || v.displayed != planeViewRegion(viewer, kHalfDepthVx) || v.displayedRect != visibleSceneRect(viewer);
 }
 
 void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d::store::Region& view)
 {
-    auto& ptr = _views[viewer];
-    if (!ptr) ptr = std::make_unique<View>();
-    auto& v = *ptr;
-    const auto started = v.region.start(view);
-    if (!started) return;
-    const auto query = *started;
-    const auto cancel = v.region.cancelled;
-    const auto revision = _revision;
-    vc3d::store::background<Listing>(this,
-        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), uuids = _surfaces,
-         query, cancel]() {
+    auto& v = _views[viewer];
+    if (!v) v = std::make_unique<View>();
+    vc3d::store::requestRegion<Listing>(this, v->region, view,
+        [this, viewer]() -> View* {
+            const auto found = _views.find(viewer);
+            return found == _views.end() ? nullptr : found->second.get();
+        },
+        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(),
+         uuids = _surfaces](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
             vc::objects::RegionOptions options;
             options.uuids = uuids;
             options.processingByteBudget = kProcessingBudget;
             auto crossings = SurfaceCatalog::region(*session, sources, volume, vc3d::store::regionSlice(query), options,
-                                                    [&] { return cancel->load(); });
+                                                    [&] { return cancelled.load(); });
             Listing listing;
             listing.complete = crossings.complete;
-            for (auto& run : crossings.runs) listing.runs.emplace_back(std::move(run.objectUuid), std::move(run.points));
+            for (auto& run : crossings.runs) listing.runs.push_back({std::move(run.objectUuid), std::move(run.points)});
             return listing;
         },
-        [this, viewer, cancel, view, query, revision](vc3d::store::Outcome<Listing> result) {
-            auto found = _views.find(viewer);
-            if (found == _views.end()) return;
-            auto& v = *found->second;
-            using Finished = vc3d::store::RegionRequests::Finished;
-            const auto finished = v.region.finish(cancel, revision == _revision, view, query, result.value.complete, result.error);
-            if (finished == Finished::Stale) return;
+        [this, viewer](View& v, Listing* listing) {
             v.dirty = true;
-            if (finished == Finished::Install && result.error.isEmpty()) {
-                v.runs.clear();
-                for (auto& [uuid, points] : result.value.runs) v.runs.push_back({std::move(uuid), std::move(points)});
-            }
+            if (listing) v.runs = std::move(listing->runs);
             refreshViewer(viewer);
         });
 }
 
-QColor StoreSurfaceOverlayController::colorFor(const std::string& uuid)
-{
-    const auto [found, inserted] = _colorIndex.try_emplace(uuid, _colorIndex.size());
-    return QColor::fromRgba(vc3d::kIntersectionPalette[found->second % vc3d::kIntersectionPalette.size()]);
-}
-
 void StoreSurfaceOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
-    const auto current = region(viewer);
+    const auto current = planeViewRegion(viewer, kHalfDepthVx);
     if (!current) return;
     request(viewer, *current);
     auto& v = *_views.at(viewer);
@@ -195,7 +163,7 @@ void StoreSurfaceOverlayController::collectPrimitives(VolumeViewerBase* viewer, 
     for (const auto& [uuid, path] : paths) {
         const bool highlighted = _highlighted.contains(uuid);
         OverlayStyle style;
-        style.penColor = highlighted ? vc3d::highlightedIntersectionColor() : colorFor(uuid);
+        style.penColor = highlighted ? vc3d::highlightedIntersectionColor() : vc3d::intersectionColor(uuid);
         style.penColor.setAlphaF(opacity);
         style.penWidth = viewer->intersectionThickness();
         style.z = highlighted ? vc3d::kHighlightedIntersectionZ : vc3d::kIntersectionZ;

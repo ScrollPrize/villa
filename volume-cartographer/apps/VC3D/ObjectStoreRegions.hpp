@@ -176,15 +176,16 @@ struct RegionRequests {
         return query;
     }
     enum class Finished { Stale, Retry, Install };
-    // A query for `view` (as `query`) ended. Stale: a newer query or a reset
-    // superseded it, ignore it; Retry: re-request the view; Install: show it.
-    Finished finish(const std::shared_ptr<std::atomic_bool>& token, bool current, const Region& view,
+    // A query for `view` (as `query`) ended. Stale: a newer query superseded
+    // it, ignore it; Retry: it was cancelled (a reset or refresh), re-request
+    // the view; Install: show it.
+    Finished finish(const std::shared_ptr<std::atomic_bool>& token, const Region& view,
                     const Region& query, bool regionComplete, const QString& failure)
     {
         if (cancelled != token) return Finished::Stale;
         busy = false;
         pending.reset();
-        if (!current || token->load()) {
+        if (token->load()) {
             requested.reset();
             return Finished::Retry;
         }
@@ -203,5 +204,30 @@ struct RegionRequests {
         return Finished::Install;
     }
 };
+
+// Query a viewer's region for `view` on the thread pool unless its requests
+// cover it; true when a query started. `query(region, cancelled)` runs there
+// and returns a payload with `complete`. When it ends, `lookup()` finds the
+// viewer's state again (with its `region` requests; null once the viewer is
+// gone) and `ended(state, payload)` gets the payload to install, or null when
+// only a redraw (or the error in `region.error`) is due.
+template <class T, class Lookup, class Query, class Ended>
+bool requestRegion(QObject* parent, RegionRequests& requests, const Region& view, Lookup lookup, Query query, Ended ended)
+{
+    const auto started = requests.start(view);
+    if (!started) return false;
+    const auto region = *started;
+    const auto cancel = requests.cancelled;
+    background<T>(parent, [query, region, cancel] { return query(region, *cancel); },
+        [lookup, ended, view, region, cancel](Outcome<T> result) {
+            auto* state = lookup();
+            if (!state) return;
+            using Finished = RegionRequests::Finished;
+            const auto finished = state->region.finish(cancel, view, region, result.value.complete, result.error);
+            if (finished == Finished::Stale) return;
+            ended(*state, finished == Finished::Install && result.error.isEmpty() ? &result.value : nullptr);
+        });
+    return true;
+}
 
 } // namespace vc3d::store

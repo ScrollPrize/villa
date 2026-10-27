@@ -344,18 +344,11 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
             vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
     }
 
-    // Highlighted surface ids are sourced from the surface panel (the source of
-    // truth behind the context-menu checkmarks), so get/set stay consistent and
-    // the value is reported even when no viewer is instantiated. Fall back to the
-    // first live viewer only if the panel is unavailable.
+    // The surface panel owns the highlighted surfaces (its context-menu checkmarks).
     QJsonArray highlightIds;
-    if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr) {
+    if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
         for (const std::string& id : panel->highlightedSurfaceIds())
             highlightIds.append(QString::fromStdString(id));
-    } else if (firstChunked) {
-        for (const std::string& id : firstChunked->highlightedSurfaceIds())
-            highlightIds.append(QString::fromStdString(id));
-    }
     o["highlightedSurfaceIds"] = highlightIds;
     return o;
 }
@@ -487,16 +480,10 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
     }
     if (hasIntersectionMaxSurfaces)
         mgr->setIntersectionMaxSurfaces(intersectionMaxSurfaces);
-    if (hasHighlightedSurfaceIds) {
-        // Route through the surface panel so its _highlightedSurfaceIds (the source
-        // of truth behind the context-menu checkmarks) stays in sync; otherwise the
-        // next GUI highlight toggle would rebuild from the stale panel set and
-        // clobber these. Fall back to ViewerManager if the panel is unavailable.
+    // The surface panel owns the highlighted surfaces (its context-menu checkmarks).
+    if (hasHighlightedSurfaceIds)
         if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
             panel->setHighlightedSurfaceIds(highlightedSurfaceIds);
-        else
-            mgr->setHighlightedSurfaceIds(highlightedSurfaceIds);
-    }
     if (hasVolumeWindow)
         mgr->setVolumeWindow(volumeWindowLow, volumeWindowHigh);
     if (hasSamplingStride)

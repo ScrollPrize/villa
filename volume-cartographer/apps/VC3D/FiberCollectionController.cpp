@@ -51,10 +51,6 @@ cv::Vec3f cvpoint(const Point& p)
 {
     return {float(p[0]), float(p[1]), float(p[2])};
 }
-Point point(const cv::Vec3f& p)
-{
-    return {p[0], p[1], p[2]};
-}
 double dot(const Point& a, const Point& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -659,15 +655,7 @@ void FiberCollectionController::navigate(int index)
 }
 std::optional<FiberCollectionController::Slice> FiberCollectionController::slice(VolumeViewerBase* viewer) const
 {
-    if (!dynamic_cast<PlaneSurface*>(viewer->currentSurface()))
-        return std::nullopt;
-    const auto rect = visibleSceneRect(viewer);
-    if (rect.isEmpty())
-        return std::nullopt;
-    return vc3d::store::viewRegion(point(viewer->sceneToVolume(rect.topLeft())),
-                                   point(viewer->sceneToVolume(rect.topRight())),
-                                   point(viewer->sceneToVolume(rect.bottomLeft())),
-                                   options_.sliceDistance);
+    return planeViewRegion(viewer, options_.sliceDistance);
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
@@ -691,32 +679,28 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         ptr = std::make_unique<View>();
         viewer->graphicsView()->viewport()->installEventFilter(this);
     }
-    auto& v = *ptr;
-    const auto started = v.region.start(s);
-    if (!started) return;
-    const auto query = *started;
-    v.dirty = true;
-    auto cancel = v.region.cancelled;
-    const auto rev = revision_;
     const double min = options_.minLengthMm / nativeVoxelMm_;
     const auto family = familyFilter();
     const auto maximum = options_.maxDisplayed;
     const bool linked = options_.showLinked;
-    background<RegionResult>(
-        this,
+    const bool started = vc3d::store::requestRegion<RegionResult>(this, ptr->region, s,
+        [this, viewer]() -> View* {
+            const auto found = views_.find(viewer);
+            return found == views_.end() ? nullptr : found->second.get();
+        },
         [connection=state_->objectStoreSession(),attachment=*state_->objectStoreAttachment(),
          volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{},
-         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{}, s=query,min,cancel,maximum,family,linked,
-         none=noFamilies()]() {
+         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
+         none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
             RegionResult result;
             if (none || volume.empty()) return result;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
-                const auto slice = vc3d::store::regionSlice(s);
+                const auto slice = vc3d::store::regionSlice(query);
                 vc::objects::RegionOptions options;
                 options.kind="fiber"; options.volume=volume; options.maximumObjects=maximum; options.minLength=min;
                 if (!selectedUuid.empty()) options.selected=selectedUuid;
                 options.family=family;
-                auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel->load() || cancelled.load(); });
+                auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel.load() || cancelled.load(); });
                 result.complete = region.complete();
                 result.limited = region.stop == vc::objects::RegionStop::ObjectLimit;
                 // Runs arrive in volume voxels, merged in UUID order with the selected fiber first.
@@ -770,16 +754,10 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             });
             return result;
         },
-        [this, viewer, rev, cancel, s, query](Outcome<RegionResult> result) {
-            auto found = views_.find(viewer);
-            if (found == views_.end()) return;
-            auto& v = *found->second;
-            using Finished = vc3d::store::RegionRequests::Finished;
-            const auto finished = v.region.finish(cancel, rev == revision_, s, query, result.value.complete, result.error);
-            if (finished == Finished::Stale) return;
+        [this, viewer](View& v, RegionResult* result) {
             v.dirty = true;
-            if (finished == Finished::Install && result.error.isEmpty()) {
-                auto& region = result.value;
+            if (result) {
+                auto& region = *result;
                 v.controls.clear();
                 for (const auto& control : region.controls)
                     v.controls.push_back({annotations_->fiberIdForUuid(control.uuid), control.index, control.position});
@@ -793,6 +771,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             }
             refreshViewer(viewer);
         });
+    if (started) ptr->dirty = true;
 }
 // A linked control point: a circle, or a triangle for an adjacent link.
 void FiberCollectionController::addLinkMark(OverlayBuilder& builder, const QPointF& center,

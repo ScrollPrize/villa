@@ -108,7 +108,7 @@ public:
     // Retires each surface in the store. The interactive caller is responsible
     // for confirmation.
     bool retireSurfaces(const QStringList& surfaceIds, QString* err = nullptr);
-    // Replace the whole highlighted-surface set at once and push it to the viewers,
+    // Replace the whole highlighted-surface set at once and publish it,
     // keeping _highlightedSurfaceIds, the source of truth behind the
     // "Highlight in slice views" checkmarks, in sync.
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);

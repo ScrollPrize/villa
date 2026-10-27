@@ -18,6 +18,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "../volume_viewers/SurfaceProjection.hpp"
+#include "vc/core/types/FiberView.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -357,6 +358,9 @@ protected:
                                        const std::vector<cv::Vec3f>& volumePoints) const;
     QGraphicsScene* viewerScene(VolumeViewerBase* viewer) const;
     QRectF visibleSceneRect(VolumeViewerBase* viewer) const;
+    // The slab of half depth `halfDepth` around a plane viewer's visible
+    // rectangle (the region the store overlays query); nothing off a plane.
+    std::optional<vc::fibers::ViewRegion> planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const;
     bool isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
     Surface* viewerSurface(VolumeViewerBase* viewer) const;
 

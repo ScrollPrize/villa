@@ -1057,11 +1057,6 @@ void ViewerManager::setIntersectionThickness(float thickness)
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setIntersectionThickness(_intersectionThickness); });
 }
 
-void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
-{
-    forEachBaseViewer([&ids](VolumeViewerBase* v) { v->setHighlightedSurfaceIds(ids); });
-}
-
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
     if (volume && _state && _state->vpkg()) {

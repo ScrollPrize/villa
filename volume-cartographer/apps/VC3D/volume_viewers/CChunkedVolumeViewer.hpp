@@ -203,10 +203,6 @@ public:
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
-    void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
-    std::vector<std::string> highlightedSurfaceIds() const {
-        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
-    }
     void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
@@ -673,13 +669,12 @@ private:
     float _intersectionThickness = 0.0f;
     int _surfacePatchSamplingStride = 2;
     std::set<std::string> _intersectTgts;
-    std::unordered_set<std::string> _highlightedSurfaceIds;
 
     // Resolved intersection targets, cached across render ticks. With very
     // large sessions (~100k visible surfaces) re-resolving every name via
     // CState per renderIntersections call costs tens of milliseconds on the
     // main thread even when the fingerprint would hit. Invalidated when the
-    // target names / highlight set change and (via CState::surfacesVersion)
+    // target names change and (via CState::surfacesVersion)
     // when the surface map itself changes.
     struct ResolvedIntersectTargets {
         std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
@@ -695,8 +690,6 @@ private:
     float _intersectionItemsCamSurfY = 0.0f;
     float _intersectionItemsCamScale = 1.0f;
     bool _intersectionItemsHaveCamera = false;
-    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
-    size_t _nextColorIndex = 0;
 
     struct IntersectFingerprint {
         int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
@@ -712,7 +705,6 @@ private:
         size_t targetHash = 0;
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
-        size_t highlightedSurfaceHash = 0;
         int segNormalOffsetQ = 0;
         // Slab bound offsets (quantized) when the flattened viewer composites;
         // INT_MIN when compositing is off so the modes never alias.
