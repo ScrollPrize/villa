@@ -1,10 +1,8 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SurfaceCatalog.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
-#include <vc_object_store/store/GeometryViews.hpp>
 #include <cmath>
 
 std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(SurfaceCatalog& catalog, const std::vector<std::string>& ids)
@@ -16,28 +14,28 @@ std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(SurfaceCatalog& ca
         AreaResult result;
         result.segmentId = id;
         try {
-            const auto opened = catalog.open(id);
-            if (!opened.editable) {
+            // A surface of the user's store (perhaps just created, not listed yet).
+            const auto* row = catalog.row(id);
+            if (!catalog.attachment() || !catalog.volume()) {
+                throw std::runtime_error("attach an object store and open a volume first");
+            }
+            if ((row && row->catalog) || !catalog.session()->writable(*catalog.attachment())) {
                 throw std::runtime_error("the object store is read-only");
             }
             // The physical area from the open volume; area_vx2 in voxels of the
             // volume the surface is bound to, whatever volume is open.
-            const double viewedVx2 = vc::surface::computeSurfaceAreaVox2(*opened.surface);
-            double areaVx2 = viewedVx2;
-            if (opened.view.mapping != vc::objects::VolumeAffine::identity()) {
-                // The same revision read in the bound volume's voxels, through the store's view of it.
-                catalog.session()->read(opened.pin.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                    const auto meta = nlohmann::json::parse(db.objectByUuid(txn, id)->meta);
-                    const auto bound = vc::objects::geometryCoordinates(
-                        meta.value("coordinates", nlohmann::json::object()))["volume_uuid"];
-                    if (!bound.is_string()) throw std::runtime_error("the surface is not bound to a volume");
-                    const auto view = vc::objects::GeometrySnapshot(db, txn)
-                                          .surface(id, opened.pin.geometryRevision)
-                                          .viewTransformedAt(bound.template get<std::string>());
-                    const auto stored = load_quad_from_store(db, txn, id, opened.pin.geometryRevision, true, &view);
-                    areaVx2 = vc::surface::computeSurfaceAreaVox2(*stored);
-                });
-            }
+            double viewedVx2 = 0.0;
+            double areaVx2 = 0.0;
+            catalog.session()->read(*catalog.attachment(), [&](const auto& db, const auto& txn, const auto&) {
+                const auto object = db.objectByUuid(txn, id);
+                if (!object) throw std::runtime_error("the surface is no longer in the object store");
+                const auto meta = nlohmann::json::parse(object->meta);
+                const auto bound = vc::objects::geometryCoordinates(
+                    meta.value("coordinates", nlohmann::json::object()))["volume_uuid"];
+                if (!bound.is_string()) throw std::runtime_error("the surface is not bound to a volume");
+                viewedVx2 = db.surfaceAreaInVolume(txn, id, catalog.volume()->id());
+                areaVx2 = db.surfaceAreaInVolume(txn, id, bound.template get<std::string>());
+            });
             if (!std::isfinite(areaVx2) || !std::isfinite(viewedVx2)) {
                 throw std::runtime_error("non-finite area");
             }

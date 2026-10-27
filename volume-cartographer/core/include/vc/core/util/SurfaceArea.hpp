@@ -12,6 +12,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
 
 namespace vc::surface
 {
@@ -56,45 +57,15 @@ inline void storeAreaMeta(utils::Json& meta, double area_vx2, double voxelSize)
 
 namespace detail
 {
-template <typename Vec>
-inline bool isFiniteVec(const Vec& v)
-{
-    return std::isfinite(static_cast<double>(v[0])) &&
-           std::isfinite(static_cast<double>(v[1])) &&
-           std::isfinite(static_cast<double>(v[2]));
-}
-
-template <typename Vec>
-inline bool isSentinelInvalid(const Vec& v)
-{
-    return static_cast<double>(v[0]) == -1.0 &&
-           static_cast<double>(v[1]) == -1.0 &&
-           static_cast<double>(v[2]) == -1.0;
-}
-
+// A triangle counts when its corners have coordinates (the store's rule).
 template <typename Vec>
 inline double triangleArea(const Vec& a, const Vec& b, const Vec& c)
 {
-    if (!isFiniteVec(a) || !isFiniteVec(b) || !isFiniteVec(c)) {
+    if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b) ||
+        !vc::geometry::validSurfacePoint(c)) {
         return 0.0;
     }
-    if (isSentinelInvalid(a) || isSentinelInvalid(b) || isSentinelInvalid(c)) {
-        return 0.0;
-    }
-
-    const double ux = static_cast<double>(b[0]) - static_cast<double>(a[0]);
-    const double uy = static_cast<double>(b[1]) - static_cast<double>(a[1]);
-    const double uz = static_cast<double>(b[2]) - static_cast<double>(a[2]);
-
-    const double vx = static_cast<double>(c[0]) - static_cast<double>(a[0]);
-    const double vy = static_cast<double>(c[1]) - static_cast<double>(a[1]);
-    const double vz = static_cast<double>(c[2]) - static_cast<double>(a[2]);
-
-    const double cx = uy * vz - uz * vy;
-    const double cy = uz * vx - ux * vz;
-    const double cz = ux * vy - uy * vx;
-
-    return 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+    return vc::geometry::triangleArea(a, b, c);
 }
 
 template <typename Vec>
@@ -109,20 +80,9 @@ inline double quadArea(const Vec& p00,
 template <typename Vec>
 inline double surfaceArea(const cv::Mat_<Vec>& points)
 {
-    if (points.empty() || points.rows < 2 || points.cols < 2) {
-        return 0.0;
-    }
-
-    double total = 0.0;
-    for (int y = 0; y < points.rows - 1; ++y) {
-        for (int x = 0; x < points.cols - 1; ++x) {
-            total += quadArea(points(y, x),
-                              points(y, x + 1),
-                              points(y + 1, x),
-                              points(y + 1, x + 1));
-        }
-    }
-    return total;
+    return vc::geometry::surfaceGridArea(
+        points.rows, points.cols, [&](int64_t r, int64_t c) -> const Vec& { return points(int(r), int(c)); },
+        [&](int64_t r, int64_t c) { return vc::geometry::validSurfacePoint(points(int(r), int(c))); });
 }
 
 inline double median(std::vector<double>& values)
