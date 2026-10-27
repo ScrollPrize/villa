@@ -1,7 +1,7 @@
 // More VolumePkg coverage:
 // - getVolpkgDirectory
 // - volumeTags
-// - normalGridPaths / normal3dZarrPaths
+// - normalGridPaths
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -169,11 +169,10 @@ TEST_CASE("runtime remote cache root is not persisted in projects")
     fs::remove_all(d);
 }
 
-TEST_CASE("normalGridPaths + normal3dZarrPaths: empty without entries")
+TEST_CASE("normalGridPaths: empty without entries")
 {
     auto p = VolumePkg::newEmpty();
     CHECK(p->normalGridPaths().empty());
-    CHECK(p->normal3dZarrPaths().empty());
 }
 
 TEST_CASE("volumeIDs returns loaded volume ids")

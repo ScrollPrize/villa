@@ -666,30 +666,6 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
     return QString();
 }
 
-QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
-                                               QString* hint)
-{
-    if (hint) {
-        *hint = QString();
-    }
-    if (!pkg) {
-        if (hint) {
-            *hint = QObject::tr("Normal3D lookup skipped (no volume package loaded)");
-        }
-        return {};
-    }
-    auto paths = pkg->normal3dZarrPaths();
-    QStringList candidates;
-    for (const auto& p : paths) candidates.push_back(QString::fromStdString(p.string()));
-    candidates.sort();
-    if (hint) {
-        *hint = candidates.isEmpty()
-            ? QObject::tr("No volumes tagged 'normal3d' in project")
-            : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
-    }
-    return candidates;
-}
-
 constexpr float kEpsilon = 1e-6f;
 
 cv::Vec3f projectVectorOntoPlane(const cv::Vec3f& v, const cv::Vec3f& normal)
@@ -2605,10 +2581,6 @@ void CWindow::updateNormalGridAvailability()
             hint = tr("No volume package loaded.");
         }
         _segmentationWidget->setNormalGridPathHint(hint);
-
-        QString normal3dHint;
-        const QStringList normal3d = normal3dZarrCandidatesForVolumePkg(_state->vpkg(), &normal3dHint);
-        _segmentationWidget->setNormal3dZarrCandidates(normal3d, normal3dHint);
     }
 }
 
@@ -3248,9 +3220,6 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());
     initializeCommandLineRunner();
-    _segmentationCommandHandler->setNormal3dZarrPathGetter([this]() -> QString {
-        return _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString();
-    });
     _segmentationCommandHandler->setNormalGridPathGetter([this]() -> QString {
         updateNormalGridAvailability();
         return _normalGridPath;
@@ -5556,8 +5525,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         _state->currentVolume(),
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
-        _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _normalGridPath
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
@@ -5587,8 +5555,7 @@ void CWindow::onCopyWithNtRequested()
         _state->currentVolume(),
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
-        _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _normalGridPath
     };
 
     if (!_segmentationGrower->startCopyWithNt(volumeContext)) {

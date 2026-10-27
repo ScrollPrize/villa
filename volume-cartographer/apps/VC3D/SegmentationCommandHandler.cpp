@@ -1549,12 +1549,6 @@ QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
 
     QJsonObject params;
     params["normal_grid_path"] = normalGridPath;
-    if (_normal3dZarrPathGetter) {
-        const QString n3dPath = _normal3dZarrPathGetter();
-        if (!n3dPath.isEmpty()) {
-            params["normal3d_zarr_path"] = n3dPath;
-        }
-    }
     params["max_gen"] = 1;
     params["generations"] = 1;
     params["resume_local_opt_step"] = 20;
@@ -1634,32 +1628,6 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     }
     if (extraParams) {
         params.paramOverrides = *extraParams;
-    }
-
-    // Check if merged params require normal3d but we don't have it
-    const QJsonObject paramsJson =
-        buildResumeLocalParamsJson(params.paramOverrides);
-    bool needsNormal3d = false;
-    if (paramsJson.contains("normal3dline_weight")) {
-        const double w = paramsJson["normal3dline_weight"].toDouble(0.0);
-        needsNormal3d = (w > 0.0);
-    }
-
-    if (needsNormal3d && !paramsJson.contains("normal3d_zarr_path")) {
-        auto reply = QMessageBox::warning(
-            _parentWidget, tr("Missing Normal3D"),
-            tr("The selected tracer profile uses normal3dline_weight > 0, "
-               "but no normal3d zarr path is available.\n\n"
-               "The normal3d line constraint will have no effect.\n\n"
-               "To fix this, select a normal3d dataset in the segmentation panel, "
-               "or use a profile without normal3dline_weight.\n\n"
-               "Continue anyway?"),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No);
-        if (reply != QMessageBox::Yes) {
-            emit statusMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
-            return;
-        }
     }
 
     CommandLaunchError error;
@@ -1893,12 +1861,6 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     paramsJson.insert(QStringLiteral("cache_root"), QDir(volpkgRoot).filePath(QStringLiteral("cache")));
     if (std::isfinite(selectedVoxelSize) && selectedVoxelSize > 0.0) {
         paramsJson.insert(QStringLiteral("voxelsize"), selectedVoxelSize);
-    }
-    if (_normal3dZarrPathGetter) {
-        const QString normal3dPath = _normal3dZarrPathGetter();
-        if (!normal3dPath.isEmpty()) {
-            paramsJson.insert(QStringLiteral("normal3d_zarr_path"), normal3dPath);
-        }
     }
 
     auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_seed_XXXXXX.json"));
@@ -2487,13 +2449,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             3000);
     }
 
-    QString referenceZarr = !_normal3dZarrPathGetter ? QString() : _normal3dZarrPathGetter();
+    const QString referenceZarr = getCurrentVolumePath();
     if (referenceZarr.isEmpty()) {
-        referenceZarr = getCurrentVolumePath();
-    }
-    if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Load a volume first."));
         return;
     }
 

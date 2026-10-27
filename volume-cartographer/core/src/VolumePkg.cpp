@@ -1132,18 +1132,6 @@ std::vector<fs::path> VolumePkg::normalGridPaths() const
     return resolvedNormalGridPaths_;
 }
 
-std::vector<fs::path> VolumePkg::normal3dZarrPaths() const
-{
-    std::vector<fs::path> out;
-    for (const auto& [id, tags] : volumeTagsByID_) {
-        if (std::find(tags.begin(), tags.end(), "normal3d") == tags.end()) continue;
-        auto it = loadedVolumes_.find(id);
-        if (it == loadedVolumes_.end()) continue;
-        out.push_back(it->second->path());
-    }
-    return out;
-}
-
 std::vector<std::string> VolumePkg::volumeTags(const std::string& volumeId) const
 {
     auto it = volumeTagsByID_.find(volumeId);

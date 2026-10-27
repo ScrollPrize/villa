@@ -34,7 +34,6 @@ public:
     [[nodiscard]] int growthSteps() const { return _growthSteps; }
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
     [[nodiscard]] int growthScale() const { return _growthScale; }
-    [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
@@ -46,7 +45,6 @@ public:
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
     void setNormalGridPath(const QString& path);
-    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
     void setVolumePackagePath(const QString& path);
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
                              const QString& activeId);
@@ -72,7 +70,6 @@ private:
     void applyGrowthDirectionMaskToUi();
     static int normalizeGrowthDirectionMask(int mask);
     void updateGrowthUiState();
-    void updateNormal3dUi();
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
                                                    const QString& requestedId) const;
@@ -95,9 +92,6 @@ private:
     QComboBox* _comboVolumes{nullptr};
     QLabel* _lblNormalGrid{nullptr};
     QLineEdit* _editNormalGridPath{nullptr};
-    QLabel* _lblNormal3d{nullptr};
-    QComboBox* _comboNormal3d{nullptr};
-    QLineEdit* _editNormal3dPath{nullptr};
 
     // State
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
@@ -112,9 +106,6 @@ private:
     QString _normalGridPath;
     int _growthScale{0};
 
-    QStringList _normal3dCandidates;
-    QString _normal3dHint;
-    QString _normal3dSelectedPath;
     QString _volumePackagePath;
     QVector<QPair<QString, QString>> _volumeEntries;
     QString _activeVolumeId;

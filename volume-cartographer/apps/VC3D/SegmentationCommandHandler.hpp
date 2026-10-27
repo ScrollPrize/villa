@@ -145,12 +145,6 @@ public:
     void setSegmentationGrower(SegmentationGrower* grower) { _segmentationGrower = grower; }
 
     /**
-     * Callback that returns the normal3d zarr path from the segmentation widget.
-     * If not set, normal3d zarr path will be empty.
-     */
-    void setNormal3dZarrPathGetter(std::function<QString()> fn) { _normal3dZarrPathGetter = std::move(fn); }
-
-    /**
      * Callback that returns the normal grid path paired with the current
      * volume. If not set, falls back to the project's first normal grid entry.
      */
@@ -387,6 +381,5 @@ private:
     std::unique_ptr<QTemporaryFile> _traceParamsFile;
 
     // Callbacks for CWindow-specific operations
-    std::function<QString()> _normal3dZarrPathGetter;
     std::function<QString()> _normalGridPathGetter;
 };

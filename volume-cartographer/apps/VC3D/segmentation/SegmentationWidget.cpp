@@ -371,7 +371,6 @@ SegmentationGrowthMethod SegmentationWidget::growthMethod() const { return _grow
 int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps(); }
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 int SegmentationWidget::growthScale() const { return _growthPanel->growthScale(); }
-QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
 ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {
@@ -413,7 +412,6 @@ void SegmentationWidget::setGrowthInProgress(bool running)
 void SegmentationWidget::setNormalGridAvailable(bool available) { _growthPanel->setNormalGridAvailable(available); }
 void SegmentationWidget::setNormalGridPathHint(const QString& hint) { _growthPanel->setNormalGridPathHint(hint); }
 void SegmentationWidget::setNormalGridPath(const QString& path) { _growthPanel->setNormalGridPath(path); }
-void SegmentationWidget::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint) { _growthPanel->setNormal3dZarrCandidates(candidates, hint); }
 void SegmentationWidget::setVolumePackagePath(const QString& path) { _growthPanel->setVolumePackagePath(path); }
 void SegmentationWidget::setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes, const QString& activeId) { _growthPanel->setAvailableVolumes(volumes, activeId); }
 void SegmentationWidget::setActiveVolume(const QString& volumeId) { _growthPanel->setActiveVolume(volumeId); }

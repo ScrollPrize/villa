@@ -749,7 +749,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
-    ctx.normal3dZarrPath = volumeContext.normal3dZarrPath;
     ctx.allowedGrowthMask = request.allowedGrowthMask;
 
     ctx.growthVolumeId = growthVolumeId;

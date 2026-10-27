@@ -154,7 +154,6 @@ struct TracerGrowthContext {
     QString cacheRoot;
     double voxelSize{1.0};
     QString normalGridPath;
-    QString normal3dZarrPath;
     cv::Mat allowedGrowthMask;
     std::string growthVolumeId;
 };

@@ -177,7 +177,6 @@ public:
     bool reloadSingleVolume(const std::string& volumeId);
 
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
-    [[nodiscard]] std::vector<std::filesystem::path> normal3dZarrPaths() const;
 
     [[nodiscard]] std::vector<std::string> volumeTags(const std::string& volumeId) const;
 

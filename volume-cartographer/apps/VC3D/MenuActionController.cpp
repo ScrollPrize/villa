@@ -1719,7 +1719,7 @@ void MenuActionController::attachVolume()
     }
     bool ok = false;
     QString tagsStr = QInputDialog::getText(_window, QObject::tr("Attach Volume"),
-        QObject::tr("Tags (comma-separated, optional; e.g. normal3d):"),
+        QObject::tr("Tags (comma-separated, optional):"),
         QLineEdit::Normal, QString(), &ok);
     if (!ok) return;
     std::vector<std::string> tags;

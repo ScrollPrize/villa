@@ -58,7 +58,6 @@ public:
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
-    [[nodiscard]] QString normal3dZarrPath() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
@@ -102,7 +101,6 @@ public:
     void setNormalGridPathHint(const QString& hint);
     void setNormalGridPath(const QString& path);
 
-    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
 
     void setVolumePackagePath(const QString& path);
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,

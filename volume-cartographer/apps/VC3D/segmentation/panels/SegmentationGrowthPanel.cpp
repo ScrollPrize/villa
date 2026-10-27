@@ -186,28 +186,6 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         panelLayout->addLayout(normalGridRow);
     }
 
-    // Normal3D zarr selection (optional)
-    {
-        auto* normal3dRow = new QHBoxLayout();
-        _lblNormal3d = new QLabel(this);
-        _lblNormal3d->setTextFormat(Qt::RichText);
-        _lblNormal3d->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        normal3dRow->addWidget(_lblNormal3d, 0);
-
-        _editNormal3dPath = new QLineEdit(this);
-        _editNormal3dPath->setReadOnly(true);
-        _editNormal3dPath->setClearButtonEnabled(false);
-        _editNormal3dPath->setVisible(false);
-        normal3dRow->addWidget(_editNormal3dPath, 1);
-
-        _comboNormal3d = new QComboBox(this);
-        _comboNormal3d->setToolTip(tr("Select Normal3D zarr volume to use for normal3dline constraints."));
-        _comboNormal3d->setVisible(false);
-        normal3dRow->addWidget(_comboNormal3d, 0);
-
-        panelLayout->addLayout(normal3dRow);
-    }
-
     // --- Signal wiring ---
 
     auto connectDirectionCheckbox = [this](QCheckBox* box) {
@@ -264,17 +242,6 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         if (volumeId.isEmpty() || volumeId == _activeVolumeId) return;
         _activeVolumeId = volumeId;
         emit volumeSelectionChanged(volumeId);
-    });
-
-    // Normal3D combo
-    connect(_comboNormal3d, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
-        if (_restoringSettings) return;
-        if (idx < 0) return;
-        const QString path = _comboNormal3d->itemData(idx).toString();
-        if (path.isEmpty() || path == _normal3dSelectedPath) return;
-        _normal3dSelectedPath = path;
-        writeSetting(QStringLiteral("normal3d_selected_path"), _normal3dSelectedPath);
-        updateNormal3dUi();
     });
 
     // Z-range connections
@@ -455,13 +422,6 @@ void SegmentationGrowthPanel::setNormalGridPathHint(const QString& hint)
 void SegmentationGrowthPanel::setNormalGridPath(const QString& path)
 {
     _normalGridPath = path.trimmed();
-    syncUiState(_editingEnabled, _growthInProgress);
-}
-
-void SegmentationGrowthPanel::setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint)
-{
-    _normal3dCandidates = candidates;
-    _normal3dHint = hint;
     syncUiState(_editingEnabled, _growthInProgress);
 }
 
@@ -665,18 +625,6 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     if (_editNormalGridPath) {
         _editNormalGridPath->setVisible(!manual && _normalGridAvailable && !_normalGridPath.isEmpty());
     }
-    if (_lblNormal3d) {
-        _lblNormal3d->setVisible(!manual);
-    }
-    const int normal3dCount = _normal3dCandidates.size();
-    const bool showNormal3dCombo = normal3dCount > 1;
-    const bool showNormal3dPath = normal3dCount == 1;
-    if (_comboNormal3d) {
-        _comboNormal3d->setVisible(!manual && showNormal3dCombo);
-    }
-    if (_editNormal3dPath) {
-        _editNormal3dPath->setVisible(!manual && showNormal3dPath);
-    }
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setEnabled(enableGrowth);
     }
@@ -712,76 +660,6 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     }
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
-    }
-}
-
-void SegmentationGrowthPanel::updateNormal3dUi()
-{
-    if (!_lblNormal3d) {
-        return;
-    }
-
-    const int count = _normal3dCandidates.size();
-    const bool hasAny = count > 0;
-
-    // Keep selection valid.
-    if (hasAny) {
-        if (_normal3dSelectedPath.isEmpty() || !_normal3dCandidates.contains(_normal3dSelectedPath)) {
-            _normal3dSelectedPath = _normal3dCandidates.front();
-        }
-    } else {
-        _normal3dSelectedPath.clear();
-    }
-
-    const bool showCombo = count > 1;
-    if (_comboNormal3d) {
-        _comboNormal3d->setVisible(showCombo);
-        _comboNormal3d->setEnabled(_editingEnabled && hasAny);
-        if (showCombo) {
-            const QSignalBlocker blocker(_comboNormal3d);
-            _comboNormal3d->clear();
-            for (const QString& p : _normal3dCandidates) {
-                _comboNormal3d->addItem(p, p);
-            }
-            const int idx = _comboNormal3d->findData(_normal3dSelectedPath);
-            if (idx >= 0) {
-                _comboNormal3d->setCurrentIndex(idx);
-            }
-        }
-    }
-
-    const QString icon = hasAny
-        ? QStringLiteral("<span style=\"color:#2e7d32; font-size:16px;\">&#10003;</span>")
-        : QStringLiteral("<span style=\"color:#c62828; font-size:16px;\">&#10007;</span>");
-
-    QString message;
-    if (!hasAny) {
-        message = tr("Normal3D volume not found.");
-    } else if (count == 1) {
-        message = tr("Normal3D volume found.");
-    } else {
-        message = tr("Normal3D volumes found (%1). Select one:").arg(count);
-    }
-
-    QString tooltip = message;
-    if (!_normal3dHint.isEmpty()) {
-        tooltip.append(QStringLiteral("\n"));
-        tooltip.append(_normal3dHint);
-    }
-    if (!_volumePackagePath.isEmpty()) {
-        tooltip.append(QStringLiteral("\n"));
-        tooltip.append(tr("Volume package: %1").arg(_volumePackagePath));
-    }
-
-    _lblNormal3d->setText(icon + QStringLiteral("&nbsp;") + message);
-    _lblNormal3d->setToolTip(tooltip);
-    _lblNormal3d->setAccessibleDescription(message);
-
-    if (_editNormal3dPath) {
-        const bool show = hasAny && !showCombo;
-        _editNormal3dPath->setVisible(show);
-        _editNormal3dPath->setText(_normal3dSelectedPath);
-        _editNormal3dPath->setToolTip(_normal3dSelectedPath);
     }
 }
 
@@ -840,7 +718,6 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
         _correctionsZMax = _correctionsZMin;
     }
 
-    _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
     _growthScale = std::clamp(settings.value(QStringLiteral("growth_scale"), _growthScale).toInt(), 0, 5);
 
     _restoringSettings = false;
@@ -923,8 +800,6 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
         _editNormalGridPath->setText(_normalGridPath);
         _editNormalGridPath->setToolTip(_normalGridPath);
     }
-
-    updateNormal3dUi();
 
     updateGrowthUiState();
 }
