@@ -13,6 +13,7 @@ class QLabel;
 class QCheckBox;
 class QDoubleSpinBox;
 class QSpinBox;
+class QTimer;
 class QMainWindow;
 class ViewerManager;
 class VolumeViewerBase;
@@ -63,6 +64,9 @@ private:
     void scheduleQuery(VolumeViewerBase* viewer);
     void invalidateQuery();  // controls that change which sheets are fetched -> re-query
     void invalidateDraw();   // controls that change only how sheets are drawn -> repaint
+    // Debounce dock-control edits: coalesce rapid spinbox steps into one apply once the
+    // value settles. needQuery records whether any pending edit needs a re-query.
+    void scheduleControlsApply(bool needQuery);
     // Minimum vertex count equivalent to the mm^2 size filter (area ~ verts*grid^2).
     int64_t minVertsThreshold() const;
 
@@ -84,6 +88,8 @@ private:
     double nativeToViewer_{1.0};
     uint64_t queryRevision_{0};  // bumped when the set of fetched sheets must change
     uint64_t drawRevision_{0};   // bumped on any change that needs a repaint
+    QTimer* controlsTimer_{};    // debounces dock-control edits
+    bool controlsNeedQuery_{false};
 
     // What was last drawn per viewport, so needsOverlayRebuild() can skip a rebuild
     // when neither the slice nor the draw revision changed.

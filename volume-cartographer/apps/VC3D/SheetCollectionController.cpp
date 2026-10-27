@@ -157,6 +157,7 @@ constexpr double kCoreNormal = 4.0;        // re-query after ~this much scroll (
 constexpr double kCoreInPlane = 24.0;      // re-query only this close (vx) to the pan-margin edge
 constexpr size_t kFetchByteBudget = 512u * 1024u * 1024u;  // decode cap per query
 constexpr int kQueryDebounceMs = 1000;     // settle time before a motion fires a read
+constexpr int kControlsDebounceMs = 1000;  // settle time before a dock-control edit applies
 
 // Build the coverage prism and its world AABB (for the rtree query) around a slice.
 ViewRegion makeCoverage(const ViewRegion& s)
@@ -337,12 +338,15 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     };
     // Changes that alter which sheets are fetched force a re-query; draw-only changes
     // just repaint from the cache.
+    // Checkboxes are single clicks -> apply instantly.
     connect(visible_, &QCheckBox::toggled, this, [this]() { invalidateDraw(); });
     connect(rainbow_, &QCheckBox::toggled, this, [this, persist]() { persist(); invalidateDraw(); });
-    connect(lineWidth_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); invalidateDraw(); });
-    connect(maxDisplayed_, qOverload<int>(&QSpinBox::valueChanged), this, [this, persist]() { persist(); invalidateQuery(); });
-    connect(minArea_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); invalidateQuery(); });
-    connect(distance_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); invalidateQuery(); });
+    // Spinboxes debounce (1 s) so dragging a value does not re-render on every step. max-displayed and line width
+    // only change the draw; min-size and slice distance change which sheets are fetched.
+    connect(lineWidth_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(false); });
+    connect(maxDisplayed_, qOverload<int>(&QSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(false); });
+    connect(minArea_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(true); });
+    connect(distance_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, persist]() { persist(); scheduleControlsApply(true); });
 
     bindToViewerManager(manager_);
 }
@@ -394,6 +398,24 @@ void SheetCollectionController::invalidateDraw()
 {
     ++drawRevision_;
     ViewerOverlayControllerBase::refreshAll();
+}
+
+void SheetCollectionController::scheduleControlsApply(bool needQuery)
+{
+    controlsNeedQuery_ = controlsNeedQuery_ || needQuery;
+    if (!controlsTimer_) {
+        controlsTimer_ = new QTimer(this);
+        controlsTimer_->setSingleShot(true);
+        controlsTimer_->setInterval(kControlsDebounceMs);
+        connect(controlsTimer_, &QTimer::timeout, this, [this]() {
+            if (controlsNeedQuery_)
+                invalidateQuery();
+            else
+                invalidateDraw();
+            controlsNeedQuery_ = false;
+        });
+    }
+    controlsTimer_->start();  // (re)start: apply once the control settles
 }
 
 int64_t SheetCollectionController::minVertsThreshold() const
