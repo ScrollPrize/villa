@@ -35,6 +35,7 @@ constexpr int MAX_BEAM=8,MAX_PARENT=32,MAX_DIR=81,MAX_CAND=MAX_PARENT*MAX_DIR;
 constexpr int MAX_STEPS=160,MAX_NODES=(MAX_STEPS/2+1)*(MAX_PARENT+MAX_BEAM)+1;
 struct Params {
     int shape[3],origin[3],dirs=0,steps=0,historySteps=0;
+    int volumeShape[3]={}; // physical source extent, distinct from the padded ROI
     double spacing=0,tolerance=0,cutoff=0;
     V lo,hi;
     float step=0,prune=0,cumulative=0;
@@ -63,11 +64,16 @@ VC_TRACE_HD V tensorAxisDerivative(const float* t,const float* dt,V v) {
 }
 template<bool ScalarsOnly=false,bool Differentiate=false>
 VC_TRACE_HD Sample sample(Fields f,const Params& p,V q,V hint,SampleJacobian* jac=nullptr) {
-    int b[3];float frac[3];double df[3];
+    int b[3],upper[3];float frac[3];double df[3];
     for(int a=0;a<3;++a) {
-        double scaled=double(q[a])/p.spacing;int origin=int(std::floor(scaled));
+        double scaled=double(q[a])/p.spacing;
+        // Normal and width sampling use the closed physical lattice domain;
+        // padding must not extend it by blending a valid edge with empty space.
+        if(!std::isfinite(scaled) || (p.volumeShape[a]>0 && (scaled<0 || scaled>p.volumeShape[a]-1)))return {};
+        int origin=int(std::floor(scaled));
         b[a]=origin-p.origin[a];df[a]=scaled-origin;frac[a]=float(df[a]);
-        if(b[a]<0||b[a]+1>=p.shape[a]) {
+        upper[a]=(p.volumeShape[a]>0?std::min(origin+1,p.volumeShape[a]-1):origin+1)-p.origin[a];
+        if(b[a]<0||upper[a]>=p.shape[a]) {
 #ifdef __CUDA_ARCH__
             atomicExch(f.error,1);
 #endif
@@ -78,7 +84,7 @@ VC_TRACE_HD Sample sample(Fields f,const Params& p,V q,V hint,SampleJacobian* ja
     float dt[2][3][6]={};V dp{},dweighted{},ddenom{};
     bool all=true;
     for(int k=0;k<8;++k) {
-        size_t i=(size_t(b[2]+((k>>2)&1))*p.shape[1]+b[1]+((k>>1)&1))*p.shape[0]+b[0]+(k&1);
+        size_t i=(size_t((k&4)?upper[2]:b[2])*p.shape[1]+((k&2)?upper[1]:b[1]))*p.shape[0]+((k&1)?upper[0]:b[0]);
         auto bytes=f.bytes+6*i;
         float w=((k&4)?frac[2]:1-frac[2])*((k&2)?frac[1]:1-frac[1])*((k&1)?frac[0]:1-frac[0]);
         presence=std::fma(w,float(bytes[0]),presence);
@@ -188,7 +194,13 @@ VC_TRACE_HD State candidate(Fields fields,const Params& p,const State& parent,fl
 // All probes check the interpolation footprint before sampling: a rejected
 // optimization trial is not an inference-cache miss.
 VC_TRACE_HD bool inField(const Params& p,V q) {
-    for(int a=0;a<3;++a){if(!std::isfinite(q[a]))return false;int b=int(std::floor(double(q[a])/p.spacing))-p.origin[a];if(b<0||b+1>=p.shape[a])return false;}
+    for(int a=0;a<3;++a){
+        const double scaled=double(q[a])/p.spacing;
+        if(!std::isfinite(scaled)||(p.volumeShape[a]>0&&(scaled<0||scaled>p.volumeShape[a]-1)))return false;
+        const int low=int(std::floor(scaled)),b=low-p.origin[a];
+        const int upper=(p.volumeShape[a]>0?std::min(low+1,p.volumeShape[a]-1):low+1)-p.origin[a];
+        if(b<0||upper>=p.shape[a])return false;
+    }
     return true;
 }
 VC_TRACE_HD State initialState(Seed seed) {
@@ -555,7 +567,42 @@ __global__ void trace(Fields fields,Params p,const Seed* seeds,const float2* off
 }
 #include "FiberChunkRolling.cuh"
 
+VC_TRACE_HD int boundarySamplesTest(const float* tensors,int* errors) {
+    unsigned char bytes[64*6]={};float widths[64]={};
+    Params p{};p.spacing=1;
+    for(int a=0;a<3;++a){p.shape[a]=4;p.origin[a]=-1;p.volumeShape[a]=2;}
+    for(int z=1;z<=2;++z)for(int y=1;y<=2;++y)for(int x=1;x<=2;++x){
+        int i=(z*4+y)*4+x;bytes[6*i]=255;bytes[6*i+1]=255;bytes[6*i+2]=128;
+        bytes[6*i+3]=255;bytes[6*i+4]=128;bytes[6*i+5]=128;widths[i]=12;
+    }
+    Fields f{bytes,widths,tensors,errors};int failures=0;
+    for(int a=0;a<3;++a)for(float outside:{-.25f,1.25f,2.f,2.25f}){
+        V q{.5f,.5f,.5f};q[a]=outside;
+        failures+=sample(f,p,q,{1,0,0}).valid||inField(p,q);
+    }
+    for(int a=0;a<3;++a)for(float edge:{0.f,.75f,1.f}){
+        V q{.5f,.5f,.5f};q[a]=edge;const auto s=sample(f,p,q,{1,0,0});
+        failures+=!s.valid||s.presence!=1||s.width!=12||!inField(p,q);
+    }
+    Params legacy=p;for(int a=0;a<3;++a)legacy.volumeShape[a]=0;
+    const auto before=sample(f,legacy,{.25f,.5f,.75f},{1,0,0});
+    const auto after=sample(f,p,{.25f,.5f,.75f},{1,0,0});
+    failures+=before.presence!=after.presence||before.width!=after.width||before.dir.dot(after.dir)!=1;
+    for(double spacing:{.5,2.})for(bool masked:{false,true}){
+        p.spacing=spacing;p.maskNormals=masked;
+        for(float z:{-.25f,0.f,.5f,1.f,1.25f})for(float y:{-.25f,0.f,.5f,1.f,1.25f})for(float x:{-.25f,0.f,.5f,1.f,1.25f}){
+            const bool inside=x>=0&&x<=1&&y>=0&&y<=1&&z>=0&&z<=1;
+            V q{x*float(spacing),y*float(spacing),z*float(spacing)};
+            const auto s=sample(f,p,q,{1,0,0});
+            failures+=s.valid!=inside||inField(p,q)!=inside;
+            if(inside)failures+=s.presence!=1||s.width!=12;
+        }
+    }
+    return failures;
+}
+
 __global__ void feasibilityTests(const float* tensors,int* failures) {
+    atomicAdd(failures,boundarySamplesTest(tensors,failures));
     unsigned char bytes[48]={};float widths[8];for(int i=0;i<8;++i)widths[i]=12;
     Params p{};for(int a=0;a<3;++a){p.shape[a]=2;p.origin[a]=0;}p.spacing=1;p.step=.1f;
     Fields f{bytes,widths,tensors,nullptr};
@@ -717,7 +764,9 @@ Json refinementReport(const Output& r){Json result={{"commits",r.refinementCommi
 }
 Params parameters(const Json& j,std::vector<float2>& offsets) {
     if(j["beam"]!=8||j["lookahead"]!=2||j["parent_cap"]!=32||!j["modulated"].get<bool>())throw std::runtime_error("unsupported GPU beam configuration");
-    Params p;for(int a=0;a<3;++a){p.origin[a]=j["origin"][a];p.shape[a]=j["shape_xyz"][a];}
+    Params p;for(int a=0;a<3;++a){p.origin[a]=j["origin"][a];p.shape[a]=j["shape_xyz"][a];
+        if(j.contains("volume_shape_xyz")){p.volumeShape[a]=j["volume_shape_xyz"][a];
+            if(p.volumeShape[a]<=0)throw std::runtime_error("invalid physical volume shape");}}
     p.spacing=j["spacing"];p.lo=vec(j["bounds"][0]);p.hi=vec(j["bounds"][1]);p.step=j["step"];
     double stepBudget=j["distance"].get<double>()/p.step;
     p.steps=int(std::ceil(stepBudget));if(stepBudget!=p.steps||p.steps>MAX_STEPS||p.steps%2)throw std::runtime_error("unsupported GPU step budget");
@@ -863,6 +912,9 @@ void hostRefinementTests() {
     std::cout<<"7 shared host refinement tests passed"<<std::endl;
 }
 int main(int argc,char** argv) try {
+    if(argc==2&&std::string(argv[1])=="--host-boundary-tests"){
+        auto table=tensorTable();if(boundarySamplesTest(table.data(),nullptr))throw std::runtime_error("physical boundary regression");
+        std::cout<<"host physical-boundary tests passed"<<std::endl;return 0;}
     if(argc==2&&std::string(argv[1])=="--host-gradient-tests"){hostGradientTests();return 0;}
     if(argc==2&&std::string(argv[1])=="--host-refinement-tests"){hostRefinementTests();return 0;}
     if(argc==2&&std::string(argv[1])=="--rolling-tests"){rollingTests();return 0;}
@@ -894,6 +946,7 @@ int main(int argc,char** argv) try {
         check(cudaMalloc(&candidates,count*MAX_CAND*sizeof(State)));
         check(cudaMalloc(&nodes,count*MAX_NODES*sizeof(Node)));check(cudaMalloc(&output,count*sizeof(Output)));
         selectionTests<<<4,128>>>(failures);check(cudaGetLastError());
+        feasibilityTests<<<1,1>>>(f.tensors,failures);check(cudaGetLastError());
         for(int repeat=0;repeat<3;++repeat){
             trace<<<count,128>>>(f,p,ds,da,candidates,nodes,output,count,true,false,false);
             check(cudaGetLastError());check(cudaDeviceSynchronize());

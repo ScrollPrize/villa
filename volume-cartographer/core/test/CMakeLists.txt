@@ -756,6 +756,8 @@ endif()
 
 add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
 add_executable(bench_fiber_seed_grid bench_fiber_seed_grid.cpp)
+add_executable(bench_fiber_sampling_overhead bench_fiber_sampling_overhead.cpp)
+target_link_libraries(bench_fiber_sampling_overhead PRIVATE vc_fiber_tracer)
 target_link_libraries(bench_fiber_seed_grid PRIVATE vc_fiber_tracer)
 target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
 vc_register_test_target(bench_fiber_intersections)

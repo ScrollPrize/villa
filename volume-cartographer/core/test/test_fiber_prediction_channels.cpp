@@ -5,6 +5,7 @@
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "utils/zarr.hpp"
 
 #include <array>
@@ -24,6 +25,62 @@ using namespace vc::fiber_tracer;
 namespace fs = std::filesystem;
 
 namespace {
+void checkCombined(const detail::FiberChunkTensor& tensor,const std::vector<cv::Vec3f>& points)
+{
+    const std::vector<cv::Vec3f> dirs(points.size(),{.2f,-.7f,.4f});
+    std::vector<FiberPredictionSample> predictions(points.size());
+    for(auto& p:predictions)for(int i=0;i<3;++i)p.options.push_back({}); // Reused storage.
+    std::vector<vc::lasagna::NormalSample> normals;
+    std::vector<float> widths,expected;
+    for(bool withNormals:{true,false})for(bool withWidths:{true,false}){
+        tensor.sampleCandidateChannels(points,dirs,withNormals,withWidths,predictions,normals,widths);
+        detail::FiberSamplingProfile profile;
+        std::vector<FiberPredictionSample> measured;
+        std::vector<vc::lasagna::NormalSample> measuredNormals;
+        std::vector<float> measuredWidths;
+        for(int repeat=0;repeat<2;++repeat){
+            tensor.sampleCandidateChannels(points,dirs,withNormals,withWidths,measured,measuredNormals,measuredWidths,&profile);
+            CHECK(profile.calls==repeat+1);
+            int64_t sum=0;for(const auto ns:profile.nanoseconds){CHECK(ns>=0);sum+=ns;}
+            CHECK(sum==profile.elapsedNanoseconds);
+            CHECK(measuredWidths==widths);CHECK(measuredNormals.size()==normals.size());
+            for(size_t i=0;i<points.size();++i){
+                CHECK(measured[i].options[0].valid==predictions[i].options[0].valid);
+                CHECK(measured[i].options[0].presence==predictions[i].options[0].presence);
+                CHECK(measured[i].options[0].direction==predictions[i].options[0].direction);
+                if(withNormals){CHECK(measuredNormals[i].valid==normals[i].valid);CHECK(measuredNormals[i].normal==normals[i].normal);}
+            }
+            if(!withWidths)CHECK(profile.entries[unsigned(detail::SamplingStage::WidthInterpolation)]==0);
+            if(!withNormals)CHECK(profile.entries[unsigned(detail::SamplingStage::NormalTensor)]==0);
+        }
+        CHECK(normals.size()==(withNormals?points.size():0));
+        CHECK(widths.size()==(withWidths?points.size():0));
+        tensor.sampleWidths(points,expected);
+        for(size_t i=0;i<points.size();++i){
+            const auto old=tensor.sample(cv::Vec3d(points[i]),cv::Vec3d(dirs[i]));
+            REQUIRE(predictions[i].options.size()==1);
+            CHECK(predictions[i].options[0].valid==old.options[0].valid);
+            CHECK(predictions[i].options[0].presence==old.options[0].presence);
+            CHECK(predictions[i].options[0].direction==old.options[0].direction);
+            if(withNormals){
+                const auto n=tensor.sampleNormal(cv::Vec3d(points[i]));
+                CHECK(normals[i].valid==n.valid);CHECK(normals[i].normal==n.normal);
+            }
+            if(withWidths)CHECK(widths[i]==expected[i]);
+        }
+    }
+    CHECK_THROWS(tensor.sampleCandidateChannels(points,{},true,true,predictions,normals,widths));
+    tensor.sampleCandidateChannels({}, {},true,true,predictions,normals,widths);
+    CHECK(predictions.empty());CHECK(normals.empty());CHECK(widths.empty());
+    detail::FiberSamplingProfile empty;
+    tensor.sampleCandidateChannels({}, {},true,true,predictions,normals,widths,&empty);
+    CHECK(empty.calls==1);
+    CHECK(empty.nanoseconds[0]==empty.elapsedNanoseconds);
+    CHECK_THROWS(tensor.sampleCandidateChannels(points,{},true,true,predictions,normals,widths,&empty));
+    int64_t sum=0;for(auto ns:empty.nanoseconds)sum+=ns;
+    CHECK(sum==empty.elapsedNanoseconds);
+}
+
 struct Fixture {
     fs::path path = fs::temp_directory_path() /
         ("vc_prediction_channels_" + std::to_string(std::mt19937_64(std::random_device{}())()));
@@ -68,8 +125,80 @@ FiberPredictionFieldOptions auxiliaryOptions() {
 }
 }
 
+TEST_CASE("direct sampling window preserves traces and falls back for incompatible sources") {
+    for(bool byteWidth:{false,true}) {
+        Fixture fixture;
+        fixture.channel<uint8_t>("presence",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("grad_mag",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+        if(byteWidth)fixture.channel<uint8_t>("width",std::vector<uint8_t>(8,20),utils::ZarrDtype::uint8);
+        else fixture.channel<float>("width",std::vector<float>(8,20.125f),utils::ZarrDtype::float32);
+        auto manifest=fixture.dataset().manifest();
+        if(byteWidth)manifest.raw["width_encoding"]="uint8-base-voxels";
+        vc::lasagna::LasagnaDataset dataset(manifest);
+        FiberPredictionFieldOptions options;options.enableWidth=true;
+        FiberPredictionField field(dataset,options),noWidth(dataset);
+        vc::lasagna::LasagnaNormalSampler normals(dataset);
+        CHECK(field.supportsDenseSampling(normals));CHECK_FALSE(noWidth.supportsDenseSampling(normals));
+        int acknowledgements=0;
+        field.setReadinessGate([&](const auto&){++acknowledgements;});
+        FiberTraceConfig config;config.parallelThreads=1;config.stepVoxels=.1;
+        config.coneAngleDegrees=5;config.widthRelativeTolerance=.3;
+        auto baseline=traceFiberExtrapolation(field,{.5,.5,.2},{0,0,1},.6,config,&normals);
+        FiberTraceProfile profile;config.profile=&profile;config.samplingWindowVoxels=8;
+        const auto actual=traceFiberExtrapolation(field,{.5,.5,.2},{0,0,1},.6,config,&normals);
+        CHECK(actual.points==baseline.points);CHECK(actual.widthMean==baseline.widthMean);
+        CHECK(actual.reason==baseline.reason);CHECK(profile.samplingWindowLoads==1);
+        CHECK(profile.samplingWindowFallbacks==0);CHECK(acknowledgements>0);
+        CHECK(profile.samplingWindowCopiedBytes==0);
+        CHECK(profile.samplingWindowPeakBytes>0);
+        CHECK(profile.samplingWindowPeakTableBytes>0);
+        config.widthRelativeTolerance=0;profile={};
+        (void)traceFiberExtrapolation(noWidth,{.5,.5,.2},{0,0,1},.6,config,&normals);
+        CHECK(profile.samplingWindowLoads==0);CHECK(profile.samplingWindowFallbacks>0);
+        config.samplingWindowVoxels=7;CHECK_THROWS(validateFiberTraceConfig(config));
+        config.samplingWindowVoxels=257;CHECK_THROWS(validateFiberTraceConfig(config));
+    }
+}
+
+TEST_CASE("sampling window refills across chunks and preserves oversized and pinned fallback") {
+    Fixture fixture;
+    for(const std::string name:{"presence","nx","ny","grad_mag","width"}) {
+        utils::ZarrMetadata meta;meta.version=utils::ZarrVersion::v2;
+        meta.shape={80,16,16};meta.chunks={16,8,8};meta.dtype=utils::ZarrDtype::uint8;
+        meta.compressor_id.clear();meta.fill_value=0;
+        auto array=utils::ZarrArray::create(fixture.path/name,meta);
+        const uint8_t value=(name=="nx"||name=="ny")?128:(name=="width"?20:255);
+        std::vector<std::byte> bytes(16*8*8,std::byte(value));
+        for(size_t z=0;z<5;++z)for(size_t y=0;y<2;++y)for(size_t x=0;x<2;++x)
+            array.write_chunk(std::array<size_t,3>{z,y,x},bytes);
+        fixture.groups[name]={{"zarr",name},{"scaledown",0},{"channels",{name}}};
+    }
+    auto manifest=fixture.dataset().manifest();manifest.raw["width_encoding"]="uint8-base-voxels";
+    vc::lasagna::LasagnaDataset dataset(manifest);
+    FiberPredictionFieldOptions options;options.enableWidth=true;
+    FiberPredictionField field(dataset,options),other(dataset,options);
+    vc::lasagna::LasagnaNormalSampler normals(dataset);
+    FiberTraceConfig config;config.parallelThreads=1;config.stepVoxels=1;
+    config.coneAngleDegrees=5;config.beamWidth=2;config.widthRelativeTolerance=.3;
+    const auto trace=[&]{return traceFiberExtrapolation(field,{8,8,2},{0,0,1},50,config,&normals);};
+    const auto baseline=trace();FiberTraceProfile profile;
+    config.profile=&profile;config.samplingWindowVoxels=8;
+    const auto window=trace();CHECK(window.points==baseline.points);CHECK(window.reason==baseline.reason);
+    CHECK(profile.samplingWindowLoads>1);CHECK(profile.samplingWindowFallbacks==0);
+    config.stepVoxels=8;config.coneAngleDegrees=25;config.samplingWindowVoxels=0;
+    const auto wide=trace();config.samplingWindowVoxels=8;profile={};
+    const auto fallback=trace();CHECK(fallback.points==wide.points);CHECK(fallback.reason==wide.reason);
+    CHECK(profile.samplingWindowFallbacks>0);
+    auto pinned=field.pinRegion({0,0,0},{15,15,79});pinned->seal();
+    config.pinnedRegion=pinned.get();profile={};
+    const auto fixed=trace();CHECK(fixed.points==wide.points);CHECK(profile.samplingWindowLoads==0);
+    CHECK(profile.samplingWindowFallbacks>0);
+    auto wrong=other.pinRegion({0,0,0},{15,15,79});wrong->seal();config.pinnedRegion=wrong.get();
+    CHECK_THROWS(trace());
+}
+
 TEST_CASE("dense chunk tensor matches scalar and batch interpolation with masked byte and float widths") {
-    for(bool byteWidth:{false,true})for(bool masked:{false,true}) {
+    for(bool byteWidth:{false,true})for(bool masked:{false,true})for(bool retained:{false,true}) {
         Fixture fixture;
         fixture.channel<uint8_t>("presence",{0,255,203,204,205,255,128,0},utils::ZarrDtype::uint8);
         fixture.channel<uint8_t>("nx",{128,129,0,255,50,170,128,128},utils::ZarrDtype::uint8);
@@ -84,11 +213,14 @@ TEST_CASE("dense chunk tensor matches scalar and batch interpolation with masked
         vc::lasagna::LasagnaDataset dataset(manifest);
         FiberPredictionFieldOptions options;options.enableWidth=true;
         FiberPredictionField field(dataset,options);vc::lasagna::LasagnaNormalSampler normals(dataset);
-        detail::FiberChunkTensor dense(field,normals,{-1,-1,-1},{2,2,2});
+        detail::FiberChunkTensor dense(field,normals,{-1,-1,-1},{2,2,2},false,true,0,retained);
+        if(retained){CHECK(dense.ownedVoxelBytes()==0);CHECK(dense.retainedVoxelBytes()>0);CHECK(dense.pointerTableBytes()>0);}
         const double s=field.chunkRegionChannels({0,0,0},{1,1,1}).first[0].spacing;
         std::vector<cv::Vec3d> points{{0,0,0},{s,s,s},{-.1,0,0},{s+.01,0,0},{2*s,0,0}};
         std::mt19937 rng(35);std::uniform_real_distribution<double> dist(0,s);
         for(int i=0;i<100;++i)points.emplace_back(dist(rng),dist(rng),dist(rng));
+        std::vector<cv::Vec3f> candidatePoints;for(const auto& p:points)candidatePoints.emplace_back(p);
+        checkCombined(dense,candidatePoints);
         for(const auto& p:points) {
             const cv::Vec3d dir{.2,-.7,.4};
             const auto a=field.sample(p,dir),b=dense.sample(p,dir);
@@ -96,7 +228,29 @@ TEST_CASE("dense chunk tensor matches scalar and batch interpolation with masked
             CHECK(a.options[0].valid==b.options[0].valid);
             CHECK(a.options[0].presence==b.options[0].presence);
             CHECK(a.options[0].direction==b.options[0].direction);
+            for (int workers : {1, 4}) {
+                std::vector<FiberPredictionSample> exact;
+                field.sampleBatchScalarEquivalent({p,p},{dir,dir},workers,exact,nullptr);
+                REQUIRE(exact.size()==2);
+                for (const auto& value : exact) {
+                    CHECK(value.options[0].valid==a.options[0].valid);
+                    CHECK(value.options[0].presence==a.options[0].presence);
+                    CHECK(value.options[0].direction==a.options[0].direction);
+                }
+                std::vector<vc::lasagna::NormalSampleWithDerivative> exactNormals;
+                (void)normals.sampleNormalBatchScalarEquivalent({p,p},workers,exactNormals);
+                const auto scalarNormal=normals.sampleNormal(p);
+                for (const auto& value : exactNormals) {
+                    CHECK(value.sample.valid==scalarNormal.valid);
+                    if (scalarNormal.valid)
+                        CHECK(value.sample.normal==scalarNormal.normal);
+                }
+            }
             std::vector<FiberPredictionSample> aa,bb;
+            dense.FiberPredictionSource::sampleBatch({p},{dir},1,bb);
+            CHECK(bb[0].options[0].valid==a.options[0].valid);
+            CHECK(bb[0].options[0].presence==a.options[0].presence);
+            CHECK(bb[0].options[0].direction==a.options[0].direction);
             field.sampleBatch({p},{dir},1,aa);dense.sampleBatch({p},{dir},1,bb);
             CHECK(aa[0].options[0].valid==bb[0].options[0].valid);
             CHECK(aa[0].options[0].presence==bb[0].options[0].presence);
@@ -108,6 +262,38 @@ TEST_CASE("dense chunk tensor matches scalar and batch interpolation with masked
             CHECK(wa==wb);
             const auto na=normals.sampleNormal(p),nb=dense.sampleNormal(p);
             CHECK(na.valid==nb.valid);if(na.valid)CHECK(na.normal==nb.normal);
+        }
+    }
+}
+
+TEST_CASE("GPU packing pads all physical boundary faces without changing interior samples") {
+    for(bool byteWidth:{false,true}) {
+        Fixture fixture;
+        fixture.channel<uint8_t>("grad_mag",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+        if(byteWidth)fixture.channel<uint8_t>("width",std::vector<uint8_t>(8,20),utils::ZarrDtype::uint8);
+        else fixture.channel<float>("width",std::vector<float>(8,20.125f),utils::ZarrDtype::float32);
+        auto manifest=fixture.dataset().manifest();
+        if(byteWidth)manifest.raw["width_encoding"]="uint8-base-voxels";
+        vc::lasagna::LasagnaDataset dataset(manifest);
+        FiberPredictionFieldOptions options;options.enableWidth=true;
+        FiberPredictionField field(dataset,options);vc::lasagna::LasagnaNormalSampler normals(dataset);
+        detail::FiberChunkTensor interior(field,normals,{0,0,0},{1,1,1});
+        std::vector<unsigned char> reference;std::vector<float> referenceWidths;
+        interior.packGpu(reference,referenceWidths);
+        // Includes all six faces, edges/corners, and an entirely external ROI.
+        for(const auto lo:{cv::Vec3d{-2,-2,-2},cv::Vec3d{3,3,3}}) {
+            detail::FiberChunkTensor padded(field,normals,lo,lo+cv::Vec3d::all(5));
+            std::vector<unsigned char> bytes(216*6,123);std::vector<float> widths(216,99);
+            padded.packGpu(bytes,widths);
+            REQUIRE(bytes.size()==216*6);REQUIRE(widths.size()==216);
+            size_t i=0;
+            for(int z=0;z<6;++z)for(int y=0;y<6;++y)for(int x=0;x<6;++x,++i){
+                const int xx=int(lo[0])+x,yy=int(lo[1])+y,zz=int(lo[2])+z;
+                const bool inside=xx>=0&&xx<2&&yy>=0&&yy<2&&zz>=0&&zz<2;
+                const size_t j=inside?size_t((zz*2+yy)*2+xx):0;
+                for(size_t c=0;c<6;++c)CHECK(bytes[6*i+c]==(inside?reference[6*j+c]:0));
+                CHECK(widths[i]==(inside?referenceWidths[j]:0));
+            }
         }
     }
 }
@@ -180,6 +366,21 @@ TEST_CASE("dense ROI respects packed channel offsets and missing chunks") {
         CHECK(widths[i]==(i<64?40:0));
     }
     CHECK(dense.sampleNormal({1.1,1.2,1.3}).normal==normals.sampleNormal({1.1,1.2,1.3}).normal);
+    detail::FiberChunkTensor retained(field,normals,{0,0,0},{3,3,7},false,true,0,true);
+    CHECK(retained.ownedVoxelBytes()==0);
+    CHECK(retained.retainedVoxelBytes()==7*64); // Packed allocation counted once.
+    for(double z:{0.,1.3,3.,3.5,4.,7.}) {
+        const cv::Vec3d point{1.1,1.2,z};
+        const auto a=retained.sample(point,{0,0,1}),b=dense.sample(point,{0,0,1});
+        CHECK(a.options[0].presence==b.options[0].presence);
+        CHECK(a.options[0].direction==b.options[0].direction);
+        CHECK(retained.sampleNormal(point).normal==dense.sampleNormal(point).normal);
+        const std::vector<cv::Vec3f> points{cv::Vec3f(point)};
+        checkCombined(retained,points);
+        std::vector<float> expected,actual;
+        dense.sampleWidths(points,expected);retained.sampleWidths(points,actual);
+        CHECK(actual==expected);
+    }
     // The last exported lattice point is not a volume edge: width sampling
     // still needs its upper interpolation corner outside the exported ROI.
     detail::FiberChunkTensor interior(field,normals,{1,1,1},{2,2,2});
@@ -211,6 +412,120 @@ TEST_CASE("dense ROI allows independently chunked widths") {
     std::vector<float> expected,actual;
     field.sampleWidths(points,expected);dense.sampleWidths(points,actual);
     CHECK(expected==actual);
+    detail::FiberChunkTensor retained(field,normals,{0,0,0},{1,1,1},false,true,0,true);
+    retained.sampleWidths(points,actual);CHECK(expected==actual);
+    checkCombined(retained,points);
+    checkCombined(dense,points);
+}
+
+TEST_CASE("retained chunk grid survives cache eviction and concurrent reads") {
+    using namespace vc::render;
+    Fixture fixture;fixture.auxiliary();
+    FiberPredictionFieldOptions options;options.enableWidth=true;
+    FiberPredictionField field(fixture.dataset(),options);
+    const auto channels=field.chunkRegionChannels({0,0,0},{1,1,1}).first;
+    auto partition=processChunkCacheService()->createDecodedPartition(1<<20);
+    auto source=rebindChunkCache(channels[0].chunkSource,partition);
+    auto owner=std::make_shared<PinnedChunkRegion>();
+    owner->pin(source,{{0,0,0,0}});
+    CHECK_THROWS(PinnedChunkGrid(owner,source,0,{0,0,0},{1,1,1}));
+    owner->seal();
+    PinnedChunkGrid grid(owner,source,0,{0,0,0},{1,1,1});
+    owner.reset(); // The grid owns the lifetime, not its caller.
+    partition->configureDecodedByteCapacity(1);
+    CHECK(source->getChunkIfCached(0,0,0,0).status==ChunkStatus::MissQueued);
+    const std::array<uint8_t,8> expected{0,255,0,255,0,255,0,255};
+    std::vector<std::future<bool>> readers;
+    for(int i=0;i<8;++i)readers.push_back(std::async(std::launch::async,[&]{
+        for(int j=0;j<1000;++j)if(grid.corners<uint8_t>({0,0,0},{1,1,1})!=expected)return false;
+        return true;
+    }));
+    for(auto& reader:readers)CHECK(reader.get());
+    CHECK(source->getChunkIfCached(0,0,0,0).status==ChunkStatus::MissQueued);
+    CHECK_THROWS_AS(grid.corners<uint8_t>({0,0,0},{2,1,1}),PinnedRegionMiss);
+}
+
+TEST_CASE("retained grid uses typed nonzero fills across partial edge chunks") {
+    using namespace vc::render;
+    for(bool floating:{false,true}) {
+        Fixture fixture;
+        utils::ZarrMetadata meta;meta.version=utils::ZarrVersion::v2;
+        meta.shape={3,3,3};meta.chunks={2,2,2};meta.compressor_id.clear();
+        meta.dtype=floating?utils::ZarrDtype::float32:utils::ZarrDtype::uint16;
+        meta.fill_value=floating?17.25:1700.;
+        auto array=std::make_shared<utils::ZarrArray>(utils::ZarrArray::create(fixture.path/"grid",meta));
+        const std::array<size_t,3> key{0,0,0};
+        if(floating){const std::array<float,8> data{1,2,3,4,5,6,7,8.5};array->write_chunk(key,std::as_bytes(std::span(data)));}
+        else {const std::array<uint16_t,8> data{1,2,3,4,5,6,7,800};array->write_chunk(key,std::as_bytes(std::span(data)));}
+        auto source=acquireProcessZarrChannel((fixture.path/"grid").string(),array,0);
+        auto owner=std::make_shared<PinnedChunkRegion>();
+        std::vector<ChunkKey> keys;
+        for(int z=0;z<2;++z)for(int y=0;y<2;++y)for(int x=0;x<2;++x)keys.push_back({0,z,y,x});
+        owner->pin(source,keys);owner->seal();
+        PinnedChunkGrid grid(owner,source,0,{0,0,0},{2,2,2});
+        const auto values=grid.corners<double>({1,1,1},{2,2,2});
+        CHECK(values[0]==(floating?8.5:800.));
+        for(size_t i=1;i<8;++i)CHECK(values[i]==(floating?17.25:1700.));
+        CHECK_THROWS(grid.corners<uint8_t>({0,0,0},{1,1,1}));
+        auto incomplete=std::make_shared<PinnedChunkRegion>();
+        incomplete->pin(source,{{0,0,0,0}});incomplete->seal();
+        CHECK_THROWS_AS(PinnedChunkGrid(incomplete,source,0,{0,0,0},{2,2,2}),PinnedRegionMiss);
+    }
+}
+
+TEST_CASE("prepared chunk addresses share element offsets only across verified layouts") {
+    using namespace vc::render;
+    Fixture fixture;
+    auto region=std::make_shared<PinnedChunkRegion>();
+    std::array<std::shared_ptr<IChunkedArray>,3> sources;
+    for(int c=0;c<3;++c){
+        utils::ZarrMetadata meta;meta.version=utils::ZarrVersion::v2;
+        meta.shape={4,2,2};meta.chunks={2,2,2};meta.compressor_id.clear();
+        meta.dtype=c==0?utils::ZarrDtype::uint8:c==1?utils::ZarrDtype::uint16:utils::ZarrDtype::float32;
+        meta.fill_value=c==0?17.:c==1?1700.:17.25;
+        const auto path=fixture.path/("prepared"+std::to_string(c));
+        auto array=std::make_shared<utils::ZarrArray>(utils::ZarrArray::create(path,meta));
+        const std::array<size_t,3> key{0,0,0};
+        if(c==0){const std::array<uint8_t,8> v{1,2,3,4,5,6,7,8};array->write_chunk(key,std::as_bytes(std::span(v)));}
+        if(c==1){const std::array<uint16_t,8> v{1,2,3,4,5,6,7,8};array->write_chunk(key,std::as_bytes(std::span(v)));}
+        if(c==2){const std::array<float,8> v{1,2,3,4,5,6,7,8};array->write_chunk(key,std::as_bytes(std::span(v)));}
+        sources[c]=acquireProcessZarrChannel(path.string(),array,0);
+        region->pin(sources[c],{{0,0,0,0},{0,1,0,0}});
+    }
+    region->seal();
+    std::array<std::unique_ptr<PinnedChunkGrid>,3> grids;
+    for(int c=0;c<3;++c)grids[c]=std::make_unique<PinnedChunkGrid>(region,sources[c],0,
+        std::array{0,0,0},std::array{1,1,3},c?grids[0].get():nullptr);
+    const auto plan=grids[0]->prepareCorners({0,0,1},{1,1,2});
+    for(int c=0;c<3;++c){
+        CHECK(grids[c]->accepts(plan));
+        const auto v=grids[c]->corners<double>(plan);
+        for(size_t i=0;i<4;++i)CHECK(v[i]==5.+i);
+        for(size_t i=4;i<8;++i)CHECK(v[i]==(c==0?17.:c==1?1700.:17.25));
+    }
+    PinnedChunkGrid firstOnly(region,sources[0],0,{0,0,0},{1,1,1});
+    PinnedChunkGrid shifted(region,sources[0],0,{0,0,2},{1,1,3},&firstOnly);
+    // Same volume/chunk/count, but a different first chunk must not share offsets.
+    const auto firstPlan=firstOnly.prepareCorners({0,0,0},{1,1,1});
+    CHECK_FALSE(shifted.accepts(firstPlan));
+    CHECK_THROWS_AS(shifted.corners<double>(firstPlan),std::invalid_argument);
+    CHECK_FALSE(shifted.accepts(plan));
+    CHECK_THROWS_AS(shifted.corners<double>(plan),std::invalid_argument);
+    CHECK_THROWS_AS(grids[0]->corners<double>(PinnedChunkGrid::CornerAddress{}),std::invalid_argument);
+    const PinnedChunkGrid::CornerAddress empty;
+    const auto emptyCopy=empty;
+    CHECK_FALSE(grids[0]->accepts(emptyCopy));
+    auto moved=std::move(shifted);
+    CHECK_FALSE(shifted.accepts(emptyCopy));
+    CHECK_THROWS_AS(shifted.corners<double>(emptyCopy),std::invalid_argument);
+    grids[0].reset(); // A compatible peer retains the layout identity and payload.
+    CHECK(grids[1]->corners<double>(plan)[0]==5.);
+    std::vector<std::future<bool>> readers;
+    for(int i=0;i<8;++i)readers.push_back(std::async(std::launch::async,[&]{
+        for(int j=0;j<1000;++j)if(grids[2]->corners<double>(plan)[7]!=17.25)return false;
+        return true;
+    }));
+    for(auto& reader:readers)CHECK(reader.get());
 }
 
 TEST_CASE("auxiliary channels are opt in and missing channels fail explicitly") {
@@ -626,5 +941,36 @@ TEST_CASE("pinned sampling outside retained chunks fails instead of fetching") {
     region->seal();
     std::vector<float> widths;
     CHECK_THROWS_AS(field.sampleWidths({{6,6,6}},widths,*region),vc::render::PinnedRegionMiss);
+    std::vector<FiberPredictionSample> samples;
+    field.sampleBatch(std::vector<cv::Vec3f>{{0,0,0}},{{1,0,0}},1,samples,nullptr,region.get());
+    field.sampleBatchScalarEquivalent({{0,0,0}},{{1,0,0}},1,samples,nullptr,region.get());
+    CHECK_THROWS_AS(field.sampleBatchScalarEquivalent({{6,6,6}},{{1,0,0}},
+        1,samples,nullptr,region.get()),vc::render::PinnedRegionMiss);
+    CHECK_THROWS_AS(field.sampleBatch(std::vector<cv::Vec3f>{{6,6,6}},{{1,0,0}},
+        1,samples,nullptr,region.get()),vc::render::PinnedRegionMiss);
     CHECK(calls==1);
+}
+
+TEST_CASE("single-worker prediction batches retain pinned reads without normal fusion") {
+    Fixture fixture;
+    fixture.channel<uint8_t>("presence",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+    FiberPredictionField field(fixture.dataset());
+    int readiness=0;
+    field.setReadinessGate([&](const auto&){++readiness;});
+    auto region=field.pinRegion({0,0,0},{1,1,1}); region->seal();
+    const int initial=readiness;
+    FiberTraceOneWayRequest request;
+    request.startPoint={.5,.5,.2};request.targetPoint={.5,.5,.8};
+    request.initialDirection={0,0,1};request.budgetSpanVoxels=.6;
+    request.targetPlanes={{"end",request.targetPoint,{0,0,1}}};
+    request.config.stepVoxels=.1;request.config.parallelThreads=1;
+    request.config.coneAngleDegrees=5;request.config.coneAngleStepDegrees=5;
+    request.config.smoothnessNormalWeight=0;request.config.smoothnessTangentWeight=0;
+    request.config.cumulativeSmoothnessTangentWeight=0;
+    request.config.pinnedRegion=region.get();
+    const auto result=traceFiberOneWay(field,request,nullptr);
+    CHECK(result.reachedTargetPlane);
+    // Initial seed validation uses the ordinary source once; candidate
+    // frontiers must stay on the supplied pinned region thereafter.
+    CHECK(readiness==initial+1);
 }

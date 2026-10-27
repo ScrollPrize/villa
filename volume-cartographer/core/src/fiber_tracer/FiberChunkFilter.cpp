@@ -5,6 +5,7 @@
 #include <chrono>
 #include <limits>
 #include <set>
+#include <numeric>
 
 namespace vc::fiber_tracer {
 using Json=nlohmann::json;
@@ -152,6 +153,120 @@ nlohmann::json filterFiberChunkConflicts(FiberChunkPaths& chunk,const FiberChunk
     auto report=inspectFiberChunkConflicts(chunk,cfg,normals,scale,parallel,readinessSource,auditQueries);
     for(const auto& i:report.at("rejected"))chunk.lines[i.get<size_t>()].clear();
     return report;
+}
+
+nlohmann::json FiberChunkPathReduction::json() const {
+    Json result={{"algorithm","terminal-complete-link-v2"},{"representative",representative},
+        {"end_reasons",endReasons},{"eligible",eligible},{"terminal_pairs",terminalPairs},
+        {"equivalent_pairs",equivalentPairs},{"fused_paths",fusedPaths},{"ambiguous_paths",ambiguousPaths}};
+    // Omitted mode means historical strict behavior; retain existing resume bytes.
+    if(!rejectAmbiguousPaths){result["reject_ambiguous_paths"]=false;result["retained_ambiguous_paths"]=retainedAmbiguousPaths;}
+    return result;
+}
+void FiberChunkPathReduction::apply(FiberChunkPaths& chunk) const {
+    if(chunk.lines.size()!=representative.size()||chunk.lines.size()!=endReasons.size())
+        throw std::runtime_error("path reduction does not match source IDs");
+    for(size_t i=0;i<representative.size();++i){
+        const auto target=representative[i];
+        if(target>=0&&(size_t(target)>=representative.size()||representative[target]!=target))
+            throw std::runtime_error("invalid path reduction representative");
+        if(target!=int64_t(i))chunk.lines[i].clear();
+    }
+    chunk.endReasons=endReasons;
+}
+
+FiberChunkPathReduction reduceFiberChunkPaths(const FiberChunkPaths& raw,const FiberChunkTraceConfig& cfg,
+    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance,bool rejectAmbiguousPaths)
+{
+    validateFiberChunkConflictAnnotation(raw,cfg);
+    if(raw.endReasons.size()!=raw.lines.size())throw std::invalid_argument("path reduction requires endpoint reasons");
+    FiberChunkPathReduction result;result.rejectAmbiguousPaths=rejectAmbiguousPaths;
+    result.representative.assign(raw.lines.size(),-1);result.endReasons=raw.endReasons;
+    auto chunk=raw;std::vector<double> lengths(chunk.lines.size());
+    for(size_t i=0;i<chunk.lines.size();++i){
+        auto& line=chunk.lines[i];
+        line.erase(std::unique(line.begin(),line.end(),[](const auto& a,const auto& b){return cv::norm(a-b)<1e-9;}),line.end());
+        if(line.size()<2||(cfg.conflictNormalBase>0&&chunk.conflictFlags[i])){line.clear();continue;}
+        lengths[i]=makePolylineArcGeometry(line).length();
+        result.representative[i]=i;++result.eligible;
+    }
+    const detail::ChunkSegmentIndex index(chunk.lines,[](const auto& points)->const auto&{return points;});
+    std::set<std::pair<size_t,size_t>> relations;
+    for(size_t i=0;i<chunk.lines.size();++i)if(result.representative[i]>=0)for(bool reverse:{false,true}){
+        auto history=chunk.lines[i];if(reverse)std::reverse(history.begin(),history.end());
+        std::set<size_t> hits;
+        index.nearbyPaths(history.back(),cfg.joinDistanceBase,[&](size_t j){if(j!=i&&result.representative[j]>=0)hits.insert(j);});
+        if(hits.empty())continue;
+        const std::vector<size_t> selected(hits.begin(),hits.end());
+        const auto tangent=history.back()-history[history.size()-2];
+        for(const auto& match:findFiberChunkMatches(chunk,history,tangent,cfg,false,nullptr,widths,widthTolerance,
+                &selected,FiberChunkMatchPurpose::TerminalRelation))
+            relations.emplace(std::min(i,match.line),std::max(i,match.line));
+    }
+    result.terminalPairs=relations.size();
+    std::vector<size_t> parent(chunk.lines.size());std::iota(parent.begin(),parent.end(),0);
+    const auto root=[&](size_t id){while(parent[id]!=id){parent[id]=parent[parent[id]];id=parent[id];}return id;};
+    for(auto [a,b]:relations){a=root(a);b=root(b);if(a!=b)parent[std::max(a,b)]=std::min(a,b);}
+    std::map<size_t,std::vector<size_t>> components;
+    for(size_t i=0;i<parent.size();++i)if(result.representative[i]>=0)components[root(i)].push_back(i);
+    // Each unordered proof is evaluated once. Full matching has no 128-vx cap;
+    // a partial success of the ordinary matcher is NOT proof of equivalence.
+    const auto fullOrientations=[&](size_t a,size_t b){
+        const auto& history=chunk.lines[a];const std::vector<size_t> selected{b};std::set<bool> orientations;
+        for(const auto& match:findFiberChunkMatches(chunk,history,history.back()-history[history.size()-2],cfg,false,
+                nullptr,widths,widthTolerance,&selected,FiberChunkMatchPurpose::FullEquivalence)){
+            constexpr double tolerance=1e-6; // base-voxel numerical coverage tolerance, not a geometric gate
+            const auto& target=chunk.lines[b];
+            const auto begin=match.reverse?target.back():target.front();
+            const auto end=match.reverse?target.front():target.back();
+            if(std::abs(match.overlap-lengths[a])<=tolerance&&
+               cv::norm(history.front()-begin)<=cfg.joinDistanceBase&&
+               cv::norm(history.back()-end)<=cfg.joinDistanceBase)orientations.insert(match.reverse);
+        }
+        return orientations;
+    };
+    for(const auto& [_,members]:components){
+        if(members.size()<2)continue;
+        bool equivalent=true;std::map<std::pair<size_t,size_t>,bool> orientations;
+        for(size_t a=0;a<members.size()&&equivalent;++a)for(size_t b=a+1;b<members.size();++b)
+            if(!relations.contains({members[a],members[b]})){equivalent=false;break;}
+        for(size_t a=0;a<members.size()&&equivalent;++a)for(size_t b=a+1;b<members.size();++b){
+            const auto i=members[a],j=members[b];const auto ij=fullOrientations(i,j),ji=fullOrientations(j,i);
+            std::vector<bool> common;for(bool reverse:ij)if(ji.contains(reverse))common.push_back(reverse);
+            if(common.size()!=1){equivalent=false;break;}
+            orientations[{i,j}]=common.front();++result.equivalentPairs;
+        }
+        const auto reversed=[&](size_t a,size_t b){return a==b?false:orientations.at({std::min(a,b),std::max(a,b)});};
+        if(equivalent)for(size_t a=0;a<members.size()&&equivalent;++a)for(size_t b=a+1;b<members.size();++b)
+            if(reversed(members[a],members[b])!=(reversed(members[0],members[a])!=reversed(members[0],members[b]))){equivalent=false;break;}
+        if(!equivalent){
+            if(rejectAmbiguousPaths)for(auto i:members){result.representative[i]=-2;++result.ambiguousPaths;}
+            else result.retainedAmbiguousPaths+=members.size();
+            continue;
+        }
+        size_t representative=members.front();
+        for(auto i:members)if(lengths[i]>lengths[representative])representative=i;
+        for(auto i:members)result.representative[i]=representative;
+        result.fusedPaths+=members.size()-1;
+        // Never turn a member's terminal stop into a newly traversable end.
+        for(size_t end=0;end<2;++end){
+            std::optional<std::array<int,3>> destination;
+            for(auto i:members){
+                const size_t memberEnd=end^size_t(reversed(representative,i));
+                const auto& line=chunk.lines[i];const auto point=memberEnd?line.back():line.front();
+                const auto previous=memberEnd?line[line.size()-2]:line[1];
+                const auto next=nextFiberChunk(chunk,point,previous,chunk.endReasons[i][memberEnd],cfg);
+                if(!next.stop.empty()){
+                    result.endReasons[representative][end]="fused_member_stop:"+next.stop;break;
+                }
+                if(destination&&*destination!=next.key){
+                    result.endReasons[representative][end]="fused_member_stop:chunk_neighbor_disagreement";break;
+                }
+                destination=next.key;
+            }
+        }
+    }
+    return result;
 }
 
 } // namespace vc::fiber_tracer

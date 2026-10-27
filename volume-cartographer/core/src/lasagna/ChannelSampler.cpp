@@ -724,7 +724,8 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     LasagnaCornerBatch& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     samples.values.assign(
         samplers.size(),
@@ -753,18 +754,19 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
         volumePoints,
         &context,
         materialize,
-        parallelThreads);
+        parallelThreads, false, pinnedRegion);
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     std::vector<std::vector<LasagnaCornerSample>>& samples,
-    int parallelThreads)
+    int parallelThreads,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     LasagnaCornerBatch batch;
     const NormalPrefetchReport report = sampleLasagnaChannelCornerBatch(
-        samplers, volumePoints, batch, parallelThreads);
+        samplers, volumePoints, batch, parallelThreads, pinnedRegion);
     samples.assign(
         samplers.size(),
         std::vector<LasagnaCornerSample>(volumePoints.size()));
@@ -1535,19 +1537,13 @@ std::optional<double> interpolateLasagnaMaskedScalarCorners(const std::array<dou
     return std::nullopt;
 }
 
-std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+LasagnaCompactTensor accumulateLasagnaCompactTensorCorners(
     const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
     const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
 {
     const auto& normalTable = decodedCompactNormalTable();
-    double t00 = 0.0;
-    double t01 = 0.0;
-    double t02 = 0.0;
-    double t11 = 0.0;
-    double t12 = 0.0;
-    double t22 = 0.0;
-    cv::Vec3d hint{0.0, 0.0, 0.0};
-    double totalWeight = 0.0;
+    LasagnaCompactTensor tensor;
+    auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     size_t cubeIndex = 0;
     for (int dz = 0; dz <= 1; ++dz) {
         const double wz = dz == 0 ? (1.0 - f[2]) : f[2];
@@ -1583,6 +1579,12 @@ std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
             }
         }
     }
+    return tensor;
+}
+
+std::optional<cv::Vec3d> finalizeLasagnaCompactTensor(const LasagnaCompactTensor& tensor)
+{
+    const auto& [t00,t01,t02,t11,t12,t22,hint,totalWeight]=tensor;
     if (totalWeight <= kEpsilon) {
         return std::nullopt;
     }
@@ -1592,6 +1594,13 @@ std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
         return std::nullopt;
     }
     return normal;
+}
+
+std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nxValues,const std::array<uint8_t,8>& nyValues,
+    const cv::Vec3d& f,const std::array<uint8_t,8>& mask)
+{
+    return finalizeLasagnaCompactTensor(accumulateLasagnaCompactTensorCorners(nxValues,nyValues,f,mask));
 }
 
 std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(

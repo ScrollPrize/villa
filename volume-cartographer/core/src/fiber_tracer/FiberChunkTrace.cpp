@@ -1,11 +1,12 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <opencv2/core.hpp>
 #include <zstd.h>
 
@@ -254,6 +255,10 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
 {
     const int side=validate(c,scale);
     validateFiberTraceConfig(trace);
+    if(trace.replayReverseDelaySteps>0 || trace.replayReverseConvergenceMinBase>0)
+        throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
+    if(trace.replayPresenceIgnoreWidth || trace.widthHardRelativeTolerance>0)
+        throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
     if(c.onlineRefineIterations && c.gpuLibrary.empty())
         throw std::invalid_argument("online refinement requires GPU backend");
     if(c.beamCommitMode=="rolling" && (c.gpuLibrary.empty() ||
@@ -407,6 +412,10 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
 
 namespace {
 Json specification(const FiberChunkTraceConfig& c,const FiberTraceConfig& t,double scale,const std::string& identity) {
+    if(t.replayReverseDelaySteps>0 || t.replayReverseConvergenceMinBase>0)
+        throw std::invalid_argument("delayed reverse verification is supported by direct CPU replay only");
+    if(t.replayPresenceIgnoreWidth || t.widthHardRelativeTolerance>0)
+        throw std::invalid_argument("separate width/presence eligibility is currently supported by direct CPU tracing only");
     Json result={{"version",1},{"source_identity",identity},{"trace_to_base",scale},
         {"chunk",{{"core",c.coreBase},{"halo",c.haloBase},{"grid",c.gridBase},{"seed_presence",c.seedPresence},
           {"nms",c.nmsBase},{"tube_half",c.tubeHalfBase},{"tube_step",c.tubeStepBase},{"tube_presence",c.tubePresence},
@@ -462,36 +471,10 @@ std::shared_ptr<FiberChunkPaths> parseChunk(const Json& j) {
     } else if(j.contains("conflict_flags"))throw std::runtime_error("conflict flags lack provenance");
     return chunk;
 }
-Json readChunk(const std::filesystem::path& path) {
-    std::ifstream input(path,std::ios::binary);
-    if(!input) throw std::runtime_error("cannot read chunk paths: "+path.string());
-    if(path.extension()==".zst") {
-        const std::string compressed((std::istreambuf_iterator<char>(input)),{});
-        const auto size=ZSTD_getFrameContentSize(compressed.data(),compressed.size());
-        // Cache frames written below always have a known size. Bound allocations
-        // before decoding a damaged/untrusted file (normal chunks are a few MiB).
-        constexpr unsigned long long maximumBytes=1024ULL*1024*1024;
-        if(size==ZSTD_CONTENTSIZE_ERROR || size==ZSTD_CONTENTSIZE_UNKNOWN || size>maximumBytes)
-            throw std::runtime_error("invalid or oversized chunk cache frame: "+path.string());
-        if(ZSTD_findFrameCompressedSize(compressed.data(),compressed.size())!=compressed.size())
-            throw std::runtime_error("invalid chunk cache frame extent: "+path.string());
-        std::vector<uint8_t> bytes(static_cast<size_t>(size));
-        const auto decoded=ZSTD_decompress(bytes.data(),bytes.size(),compressed.data(),compressed.size());
-        if(ZSTD_isError(decoded) || decoded!=bytes.size())
-            throw std::runtime_error("cannot decompress chunk paths: "+path.string());
-        return Json::from_msgpack(bytes);
-    }
-    return Json::parse(input);
-}
-void writeChunk(const std::filesystem::path& path,const Json& document) {
-    const auto bytes=Json::to_msgpack(document);
-    if(bytes.size()>1024ULL*1024*1024)throw std::runtime_error("chunk cache exceeds 1 GiB decoded limit");
-    std::vector<std::byte> compressed(ZSTD_compressBound(bytes.size()));
-    const auto size=ZSTD_compress(compressed.data(),compressed.size(),bytes.data(),bytes.size(),3);
-    if(ZSTD_isError(size))throw std::runtime_error(std::string("chunk compression failed: ")+ZSTD_getErrorName(size));
-    compressed.resize(size);
-    vc::core::util::atomicWriteBytes(path,compressed);
-}
+using detail::readFiberPacked;
+using detail::writeFiberPacked;
+Json readChunk(const std::filesystem::path& path) {return readFiberPacked(path);}
+void writeChunk(const std::filesystem::path& path,const Json& document) {writeFiberPacked(path,document);}
 }
 
 nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
@@ -605,7 +588,7 @@ std::shared_ptr<FiberChunkPaths> prepareFiberChunkPaths(const std::array<int,3>&
     const FiberPredictionSource& source,const FiberTraceConfig& trace,
     const vc::lasagna::NormalSampler& normals,const FiberChunkTraceConfig& config,double scale,
     const std::filesystem::path& output,const std::string& identity,std::string& outcome,
-    const FiberChunkParallelFor& parallelFor,const FiberChunkWait& wait)
+    const FiberChunkParallelFor& parallelFor,const FiberChunkWait& wait,bool readOnly)
 {
     validate(config,scale);validateFiberTraceConfig(trace);
     if(output.empty()||identity.empty())throw std::invalid_argument("chunk output and source identity required");
@@ -636,7 +619,7 @@ std::shared_ptr<FiberChunkPaths> prepareFiberChunkPaths(const std::array<int,3>&
                 throw std::runtime_error("cached chunk bounds mismatch");
         outcome="reused";
     } else {
-        if(config.cacheOnly)throw std::runtime_error("cache-only chunk missing: "+path.string());
+        if(config.cacheOnly||readOnly)throw std::runtime_error("cache-only chunk missing: "+path.string());
         chunk=buildFiberChunkPaths(key,source,trace,normals,config,scale,parallelFor,wait);
         Json lines=Json::array();
         for(const auto& line:chunk->lines){Json points=Json::array();for(const auto& p:line)points.push_back(xyz(p));lines.push_back(points);}
@@ -653,6 +636,7 @@ std::shared_ptr<FiberChunkPaths> prepareFiberChunkPaths(const std::array<int,3>&
             {"agreement",config.conflictAgreementBase},{"separation",config.conflictSeparationBase},
             {"sample_base",8},{"angle_degrees",25},{"interior_base",16},{"max_projection_jump_base",32}};
         if(chunk->conflictAnnotation.is_null() || chunk->conflictAnnotation.value("specification",Json{})!=filterSpec) {
+            if(readOnly)throw std::runtime_error("stale conflict annotation in read-only chunk: "+path.string());
             auto report=inspectFiberChunkConflicts(*chunk,config,normals,scale,parallelFor,
                 dynamic_cast<const FiberPredictionField*>(&source)?&source:nullptr);
             chunk->conflictFlags.assign(chunk->lines.size(),false);
@@ -715,13 +699,7 @@ std::shared_ptr<const FiberChunkPaths> FiberChunkTraceCache::get(const std::arra
     }
 }
 
-FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
-    const cv::Vec3d& initialDirection,const FiberChunkTraceConfig& c,bool initial,
-    const FiberChunkInitialRegion* region,
-    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance)
-{
-    validate(c,1);
-    FiberChunkMatch bestMatch;
+void validateFiberChunkConflictAnnotation(const FiberChunkPaths& chunk,const FiberChunkTraceConfig& c) {
     if(c.conflictNormalBase>0) {
         if(chunk.conflictAnnotation.is_null() || chunk.conflictFlags.size()!=chunk.lines.size())
             throw std::invalid_argument("conflict matching requires prepared current annotations");
@@ -731,9 +709,26 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
            s.at("agreement")!=c.conflictAgreementBase || s.at("separation")!=c.conflictSeparationBase)
             throw std::invalid_argument("stale conflict annotation; prepare chunk with current filter settings");
     }
-    if(history.empty()) return bestMatch;
+}
+
+std::vector<FiberChunkMatch> findFiberChunkMatches(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
+    const cv::Vec3d& initialDirection,const FiberChunkTraceConfig& c,bool initial,
+    const FiberChunkInitialRegion* region,
+    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance,
+    const std::vector<size_t>* candidateLines,FiberChunkMatchPurpose purpose)
+{
+    validate(c,1);
+    std::vector<FiberChunkMatch> matches;
+    validateFiberChunkConflictAnnotation(chunk,c);
+    if(history.empty()) return matches;
     for(const auto& p:history) if(!finite(p)) throw std::invalid_argument("nonfinite chunk history");
-    for(const auto& line:chunk.lines) for(const auto& p:line)
+    const size_t count=candidateLines?candidateLines->size():chunk.lines.size();
+    const auto lineId=[&](size_t i){
+        const auto id=candidateLines?candidateLines->at(i):i;
+        if(id>=chunk.lines.size())throw std::invalid_argument("candidate path ID outside chunk");
+        return id;
+    };
+    for(size_t index=0;index<count;++index)for(const auto& p:chunk.lines[lineId(index)])
         if(!finite(p)) throw std::invalid_argument("nonfinite chunk path");
     if(initial) {
         if(!region||!finite(region->center)) throw std::invalid_argument("initial chunk match requires an ellipse");
@@ -747,7 +742,8 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
         throw std::invalid_argument("width-aware join requires widths and positive tolerance");
     const auto dir=!initial&&history.size()>1?unit(history.back()-history[history.size()-2]):unit(initialDirection);
     if(!finite(dir)||cv::norm(dir)<.5) throw std::invalid_argument("invalid chunk match direction");
-    for(size_t i=0;i<chunk.lines.size();++i) for(bool reverse:{false,true}) {
+    for(size_t index=0;index<count;++index) for(bool reverse:{false,true}) {
+        const auto i=lineId(index);
         if(c.conflictNormalBase>0 && i<chunk.conflictFlags.size() && chunk.conflictFlags[i])continue;
         auto line=chunk.lines[i];if(line.size()<2) continue;
         if(reverse) std::reverse(line.begin(),line.end());
@@ -771,13 +767,19 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             const auto delta=end.point-region->center;
             initialScore=std::exp(-.5*delta.dot(region->metric*delta))*alignment/initialSamples;
         }
-        if(!initial&&(end.distance>c.joinDistanceBase||geometry.length()-end.arc<16)) continue;
+        const double remaining=purpose==FiberChunkMatchPurpose::Continuation?16:0;
+        if(!initial&&(end.distance>c.joinDistanceBase||geometry.length()-end.arc<remaining)) continue;
         double overlap=0,error=end.distance,angle=1-end.tangent.dot(dir),lastArc=end.arc;
         size_t matched=1;
+        std::vector<std::pair<double,double>> overlapArcs;
         std::vector<cv::Vec3d> widthPoints;
         if(!initial&&c.joinWidthWeight) widthPoints={history.back(),end.point};
-        for(size_t j=history.size()-1;!initial&&j>0&&overlap<2*c.haloBase;--j) {
-            if(!inside(history[j-1],chunk.lo,chunk.hi)) break;
+        const double maximumOverlap=purpose==FiberChunkMatchPurpose::FullEquivalence?
+            std::numeric_limits<double>::infinity():2*c.haloBase;
+        for(size_t j=history.size()-1;!initial&&j>0&&overlap<maximumOverlap;--j) {
+            // Terminal relation differs from continuation only in target runway.
+            // Complete-path proof must additionally examine all canonical geometry.
+            if(purpose!=FiberChunkMatchPurpose::FullEquivalence&&!inside(history[j-1],chunk.lo,chunk.hi)) break;
             const auto tangent=unit(history[j]-history[j-1]);
             const double step=cv::norm(history[j]-history[j-1]);
             const int subdivisions=std::max(1,int(std::ceil(step/4)));
@@ -786,8 +788,14 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
                 const auto point=history[j]+(history[j-1]-history[j])*(double(n)/subdivisions);
                 const auto p=project(line,point,tangent,std::cos(c.joinAngleDegrees*pi/180),
                     std::max(0.,lastArc-2*step/subdivisions),lastArc);
-                if(p.distance>c.joinDistanceBase||p.arc>=lastArc) {valid=false;break;}
+                // Whole-path proof may examine a slightly longer duplicate's
+                // tail against the fixed target endpoint. It must still pass
+                // every geometric/width gate; interior plateaus never qualify.
+                const bool endpointClamp=purpose==FiberChunkMatchPurpose::FullEquivalence&&
+                    p.arc==lastArc&&(p.arc==0||p.arc==geometry.length());
+                if(p.distance>c.joinDistanceBase||(p.arc>=lastArc&&!endpointClamp)) {valid=false;break;}
                 lastArc=p.arc;overlap+=step/subdivisions;error+=p.distance;
+                overlapArcs.emplace_back(overlap,lastArc);
                 if(c.joinWidthWeight) {widthPoints.push_back(point);widthPoints.push_back(p.point);}
                 angle+=1-p.tangent.dot(tangent);++matched;
             }
@@ -801,8 +809,13 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             if(values.size()!=widthPoints.size()) throw std::runtime_error("chunk join width sample count mismatch");
             compatibility=0;
             for(size_t k=0;k<values.size();k+=2) {
-                if(!std::isfinite(values[k])||!std::isfinite(values[k+1])||values[k]<=0||values[k+1]<=0) continue;
-                compatibility+=fiberWidthPresenceScale(values[k+1],values[k],widthTolerance,true);
+                if(!std::isfinite(values[k])||!std::isfinite(values[k+1])||values[k]<=0||values[k+1]<=0) {
+                    if(purpose==FiberChunkMatchPurpose::FullEquivalence){compatibility=0;break;}
+                    continue;
+                }
+                const double weight=fiberWidthPresenceScale(values[k+1],values[k],widthTolerance,true);
+                if(purpose==FiberChunkMatchPurpose::FullEquivalence&&weight<=0){compatibility=0;break;}
+                compatibility+=weight;
             }
             compatibility/=values.size()/2;
             if(compatibility<=0) continue;
@@ -812,17 +825,38 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
             c.joinWeights[0]*std::min(1.,overlap/(2*c.haloBase))+c.joinWeights[1]*compatibility-
             c.joinWeights[2]*std::pow(error/c.joinDistanceBase,2)-
             c.joinWeights[3]*angle/(1-std::cos(c.joinAngleDegrees*pi/180)):weighted;
-        if(initial&&c.initialAlignmentPower>0) {
-            if(!bestMatch.valid||initialScore>bestMatch.initialScore||
-               (initialScore==bestMatch.initialScore&&error<bestMatch.error)) {
-                bestMatch={i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted};
-                bestMatch.initialScore=initialScore;bestMatch.initialSamples=initialSamples;
-            }
-            continue;
+        FiberChunkMatch match{i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted,joint};
+        match.initialScore=initialScore;match.initialSamples=initialSamples;
+        match.overlapBeginArc=lastArc;match.overlapArcs=std::move(overlapArcs);
+        matches.push_back(std::move(match));
+    }
+    return matches;
+}
+
+FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vector<cv::Vec3d>& history,
+    const cv::Vec3d& initialDirection,const FiberChunkTraceConfig& c,bool initial,
+    const FiberChunkInitialRegion* region,
+    const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths,double widthTolerance,
+    const vc::lasagna::NormalSampler* normals,double normalScale)
+{
+    FiberChunkMatch bestMatch;std::set<size_t> qualified;
+    for(auto& match:findFiberChunkMatches(chunk,history,initialDirection,c,initial,region,widths,widthTolerance)){
+        qualified.insert(match.line);
+        const bool better=initial&&c.initialAlignmentPower>0?
+            (match.initialScore>bestMatch.initialScore||(match.initialScore==bestMatch.initialScore&&match.error<bestMatch.error)):
+            (match.jointScore>bestMatch.jointScore||(match.jointScore==bestMatch.jointScore&&
+             (match.error<bestMatch.error||(match.error==bestMatch.error&&match.angleError<bestMatch.angleError))));
+        if(!bestMatch.valid||better)bestMatch=std::move(match);
+    }
+    if(!initial&&qualified.size()>1&&c.conflictNormalBase>0) {
+        if(!normals)throw std::invalid_argument("ambiguous boundary matching requires tracing normals");
+        FiberChunkPaths alternatives;alternatives.key=chunk.key;
+        alternatives.lines.push_back(history);
+        for(auto id:qualified)alternatives.lines.push_back(chunk.lines[id]);
+        const auto report=inspectFiberChunkConflicts(alternatives,c,*normals,normalScale);
+        if(!report.at("rejected").empty()||report.at("invalid_normal_samples").get<size_t>()) {
+            bestMatch.valid=false;bestMatch.ambiguous=true;
         }
-        if(!bestMatch.valid||joint>bestMatch.jointScore||(joint==bestMatch.jointScore&&
-            (error<bestMatch.error||(error==bestMatch.error&&angle<bestMatch.angleError))))
-            bestMatch={i,end.segment,reverse,true,end.point,end.arc,overlap,error,angle,compatibility,weighted,joint};
     }
     return bestMatch;
 }

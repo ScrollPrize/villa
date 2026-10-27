@@ -185,6 +185,17 @@ class BatchPrediction final : public vc::fiber_tracer::FiberPredictionSource {
 public:
     mutable int sampleCalls = 0;
     mutable int batchCalls = 0;
+    mutable std::vector<size_t> batchSizes;
+    mutable std::vector<int> batchWorkers;
+
+    vc::lasagna::NormalPrefetchReport prefetchSamples(
+        const std::vector<cv::Vec3d>& points) const override
+    {
+        ++batchCalls;
+        batchSizes.push_back(points.size());
+        batchWorkers.push_back(1);
+        return {};
+    }
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
     {
@@ -204,10 +215,12 @@ public:
     void sampleBatch(
         const std::vector<cv::Vec3d>& volumePoints,
         const std::vector<cv::Vec3d>& referenceDirections,
-        int,
+        int workers,
         std::vector<vc::fiber_tracer::FiberPredictionSample>& samples) const override
     {
         ++batchCalls;
+        batchSizes.push_back(volumePoints.size());
+        batchWorkers.push_back(workers);
         samples.clear();
         samples.reserve(volumePoints.size());
         for (size_t index = 0; index < volumePoints.size(); ++index) {
@@ -549,8 +562,9 @@ TEST_CASE("native fiber tracer scores persisted corners without materialized sam
     CHECK(score.selectedDirection[2] == doctest::Approx(0.0));
 }
 
-TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
+TEST_CASE("native fiber tracer batches the candidate cone even with one worker")
 {
+    for (const int workers : {1, 2}) {
     BatchPrediction predictions;
     vc::fiber_tracer::FiberTraceOneWayRequest request;
     request.startPoint = {0.0, 0.0, 0.0};
@@ -562,7 +576,7 @@ TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
     request.config.coneAngleDegrees = 5.0;
     request.config.coneAngleStepDegrees = 5.0;
     request.config.beamWidth = 2;
-    request.config.parallelThreads = 2;
+    request.config.parallelThreads = workers;
     request.config.smoothnessWeight = 0.0;
     request.config.smoothnessNormalWeight = 0.0;
     request.config.smoothnessTangentWeight = 0.0;
@@ -572,8 +586,35 @@ TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
 
     CHECK(result.reachedTargetPlane);
-    CHECK(predictions.sampleCalls == 1);
+    REQUIRE(predictions.batchSizes.size() == 1);
+    CHECK(predictions.sampleCalls == (workers==1 ? 1+predictions.batchSizes.front() : 1));
     CHECK(predictions.batchCalls == 1);
+    CHECK(predictions.batchSizes.front() > 1);
+    CHECK(predictions.batchWorkers.front() == workers);
+    }
+}
+
+TEST_CASE("native fiber tracer batches lookahead with nonconcurrent normal samplers")
+{
+    BatchPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0,0,0}; request.targetPoint = {16,0,0};
+    request.initialDirection = {1,0,0}; request.budgetSpanVoxels = 16;
+    setExplicitTargetPlane(request, {1,0,0});
+    request.config.stepVoxels = 4;
+    request.config.coneAngleDegrees = 5; request.config.coneAngleStepDegrees = 5;
+    request.config.beamWidth = 2; request.config.beamLookaheadSteps = 2;
+    request.config.parallelThreads = 4; // Normal sampler requires serial work.
+    request.config.replayPresenceCutoff = .4;
+    request.config.replayPresenceModulated = true;
+    const auto result = vc::fiber_tracer::traceFiberOneWay(predictions, request, &normals);
+    CHECK(result.reachedTargetPlane);
+    size_t totalSamples=1;
+    for (size_t size : predictions.batchSizes) totalSamples+=size;
+    CHECK(predictions.sampleCalls == totalSamples);
+    CHECK(predictions.batchCalls > 2);
+    for (int workers : predictions.batchWorkers) CHECK(workers == 1);
 }
 
 TEST_CASE("native fiber tracer prunes beams by Python score and generation order")

@@ -105,6 +105,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
         if(!field || !normalField || field->optionCount()!=1 || c.refineSeed || cfg.embeddingWeight>0)
             throw std::runtime_error("GPU fixture requires single native option, no embeddings/seed fit");
         const double spacing=field->storedGridInfo().predictionToBaseScale/scale;
+        const auto volumeShape=field->storedGridInfo().shapeZYX;
         const double margin=cfg.stepVoxels*std::max(1,cfg.beamLookaheadSteps)+
             (c.onlineRefineIterations?(c.onlineRefineCapBase+c.onlineRefineEpsilonBase)/scale:0);
         std::array<int,3> origin{},shape{};
@@ -131,16 +132,25 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             auto visitor=[](void* context,size_t i,const cv::Vec3f& fraction,bool valid,
                             std::span<const std::array<uint8_t,8>> values){
                 auto& c=*static_cast<vc::lasagna::LasagnaCornerBatch*>(context);
-                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
                 c.valid[i]=valid;c.fractionsXYZ[i]=fraction;
+                // Out-of-volume visitor callbacks carry no channel payload.
+                // Keep the same invalid padding as the owned ROI export.
+                if(!valid){for(auto& channel:c.values)channel[i]={};return;}
+                if(values.size()!=6)throw std::runtime_error("GPU export requires six aligned channels");
                 for(size_t k=0;k<6;++k)c.values[k][i]=values[k];
             };
             if(!field->visitCornerBatchWithNormals(*normalField,points,1,&corners,visitor,0,nullptr,pinned.get()))
                 throw std::runtime_error("GPU fixture requires aligned native corner grids");
             std::vector<float> widths;if(pinned)field->sampleWidths(points,widths,*pinned);else field->sampleWidths(points,widths);
             for(size_t i=0;i<points.size();++i) {
-                if(!corners.valid[i] || cv::norm(corners.fractionsXYZ[i])>1e-6)
-                    throw std::runtime_error("GPU fixture lattice mismatch/outside volume");
+                const int x=origin[0]+int(i%shape[0]),y=origin[1]+int(i/shape[0]),zz=origin[2]+z;
+                const bool inside=x>=0&&y>=0&&zz>=0&&size_t(x)<volumeShape[2]&&size_t(y)<volumeShape[1]&&size_t(zz)<volumeShape[0];
+                if(!inside){
+                    byteValues.insert(byteValues.end(),6,0);widths[i]=0;continue;
+                }
+                if(!corners.valid[i])throw std::runtime_error("GPU export invalid channels inside volume");
+                if(cv::norm(corners.fractionsXYZ[i])>1e-6)
+                    throw std::runtime_error("GPU fixture lattice mismatch");
                 for(int channel=0;channel<6;++channel) byteValues.push_back(corners.values[channel][i][0]);
             }
             widthValues.insert(widthValues.end(),widths.begin(),widths.end());
@@ -159,6 +169,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             {"normal_smoothness",cfg.smoothnessNormalWeight},{"tangent_smoothness",cfg.smoothnessTangentWeight},
             {"free_angle",cfg.smoothnessFreeAngleDegrees},{"cumulative_weight",cfg.cumulativeSmoothnessTangentWeight},
             {"cumulative_steps",cfg.cumulativeSmoothnessSteps},{"mask_normals",normalField->masksInvalidCorners()}};
+        meta["volume_shape_xyz"]={volumeShape[2],volumeShape[1],volumeShape[0]};
         meta["online_refine_iterations"]=c.onlineRefineIterations;
         meta["online_refine_window"]=c.onlineRefineWindow;
         meta["online_refine_mode"]=c.onlineRefineMode;

@@ -52,6 +52,15 @@ struct FiberTraceProfile {
     std::vector<uint64_t> localityCurrentDepth1Dependencies;
     std::vector<uint64_t> localityPreviousStepDependencies;
     double startSampleSeconds = 0.0;
+    double widthSampleSeconds = 0.0;
+    size_t widthSamplePoints = 0;
+    size_t samplingWindowLoads = 0;
+    size_t samplingWindowFallbacks = 0;
+    size_t samplingWindowPeakBytes = 0;
+    size_t samplingWindowPeakTableBytes = 0;
+    size_t samplingWindowCopiedBytes = 0;
+    double samplingWindowLoadSeconds = 0;
+    double combinedChannelSampleSeconds = 0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
     double readinessPlanSeconds = 0.0;
@@ -96,6 +105,9 @@ struct FiberTraceConfig {
     size_t lookaheadParentCap = 32;
     size_t lookaheadRetryParentCap = 0;
     int parallelThreads = 0;
+    // Opt-in retained decoded-chunk window, side in stored voxels. Zero disables.
+    // Only scalar one-worker compatible fields; all other paths are unchanged.
+    int samplingWindowVoxels = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
@@ -124,6 +136,9 @@ struct FiberTraceConfig {
     // selected option's direction/width-modulated presence, before smoothness.
     double replayPresenceCutoff = 0.0;
     bool replayPresenceModulated = false;
+    // Opt-in direct CPU eligibility, independent of the width-weighted objective.
+    bool replayPresenceIgnoreWidth = false;
+    double widthHardRelativeTolerance = 0.0; // zero disabled; inclusive relative deviation
     // Existing reference-replay consistency controls; zero interval disables them.
     double replayReverseIntervalBase = 0.0;
     double replayReverseNormalRadiusBase = 20.0;
@@ -131,6 +146,11 @@ struct FiberTraceConfig {
     bool replayReverseToStart = false;
     bool replayReverseAllEndpoints = false;
     int replayReverseHistorySteps = 0;
+    int replayReverseDelaySteps = 0; // incoming reverse history from later forward edges
+    double replayReverseConvergenceMinBase = 0; // zero disables early success
+    double replayReverseConvergenceDistanceBase = 4;
+    double replayReverseConvergenceAngleDegrees = 5;
+    int replayReverseConvergenceSteps = 4;
     bool preserveInitialDirection = false; // history prior, not a forced step
     // Stop the entire frontier after any surviving branch exits this box.
     std::optional<std::array<cv::Vec3d, 2>> committedBounds;
@@ -384,6 +404,8 @@ public:
     // stored units into the same working units as sampleWidths().
     [[nodiscard]] std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
         chunkRegionChannels(const cv::Vec3d& lo,const cv::Vec3d& hi) const;
+    // Metadata-only capability check. Does not wait for inference or read chunks.
+    [[nodiscard]] bool supportsDenseSampling(const vc::lasagna::LasagnaNormalSampler&) const;
     // Configure before concurrent sampling; empty keeps offline behavior.
     // The gate may be called concurrently and must not sample this field itself.
     void setReadinessGate(FiberPredictionReadinessGate gate);
@@ -432,12 +454,21 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
+    // Batch chunk access without changing the scalar interpolation arithmetic.
+    void sampleBatchScalarEquivalent(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* region = nullptr) const;
     void sampleBatch(
         const std::vector<cv::Vec3f>& volumePoints,
         const std::vector<cv::Vec3f>& referenceDirections,
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
-        FiberTraceProfile* profile) const;
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* region = nullptr) const;
     [[nodiscard]] bool sampleCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,

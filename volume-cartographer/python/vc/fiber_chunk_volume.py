@@ -109,7 +109,7 @@ def load_config(path):
     path = Path(path).resolve()
     cfg = json.loads(path.read_text())
     _keys(cfg, ("prediction_manifest", "normal_manifest", "source_identity", "scaledown_power",
-                "enable_width", "cache_bytes", "trace", "chunks", "keys_xyz", "loader"), "volume config")
+                "enable_width", "cache_bytes", "trace", "chunks", "keys_xyz", "loader", "routes"), "volume config")
     if not isinstance(cfg.get("source_identity"), str) or not cfg["source_identity"]:
         raise ValueError("source_identity must identify immutable predictions AND normals")
     for name in ("prediction_manifest", "normal_manifest"):
@@ -209,7 +209,25 @@ def inspect_outputs(config, output):
     return tuple(json.loads(completed.stdout.splitlines()[-1]))
 
 
-def execute(cfg, output, workers, contexts, *, progress=None):
+def route_jobs(cfg, field, chunks):
+    options = dict(cfg.get("routes", {}))
+    _keys(options, ("cache_bytes", "maximum_distance_base", "maximum_steps", "page_points",
+                   "inventory_keys_xyz", "reduce_duplicate_paths", "reject_ambiguous_paths"), "routes")
+    for name in ("reduce_duplicate_paths", "reject_ambiguous_paths"):
+        if name in options and not isinstance(options[name], bool):
+            raise ValueError(f"{name} must be boolean")
+    inventory = options.pop("inventory_keys_xyz", None)
+    base = {k: v for k, v in cfg.items() if k != "keys_xyz"}
+    if inventory is not None:
+        base["keys_xyz"] = inventory
+    keys = job_keys(base, field, chunks)
+    seeds = job_keys(cfg, field, chunks) if "keys_xyz" in cfg else keys
+    if not {tuple(k) for k in seeds} <= {tuple(k) for k in keys}:
+        raise ValueError("route seed owners must belong to routing inventory")
+    return keys, seeds, options
+
+
+def execute(cfg, output, workers, contexts, *, progress=None, route_cache=None):
     grant = json.loads(os.environ.get("VILLA_GPU_MANAGER_GRANT", "null"))
     if grant is not None:
         workers = min(workers, int(grant["cpu_cores"]))
@@ -217,8 +235,8 @@ def execute(cfg, output, workers, contexts, *, progress=None):
             raise RuntimeError("manager grant contains no CPU workers")
     loader = configure_loader(cfg, workers)
     field, normals, trace, chunks = open_inputs(cfg)
-    keys = job_keys(cfg, field, chunks)
-    if chunks.gpu_library and missing_outputs(output, keys) and not chunks.cache_only:
+    keys = job_keys(cfg, field, chunks) if route_cache is None else None
+    if route_cache is None and chunks.gpu_library and missing_outputs(output, keys) and not chunks.cache_only:
         if not grant or not grant.get("gpus"):
             raise RuntimeError("GPU construction requires a GPU-manager grant")
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
@@ -234,8 +252,14 @@ def execute(cfg, output, workers, contexts, *, progress=None):
     control = ft.EvaluationControl()
     began = time.monotonic()
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(ft.prepare_chunk_volume, field, normals, trace, chunks,
-            str(output), cfg["source_identity"], keys, control, workers, contexts)
+        if route_cache is None:
+            future = pool.submit(ft.prepare_chunk_volume, field, normals, trace, chunks,
+                str(output), cfg["source_identity"], keys, control, workers, contexts)
+        else:
+            keys, seeds, options = route_jobs(cfg, field, chunks)
+            future = pool.submit(ft.export_chunk_routes, field, normals, trace, chunks,
+                str(route_cache), str(output), cfg["source_identity"], keys, seeds,
+                control, workers, contexts, **options)
         try:
             while True:
                 try:
@@ -248,7 +272,8 @@ def execute(cfg, output, workers, contexts, *, progress=None):
             control.cancel("volume command interrupted or failed")
             raise  # Executor joins all native work before releasing resources.
     result = dict(control.status(), wall_seconds=time.monotonic()-began,
-                  workers=workers, contexts_per_worker=contexts, loader=loader)
+                  workers=workers, contexts_per_worker=contexts, loader=loader,
+                  stage="routes" if route_cache is not None else "chunks")
     if hasattr(ft,"chunk_loader_stats"):
         result["loader_stats"]=json.loads(ft.chunk_loader_stats())
     if progress:
@@ -293,18 +318,42 @@ def main(argv=None):
     parser.add_argument("config", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
-    parser.add_argument("--contexts-per-worker", type=int, default=8)
+    parser.add_argument("--contexts-per-worker", type=int,
+                        help="default: 8 for GPU chunk construction, 1 for CPU route export")
     parser.add_argument("--devices", help="optional GPU-index restriction; default: manager chooses from its full inventory")
     parser.add_argument("--vram-gib", type=float, default=8)
     parser.add_argument("--priority", type=int, default=100)
+    parser.add_argument("--routes-from", type=Path,
+                        help="export full-length fibers from a completed chunk cache; CPU-only, no retracing/inference")
     parser.add_argument("--plan", action="store_true", help="enumerate only; no tracing or GPU request")
     parser.add_argument("--managed-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--inspect-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.contexts_per_worker is None:
+        args.contexts_per_worker = 1 if args.routes_from is not None else 8
     if args.workers < 1 or args.contexts_per_worker < 1 or not math.isfinite(args.vram_gib) or args.vram_gib <= 0:
         parser.error("positive resource budgets required")
     cfg = load_config(args.config)
     output = args.output.resolve()
+    if args.routes_from is not None:
+        source = args.routes_from.resolve()
+        if source == output or not source.is_dir():
+            parser.error("--routes-from must be an existing cache distinct from output")
+        if args.inspect_worker or args.managed_worker:
+            parser.error("route export does not use GPU worker modes")
+        if args.plan:
+            field, normals, trace, chunks = open_inputs(cfg)
+            keys, seeds, options = route_jobs(cfg, field, chunks)
+            print(json.dumps(dict(stage="routes", source_cores=len(keys), seed_cores=len(seeds),
+                                  missing_source=missing_outputs(source, keys), gpus=0, options=options)))
+            return 0
+        # Same lock inode as construction. A completed source stays immutable
+        # throughout export, including resume validation and background reads.
+        with output_lock(source), output_lock(output):
+            result = execute(cfg, output, args.workers, args.contexts_per_worker,
+                             progress=print_progress, route_cache=source)
+        print(json.dumps(result, sort_keys=True), flush=True)
+        return 0
     if args.inspect_worker:
         print(json.dumps(_inspect_outputs(cfg, output)), flush=True)
         return 0

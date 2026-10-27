@@ -10,6 +10,63 @@ from test_fiber_trace import fiber_trace as ft
 from vc.fiber_chunk_volume import sparse_keys, output_lock, execute
 
 
+def test_training_replay_binding_keeps_historical_seed_and_reverse_options(inputs):
+    from vc.fiber_evaluation import replay_dict
+    field, normal = handles(inputs)
+    settings = trace_config().to_dict()
+    settings.update(replay_reverse_interval_base=512., replay_reverse_to_start=True,
+                    replay_reverse_all_endpoints=True, replay_reverse_history_steps=0,
+                    replay_reverse_normal_radius_base=20., replay_reverse_tangential_radius_base=40.)
+    trace = ft.TraceConfig.from_dict(settings)
+    assert trace.to_dict() == settings
+    case = ft.EvaluationCase(np.asarray([[16., 15., 16.], [240., 15., 16.]]))
+    result = replay_dict(ft.training_replay(field, normal, normal, trace, case,
+                                           ft.ChunkReplayConfig(), prediction_based_seeding=True))
+    assert result['segments']
+    np.testing.assert_allclose(result['segments'][0]['points_base_xyz'][0], [16., 16., 16.])
+
+
+def test_route_inventory_is_not_truncated_by_seed_selection(monkeypatch):
+    from vc import fiber_chunk_volume as workflow
+    def keys(config, *unused):
+        return config.get("keys_xyz", [[0,0,0], [1,0,0], [2,0,0]])
+    monkeypatch.setattr(workflow, "job_keys", keys)
+    inventory, seeds, options = workflow.route_jobs({"keys_xyz": [[1,0,0]], "routes": {"cache_bytes": 1024}}, None, None)
+    assert len(inventory) == 3 and seeds == [[1,0,0]] and options == {"cache_bytes": 1024}
+    inventory, seeds, _ = workflow.route_jobs({"routes": {"inventory_keys_xyz": [[1,0,0]]}}, None, None)
+    assert inventory == seeds == [[1,0,0]]
+    _, _, options = workflow.route_jobs({"routes": {"reduce_duplicate_paths": False}}, None, None)
+    assert options["reduce_duplicate_paths"] is False
+    with pytest.raises(ValueError, match="reduce_duplicate_paths"):
+        workflow.route_jobs({"routes": {"reduce_duplicate_paths": 1}}, None, None)
+    _, _, options = workflow.route_jobs({"routes": {"reject_ambiguous_paths": False}}, None, None)
+    assert options["reject_ambiguous_paths"] is False
+    with pytest.raises(ValueError, match="reject_ambiguous_paths"):
+        workflow.route_jobs({"routes": {"reject_ambiguous_paths": 0}}, None, None)
+    with pytest.raises(ValueError, match="must belong"):
+        workflow.route_jobs({"keys_xyz": [[0,0,0]], "routes": {"inventory_keys_xyz": [[1,0,0]]}}, None, None)
+
+
+def test_route_cli_uses_no_gpu_and_holds_both_locks(tmp_path, monkeypatch):
+    from vc import fiber_chunk_volume as workflow
+    source, output = tmp_path / "cache", tmp_path / "routes"
+    source.mkdir()
+    monkeypatch.setattr(workflow, "load_config", lambda _: {})
+    def run(cfg, out, workers, contexts, **kwargs):
+        assert kwargs["route_cache"] == source
+        assert contexts == 1
+        for path in (source, output):
+            with pytest.raises(RuntimeError, match="another writer"):
+                with workflow.output_lock(path):
+                    pass
+        return {"completed": 1}
+    monkeypatch.setattr(workflow, "execute", run)
+    monkeypatch.setattr(workflow, "inspect_outputs", lambda *a: pytest.fail("GPU preflight called"))
+    assert workflow.main([str(tmp_path / "config"), str(output), "--routes-from", str(source)]) == 0
+    with pytest.raises(SystemExit):
+        workflow.main([str(tmp_path / "config"), str(source), "--routes-from", str(source)])
+
+
 def test_queued_loader_configuration(monkeypatch):
     from vc import fiber_chunk_volume as workflow
     calls = []

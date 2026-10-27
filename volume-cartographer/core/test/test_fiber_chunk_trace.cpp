@@ -3,6 +3,9 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include "vc/fiber_tracer/detail/PolylineSegmentIndex.hpp"
+#include "vc/fiber_tracer/detail/FiberRouteOwnership.hpp"
+#include "vc/fiber_tracer/detail/FiberContinuationGraph.hpp"
+#include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -360,6 +363,139 @@ TEST_CASE("chunk route joins suffixes both ways and respects distance and observ
         [](const auto&,double,int){return true;}));
 }
 
+TEST_CASE("volume routes join both ways, retain selected seed and resume deterministically") {
+    Temp temp;const auto input=temp.path/"input";std::filesystem::create_directories(input);
+    Tubes source;Normal normals;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;c.joinDistanceBase=.25;
+    const std::vector<std::array<int,3>> keys{{0,0,0},{1,0,0},{2,0,0}};
+    for(const auto& key:keys) {
+        nlohmann::json lines=nlohmann::json::array();
+        for(double y:{8.,9.,64.,-1.,50.}) { // upper-face and halo-only paths have no owner here
+            nlohmann::json line=nlohmann::json::array();
+            for(int i=0;i<=8;++i)line.push_back({key[0]*64.-32+16*i,y,8});
+            line.insert(line.begin(),line.front());line.push_back(line.back()); // repeated endpoints must retain graph edges
+            lines.push_back(line);
+        }
+        detail::writeFiberPacked(input/(std::to_string(key[0])+"_0_0.msgpack.zst"),
+            {{"key",key},{"lo",{key[0]*64.-32,-32,-32}},{"hi",{key[0]*64.+96,96,96}},
+             {"maxima",5},{"seeds",5},{"lines",lines},
+             {"end_reasons",std::vector<std::array<std::string,2>>(5,{"chunk_boundary","chunk_boundary"})},
+             {"specification",fiberChunkCacheSpecification(c,t,1,"route-test")}});
+    }
+    FiberChunkRouteVolumeConfig cfg;cfg.cacheBytes=1;cfg.pagePoints=8; // exercise eviction and page splitting
+    auto run=[&](const std::filesystem::path& out,size_t workers,const std::string& identity="route-test") {
+        FiberEvaluationControl control;
+        exportFiberChunkRoutes(source,t,1,normals,c,input,out,identity,keys,keys,cfg,control,workers,2);
+        return control.status();
+    };
+    const auto a=temp.path/"serial",b=temp.path/"parallel";
+    FiberEvaluationControl cancelled;cancelled.cancel("test cancellation");
+    CHECK_THROWS(exportFiberChunkRoutes(source,t,1,normals,c,input,temp.path/"cancelled","route-test",keys,keys,cfg,cancelled,4,2));
+    CHECK_FALSE(std::filesystem::exists(temp.path/"cancelled"));
+    const auto serialStatus=run(a,1),parallelStatus=run(b,4);
+    CHECK(serialStatus.built==3);CHECK(parallelStatus.built==3);
+    auto index=readPackedFixture(a/"component_0.routes.msgpack.zst");
+    REQUIRE(index["seeds"].size()==3);REQUIRE(index["pages"].size()==1);
+    for(int page=0;page<2;++page) {
+        const auto name="component_"+std::to_string(page)+".routes.0.msgpack.zst";
+        auto left=readPackedFixture(a/name),right=readPackedFixture(b/name);
+        left.erase("generation");right.erase("generation");CHECK(left==right);
+        const auto& fiber=left["fibers"][0];const auto& points=fiber["points_base"];
+        CHECK(fiber["source_line"]==page);CHECK(fiber["length_base"]==256);
+        CHECK(points.front()[0]==-32);CHECK(points.back()[0]==224);
+        for(const auto& p:points)CHECK(p[1]==8.+page);
+        CHECK(fiber["stop_reasons"]==nlohmann::json({"chunk_inventory_boundary","chunk_inventory_boundary"}));
+        CHECK(fiber["joins"][0].size()>=1);CHECK(fiber["joins"][1].size()>=2);
+        CHECK_FALSE(fiber["owned_arcs"].empty());
+    }
+    const auto modified=std::filesystem::last_write_time(a/"component_0.routes.msgpack.zst");
+    CHECK(run(a,4).reused==3);
+    CHECK(std::filesystem::last_write_time(a/"component_0.routes.msgpack.zst")==modified);
+    CHECK_THROWS(run(a,2,"different"));
+    // A source identity mismatch is rejected even in a completely fresh export.
+    CHECK_THROWS(run(temp.path/"wrong-source",2,"different"));
+    cfg.maximumDistanceBase=100;CHECK_THROWS(run(a,1));cfg.maximumDistanceBase=1000000;
+    cfg.maximumSteps=1;
+    CHECK(run(temp.path/"budget",4).built==3);
+    CHECK(run(temp.path/"budget",1).reused==3);
+    cfg.maximumSteps=100000;
+    auto damaged=readPackedFixture(a/"component_0.routes.0.msgpack.zst");
+    const auto saved=damaged;
+    damaged["fibers"][0]["joins"][0][0]["arc"]=-1;
+    detail::writeFiberPacked(a/"component_0.routes.0.msgpack.zst",damaged);CHECK_THROWS(run(a,1));
+    detail::writeFiberPacked(a/"component_0.routes.0.msgpack.zst",saved);
+    // Partial pages without the final index do not masquerade as complete.
+    std::filesystem::remove(a/"component_0.routes.msgpack.zst");CHECK(run(a,4).built==1);
+    std::ofstream(a/"component_0.routes.0.msgpack.zst",std::ios::trunc)<<"corrupt";
+    CHECK_THROWS(run(a,1));
+    std::filesystem::remove(input/"2_0_0.msgpack.zst");CHECK_THROWS(run(temp.path/"missing",4));
+}
+
+TEST_CASE("volume ownership includes a core-crossing segment with no in-core vertex") {
+    Temp temp;const auto input=temp.path/"input";std::filesystem::create_directories(input);
+    Tubes source;Normal normals;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    const std::array<int,3> key{0,0,0};
+    detail::writeFiberPacked(input/"0_0_0.msgpack.zst",{
+        {"key",key},{"lo",{-32,-32,-32}},{"hi",{96,96,96}},{"maxima",1},{"seeds",1},
+        {"lines",{{{-1,1,8},{1,-1,8}}}},
+        {"end_reasons",std::vector<std::array<std::string,2>>(1,{"presence_cutoff","presence_cutoff"})},
+        {"specification",fiberChunkCacheSpecification(c,t,1,"corner")}});
+    // Move the second endpoint so the segment crosses a positive core interval.
+    auto data=readPackedFixture(input/"0_0_0.msgpack.zst");data["lines"][0][1]={2,-1,8};
+    detail::writeFiberPacked(input/"0_0_0.msgpack.zst",data);
+    FiberChunkRouteVolumeConfig cfg;FiberEvaluationControl control;
+    exportFiberChunkRoutes(source,t,1,normals,c,input,temp.path/"out","corner",{key},{key},cfg,control,2,1);
+    CHECK(control.status().built==1);
+    const auto page=readPackedFixture(temp.path/"out/component_0.routes.0.msgpack.zst");
+    CHECK(page["fibers"].size()==1);CHECK(page["fibers"][0]["length_base"].get<double>()==doctest::Approx(std::sqrt(13.)));
+}
+
+TEST_CASE("explicit route seed respects flags, coordinates and limits") {
+    Tubes source;auto t=traceConfig();t.stepVoxels=16;auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    auto chunk=std::make_shared<FiberChunkPaths>();chunk->key={0,0,0};chunk->lo={-32,-32,-32};chunk->hi={96,96,96};
+    chunk->lines={{{0,8,8},{16,8,8},{32,8,8}},{{0,9,8},{16,9,8},{32,9,8}}};
+    chunk->endReasons={{{"presence_cutoff","presence_cutoff"}},{{"presence_cutoff","presence_cutoff"}}};
+    FiberChunkInitialRegion region;region.center={16,9,8};FiberChunkRouteStart start{1,1,false};
+    auto run=[&] {
+        std::vector<cv::Vec3d> points;
+        auto stop=traceFiberChunkRoute([&](const auto&){return chunk;},c,source,t,1,region,{1,0,0},8,100,
+            [&](const auto& p,double,int){points.push_back(p);return true;},{},&start);
+        return std::make_pair(stop,points);
+    };
+    auto result=run();CHECK(result.first=="chunk_length_limit");REQUIRE(result.second.size()==1);
+    CHECK(result.second[0]==cv::Vec3d(24,9,8));
+    region.center={16,8,8};CHECK_THROWS(run());region.center={16,9,8};
+    c.conflictNormalBase=10;c.conflictTangentBase=20;CHECK_THROWS(run());
+    chunk->conflictAnnotation={{"specification",{{"version",1},{"algorithm","chunk-conflict-v1"},
+        {"normal",10},{"tangent",20},{"agreement",c.conflictAgreementBase},{"separation",c.conflictSeparationBase}}}};
+    chunk->conflictFlags={false,true};CHECK(run().first=="chunk_seed_conflict");
+    chunk->conflictAnnotation["specification"]["normal"]=11;CHECK_THROWS(run());
+}
+
+TEST_CASE("cross-chunk loops terminate with an explicit cycle reason") {
+    Tubes source;auto t=traceConfig();t.stepVoxels=16;auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    auto left=std::make_shared<FiberChunkPaths>(),right=std::make_shared<FiberChunkPaths>();
+    left->key={0,0,0};right->key={1,0,0};left->lo={-32,-32,-32};left->hi={96,96,96};
+    right->lo={32,-32,-32};right->hi={160,96,96};
+    left->lines={{{80,24,8},{64,24,8},{48,24,8},{32,24,8},{16,24,8},{0,24,8},
+                   {0,8,8},{16,8,8},{32,8,8},{48,8,8},{64,8,8},{80,8,8},{96,8,8}}};
+    right->lines={{{48,8,8},{64,8,8},{80,8,8},{96,8,8},{112,8,8},{128,8,8},
+                    {128,24,8},{112,24,8},{96,24,8},{80,24,8},{64,24,8},{48,24,8}}};
+    left->endReasons={{{"chunk_boundary","chunk_boundary"}}};right->endReasons=left->endReasons;
+    const FiberChunkProvider provider=[&](const auto& key) {
+        if(key==left->key)return left;if(key==right->key)return right;
+        throw std::runtime_error("cycle unexpectedly left its two cores");
+    };
+    FiberChunkInitialRegion region;region.center={32,8,8};
+    for(bool reverse:{false,true}) {
+        FiberChunkRouteStart start{0,8,reverse};size_t points=0;
+        auto reason=traceFiberChunkRoute(provider,c,source,t,1,region,reverse?cv::Vec3d(-1,0,0):cv::Vec3d(1,0,0),
+            10000,1000,[&](const auto&,double,int){++points;return true;},{},&start);
+        CHECK(reason=="chunk_route_cycle");CHECK(points>5);CHECK(points<50);
+    }
+}
+
 TEST_CASE("chunk route preserves semantic stops and rejects unsupported splices") {
     Tubes source;auto t=traceConfig();t.stepVoxels=16;
     auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
@@ -461,6 +597,282 @@ TEST_CASE("Recovered conflict filter rejects branching partners, not duplicates"
     CHECK(report["rejected"]==nlohmann::json::array({0,1}));
     cfg.conflictNormalBase=std::numeric_limits<double>::infinity();
     CHECK_THROWS(filterFiberChunkConflicts(duplicate,cfg,normal,1));
+}
+
+TEST_CASE("boundary ambiguity reuses conflict grammar and permits equivalent copies") {
+    Normal normals;FiberChunkTraceConfig c;c.conflictNormalBase=10;c.conflictTangentBase=20;
+    FiberChunkPaths p;p.lo={-64,-64,-64};p.hi={576,576,576};
+    p.conflictAnnotation={{"specification",{{"version",1},{"algorithm","chunk-conflict-v1"},
+        {"normal",10},{"tangent",20},{"agreement",64},{"separation",32}}}};
+    p.conflictFlags={false,false};
+    std::vector<cv::Vec3d> history;
+    for(int x=0;x<=128;x+=8)history.emplace_back(x,0,0);
+    for(int i=0;i<2;++i){p.lines.emplace_back();for(int x=0;x<=320;x+=8)p.lines.back().emplace_back(x,0,0);}
+    auto match=[&]{return matchFiberChunkPaths(p,history,{1,0,0},c,false,nullptr,{},.4,&normals,1);};
+    CHECK(match().valid);CHECK_FALSE(match().ambiguous);
+    for(auto& point:p.lines[1])point[1]=std::max(0.,point[0]-160)*.5;
+    CHECK_FALSE(match().valid);CHECK(match().ambiguous);
+    std::reverse(p.lines[1].begin(),p.lines[1].end());CHECK(match().ambiguous);
+    p.conflictFlags[1]=true;CHECK(match().valid); // excluded alternatives cannot cause ambiguity
+}
+
+TEST_CASE("route interval ownership retains unvisited prefixes and budget tails") {
+    detail::FiberRouteOwnership arcs(100);
+    arcs.add(30,60);
+    CHECK(arcs.available(50,false)==0);CHECK(arcs.available(50,true)==0);
+    CHECK(arcs.available(20,false)==10);CHECK(arcs.available(80,true)==20);
+    CHECK(arcs.available(30,false)==0);CHECK(arcs.available(60,true)==0);
+    CHECK(std::isinf(arcs.available(30,true)));CHECK(std::isinf(arcs.available(60,false)));
+    REQUIRE(arcs.uncovered(0,100));CHECK(arcs.uncovered(0,100)->second==30);
+    arcs.add(0,30);CHECK(arcs.uncovered(0,100)->first==60);
+    CHECK_THROWS(arcs.add(29,31));arcs.add(60,100);CHECK_FALSE(arcs.uncovered(0,100));
+    CHECK_THROWS(arcs.add(-1,0));CHECK_THROWS(arcs.add(100,101));
+    detail::FiberRouteOwnership tiny(100);tiny.add(0,50);tiny.add(50+1e-10,100);
+    CHECK_FALSE(tiny.uncovered(0,100));CHECK_FALSE(tiny.uncovered(70,70+1e-10));
+    detail::FiberRouteOwnership small(100);small.add(0,30);small.add(30+1.5e-9,100);
+    const auto gap=small.uncovered(0,100);REQUIRE(gap);
+    CHECK(small.available(gap->first,false)>small.tolerance());
+    small.add(gap->first,gap->second);CHECK_FALSE(small.uncovered(0,100));
+}
+
+TEST_CASE("shared ownership policy converts both orientations and aliases only uncovered arcs") {
+    for(bool reverse:{false,true}){
+        detail::FiberRouteOwnership arcs(100);std::vector<std::tuple<double,double,bool>> recorded;
+        auto policy=detail::fiberRouteOwnershipPolicy([&](const FiberChunkRouteJoin&){return std::pair{&arcs,100.};},
+            [&](const auto&,double a,double b,bool alias){recorded.emplace_back(a,b,alias);});
+        FiberChunkRouteJoin join;join.match.reverse=reverse;join.match.arc=20;
+        CHECK(std::isinf(policy.available(join)));policy.consume(join,20,40);
+        CHECK(policy.available(join)==0);policy.alias(join,10,30);
+        REQUIRE(recorded.size()==2);
+        CHECK(std::get<0>(recorded[0])==(reverse?60:20));
+        CHECK(std::get<1>(recorded[0])==(reverse?80:40));
+        CHECK(std::get<0>(recorded[1])==(reverse?80:10));
+        CHECK(std::get<1>(recorded[1])==(reverse?90:20));
+        CHECK(std::get<2>(recorded[1]));policy.alias(join,10,30);CHECK(recorded.size()==2);
+    }
+}
+
+TEST_CASE("frozen replay preserves endpoints, directions and independent case ordering") {
+    Tubes source;Normal normal;auto trace=traceConfig();trace.stepVoxels=16;
+    auto config=chunkConfig();config.presencePeakRestarts=false;
+    config.initialNormalRadiusBase=10;config.initialTangentialRadiusBase=40;
+    FiberChunkReplayConfig replay;replay.errorThresholdBase=40;replay.tangentialThresholdFactor=2;
+    const std::vector<cv::Vec3d> line{{0,8,8},{16,8,8},{32,8,8},{49,8,8}};
+    FiberStoredRouteSet routes({line},{{"presence_cutoff","presence_cutoff"}});
+    const auto forward=makePolylineArcGeometry(line);
+    auto reversed=line;std::reverse(reversed.begin(),reversed.end());const auto backward=makePolylineArcGeometry(reversed);
+    const auto run=[&](const auto& ref){return routes.replay(source,trace,1,ref,normal,1,config,replay);};
+    auto a=run(forward),b=run(backward);REQUIRE(a.segments.size()==1);REQUIRE(b.segments.size()==1);
+    CHECK(a.failures.empty());CHECK(b.failures.empty());
+    CHECK(cv::norm(a.segments.back().tracePointsBase.back()-line.back())<1e-8);
+    CHECK(cv::norm(b.segments.back().tracePointsBase.back()-line.front())<1e-8);
+    const auto again=run(forward);CHECK(again.segments.size()==a.segments.size());
+    CHECK(again.segments.front().tracePointsBase==a.segments.front().tracePointsBase);
+    FiberStoredRouteSet empty({},{});CHECK(empty.replay(source,trace,1,forward,normal,1,config,replay).segments.empty());
+}
+
+TEST_CASE("continuation prefilter rejects forks and merges before traversal in either direction") {
+    using End=detail::FiberPathEnd;
+    const End a{{0,0,0},0,false},b{{0,0,0},1,false},c{{1,0,0},0,true},d{{1,0,0},1,true};
+    detail::FiberContinuationGraph unique;unique.add(a,c);unique.add(c,a);
+    CHECK(unique.edges().size()==1);CHECK(unique.reason(a,c).empty());CHECK(unique.reason(c,a).empty());
+    CHECK(unique.reason(b,c)=="chunk_unqualified_continuation");
+    auto merge=unique;merge.add(b,c);
+    CHECK(merge.degree(c)==2);CHECK(merge.reason(a,c)=="chunk_ambiguous_continuation");
+    CHECK(merge.reason(c,b)=="chunk_ambiguous_continuation");
+    auto fork=unique;fork.add(a,d);
+    CHECK(fork.reason(a,c)=="chunk_ambiguous_continuation");CHECK(fork.reason(d,a)=="chunk_ambiguous_continuation");
+    // A rival's other ambiguity must not cause peeling that makes a link unique.
+    merge.add(b,d);CHECK(merge.reason(a,c)=="chunk_ambiguous_continuation");
+    CHECK(merge.reason(b,d)=="chunk_ambiguous_continuation");
+}
+
+TEST_CASE("export rules validate source and replay independently of case order") {
+    Temp temp;const auto input=temp.path/"input";std::filesystem::create_directories(input);
+    Tubes source;Normal normal;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;c.joinDistanceBase=2;
+    std::vector<std::array<int,3>> keys{{0,0,0},{1,0,0}};
+    for(const auto& key:keys){
+        nlohmann::json line=nlohmann::json::array();
+        for(int x=-32;x<=96;x+=16)line.push_back({key[0]*64+x,8,8});
+        detail::writeFiberPacked(input/(std::to_string(key[0])+"_0_0.msgpack.zst"),{
+            {"key",key},{"lo",{key[0]*64-32,-32,-32}},{"hi",{key[0]*64+96,96,96}},
+            {"maxima",1},{"seeds",1},{"lines",nlohmann::json::array({line})},
+            {"end_reasons",nlohmann::json::array({key[0]?nlohmann::json::array({"chunk_boundary","presence_cutoff"}):
+                nlohmann::json::array({"presence_cutoff","chunk_boundary"})})},
+            {"specification",fiberChunkCacheSpecification(c,t,1,"rules")}});
+    }
+    FiberEvaluationControl control;FiberChunkRouteVolumeConfig cfg;cfg.rejectAmbiguousPaths=false;
+    const auto out=temp.path/"out";
+    exportFiberChunkRoutes(source,t,1,normal,c,input,out,"rules",keys,keys,cfg,control,4,1);
+    FiberChunkRoutingRules rules(out,input,c,t,1,"rules");
+    auto changed=c;changed.joinDistanceBase=3;
+    CHECK_THROWS(FiberChunkRoutingRules(out,input,changed,t,1,"rules"));
+    CHECK_THROWS(FiberChunkRoutingRules(out,input,c,t,1,"wrong-source"));
+    c.cacheOnly=true;FiberChunkTraceCache cache(c,input,"rules");
+    FiberChunkTraceCache otherIdentity(c,input,"other");
+    FiberChunkTraceCache otherDirectory(c,temp.path/"elsewhere","rules");
+    FiberChunkTraceCache otherSettings(changed,input,"rules");
+    rules.validate(cache,t,1);
+    CHECK_THROWS(rules.validate(otherIdentity,t,1));
+    CHECK_THROWS(rules.validate(otherDirectory,t,1));
+    CHECK_THROWS(rules.validate(otherSettings,t,1));
+    const auto reference=makePolylineArcGeometry({{0,8,8},{112,8,8}});
+    const auto reverse=makePolylineArcGeometry({{112,8,8},{0,8,8}});
+    FiberChunkReplayConfig replay;replay.errorThresholdBase=40;
+    const auto run=[&](const auto& ref){return traceFiberChunkReferenceReplay(cache,source,t,1,normal,
+        ref,0,ref.length(),normal,1,replay,{},{},{},{},{},{},&rules);};
+    const auto a=run(reference),b=run(reverse),again=run(reference);
+    REQUIRE(a.segments.size()==1);CHECK(a.failures.empty());CHECK(b.failures.empty());
+    CHECK(a.segments.front().tracePointsBase==again.segments.front().tracePointsBase);
+    auto f=std::async(std::launch::async,[&]{return run(reference);});const auto parallel=run(reverse);
+    CHECK(f.get().segments.front().tracePointsBase==a.segments.front().tracePointsBase);
+    CHECK(parallel.segments.front().tracePointsBase==b.segments.front().tracePointsBase);
+}
+
+TEST_CASE("runtime history cannot resurrect a continuation absent from the prefilter") {
+    Tubes source;auto t=traceConfig();t.stepVoxels=16;auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    const FiberChunkProvider provider=[](const auto& key){
+        auto chunk=std::make_shared<FiberChunkPaths>();chunk->key=key;
+        chunk->lo={key[0]*64.-32,-32,-32};chunk->hi={key[0]*64.+96,96,96};chunk->lines.emplace_back();
+        for(int x=-32;x<=96;x+=16)chunk->lines[0].push_back({key[0]*64.+x,8,8});
+        chunk->endReasons.push_back({"chunk_boundary","chunk_boundary"});return chunk;
+    };
+    const auto target=provider({1,0,0});
+    // Short canonical context cannot qualify; longer stitched runtime context can.
+    const std::vector<cv::Vec3d> shortHistory{{95,8,8},{96,8,8}},stitched{{64,8,8},{80,8,8},{96,8,8}};
+    CHECK(findFiberChunkMatches(*target,shortHistory,{1,0,0},c,false).empty());
+    CHECK_FALSE(findFiberChunkMatches(*target,stitched,{1,0,0},c,false).empty());
+    detail::FiberContinuationGraph graph;
+    const FiberChunkContinuationGate gate=[&](const auto& a,const auto& b){
+        return graph.reason({a.key,a.match.line,a.match.reverse},{b.key,b.match.line,!b.match.reverse});};
+    FiberChunkInitialRegion region;region.center={0,8,8};FiberChunkRouteStart start{0,2,false};
+    std::vector<cv::Vec3d> points;size_t joins=0;
+    const auto stop=traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},256,100,
+        [&](const auto& p,double,int){points.push_back(p);return true;},[&](const auto&){++joins;},
+        &start,nullptr,nullptr,gate);
+    if(stop!="chunk_unqualified_continuation")std::cerr<<"unexpected gate stop: "<<stop<<"\n";
+    CHECK(stop=="chunk_unqualified_continuation");
+    REQUIRE(!points.empty());CHECK(points.back()[0]==96);CHECK(joins==1);
+}
+
+TEST_CASE("full export prefilters two incoming paths into one target, including reverse traversal") {
+    Temp temp;const auto input=temp.path/"input";std::filesystem::create_directories(input);
+    Tubes source;Normal normals;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;c.joinDistanceBase=2;
+    std::vector<std::array<int,3>> keys{{0,0,0},{1,0,0}};
+    for(const auto& key:keys){
+        nlohmann::json lines=nlohmann::json::array();
+        for(int l=0;l<(key[0]?1:2);++l){
+            nlohmann::json line=nlohmann::json::array();
+            for(int x=-32;x<=96;x+=16)line.push_back({key[0]*64+x,8+l,8});
+            lines.push_back(line);
+        }
+        const std::array<std::string,2> reason=key[0]?std::array<std::string,2>{"chunk_boundary","presence_cutoff"}:
+            std::array<std::string,2>{"presence_cutoff","chunk_boundary"};
+        detail::writeFiberPacked(input/(std::to_string(key[0])+"_0_0.msgpack.zst"),{
+            {"key",key},{"lo",{key[0]*64-32,-32,-32}},{"hi",{key[0]*64+96,96,96}},
+            {"maxima",lines.size()},{"seeds",lines.size()},{"lines",lines},
+            {"end_reasons",std::vector<std::array<std::string,2>>(lines.size(),reason)},
+            {"specification",fiberChunkCacheSpecification(c,t,1,"merge")}});
+    }
+    FiberEvaluationControl control;FiberChunkRouteVolumeConfig cfg;cfg.reduceDuplicatePaths=false;
+    const auto out=temp.path/"out";
+    exportFiberChunkRoutes(source,t,1,normals,c,input,out,"merge",keys,keys,cfg,control,4,1);
+    const auto graph=readPackedFixture(out/"continuations.msgpack.zst");
+    CHECK(graph["candidate_connections"]==2);CHECK(graph["accepted_connections"]==0);CHECK(graph["ambiguous_ends"]==1);
+    const auto page=readPackedFixture(out/"component_0.routes.0.msgpack.zst");
+    REQUIRE(page["fibers"].size()==3);
+    for(const auto& fiber:page["fibers"]){
+        CHECK(fiber["length_base"].get<double>()==128);
+        const auto& stops=fiber["stop_reasons"];
+        CHECK((stops[0]=="chunk_ambiguous_continuation"||stops[1]=="chunk_ambiguous_continuation"));
+        for(const auto& joins:fiber["joins"])CHECK(joins.size()==1);
+    }
+    FiberEvaluationControl resume;
+    exportFiberChunkRoutes(source,t,1,normals,c,input,out,"merge",keys,keys,cfg,resume,1,1);
+    CHECK(resume.status().reused==1);
+    cfg.reduceDuplicatePaths=true;FiberEvaluationControl reduced;
+    exportFiberChunkRoutes(source,t,1,normals,c,input,temp.path/"reduced","merge",keys,keys,cfg,reduced,4,1);
+    const auto fusion=readPackedFixture(temp.path/"reduced/path_reduction.msgpack.zst");
+    CHECK(fusion["fused_paths"]==1);CHECK(fusion["ambiguous_paths"]==0);
+    const auto reducedGraph=readPackedFixture(temp.path/"reduced/continuations.msgpack.zst");
+    CHECK(reducedGraph["candidate_connections"]==1);CHECK(reducedGraph["accepted_connections"]==1);
+    const auto fusedPage=readPackedFixture(temp.path/"reduced/component_0.routes.0.msgpack.zst");
+    REQUIRE(fusedPage["fibers"].size()==1);CHECK(fusedPage["fibers"][0]["length_base"].get<double>()==192);
+    CHECK(readPackedFixture(input/"0_0_0.msgpack.zst")["lines"].size()==2);
+    cfg.rejectAmbiguousPaths=false;FiberEvaluationControl wrongMode;
+    CHECK_THROWS(exportFiberChunkRoutes(source,t,1,normals,c,input,temp.path/"reduced","merge",keys,keys,cfg,wrongMode,1,1));
+}
+
+TEST_CASE("in-chunk endpoint reduction shares continuation gates without the 16 voxel runway") {
+    auto cfg=chunkConfig();cfg.coreBase=256;cfg.haloBase=64;cfg.joinMinimumBase=32;cfg.joinDistanceBase=12;
+    FiberChunkPaths paths;paths.key={0,0,0};paths.lo={-64,-64,-64};paths.hi={320,320,320};
+    auto straight=[](double y,int step=16){std::vector<cv::Vec3d> line;for(int x=0;x<=160;x+=step)line.emplace_back(x,y,8);return line;};
+    paths.lines={straight(8),straight(8,8)};paths.endReasons.assign(2,{"chunk_boundary","chunk_boundary"});
+    std::reverse(paths.lines[1].begin(),paths.lines[1].end());
+    const std::vector<size_t> second{1};
+    CHECK(findFiberChunkMatches(paths,paths.lines[0],{1,0,0},cfg,false,nullptr,{},.4,&second).empty());
+    CHECK(findFiberChunkMatches(paths,paths.lines[0],{1,0,0},cfg,false,nullptr,{},.4,&second,
+        FiberChunkMatchPurpose::TerminalRelation).size()==1);
+    auto outside=paths;
+    for(auto& line:outside.lines)for(auto& p:line)p[1]=outside.hi[1];
+    CHECK(findFiberChunkMatches(outside,outside.lines[0],{1,0,0},cfg,false,nullptr,{},.4,&second,
+        FiberChunkMatchPurpose::TerminalRelation).empty());
+    const auto reduction=reduceFiberChunkPaths(paths,cfg);
+    CHECK(reduction.fusedPaths==1);CHECK(reduction.ambiguousPaths==0);
+    CHECK(reduction.representative==std::vector<int64_t>({0,0}));
+    const auto fusionOnly=reduceFiberChunkPaths(paths,cfg,{},.4,false);
+    CHECK(fusionOnly.representative==reduction.representative);
+    CHECK(fusionOnly.endReasons==reduction.endReasons);
+    CHECK(fusionOnly.fusedPaths==reduction.fusedPaths);
+    auto view=paths;reduction.apply(view);CHECK(view.lines[0]==paths.lines[0]);CHECK(view.lines[1].empty());
+    CHECK(view.endReasons[0][0].starts_with("fused_member_stop:")); // interior ends must remain stopped
+    CHECK(!nextFiberChunk(view,view.lines[0].front(),view.lines[0][1],view.endReasons[0][0],cfg).stop.empty());
+    // Same terminal region, but divergent opposite end: do not fuse or retain either.
+    paths.lines={straight(8),straight(8)};
+    for(auto& p:paths.lines[1])if(p[0]<80)p[1]+=(80-p[0])*.5;
+    auto conflict=reduceFiberChunkPaths(paths,cfg);CHECK(conflict.fusedPaths==0);CHECK(conflict.ambiguousPaths==2);
+    const auto retained=reduceFiberChunkPaths(paths,cfg,{},.4,false);
+    CHECK(retained.ambiguousPaths==0);CHECK(retained.retainedAmbiguousPaths==2);
+    CHECK(retained.representative==std::vector<int64_t>({0,1}));
+    auto retainedView=paths;retained.apply(retainedView);
+    CHECK(retainedView.lines==paths.lines);CHECK(retainedView.endReasons==paths.endReasons);
+    // An interior excursion is not made equivalent merely by matching BOTH ends.
+    paths.lines={straight(8),straight(8)};paths.lines[1][5][1]+=32;
+    conflict=reduceFiberChunkPaths(paths,cfg);CHECK(conflict.ambiguousPaths==2);
+    // Shifted, reversed endpoints within the same geometric gate are duplicates.
+    paths.lines={straight(8),straight(8,8)};
+    for(auto& p:paths.lines[1])p[0]+=6;
+    std::reverse(paths.lines[1].begin(),paths.lines[1].end());
+    CHECK(reduceFiberChunkPaths(paths,cfg).fusedPaths==1);
+    for(auto& p:paths.lines[1])p[0]+=1e-8;
+    CHECK(reduceFiberChunkPaths(paths,cfg).fusedPaths==1);
+    // A tail exceeding the geometric gate cannot be fused.
+    paths.lines={straight(8),straight(8)};paths.lines[1].pop_back();
+    conflict=reduceFiberChunkPaths(paths,cfg);CHECK(conflict.ambiguousPaths==2);
+    // Nontransitive A~B~C must not turn A and C into a single identity.
+    paths.lines={straight(8),straight(18),straight(28)};paths.endReasons.assign(3,{"chunk_boundary","chunk_boundary"});
+    conflict=reduceFiberChunkPaths(paths,cfg);CHECK(conflict.ambiguousPaths==3);CHECK(conflict.fusedPaths==0);
+    const auto retainedChain=reduceFiberChunkPaths(paths,cfg,{},.4,false);
+    CHECK(retainedChain.representative==std::vector<int64_t>({0,1,2}));
+    CHECK(retainedChain.retainedAmbiguousPaths==3);CHECK(retainedChain.fusedPaths==0);
+    paths.lines={straight(8),straight(33)};paths.endReasons.resize(2);
+    auto separate=reduceFiberChunkPaths(paths,cfg);CHECK(separate.terminalPairs==0);CHECK(separate.ambiguousPaths==0);
+    // Invalid width at even one point may permit a soft join, but never prove equivalence.
+    paths.lines={straight(8),straight(8)};cfg.joinWidthWeight=true;
+    const auto incomplete=[](const std::vector<cv::Vec3d>& points){
+        std::vector<float> widths;for(const auto& p:points)widths.push_back(p[0]==80?std::numeric_limits<float>::quiet_NaN():40);return widths;};
+    conflict=reduceFiberChunkPaths(paths,cfg,incomplete);CHECK(conflict.ambiguousPaths==2);
+    const auto valid=[](const auto& points){return std::vector<float>(points.size(),40);};
+    CHECK(reduceFiberChunkPaths(paths,cfg,valid).fusedPaths==1);
+    // Retaining endpoint ambiguity does not resurrect the original conflict flags.
+    cfg.conflictNormalBase=10;cfg.conflictTangentBase=20;
+    paths.conflictFlags={true,false};
+    paths.conflictAnnotation={{"specification",{{"version",1},{"algorithm","chunk-conflict-v1"},
+        {"normal",cfg.conflictNormalBase},{"tangent",cfg.conflictTangentBase},
+        {"agreement",cfg.conflictAgreementBase},{"separation",cfg.conflictSeparationBase}}}};
+    CHECK(reduceFiberChunkPaths(paths,cfg,valid,.4,false).representative==std::vector<int64_t>({-1,1}));
 }
 
 TEST_CASE("conflict candidate shared-run boundary and gap preserve directed decisions") {

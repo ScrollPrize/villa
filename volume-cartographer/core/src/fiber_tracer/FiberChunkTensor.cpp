@@ -1,6 +1,7 @@
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "utils/zarr.hpp"
 #include "../render/SamplingWaitProfile.hpp"
 #include <algorithm>
 #include <cmath>
@@ -67,7 +68,7 @@ FiberPredictionSampleOption batchDirection(float presence,
 
 FiberChunkTensor::FiberChunkTensor(const FiberPredictionField& field,
     const vc::lasagna::LasagnaNormalSampler& normals,const cv::Vec3d& lo,const cv::Vec3d& hi,bool presenceOnly,
-    bool channelHints,std::size_t workerCacheBytes)
+    bool channelHints,std::size_t workerCacheBytes,bool retainCacheChunks)
 {
     const auto [prediction,multiplier]=field.chunkRegionChannels(lo,hi);
     const auto normal=normals.regionChannels();
@@ -101,6 +102,25 @@ FiberChunkTensor::FiberChunkTensor(const FiberPredictionField& field,
         for(auto& binding:pendingBindings_)binding.chunkSource=vc::render::rebindChunkCache(binding.chunkSource,partition);
     }
     widthIsFloat_=prediction[3].chunkSource->dtype()==vc::render::ChunkDtype::Float32;
+    if(retainCacheChunks) {
+        if(presenceOnly)throw std::invalid_argument("retained chunk sampling requires all companions");
+        retained_=std::make_shared<vc::render::PinnedChunkRegion>();
+        // chunkRegionChannels above already awaited coherent publication.
+        // These are ownership references to regular cache payloads, not copies.
+        for(const auto& binding:pendingBindings_) {
+            if(!binding.array->metadata().fill_value.has_value())
+                throw std::invalid_argument("retained tensor requires explicit fill values");
+            vc::lasagna::pinLasagnaRegion(*retained_,binding,lo,hi);
+        }
+        retained_->seal();
+        const std::array<int,3> upper{origin_[0]+shape_[0],origin_[1]+shape_[1],origin_[2]+shape_[2]};
+        for(size_t c=0;c<7;++c)
+            retainedChannels_[c]=std::make_unique<vc::render::PinnedChunkGrid>(
+                retained_,pendingBindings_[c].chunkSource,0,origin_,upper,
+                c?retainedChannels_[0].get():nullptr);
+        companionsLoaded_=true;pendingBindings_={};
+        return; // No Array3D::resize, ROI reads or voxel-array allocation.
+    }
     SerialRoi serial;
     channels_[0].resize(dims);
     vc::render::ChunkRequestContext request;
@@ -135,18 +155,19 @@ void FiberChunkTensor::requireCompanions() const
         throw std::logic_error("presence-only tensor must finish an eligible seedGrid before sampling companions");
 }
 
-bool FiberChunkTensor::cube(const cv::Vec3d& p,bool scalar,std::array<size_t,8>& indices,cv::Vec3d& f) const
+bool FiberChunkTensor::cube(const cv::Vec3d& p,bool scalar,Cube& cube,cv::Vec3d& f) const
 {
-    std::array<int,3> low{},high{};
+    auto& low=cube.lo;auto& high=cube.hi;
     for(int a=0;a<3;++a){
         if(!std::isfinite(p[a])||p[a]<0||(scalar?p[a]>volumeShape_[a]-1:p[a]>=volumeShape_[a]))return false;
         low[a]=int(std::floor(p[a]));high[a]=std::min(low[a]+1,volumeShape_[a]-1);
-        f[a]=p[a]-low[a];low[a]-=origin_[a];high[a]-=origin_[a];
-        if(low[a]<0||high[a]>shape_[a])throw std::out_of_range("dense chunk interpolation exceeded loaded region: axis="+std::to_string(a)+" lattice="+std::to_string(p[a])+" origin="+std::to_string(origin_[a])+" shape="+std::to_string(shape_[a])+" spacing="+std::to_string(spacing_));
+        f[a]=p[a]-low[a];
+        if(low[a]-origin_[a]<0||high[a]-origin_[a]>shape_[a])throw std::out_of_range("dense chunk interpolation exceeded loaded region: axis="+std::to_string(a)+" lattice="+std::to_string(p[a])+" origin="+std::to_string(origin_[a])+" shape="+std::to_string(shape_[a])+" spacing="+std::to_string(spacing_));
     }
+    if(retained_)return true; // No dense indices or index-to-XYZ roundtrip.
     for(size_t k=0;k<8;++k){
-        const auto x=(k&1)?high[0]:low[0],y=(k&2)?high[1]:low[1],z=(k&4)?high[2]:low[2];
-        indices[k]=size_t(z)+size_t(y)*(shape_[2]+1)+size_t(x)*(shape_[2]+1)*(shape_[1]+1);
+        const auto x=((k&1)?high[0]:low[0])-origin_[0],y=((k&2)?high[1]:low[1])-origin_[1],z=((k&4)?high[2]:low[2])-origin_[2];
+        cube.indices[k]=size_t(z)+size_t(y)*(shape_[2]+1)+size_t(x)*(shape_[2]+1)*(shape_[1]+1);
     }
     return true;
 }
@@ -156,23 +177,93 @@ std::array<uint8_t,8> FiberChunkTensor::bytes(size_t c,const std::array<size_t,8
     std::array<uint8_t,8> out;for(size_t k=0;k<8;++k)out[k]=channels_[c].data()[indices[k]];return out;
 }
 
+std::array<uint8_t,8> FiberChunkTensor::bytes(size_t c,Cube& cube) const
+{
+    return retained_?retainedCorners<uint8_t>(c,cube):bytes(c,cube.indices);
+}
+
+std::array<double,8> FiberChunkTensor::values(size_t c,Cube& cube) const
+{
+    if(retained_)return retainedCorners<double>(c,cube);
+    const auto& indices=cube.indices;
+    std::array<double,8> out;
+    for(size_t k=0;k<8;++k)out[k]=c<6?double(channels_[c].data()[indices[k]]):
+        (widthIsFloat_?double(floatWidth_.data()[indices[k]]):double(byteWidth_.data()[indices[k]]));
+    return out;
+}
+
+size_t FiberChunkTensor::ownedVoxelBytes() const
+{
+    size_t n=byteWidth_.size()+4*floatWidth_.size();for(const auto& c:channels_)n+=c.size();return n;
+}
+
+size_t FiberChunkTensor::pointerTableBytes() const
+{
+    size_t n=0;for(const auto& c:retainedChannels_)if(c)n+=c->tableBytes();return n;
+}
+
 FiberPredictionSample FiberChunkTensor::sample(const cv::Vec3d& p,const cv::Vec3d& ref) const
 {
     requireCompanions();
-    std::array<size_t,8> indices;cv::Vec3d f;
+    Cube indices;cv::Vec3d f;
     FiberPredictionSample result;
     if(!cube(p/spacing_,true,indices,f)){result.options.push_back({});return result;}
-    const auto direction=vc::lasagna::interpolateLasagnaCompactTensorCorners(bytes(1,indices),bytes(2,indices),f,allValid());
-    if(!direction){result.options.push_back({});return result;}
-    std::array<double,8> presence;for(size_t k=0;k<8;++k)presence[k]=channels_[0].data()[indices[k]];
-    result.options.push_back(materializeFiberScalarPrediction(vc::lasagna::interpolateLasagnaScalarCorners(presence,f),*direction,ref));
+    result.options.push_back(scalarOption(indices,f,ref));
     return result;
+}
+
+FiberPredictionSampleOption FiberChunkTensor::scalarOption(Cube& indices,const cv::Vec3d& f,const cv::Vec3d& ref) const
+{
+    FiberSamplingTimer<false> timer;return scalarOption(indices,f,ref,timer);
+}
+
+template<bool Measured,class T>
+std::array<T,8> FiberChunkTensor::sampleCorners(size_t channel,Cube& indices,FiberSamplingTimer<Measured>& timer) const
+{
+    // Same generic retained grid and owned-array operations. No profiling branch
+    // or clock survives in the normal specialization.
+    if(retained_){
+        const auto& grid=*retainedChannels_[channel];
+        if(!grid.accepts(indices.address)){
+            typename FiberSamplingTimer<Measured>::Scope stage(timer,SamplingStage::Address);
+            indices.address=grid.prepareCorners(indices.lo,indices.hi);
+        }
+        typename FiberSamplingTimer<Measured>::Scope stage(timer,SamplingStage::Gather);
+        return grid.corners<T>(indices.address);
+    }
+    typename FiberSamplingTimer<Measured>::Scope stage(timer,SamplingStage::Gather);
+    if constexpr(std::is_same_v<T,uint8_t>)return bytes(channel,indices);
+    else return values(channel,indices);
+}
+
+template<bool Measured>
+FiberPredictionSampleOption FiberChunkTensor::scalarOption(Cube& indices,const cv::Vec3d& f,
+    const cv::Vec3d& ref,FiberSamplingTimer<Measured>& timer) const
+{
+    using Scope=typename FiberSamplingTimer<Measured>::Scope;
+    const auto nx=sampleCorners<Measured,uint8_t>(1,indices,timer);
+    const auto ny=sampleCorners<Measured,uint8_t>(2,indices,timer);
+    const auto direction=[&]{
+        if constexpr(!Measured)return vc::lasagna::interpolateLasagnaCompactTensorCorners(nx,ny,f,allValid());
+        else {
+            const auto tensor=[&]{Scope stage(timer,SamplingStage::DirectionTensor);
+                return vc::lasagna::accumulateLasagnaCompactTensorCorners(nx,ny,f,allValid());}();
+            Scope stage(timer,SamplingStage::DirectionAxis);
+            return vc::lasagna::finalizeLasagnaCompactTensor(tensor);
+        }
+    }();
+    if(!direction)return {};
+    const auto presence=sampleCorners<Measured,double>(0,indices,timer);
+    const auto interpolated=[&]{Scope stage(timer,SamplingStage::Presence);
+        return vc::lasagna::interpolateLasagnaScalarCorners(presence,f);}();
+    Scope stage(timer,SamplingStage::PredictionOutput);
+    return materializeFiberScalarPrediction(interpolated,*direction,ref);
 }
 
 FiberPredictionSampleOption FiberChunkTensor::batchOption(const cv::Vec3d& p,const cv::Vec3d& ref,double threshold) const
 {
     // Match the existing double -> float point conversion, then float division.
-    const cv::Vec3f fp=cv::Vec3f(p)/float(spacing_);std::array<size_t,8> indices;cv::Vec3d fd;
+    const cv::Vec3f fp=cv::Vec3f(p)/float(spacing_);Cube indices;cv::Vec3d fd;
     if(!cube(cv::Vec3d(fp),false,indices,fd))return {};
     const cv::Vec3f f(fd),reference(ref);
     const auto weights=vc::lasagna::lasagnaCornerWeights(f);
@@ -190,6 +281,7 @@ float FiberChunkTensor::seedPresence(const cv::Vec3d& p,double threshold) const
 nlohmann::json FiberChunkTensor::seedGrid(const cv::Vec3d& lo,double scale,double grid,
     int side,double threshold,std::vector<float>& output)
 {
+    if(retained_)throw std::logic_error("regular seed grid requires owned tensor backend");
     if(side<1 || side>1024 || !std::isfinite(scale) || scale<=0 ||
        !std::isfinite(grid) || grid<=0 || !std::isfinite(threshold) || threshold<0 || threshold>1)
         throw std::invalid_argument("invalid regular seed grid");
@@ -305,11 +397,25 @@ void FiberChunkTensor::sampleBatch(const std::vector<cv::Vec3d>& points,const st
 
 float FiberChunkTensor::width(const cv::Vec3f& p) const
 {
-    std::array<size_t,8> indices;cv::Vec3d f;
+    Cube indices;cv::Vec3d f;
     if(!cube(cv::Vec3d(p)/spacing_,true,indices,f))return 0;
-    std::array<double,8> values;
-    for(size_t k=0;k<8;++k)values[k]=widthIsFloat_?double(floatWidth_.data()[indices[k]]):double(byteWidth_.data()[indices[k]]);
-    const auto value=vc::lasagna::interpolateLasagnaMaskedScalarCorners(values,f,bytes(0,indices));
+    return width(indices,f);
+}
+
+float FiberChunkTensor::width(Cube& indices,const cv::Vec3d& f) const
+{
+    FiberSamplingTimer<false> timer;return width(indices,f,timer);
+}
+
+template<bool Measured>
+float FiberChunkTensor::width(Cube& indices,const cv::Vec3d& f,FiberSamplingTimer<Measured>& timer) const
+{
+    using Scope=typename FiberSamplingTimer<Measured>::Scope;
+    const auto mask=sampleCorners<Measured,uint8_t>(0,indices,timer);
+    const auto samples=sampleCorners<Measured,double>(6,indices,timer);
+    const auto value=[&]{Scope stage(timer,SamplingStage::WidthInterpolation);
+        return vc::lasagna::interpolateLasagnaMaskedScalarCorners(samples,f,mask);}();
+    Scope stage(timer,SamplingStage::WidthConversion);
     if(!value||!std::isfinite(*value)||!std::isfinite(*value * *value))return 0;
     // Existing vector materialization rounds before unit conversion.
     return static_cast<float>(static_cast<float>(*value)*widthMultiplier_);
@@ -324,24 +430,95 @@ void FiberChunkTensor::sampleWidths(const std::vector<cv::Vec3f>& points,std::ve
 vc::lasagna::NormalSample FiberChunkTensor::sampleNormal(const cv::Vec3d& p) const
 {
     requireCompanions();
-    std::array<size_t,8> indices;cv::Vec3d f;
+    Cube indices;cv::Vec3d f;
     if(!cube(p/spacing_,true,indices,f))return {{},false,"outside normal volume"};
-    const auto mask=bytes(3,indices);std::array<double,8> grad;
-    for(size_t k=0;k<8;++k)grad[k]=mask[k];
-    if(vc::lasagna::interpolateLasagnaScalarCorners(grad,f)<=0)return {{},false,"zero normal magnitude"};
-    const auto normal=vc::lasagna::interpolateLasagnaCompactTensorCorners(bytes(4,indices),bytes(5,indices),f,maskNormals_?mask:allValid());
+    return normal(indices,f);
+}
+
+vc::lasagna::NormalSample FiberChunkTensor::normal(Cube& indices,const cv::Vec3d& f) const
+{
+    FiberSamplingTimer<false> timer;return normal(indices,f,timer);
+}
+
+template<bool Measured>
+vc::lasagna::NormalSample FiberChunkTensor::normal(Cube& indices,const cv::Vec3d& f,FiberSamplingTimer<Measured>& timer) const
+{
+    using Scope=typename FiberSamplingTimer<Measured>::Scope;
+    const auto mask=sampleCorners<Measured,uint8_t>(3,indices,timer);
+    const auto magnitude=[&]{Scope stage(timer,SamplingStage::NormalValidity);
+        std::array<double,8> grad;for(size_t k=0;k<8;++k)grad[k]=mask[k];
+        return vc::lasagna::interpolateLasagnaScalarCorners(grad,f);}();
+    if(magnitude<=0)return {{},false,"zero normal magnitude"};
+    const auto nx=sampleCorners<Measured,uint8_t>(4,indices,timer);
+    const auto ny=sampleCorners<Measured,uint8_t>(5,indices,timer);
+    const auto normal=[&]{
+        if constexpr(!Measured)return vc::lasagna::interpolateLasagnaCompactTensorCorners(nx,ny,f,maskNormals_?mask:allValid());
+        else {
+            const auto tensor=[&]{Scope stage(timer,SamplingStage::NormalTensor);
+                return vc::lasagna::accumulateLasagnaCompactTensorCorners(nx,ny,f,maskNormals_?mask:allValid());}();
+            Scope stage(timer,SamplingStage::NormalAxis);
+            return vc::lasagna::finalizeLasagnaCompactTensor(tensor);
+        }
+    }();
     return normal?vc::lasagna::NormalSample{*normal,true,{}}:vc::lasagna::NormalSample{{},false,"invalid normal"};
+}
+
+void FiberChunkTensor::sampleCandidateChannels(const std::vector<cv::Vec3f>& points,
+    const std::vector<cv::Vec3f>& directions,bool withNormals,bool withWidths,
+    std::vector<FiberPredictionSample>& predictions,std::vector<vc::lasagna::NormalSample>& normals,
+    std::vector<float>& widths,FiberSamplingProfile* profile) const
+{
+    if(profile)sampleCandidateChannelsImpl<true>(points,directions,withNormals,withWidths,predictions,normals,widths,profile);
+    else sampleCandidateChannelsImpl<false>(points,directions,withNormals,withWidths,predictions,normals,widths,nullptr);
+}
+
+template<bool Measured>
+void FiberChunkTensor::sampleCandidateChannelsImpl(const std::vector<cv::Vec3f>& points,
+    const std::vector<cv::Vec3f>& directions,bool withNormals,bool withWidths,
+    std::vector<FiberPredictionSample>& predictions,std::vector<vc::lasagna::NormalSample>& normals,
+    std::vector<float>& widths,FiberSamplingProfile* profile) const
+{
+    FiberSamplingTimer<Measured> timer(profile);
+    using Scope=typename FiberSamplingTimer<Measured>::Scope;
+    requireCompanions();
+    if(points.size()!=directions.size())throw std::invalid_argument("candidate point/direction count mismatch");
+    predictions.resize(points.size());normals.resize(withNormals?points.size():0);widths.resize(withWidths?points.size():0);
+    for(size_t i=0;i<points.size();++i){
+        Cube indices;cv::Vec3d f;
+        auto& out=predictions[i].options;out.clear();
+        const auto inside=[&]{Scope stage(timer,SamplingStage::Coordinates);
+            return cube(cv::Vec3d(points[i])/spacing_,true,indices,f);}();
+        if(!inside){
+            out.push_back({});
+            if(withNormals)normals[i]={{},false,"outside normal volume"};
+            if(withWidths)widths[i]=0;
+            continue;
+        }
+        out.push_back(scalarOption(indices,f,cv::Vec3d(directions[i]),timer));
+        if(withNormals)normals[i]=normal(indices,f,timer);
+        // Width may have independent chunk strides; retainedCorners validates
+        // layout identity and prepares a new address only in that case.
+        if(withWidths)widths[i]=width(indices,f,timer);
+    }
 }
 
 void FiberChunkTensor::packGpu(std::vector<unsigned char>& output,std::vector<float>& widths) const
 {
+    if(retained_)throw std::logic_error("GPU packing requires owned tensor backend");
     requireCompanions();
     const size_t count=size_t(shape_[0])*shape_[1]*shape_[2];output.resize(count*6);widths.resize(count);
     size_t i=0;
     for(int z=0;z<shape_[2];++z)for(int y=0;y<shape_[1];++y)for(int x=0;x<shape_[0];++x,++i){
-        // Preserve original GPU lattice validity checks; no silent padding change.
+        // A boundary core still needs a complete lookahead halo. Outside the
+        // physical volume there is no prediction, direction, normal or width:
+        // explicitly mark those lattice nodes invalid, including reused buffers.
+        bool inside=true;
         for(int a=0;a<3;++a){const int v=origin_[a]+(a==0?x:a==1?y:z);
-            if(v<0||v>=volumeShape_[a])throw std::out_of_range("GPU fixture lattice outside volume");}
+            inside&=v>=0&&v<volumeShape_[a];}
+        if(!inside){
+            std::fill_n(output.data()+6*i,6,0);widths[i]=0;
+            continue;
+        }
         for(size_t c=0;c<6;++c)output[6*i+c]=channels_[c](z,y,x);
         const cv::Vec3f p((origin_[0]+x)*spacing_,(origin_[1]+y)*spacing_,(origin_[2]+z)*spacing_);
         widths[i]=width(p);

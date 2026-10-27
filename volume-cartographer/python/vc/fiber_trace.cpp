@@ -45,6 +45,50 @@ namespace {
 using Vec3 = std::array<double, 3>;
 using PointsIn = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 
+// Synchronous per-call collector. active is accessed only while holding the GIL;
+// readers/reusers cannot touch values while native tracing mutates them.
+struct TraceProfileHandle {
+    ft::FiberTraceProfile value;
+    bool active = false;
+};
+struct TraceProfileUse {
+    TraceProfileHandle* handle;
+    explicit TraceProfileUse(TraceProfileHandle* p) : handle(p) {
+        if (!p) return;
+        if (p->active) throw std::runtime_error("trace profile is already in use");
+        p->value = {};
+        p->active = true;
+    }
+    ~TraceProfileUse() { if (handle) handle->active = false; }
+};
+
+nb::dict profileDict(const TraceProfileHandle& handle) {
+    if (handle.active) throw std::runtime_error("trace profile is already in use");
+    const auto& p=handle.value; nb::dict out;
+#define VC_PROFILE_FIELD(name) out[#name]=nb::cast(p.name)
+    VC_PROFILE_FIELD(oneWayCalls); VC_PROFILE_FIELD(generations); VC_PROFILE_FIELD(candidateTasks);
+    VC_PROFILE_FIELD(candidateDepth1BatchSizes); VC_PROFILE_FIELD(candidateDepth2BatchSizes);
+    VC_PROFILE_FIELD(startSampleSeconds); VC_PROFILE_FIELD(widthSampleSeconds); VC_PROFILE_FIELD(widthSamplePoints);
+    VC_PROFILE_FIELD(combinedChannelSampleSeconds);
+    VC_PROFILE_FIELD(samplingWindowLoads); VC_PROFILE_FIELD(samplingWindowFallbacks);
+    VC_PROFILE_FIELD(samplingWindowPeakBytes); VC_PROFILE_FIELD(samplingWindowLoadSeconds);
+    VC_PROFILE_FIELD(samplingWindowPeakTableBytes); VC_PROFILE_FIELD(samplingWindowCopiedBytes);
+    VC_PROFILE_FIELD(taskBuildSeconds); VC_PROFILE_FIELD(predictionBatchSeconds);
+    VC_PROFILE_FIELD(readinessPlanSeconds); VC_PROFILE_FIELD(readinessPlanPoints); VC_PROFILE_FIELD(readinessPlanDependencies);
+    VC_PROFILE_FIELD(predictionPrepareSeconds); VC_PROFILE_FIELD(predictionPrefetchSeconds);
+    VC_PROFILE_FIELD(predictionAssignSeconds); VC_PROFILE_FIELD(predictionMaterializeSeconds);
+    VC_PROFILE_FIELD(predictionCornerSeconds); VC_PROFILE_FIELD(predictionCornerPrepareSeconds);
+    VC_PROFILE_FIELD(predictionCornerLayoutSeconds); VC_PROFILE_FIELD(predictionCornerPinSeconds);
+    VC_PROFILE_FIELD(predictionCornerGatherSeconds); VC_PROFILE_FIELD(predictionDecodeSeconds);
+    VC_PROFILE_FIELD(normalDecodeSeconds); VC_PROFILE_FIELD(normalBatchSeconds);
+    VC_PROFILE_FIELD(normalPrefetchSeconds); VC_PROFILE_FIELD(normalMaterializeSeconds);
+    VC_PROFILE_FIELD(candidateScoreSeconds); VC_PROFILE_FIELD(frontierSeconds); VC_PROFILE_FIELD(pruneSeconds);
+    VC_PROFILE_FIELD(lookaheadDecisionSeconds); VC_PROFILE_FIELD(lookaheadParentOrderSeconds);
+    VC_PROFILE_FIELD(lookaheadFrontierStorageSeconds);
+#undef VC_PROFILE_FIELD
+    return out;
+}
+
 cv::Vec3d toVec(const Vec3& value)
 {
     return {value[0], value[1], value[2]};
@@ -239,6 +283,7 @@ const std::vector<ConfigField>& configFields()
         field<size_t, &ft::FiberTraceConfig::lookaheadParentCap>("lookahead_parent_cap"),
         field<size_t, &ft::FiberTraceConfig::lookaheadRetryParentCap>("lookahead_retry_parent_cap"),
         field<int, &ft::FiberTraceConfig::parallelThreads>("parallel_threads"),
+        field<int, &ft::FiberTraceConfig::samplingWindowVoxels>("sampling_window_voxels"),
         field<double, &ft::FiberTraceConfig::smoothnessWeight>("smoothness_weight"),
         field<double, &ft::FiberTraceConfig::smoothnessNormalWeight>("smoothness_normal_weight"),
         field<double, &ft::FiberTraceConfig::smoothnessTangentWeight>("smoothness_tangent_weight"),
@@ -252,6 +297,19 @@ const std::vector<ConfigField>& configFields()
         field<double, &ft::FiberTraceConfig::traceToBaseScale>("trace_to_base_scale"),
         field<double, &ft::FiberTraceConfig::replayPresenceCutoff>("replay_presence_cutoff"),
         field<bool, &ft::FiberTraceConfig::replayPresenceModulated>("replay_presence_modulated"),
+        field<bool, &ft::FiberTraceConfig::replayPresenceIgnoreWidth>("replay_presence_ignore_width"),
+        field<double, &ft::FiberTraceConfig::widthHardRelativeTolerance>("width_hard_relative_tolerance"),
+        field<double, &ft::FiberTraceConfig::replayReverseIntervalBase>("replay_reverse_interval_base"),
+        field<double, &ft::FiberTraceConfig::replayReverseNormalRadiusBase>("replay_reverse_normal_radius_base"),
+        field<double, &ft::FiberTraceConfig::replayReverseTangentialRadiusBase>("replay_reverse_tangential_radius_base"),
+        field<int, &ft::FiberTraceConfig::replayReverseHistorySteps>("replay_reverse_history_steps"),
+        field<int, &ft::FiberTraceConfig::replayReverseDelaySteps>("replay_reverse_delay_steps"),
+        field<double, &ft::FiberTraceConfig::replayReverseConvergenceMinBase>("replay_reverse_convergence_min_base"),
+        field<double, &ft::FiberTraceConfig::replayReverseConvergenceDistanceBase>("replay_reverse_convergence_distance_base"),
+        field<double, &ft::FiberTraceConfig::replayReverseConvergenceAngleDegrees>("replay_reverse_convergence_angle_degrees"),
+        field<int, &ft::FiberTraceConfig::replayReverseConvergenceSteps>("replay_reverse_convergence_steps"),
+        field<bool, &ft::FiberTraceConfig::replayReverseToStart>("replay_reverse_to_start"),
+        field<bool, &ft::FiberTraceConfig::replayReverseAllEndpoints>("replay_reverse_all_endpoints"),
         field<double, &ft::FiberTraceConfig::widthRelativeTolerance>("width_relative_tolerance"),
         field<bool, &ft::FiberTraceConfig::widthCosineWeight>("width_cosine_weight"),
         field<double, &ft::FiberTraceConfig::widthReferenceMean>("width_reference_mean"),
@@ -274,8 +332,12 @@ void setConfigField(ft::FiberTraceConfig& config, const std::string& key, nb::ha
 nb::dict configToDict(const ft::FiberTraceConfig& config)
 {
     nb::dict out;
-    for (const auto& entry : configFields())
+    for (const auto& entry : configFields()) {
+        // Preserve existing default serialization/cache identity for this opt-in.
+        if(std::string_view(entry.key)=="sampling_window_voxels" && config.samplingWindowVoxels==0)
+            continue;
         out[entry.key] = entry.get(config);
+    }
     return out;
 }
 
@@ -339,11 +401,12 @@ struct ChunkCacheHandle {
     const PredictionFieldHandle& predictions;
     const NormalSamplerHandle& normals;
     const ft::FiberTraceConfig trace;
+    const std::string directory,identity;
     ft::FiberChunkTraceCache cache;
     ChunkCacheHandle(const PredictionFieldHandle& p,const NormalSamplerHandle& n,
         const ft::FiberTraceConfig& t,const ft::FiberChunkTraceConfig& c,
         const std::string& output,const std::string& identity)
-        : predictions(p),normals(n),trace(checkedConfig(p,t,&n)),cache(c,output,identity) {}
+        : predictions(p),normals(n),trace(checkedConfig(p,t,&n)),directory(output),identity(identity),cache(c,output,identity) {}
     ChunkPathsHandle get(const std::array<int,3>& key) {
         nb::gil_scoped_release release;
         return {cache.get(key,*predictions.field,trace,*normals.sampler,predictions.scales.traceToBaseScale)};
@@ -385,7 +448,7 @@ nb::dict chunkRoute(ChunkCacheHandle& self,Vec3 center,Vec3 direction,
         reason=ft::traceFiberChunkRoute(get,self.cache.config(),*self.predictions.field,self.trace,
             self.predictions.scales.traceToBaseScale,region,toVec(direction),maximumDistance,maximumSteps,
             [&](const auto& p,double,int){points.push_back(p);return true;},
-            [&](const auto& j){joins.push_back(j);});
+            [&](const auto& j){joins.push_back(j);},nullptr,self.normals.sampler.get());
     }
     nb::dict out;out["points_base"]=pointsArray(points);out["reason"]=reason;out["joins"]=nb::cast(joins);
     return out;
@@ -393,7 +456,7 @@ nb::dict chunkRoute(ChunkCacheHandle& self,Vec3 center,Vec3 direction,
 
 ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& points,
     const NormalSamplerHandle& evaluationNormals,const ft::FiberChunkReplayConfig& config,
-    double begin,const std::optional<double>& end,double reverseInterval)
+    double begin,const std::optional<double>& end,double reverseInterval,const ft::FiberChunkRoutingRules* rules)
 {
     const auto reference=ft::makePolylineArcGeometry(toPoints(points,"reference_base"));
     const auto c=config;
@@ -402,13 +465,17 @@ ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& po
     nb::gil_scoped_release release;
     return ft::traceFiberChunkReferenceReplay(self.cache,*self.predictions.field,self.trace,
         self.predictions.scales.traceToBaseScale,*self.normals.sampler,reference,begin,end.value_or(reference.length()),
-        *evaluationNormals.sampler,evaluationNormals.workingToBaseScale,c,{},{},{},{},policy);
+        *evaluationNormals.sampler,evaluationNormals.workingToBaseScale,c,{},{},{},{},policy,{},rules);
 }
 
 } // namespace
 
 NB_MODULE(fiber_trace, m)
 {
+    nb::class_<TraceProfileHandle>(m,"TraceProfile")
+        .def(nb::init<>())
+        .def("to_dict",&profileDict,
+             "Snapshot completed-call counters. Read/reuse while active is rejected.");
     m.def("configure_chunk_loader",[](size_t cores,size_t bytes,const std::string& backend,size_t window){
         nb::gil_scoped_release release;
         auto options=vc::render::ChunkCacheService::batchOptions(cores,bytes);
@@ -442,6 +509,21 @@ NB_MODULE(fiber_trace, m)
             *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale, c, r, interval);
     }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "case"_a, "replay"_a,
        "reverse_interval_base"_a=0.);
+    m.def("training_replay", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+        const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
+        const ft::FiberEvaluationCase& input, const ft::FiberChunkReplayConfig& replay,
+        bool predictionBasedSeeding, TraceProfileHandle* profile) {
+        auto trace = checkedConfig(field, config, &normals);
+        const auto c = input;
+        const auto r = replay;
+        TraceProfileUse use(profile);
+        if (profile) trace.profile=&profile->value;
+        nb::gil_scoped_release release;
+        return ft::replayFiberTrainingCase(*field.field, trace, field.scales.traceToBaseScale,
+            *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale,
+            c, r, {}, predictionBasedSeeding);
+    }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "case"_a, "replay"_a,
+       "prediction_based_seeding"_a=true,"profile"_a=nb::none());
     m.def("beam_replay_many", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
         const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
         const std::vector<ft::FiberEvaluationCase>& input, const ft::FiberChunkReplayConfig& replay,
@@ -524,6 +606,22 @@ NB_MODULE(fiber_trace, m)
             output,identity,copiedKeys,control,workers,contexts);
     },"field"_a,"normals"_a,"trace"_a,"chunks"_a,"output"_a,"source_identity"_a,"keys_xyz"_a,
        "control"_a,"workers"_a=4,"contexts_per_worker"_a=8);
+    m.def("export_chunk_routes",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
+        const ft::FiberTraceConfig& trace,const ft::FiberChunkTraceConfig& chunks,
+        const std::string& directory,const std::string& output,const std::string& identity,
+        const std::vector<std::array<int,3>>& keys,const std::vector<std::array<int,3>>& seeds,
+        ft::FiberEvaluationControl& control,size_t workers,size_t contexts,size_t cacheBytes,
+        double maximumDistance,int maximumSteps,size_t pagePoints,bool reduceDuplicates,bool rejectAmbiguous) {
+        const auto t=checkedConfig(field,trace,&normals);const auto c=chunks;
+        const auto copiedKeys=keys,copiedSeeds=seeds;
+        const ft::FiberChunkRouteVolumeConfig config{cacheBytes,maximumDistance,maximumSteps,pagePoints,reduceDuplicates,rejectAmbiguous};
+        nb::gil_scoped_release release;
+        ft::exportFiberChunkRoutes(*field.field,t,field.scales.traceToBaseScale,*normals.sampler,c,
+            directory,output,identity,copiedKeys,copiedSeeds,config,control,workers,contexts);
+    },"field"_a,"normals"_a,"trace"_a,"chunks"_a,"chunk_directory"_a,"output"_a,"source_identity"_a,
+        "keys_xyz"_a,"seed_keys_xyz"_a,"control"_a,"workers"_a=4,"contexts_per_worker"_a=1,
+        "cache_bytes"_a=size_t(1024ULL*1024*1024),"maximum_distance_base"_a=1000000.,
+        "maximum_steps"_a=100000,"page_points"_a=50000,"reduce_duplicate_paths"_a=true,"reject_ambiguous_paths"_a=true);
     m.def("build_chunk_paths",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
                                  const ft::FiberTraceConfig& t,const ft::FiberChunkTraceConfig& c,
                                  const std::array<int,3>& key,size_t workers) {
@@ -626,6 +724,10 @@ NB_MODULE(fiber_trace, m)
     nb::class_<ft::FiberReplayTraceResult>(m,"ReplayResult")
         .def_ro("filtered_stops",&ft::FiberReplayTraceResult::filteredStops)
         .def_ro("reverse_checks",&ft::FiberReplayTraceResult::reverseChecks)
+        .def_ro("reverse_diagnostics",&ft::FiberReplayTraceResult::reverseDiagnostics)
+        .def_ro("reverse_stop_tail_checks",&ft::FiberReplayTraceResult::reverseStopTailChecks)
+        .def_ro("reverse_stop_tail_passed",&ft::FiberReplayTraceResult::reverseStopTailPassed)
+        .def_ro("reverse_stop_tail_history_only",&ft::FiberReplayTraceResult::reverseStopTailHistoryOnly)
         .def_ro("tangential_threshold_factor",&ft::FiberReplayTraceResult::tangentialThresholdFactor)
         .def_ro("reference_begin_arc_base",&ft::FiberReplayTraceResult::referenceBeginArcBase)
         .def_ro("reference_end_arc_base",&ft::FiberReplayTraceResult::referenceEndArcBase)
@@ -719,12 +821,34 @@ NB_MODULE(fiber_trace, m)
             manifest.sourceToBase*group->scaleFactor(),*manifest.baseShapeZYX);
     },"field"_a);
 
+    nb::class_<ft::FiberStoredRouteSet>(m,"StoredRouteSet")
+        .def("__init__",[](ft::FiberStoredRouteSet* self,const std::vector<PointsIn>& arrays,
+            const std::vector<std::array<std::string,2>>& reasons){
+            std::vector<std::vector<cv::Vec3d>> lines;for(const auto& a:arrays)lines.push_back(toPoints(a,"route"));
+            nb::gil_scoped_release release;new(self)ft::FiberStoredRouteSet(std::move(lines),reasons);
+        },"lines_base"_a,"end_reasons"_a)
+        .def("replay",[](const ft::FiberStoredRouteSet& routes,const PredictionFieldHandle& field,
+            const ft::FiberTraceConfig& trace,const PointsIn& points,const NormalSamplerHandle& normals,
+            const ft::FiberChunkTraceConfig& chunks,const ft::FiberChunkReplayConfig& replay){
+            const auto reference=ft::makePolylineArcGeometry(toPoints(points,"reference_base"));
+            const auto t=checkedConfig(field,trace,&normals);const auto c=chunks;const auto r=replay;
+            nb::gil_scoped_release release;
+            return routes.replay(*field.field,t,field.scales.traceToBaseScale,reference,*normals.sampler,
+                normals.workingToBaseScale,c,r);
+        },"field"_a,"trace"_a,"reference_base"_a.noconvert(),"evaluation_normals"_a,"chunks"_a,"config"_a);
+
+    nb::class_<ft::FiberChunkRoutingRules>(m,"ChunkRoutingRules");
     nb::class_<ChunkCacheHandle>(m,"ChunkCache")
         .def(nb::init<const PredictionFieldHandle&,const NormalSamplerHandle&,const ft::FiberTraceConfig&,
              const ft::FiberChunkTraceConfig&,const std::string&,const std::string&>(),
              "field"_a,"normal_sampler"_a,"trace_config"_a,"chunk_config"_a,"output_directory"_a,"source_identity"_a,
              nb::keep_alive<1,2>(),nb::keep_alive<1,3>())
         .def("get",&ChunkCacheHandle::get,"key_xyz"_a)
+        .def("routing_rules",[](const ChunkCacheHandle& self,const std::string& directory){
+            nb::gil_scoped_release release;
+            return ft::FiberChunkRoutingRules(directory,self.directory,self.cache.config(),self.trace,
+                self.predictions.scales.traceToBaseScale,self.identity);
+        },"export_directory"_a,"Load complete, source/config-validated export rules; no inference or tracing.")
         .def("get_many",&ChunkCacheHandle::getMany,"keys_xyz"_a,"workers"_a=4,"contexts_per_worker"_a=8,
              "Bounded native cases; ordered results, cooperative publication and cache waits.")
         .def("replay_many", [](ChunkCacheHandle& self, const std::vector<ft::FiberEvaluationCase>& cases,
@@ -745,7 +869,7 @@ NB_MODULE(fiber_trace, m)
              "maximum_distance_base"_a,"maximum_steps"_a,
              "Return committed suffix points (excluding initial snap), reason and join diagnostics.")
         .def("replay",&chunkReplay,"reference_base"_a.noconvert(),"evaluation_normals"_a,"config"_a,
-             "begin_arc_base"_a=0.,"end_arc_base"_a=nb::none(),"reverse_interval_base"_a=0.,
+             "begin_arc_base"_a=0.,"end_arc_base"_a=nb::none(),"reverse_interval_base"_a=0.,"rules"_a=nb::none(),
              "Shared reference replay; optional reverse checks use the configured acceptance radii.");
 
     m.def("case_queue_supported",&ft::FiberCaseQueue::supported);
@@ -789,6 +913,7 @@ NB_MODULE(fiber_trace, m)
         .def_rw("lookahead_parent_cap", &ft::FiberTraceConfig::lookaheadParentCap)
         .def_rw("lookahead_retry_parent_cap", &ft::FiberTraceConfig::lookaheadRetryParentCap)
         .def_rw("parallel_threads", &ft::FiberTraceConfig::parallelThreads)
+        .def_rw("sampling_window_voxels", &ft::FiberTraceConfig::samplingWindowVoxels)
         .def_rw("smoothness_weight", &ft::FiberTraceConfig::smoothnessWeight)
         .def_rw("smoothness_normal_weight", &ft::FiberTraceConfig::smoothnessNormalWeight)
         .def_rw("smoothness_tangent_weight", &ft::FiberTraceConfig::smoothnessTangentWeight)
@@ -804,6 +929,8 @@ NB_MODULE(fiber_trace, m)
         .def_rw("trace_to_base_scale", &ft::FiberTraceConfig::traceToBaseScale)
         .def_rw("replay_presence_cutoff", &ft::FiberTraceConfig::replayPresenceCutoff)
         .def_rw("replay_presence_modulated", &ft::FiberTraceConfig::replayPresenceModulated)
+        .def_rw("replay_presence_ignore_width", &ft::FiberTraceConfig::replayPresenceIgnoreWidth)
+        .def_rw("width_hard_relative_tolerance", &ft::FiberTraceConfig::widthHardRelativeTolerance)
         .def_rw("width_relative_tolerance", &ft::FiberTraceConfig::widthRelativeTolerance)
         .def_rw("width_cosine_weight", &ft::FiberTraceConfig::widthCosineWeight)
         .def_rw("width_reference_mean", &ft::FiberTraceConfig::widthReferenceMean)
