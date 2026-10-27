@@ -51,8 +51,8 @@ collection export imports through the store, edits persist before Save, external
 journal updates are observed, and edits survive a fresh VC3D process. For
 surfaces it lists a user surface beside a read-only catalog store surface;
 activation, tags, rename and review commit to the store; cropping commits a child
-geometry revision; the catalog surface refuses edits until
-`segments.create_editable_copy` copies it into the user's store. Two hosted
+geometry revision; the catalog surface refuses rename and tags, and enabling
+editing on it imports it into the user's store as the same surface. Two hosted
 replicas exchange fiber and surface edits through a hub, and a lease held
 elsewhere blocks editing. Supplying `--database PATH` instead runs against a
 disposable backup of a current database.

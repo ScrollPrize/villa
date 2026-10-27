@@ -165,8 +165,7 @@ inline const SurfaceCatalog::Row& writableCatalogRow(SurfaceCatalog* catalog, co
     if (row.catalog) {
         QJsonObject data;
         data["id"] = segmentIdQ;
-        data["action"] = "segments.create_editable_copy";
-        data["detail"] = "catalog surfaces are read-only; make an editable copy first";
+        data["detail"] = "catalog surfaces change only by editing their geometry, which brings them into your store";
         throw AgentBridgeError{-32009, "Cannot change a read-only catalog surface", data};
     }
     return row;

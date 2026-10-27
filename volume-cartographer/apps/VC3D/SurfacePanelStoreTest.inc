@@ -6,11 +6,12 @@
 #include <vc_object_store/Uuid.hpp>
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
+#include "OpenDataSurfaceStore.hpp"
 #include <QTreeWidget>
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
 // read-only catalog store listed beside it at a pyramid level, fetched on
-// activation and copied into the user's store.
+// activation and edited in the user's store as the same surface.
 int runSurfacePanelStoreTests()
 {
     using namespace vc::objects;
@@ -141,23 +142,45 @@ int runSurfacePanelStoreTests()
                 }),
                 "Patch Tracer sources load from their own stores, catalog ones scaled to the volume");
 
-        const auto copy = catalog.copy(shown, "editable");
-        catalog.readNow({copy});
-        require(catalog.row(copy) && !catalog.row(copy)->catalog && catalog.row(copy)->toolInput(),
-                "a copy of a catalog surface is the user's, in the open volume's voxels");
-        require(panel.activateSurfaceById(copy, &error) && panel.opened()->editable &&
-                (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "the copy opens editable");
+        // Editing a catalog surface edits it in the user's store as the same
+        // surface. The open volume is the catalog volume's level 1, registered in
+        // the user's store as VC3D does when it opens one.
+        vc3d::opendata::registerVolumeLevel(*state.objectStoreSession(), attachment, "panel-volume", "catalog-volume", 1);
+        require(panel.activateSurfaceById(shown, &error), "the catalog surface opens");
+        const auto onScreen = panel.opened()->surface;
+        require(panel.editInUserStore(shown, &error) && panel.opened()->editable &&
+                    panel.opened()->pin.attachment == attachment && panel.opened()->surface == onScreen,
+                "editing a catalog surface continues it, on screen, in the user's store");
+        require(!catalog.row(shown)->catalog && catalog.row(shown)->original &&
+                    catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5),
+                "its row is the user's, as stored, with the catalog version as its original");
+        require(tree.topLevelItemCount() == 4, "it is listed once");
+        std::string catalogVersion;
+        state.objectStoreSession()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            const auto history = db.objectHistory(txn, shown);
+            require(history.size() == 1 && nlohmann::json::parse(history.front().record.meta)["coordinates"]["volume_uuid"] ==
+                                               "catalog-volume", "its first revision is the catalog version as stored");
+            catalogVersion = history.front().uuid;
+        });
+        catalog.rename(shown, "edited");
+        pump([&] { return catalog.row(shown)->record.name == "edited"; }, "the imported surface is edited in the user's store");
+        const auto past = catalog.open(shown, catalogVersion);
+        require(!past.current && !past.editable && past.surface->id == shown &&
+                    (*past.surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "a past revision opens read-only");
+        require(panel.resetToCatalogVersion(shown, &error), "an imported surface resets to its catalog version");
+        pump([&] { return catalog.row(shown)->record.name == "shown"; }, "the reset restores the catalog version");
 
         // The Transforms dock lists the volumes the store maps into the open one,
         // including a registration committed while it is shown.
         state.setCurrentVolume(volume);
         VolumeRegistrationsPanel registrations(&state);
         auto* related = registrations.findChild<QTreeWidget*>();
-        require(related && related->topLevelItemCount() == 0, "no registrations yet");
+        require(related && related->topLevelItemCount() == 1 && related->topLevelItem(0)->text(0) == "catalog-volume",
+                "the dock lists the catalog volume the open volume shows");
         vc3d::registrations::registerAffine(*state.objectStoreSession(), attachment, "scan-b", "panel-volume",
                                             vc::objects::VolumeAffine::scale(2), "test registration");
         state.pollObjectStoreChanges();
-        require(related->topLevelItemCount() == 1 && related->topLevelItem(0)->text(0) == "scan-b",
+        require(related->topLevelItemCount() == 2 && !related->findItems("scan-b", Qt::MatchExactly).isEmpty(),
                 "a committed registration appears in the Transforms dock");
         state.detachObjectStore();
         std::cerr << "surface panel store tests passed\n";

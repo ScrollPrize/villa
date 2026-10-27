@@ -332,58 +332,6 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
 }
 
 
-// A catalog (Open Data) surface copied into the user's store in the open
-// volume's voxels, then activated: the editable copy.
-QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue& params)
-{
-    if (_window->_segmentationWidget &&
-        _window->_segmentationWidget->isEditingEnabled()) {
-        throw AgentBridgeError{
-            -32004,
-            "Cannot create an editable copy while editing",
-            QJsonObject{{"detail", "disable segmentation editing first"}},
-        };
-    }
-
-    const QJsonObject p = params.toObject();
-    const QString segmentIdQ = p.value("segmentId").toString();
-    if (segmentIdQ.isEmpty()) {
-        throw AgentBridgeError{
-            -32602,
-            "segmentId is required",
-            QJsonObject{{"param", "segmentId"}},
-        };
-    }
-    auto* panel = _window->_surfacePanel.get();
-    auto* catalog = panel ? panel->catalog() : nullptr;
-    const auto* row = catalog ? catalog->row(segmentIdQ.toStdString()) : nullptr;
-    if (!row) {
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown surface: %1").arg(segmentIdQ)};
-    }
-    if (!row->catalog) {
-        throw AgentBridgeError{-32602, QStringLiteral("%1 is already in your store").arg(segmentIdQ),
-                               QJsonObject{{"param", "segmentId"}}};
-    }
-    const QString name = p.value("name").toString(QString::fromStdString(row->record.name) + QStringLiteral("_editable"));
-    std::string copied;
-    try {
-        copied = catalog->copy(segmentIdQ.toStdString(), name.toStdString());
-    } catch (const std::exception& error) {
-        throw AgentBridgeError{-32000, QStringLiteral("Copy failed: %1").arg(QString::fromUtf8(error.what()))};
-    }
-    catalog->readNow({copied});
-    panel->activateSurfaceById(copied);
-    return QJsonObject{
-        {"created", true},
-        {"segmentId", QString::fromStdString(copied)},
-        {"sourceId", segmentIdQ},
-        {"name", name},
-        {"activated", true},
-    };
-}
-
-
-
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();

@@ -78,11 +78,12 @@ of time and show each segment as missing, remote or stored.
 
 While an Open Data volume is open (recognized by its volume tags), VC3D lists the
 sample's store read-only beside the user's store, scaled from L0 to the open
-volume's pyramid level. Catalog surfaces can be viewed, focused, drawn as
-overlays and copied; renaming, tagging, editing and the surface tools need a copy
-in the user's store (surface panel context menu,
-**Copy Surface > Copy Surface...**, or the bridge's
-`segments.create_editable_copy`). Ink detections stay the published PNG/JPEG
+volume's pyramid level. Catalog surfaces can be viewed, focused and drawn as
+overlays; they are never copied. Editing one (or rotating it) edits it in the
+user's store as the same surface: its catalog version, as stored, becomes its
+first revision there, it is listed from the user's store from then on, and
+**Reset to Open Data Version** (surface panel context menu) restores that
+revision. **History...** views or restores any revision of a surface. Ink detections stay the published PNG/JPEG
 images; the ink overlay downloads them into the surface's artifact directory.
 
 Main and overlay volume selectors put recognized volumes first and prefix their

@@ -6,8 +6,8 @@ must contain at least one fiber; neither it nor the user's settings are modified
 Without --database, create a current-format fixture and check lazy span details.
 VC3D opens a one-volume project; the database gets a surface bound to that
 volume and an Open Data sample store a read-only catalog surface, so the bridge's
-surface workflow (list, activate, rename, tags, review, catalog guards, editable
-copy) runs against real stores.
+surface workflow (list, activate, rename, tags, review, catalog guards, editing a
+catalog surface) runs against real stores.
 """
 import argparse
 import json
@@ -79,7 +79,7 @@ def main():
         config = root / 'config'
         config.mkdir()
         (config / 'VC3D.ini').write_text(
-            '[viewer]\nremote_cache_dir=' + str(root / 'remote-cache') +
+            '[viewer]\nusername=bridge-smoke\nremote_cache_dir=' + str(root / 'remote-cache') +
             '\n[project]\nshow_open_data_catalog_on_startup=false\n')
         tag = 'bridge_smoke_' + str(os.getpid())
 
@@ -208,27 +208,21 @@ def surfaces(client, database, user_surface, catalog_surface):
     assert [array['shape'] for array in after['arrays'] if array['name'] == 'points'] == [[3, 3, 3]], after
 
     client.call('segments.activate', {'segmentId': catalog_surface}, timeout=120)
-    error = expect_error(client, 'segments.rename', {'segmentId': catalog_surface, 'newName': 'x'}, -32009)
-    assert error.data.get('action') == 'segments.create_editable_copy', error.data
+    expect_error(client, 'segments.rename', {'segmentId': catalog_surface, 'newName': 'x'}, -32009)
     expect_error(client, 'tags.set', {'segmentId': catalog_surface, 'tag': 'approved', 'enabled': True}, -32009)
-    expect_error(client, 'segmentation.enable_editing', {'enabled': True}, -32009)
 
-    copied, _ = client.call('segments.create_editable_copy',
-                            {'segmentId': catalog_surface, 'name': 'editable'}, timeout=120)
-    copy = copied['segmentId']
-    assert copied['created'] and copied['activated'] and copy != catalog_surface, copied
-    with ObjectStore.open(str(database), read_only=True) as store:
-        record = store.object(copy)
-        assert record['name'] == 'editable', record
-        assert record['meta']['coordinates']['volume_uuid'] == 'vol1', record['meta']
-        assert record['meta']['provenance']['sources'] == [catalog_surface], record['meta']
-    state, _ = client.call('state.get', timeout=120)
-    assert state['activeSurface']['id'] == copy, state['activeSurface']
+    # Editing a catalog surface edits it in the user's store, as the same surface
+    # whose first revision is the catalog version as stored.
     enabled, _ = client.call('segmentation.enable_editing', {'enabled': True}, timeout=120)
     assert enabled['enabled'], enabled
     client.call('segmentation.enable_editing', {'enabled': False}, timeout=120)
+    with ObjectStore.open(str(database), read_only=True) as store:
+        record = store.object(catalog_surface)
+        assert record['meta']['coordinates']['volume_uuid'] == 'catvol', record['meta']
+    rows = listed_surfaces(client, {catalog_surface})
+    assert not rows[catalog_surface]['catalog'], rows[catalog_surface]
     print('Surfaces: list, activate, tags, rename, review and crop edit the store; a catalog surface '
-          'is read-only and its editable copy edits', flush=True)
+          'is edited in the user\'s store as the same surface', flush=True)
 
 
 def render(client, root, *surface_ids):

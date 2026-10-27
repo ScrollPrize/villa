@@ -4,8 +4,11 @@
 The segmentation editor lets annotators reshape an existing `QuadSurface` by
 pulling its grid vertices with a Gaussian falloff. Editing operates directly on every valid vertex in the surface.
 The surface is an object in the attached object store; edits are committed to it
-as new geometry revisions. Surfaces of an Open Data catalog store are read-only:
-editing one first makes an editable copy in the user's store.
+as new geometry revisions. Editing a surface of an Open Data catalog store edits
+it in the user's store as the same surface: the catalog version, as stored, is
+its first revision there (`SurfaceCatalog::importCatalogSurface`), and
+**Reset to Open Data Version** restores it. **History...** in the surface panel
+views or restores any revision.
 
 Unless noted otherwise, paths are relative to `apps/VC3D`.
 

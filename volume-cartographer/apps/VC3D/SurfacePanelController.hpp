@@ -120,6 +120,18 @@ public:
     // session is active on the connected service.
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
 
+    // Editing a catalog surface edits it in the user's store: the opened catalog
+    // surface is imported there (SurfaceCatalog::importCatalogSurface) and
+    // continues from there. True when `id` can be edited (also for the user's
+    // surfaces); false with a reason otherwise.
+    bool editInUserStore(const std::string& id, QString* errorMessage = nullptr);
+    // Make object revision `revision` of a surface of the user's store its
+    // current one (a new revision with its content); the open surface reopens
+    // from the commit. False with a reason when it cannot.
+    bool restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage = nullptr);
+    // Restore an imported catalog surface's catalog version: its first revision.
+    bool resetToCatalogVersion(const std::string& id, QString* errorMessage = nullptr);
+
     SurfaceCatalog* catalog() const { return _catalog; }
     // The surface last opened by activation, pinned at the revisions it was read from.
     const std::optional<SurfaceCatalog::Opened>& opened() const { return _opened; }
@@ -182,6 +194,8 @@ private:
     void handleRetireSurfaces(const QStringList& surfaceIds);
     void renameSurface(const std::string& id);
     void copySurface(const std::string& id);
+    // The surface's revisions: view one (read-only) or restore it as the current one.
+    void showHistory(const std::string& id);
     void bindSurface(const std::string& id);
     void onTagCheckboxToggled();
     void applyFiltersInternal();

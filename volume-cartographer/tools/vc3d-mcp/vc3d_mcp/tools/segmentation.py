@@ -18,7 +18,8 @@ class Point3D(TypedDict):
 @mcp.tool()
 async def vc3d_list_segments() -> dict[str, Any]:
     """List the surfaces of the open volume: your object store's and, for an
-    Open Data volume, the read-only catalog surfaces of its sample.
+    Open Data volume, the catalog surfaces of its sample (those you edited are
+    listed from your store).
 
     Each entry has "id" (the surface's store UUID, used by every other segment
     tool), "name", record "tags", "catalog" (read-only catalog surface),
@@ -37,29 +38,6 @@ async def vc3d_activate_segment(segment_id: str) -> dict[str, Any]:
     surface whose geometry is still remote is downloaded first (the call blocks
     meanwhile)."""
     return await _call("segments.activate", {"segmentId": segment_id})
-
-
-@mcp.tool()
-async def vc3d_create_editable_segment_copy(
-    segment_id: str, name: Optional[str] = None
-) -> dict[str, Any]:
-    """Copy a read-only catalog (Open Data) surface into your object store as an
-    editable surface, in the open volume's voxels, and activate the copy.
-
-    Catalog surfaces cannot be edited, renamed, tagged or deleted. Call this when
-    vc3d_enable_editing, vc3d_rename_segment, vc3d_set_segment_tag or
-    vc3d_delete_segment report error -32009 with
-    action="segments.create_editable_copy".
-
-    segment_id: a catalog surface UUID returned by vc3d_list_segments.
-    name: the copy's name (default: the catalog name + "_editable").
-
-    Returns {"created", "segmentId" (the copy's UUID), "sourceId", "name",
-    "activated"}. Errors: -32004 (editing is enabled), -32007 (unknown
-    surface), -32602 (already in your store), -32000 (copy failure)."""
-    return await _call(
-        "segments.create_editable_copy", _strip_none({"segmentId": segment_id, "name": name})
-    )
 
 
 @mcp.tool()
@@ -97,7 +75,12 @@ async def vc3d_rename_segment(segment_id: str, new_name: str) -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
-    """Turn segmentation editing mode on/off for the active segment."""
+    """Turn segmentation editing mode on/off for the active segment.
+
+    Editing a catalog surface edits it in your object store as the same surface:
+    its catalog version becomes its first revision there, and the listing then
+    reports it with "catalog": false. Fails -32009 when it cannot be (no
+    writable store, or a past revision is being viewed)."""
     return await _call("segmentation.enable_editing", {"enabled": enabled})
 
 

@@ -22,7 +22,9 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QGridLayout>
@@ -434,6 +436,20 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
         renameAction->setEnabled(writable);
         connect(renameAction, &QAction::triggered, this, [this, segmentIdStd]() { renameSurface(segmentIdStd); });
+        QAction* historyAction = contextMenu.addAction(tr("History..."));
+        connect(historyAction, &QAction::triggered, this, [this, segmentIdStd]() { showHistory(segmentIdStd); });
+        const auto* row = _catalog->row(segmentIdStd);
+        if (row && row->original) {
+            // Its first revision in your store is the catalog version.
+            QAction* resetAction = contextMenu.addAction(tr("Reset to Open Data Version"));
+            resetAction->setEnabled(storeWritable);
+            connect(resetAction, &QAction::triggered, this, [this, segmentIdStd]() {
+                QString error;
+                if (!resetToCatalogVersion(segmentIdStd, &error)) {
+                    QMessageBox::critical(_ui.treeWidget, tr("Reset Failed"), error);
+                }
+            });
+        }
         QAction* focusAction = contextMenu.addAction(tr("Focus"));
         focusAction->setEnabled(isBound);
         connect(focusAction, &QAction::triggered, this, [this, segmentId]() {
@@ -471,10 +487,11 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
-    // Copying a catalog surface makes an editable one in your store.
     copySurfaceMenu->setEnabled(storeWritable);
     if (selectedSegmentIds.size() <= 1) {
+        // Catalog surfaces are edited in place (in your store), never copied.
         QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
+        copySurfaceAction->setEnabled(writable);
         connect(copySurfaceAction, &QAction::triggered, this, [this, segmentIdStd]() { copySurface(segmentIdStd); });
         copySurfaceMenu->addSeparator();
     }
@@ -621,11 +638,163 @@ void SurfacePanelController::copySurface(const std::string& id)
         return;
     }
     try {
-        const auto copied = _catalog->copy(id, name.toStdString());
+        const auto copied =
+            _catalog->session()->copyObject(*_catalog->attachment(), *_catalog->attachment(), id, name.toStdString());
         emit statusMessageRequested(tr("Copied surface to %1").arg(QString::fromStdString(copied)), 5000);
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Copy Failed"), QString::fromUtf8(error.what()));
     }
+}
+
+void SurfacePanelController::showHistory(const std::string& id)
+{
+    const auto* row = _catalog->row(id);
+    if (!row) {
+        return;
+    }
+    const auto attachment = row->source.attachment;
+    std::vector<vc::objects::ObjectRevision> history;
+    try {
+        _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            history = db.objectHistory(txn, id);
+        });
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_ui.treeWidget, tr("Surface History"), QString::fromUtf8(error.what()));
+        return;
+    }
+
+    QDialog dialog(_ui.treeWidget);
+    dialog.setWindowTitle(tr("History of %1").arg(display_name(*row)));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* list = new QTreeWidget(&dialog);
+    list->setHeaderLabels({tr("Published"), tr("Author"), tr("Name"), tr("Geometry")});
+    list->setRootIsDecorated(false);
+    std::optional<std::string> previousGeometry;
+    for (const auto& revision : history) {
+        if (revision.deleted) {
+            continue;
+        }
+        const auto published = revision.publishedAtUs
+            ? QDateTime::fromMSecsSinceEpoch(*revision.publishedAtUs / 1000).toString(Qt::ISODate)
+            : tr("(not published)");
+        auto* item = new QTreeWidgetItem(list, {published, QString::fromStdString(revision.record.changedBy),
+                                                QString::fromStdString(revision.record.name),
+                                                revision.geometryRevision == previousGeometry ? QString() : tr("changed")});
+        item->setData(0, Qt::UserRole, QString::fromStdString(revision.uuid));
+        previousGeometry = revision.geometryRevision;
+    }
+    if (list->topLevelItemCount() > 0) {
+        list->setCurrentItem(list->topLevelItem(list->topLevelItemCount() - 1));
+    }
+    layout->addWidget(list);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto* view = buttons->addButton(tr("View"), QDialogButtonBox::ActionRole);
+    auto* restore = buttons->addButton(tr("Restore"), QDialogButtonBox::ActionRole);
+    restore->setEnabled(!row->catalog && _catalog->session()->writable(attachment));
+    auto selected = [list]() {
+        const auto* item = list->currentItem();
+        return item ? item->data(0, Qt::UserRole).toString().toStdString() : std::string();
+    };
+    connect(view, &QPushButton::clicked, &dialog, [&]() {
+        const auto revision = selected();
+        if (revision.empty() || !selectSurfaceById(id)) {
+            return;
+        }
+        try {
+            activate(id, false, _catalog->open(id, revision));
+        } catch (const std::exception& error) {
+            QMessageBox::critical(&dialog, tr("Surface History"), QString::fromUtf8(error.what()));
+        }
+    });
+    connect(restore, &QPushButton::clicked, &dialog, [&]() {
+        const auto revision = selected();
+        if (revision.empty()) {
+            return;
+        }
+        QString error;
+        if (restoreRevision(id, revision, &error)) {
+            dialog.accept();
+        } else {
+            QMessageBox::critical(&dialog, tr("Restore Failed"), error);
+        }
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.resize(640, 360);
+    dialog.exec();
+}
+
+bool SurfacePanelController::restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage)
+{
+    try {
+        const auto* row = _catalog->row(id);
+        if (!row || row->catalog || !_catalog->attachment()) {
+            throw std::runtime_error("Only surfaces of your object store can be restored");
+        }
+        const auto attachment = *_catalog->attachment();
+        std::optional<std::string> head;
+        _catalog->session()->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto current = db.currentObjectRevision(txn, id)) head = current->uuid;
+        });
+        if (!head) throw std::runtime_error("The surface is no longer in the object store");
+        if (*head == revision) return true;
+        _catalog->session()->editKeepingRelationships(attachment, {{id, *head}}, {},
+            [&](auto& db, auto& txn, const auto&) {
+                db.restoreObject(txn, id, revision);
+                db.keepRecordedRelationshipsOf(txn, id);
+            });
+    } catch (const std::exception& error) {
+        if (errorMessage) *errorMessage = QString::fromUtf8(error.what());
+        return false;
+    }
+    return true;
+}
+
+bool SurfacePanelController::resetToCatalogVersion(const std::string& id, QString* errorMessage)
+{
+    const auto* row = _catalog->row(id);
+    if (!row || !row->original) {
+        if (errorMessage) *errorMessage = tr("The surface has no catalog version");
+        return false;
+    }
+    std::optional<std::string> first;
+    _catalog->session()->read(row->source.attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto history = db.objectHistory(txn, id);
+        if (!history.empty()) first = history.front().uuid;
+    });
+    return first && restoreRevision(id, *first, errorMessage);
+}
+
+bool SurfacePanelController::editInUserStore(const std::string& id, QString* errorMessage)
+{
+    const auto* row = _catalog->row(id);
+    if (!row || !row->catalog) {
+        return true;
+    }
+    auto fail = [&](const QString& message) {
+        if (errorMessage) *errorMessage = message;
+        return false;
+    };
+    if (!_opened || _opened->surface->id != id || !_opened->current) {
+        return fail(tr("Open the surface's current version to edit it"));
+    }
+    try {
+        _catalog->importCatalogSurface(id);
+        // The same geometry through your store: the surface on screen continues.
+        auto reopened = _catalog->open(id);
+        if (reopened.view.mapping != _opened->view.mapping) {
+            throw std::runtime_error("your object store places the surface differently in this volume; reopen it");
+        }
+        reopened.surface = _opened->surface;
+        reopened.surface->setChannelLoader(
+            store_channel_loader(_catalog->session(), reopened.pin.attachment, *reopened.pin.geometryRevision));
+        _opened = std::move(reopened);
+    } catch (const std::exception& error) {
+        return fail(tr("Cannot edit %1 in your object store: %2")
+                        .arg(QString::fromStdString(id), QString::fromUtf8(error.what())));
+    }
+    updateTagCheckboxStates(_catalog->row(id));
+    return true;
 }
 
 void SurfacePanelController::bindSurface(const std::string& id)

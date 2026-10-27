@@ -3,7 +3,9 @@
 // read-only catalog stores (Open Data samples): one row per surface record,
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
-// viewed or edited. Surfaces are identified by their store UUID.
+// viewed or edited. Surfaces are identified by their store UUID. A catalog
+// surface is edited in the user's store as the same surface (importCatalogSurface);
+// from then on its row and crossings come from the user's store.
 #include "ObjectStoreCoordinates.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
@@ -44,6 +46,9 @@ public:
         vc::objects::AttachmentIdentity attachment;
         std::string volume;
         double scale = 1;
+        // Surfaces of a catalog store that the user's store holds too
+        // (imported): read from the user's store instead.
+        std::set<std::string> shadowed;
         bool operator==(const Source&) const = default;
     };
     struct Row {
@@ -55,6 +60,9 @@ public:
         // The store it is in; catalog rows are read-only.
         Source source;
         bool catalog = false;
+        // A surface imported from a catalog store: the source still holding the
+        // catalog version (its first revision in the user's store).
+        std::optional<Source> original;
         // Shown and opened in the open volume (through `mapping`).
         bool bound() const { return mapping.has_value(); }
         // Input for external tools, which read stored coordinates: a user
@@ -68,7 +76,9 @@ public:
         vc::objects::PinnedObject pin;
         // The view it was read through; edits map back through it.
         vc3d::VolumeView view;
-        // The attachment is writable.
+        // The surface's current revision, not a past one being viewed.
+        bool current = true;
+        // The current revision in a writable attachment.
         bool editable = false;
     };
 
@@ -99,13 +109,15 @@ public:
     bool loading() const { return loading_; }
     const QString& error() const { return error_; }
 
-    // The surface's current geometry in the volume's voxels; channels read on
-    // demand from the same revision. Throws when it cannot be read.
-    Opened open(const std::string& uuid) const;
+    // The surface's geometry in the volume's voxels: current, or at object
+    // revision `revision` of its history (read-only); channels read on demand
+    // from the same revision. Throws when it cannot be read.
+    Opened open(const std::string& uuid, const std::optional<std::string>& revision = std::nullopt) const;
     // The same from an explicit source, for worker threads.
     static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
                        const vc::objects::AttachmentIdentity& attachment, const std::string& volume,
-                       const std::string& uuid, double scale = 1);
+                       const std::string& uuid, double scale = 1,
+                       const std::optional<std::string>& revision = std::nullopt);
 
     // Where the surfaces of every source cross `slice` (open-volume voxels),
     // with `options` (uuids, budgets) per source; complete when every source's
@@ -143,10 +155,10 @@ public:
     void rename(const std::string& uuid, const std::string& name);
     void updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change);
     void retire(const std::vector<std::string>& uuids);
-    // A new surface with the current record and geometry of `uuid`; returns its
-    // UUID. A catalog surface is copied into the user's store in the open
-    // volume's voxels (an editable copy).
-    std::string copy(const std::string& uuid, const std::string& name);
+    // Edit a catalog surface in the user's store: imports it there as the same
+    // surface, its catalog version (as stored) the first revision, and reads its
+    // row from there. Throws without its geometry (fetch it first).
+    void importCatalogSurface(const std::string& uuid);
     // A new surface holding `surface` (in the volume's voxels), bound to the
     // volume; `provenance` records how it was made ({tool, parameters, sources}).
     // Sets surface.id and returns the UUID.

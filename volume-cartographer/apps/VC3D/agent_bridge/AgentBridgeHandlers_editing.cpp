@@ -341,22 +341,15 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         throw AgentBridgeError{-32007, "No active segmentation surface", data};
     }
 
-    if (enabled) {
-        auto* catalog = _window->_surfacePanel ? _window->_surfacePanel->catalog() : nullptr;
-        const auto* row = catalog ? catalog->row(state->activeSurfaceId()) : nullptr;
-        if (row && row->catalog) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = QString::fromStdString(state->activeSurfaceId());
-            data["action"] = "segments.create_editable_copy";
-            data["detail"] =
-                "catalog segments are immutable; create and activate an "
-                "editable copy first";
-            throw AgentBridgeError{
-                -32009,
-                "Cannot edit an immutable Open Data catalog segment",
-                data};
-        }
+    // A catalog surface is edited in the user's store.
+    QString importError;
+    if (enabled && _window->_surfacePanel &&
+        !_window->_surfacePanel->editInUserStore(state->activeSurfaceId(), &importError)) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = QString::fromStdString(state->activeSurfaceId());
+        data["detail"] = importError;
+        throw AgentBridgeError{-32009, "Cannot edit this surface", data};
     }
 
     widget->setEditingEnabled(enabled);

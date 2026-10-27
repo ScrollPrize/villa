@@ -50,7 +50,6 @@ from vc3d_mcp.tools.session import (
 )
 from vc3d_mcp.tools.segmentation import (
     vc3d_activate_segment,
-    vc3d_create_editable_segment_copy,
     vc3d_delete_segment,
     vc3d_grow_segment,
     vc3d_rename_segment,
@@ -413,20 +412,6 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["deleted"], ["seg-ready"])
         sent = self.fake_server.received_requests[-1]["params"]
         self.assertEqual(sent, {"segmentId": "seg-ready", "confirm": True})
-
-    async def test_vc3d_create_editable_segment_copy_forwards_segment_id(self) -> None:
-        result = await vc3d_create_editable_segment_copy("seg-catalog")
-        self.assertEqual(result["sourceId"], "seg-catalog")
-        self.assertNotEqual(result["segmentId"], "seg-catalog")
-        self.assertTrue(result["activated"])
-        sent = self.fake_server.received_requests[-1]["params"]
-        self.assertEqual(sent, {"segmentId": "seg-catalog"})
-
-    async def test_vc3d_create_editable_segment_copy_forwards_name(self) -> None:
-        result = await vc3d_create_editable_segment_copy("seg-catalog", name="mine")
-        self.assertEqual(result["name"], "mine")
-        sent = self.fake_server.received_requests[-1]["params"]
-        self.assertEqual(sent, {"segmentId": "seg-catalog", "name": "mine"})
 
     async def test_vc3d_delete_segment_default_confirm_false_is_forwarded_and_refused(self) -> None:
         # confirm defaults to False and IS forwarded (the bridge enforces the

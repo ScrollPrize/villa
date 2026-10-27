@@ -4,9 +4,9 @@ This is relatively untested, but (should) work. It's possible to easily create r
 
 **rotate and flip a surface**
 
-Select a segmentation, then open `Actions > Transforms > Rotate`. Open Data catalog surfaces are read-only: copy one into your object store first (surface panel context menu, `Copy Surface > Copy Surface...`) and rotate the copy. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to commit the transformed surface to the store as a new geometry revision. Rotation and flip preview remain available for surfaces with disconnected component ranges, but `Apply` is disabled because those cannot yet be transformed safely.
+Select a segmentation, then open `Actions > Transforms > Rotate`. Rotating an Open Data catalog surface rotates it in your object store; its catalog version stays its first revision there (surface panel context menu, `Reset to Open Data Version`). Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to commit the transformed surface to the store as a new geometry revision. Rotation and flip preview remain available for surfaces with disconnected component ranges, but `Apply` is disabled because those cannot yet be transformed safely.
 
-The captures below were made with an earlier build using sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog. They demonstrate the transform output; current builds rotate an editable copy of a catalog surface.
+The captures below were made with an earlier build using sample `PHerc0800`, segment `20251028220955`, from the Vesuvius Challenge Open Data catalog. They demonstrate the transform output.
 
 | Original | Preview: 37° + horizontal flip | Transformed result after Apply (earlier build) |
 | --- | --- | --- |

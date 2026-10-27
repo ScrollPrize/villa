@@ -397,19 +397,6 @@ class FakeAgentBridgeServer:
             await self._reply(
                 writer, req_id, result={"id": seg, "name": new_name},
             )
-        elif method == "segments.create_editable_copy":
-            seg = params.get("segmentId")
-            await self._reply(
-                writer,
-                req_id,
-                result={
-                    "created": True,
-                    "segmentId": f"{seg}-copy",
-                    "sourceId": seg,
-                    "name": params.get("name", f"{seg}_editable"),
-                    "activated": True,
-                },
-            )
         elif method == "viewer.get_render_settings":
             await self._reply(writer, req_id, result=dict(self._render_settings))
         elif method == "viewer.set_render_settings":

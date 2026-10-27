@@ -3357,6 +3357,12 @@ void CWindow::CreateWidgets(void)
         _segmentationWidget->isEditingEnabled(),
         this);
     _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        // A catalog surface is edited in the user's store.
+        QString error;
+        if (surface && _surfacePanel && !_surfacePanel->editInUserStore(surface->id, &error)) {
+            showStatusBarMessage(error, 15000);
+            return false;
+        }
         return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
     });
     // Edits of the active surface commit to the store object it was opened from.

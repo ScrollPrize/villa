@@ -296,11 +296,11 @@ Methods on segments need an attached store and an open volume (-32000).
 - `segments.activate` validates before changing selection. Activating the
   current segment is a no-op success. A catalog surface whose geometry is still
   remote is fetched first (the call blocks while it downloads).
-- `segments.create_editable_copy` copies a catalog surface into the user's
-  store in the open volume's voxels (optional `name`), and activates the copy.
-- Delete (retire), rename and `tags.set` change the user's store and fail with
-  -32009 on catalog surfaces, as does enabling editing on one; the error's
-  `action` is `segments.create_editable_copy`.
+- Enabling editing on a catalog surface imports it into the user's store as
+  the same surface (its catalog version, as stored, is its first revision
+  there); from then on it is listed from the user's store. Delete (retire),
+  rename and `tags.set` change the user's store and fail with -32009 on a
+  catalog surface that was not edited yet.
 - `segments.review` derives review status from the record tags, with optional
   tag filters, without changing the current selection.
 
@@ -418,7 +418,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_editable_segment_copy` | `segments.create_editable_copy` | Copy a read-only catalog (Open Data) surface into your object store as an editable surface and activate it. |
 | `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
 | `vc3d_delete_segment` | `segments.delete` | Retire a surface in your object store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on catalog surfaces. |
