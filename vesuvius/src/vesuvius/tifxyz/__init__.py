@@ -35,6 +35,7 @@ from .reader import (
     load_folder,
     read_tifxyz,
 )
+from .isometry import compute_grid_isometry, update_meta_isometry
 from .types import Tifxyz
 from .upsampling import (
     catmull_rom_smooth_1d,
@@ -55,6 +56,9 @@ __all__ = [
     "list_tifxyz",
     "load_folder",
     "TifxyzInfo",
+    # Isometry
+    "compute_grid_isometry",
+    "update_meta_isometry",
     # Writer
     "write_tifxyz",
     "TifxyzWriter",
