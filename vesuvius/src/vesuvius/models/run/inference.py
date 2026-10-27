@@ -1261,7 +1261,7 @@ def build_parser():
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
     parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
-                      help='TTA type (mirroring or rotation). Default: rotation')
+                      help='TTA type (mirroring or rotation). Default: mirroring')
     parser.add_argument('--disable_tta', action='store_true', help='Disable test time augmentation')
     parser.add_argument('--num_parts', type=int, default=1, help='Number of parts to split processing into')
     parser.add_argument('--part_id', type=int, default=0, help='Part ID to process (0-indexed)')
