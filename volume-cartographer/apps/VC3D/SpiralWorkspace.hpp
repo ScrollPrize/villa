@@ -61,7 +61,6 @@ public:
                            const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // Cross-panel entry points for "Add to current spiral fit".
-    bool hasActiveSpiralSession() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
@@ -108,7 +107,6 @@ private:
             double p50 = 0.0;
             double p95 = 0.0;
             double maximum = 0.0;
-            double displayMaximum = 0.0;
             qint64 sampleCount = 0;
             qint64 eligibleSampleCount = 0;
             qint64 projectedSampleCount = 0;

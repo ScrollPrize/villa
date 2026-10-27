@@ -1055,8 +1055,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 }
                 refreshReloadRequired();
             });
-    connect(_service, &SpiralServiceManager::configurationReviewRequested,
-            _advancedProfiles, &SpiralConfigProfileEditor::showWindow);
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this, &SpiralPanel::updateStatus);
     connect(_service, &SpiralServiceManager::previewTransferProgress, this,
             [this](const QString& phase, const QString& fileName,
@@ -1701,7 +1699,7 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
     row->addWidget(edit, 1); row->addWidget(browse);
     form->addRow(label, container);
     describe(QStringLiteral("path_") + key, {container});
-    _paths[key] = edit; _pathDirectories[key] = directory;
+    _paths[key] = edit;
     _pathBrowseButtons[key] = browse;
     connect(edit, &QLineEdit::textEdited, this, [this, key](const QString&) {
         if (!_applyingResolution) {
@@ -2029,21 +2027,6 @@ void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
         _maxTrackCrossings->setValue(crossings.isDouble() ? crossings.toInt() : 0);
     }
     updateTrackSamplingUi();
-}
-
-void SpiralPanel::writeTrackSamplingControlsToAdvanced()
-{
-    QJsonDocument document =
-        QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    if (!document.isObject()) {
-        refreshReloadRequired();
-        return;
-    }
-    QJsonObject config = document.object();
-    applyTrackSamplingConfig(config);
-    _advancedProfiles->setCurrentText(QString::fromUtf8(
-        QJsonDocument(config).toJson(QJsonDocument::Indented)).trimmed());
-    refreshReloadRequired();
 }
 
 void SpiralPanel::syncVerticalFiberOffsetControls(const QJsonObject& effectiveConfig)
@@ -2598,21 +2581,13 @@ void SpiralPanel::persist() const
 void SpiralPanel::restore()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString prefix = formSettingsPrefix();
-    // One-time migration: the original panel persisted everything under
-    // global keys; import them into the built-in local profile.
-    const bool legacy = _currentProfileId == kLocalhostProfileId
-        && !settings.contains(prefix + "z_begin")
-        && settings.contains(QStringLiteral("spiral/z_begin"));
-    const QString pathsPrefix = legacy ? QStringLiteral("spiral/paths/")
-                                       : prefix + QStringLiteral("paths/");
-    const QString valuePrefix = legacy ? QStringLiteral("spiral/") : prefix;
+    const QString prefix = formSettingsPrefix();
 
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
-        it.value()->setText(settings.value(pathsPrefix + it.key()).toString());
+        it.value()->setText(settings.value(prefix + QStringLiteral("paths/") + it.key()).toString());
     _pclList->clear();
-    const QByteArray savedPcls = settings.value(valuePrefix + QStringLiteral("pcls")).toByteArray();
+    const QByteArray savedPcls = settings.value(prefix + QStringLiteral("pcls")).toByteArray();
     const QJsonDocument pclDocument = QJsonDocument::fromJson(savedPcls);
     if (pclDocument.isArray()) {
         for (const QJsonValue& value : pclDocument.array()) {
@@ -2621,38 +2596,27 @@ void SpiralPanel::restore()
                        item.value(QStringLiteral("role")).toString(),
                        item.value(QStringLiteral("required")).toBool());
         }
-    } else if (legacy) {
-        // Import settings written by the original four-row PCL UI once. The
-        // retired patch-overlap row is deliberately not imported.
-        for (const auto& pair : std::initializer_list<std::pair<const char*, const char*>>{
-                 {"pcl_absolute", "absolute"},
-                 {"pcl_relative", "relative"}, {"pcl_same_winding", "same_winding"},
-                 {"pcl_drawn_control_points", "drawn_control_points"}}) {
-            const QString path = settings.value(
-                QStringLiteral("spiral/paths/") + QString::fromLatin1(pair.first)).toString();
-            addPclItem(path, QString::fromLatin1(pair.second));
-        }
     }
-    _zBegin->setValue(settings.value(valuePrefix + "z_begin", 4000).toInt());
-    _zEnd->setValue(settings.value(valuePrefix + "z_end", 17000).toInt());
-    _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
-    _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
+    _zBegin->setValue(settings.value(prefix + "z_begin", 4000).toInt());
+    _zEnd->setValue(settings.value(prefix + "z_end", 17000).toInt());
+    _runTag->setText(settings.value(prefix + "run_tag").toString());
+    _renderVolumeScale->setValue(settings.value(prefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(
-        settings.value(valuePrefix + "output_save_png_visualizations", false).toBool());
+        settings.value(prefix + "output_save_png_visualizations", false).toBool());
     _verticalFiberOffsetEnabled->setChecked(
-        settings.value(valuePrefix + "vertical_fiber_offset_enabled", false).toBool());
+        settings.value(prefix + "vertical_fiber_offset_enabled", false).toBool());
     _verticalFiberOffsetVoxels->setValue(
-        settings.value(valuePrefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
+        settings.value(prefix + "vertical_fiber_offset_voxels", 4.0).toDouble());
     _verticalFiberOffsetVoxels->setEnabled(_verticalFiberOffsetEnabled->isChecked());
-    _iterations->setValue(settings.value(valuePrefix + "iterations", 100).toInt());
+    _iterations->setValue(settings.value(prefix + "iterations", 100).toInt());
     _dtLossScheduleEnabled->setChecked(
-        settings.value(valuePrefix + "dt_loss_schedule_enabled", false).toBool());
+        settings.value(prefix + "dt_loss_schedule_enabled", false).toBool());
     _dtLossLastPct->setValue(
-        settings.value(valuePrefix + "dt_loss_last_pct", 25).toInt());
+        settings.value(prefix + "dt_loss_last_pct", 25).toInt());
     _backgroundPreview->setChecked(
-        settings.value(valuePrefix + "background_preview_enabled", false).toBool());
+        settings.value(prefix + "background_preview_enabled", false).toBool());
     _previewCadence->setValue(
-        settings.value(valuePrefix + "background_preview_cadence", 100).toInt());
+        settings.value(prefix + "background_preview_cadence", 100).toInt());
     _advancedProfiles->clearSessionDefault();
     {
         const QSignalBlocker blocker(_checkpointChoice);

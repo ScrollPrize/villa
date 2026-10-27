@@ -1463,11 +1463,6 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
         });
 }
 
-bool SpiralWorkspace::hasActiveSpiralSession() const
-{
-    return _service && _service->hasActiveSession();
-}
-
 void SpiralWorkspace::addPatchToCurrentFit(
     const QString& tifxyzDirectory, const std::shared_ptr<QuadSurface>& surface)
 {
@@ -1911,7 +1906,6 @@ SpiralWorkspace::parseLossMaps(const QJsonObject& manifest,
         map.p50 = entry.value(QStringLiteral("p50")).toDouble();
         map.p95 = entry.value(QStringLiteral("p95")).toDouble();
         map.maximum = entry.value(QStringLiteral("maximum")).toDouble();
-        map.displayMaximum = entry.value(QStringLiteral("display_maximum")).toDouble();
         map.sampleCount = entry.value(QStringLiteral("sample_count")).toInteger();
         map.eligibleSampleCount = entry.contains(QStringLiteral("eligible_sample_count"))
             ? entry.value(QStringLiteral("eligible_sample_count")).toInteger()

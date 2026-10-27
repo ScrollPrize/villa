@@ -80,8 +80,6 @@ public:
     void setPclSourceVisible(PclRole role, bool visible);
     void setPclHitOverlay(PclRole role, PointsOverlayController* overlay);
     void setPointViewTolerance(double tolerance);
-    void replacementConflict(const QString& id, bool discardDraft);
-    void resetSession();
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
     bool hasReadyDrafts() const;
@@ -90,7 +88,6 @@ public:
                                const QString& alias, const QJsonDocument& document,
                                const QString& sourceIdentity = {});
     void markDraftsReady();
-    int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
     std::vector<PreparedPointCollections> preparePointCollections(QStringList& warnings);
@@ -263,9 +260,6 @@ private:
     // Aliases of `_flattened` kept for the paint/polyline code paths.
     VolumeViewerBase* _viewer = nullptr;
     std::shared_ptr<QuadSurface> _paintSurface;
-    QObject* _viewport = nullptr;
-    QObject* _viewObject = nullptr;
-    SpiralBrushCursorWidget* _cursorWidget = nullptr;
     std::vector<Gesture> _gestures;
     std::vector<PolylineGesture> _polylines;
     QSet<QString> _visiblePointCollectionIds;
