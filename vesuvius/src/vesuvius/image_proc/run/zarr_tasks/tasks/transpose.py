@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, List, Tuple
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 import numpy as np
 import zarr
@@ -54,6 +57,28 @@ def _transpose_worker(args: Tuple) -> Tuple[Tuple[int, int], ...]:
     return out_chunk_coords
 
 
+def _validate_transpose_paths(input_path, output_path):
+    """Keep this non-inplace operation outside its read-only local input tree."""
+    if not output_path:
+        raise ValueError("transpose requires a separate output path")
+    source = str(input_path)
+    # A Windows drive is a local path, including the accepted C:// spelling.
+    is_drive = (len(source) >= 3 and source[0].isalpha() and source[1] == ":"
+                and source[2] in "/\\")
+    if "://" in source and not is_drive:
+        parsed = urlsplit(source)
+        if parsed.scheme != "file":
+            # The creator writes a local Path; a remote input is a separate store.
+            return
+        source = url2pathname(parsed.path)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            source = "//" + parsed.netloc + source
+    source = Path(source).resolve()
+    destination = Path(output_path).resolve()
+    if destination.is_relative_to(source) or source.is_relative_to(destination):
+        raise ValueError("transpose output overlaps its input; use a separate output directory")
+
+
 @register_task("transpose")
 class TransposeTask(ZarrTask):
     """Transpose zarr array axes."""
@@ -86,6 +111,10 @@ class TransposeTask(ZarrTask):
     @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate transpose arguments."""
+        try:
+            _validate_transpose_paths(args.input_zarr, args.output_zarr)
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from None
         order_str = args.transpose_order.lower()
         if sorted(order_str) != ["x", "y", "z"] or len(order_str) != 3:
             raise SystemExit(
@@ -110,6 +139,7 @@ class TransposeTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure with transposed shape."""
+        _validate_transpose_paths(self.config.input_zarr, self.config.output_zarr)
         input_z = self._get_input_array(
             str(self.config.level) if self.config.level is not None else "0"
         )
