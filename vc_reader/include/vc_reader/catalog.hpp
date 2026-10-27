@@ -47,6 +47,8 @@ struct OpenDataAccessRoot {
 
 struct OpenDataOrigin {
     std::string path;
+    // copy_info.source_path: where the published copy was copied from.
+    std::string copySourcePath;
     std::vector<OpenDataAccessRoot> accessRoots;
     nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
@@ -88,6 +90,10 @@ struct OpenDataArtifact {
     std::string annotatedOn;
     std::optional<double> mappingCoverage;
     OpenDataCreation creation;  // from creation_info
+
+    // The <type> of a published path under predictions/<type>/ (surfaces,
+    // lasagna, fibers, ink-3d); empty elsewhere.
+    std::string predictionType;
 
     // Preferred public origin selected from origins/access_roots.
     std::string sourcePath;
@@ -364,10 +370,17 @@ struct OpenDataManifest {
 // The s3:// form of a URL in a public channel (or already s3://), else nullopt.
 [[nodiscard]] std::optional<std::string> openDataS3Url(std::string url);
 [[nodiscard]] std::string joinOpenDataUrl(std::string root, std::string path);
+// A catalog id as one cache path component: characters other than
+// [A-Za-z0-9._-] become '_' and leading '.'/'_' are dropped ("unnamed" if empty).
+[[nodiscard]] std::string safePathComponent(std::string value);
 
 [[nodiscard]] const OpenDataArtifact* findArtifact(
     const std::vector<OpenDataArtifact>& artifacts,
     std::string_view type) noexcept;
+
+// A Zarr array or pyramid: its type names Zarr (ome-zarr,
+// surface-prediction-zarr, ...) or its URL path ends in .zarr.
+[[nodiscard]] bool isZarrArtifact(const OpenDataArtifact& artifact);
 
 [[nodiscard]] const OpenDataArtifact* preferredVolumeArtifact(
     const OpenDataVolume& volume) noexcept;

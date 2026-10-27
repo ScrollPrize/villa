@@ -45,12 +45,14 @@ const char* kSample = R"({
             "license": {"name": "CC BY-NC 4.0", "url": "https://creativecommons.org/licenses/by-nc/4.0/"},
             "render_level": 2, "render_segments": true},
           "data": [
-            {"type": "zarr", "origins": [{"path": "PHerc0139/volumes/vol1.zarr", "access_roots": [
+            {"type": "zarr", "origins": [{"path": "PHerc0139/volumes/vol1.zarr",
+              "copy_info": {"source_path": "s3://scans/PHerc0139/vol1_masked.zarr/"}, "access_roots": [
               {"type": "s3", "url": "s3://private-root/", "usage": "internal"},
               {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "surface-prediction-zarr", "parameters": {"level": 2}},
             {"type": "normal-grids", "parameters": {"level": 2.5}},
-            {"type": "lasagna"},
+            {"type": "lasagna", "origins": [{"path": "PHerc0139/representations/predictions/fibers/f1/", "access_roots": [
+              {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}]}]},
             {"type": "ink_detection_3d_zarr"},
             {"type": "future-pred-zarr"}
           ]},
@@ -248,10 +250,23 @@ int main()
                     images[0].label == "seg-a - ink-detection-downsampled",
                 "ink images");
 
+        // Where an artifact was copied from, and its prediction type.
+        const auto& vol1Artifacts = sample->findVolume("vol1")->artifacts;
+        require(vol1Artifacts[0].origins.front().copySourcePath == "s3://scans/PHerc0139/vol1_masked.zarr/" &&
+                    vol1Artifacts[0].predictionType.empty(),
+                "copy source");
+        require(vol1Artifacts[3].type == "lasagna" && vol1Artifacts[3].predictionType == "fibers", "prediction type");
+        require(isZarrArtifact(vol1Artifacts[0]) && isZarrArtifact(vol1Artifacts[1]) && !isZarrArtifact(vol1Artifacts[3]),
+                "zarr by type");
+        OpenDataArtifact byUrl;
+        byUrl.resolvedUrl = "https://example.test/data/v.ZARR/?x=1";
+        require(isZarrArtifact(byUrl), "zarr by URL");
+
         // URLs.
         require(resolveOpenDataUrl("s3://vesuvius-challenge/full-scrolls/x") ==
                     "https://data.aws.ash2txt.org/samples/full-scrolls/x",
                 "website rewrite");
+        require(safePathComponent("..a/b c") == "a_b_c" && safePathComponent("._") == "unnamed", "path component");
         require(joinOpenDataUrl("s3://vesuvius-challenge-open-data/", "/a/b") == "s3://vesuvius-challenge-open-data/a/b",
                 "join");
 

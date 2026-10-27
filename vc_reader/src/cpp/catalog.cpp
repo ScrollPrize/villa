@@ -32,16 +32,6 @@ bool containsInsensitive(std::string_view haystack, std::string_view needle)
     return lowerCopy(haystack).find(lowerCopy(needle)) != std::string::npos;
 }
 
-std::string safePathComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') c = '_';
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_')) value.erase(value.begin());
-    return value.empty() ? std::string("unnamed") : value;
-}
-
 
 // Fields of published records, by their published keys only.
 const nlohmann::json* member(const nlohmann::json& obj, const char* key)
@@ -214,6 +204,7 @@ std::vector<OpenDataOrigin> parseOrigins(const nlohmann::json& originsJson)
         origin.raw = originJson;
         origin.properties = objectOrEmpty(originJson, "properties");
         origin.path = stringValue(originJson, "path").value_or("");
+        origin.copySourcePath = stringValue(objectOrEmpty(originJson, "copy_info"), "source_path").value_or("");
         if (const auto* roots = member(originJson, "access_roots")) origin.accessRoots = parseAccessRoots(*roots);
         origins.push_back(std::move(origin));
     }
@@ -293,6 +284,10 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
         artifact.creation = parseCreation(artifact.creationInfo);
         if (const auto* origins = member(itemJson, "origins")) artifact.origins = parseOrigins(*origins);
         selectPreferredOrigin(artifact);
+        if (const auto at = ("/" + artifact.sourcePath).find("/predictions/"); at != std::string::npos) {
+            const auto type = artifact.sourcePath.substr(at + 12);
+            artifact.predictionType = type.substr(0, type.find('/'));
+        }
         artifacts.push_back(std::move(artifact));
     }
     return artifacts;
@@ -774,6 +769,16 @@ std::string resolveOpenDataUrl(std::string url)
     return url;
 }
 
+std::string safePathComponent(std::string value)
+{
+    for (char& c : value) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') c = '_';
+    }
+    while (!value.empty() && (value.front() == '.' || value.front() == '_')) value.erase(value.begin());
+    return value.empty() ? std::string("unnamed") : value;
+}
+
 std::optional<std::string> openDataS3Url(std::string url)
 {
     if (startsWith(url, "s3://")) return url;
@@ -850,6 +855,15 @@ std::vector<OpenDataSegmentImage> inkDetectionImages(const OpenDataSegment& segm
     return result;
 }
 
+bool isZarrArtifact(const OpenDataArtifact& artifact)
+{
+    if (containsInsensitive(artifact.type, "zarr")) return true;
+    auto path = artifact.url();
+    path.resize(std::min(path.size(), path.find_first_of("?#")));
+    while (!path.empty() && path.back() == '/') path.pop_back();
+    return lowerCopy(path).ends_with(".zarr");
+}
+
 const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) noexcept
 {
     for (const auto* type : {"zarr", "zarr3", "volume_zarr", "omezarr", "ome-zarr"}) {
@@ -859,7 +873,7 @@ const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) no
     }
     const auto it = std::find_if(
         volume.artifacts.begin(), volume.artifacts.end(), [](const OpenDataArtifact& artifact) {
-            return artifact.hasResolvedUrl() && containsInsensitive(artifact.type, "zarr");
+            return artifact.hasResolvedUrl() && isZarrArtifact(artifact);
         });
     if (it != volume.artifacts.end()) {
         return &*it;
