@@ -1,4 +1,5 @@
 #include "TestSupport.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
@@ -182,13 +183,12 @@ int main() try {
         // Binding declares a frame once; a conflicting declaration is refused.
         std::string loose;
         {auto txn=db.write();ObjectRecord r;r.kind="fiber";loose=db.upsertObject(txn,r);txn.commit();}
-        const nlohmann::json at{{"volume_uuid","c"},{"scale_factor",2}};
-        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,at,{{"shape_zyx",{1,2,3}}});txn.commit();}
-        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,at);txn.commit();}
+        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,"c",2);txn.commit();}
+        {auto txn=db.write();db.bindGeometryCoordinates(txn,loose,"c",2);txn.commit();}
         auto read=db.read();const auto meta=nlohmann::json::parse(db.objectByUuid(read,loose)->meta);
-        require(meta["coordinates"]==at&&meta["coordinate_binding"]["shape_zyx"].size()==3,"bound coordinates and binding");
+        require(meta["coordinates"]==vc::objects::volumeCoordinates("c",2)&&!meta.contains("coordinate_binding"),"bound coordinates");
         bool conflict=false;
-        try{auto txn=db.write();db.bindGeometryCoordinates(txn,loose,{{"volume_uuid","c"},{"scale_factor",4}});}
+        try{auto txn=db.write();db.bindGeometryCoordinates(txn,loose,"c",4);}
         catch(const std::invalid_argument&){conflict=true;}
         require(conflict,"a different frame is refused");
     }
