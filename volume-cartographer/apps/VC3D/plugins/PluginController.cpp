@@ -350,6 +350,11 @@ QString PluginController::loadResult(const Run& run)
                     }
                     ++points;
                 }
+                // addPoint made the collection with VC3D's default metadata (absolute windings);
+                // keep the file's, so relative windings stay relative.
+                if (const auto liveId = live->getCollectionId(name)) {
+                    live->setCollectionMetadata(*liveId, col.metadata);
+                }
                 ++collections;
             }
             return tr("%1 added %2 point(s) in %3 collection(s)").arg(m.name).arg(points).arg(collections);
