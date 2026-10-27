@@ -182,6 +182,8 @@ set(srcs
     overlays/RawPointsOverlayController.hpp
     overlays/BBoxOverlayController.cpp
     overlays/BBoxOverlayController.hpp
+    SheetCollectionController.cpp
+    SheetCollectionController.hpp
     overlays/PathsOverlayController.cpp
     overlays/PathsOverlayController.hpp
     overlays/VectorOverlayController.cpp
@@ -386,6 +388,7 @@ target_link_libraries(VC3D
     vc_core
     vc_object_store::vc_object_geometry
     vc_fiber_view
+    vc_sheet_collection
     vc_atlas
     vc_lasagna
     vc_fiber_tracer

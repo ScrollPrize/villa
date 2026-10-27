@@ -122,6 +122,7 @@ class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
 class FiberCollectionController;
+class SheetCollectionController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -142,6 +143,8 @@ class CWindow : public QMainWindow
 
 public:
     void attachObjectStore(const QString& path);
+    // Read-only Automated Sheet Volume (.asv) viewer; null until constructed.
+    SheetCollectionController* sheetCollection() const { return _sheetCollection.get(); }
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
@@ -506,6 +509,7 @@ private:
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
+    std::unique_ptr<SheetCollectionController> _sheetCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;

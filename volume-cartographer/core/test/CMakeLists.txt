@@ -66,6 +66,7 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
+vc_add_test(NAME test_sheet_collection LIBS doctest::doctest vc_sheet_collection)
 vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
 vc_add_test(NAME test_sampling_wait_profile)

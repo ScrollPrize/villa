@@ -57,6 +57,7 @@
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -143,6 +144,7 @@
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberCollectionController.hpp"
+#include "SheetCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2826,6 +2828,26 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    // Read-only .asv sheet-mesh overlay. Binds itself to the main viewer manager
+    // (attaches to all current and future planar viewers); no identity gate.
+    _sheetCollection = std::make_unique<SheetCollectionController>(_viewerManager.get(), this);
+    // Persist the attached .asv next to the project so it reopens with it.
+    connect(_sheetCollection.get(), &SheetCollectionController::collectionOpened, this,
+            [this](const QString& p) {
+                const QString vp = _state ? _state->vpkgPath() : QString();
+                if (vp.isEmpty())
+                    return;
+                const QString side = vp + ".sheet-collection.json";
+                if (p.isEmpty()) {
+                    QFile::remove(side);
+                    return;
+                }
+                QJsonObject o;
+                o["path"] = QFileInfo(p).absoluteFilePath();
+                QFile f(side);
+                if (f.open(QIODevice::WriteOnly))
+                    f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+            });
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
@@ -3486,6 +3508,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetRenderSettings);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
+    addDock(menu, _sheetCollection ? _sheetCollection->dock() : nullptr);
 
     if (_atlasOverviewDock || _atlasSearchDock || _atlasControlDock || _atlasWorkspaceFiberDock) {
         auto* atlasMenu = menu->addMenu(tr("Atlas"));
@@ -9056,6 +9079,19 @@ bool CWindow::openVolumePackage(const QString& path,
     const bool opened = OpenVolume(
         path, interactive, errorMessage, preferredVolumeId, openError);
     UpdateView();
+    // Reopen a sheet volume attached to this project, if any.
+    if (opened && _sheetCollection) {
+        const QString vp = _state ? _state->vpkgPath() : QString();
+        if (!vp.isEmpty()) {
+            QFile f(vp + ".sheet-collection.json");
+            if (f.open(QIODevice::ReadOnly)) {
+                const QString ap =
+                    QJsonDocument::fromJson(f.readAll()).object().value("path").toString();
+                if (!ap.isEmpty() && QFileInfo::exists(ap))
+                    _sheetCollection->openCollection(ap);
+            }
+        }
+    }
     return opened;
 }
 
