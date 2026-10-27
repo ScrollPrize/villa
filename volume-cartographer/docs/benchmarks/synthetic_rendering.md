@@ -308,8 +308,8 @@ out-of-domain saturation diagnostic, not accepted calibration data.
 
 ### Synthetic-only passive replay calibration
 
-`calibrate_thread_sync_synthetic.py` calibrates passive replay without running
-or reading any renderer. Its only executable workload is
+The synthetic-only calibration fitted passive replay without running or
+reading any renderer. Its only executable workload was
 `bench_thread_pool_dispatch`, using deterministic ALU work and the production
 generic `utils::ThreadPool` futures path. Synthetic traces use DRD vector-clock
 dependencies, Callgrind instruction counts, and one spare caller CPU.
@@ -346,21 +346,6 @@ The calibration is **not accepted**. Maximum fit error is 17.19% versus the
 the 10% requirement. A per-thread lifecycle candidate was less stable and was
 rejected. These limits are not relaxed based on holdout accuracy, and no
 renderer timing claim is enabled.
-
-Collect and refit with:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_thread_sync_synthetic.py \
-  --runner volume-cartographer/scripts/run_thread_sync_replay.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --output-dir /tmp/thread-sync-synthetic-fixed-3401-v3 \
-  --trace-trials 3 --native-trials 5
-```
-
-This runs five native whole-process trials for each of the one-core and
-caller-plus-worker affinity configurations in every case. The final report
-prints estimated and achieved holdout speedups together with each absolute
-relative speedup error and its median, RMS, and maximum summary.
 
 `observations.json` explicitly records `renderer_inputs_used: false`; model
 fitting rejects any result whose workload is not `synthetic`.
@@ -822,50 +807,6 @@ range was 33.63% due to isolated slow samples, while the worst row's MAD was
 2.52%. Medians are used throughout, but the experiment is not promoted as a
 timing model.
 
-Reproduce the opened calibration with:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_synthetic_event_features.py \
-  --phase fit \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --base-observations /tmp/synthetic-event-costs-fixed-3401-v10-overlap/observations.json \
-  --output-dir /tmp/synthetic-event-features-v2 --native-trials 5
-```
-
-Exit status 2 is expected because every candidate is rejected.
-
-The crossed-subset diagnostic uses the same command with
-`--output-dir /tmp/synthetic-event-features-v4-crossed`; its 132 density cases
-are declared by `ALL_DENSITY_FIT_CASES`.
-
-Reproduce the synthetic comparison with:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_synthetic_event_costs_minimax.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --base-observations /tmp/synthetic-event-costs-fixed-3401-v10-overlap/observations.json \
-  --output-dir /tmp/synthetic-event-costs-minimax-v3 --native-trials 5
-```
-
-Reproduce the two synthetic fits with:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_synthetic_event_costs.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --output-dir /tmp/synthetic-event-costs --native-trials 5
-python3 volume-cartographer/scripts/calibrate_thread_sync_synthetic.py \
-  --runner volume-cartographer/scripts/run_thread_sync_replay.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --output-dir /tmp/thread-sync-synthetic \
-  --event-cost-model /tmp/synthetic-event-costs/model.json \
-  --trace-trials 3 --native-trials 5
-python3 volume-cartographer/scripts/evaluate_render_attribution_sensitivity.py \
-  --model /tmp/thread-sync-synthetic/model.json \
-  --event-model /tmp/synthetic-event-costs/model.json \
-  --cases /tmp/renderer-attribution-cases.json \
-  --output /tmp/renderer-attribution-sensitivity.json
-```
-
 ## Deterministic Cost
 
 Configure the non-default Release benchmark graph and run the complete gate:
@@ -915,13 +856,8 @@ Those legacy coefficients and effective parallelism values live in
 `core/test/data/render_callgrind_model.json`. Aggregate parallel work is divided
 by the calibrated effective parallelism for the fixed worker count, then one
 shared `nanoseconds_per_modeled_cycle` factor produces estimated ns/px and
-Mpx/s. The model is fitted reproducibly with:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_render_model.py \
-  volume-cartographer/core/test/data/render_calibration_observations.json \
-  --output volume-cartographer/core/test/data/render_callgrind_model.json
-```
+Mpx/s. The model was fitted from
+`core/test/data/render_calibration_observations.json`.
 
 The calibration uses six scenarios for fitting and reserves
 `fallback_3_shuffled` and `full_res_cache_stress_shuffled` for held-out

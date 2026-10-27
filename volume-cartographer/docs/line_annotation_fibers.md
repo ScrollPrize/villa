@@ -935,9 +935,8 @@ that depends on trace provenance requires the per-span descriptors.
 
 VC3D uses the database's checked transactions, geometry edit APIs, relationships
 and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
-or publish fibers to Hugging Face. S3/SFTP fiber merging and one-off fiber tag
-migration scripts have been retired. Generic file transfers remain available
-through `scripts/vc_sync.py`.
+or publish fibers to Hugging Face. S3/SFTP fiber merging, one-off fiber tag
+migration scripts and `vc_sync.py` have been retired.
 
 `vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent version-4
 Lasagna result: exact CP positions and existing goals are retained, actual span

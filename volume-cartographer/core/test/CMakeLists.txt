@@ -620,30 +620,10 @@ if(VC_RUN_RENDER_BENCHMARKS)
         ENVIRONMENT
             "VC_THREAD_SYNC_REPLAY_BIN=$<TARGET_FILE:bench_thread_sync_replay>")
     vc_register_ctest(test_thread_sync_replay_model bench_thread_pool_dispatch)
-    add_test(NAME test_render_attribution_sensitivity
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_evaluate_render_attribution_sensitivity.py")
-    vc_register_ctest(test_render_attribution_sensitivity bench_thread_pool_dispatch)
     add_test(NAME test_thread_dispatch_shared_calibration
         COMMAND ${Python3_EXECUTABLE}
             "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_dispatch_shared.py")
     vc_register_ctest(test_thread_dispatch_shared_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_thread_sync_synthetic_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_thread_sync_synthetic.py")
-    vc_register_ctest(test_thread_sync_synthetic_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_cost_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs.py")
-    vc_register_ctest(test_synthetic_event_cost_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_cost_minimax_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_costs_minimax.py")
-    vc_register_ctest(test_synthetic_event_cost_minimax_calibration bench_thread_pool_dispatch)
-    add_test(NAME test_synthetic_event_feature_calibration
-        COMMAND ${Python3_EXECUTABLE}
-            "${PROJECT_SOURCE_DIR}/core/test/test_calibrate_synthetic_event_features.py")
-    vc_register_ctest(test_synthetic_event_feature_calibration bench_thread_pool_dispatch)
     add_test(NAME test_render_thread_calibration_validation
         COMMAND ${Python3_EXECUTABLE}
             "${PROJECT_SOURCE_DIR}/core/test/test_validate_render_thread_calibration.py")

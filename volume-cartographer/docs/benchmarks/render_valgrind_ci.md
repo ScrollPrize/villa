@@ -135,74 +135,11 @@ pull-request description.
 
 ## Recalibrating The Model
 
-Recalibration includes native timing, unlike the CI gate. It must run on the
-documented one-CCD calibration host with CPU frequency pinned and at least five
-sequential native processes per case. Build
-`bench_thread_pool_dispatch` and `bench_thread_sync_replay` in Release first.
-
-```bash
-sudo volume-cartographer/scripts/run_with_fixed_cpu_frequency.py set
-trap 'sudo volume-cartographer/scripts/run_with_fixed_cpu_frequency.py restore' EXIT
-jobs=$(nproc)
-cmake --build volume-cartographer/build-release \
-  --target bench_thread_pool_dispatch bench_thread_sync_replay \
-  --parallel "$jobs"
-```
-
-Collect the base synthetic event observations, then the expanded access-density
-fit and untouched holdout:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_synthetic_event_costs.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --output-dir /tmp/render-event-base --native-trials 5
-python3 volume-cartographer/scripts/calibrate_synthetic_event_features.py \
-  --phase fit \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --base-observations /tmp/render-event-base/observations.json \
-  --output-dir /tmp/render-event-features --native-trials 5
-python3 volume-cartographer/scripts/calibrate_synthetic_event_features.py \
-  --phase holdout \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --base-observations /tmp/render-event-base/observations.json \
-  --output-dir /tmp/render-event-features --native-trials 5
-```
-
-The normal path continues only if the fit and holdout gates accept
-`model_data_reads.json`. Use that event model for synthetic synchronization
-calibration:
-
-```bash
-python3 volume-cartographer/scripts/calibrate_thread_sync_synthetic.py \
-  --runner volume-cartographer/scripts/run_thread_sync_replay.py \
-  --benchmark volume-cartographer/build-release/bin/bench_thread_pool_dispatch \
-  --replay-engine volume-cartographer/build-release/bin/bench_thread_sync_replay \
-  --event-cost-model /tmp/render-event-features/model_data_reads.json \
-  --output-dir /tmp/render-thread-sync --trace-trials 3 --native-trials 5
-```
-
-Review all fit, holdout, frequency, coefficient-bound, rank/correlation, and
-candidate-acceptance diagnostics before producing the compact CI model:
-
-```bash
-python3 volume-cartographer/scripts/run_render_valgrind_ci.py freeze-model \
-  --calibration /tmp/render-thread-sync/model.json \
-  --model-id synthetic-data-reads-v2 \
-  --output volume-cartographer/core/test/data/render_valgrind_ci_model.json
-```
-
-`freeze-model` requires synthetic-only provenance and the exact seven-feature
-data-read basis. It rejects an unaccepted calibration. The exceptional
-`--allow-unpromoted` option exists only for an explicitly reviewed experimental
-promotion; using it keeps `timing_claims_enabled=false` and must be justified in
-the pull request.
-
-Always restore the saved CPU policy, including after a failed calibration:
-
-```bash
-sudo volume-cartographer/scripts/run_with_fixed_cpu_frequency.py restore
-trap - EXIT
-```
+The synthetic event-cost and synchronization calibration scripts that produced
+`core/test/data/render_valgrind_ci_model.json` have been retired; the frozen
+model stays checked in. `run_render_valgrind_ci.py freeze-model` still freezes a
+calibration `model.json` with synthetic-only provenance and the exact
+seven-feature data-read basis, and rejects an unaccepted calibration.
 
 A model change is recorded but does not fail by identity. Refresh all eight
 references only when an understood model change intentionally shifts the score

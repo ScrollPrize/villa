@@ -45,12 +45,3 @@ VC_THREAD_SYNC_REPLAY_BIN=build-release/bin/bench_thread_sync_replay \
   python3 -m unittest core/test/test_run_thread_sync_replay.py
 ```
 
-Measure a saved trace against the Python oracle:
-
-```bash
-python3 scripts/benchmark_thread_sync_replay.py \
-  --events /path/to/sync-events.jsonl \
-  --result /path/to/sync-replay.json \
-  --replay-engine build-release/bin/bench_thread_sync_replay \
-  --repetitions 5
-```

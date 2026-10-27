@@ -383,8 +383,8 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return volcompCompress(input, cfg);
     case CompressorId::Delta3d:
         // Encoding needs the chunk shape, which this byte-oriented layer
-        // does not have. Volumes are written in this format by
-        // scripts/recompress_zarr.py (or the chunk-cache writer).
+        // does not have. Volumes are written in this format by the
+        // chunk-cache writer.
         throw std::runtime_error(
             "writing delta3d zarr chunks is not supported here");
     }
