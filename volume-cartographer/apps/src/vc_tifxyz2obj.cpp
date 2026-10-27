@@ -172,15 +172,15 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     }
     
     // Apply decimation if requested: one pass, stride derived from the
-    // requested keep fraction (decimateGrid computes stride =
-    // round(1/sqrt(p))). Skip when keep_percent >= 100 (no decimation).
+    // requested keep fraction (decimationStride: round(1/sqrt(p))). Skip
+    // when keep_percent >= 100 (no decimation).
     if (keep_percent > 0.0f && keep_percent < 100.0f) {
         std::cout << "Original grid: " << points.rows << " x " << points.cols
                   << " (" << (points.rows * points.cols) << " points)" << std::endl;
         const float ratio = keep_percent / 100.0f;
         const int rows = points.rows, cols = points.cols;
-        int stride = 1;
-        points = vc::meshing::decimateGrid(points, ratio, &stride);
+        const int stride = vc::meshing::decimationStride(ratio);
+        points = vc::meshing::decimateGrid(points, stride);
         float actual_ratio = float(points.rows * points.cols) / float(rows * cols);
         std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
                   << "reduced to " << points.rows << " x " << points.cols

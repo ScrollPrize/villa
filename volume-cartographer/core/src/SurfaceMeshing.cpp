@@ -12,38 +12,19 @@
 
 namespace vc::meshing {
 
-cv::Mat_<cv::Vec3f> decimateGrid(const cv::Mat_<cv::Vec3f>& points, float ratio, int* stride_out)
+int decimationStride(float ratio)
 {
-    if (stride_out) *stride_out = 1;
-    if (ratio <= 0.0f || ratio >= 1.0f) return points.clone();
-
+    if (ratio <= 0.0f || ratio >= 1.0f) return 1;
     // For ratio r, we want 1/s² = r, so s = 1/sqrt(r)
-    int stride = std::max(2, static_cast<int>(std::round(1.0f / std::sqrt(ratio))));
-    if (stride_out) *stride_out = stride;
+    return std::max(2, static_cast<int>(std::round(1.0f / std::sqrt(ratio))));
+}
 
-    // Calculate new dimensions
-    int new_rows = (points.rows + stride - 1) / stride;
-    int new_cols = (points.cols + stride - 1) / stride;
-
-    cv::Mat_<cv::Vec3f> decimated(new_rows, new_cols);
-
-    // Sample every stride-th point
-    for (int j = 0; j < new_rows; ++j) {
-        for (int i = 0; i < new_cols; ++i) {
-            int src_j = j * stride;
-            int src_i = i * stride;
-
-            // Ensure we don't go out of bounds
-            if (src_j < points.rows && src_i < points.cols) {
-                decimated(j, i) = points(src_j, src_i);
-            } else {
-                // Handle edge case - use the last valid point
-                src_j = std::min(src_j, points.rows - 1);
-                src_i = std::min(src_i, points.cols - 1);
-                decimated(j, i) = points(src_j, src_i);
-            }
-        }
-    }
+cv::Mat_<cv::Vec3f> decimateGrid(const cv::Mat_<cv::Vec3f>& points, int stride)
+{
+    if (stride <= 1) return points.clone();
+    cv::Mat_<cv::Vec3f> decimated((points.rows + stride - 1) / stride, (points.cols + stride - 1) / stride);
+    for (int j = 0; j < decimated.rows; ++j)
+        for (int i = 0; i < decimated.cols; ++i) decimated(j, i) = points(j * stride, i * stride);
     return decimated;
 }
 

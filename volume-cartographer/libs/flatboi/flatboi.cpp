@@ -983,8 +983,8 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   const float uv_fac_y = (std::isfinite(scale[1]) && scale[1] > 0.f) ? 1.0f / scale[1] : 1.0f;
 
   const bool decimating = opt.keep_percent > 0.0f && opt.keep_percent < 100.0f;
-  int stride = 1;
-  cv::Mat_<cv::Vec3f> coarse = decimating ? vc::meshing::decimateGrid(full, opt.keep_percent / 100.0f, &stride) : full;
+  const int stride = decimating ? vc::meshing::decimationStride(opt.keep_percent / 100.0f) : 1;
+  cv::Mat_<cv::Vec3f> coarse = decimating ? vc::meshing::decimateGrid(full, stride) : full;
   if (decimating)
     std::cout << "Decimated " << full.rows << " x " << full.cols << " to " << coarse.rows << " x " << coarse.cols
               << " (stride " << stride << ")\n";

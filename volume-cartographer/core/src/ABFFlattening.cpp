@@ -1,5 +1,6 @@
 #include "vc/flattening/ABFFlattening.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
 
 #include <OpenABF/OpenABF.hpp>
 
@@ -420,35 +421,6 @@ static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const QuadSurface& s
         }
     }
     return area;
-}
-
-/**
- * @brief Downsample a grid by taking every Nth row and column
- *
- * @param grid Input grid
- * @param factor Downsample factor (2 = half, 4 = quarter, etc.)
- * @return Downsampled grid
- */
-static cv::Mat_<cv::Vec3f> downsampleGrid(const cv::Mat_<cv::Vec3f>& grid, int factor) {
-    if (factor <= 1) {
-        return grid.clone();
-    }
-
-    int outRows = (grid.rows + factor - 1) / factor;
-    int outCols = (grid.cols + factor - 1) / factor;
-
-    cv::Mat_<cv::Vec3f> result(outRows, outCols);
-
-    #pragma omp parallel for collapse(2)
-    for (int outRow = 0; outRow < outRows; ++outRow) {
-        for (int outCol = 0; outCol < outCols; ++outCol) {
-            int inRow = outRow * factor;
-            int inCol = outCol * factor;
-            result(outRow, outCol) = grid(inRow, inCol);
-        }
-    }
-
-    return result;
 }
 
 /**
@@ -1851,7 +1823,7 @@ cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& conf
     std::cout << "ABF++: Downsampling grid by factor " << config.downsampleFactor
               << " (" << originalRows << "x" << originalCols << " -> ";
 
-    cv::Mat_<cv::Vec3f> coarseGrid = downsampleGrid(*points, config.downsampleFactor);
+    cv::Mat_<cv::Vec3f> coarseGrid = vc::meshing::decimateGrid(*points, config.downsampleFactor);
 
     std::cout << coarseGrid.rows << "x" << coarseGrid.cols << ")" << std::endl;
 
@@ -1898,7 +1870,7 @@ ABFDiagnostics diagnoseAbfFlattening(const QuadSurface& surface,
     } else {
         const int originalRows = points->rows;
         const int originalCols = points->cols;
-        cv::Mat_<cv::Vec3f> coarseGrid = downsampleGrid(*points, config.downsampleFactor);
+        cv::Mat_<cv::Vec3f> coarseGrid = vc::meshing::decimateGrid(*points, config.downsampleFactor);
         cv::Mat_<cv::Vec3f>* coarsePointsPtr = new cv::Mat_<cv::Vec3f>(coarseGrid);
         cv::Vec2f coarseScale = surface._scale * static_cast<float>(config.downsampleFactor);
         QuadSurface coarseSurface(coarsePointsPtr, coarseScale);

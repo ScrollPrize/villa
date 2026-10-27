@@ -12,10 +12,13 @@ class QuadSurface;
 
 namespace vc::meshing {
 
-// Keeps ~`ratio` of the grid's points: every stride-th row and column with
-// stride = max(2, round(1/sqrt(ratio))). A ratio outside (0, 1) keeps all
-// (stride 1). `stride` receives the stride used.
-cv::Mat_<cv::Vec3f> decimateGrid(const cv::Mat_<cv::Vec3f>& points, float ratio, int* stride = nullptr);
+// The stride that keeps ~`ratio` of a grid's points: max(2, round(1/sqrt(ratio))),
+// or 1 (keep all) for a ratio outside (0, 1).
+int decimationStride(float ratio);
+
+// Every stride-th row and column of the grid, starting at the first; a copy of
+// the whole grid for a stride of 1 or less.
+cv::Mat_<cv::Vec3f> decimateGrid(const cv::Mat_<cv::Vec3f>& points, int stride);
 
 // The triangles of a grid's valid quads (loc_valid). Vertices are numbered in
 // first-use order while walking quads row by row, each quad adding its new
@@ -30,7 +33,7 @@ GridMesh meshGrid(const cv::Mat_<cv::Vec3f>& points);
 
 // UVs for the vertices of `fine` (meshGrid of a grid) from `coarseUVs`, the
 // UVs of `coarse` = meshGrid(coarsePoints), coarsePoints = decimateGrid(grid,
-// ..., stride). Vertices are matched by grid position: fine cell (r, c) lies at
+// stride). Vertices are matched by grid position: fine cell (r, c) lies at
 // (r, c) / stride in the decimated grid, so a vertex on a decimated sample takes
 // that sample's UV exactly and one inside a decimated quad the barycentric mix
 // of the quad's triangle. A vertex outside the decimated quads (a hole, or the

@@ -42,14 +42,20 @@ TEST_CASE("meshGrid triangulates valid quads and numbers vertices in first-use o
 TEST_CASE("decimateGrid keeps every stride-th row and column")
 {
     const auto points = sheet(10, 9);
-    int stride = 0;
-    const auto coarse = decimateGrid(points, 0.25f, &stride);
-    CHECK(stride == 2);
+    CHECK(decimationStride(0.25f) == 2);
+    CHECK(decimationStride(0.1f) == 3);
+    CHECK(decimationStride(0.9f) == 2);
+    CHECK(decimationStride(1.0f) == 1);
+    CHECK(decimationStride(0.0f) == 1);
+    const auto coarse = decimateGrid(points, 2);
     CHECK(coarse.rows == 5);
     CHECK(coarse.cols == 5);
     CHECK(coarse(4, 4) == points(8, 8));
-    CHECK(decimateGrid(points, 1.0f, &stride).size() == points.size());
-    CHECK(stride == 1);
+    const auto thirds = decimateGrid(points, 3);
+    CHECK(thirds.rows == 4);
+    CHECK(thirds.cols == 3);
+    CHECK(thirds(3, 2) == points(9, 6));
+    CHECK(decimateGrid(points, 1).size() == points.size());
 }
 
 TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are invalid")
@@ -63,9 +69,9 @@ TEST_CASE("liftGridUVs is exact in grid space when border rows and columns are i
     for (int r = 0; r < points.rows; ++r) invalidate(points, r, 0);
     invalidate(points, 10, 9);  // an interior hole
 
-    int stride = 0;
-    const auto coarsePoints = decimateGrid(points, 0.25f, &stride);
+    const int stride = decimationStride(0.25f);
     REQUIRE(stride == 2);
+    const auto coarsePoints = decimateGrid(points, stride);
     const auto coarse = meshGrid(coarsePoints);
     std::vector<cv::Vec2d> coarseUVs;
     for (const auto& cell : coarse.cells) coarseUVs.push_back(affine(cell[0], cell[1]));
