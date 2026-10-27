@@ -469,7 +469,11 @@ validation pixels, so only the first number is held out. A checkpoint trained
 on the segment scores close to 1 on the second.
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.inference.evaluate   /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016   s43=/data/predictions/pherc0139-w016_seed43.tif   s42=/data/predictions/pherc0139-w016_seed42.tif   --json-out pherc0139-w016_scores.json
+uv run --extra models python -m vesuvius.ink_detection.inference.evaluate \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016 \
+  s43=/data/predictions/pherc0139-w016_seed43.tif \
+  s42=/data/predictions/pherc0139-w016_seed42.tif \
+  --json-out pherc0139-w016_scores.json
 ```
 
 Each prediction is `NAME=PATH`, or just `PATH` to use the file stem as the

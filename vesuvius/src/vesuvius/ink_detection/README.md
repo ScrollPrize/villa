@@ -150,7 +150,9 @@ Score predictions inside a segment's validation mask and, separately, on the
 rest of its supervision mask:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.inference.evaluate   /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016   /data/predictions/pherc0139-w016.tif
+uv run --extra models python -m vesuvius.ink_detection.inference.evaluate \
+  /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016 \
+  /data/predictions/pherc0139-w016.tif
 ```
 
 ## Checkpoints and metrics
