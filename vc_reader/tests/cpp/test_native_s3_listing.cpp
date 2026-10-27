@@ -76,6 +76,7 @@ int main()
 
         // Failures.
         require(throws("<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"), "error document");
+        require(throws("") && throws("<?xml version=\"1.0\"?>\n"), "empty response");
         require(throws("<html><body>nope</body></html>"), "not a listing");
         require(throws("<ListBucketResult><Contents><Key>a</Key></ListBucketResult>"), "mismatched tags");
         require(throws("<ListBucketResult><Contents><Key>a</Key>"), "unterminated");

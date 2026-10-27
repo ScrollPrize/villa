@@ -39,8 +39,8 @@ struct ListPage {
     std::string nextContinuationToken;        // empty on the last page
 };
 
-// Parse a ListBucketResult document. Throws std::runtime_error on an S3 Error
-// document or malformed XML.
+// Parse a ListBucketResult document. Throws std::runtime_error on an empty
+// response, an S3 Error document or malformed XML.
 [[nodiscard]] ListPage parseListPage(std::string_view xml);
 
 // The GET URL of the object `key` at `origin`, percent-encoded except '/'.

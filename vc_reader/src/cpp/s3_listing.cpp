@@ -143,6 +143,7 @@ ListPage parseListPage(std::string_view xml)
     std::string text;                    // character data since the last tag
     Object object;
     std::string errorCode, errorMessage, token;
+    bool rooted = false;
     bool truncated = false;
     bool urlEncoded = false;
 
@@ -206,10 +207,12 @@ ListPage parseListPage(std::string_view xml)
         if (name.empty()) throw std::runtime_error("S3 listing: empty XML element name");
         if (open.empty() && name != "ListBucketResult" && name != "Error")
             throw std::runtime_error("S3 listing: not a ListObjectsV2 response (<" + std::string(name) + ">)");
+        rooted = true;
         open.push_back(name);
         text.clear();
         if (empty) close(name);
     }
+    if (!rooted) throw std::runtime_error("S3 listing: empty response");
     if (!open.empty()) throw std::runtime_error("S3 listing: unterminated XML element <" + std::string(open.back()) + ">");
     if (!errorCode.empty() || !errorMessage.empty())
         throw std::runtime_error("S3 listing failed: " + errorCode + (errorMessage.empty() ? "" : ": " + errorMessage));
