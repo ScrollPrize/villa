@@ -38,12 +38,25 @@ void finish(SurfaceDraft::Tile& tile, SurfaceDraft::TileData& data)
     }
 }
 
-bool overlaps(const Bounds& a, const Bounds& b)
+void reindex(SurfaceDraft& draft)
 {
-    for (int axis = 0; axis < 3; ++axis)
-        if (a[axis + 3] < b[axis] || a[axis] > b[axis + 3]) return false;
-    return true;
+    std::vector<BoundsIndex::Box> boxes;
+    draft.bounded.clear();
+    for (size_t i = 0; i < draft.tiles.size(); ++i)
+        if (draft.tiles[i].bounds) {
+            boxes.push_back(*draft.tiles[i].bounds);
+            draft.bounded.push_back(i);
+        }
+    draft.index.build(std::move(boxes));
 }
+}
+
+std::vector<size_t> SurfaceDraft::tilesIn(const Bounds& box) const
+{
+    std::vector<size_t> found;
+    index.query(box, [&](size_t i) { found.push_back(bounded[i]); });
+    std::sort(found.begin(), found.end());
+    return found;
 }
 
 std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface& surface, const CoordinateJson& coordinates,
@@ -68,6 +81,7 @@ std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface
         tile.data = std::move(data);
         draft->tiles.push_back(std::move(tile));
     }
+    reindex(*draft);
     return draft;
 }
 
@@ -97,6 +111,7 @@ std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft& draft, 
         finish(tile, *data);
         tile.data = std::move(data);
     }
+    reindex(*edited);
     return edited;
 }
 
@@ -127,8 +142,8 @@ bool draftRegion(const std::string& uuid, const SurfaceDraft& draft, const Draft
     SurfaceCut cut(view, placement.toTarget, draft.columns);
     bool hit = false;
     try {
-        for (const auto& tile : draft.tiles) {
-            if (!tile.bounds || !overlaps(*tile.bounds, bounds)) continue;
+        for (const auto i : draft.tilesIn(bounds)) {
+            const auto& tile = draft.tiles[i];
             request.poll();
             ++result.stats.candidateVisits;
             const auto& rect = tile.rect;
@@ -158,8 +173,8 @@ std::optional<SurfaceProximityHit> draftNearest(const std::string& uuid, const S
         throw std::invalid_argument("surface proximity tolerance must be finite and nonnegative");
     SurfaceNearest nearest(point, tolerance, placement.toTarget);
     const auto box = placement.toTarget ? transformBounds(nearest.box(), placement.toTarget->inverse()) : nearest.box();
-    for (const auto& tile : draft.tiles) {
-        if (!tile.bounds || !overlaps(*tile.bounds, box)) continue;
+    for (const auto i : draft.tilesIn(box)) {
+        const auto& tile = draft.tiles[i];
         const auto& rect = tile.rect;
         if (rect.rows < 2 || rect.columns < 2) continue;
         nearest.add(tile.data->tile, rect.row, rect.column, rect.rows, rect.columns);

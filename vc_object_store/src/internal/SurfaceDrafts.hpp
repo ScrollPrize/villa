@@ -1,5 +1,6 @@
 #pragma once
 #include "internal/Spatial.hpp"
+#include "spatial/BoundsIndex.hpp"
 #include "spatial/SurfaceTiles.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
@@ -26,6 +27,11 @@ struct SurfaceDraft {
     CoordinateJson coordinates;
     std::optional<AttachmentIdentity> attachment;
     std::vector<Tile> tiles;
+    // The tiles with bounds (`bounded[i]` is the tile of index box i).
+    BoundsIndex index;
+    std::vector<size_t> bounded;
+    // Tiles whose bounds overlap `box`, in row/column order.
+    std::vector<size_t> tilesIn(const Bounds& box) const;
 };
 
 std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface&, const CoordinateJson& coordinates,
