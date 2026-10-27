@@ -41,8 +41,8 @@ cv::Vec3f grid_normal_int(const cv::Mat_<cv::Vec3f> &points, int row, int col)
     const cv::Vec3f& yd = rNext[col];
 
     // Branchless invalid check: any sentinel (-1) → return NaN.
-    const int bad = (xl[0] == -1.f) | (xr[0] == -1.f)
-                  | (yu[0] == -1.f) | (yd[0] == -1.f);
+    const int bad = (!vc::geometry::validSurfacePoint(xl)) | (!vc::geometry::validSurfacePoint(xr))
+                  | (!vc::geometry::validSurfacePoint(yu)) | (!vc::geometry::validSurfacePoint(yd));
     if (bad) return {NAN, NAN, NAN};
 
     cv::Vec3f xv = xr - xl;
@@ -83,7 +83,7 @@ cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
     for (int dy = -1; dy <= 2; ++dy) {
         const cv::Vec3f* row = points.ptr<cv::Vec3f>(iy + dy);
         for (int dx = -1; dx <= 2; ++dx) {
-            if (row[ix + dx][0] == -1.f) return qnan;
+            if (!vc::geometry::validSurfacePoint(row[ix + dx])) return qnan;
         }
     }
 
@@ -143,13 +143,13 @@ static bool loc_valid_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
         static_cast<int>(std::floor(l[1]))
     };
 
-    if (m(li[0],li[1])[0] == -1)
+    if (!vc::geometry::validSurfacePoint(m(li[0],li[1])))
         return false;
-    if (m(li[0]+1,li[1])[0] == -1)
+    if (!vc::geometry::validSurfacePoint(m(li[0]+1,li[1])))
         return false;
-    if (m(li[0],li[1]+1)[0] == -1)
+    if (!vc::geometry::validSurfacePoint(m(li[0],li[1]+1)))
         return false;
-    if (m(li[0]+1,li[1]+1)[0] == -1)
+    if (!vc::geometry::validSurfacePoint(m(li[0]+1,li[1]+1)))
         return false;
     return true;
 }
@@ -262,7 +262,7 @@ cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, fl
                 const int ny = j + dy;
                 const int nx = i + dx;
                 if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
-                    if (points(ny, nx)[0] != -1.f) {
+                    if (vc::geometry::validSurfacePoint(points(ny, nx))) {
                         const cv::Vec3f& neighbor = points(ny, nx);
                         const float dist = cv::norm(center - neighbor);
                         if (std::isfinite(dist) && dist > 0.f) {
@@ -308,7 +308,7 @@ cv::Mat_<cv::Vec3f> clean_surface_outliers(const cv::Mat_<cv::Vec3f>& points, fl
                 const int ny = j + dy;
                 const int nx = i + dx;
                 if (ny >= 0 && ny < points.rows && nx >= 0 && nx < points.cols) {
-                    if (points(ny, nx)[0] != -1.f) {
+                    if (vc::geometry::validSurfacePoint(points(ny, nx))) {
                         const float dist = cv::norm(center - points(ny, nx));
                         if (std::isfinite(dist)) {
                             min_neighbor = std::min(min_neighbor, dist);

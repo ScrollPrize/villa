@@ -296,7 +296,7 @@ QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
     int valid_count = 0;
     for (int y = 0; y < grid_size[1]; y++) {
         for (int x = 0; x < grid_size[0]; x++) {
-            if ((*points)(y, x)[0] != -1) {
+            if (vc::geometry::validSurfacePoint((*points)(y, x))) {
                 valid_count++;
             }
         }
@@ -352,7 +352,7 @@ void UvGridRasterizer::calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points,
     for (int j = jmin; j < jmax; j += step) {
         for (int i = imin; i < imax; i += step) {
             // Skip invalid points
-            if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
+            if (!vc::geometry::validSurfacePoint(points(j, i)) || !vc::geometry::validSurfacePoint(points(j, i-1)) || !vc::geometry::validSurfacePoint(points(j-1, i)))
                 continue;
 
             // Distance to neighbor in X direction
@@ -456,7 +456,7 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
             if ((w0 + bias0) < 0 || (w1 + bias1) < 0 || (w2 + bias2) < 0) {
                 continue;
             }
-            if (points(y, x)[0] != -1) {
+            if (vc::geometry::validSurfacePoint(points(y, x))) {
                 continue; // first triangle wins
             }
             const float b0 = static_cast<float>(w0 * inv_area);
@@ -638,7 +638,7 @@ QuadSurface* StepUvRasterizer::createQuadSurface()
     int valid_count = 0;
     for (int y = 0; y < grid_size[1]; y++) {
         for (int x = 0; x < grid_size[0]; x++) {
-            if ((*points)(y, x)[0] != -1) {
+            if (vc::geometry::validSurfacePoint((*points)(y, x))) {
                 valid_count++;
             }
         }
@@ -723,7 +723,7 @@ void StepUvRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
                 cv::Vec3f pos = bary[0] * v0 + bary[1] * v1 + bary[2] * v2;
 
                 // Only update if not already set (first triangle wins)
-                if (points(y, x)[0] == -1) {
+                if (!vc::geometry::validSurfacePoint(points(y, x))) {
                     points(y, x) = pos;
                 }
             }

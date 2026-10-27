@@ -74,25 +74,21 @@ std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t mask
                                       int64_t rows, int64_t columns);
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
-// A surface vertex has coordinates unless a component is -1 or non-finite;
-// missing vertices are stored as the (-1,-1,-1) sentinel.
-bool validSurfacePoint(const SurfacePoint&);
-// tifxyz grids, and the in-memory grids of tools that read and write them,
-// also mark missing vertices with z <= 0 (tracers leave extrapolations there).
-// Their readers and writers convert with this rule at that boundary.
-bool validTifxyzPoint(const SurfacePoint&);
+// The store's one rule for surface vertices: a vertex has coordinates unless a
+// component is -1 or non-finite, or z <= 0 (tracers leave extrapolations there).
+// Stored surfaces hold missing vertices as the (-1,-1,-1) sentinel.
+inline bool validSurfacePoint(const SurfacePoint& p)
+{
+    for (const auto v : p)
+        if (!std::isfinite(v) || v == -1) return false;
+    return p[2] > 0;
+}
 // The same for any three-component vector (cv::Vec3f, Eigen, ...).
 template <class Vector>
     requires(!std::same_as<Vector, SurfacePoint>)
 bool validSurfacePoint(const Vector& p)
 {
     return validSurfacePoint(SurfacePoint{static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])});
-}
-template <class Vector>
-    requires(!std::same_as<Vector, SurfacePoint>)
-bool validTifxyzPoint(const Vector& p)
-{
-    return validTifxyzPoint(SurfacePoint{static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])});
 }
 
 // The area of triangle abc (any three-component vectors), in double precision.

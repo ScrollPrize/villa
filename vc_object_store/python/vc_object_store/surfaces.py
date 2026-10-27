@@ -1,6 +1,7 @@
 """Surfaces as numpy grids: read one in a volume's voxels, create one from a grid.
 
-A stored surface's geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a missing vertex), an optional
+A stored surface's geometry is a ``points`` array (rows x columns x 3, xyz, -1 for a missing vertex; the store's validity rule decides which
+vertices are missing), an optional
 ``valid`` array and per-vertex channels, with a grid ``scale``; ``meta.coordinates`` binds it to a volume.
 """
 from __future__ import annotations
@@ -52,13 +53,12 @@ def read_surface(store, surface_uuid, *, volume, geometry_revision=None, target_
 
 def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, sources=(), meta=None,
                    channels=None, tags=(), author=None):
-    """A new surface holding ``xyz`` ((rows, columns, 3) in voxels of ``volume``; non-finite or -1 vertices are
-    missing) with grid ``scale`` (one number or a pair), bound to ``volume``, with per-vertex ``channels`` and
+    """A new surface holding ``xyz`` ((rows, columns, 3) in voxels of ``volume``; vertices are missing by the
+    store's validity rule) with grid ``scale`` (one number or a pair), bound to ``volume``, with per-vertex ``channels`` and
     meta.provenance {tool, parameters, sources}. ``meta`` is kept except tifxyz file keys. Returns its UUID."""
     points = np.ascontiguousarray(np.asarray(xyz, dtype="<f4"))
     if points.ndim != 3 or points.shape[2] != 3:
         raise ValueError(f"expected a (rows, columns, 3) grid, got {points.shape}")
-    points[~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)] = INVALID
     pair = (scale, scale) if np.isscalar(scale) else tuple(scale)
     geometry = Surface.from_arrays(points, [float(pair[0]), float(pair[1])])
     arrays = []

@@ -2807,7 +2807,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 const auto* nrow = normals.ptr<cv::Vec3f>(y);
                 auto* dstRow = layerCoords.ptr<cv::Vec3f>(y);
                 for (int x = 0; x < coords.cols; ++x) {
-                    if (!std::isfinite(src[x][0]) || src[x][0] == -1.0f)
+                    if (!vc::geometry::validSurfacePoint(src[x]))
                         dstRow[x] = src[x];
                     else
                         dstRow[x] = src[x] + nrow[x] * offset;
@@ -5534,7 +5534,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     for (int j = j0; j <= j1; ++j) {
         for (int i = i0; i <= i1; ++i) {
             const cv::Vec3f& p = src(j, i);
-            if (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f)
+            if (!vc::geometry::validSurfacePoint(p))
                 continue;
             const double u = (i - cx) / scale[0];
             const double v = (j - cy) / scale[1];
@@ -5550,7 +5550,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     auto countValidInCol = [&](int c) {
         int count = 0;
         for (int r = 0; r < cleaned.rows; ++r) {
-            if (cleaned(r, c)[0] != -1.0f)
+            if (vc::geometry::validSurfacePoint(cleaned(r, c)))
                 ++count;
         }
         return count;
@@ -5558,7 +5558,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
     auto countValidInRow = [&](int r) {
         int count = 0;
         for (int c = 0; c < cleaned.cols; ++c) {
-            if (cleaned(r, c)[0] != -1.0f)
+            if (vc::geometry::validSurfacePoint(cleaned(r, c)))
                 ++count;
         }
         return count;
@@ -5586,7 +5586,7 @@ QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QR
         bottom = -1;
         for (int j = 0; j < cleaned.rows; ++j) {
             for (int i = 0; i < cleaned.cols; ++i) {
-                if (cleaned(j, i)[0] != -1.0f) {
+                if (vc::geometry::validSurfacePoint(cleaned(j, i))) {
                     left = std::min(left, i);
                     right = std::max(right, i);
                     top = std::min(top, j);

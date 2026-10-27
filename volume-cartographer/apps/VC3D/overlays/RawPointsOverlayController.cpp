@@ -17,12 +17,6 @@ namespace
 constexpr const char* kOverlayGroupRawPoints = "raw_points_overlay";
 constexpr qreal kZValue = 85.0;  // Below vertex markers but above most overlays
 
-// Check if a point is valid (not the sentinel -1 value)
-bool isValidPoint(const cv::Vec3f& p)
-{
-    return p[0] != -1.f;
-}
-
 } // namespace
 
 RawPointsOverlayController::RawPointsOverlayController(CState* state, QObject* parent)
@@ -244,7 +238,7 @@ void RawPointsOverlayController::collectFlattenedViewPoints(VolumeViewerBase* vi
     for (int r = minRow; r <= maxRow; ++r) {
         for (int c = minCol; c <= maxCol; ++c) {
             const cv::Vec3f& p = (*points)(r, c);
-            if (!isValidPoint(p)) {
+            if (!vc::geometry::validSurfacePoint(p)) {
                 continue;
             }
 
@@ -345,7 +339,7 @@ void RawPointsOverlayController::collectPlaneViewPoints(VolumeViewerBase* viewer
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             const cv::Vec3f& p = (*points)(r, c);
-            if (!isValidPoint(p)) {
+            if (!vc::geometry::validSurfacePoint(p)) {
                 continue;
             }
 

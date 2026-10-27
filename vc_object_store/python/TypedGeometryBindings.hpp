@@ -124,7 +124,10 @@ inline void bindTypedGeometry(nb::module_& m)
                                       std::optional<nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>> validity) {
             vg::Surface s{int64_t(points.shape(0)), int64_t(points.shape(1)), scale, {}};
             s.points.resize(size_t(s.rows * s.columns));
-            for (size_t i = 0; i < s.points.size(); ++i) s.points[i] = {points.data()[3*i], points.data()[3*i+1], points.data()[3*i+2]};
+            for (size_t i = 0; i < s.points.size(); ++i) {
+                s.points[i] = {points.data()[3*i], points.data()[3*i+1], points.data()[3*i+2]};
+                if (!vg::validSurfacePoint(s.points[i])) s.points[i] = {-1, -1, -1};
+            }
             if (validity) {
                 if (validity->shape(0) != points.shape(0) || validity->shape(1) != points.shape(1))
                     throw std::invalid_argument("validity must match the points grid");
@@ -133,7 +136,7 @@ inline void bindTypedGeometry(nb::module_& m)
             s.validate();
             return s;
         }, nb::arg("points"), nb::arg("scale"), nb::arg("validity") = nb::none(),
-           "A surface from a (rows, columns, 3) float32 XYZ array (missing vertices (-1,-1,-1)) and optional (rows, columns) uint8 validity.")
+           "A surface from a (rows, columns, 3) float32 XYZ array and optional (rows, columns) uint8 validity; vertices the store treats as missing become (-1,-1,-1).")
         .def("points_array", [](const vg::Surface& s) {
             return xyzArray(s.points, {size_t(s.rows), size_t(s.columns), 3});
         }, "Points as a (rows, columns, 3) float32 array.")

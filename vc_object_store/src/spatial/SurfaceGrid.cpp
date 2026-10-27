@@ -36,7 +36,7 @@ SurfaceGrid readSurfaceGrid(const std::filesystem::path& path){
     cv::Mat_<cv::Vec3f> points(x.size());
     for(int r=0;r<x.rows;++r)for(int c=0;c<x.cols;++c){
         points(r,c)={float(x(r,c)),float(y(r,c)),float(z(r,c))};
-        if(!vc::geometry::validTifxyzPoint({points(r,c)[0],points(r,c)[1],points(r,c)[2]}))points(r,c)={-1,-1,-1};
+        if(!vc::geometry::validSurfacePoint({points(r,c)[0],points(r,c)[1],points(r,c)[2]}))points(r,c)={-1,-1,-1};
     }
     return SurfaceGrid(points,{metadata.at("scale").at(0).get<float>(),metadata.at("scale").at(1).get<float>()});
 }

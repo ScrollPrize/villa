@@ -158,7 +158,7 @@ public:
 
         void advanceToValid() {
             while (_row < _points->rows) {
-                if ((*_points)(_row, _col)[0] != -1.f) {
+                if (vc::geometry::validSurfacePoint((*_points)(_row, _col))) {
                     return;
                 }
                 advance();
@@ -249,10 +249,10 @@ public:
         }
 
         bool isQuadValid() const {
-            return (*_points)(_row, _col)[0] != -1.f &&
-                   (*_points)(_row, _col + 1)[0] != -1.f &&
-                   (*_points)(_row + 1, _col)[0] != -1.f &&
-                   (*_points)(_row + 1, _col + 1)[0] != -1.f;
+            return vc::geometry::validSurfacePoint((*_points)(_row, _col)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row, _col + 1)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row + 1, _col)) &&
+                   vc::geometry::validSurfacePoint((*_points)(_row + 1, _col + 1));
         }
 
         MatPtr _points;
@@ -446,16 +446,16 @@ public:
         const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
             return false;
-        return (*_points)(row, col)[0] != -1.f;
+        return vc::geometry::validSurfacePoint((*_points)(row, col));
     }
     bool isQuadValid(int row, int col) const {
         const_cast<QuadSurface*>(this)->ensureLoaded();
         if (!_points || row < 0 || row >= _points->rows - 1 || col < 0 || col >= _points->cols - 1)
             return false;
-        return (*_points)(row, col)[0] != -1.f &&
-               (*_points)(row, col + 1)[0] != -1.f &&
-               (*_points)(row + 1, col)[0] != -1.f &&
-               (*_points)(row + 1, col + 1)[0] != -1.f;
+        return vc::geometry::validSurfacePoint((*_points)(row, col)) &&
+               vc::geometry::validSurfacePoint((*_points)(row, col + 1)) &&
+               vc::geometry::validSurfacePoint((*_points)(row + 1, col)) &&
+               vc::geometry::validSurfacePoint((*_points)(row + 1, col + 1));
     }
 
     // Counting helpers

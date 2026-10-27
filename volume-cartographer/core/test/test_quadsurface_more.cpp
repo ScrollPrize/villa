@@ -16,7 +16,7 @@
 
 namespace {
 
-cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
+cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 1.f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r)
@@ -25,7 +25,7 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 0.f)
     return m;
 }
 
-cv::Mat_<cv::Vec3f> makeOffsetGrid(int rows, int cols, cv::Vec3f offset, float z = 0.f)
+cv::Mat_<cv::Vec3f> makeOffsetGrid(int rows, int cols, cv::Vec3f offset, float z = 1.f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r)

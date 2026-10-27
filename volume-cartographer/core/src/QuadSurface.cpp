@@ -2786,11 +2786,11 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     read_band_into(std::filesystem::path(path)/"y.tif", *points, 1, W, H);
     read_band_into(std::filesystem::path(path)/"z.tif", *points, 2, W, H);
 
-    // Missing vertices by the store's tifxyz rule.
+    // Missing vertices by the store's validity rule.
     for (int j=0;j<points->rows;++j)
         for (int i=0;i<points->cols;++i) {
             const cv::Vec3f& p = (*points)(j,i);
-            if (!vc::geometry::validTifxyzPoint(p))
+            if (!vc::geometry::validSurfacePoint(p))
                 (*points)(j,i) = cv::Vec3f(-1.f,-1.f,-1.f);
         }
 

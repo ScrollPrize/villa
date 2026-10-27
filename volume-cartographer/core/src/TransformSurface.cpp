@@ -21,14 +21,6 @@ struct GridAxisSpacing {
     int y_count = 0;
 };
 
-bool isValidSurfacePoint(const cv::Vec3f& point)
-{
-    return point[0] != -1.0f
-        && std::isfinite(point[0])
-        && std::isfinite(point[1])
-        && std::isfinite(point[2]);
-}
-
 bool isRepresentableFloat(double value)
 {
     return std::isfinite(value)
@@ -98,12 +90,12 @@ GridAxisSpacing measureGridAxisSpacing(const cv::Mat_<cv::Vec3f>& points)
     for (int row = rowStart; row < rowEnd; row += step) {
         for (int col = colStart; col < colEnd; col += step) {
             const cv::Vec3f& point = points(row, col);
-            if (!isValidSurfacePoint(point)) {
+            if (!vc::geometry::validSurfacePoint(point)) {
                 continue;
             }
 
             const cv::Vec3f& left = points(row, col - 1);
-            if (isValidSurfacePoint(left)) {
+            if (vc::geometry::validSurfacePoint(left)) {
                 const cv::Vec3d delta = cv::Vec3d(point) - cv::Vec3d(left);
                 const double distance = cv::norm(delta);
                 if (std::isfinite(distance) && distance > 0.0) {
@@ -112,7 +104,7 @@ GridAxisSpacing measureGridAxisSpacing(const cv::Mat_<cv::Vec3f>& points)
             }
 
             const cv::Vec3f& up = points(row - 1, col);
-            if (isValidSurfacePoint(up)) {
+            if (vc::geometry::validSurfacePoint(up)) {
                 const cv::Vec3d delta = cv::Vec3d(point) - cv::Vec3d(up);
                 const double distance = cv::norm(delta);
                 if (std::isfinite(distance) && distance > 0.0) {
@@ -147,12 +139,12 @@ void transformSurfacePoints(QuadSurface* surface,
         for (int row = 0; row < points->rows; ++row) {
             for (int col = 0; col < points->cols; ++col) {
                 auto& point = (*points)(row, col);
-                if (!isValidSurfacePoint(point)) {
+                if (!vc::geometry::validSurfacePoint(point)) {
                     continue;
                 }
 
                 point *= static_cast<float>(scaleBeforeAffine);
-                if (!isValidSurfacePoint(point)) {
+                if (!vc::geometry::validSurfacePoint(point)) {
                     point = invalidSurfacePoint();
                     continue;
                 }
@@ -163,13 +155,13 @@ void transformSurfacePoints(QuadSurface* surface,
                         ? cv::Vec3f(static_cast<float>(mapped[0]), static_cast<float>(mapped[1]), static_cast<float>(mapped[2]))
                         : invalidSurfacePoint();
                 }
-                if (!isValidSurfacePoint(point)) {
+                if (!vc::geometry::validSurfacePoint(point)) {
                     point = invalidSurfacePoint();
                     continue;
                 }
 
                 point *= static_cast<float>(scaleAfterAffine);
-                if (!isValidSurfacePoint(point)) {
+                if (!vc::geometry::validSurfacePoint(point)) {
                     point = invalidSurfacePoint();
                 }
             }

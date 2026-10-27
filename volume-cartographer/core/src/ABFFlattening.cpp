@@ -23,11 +23,6 @@ using HalfEdgeMesh = OpenABF::detail::ABF::Mesh<double>;
 using ABF = OpenABF::ABFPlusPlus<double>;
 using LSCM = OpenABF::AngleBasedLSCM<double, HalfEdgeMesh>;
 
-static inline bool isValidSurfacePoint(const cv::Vec3f& p)
-{
-    return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-}
-
 static cv::Mat_<cv::Vec3f> resizePointsLinearPreservingInvalids(const cv::Mat_<cv::Vec3f>& points,
                                                                 const cv::Size& size)
 {
@@ -57,8 +52,8 @@ static cv::Mat_<cv::Vec3f> resizePointsLinearPreservingInvalids(const cv::Mat_<c
             const cv::Vec3f& p01 = points(y0, x1);
             const cv::Vec3f& p10 = points(y1, x0);
             const cv::Vec3f& p11 = points(y1, x1);
-            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11)) {
                 continue;
             }
 
@@ -81,7 +76,7 @@ static inline bool hasZeroLengthEdge(const cv::Vec3f& a, const cv::Vec3f& b, con
 
 static inline bool isUsableTriangle(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
 {
-    if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b) || !isValidSurfacePoint(c)) {
+    if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b) || !vc::geometry::validSurfacePoint(c)) {
         return false;
     }
     return !hasZeroLengthEdge(a, b, c);
@@ -117,7 +112,7 @@ static inline float triangleQuality(const cv::Vec3f& a, const cv::Vec3f& b, cons
 static inline bool isUsableTriangle(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c,
                                     float minEdgeSq, float maxEdgeSq, float minQuality)
 {
-    if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b) || !isValidSurfacePoint(c)) {
+    if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b) || !vc::geometry::validSurfacePoint(c)) {
         return false;
     }
     const cv::Vec3f ab = b - a;
@@ -152,7 +147,7 @@ static EdgeLengthStats computeGridEdgeLengthStats(const cv::Mat_<cv::Vec3f>& poi
     lengths.reserve(static_cast<std::size_t>(points.rows * points.cols * 2));
 
     auto addEdge = [&](const cv::Vec3f& a, const cv::Vec3f& b) {
-        if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b)) {
+        if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b)) {
             return;
         }
         const cv::Vec3f d = b - a;
@@ -209,7 +204,7 @@ static void regularizeGridSpacing(cv::Mat_<cv::Vec3f>& grid, float targetSpacing
     const float maxEdgeCorrection = targetSpacingVx * 0.6f;
 
     auto isValidAt = [&](const cv::Mat_<cv::Vec3f>& g, int row, int col) -> bool {
-        return isValidSurfacePoint(g(row, col));
+        return vc::geometry::validSurfacePoint(g(row, col));
     };
 
     for (int iter = 0; iter < kIters; ++iter) {
@@ -294,7 +289,7 @@ static void regularizeGridSpacing(cv::Mat_<cv::Vec3f>& grid, float targetSpacing
     int validCount = 0;
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
-            if (!isValidSurfacePoint(grid(row, col))) {
+            if (!vc::geometry::validSurfacePoint(grid(row, col))) {
                 continue;
             }
             centroid += grid(row, col);
@@ -308,7 +303,7 @@ static void regularizeGridSpacing(cv::Mat_<cv::Vec3f>& grid, float targetSpacing
 
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
-            if (!isValidSurfacePoint(grid(row, col))) {
+            if (!vc::geometry::validSurfacePoint(grid(row, col))) {
                 continue;
             }
             const cv::Vec3f centered = grid(row, col) - centroid;
@@ -358,7 +353,8 @@ static double computeSurfaceArea3D(const QuadSurface& surface) {
             const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
 
             // Skip invalid quads
-            if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f)
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11))
                 continue;
 
             // Triangle 1: p10, p00, p01
@@ -401,7 +397,8 @@ static double computeArea2D(const cv::Mat_<cv::Vec2f>& uvs, const QuadSurface& s
             const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
 
             // Skip invalid quads
-            if (p00[0] == -1.f || p01[0] == -1.f || p10[0] == -1.f || p11[0] == -1.f)
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11))
                 continue;
 
             const cv::Vec2f& uv00 = uvs(row, col);
@@ -544,7 +541,7 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
         auto addEdge = [&](int r0, int c0, int r1, int c1) {
             const cv::Vec3f& a = grid(r0, c0);
             const cv::Vec3f& b = grid(r1, c1);
-            if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b)) {
+            if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b)) {
                 return;
             }
             const cv::Vec3f d = b - a;
@@ -611,7 +608,7 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
         auto voteEdge = [&](int r0, int c0, int r1, int c1) {
             const cv::Vec3f& a = clone(r0, c0);
             const cv::Vec3f& b = clone(r1, c1);
-            if (!isValidSurfacePoint(a) || !isValidSurfacePoint(b)) {
+            if (!vc::geometry::validSurfacePoint(a) || !vc::geometry::validSurfacePoint(b)) {
                 return;
             }
             const cv::Vec3f d = b - a;
@@ -668,7 +665,7 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
 
         for (int row = 0; row < rows; ++row) {
             for (int col = 0; col < cols; ++col) {
-                if (!isValidSurfacePoint(clone(row, col))) {
+                if (!vc::geometry::validSurfacePoint(clone(row, col))) {
                     continue;
                 }
                 const int idx = linearIdx(row, col);
@@ -694,24 +691,24 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
                 int changed = 0;
                 for (int row = 0; row < rows; ++row) {
                     for (int col = 0; col < cols; ++col) {
-                        if (isValidSurfacePoint(clone(row, col))) {
+                        if (vc::geometry::validSurfacePoint(clone(row, col))) {
                             continue;
                         }
                         cv::Vec3f sum(0.f, 0.f, 0.f);
                         int neighbors = 0;
-                        if (row > 0 && isValidSurfacePoint(clone(row - 1, col))) {
+                        if (row > 0 && vc::geometry::validSurfacePoint(clone(row - 1, col))) {
                             sum += clone(row - 1, col);
                             neighbors++;
                         }
-                        if (row + 1 < rows && isValidSurfacePoint(clone(row + 1, col))) {
+                        if (row + 1 < rows && vc::geometry::validSurfacePoint(clone(row + 1, col))) {
                             sum += clone(row + 1, col);
                             neighbors++;
                         }
-                        if (col > 0 && isValidSurfacePoint(clone(row, col - 1))) {
+                        if (col > 0 && vc::geometry::validSurfacePoint(clone(row, col - 1))) {
                             sum += clone(row, col - 1);
                             neighbors++;
                         }
-                        if (col + 1 < cols && isValidSurfacePoint(clone(row, col + 1))) {
+                        if (col + 1 < cols && vc::geometry::validSurfacePoint(clone(row, col + 1))) {
                             sum += clone(row, col + 1);
                             neighbors++;
                         }
@@ -757,16 +754,16 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
 
     auto countGridNeighbors = [&](int row, int col) -> int {
         int neighbors = 0;
-        if (row > 0 && isValidSurfacePoint(reg(row - 1, col))) {
+        if (row > 0 && vc::geometry::validSurfacePoint(reg(row - 1, col))) {
             neighbors++;
         }
-        if (row + 1 < reg.rows && isValidSurfacePoint(reg(row + 1, col))) {
+        if (row + 1 < reg.rows && vc::geometry::validSurfacePoint(reg(row + 1, col))) {
             neighbors++;
         }
-        if (col > 0 && isValidSurfacePoint(reg(row, col - 1))) {
+        if (col > 0 && vc::geometry::validSurfacePoint(reg(row, col - 1))) {
             neighbors++;
         }
-        if (col + 1 < reg.cols && isValidSurfacePoint(reg(row, col + 1))) {
+        if (col + 1 < reg.cols && vc::geometry::validSurfacePoint(reg(row, col + 1))) {
             neighbors++;
         }
         return neighbors;
@@ -778,7 +775,7 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
         int trimmedThisIter = 0;
         for (int row = 0; row < reg.rows; ++row) {
             for (int col = 0; col < reg.cols; ++col) {
-                if (!isValidSurfacePoint(reg(row, col))) {
+                if (!vc::geometry::validSurfacePoint(reg(row, col))) {
                     continue;
                 }
                 // Trim leaf vertices introduced by interpolation/mask edges.
@@ -823,10 +820,6 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
 
 static void alignUVsToInputGrid(const cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::Vec2f>& uvs)
 {
-    auto isValidPoint = [&](int row, int col) -> bool {
-        const cv::Vec3f& p = points(row, col);
-        return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
-    };
     auto isValidUV = [&](int row, int col) -> bool {
         const cv::Vec2f& uv = uvs(row, col);
         return uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1]);
@@ -839,7 +832,7 @@ static void alignUVsToInputGrid(const cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::
 
     for (int row = 0; row < points.rows; ++row) {
         for (int col = 0; col + 1 < points.cols; ++col) {
-            if (!isValidPoint(row, col) || !isValidPoint(row, col + 1) ||
+            if (!vc::geometry::validSurfacePoint(points(row, col)) || !vc::geometry::validSurfacePoint(points(row, col + 1)) ||
                 !isValidUV(row, col) || !isValidUV(row, col + 1)) {
                 continue;
             }
@@ -852,7 +845,7 @@ static void alignUVsToInputGrid(const cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::
 
     for (int row = 0; row + 1 < points.rows; ++row) {
         for (int col = 0; col < points.cols; ++col) {
-            if (!isValidPoint(row, col) || !isValidPoint(row + 1, col) ||
+            if (!vc::geometry::validSurfacePoint(points(row, col)) || !vc::geometry::validSurfacePoint(points(row + 1, col)) ||
                 !isValidUV(row, col) || !isValidUV(row + 1, col)) {
                 continue;
             }
@@ -986,8 +979,8 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
             const cv::Vec3f& p10 = (*points)(row + 1, col);
             const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
 
-            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11)) {
                 continue;
             }
 
@@ -1542,7 +1535,7 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
                 const cv::Vec2f& uv = uvs(row, col);
                 if (uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
                     diagnosticsOut->validUvCount++;
-                } else if (isValidSurfacePoint((*points)(row, col))) {
+                } else if (vc::geometry::validSurfacePoint((*points)(row, col))) {
                     diagnosticsOut->vertexBadness(row, col) += 1000.f;
                 }
             }
@@ -1589,7 +1582,7 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
                 const int col = idx[k] % points->cols;
                 p3[k] = (*points)(row, col);
                 p2[k] = uvs(row, col);
-                if (!isValidSurfacePoint(p3[k]) || p2[k][0] == -1.f ||
+                if (!vc::geometry::validSurfacePoint(p3[k]) || p2[k][0] == -1.f ||
                     !std::isfinite(p2[k][0]) || !std::isfinite(p2[k][1])) {
                     for (int badIdx : idx) {
                         addGridBadness(badIdx, 1000.f);
@@ -1696,7 +1689,7 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
             samples.reserve(static_cast<std::size_t>(diagnosticsOut->validUvCount));
             for (int row = 0; row < uvs.rows; ++row) {
                 for (int col = 0; col < uvs.cols; ++col) {
-                    if (!isValidSurfacePoint((*points)(row, col))) {
+                    if (!vc::geometry::validSurfacePoint((*points)(row, col))) {
                         continue;
                     }
                     const cv::Vec2f& uv = uvs(row, col);
@@ -1775,8 +1768,8 @@ static cv::Mat_<cv::Vec2f> runAbfWithRegridFallback(const QuadSurface& surface,
                 const cv::Vec3f& p01 = pts(row, col + 1);
                 const cv::Vec3f& p10 = pts(row + 1, col);
                 const cv::Vec3f& p11 = pts(row + 1, col + 1);
-                if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                    !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+                if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                    !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11)) {
                     continue;
                 }
                 if (!isUsableTriangle(p10, p00, p01)) {
@@ -2114,8 +2107,8 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec3f& p01 = (*srcPoints)(row, col + 1);
             const cv::Vec3f& p10 = (*srcPoints)(row + 1, col);
             const cv::Vec3f& p11 = (*srcPoints)(row + 1, col + 1);
-            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11)) {
                 continue;
             }
 
@@ -2166,8 +2159,8 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec3f& p01 = (*srcPoints)(row, col + 1);
             const cv::Vec3f& p10 = (*srcPoints)(row + 1, col);
             const cv::Vec3f& p11 = (*srcPoints)(row + 1, col + 1);
-            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11)) {
                 continue;
             }
 
@@ -2305,8 +2298,8 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
             const cv::Vec3f& p10 = (*srcPoints)(row + 1, col);
             const cv::Vec3f& p11 = (*srcPoints)(row + 1, col + 1);
 
-            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
-                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11))
+            if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p01) ||
+                !vc::geometry::validSurfacePoint(p10) || !vc::geometry::validSurfacePoint(p11))
                 continue;
 
             const cv::Vec2f& uv00 = uvs(row, col);

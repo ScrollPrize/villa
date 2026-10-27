@@ -340,11 +340,11 @@ geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired
         shown={float(p[0]),float(p[1]),float(p[2])};
     }
     if(original&&desired==shown)return *original;
-    if(desired==missing)return missing;
+    if(!geometry::validSurfacePoint(desired))return missing;
     const auto p=inverse.apply({desired[0],desired[1],desired[2]});
     geometry::SurfacePoint result{float(p[0]),float(p[1]),float(p[2])};
-    if(!geometry::validSurfacePoint(result))throw std::invalid_argument("surface coordinate cannot be represented in the canonical frame");
-    return result;
+    // A position the validity rule rejects in the canonical frame is missing there.
+    return geometry::validSurfacePoint(result)?result:missing;
 }
 }
 geometry::Fiber TransformedGeometryView::canonicalFiber(const geometry::Fiber& desired) const {

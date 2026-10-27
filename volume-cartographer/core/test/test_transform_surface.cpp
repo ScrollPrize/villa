@@ -29,7 +29,7 @@ cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float spacing = 1.0f)
         for (int c = 0; c < cols; ++c)
             m(r, c) = cv::Vec3f(static_cast<float>(c) * spacing,
                                 static_cast<float>(r) * spacing,
-                                0.f);
+                                1.f);
     return m;
 }
 
@@ -210,7 +210,7 @@ TEST_CASE("scales before and after the affine compose, and the grid follows the 
     // interval, and the corners keep their scaled positions.
     CHECK(p.cols > 5 * pts.cols);
     CHECK(qs.scale() == cv::Vec2f(1.f, 1.f));
-    CHECK(p(0, 0) == cv::Vec3f(0, 0, 0));
+    CHECK(p(0, 0) == cv::Vec3f(0, 0, 6));
     const auto far = p(p.rows - 1, p.cols - 1);
     CHECK(far[0] == doctest::Approx(23 * 6).epsilon(0.05));
     CHECK(far[1] == doctest::Approx(23 * 6).epsilon(0.05));

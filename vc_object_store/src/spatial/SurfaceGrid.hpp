@@ -20,7 +20,7 @@ public:
     cv::Mat_<cv::Vec3f>* rawPointsPtr() {return &points_;}
     cv::Vec2f scale() const {return scale_;}
 };
-// tifxyz x/y/z planes; vertices failing validTifxyzPoint become the (-1,-1,-1) sentinel.
+// tifxyz x/y/z planes; vertices failing validSurfacePoint become the (-1,-1,-1) sentinel.
 SurfaceGrid readSurfaceGrid(const std::filesystem::path& directory);
 // mask.tif as per-vertex validity (255 valid, 0 invalid), absent without a mask.
 // A mask may be a whole multiple of the grid; a vertex is valid only when every

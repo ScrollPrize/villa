@@ -645,16 +645,18 @@ def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkey
         vos.set_sftp_authenticator(None)
 
 
-def test_surface_vertices_are_missing_only_as_the_minus_one_sentinel(db, tmp_path):
-    surface = Surface(1, 2, [1, 1], [[1, 2, 0], [-1, -1, -1]])
-    assert surface.valid(0, 0) and not surface.valid(0, 1)  # z = 0 is a slice, not a missing vertex
-    with pytest.raises((RuntimeError, ValueError)):
-        Surface(1, 1, [1, 1], [[-1, 5, 5]]).validate()  # missing vertices use exactly (-1,-1,-1)
-    uid, _ = put(db, surface, 'surface')
+def test_surface_vertices_are_missing_by_the_store_rule(db, tmp_path):
+    surface = Surface(1, 2, [1, 1], [[1, 2, 3], [-1, -1, -1]])
+    assert surface.valid(0, 0) and not surface.valid(0, 1)
+    for missing in ([-1, 5, 5], [1, 2, 0], [1, 2, -3]):
+        with pytest.raises((RuntimeError, ValueError)):
+            Surface(1, 1, [1, 1], [missing]).validate()  # stored missing vertices use exactly (-1,-1,-1)
+    grid = Surface.from_arrays(np.array([[[1, 2, 0], [1, 2, 3]]], dtype='<f4'), [1, 1])
+    assert grid.points_array()[0, 0].tolist() == [-1, -1, -1] and grid.valid(0, 1)  # z <= 0 is missing
+    uid, _ = put(db, grid, 'surface')
     with db.geometry_snapshot() as snapshot:
-        assert snapshot.surface(uid).valid(0, 0)
-    with pytest.raises((RuntimeError, ValueError)):
-        db.export_geometry(uid, tmp_path / 'out')  # tifxyz readers drop z <= 0
+        assert not snapshot.surface(uid).valid(0, 0) and snapshot.surface(uid).valid(0, 1)
+    db.export_geometry(uid, tmp_path / 'out')
 
 
 def test_attachments_by_role(db):
@@ -695,7 +697,7 @@ def test_surface_export_keeps_validity_or_writes_valid_only(db, tmp_path):
 
 def test_numpy_geometry_and_coordinate_bindings(db):
     from vc_object_store import Umbilicus, geometry_scale_to_volume
-    points = np.array([[[1, 2, 3], [-1, -1, -1], [4, 5, 0]]], dtype='<f4')
+    points = np.array([[[1, 2, 3], [-1, -1, -1], [4, 5, 6]]], dtype='<f4')
     surface = Surface.from_arrays(points, [1, 1], np.array([[255, 255, 0]], dtype='u1'))
     assert surface.points_array().tolist() == points.tolist()
     assert surface.valid_mask().tolist() == [[True, False, False]]

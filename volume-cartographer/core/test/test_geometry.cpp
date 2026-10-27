@@ -11,7 +11,7 @@
 
 namespace {
 
-cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float dx = 1.0f, float dy = 1.0f, float z = 0.0f)
+cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float dx = 1.0f, float dy = 1.0f, float z = 1.0f)
 {
     cv::Mat_<cv::Vec3f> m(rows, cols);
     for (int r = 0; r < rows; ++r) {
@@ -30,7 +30,7 @@ TEST_CASE("at_int Vec3f bilinear at integer corner returns same value")
     cv::Vec3f v = at_int(m, cv::Vec2f(1.0f, 2.0f));
     CHECK(v[0] == doctest::Approx(1.0f));
     CHECK(v[1] == doctest::Approx(2.0f));
-    CHECK(v[2] == doctest::Approx(0.0f));
+    CHECK(v[2] == doctest::Approx(1.0f));
 }
 
 TEST_CASE("at_int Vec3f bilinear at midpoint averages neighbors")
@@ -63,7 +63,7 @@ TEST_CASE("at_int Vec3d overload")
     CHECK(v[1] == doctest::Approx(1.0));
 }
 
-TEST_CASE("grid_normal on a flat z=0 plane is +/- z")
+TEST_CASE("grid_normal on a flat z=1 plane is +/- z")
 {
     auto m = makePlanarGrid(10, 10);
     cv::Vec3f n = grid_normal(m, cv::Vec3f(5.0f, 5.0f, 0.0f));
@@ -184,7 +184,7 @@ TEST_CASE("loc_valid Vec3f rejects sentinel in 2x2 window")
 
 TEST_CASE("loc_valid Vec3d / float overloads")
 {
-    cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(0, 0, 0));
+    cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(1, 1, 1));
     CHECK(loc_valid(md, cv::Vec2d(1.0, 1.0)));
     CHECK(loc_valid(md, cv::Vec2d(2.0, 2.0)));
     md(1, 1) = cv::Vec3d(-1, -1, -1);
@@ -209,7 +209,7 @@ TEST_CASE("loc_valid_xy swaps axis order vs loc_valid")
     CHECK(loc_valid_xy(mf, cv::Vec2d(1.0, 1.0)));
     CHECK(loc_valid_xy(mf, cv::Vec2d(2.0, 2.0)));
     // Vec3d overload
-    cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(0, 0, 0));
+    cv::Mat_<cv::Vec3d> md(4, 4, cv::Vec3d(1, 1, 1));
     CHECK(loc_valid_xy(md, cv::Vec2d(1.0, 1.0)));
     CHECK(loc_valid_xy(md, cv::Vec2d(2.0, 2.0)));
 }

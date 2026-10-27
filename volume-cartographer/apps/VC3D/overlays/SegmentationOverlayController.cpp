@@ -63,12 +63,6 @@ constexpr int kSurfaceOverlapSampleStride = 1;
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
 
-bool validSurfaceOverlapPoint(const cv::Vec3f& p)
-{
-    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-           p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
-}
-
 int overlapSampleCount(int fullCount)
 {
     if (fullCount <= 0) {
@@ -1836,7 +1830,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                                 auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
                                 for (int c = 0; c < sampledPoints.cols; ++c) {
                                     const cv::Vec3f& pt = sampledPoints(r, c);
-                                    if (!validSurfaceOverlapPoint(pt)) {
+                                    if (!vc::geometry::validSurfacePoint(pt)) {
                                         continue;
                                     }
 

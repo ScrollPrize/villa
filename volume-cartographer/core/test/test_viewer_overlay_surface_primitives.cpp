@@ -671,7 +671,7 @@ private slots:
         for (int row = 0; row < grid.rows; ++row) {
             for (int col = 0; col < grid.cols; ++col) {
                 grid(row, col) = cv::Vec3f(static_cast<float>(col),
-                                           static_cast<float>(row), 0.0f);
+                                           static_cast<float>(row), 50.0f);
             }
         }
         auto surface = std::make_shared<QuadSurface>(grid, cv::Vec2f(1.0f, 1.0f));
@@ -687,7 +687,7 @@ private slots:
 
         const cv::Vec3f normal = surface->normal(surface->pointer());
         auto at = [&normal](float x, float depth) {
-            return cv::Vec3f(x, 10.0f, 0.0f) + normal * depth;
+            return cv::Vec3f(x, 10.0f, 50.0f) + normal * depth;
         };
         // Depths: nominal surface, inside the slab, just past its front,
         // beyond tolerance, and the mirror side.
@@ -956,7 +956,7 @@ private slots:
             for (int col = 0; col < points.cols; ++col) {
                 points(row, col) = cv::Vec3f(static_cast<float>(col),
                                               static_cast<float>(row),
-                                              0.0f);
+                                              50.0f);
             }
         }
         auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f, 1.0f));
@@ -971,7 +971,7 @@ private slots:
         // Its nearest mesh point is on the left edge and remains useful as a
         // line endpoint, but it must not become a displayed control point.
         const std::vector<cv::Vec3f> chain = {
-            {-2.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 0.0f}};
+            {-2.0f, 20.0f, 50.0f}, {5.0f, 20.0f, 50.0f}};
         ViewerOverlayControllerBase::PointChainStyle style;
         // A wide tolerance used to accept the surface center as a good-enough
         // iterative-search seed, making this artifact distance-dependent.
@@ -997,7 +997,7 @@ private slots:
 
         ChainTestController::OverlayBuilder realEdgePointBuilder(&viewer);
         const std::vector<cv::Vec3f> realEdgePointChain = {
-            {0.0f, 20.0f, 0.0f}, {5.0f, 20.0f, 2.0f}};
+            {0.0f, 20.0f, 50.0f}, {5.0f, 20.0f, 52.0f}};
         controller.renderPointChain(&viewer, realEdgePointBuilder, realEdgePointChain, style);
         const auto realEdgePointPrimitives = realEdgePointBuilder.takePrimitives();
         const auto realEdgePointDots = std::count_if(

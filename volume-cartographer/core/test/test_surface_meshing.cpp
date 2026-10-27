@@ -12,7 +12,7 @@ cv::Mat_<cv::Vec3f> sheet(int rows, int cols)
 {
     cv::Mat_<cv::Vec3f> points(rows, cols);
     for (int r = 0; r < rows; ++r)
-        for (int c = 0; c < cols; ++c) points(r, c) = {2.f * c, 2.f * r, 0.1f * c * r};
+        for (int c = 0; c < cols; ++c) points(r, c) = {2.f * c, 2.f * r, 1.f + 0.1f * c * r};
     return points;
 }
 

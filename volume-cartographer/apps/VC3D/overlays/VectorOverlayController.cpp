@@ -210,18 +210,18 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
         }
 
         cv::Vec3f centerWorld = quad->coord(ptr, {0, 0, 0});
-        if (centerWorld[0] != -1.0f) {
+        if (vc::geometry::validSurfacePoint(centerWorld)) {
             addMarker(viewer->volumeToScene(centerWorld), kCenterColor, kStepCenterRadius);
         }
 
         for (int n = 1; n <= numPoints; ++n) {
             cv::Vec3f pos = quad->coord(ptr, {n * stepVal, 0, 0});
-            if (pos[0] != -1.0f) {
+            if (vc::geometry::validSurfacePoint(pos)) {
                 addMarker(viewer->volumeToScene(pos), kArrowFalseColor, kStepMarkerRadius);
             }
 
             cv::Vec3f neg = quad->coord(ptr, {-n * stepVal, 0, 0});
-            if (neg[0] != -1.0f) {
+            if (vc::geometry::validSurfacePoint(neg)) {
                 addMarker(viewer->volumeToScene(neg), kArrowTrueColor, kStepMarkerRadius);
             }
         }
@@ -248,7 +248,7 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
         segSurface->pointTo(segPtr, targetWP, 4.0, 100, patchIndex);
 
         cv::Vec3f p0 = segSurface->coord(segPtr, {0, 0, 0});
-        if (p0[0] == -1.0f) {
+        if (!vc::geometry::validSurfacePoint(p0)) {
             return;
         }
 
@@ -283,10 +283,10 @@ void VectorOverlayController::collectDirectionHints(VolumeViewerBase* viewer,
         for (int n = 1; n <= numPoints; ++n) {
             cv::Vec3f pPos = segSurface->coord(segPtr, {n * stepVal, 0, 0});
             cv::Vec3f pNeg = segSurface->coord(segPtr, {-n * stepVal, 0, 0});
-            if (pPos[0] != -1) {
+            if (vc::geometry::validSurfacePoint(pPos)) {
                 addMarker(viewer->volumeToScene(pPos), kArrowFalseColor, kStepMarkerRadius);
             }
-            if (pNeg[0] != -1) {
+            if (vc::geometry::validSurfacePoint(pNeg)) {
                 addMarker(viewer->volumeToScene(pNeg), kArrowTrueColor, kStepMarkerRadius);
             }
         }
@@ -456,24 +456,24 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
         for (int r = 0; r < rows; r += strideR) {
             for (int c = 0; c < cols; c += strideC) {
                 const cv::Vec3f& p = (*points)(r, c);
-                if (p[0] == -1.0f) continue;
+                if (!vc::geometry::validSurfacePoint(p)) continue;
 
                 cv::Vec3f pRight(-1, -1, -1), pLeft(-1, -1, -1);
                 cv::Vec3f pDown(-1, -1, -1), pUp(-1, -1, -1);
 
                 for (int d = 1; d <= 5; ++d) {
-                    if (pRight[0] == -1.0f && c + d < cols && (*points)(r, c + d)[0] != -1.0f)
+                    if (!vc::geometry::validSurfacePoint(pRight) && c + d < cols && vc::geometry::validSurfacePoint((*points)(r, c + d)))
                         pRight = (*points)(r, c + d);
-                    if (pLeft[0] == -1.0f && c - d >= 0 && (*points)(r, c - d)[0] != -1.0f)
+                    if (!vc::geometry::validSurfacePoint(pLeft) && c - d >= 0 && vc::geometry::validSurfacePoint((*points)(r, c - d)))
                         pLeft = (*points)(r, c - d);
-                    if (pDown[0] == -1.0f && r + d < rows && (*points)(r + d, c)[0] != -1.0f)
+                    if (!vc::geometry::validSurfacePoint(pDown) && r + d < rows && vc::geometry::validSurfacePoint((*points)(r + d, c)))
                         pDown = (*points)(r + d, c);
-                    if (pUp[0] == -1.0f && r - d >= 0 && (*points)(r - d, c)[0] != -1.0f)
+                    if (!vc::geometry::validSurfacePoint(pUp) && r - d >= 0 && vc::geometry::validSurfacePoint((*points)(r - d, c)))
                         pUp = (*points)(r - d, c);
                 }
 
-                bool hasU = (pRight[0] != -1.0f && pLeft[0] != -1.0f);
-                bool hasV = (pDown[0] != -1.0f && pUp[0] != -1.0f);
+                bool hasU = (vc::geometry::validSurfacePoint(pRight) && vc::geometry::validSurfacePoint(pLeft));
+                bool hasV = (vc::geometry::validSurfacePoint(pDown) && vc::geometry::validSurfacePoint(pUp));
                 if (!hasU && !hasV) continue;
 
                 // Map the grid cell to scene via the viewer's real transform, which
@@ -626,7 +626,7 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             float offsetV = nv * sampleStep;
 
             cv::Vec3f worldPos = segSurface->coord(segPtr, {offsetU, offsetV, 0});
-            if (worldPos[0] == -1.0f) continue;
+            if (!vc::geometry::validSurfacePoint(worldPos)) continue;
 
             // Only draw if this point is close to the viewing plane
             float planeDist = std::abs(plane->pointDist(worldPos));
@@ -638,8 +638,8 @@ void VectorOverlayController::collectSurfaceNormals(VolumeViewerBase* viewer,
             cv::Vec3f pPlusV = segSurface->coord(segPtr, {offsetU, offsetV + 2.0f, 0});
             cv::Vec3f pMinusV = segSurface->coord(segPtr, {offsetU, offsetV - 2.0f, 0});
 
-            bool hasU = (pPlusU[0] != -1.0f && pMinusU[0] != -1.0f);
-            bool hasV = (pPlusV[0] != -1.0f && pMinusV[0] != -1.0f);
+            bool hasU = (vc::geometry::validSurfacePoint(pPlusU) && vc::geometry::validSurfacePoint(pMinusU));
+            bool hasV = (vc::geometry::validSurfacePoint(pPlusV) && vc::geometry::validSurfacePoint(pMinusV));
 
             if (!hasU && !hasV) continue;
 

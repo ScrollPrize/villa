@@ -89,12 +89,9 @@ void surface(const Snapshot& s, Json attributes, const fs::path& path, bool vali
     bool any = false;
     for (size_t i = 0; i < xyz.size(); i += 3) {
         if (!vc::geometry::validSurfacePoint({xyz[i], xyz[i+1], xyz[i+2]})) {
-            if (xyz[i] != -1 || xyz[i+1] != -1 || xyz[i+2] != -1)
-                throw std::runtime_error("missing surface vertices must use the (-1,-1,-1) sentinel");
+            std::fill_n(xyz.begin() + std::ptrdiff_t(i), 3, -1.f);
             continue;
         }
-        if (!vc::geometry::validTifxyzPoint({xyz[i], xyz[i+1], xyz[i+2]}))
-            throw std::runtime_error("tifxyz cannot hold a surface vertex at z <= 0");
         for (int a = 0; a < 3; ++a) {
             low[a] = any ? std::min(low[a], xyz[i+a]) : xyz[i+a];
             high[a] = any ? std::max(high[a], xyz[i+a]) : xyz[i+a];

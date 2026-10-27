@@ -632,7 +632,7 @@ TEST_CASE("Direction handles use a valid local frame even on two-column strips")
 {
     cv::Mat_<cv::Vec3f> points(7,2);
     for (int y=0;y<7;++y)
-        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y-3),0};
+        for (int x=0;x<2;++x) points(y,x)={float(x*10),float(y+10),1};
     QuadSurface surface(points,{1,1});
     const auto frame=vc3d::line_annotation::generatedStripFrame(
         &surface,surface.gridToSurface({0.5,3}));
@@ -1415,14 +1415,18 @@ TEST_CASE("Zero display correction preserves smoothed ribbon geometry")
 
 TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origin shifts")
 {
+    // Above z = 0, where the ribbon's vertices are valid on both sides of the line.
+    constexpr double z=50;
     auto model=lineModel();
     model.points[2].position={10,20,0};
+    for (auto& point : model.points) point.position[2]+=z;
+    for (auto& segment : model.segmentSamples)
+        for (auto& sample : segment.samples) sample.position[2]+=z;
     vc::lasagna::LineViewConfig config;
     config.targetSpacingBaseVoxels=50; // Deliberately coarse support grid.
     config.controlPointLinePositions={0,1,2};
     config.displayPointNormals.assign(3,cv::Vec3f(0,0,1));
     const auto views=vc::lasagna::buildLineViewSurfaces(model,config);
-    const std::vector<cv::Vec3f> p{{0,0,0},{10,0,0},{10,20,0}};
     for (const auto& surface : {views.lineSurface,views.lineSideSlice}) {
         CHECK(typeid(*surface) == typeid(QuadSurface));
         surface->shiftSurfaceOrigin({123,-17});
@@ -1430,7 +1434,7 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
         const auto uv=surface->gridToSurface({col,3});
         const auto sample=surface->sampleAtSurface(uv);
         REQUIRE(sample.valid());
-        const auto expected=cv::Vec3f(5,0,0);
+        const auto expected=cv::Vec3f(5,0,float(z));
         CHECK(cv::norm(sample.volume-expected)<1e-5);
         for (float scale : {0.5f,2.0f}) {
             cv::Mat_<cv::Vec3f> coords,normals;
