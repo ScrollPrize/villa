@@ -7,22 +7,11 @@
 #include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
-#include <cctype>
 
 namespace vc::objects {
 namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
-
-std::string safePathComponent(std::string value)
-{
-    for (char& c : value) {
-        const auto uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') c = '_';
-    }
-    while (!value.empty() && (value.front() == '.' || value.front() == '_')) value.erase(value.begin());
-    return value.empty() ? std::string("unnamed") : value;
-}
 
 OpenOptions builderOptions()
 {
@@ -84,7 +73,7 @@ bool sameCatalogRecord(const ObjectRecord& a, const ObjectRecord& b)
 
 fs::path catalogSampleStorePath(const fs::path& cacheRoot, const std::string& sampleId)
 {
-    return cacheRoot / "open_data" / "stores" / (safePathComponent(sampleId) + ".vcobj");
+    return cacheRoot / "open_data" / "stores" / (vcr::catalog::safePathComponent(sampleId) + ".vcobj");
 }
 
 std::string catalogSurfaceUuid(const vcr::catalog::OpenDataSurface& surface)
