@@ -14,7 +14,8 @@ struct SurfaceProvenance {
     std::vector<std::string> sources;
 };
 // The keys of a tifxyz meta.json that describe the file rather than the
-// surface (identity and grid layout); an object's record and geometry hold them.
+// surface (identity, grid layout and area); an object's record and geometry
+// hold them.
 const std::vector<std::string>& tifxyzFileKeys();
 // A new surface `uuid` named `name` holding `geometry`, bound by `coordinates`
 // ({volume_uuid, scale_factor}), with `tags`, meta.provenance, and the rest of

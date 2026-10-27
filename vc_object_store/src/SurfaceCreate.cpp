@@ -4,7 +4,9 @@
 namespace vc::objects {
 const std::vector<std::string>& tifxyzFileKeys()
 {
-    static const std::vector<std::string> keys{"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions"};
+    // The area keys too: the store keeps the surface's area itself (SurfaceDetail::area).
+    static const std::vector<std::string> keys{"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions",
+                                               "area_vx2", "area_cm2"};
     return keys;
 }
 

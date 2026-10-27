@@ -35,7 +35,7 @@ void detailFields(Detail& d, Visit visit)
         visit("width_gap_fraction", d.widthGapFraction); visit("optimization_mode", d.optimizationMode);
     } else if constexpr (std::is_same_v<T, SurfaceDetail>) {
         visit("grid_width", d.gridWidth); visit("grid_height", d.gridHeight);
-        visit("scale", d.scale);
+        visit("scale", d.scale); visit("area", d.area);
     } else {
         static_assert(std::is_same_v<T, TrackDetail>);
         visit("dataset_ref", d.datasetRef); visit("external_key", d.externalKey);

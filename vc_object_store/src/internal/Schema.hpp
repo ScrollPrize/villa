@@ -36,7 +36,7 @@ CREATE TABLE fibers(
 CREATE TABLE surfaces(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
   grid_width INTEGER NOT NULL DEFAULT 0, grid_height INTEGER NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 0,
-  scale_y REAL NOT NULL DEFAULT 0,
+  scale_y REAL NOT NULL DEFAULT 0, area REAL NOT NULL DEFAULT 0,
   bbox_min_x REAL, bbox_min_y REAL, bbox_min_z REAL, bbox_max_x REAL, bbox_max_y REAL, bbox_max_z REAL
 );
 CREATE TABLE tracks(

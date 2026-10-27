@@ -118,9 +118,9 @@ template<class Visit> void detailTables(Visit visit)
     visit("fiber", "fibers", "family,manual_family,control_point_count,line_point_count,length,width,"
         "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::fiber, readDetail<FiberDetail>, 14);
-    visit("surface", "surfaces", "grid_width,grid_height,scale,scale_y,"
+    visit("surface", "surfaces", "grid_width,grid_height,scale,scale_y,area,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
-        &ObjectRecord::surface, readDetail<SurfaceDetail>, 10);
+        &ObjectRecord::surface, readDetail<SurfaceDetail>, 11);
     visit("track", "tracks", "dataset_ref,external_key,family,point_count,length,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::track, readDetail<TrackDetail>, 11);
@@ -205,7 +205,15 @@ void validateObjectDetail(const ObjectRecord& rec)
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
 {
+    // A surface's area is the store's (refreshSurfaceArea), kept across record
+    // writes, as is its detail row when a record carries none.
+    std::optional<double> storedArea;
+    {
+        Statement area(db, "SELECT area FROM surfaces WHERE object_id=?", id);
+        if (area.row()) storedArea = area.f64(0);
+    }
     for (const char* table : {"fibers", "surfaces", "tracks"}) {
+        if (storedArea && rec.kind == "surface" && !rec.surface && std::string(table) == "surfaces") continue;
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_id=?", id);
     }
     bool written = false;
@@ -232,6 +240,7 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         row.stepDone();
         written = true;
     });
+    if (storedArea && rec.surface) execute(db, "UPDATE surfaces SET area=? WHERE object_id=?", *storedArea, id);
 }
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags)

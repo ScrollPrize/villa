@@ -2,6 +2,7 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <bit>
@@ -245,6 +246,7 @@ void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revis
         arrays.push_back({a.name, a.dtype, a.shape, static_cast<int64_t>(a.bytes.size())});
         data.emplace(a.name, &a);
     }
+    if (geometry.kind == "surface") refreshSurfaceArea(db, objectId, revision);
     indexGeometry(db, objectId, revision, geometry.kind, arrays,
         [&](const std::string& name, int64_t offset, int64_t count) {
             return std::span<const uint8_t>(data.at(name)->bytes).subspan(offset, count);
@@ -255,6 +257,34 @@ void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revis
                 std::memcpy(bytes.data() + y * cols * 12, a.bytes.data() + ((row + y) * a.shape[1] + col) * 12, cols * 12);
             return bytes;
         });
+}
+
+void refreshSurfaceArea(sqlite3* db, int64_t objectId, const std::string& revision)
+{
+    GeometryReader reader(db, revision, false);
+    const auto& manifest = reader.manifest();
+    if (manifest.at("kind") != "surface") return;
+    const auto& arrays = manifest.at("arrays");
+    const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
+    const int64_t rows = shape.at(0), columns = shape.at(1);
+    const bool hasValid = arrays.contains(surfaceValidChannel);
+    // Bands of about a million vertices, overlapping by a row.
+    const int64_t band = std::max<int64_t>(2, (int64_t(1) << 20) / std::max<int64_t>(columns, 1));
+    double total = 0;
+    for (int64_t row = 0; row + 1 < rows; row += band - 1) {
+        const int64_t count = std::min(band, rows - row);
+        const auto points = xyzValues<float>(reader.rectangle("points", row, 0, count, columns));
+        const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row, 0, count, columns) : std::vector<uint8_t>{};
+        total = vc::geometry::surfaceGridArea(count, columns,
+            [&](int64_t r, int64_t c) -> const std::array<float, 3>& { return points[size_t(r * columns + c)]; },
+            [&](int64_t r, int64_t c) {
+                const auto i = size_t(r * columns + c);
+                return vc::geometry::validSurfacePoint(points[i]) && (!hasValid || valid[i]);
+            }, total);
+    }
+    execute(db, "INSERT INTO surfaces(object_id,grid_width,grid_height,area) VALUES(?,?,?,?) ON CONFLICT(object_id) "
+                "DO UPDATE SET grid_width=excluded.grid_width,grid_height=excluded.grid_height,area=excluded.area",
+            objectId, columns, rows, total);
 }
 
 void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
@@ -268,6 +298,7 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
     std::vector<GeometryArrayInfo> arrays;
     for (const auto& [name, a] : manifest.at("arrays").items())
         arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
+    refreshSurfaceArea(db, head.i64(0), revision);
     indexGeometry(db, head.i64(0), revision, manifest.at("kind").get<std::string>(), arrays,
         [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); },
         [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
@@ -281,6 +312,11 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
     GeometryReader reader(db, revision);
     const auto& manifest = reader.manifest();
     const std::string kind = manifest.at("kind");
+    // No edits list: a channel rewrite, which may replace validity.
+    if (kind == "surface" && (edits.empty() || std::any_of(edits.begin(), edits.end(), [](const auto& edit) {
+            return edit.array == "points" || edit.array == surfaceValidChannel;
+        })))
+        refreshSurfaceArea(db, objectId, revision);
     std::set<RegionKey> dirty;
     for (const auto& edit : edits) {
         if (edit.bytes.empty() || !coordinates(kind, edit.array)) continue;

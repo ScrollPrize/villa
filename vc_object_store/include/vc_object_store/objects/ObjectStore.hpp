@@ -37,6 +37,10 @@ struct SurfaceDetail {
     int64_t gridWidth = 0;
     int64_t gridHeight = 0;
     std::array<double, 2> scale{0.0, 0.0};  // column and row scale, as in tifxyz meta.json
+    // The grid's area in stored units squared (geometry::surfaceGridArea over
+    // its valid vertices). The store keeps it with the geometry head; a record
+    // write keeps the stored value.
+    double area = 0.0;
     std::optional<std::array<double, 6>> bbox;
 };
 

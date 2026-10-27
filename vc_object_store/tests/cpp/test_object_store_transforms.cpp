@@ -217,6 +217,15 @@ int main() try {
             [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return restored.vertex(r,c);},
             [](int64_t,int64_t){return true;});
         require(complete-whole==3.75,"a missing vertex drops its six triangles");
+        require(db.objectByUuid(read,uuid)->surface->area==whole,"the store keeps the area with the geometry");
+        const auto head=db.currentGeometry(read,uuid)->uuid;
+        // A record write keeps it; an edit restoring the vertex adds its triangles.
+        {auto txn=db.write();auto r=*db.objectByUuid(txn,uuid);r.name="renamed";r.surface->area=0;db.upsertObject(txn,r);txn.commit();}
+        require(db.objectByUuid(db.read(),uuid)->surface->area==whole,"a record write keeps the store's area");
+        {auto txn=db.write();const std::array<float,3> vertex{7*1.25f,5,1.f};
+         db.editGeometry(txn,uuid,{{"points",(5*large.columns+7)*3,vc::objects::detail::scalarBytes(std::span<const float>(vertex))}},head);
+         txn.commit();}
+        require(db.objectByUuid(db.read(),uuid)->surface->area==complete,"an edit updates the area");
     }
     {
         // Importing an umbilicus file: the store reads it, decides its frame
