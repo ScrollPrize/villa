@@ -16,6 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -366,6 +367,8 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     }
     _currentVolume = std::move(vol);
     updateAnnotationVolume();
+    // The open surface's draft is declared in the volume's voxels.
+    draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surface("segmentation")));
     const auto volumeId = currentVolumeId();
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, volumeId);
@@ -537,6 +540,9 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
+    if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf));
+    }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
         // change should invalidate cached views of the surface map.
@@ -557,6 +563,24 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
             delayedFocusPoi->suppressViewerRecenter = false;
         }
     }
+}
+
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
+{
+    // Workspaces sharing the main session draft their own surfaces.
+    if (_objectStoreOwner || !_objectStoreSession) {
+        return;
+    }
+    if (!_activeSurfaceDraft.empty() && (!surface || surface->id != _activeSurfaceDraft)) {
+        _objectStoreSession->clearDraft(_activeSurfaceDraft);
+        _activeSurfaceDraft.clear();
+    }
+    if (!surface || !_currentVolume || !vc::objects::util::isUuid(surface->id)) {
+        return;
+    }
+    _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
+                                  vc::objects::volumeCoordinates(currentVolumeId(), 1));
+    _activeSurfaceDraft = surface->id;
 }
 
 void CState::setSurfacesBatch(

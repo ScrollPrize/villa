@@ -60,9 +60,12 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
         if (event.kind == Kind::Hub) return;
         if (event.kind == Kind::Attached || event.kind == Kind::Detached) {
             invalidate();
+        } else if (event.kind == Kind::Draft) {
+            // Drafts are cut on every redraw; a draft starting or ending
+            // moves its surface between drafted and stored targets there.
+            for (auto& [viewer, view] : _views) view->dirty = true;
+            refreshAll();
         } else if (event.touches({"surface"})) {
-            // A draft started or ended (stored and drafted targets swap) or
-            // stored geometry changed.
             refreshCommittedSurfaces();
         }
     });
@@ -242,13 +245,9 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
         },
         [this, viewer](View& v, Listing* listing) {
             v.dirty = true;
-            if (std::exchange(v.refreshPending, false)) {
-                // Coalesce commits into one final read, including any edits
-                // made while the batch was fetching. Keep the old display.
-                v.region.refresh();
-            } else if (listing) {
-                v.runs = std::move(listing->runs);
-            }
+            if (listing) v.runs = std::move(listing->runs);
+            // Commits made while it read: show this read, then read once more.
+            if (std::exchange(v.refreshPending, false)) v.region.refresh();
             refreshViewer(viewer);
         });
 }

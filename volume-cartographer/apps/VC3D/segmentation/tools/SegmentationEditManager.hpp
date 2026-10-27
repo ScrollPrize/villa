@@ -89,7 +89,7 @@ public:
         vc::objects::CoordinateJson coordinates;
         vc::objects::AttachmentIdentity attachment;
     };
-    // Edits keep the draft current; ending the session drops it.
+    // Edits keep the draft current (the open surface's, kept by CState).
     bool beginSession(std::shared_ptr<QuadSurface> baseSurface, DraftTarget draft);
     void endSession();
 

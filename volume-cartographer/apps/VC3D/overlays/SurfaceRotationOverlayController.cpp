@@ -1,5 +1,4 @@
 #include "SurfaceRotationOverlayController.hpp"
-#include <vc_object_store/Uuid.hpp>
 #include "SurfaceRotationTransform.hpp"
 
 #include "../CState.hpp"
@@ -572,17 +571,7 @@ void SurfaceRotationOverlayController::updatePreview()
 
 void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
 {
-    // The rotated preview is not stored: while shown it is the surface's draft,
-    // so store queries (intersections, lookups) see its grid.
-    const auto session = _state->objectStoreSession();
-    if (session && surface && vc::objects::util::isUuid(surface->id)) {
-        if (surface == _previewSurface) {
-            session->setDraft(surface->id, quad_surface_grid(*surface),
-                              vc::objects::volumeCoordinates(_state->currentVolumeId(), 1));
-        } else {
-            session->clearDraft(surface->id);
-        }
-    }
+    // CState drafts the shown surface, so store queries see the preview's grid.
     _state->setSurface("segmentation", surface, false, true);
 }
 

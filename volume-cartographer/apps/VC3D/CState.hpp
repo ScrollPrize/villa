@@ -105,6 +105,9 @@ public:
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    // While an edit session publishes the open surface's changed rectangles to
+    // its draft itself, edit updates do not re-draft the whole surface.
+    void setActiveSurfaceEditing(bool editing) { _activeSurfaceEditing = editing; }
     // Apply catalog-style surface additions/replacements/removals atomically
     // from observers' perspective. Individual surface signals are suppressed
     // and one empty-name surfaceChanged signal is emitted after the map is final.
@@ -143,6 +146,12 @@ signals:
 
 private:
     void updateAnnotationVolume();
+    // The open ("segmentation") surface is in memory: while open it is a
+    // draft of the session (in the current volume's voxels), so store
+    // queries read it there rather than from its store.
+    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface);
+    std::string _activeSurfaceDraft;
+    bool _activeSurfaceEditing = false;
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;

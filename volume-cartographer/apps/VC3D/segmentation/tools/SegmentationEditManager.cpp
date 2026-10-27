@@ -82,7 +82,7 @@ void SegmentationEditManager::endSession()
     _recentTouched.clear();
     clearActiveDrag();
 
-    if (_draft && _baseSurface) _draft->session->clearDraft(_baseSurface->id);
+    // The surface stays open (and drafted by CState) after the session.
     _draft.reset();
     _draftDirty.reset();
     _originalPoints.reset();

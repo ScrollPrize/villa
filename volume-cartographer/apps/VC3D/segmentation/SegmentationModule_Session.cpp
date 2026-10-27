@@ -72,6 +72,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     _autosaveState.beginSession();
 
     if (_state) {
+        _state->setActiveSurfaceEditing(true);
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
@@ -137,6 +138,9 @@ void SegmentationModule::endEditingSession()
 
     if (_editManager) {
         _editManager->endSession();
+    }
+    if (_state) {
+        _state->setActiveSurfaceEditing(false);
     }
     _autosaveState.endSession();
     _saveSnapshot.reset();
