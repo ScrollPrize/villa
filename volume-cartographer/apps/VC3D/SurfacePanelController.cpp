@@ -537,7 +537,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     addToolAction(tr("Refine (Alpha-comp)"), usable, &SurfacePanelController::alphaCompRefineRequested);
     addToolAction(tr("SLIM-flatten"), usable, &SurfacePanelController::slimFlattenRequested);
     addToolAction(tr("Straighten (vc_straighten)"), usable, &SurfacePanelController::straightenRequested);
-    addToolAction(tr("ABF++ flatten"), usable, &SurfacePanelController::abfFlattenRequested);
 
     contextMenu.addSeparator();
 

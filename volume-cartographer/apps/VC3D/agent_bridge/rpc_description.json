@@ -694,49 +694,6 @@
         "type": "object"
       }
     },
-    "flatten.abf": {
-      "errors": [
-        -32602,
-        -32000,
-        -32004,
-        -32005,
-        -32007,
-        -32009
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "downsampleFactor": "downsample_factor",
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_flatten_abf"
-      },
-      "params": {
-        "properties": {
-          "downsampleFactor": {
-            "default": 1,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "iterations": {
-            "default": 10,
-            "maximum": 2147483647,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "flatten.slim": {
       "errors": [
         -32602,

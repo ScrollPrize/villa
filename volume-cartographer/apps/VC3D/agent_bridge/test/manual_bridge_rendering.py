@@ -179,17 +179,17 @@ def run_render_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
 
 def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                       seg_ids: set, flatten_timeout: float = 300.0) -> None:
-    """Exercise flatten.slim / flatten.abf / flatten.straighten.
+    """Exercise flatten.slim / flatten.straighten.
 
-    Exercises every error path for all three RPCs (missing/bad params, unknown
-    segment, and the source:"flatten" concurrency guard) plus one REAL, bounded,
-    in-process ABF++ flatten of a pre-existing segment, polled to a terminal job
-    state with the output artifact verified on disk and then cleaned up. Every
-    timeout checks process liveness. No SlimFlattenDialog / ABFFlattenDialog /
-    StraightenDialog is ever reached (the headless start* launchers go straight
-    from validated params to a suppressDialogs=true job), and every terminal /
-    mid-pipeline QMessageBox in the three bespoke job classes is gated behind
-    suppressDialogs, so no step can hang on a modal dialog.
+    Exercises every error path for both RPCs (missing/bad params, unknown
+    segment, and the source:"flatten" concurrency guard) plus one REAL, bounded
+    SLIM flatten of a pre-existing segment, polled to a terminal job state with
+    the output surface verified in the store and then cleaned up. Every
+    timeout checks process liveness. No SlimFlattenDialog / StraightenDialog is
+    ever reached (the headless start* launchers go straight from validated
+    params to a suppressDialogs=true job), and every terminal / mid-pipeline
+    QMessageBox in the flatten job is gated behind suppressDialogs, so no step
+    can hang on a modal dialog.
     """
 
     def call_checked(name: str, method: str, params: dict | None = None,
@@ -264,23 +264,6 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         rec.step("flatten.slim unknown segment data.kind == segment",
                  e.data.get("kind") == "segment", f"data={e.data}")
 
-    # --- flatten.abf error paths. ---
-    e = call_expect_error("flatten.abf missing segmentId -> -32602",
-                          "flatten.abf", {}, -32602)
-    if e is not None:
-        rec.step("flatten.abf missing segmentId data.param == segmentId",
-                 e.data.get("param") == "segmentId", f"data={e.data}")
-    call_expect_error("flatten.abf iterations<1 -> -32602",
-                      "flatten.abf", {"segmentId": probe, "iterations": 0}, -32602)
-    call_expect_error("flatten.abf downsampleFactor<1 -> -32602",
-                      "flatten.abf", {"segmentId": probe, "downsampleFactor": 0}, -32602)
-    e = call_expect_error("flatten.abf unknown segment -> -32007 kind=segment",
-                          "flatten.abf",
-                          {"segmentId": "agent-bridge-nonexistent-seg"}, -32007)
-    if e is not None:
-        rec.step("flatten.abf unknown segment data.kind == segment",
-                 e.data.get("kind") == "segment", f"data={e.data}")
-
     # --- flatten.straighten error paths. ---
     e = call_expect_error("flatten.straighten missing segmentId -> -32602",
                           "flatten.straighten", {}, -32602)
@@ -303,34 +286,33 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                  e.data.get("kind") == "segment", f"data={e.data}")
 
     if target is None:
-        rec.step("flatten.abf real flatten (no target segment available)", False,
+        rec.step("flatten.slim real flatten (no target segment available)", False,
                  "no segment to flatten")
         return
 
-    # --- Real, bounded, in-process ABF++ flatten of a pre-existing segment. It
-    # runs on a QtConcurrent worker (no subprocess), needs no external tool,
-    # and creates a new surface in the object store. A high downsampleFactor +
-    # low iterations keeps it bounded. Proves the full
+    # --- Real, bounded SLIM (flatboi) flatten of a pre-existing segment. It
+    # creates a new surface in the object store. A low keepPercent + few
+    # iterations keeps it bounded. Proves the full
     # launch->job->flattenJobFinished->store path with dialogs suppressed. ---
     created = None
     job_id = None
     started_at = time.monotonic()
-    r = call_checked("flatten.abf (started)", "flatten.abf",
-                     {"segmentId": target, "iterations": 3, "downsampleFactor": 4})
+    r = call_checked("flatten.slim (started)", "flatten.slim",
+                     {"segmentId": target, "iterations": 3, "keepPercent": 5.0})
     if r is not None:
         job_id = r.get("jobId")
-        rec.step("flatten.abf result shape {jobId,kind,source,outputName}",
-                 job_id is not None and r.get("kind") == "flatten.abf"
+        rec.step("flatten.slim result shape {jobId,kind,source,outputName}",
+                 job_id is not None and r.get("kind") == "flatten.slim"
                  and r.get("source") == "flatten"
                  and isinstance(r.get("outputName"), str) and bool(r.get("outputName")),
                  json.dumps(r))
 
     if job_id:
         # job.status must carry source:"flatten" for this real flatten.
-        jst = call_checked("flatten.abf job.status carries source=flatten", "job.status",
+        jst = call_checked("flatten.slim job.status carries source=flatten", "job.status",
                            {"jobId": job_id})
         if jst is not None:
-            rec.step("flatten.abf job.status source == flatten",
+            rec.step("flatten.slim job.status source == flatten",
                      jst.get("source") == "flatten", f"source={jst.get('source')}")
 
         # Concurrency guard: a second flatten (any kind) while one is active ->
@@ -345,7 +327,7 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         last_state = None
         st = None
         while time.monotonic() < deadline:
-            st = call_checked("flatten.abf poll job.status", "job.status",
+            st = call_checked("flatten.slim poll job.status", "job.status",
                               {"jobId": job_id}, timeout=15.0)
             if st is None:
                 break
@@ -354,22 +336,22 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                 break
             time.sleep(2.0)
         elapsed = time.monotonic() - started_at
-        rec.step("flatten.abf (completed within timeout)",
+        rec.step("flatten.slim (completed within timeout)",
                  last_state in ("succeeded", "failed"),
                  f"final_state={last_state} elapsed={elapsed:.1f}s")
         if last_state == "succeeded":
             # The finished job names the new surface by its store UUID.
             created = (st or {}).get("outputPath")
-            listed = call_checked("segments.list after flatten.abf", "segments.list") or {}
+            listed = call_checked("segments.list after flatten.slim", "segments.list") or {}
             ids = [segment.get("id") for segment in listed.get("segments", [])]
-            rec.step("flatten.abf created a surface in the object store",
+            rec.step("flatten.slim created a surface in the object store",
                      bool(created) and created in ids,
                      f"outputPath={created} listed={created in ids}")
         elif last_state == "failed":
-            rec.step("flatten.abf real flatten outcome", False,
+            rec.step("flatten.slim real flatten outcome", False,
                      f"job failed: {st.get('message') if st else '?'}")
 
     # Retire the surface this check created so the store's listing is left as it was.
     if created:
-        call_checked("segments.delete flatten.abf output", "segments.delete",
+        call_checked("segments.delete flatten.slim output", "segments.delete",
                      {"segmentId": created, "confirm": True})

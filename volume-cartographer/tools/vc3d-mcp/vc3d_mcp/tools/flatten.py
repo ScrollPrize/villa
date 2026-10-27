@@ -118,40 +118,6 @@ async def vc3d_flatten_slim(
 
 
 @mcp.tool()
-async def vc3d_flatten_abf(
-    segment_id: str,
-    iterations: int = 10,
-    downsample_factor: int = 1,
-    wait: bool = False,
-    ctx: Optional[Context] = None,
-) -> dict[str, Any]:
-    """Flatten a segment with ABF++ -- the headless twin of the "ABF++ flatten"
-    context-menu action. Runs in-process (no external tool), asynchronous (a
-    source:"flatten" job -- poll vc3d_job_status). No dialog is ever shown.
-
-    segment_id: id of the segment to flatten.
-    iterations: ABF++ iterations, >= 1 (default 10).
-    downsample_factor: mesh downsample factor, >= 1 (default 1).
-    wait: if true (MCP-server-side only), block until the job finishes
-    (30-minute cap) and return the terminal job.status inline.
-
-    Returns {"jobId", "kind": "flatten.abf", "source": "flatten", "outputName"}
-    -- a new surface named <name>_abf, whose UUID is the finished job's output.
-    """
-    result = await _call(
-        "flatten.abf",
-        _strip_none(
-            {
-                "segmentId": segment_id,
-                "iterations": iterations,
-                "downsampleFactor": downsample_factor,
-            }
-        ),
-    )
-    return await _wait_for_job(result["jobId"], wait, result, ctx)
-
-
-@mcp.tool()
 async def vc3d_flatten_straighten(
     segment_id: str,
     unbend: bool = True,

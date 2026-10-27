@@ -83,7 +83,6 @@ target_link_libraries(vc_core
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
         TIFF::TIFF
-        OpenABF
         CURL::libcurl
 )
 
@@ -164,9 +163,6 @@ if(VC_USE_PCH)
     target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
     target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
 endif()
-
-add_library(vc_flattening src/ABFFlattening.cpp)
-target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 
 add_library(vc_inpaint src/InpaintSurface.cpp)
 target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
@@ -283,11 +279,11 @@ add_library(vc_tracer
     src/growth_strategies/ComponentPruning.cpp
     src/growth_strategies/GrowthConfig.cpp
 )
-target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
+target_link_libraries(vc_tracer PUBLIC vc_core Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)
+    foreach(_lib vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

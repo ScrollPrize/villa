@@ -8,7 +8,6 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
-#include "vc/flattening/ABFFlattening.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
@@ -1223,9 +1222,6 @@ int main(int argc, char *argv[])
         ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
-        ("flatten", po::bool_switch()->default_value(false), "ABF++ flattening")
-        ("flatten-iterations", po::value<int>()->default_value(10), "ABF++ iterations")
-        ("flatten-downsample", po::value<int>()->default_value(1), "ABF++ downsample factor")
         ("alpha-min", po::value<float>()->default_value(0.0f), "Alpha min (0-255)")
         ("alpha-max", po::value<float>()->default_value(255.0f), "Alpha max (0-255)")
         ("alpha-opacity", po::value<float>()->default_value(230.0f), "Alpha opacity (0-255)")
@@ -1725,22 +1721,7 @@ int main(int argc, char *argv[])
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
-        if (parsed["flatten"].as<bool>()) {
-            logPrintf(stdout, "Applying ABF++ flattening...\n");
-            vc::ABFConfig cfg;
-            cfg.maxIterations = size_t(parsed["flatten-iterations"].as<int>());
-            cfg.downsampleFactor = parsed["flatten-downsample"].as<int>();
-            cfg.useABF = true; cfg.scaleToOriginalArea = true;
-            if (auto* fs = vc::abfFlattenToNewSurface(*surf, cfg)) {
-                surf.reset(fs);
-                logPrintf(stdout, "Flattened: %dx%d\n", surf->rawPointsPtr()->cols, surf->rawPointsPtr()->rows);
-            } else {
-                logPrintf(stderr, "Warning: ABF++ failed, using original\n");
-            }
-        }
-
-        // Set the surface resampling mode here, AFTER the --flatten block above
-        // (which does surf.reset() and would drop it) and BEFORE both the
+        // Set the surface resampling mode here, BEFORE both the
         // prefetch planning pass and the render pass. The planner re-runs
         // gen() itself to work out which chunks the render will touch, so if
         // this moved below it the planner and the sampler would disagree

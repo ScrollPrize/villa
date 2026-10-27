@@ -1,8 +1,7 @@
 // The mesh tools' outputs on small fixed inputs: the OBJ vc_tifxyz2obj writes
-// (bytes), the grids vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize from an
-// OBJ, and the flattened surface and UVs vc_flatten (ABF++) makes. The expected
-// values were recorded from the tools before their mesh code moved into
-// vc::meshing; each tool's binary comes from VC_<TOOL>_BIN.
+// (bytes) and the grids vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize from
+// an OBJ. The expected values were recorded from the tools before their mesh
+// code moved into vc::meshing; each tool's binary comes from VC_<TOOL>_BIN.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -81,7 +80,6 @@ GridStats stats(const cv::Mat_<Vec>& grid, bool (*valid)(const Vec&))
 }
 
 bool validPoint(const cv::Vec3f& p) { return p[0] != -1.f; }
-bool validUv(const cv::Vec2f& uv) { return uv[0] != -1.f; }
 
 void checkStats(const GridStats& s, const GridStats& expected, int channels)
 {
@@ -203,30 +201,4 @@ TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
         dir.path / "legacy.log");
     const auto legacy = load_quad_from_tifxyz(dir.path / "legacy");
     checkStats(stats(*legacy->rawPointsPtr(), validPoint), GridStats{19, 22, 311, {20450.56852722168, 22397.15013885498, 12711.597316741943}, {22333.401655410762, 24536.34768153762, 13867.411323276525}}, 3);
-}
-
-TEST_CASE("vc_flatten flattens a surface with ABF++")
-{
-    Dir dir;
-    curvedSurface().save(dir.path / "curved", true);
-    const auto bin = tool("VC_FLATTEN_BIN");
-    const GridStats expectedFlat[2] = {
-        GridStats{17, 12, 158, {20356.313972473145, 22303.999977111816, 12792.15584564209},
-                  {22163.803524917603, 24136.759972480773, 13847.241616340634}},
-        GridStats{16, 11, 163, {20891.62134552002, 22855.759574890137, 13203.800247192383},
-                  {22706.00360906983, 24688.278533035271, 14263.524605239869}}};
-    const GridStats expectedUv[2] = {
-        GridStats{12, 16, 191, {-3459.9999999995903, 5020.7119359971584, 0}, {-3767.5199999995825, 5350.6373302346892, 0}},
-        GridStats{12, 16, 192, {-2615.999999999975, 4213.8771142959604, 0}, {-2867.9159999999738, 4491.8725996551511, 0}}};
-    for (int downsample = 1; downsample <= 2; ++downsample) {
-        CAPTURE(downsample);
-        const auto flat = dir.path / ("flat" + std::to_string(downsample));
-        const auto uv = dir.path / ("uv" + std::to_string(downsample));
-        const std::string options = " --downsample " + std::to_string(downsample);
-        run(bin + " -i " + quoted(dir.path / "curved") + " -o " + quoted(flat) + options, dir.path / "flat.log");
-        checkStats(stats(*load_quad_from_tifxyz(flat)->rawPointsPtr(), validPoint), expectedFlat[downsample - 1], 3);
-        run(bin + " -i " + quoted(dir.path / "curved") + " -o " + quoted(uv) + options + " --uv-only", dir.path / "uv.log");
-        const cv::Mat_<cv::Vec2f> uvs = load_quad_from_tifxyz(uv)->channel("uv", SURF_CHANNEL_NORESIZE);
-        checkStats(stats(uvs, validUv), expectedUv[downsample - 1], 2);
-    }
 }

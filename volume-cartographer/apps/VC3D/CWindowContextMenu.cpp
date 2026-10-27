@@ -18,7 +18,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include "LasagnaServiceManager.hpp"
 #include "SurfaceCatalog.hpp"

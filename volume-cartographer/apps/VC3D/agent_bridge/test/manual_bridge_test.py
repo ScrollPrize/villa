@@ -465,7 +465,7 @@ def run_offscreen(args) -> dict:
         # verified. Threaded `proc` so every timeout is liveness-checked.
         run_render_smoke(client, rec, proc, seg_ids)
 
-        # Exercise flatten error paths and one bounded in-process ABF++ job
+        # Exercise flatten error paths and one bounded SLIM job
         # before catalog replacement. Verify its artifact and process liveness.
         run_flatten_smoke(client, rec, proc, seg_ids)
 

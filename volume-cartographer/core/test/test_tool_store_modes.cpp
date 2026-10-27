@@ -337,32 +337,6 @@ TEST_CASE("vc_merge_tifxyz stores the merge of stored surfaces like a tifxyz mer
     CHECK(fs::exists(artifacts / "merge_summary.json"));
 }
 
-TEST_CASE("vc_flatten flattens a stored surface and stores its uv channel")
-{
-    Fixture f;
-    const auto bin = tool("VC_FLATTEN_BIN") + " --iterations 5";
-    run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "flat").string() + "\"", f.dir / "file.log");
-    const auto flat = surfaceUuid(run(bin + " " + f.storeArgs() + " --tag flat", f.dir / "store.log"));
-    run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "uv").string() + "\" --uv-only", f.dir / "file-uv.log");
-    run(bin + " " + f.storeArgs() + " --uv-only", f.dir / "store-uv.log");
-    OpenOptions options; options.author = "tool-store-test";
-    auto db = ObjectStore::open(f.store, options);
-    auto txn = db.read();
-    const auto stored = load_quad_from_store(db, txn, flat);
-    const auto files = load_quad_from_tifxyz(f.dir / "flat");
-    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
-    CHECK(nlohmann::json::parse(db.objectByUuid(txn, flat)->meta).at("provenance").at("sources") == nlohmann::json::array({f.uuid}));
-    const auto revision = db.currentGeometry(txn, f.uuid);
-    const auto uvArray = std::find_if(revision->arrays.begin(), revision->arrays.end(), [](const auto& a) { return a.name == "uv"; });
-    REQUIRE(uvArray != revision->arrays.end());
-    CHECK(uvArray->dtype == "<f4");
-    CHECK(uvArray->shape == std::vector<int64_t>{12, 16, 2});
-    const cv::Mat fileUv = load_quad_from_tifxyz(f.dir / "uv")->channel("uv", SURF_CHANNEL_NORESIZE);
-    REQUIRE(fileUv.type() == CV_32FC2);
-    CHECK(std::vector<uint8_t>(fileUv.datastart, fileUv.dataend) == db.readGeometryArray(txn, revision->uuid, "uv"));
-}
-
 TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
 {
     Fixture f;

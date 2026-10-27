@@ -103,9 +103,6 @@ public:
         double  rotateDegrees{0.0};
         int     flipAxis{-1};         // -1 => no flip
         bool    includeTifs{false};   // also write TIFF slices (Zarr output)
-        bool    flatten{false};
-        int     flattenIterations{10};
-        int     flattenDownsample{1};
     };
 
     // Arguments accepted by startSlimFlatten. keepPercent defaults to full
@@ -177,9 +174,9 @@ signals:
     void showWarning(QString title, QString text);
 
     /**
-     * Emitted when a flattening job (SlimJob / ABFJob / StraightenJob) begins.
+     * Emitted when a flattening job (SLIM or straighten) begins.
      * Emitted from both interactive slots and direct start* methods. `kind` is
-     * "flatten.slim" / "flatten.abf" / "flatten.straighten"; `label` is a short
+     * "flatten.slim" / "flatten.straighten"; `label` is a short
      * human string.
      */
     void flattenJobStarted(QString kind, QString label);
@@ -202,7 +199,6 @@ public slots:
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onStraighten(const std::string& segmentId);
-    void onABFFlatten(const std::string& segmentId);
     void onRasterizeSegments(const QStringList& segmentIds);
     // Open the MergeSurfacesDialog seeded with `segmentIds` (empty = open
     // dialog with empty grid for the user to populate via "Add segments").
@@ -252,21 +248,6 @@ public:
                           const SlimFlattenParams& params,
                           CommandLaunchError* error = nullptr,
                           QString* resolvedOutputName = nullptr);
-
-    /// Starts ABF++ asynchronously on a worker thread with dialogs suppressed.
-    /// Completion uses flattenJobFinished.
-    bool startAbfFlatten(const std::string& segmentId,
-                         int iterations,
-                         int downsampleFactor,
-                         CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputName = nullptr);
-    // The one ABF launch, from the dialog (interactive) or the bridge.
-    bool startAbfFlattenImpl(const std::string& segmentId,
-                             int iterations,
-                             int downsampleFactor,
-                             bool interactive,
-                             CommandLaunchError* error,
-                             QString* resolvedOutputName);
 
     /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
     /// validated before launch; completion uses flattenJobFinished.

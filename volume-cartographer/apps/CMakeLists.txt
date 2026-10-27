@@ -57,7 +57,7 @@ add_executable(vc_render_video src/vc_render_video.cpp)
 target_link_libraries(vc_render_video opencv_core vc_core opencv_videoio)
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
-target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF)
+target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
 
 add_executable(vc_objrefine src/ObjAlphaCompRefinement.cpp)
 target_link_libraries(vc_objrefine vc_core)
@@ -89,9 +89,6 @@ target_link_libraries(vc_obj2tifxyz vc_core)
 
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
-
-add_executable(vc_flatten src/vc_flatten.cpp)
-target_link_libraries(vc_flatten vc_core vc_flattening Boost::program_options)
 
 add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
 target_link_libraries(vc_tifxyz_inp_mask vc_core)
@@ -227,7 +224,7 @@ set(VC_CLI_TARGETS
     vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
     vc_grow_seg_from_segments vc_tifxyz2obj
     vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
-    vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+    vc_obj2tifxyz_legacy vc_tifxyz_inp_mask vc_tifxyz_trim
     vc_straighten vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
     vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
@@ -263,7 +260,7 @@ if(VC_USE_PCH)
         vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
         vc_grow_seg_from_segments vc_tifxyz2obj
         vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
-        vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+        vc_obj2tifxyz_legacy vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
         vc_calc_surface_metrics
         vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt vc_diffuse_winding

@@ -616,8 +616,8 @@ bool selectResumeLocalTracerParams(QWidget* parent,
     return true;
 }
 
-// A flattening tool run on a stored surface (SLIM by flatboi, ABF++ by
-// vc_flatten, vc_straighten): the tool reads the surface from the store and
+// A flattening tool run on a stored surface (SLIM by flatboi,
+// vc_straighten): the tool reads the surface from the store and
 // creates the result there. Shows a progress dialog, reports the run through
 // flattenJobStarted/flattenJobFinished exactly once (an empty message means
 // cancelled), and deletes itself.
@@ -628,7 +628,7 @@ public:
         QString store, volume;  // the store contract (ToolProcess::Launch)
         QStringList args;
         QString kind;         // flattenJobStarted's kind, e.g. "flatten.slim"
-        QString title;        // "SLIM-flatten", "ABF++ flatten", "Straighten"
+        QString title;        // "SLIM-flatten", "Straighten"
         QString running;      // the progress dialog's first label
         QString outputName;
         // A determinate bar over this many iterations, fed by "PROGRESS n / m"
@@ -1007,9 +1007,6 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     params.rotateDegrees = dlg.rotateDegrees();
     params.flipAxis = dlg.flipAxis();
     params.includeTifs = dlg.includeTifs();
-    params.flatten = dlg.flatten();
-    params.flattenIterations = dlg.flattenIterations();
-    params.flattenDownsample = dlg.flattenDownsample();
     CommandLaunchError error;
     if (!startRenderImpl(segmentId, params, /*interactive=*/true, &error, nullptr)) {
         QMessageBox::warning(_parentWidget, tr("Error"), error.message);
@@ -1068,18 +1065,6 @@ void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
         QMessageBox::critical(_parentWidget, tr("Error"), error.message);
         emit statusMessage(tr("Straighten failed"), 5000);
     }
-}
-
-void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
-{
-    const auto stored = requireStoredSurface(segmentId, false, true);
-    if (!stored) return;
-
-    ABFFlattenDialog dlg(_parentWidget);
-    if (dlg.exec() != QDialog::Accepted) {
-        return;
-    }
-    startAbfFlattenImpl(segmentId, dlg.iterations(), dlg.downsampleFactor(), /*interactive=*/true, nullptr, nullptr);
 }
 
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
@@ -1331,7 +1316,6 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     _cmdRunner->setRenderAdvanced(params.cropX, params.cropY, params.cropWidth, params.cropHeight,
                                   params.rotateDegrees, params.flipAxis);
     _cmdRunner->setIncludeTifs(params.includeTifs);
-    _cmdRunner->setFlattenOptions(params.flatten, params.flattenIterations, params.flattenDownsample);
     if (!_cmdRunner->execute(
             CommandLineToolRunner::Tool::RenderTifXYZ,
             interactive ? CommandLineToolRunner::ExecutionOptions{}
@@ -1384,46 +1368,6 @@ bool SegmentationCommandHandler::startSlimFlattenImpl(const std::string& segment
     new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
                    {flatboiExe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.slim"), tr("SLIM-flatten"), tr("Running SLIM (flatboi)..."),
                     outputName, iters, /*modal=*/true},
-                   /*suppressDialogs=*/!interactive);
-
-    if (resolvedOutputName) *resolvedOutputName = outputName;
-    return true;
-}
-
-bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
-                                                 int iterations,
-                                                 int downsampleFactor,
-                                                 CommandLaunchError* error,
-                                                 QString* resolvedOutputName)
-{
-    return startAbfFlattenImpl(segmentId, iterations, downsampleFactor, /*interactive=*/false, error, resolvedOutputName);
-}
-
-bool SegmentationCommandHandler::startAbfFlattenImpl(const std::string& segmentId,
-                                                     int iterations,
-                                                     int downsampleFactor,
-                                                     bool interactive,
-                                                     CommandLaunchError* error,
-                                                     QString* resolvedOutputName)
-{
-    const CommandLaunchErrorSetter setErr{error};
-    const auto stored = storedSurface(segmentId, error, true);
-    if (!stored) return false;
-
-    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_flatten"));
-    if (exe.isEmpty()) {
-        setErr(tr("Could not find the 'vc_flatten' executable (known locations and PATH). "
-                  "Set it in VC.ini [tools] vc_flatten, or put it on PATH."),
-               CommandLaunchError::ToolUnavailable);
-        return false;
-    }
-    const QString outputName = stored->name + QStringLiteral("_abf");
-    const QStringList args{QStringLiteral("--surface"), QString::fromStdString(stored->uuid),
-                           QStringLiteral("--name"), outputName,
-                           QStringLiteral("--iterations"), QString::number(std::max(1, iterations)),
-                           QStringLiteral("--downsample"), QString::number(std::max(1, downsampleFactor))};
-    new FlattenJob(_parentWidget, this, _surfacePanel->catalog(),
-                   {exe, stored->store, stored->volumeUuid, args, QStringLiteral("flatten.abf"), tr("ABF++ flatten"), tr("ABF++ Flattening..."), outputName},
                    /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;

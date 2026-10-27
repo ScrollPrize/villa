@@ -163,7 +163,6 @@ public:
     void setIncludeTifs(bool include);
     // Applies to the next execute() attempt only.
     void setNextOmpThreads(int threads);
-    void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
 
 #ifdef VC_TESTING
     QStringList argumentsForTesting(Tool tool) { return vc3d::ToolProcess::arguments(launchFor(tool)); }
@@ -233,11 +232,6 @@ private:
     double _rotateDeg{0.0};
     int _flipAxis{-1};
     bool _includeTifs{false};
-
-    // ABF++ flattening options
-    bool _flatten{false};
-    int _flattenIters{10};
-    int _flattenDownsample{1};
 
     // vc_tifxyz2obj options
     bool _optNormalizeUV{false};

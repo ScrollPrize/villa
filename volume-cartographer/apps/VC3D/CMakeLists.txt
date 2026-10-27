@@ -382,7 +382,6 @@ target_link_libraries(VC3D
     vc_lasagna
     vc_fiber_tracer
     vc_tracer
-    vc_flattening
     Ceres::ceres
     Qt6::Core
     Qt6::Concurrent

@@ -58,10 +58,10 @@
 
 
 // ---------------------------------------------------------------------------
-// Flattening RPCs: flatten.slim / flatten.abf / flatten.straighten
+// Flattening RPCs: flatten.slim / flatten.straighten
 // ---------------------------------------------------------------------------
 
-// Shared launch body for all three flatten RPCs: the handler builds `launch`
+// Shared launch body for both flatten RPCs: the handler builds `launch`
 // (a closure over the concrete start* launcher); this registers the job and
 // maps typed launch failures to JSON-RPC errors. Completion is driven by
 // SegmentationCommandHandler::flattenJobFinished rather than a
@@ -141,36 +141,6 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         [handler, segmentId, sp](CommandLaunchError* error, QString* outputName) {
             return handler && handler->startSlimFlatten(
                 segmentId.toStdString(), sp, error, outputName);
-        });
-}
-
-
-QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QString segmentId = p.value("segmentId").toString();
-    if (segmentId.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentId";
-        throw AgentBridgeError{-32602, "segmentId is required", data};
-    }
-
-    const int iterations = p.value("iterations").toInt(10);
-    const int downsampleFactor = p.value("downsampleFactor").toInt(1);
-
-    SegmentationCommandHandler* handler =
-        _window ? _window->_segmentationCommandHandler.get() : nullptr;
-    return launchFlattenJob(
-        QStringLiteral("flatten.abf"), QStringLiteral("ABF++ flatten"), segmentId,
-        [handler, segmentId, iterations, downsampleFactor](CommandLaunchError* error,
-                                                           QString* outputName) {
-            return handler && handler->startAbfFlatten(segmentId.toStdString(),
-                                                       iterations, downsampleFactor,
-                                                       error, outputName);
         });
 }
 

@@ -72,23 +72,6 @@ void AgentBridgeServer::registerFlattenHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("flatten.abf"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-                integerAtLeast(QStringLiteral("iterations"), 10, 1),
-                integerAtLeast(QStringLiteral("downsampleFactor"), 1, 1),
-            },
-            .errors = {
-                -32602, -32000, -32004, -32005, -32007, -32009,
-            },
-            .mcp = Mcp::snakeCase(
-                QStringLiteral("vc3d_flatten_abf"),
-                {QStringLiteral("wait")}),
-        },
-        [this](const QJsonValue& p) { return handleFlattenAbf(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("flatten.straighten"),
             .params = {
                 Params::requiredString(QStringLiteral("segmentId")),
