@@ -31,7 +31,7 @@
 
 #include "AnnotationFrame.hpp"
 #include "UmbilicusOrientationFreshness.hpp"
-#include "LineAnnotationFiberClassification.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
@@ -39,7 +39,7 @@
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
-#include "vc/atlas/FiberIntersections.hpp"
+#include "vc/fiber_tracer/FiberSideStripIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include "vc/lasagna/LineOptimizer.hpp"
@@ -95,7 +95,7 @@ public:
     // owning session's line revision/edit epoch), so a query no longer
     // deep-copies and re-hashes every candidate fiber per placement.
     struct SideStripFiberSnapshot {
-        std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
+        std::shared_ptr<const vc::fiber_tracer::FiberPolyline> polyline;
         uint64_t geometryHash = 0;
     };
 
@@ -605,7 +605,7 @@ private:
         std::vector<uint64_t> excludedFiberIds;
         cv::Mat_<cv::Vec3f> stripPoints;
         std::vector<SideStripFiberSnapshot> fibers;
-        std::vector<vc::atlas::FiberSideStripLineQuery> branchLinks;
+        std::vector<vc::fiber_tracer::FiberSideStripLineQuery> branchLinks;
     };
 
     struct SideStripIntersectionTaskResult {

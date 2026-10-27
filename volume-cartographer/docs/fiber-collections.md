@@ -34,8 +34,8 @@ and imports a directory's branch graph atomically. Fiber transfer accepts the
 current version-4 format; there is no legacy-file conversion or refresh path. Native JSON import/export in
 VC3D is an explicit transfer operation; exported files are not live storage.
 Surfaces and the point collections attached to them (corrections, tool results)
-are objects of the same store; CT, inference volumes and atlas directories retain
-their existing storage (an atlas pins its base surface by revision).
+are objects of the same store; CT and inference volumes retain their existing
+storage.
 
 Open a CT volume and select a fiber in the **Fibers** panel of the status bar. When its
 coordinate identity or scale is missing, the binding dialog shows the active
@@ -50,7 +50,7 @@ open-data `metadata.json` verbatim (for example `20260411134726`). VC3D compares
 it directly with `Volume::id()`; it does not generate or canonicalize a UUID.
 Its scale must be finite and positive. Advisory labels cannot override a different
 volume ID. Existing derived-UUID bindings require an explicit metadata correction. Transfer preserves known and unknown coordinates for every
-geometry kind; atlas export adjusts the declared scale with the exported XYZ.
+geometry kind.
 
 Completed interactions and accepted solver results commit immediately. Save waits
 for outstanding work and writes; it is not required to persist an edit. Conflicts
@@ -63,7 +63,7 @@ their distinct winding semantics.
 Catalog, overlay and spatial requests use `ObjectStore` directly through the
 application's shared `ObjectStoreSession`. There is no fiber repository. Runtime
 numeric handles map to store/object UUIDs; names and transport paths are labels.
-Atlas mappings record object and geometry revision pins. Spiral requests
+Spiral requests
 serialize pinned revisions into temporary transport artifacts while retaining
 their existing wire formats; the Lasagna service reads surfaces from the store
 itself (`{type: "surface", uuid, revision}` references). Fiber transport uses UUID filenames, with
@@ -133,7 +133,7 @@ AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j6 VC3D \
   test_line_annotation_fiber_deletion test_spiral_input_workflow test_object_store_fiber_json
 ctest --test-dir build --output-on-failure
 PYTHONPATH=build/python python3 -m pytest tests/python -q
-ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|atlas|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
+ctest --test-dir ../volume-cartographer/build --output-on-failure -R '(fiber|line_annotation|spiral|agent_bridge|object_store|viewer_overlay_surface_primitives)'
 ```
 
 With `VC_TESTING` enabled, the production controller test can additionally use a

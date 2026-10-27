@@ -20,7 +20,7 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationFiberClassification.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -96,7 +96,7 @@ struct StoredFiber {
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.
     std::vector<FiberBranchRef> branches;
-    FiberHvClassification hvClassification;
+    vc::fiber_tracer::FiberHvClassification hvClassification;
     std::string manualHvTag;
     std::vector<std::string> tags;
     FiberOptimizationMode optimizationMode = FiberOptimizationMode::Lasagna;

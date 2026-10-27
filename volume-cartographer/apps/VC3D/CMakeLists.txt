@@ -31,7 +31,6 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
-    LineAnnotationFiberClassification.hpp
     LineAnnotationFiberDeletion.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
@@ -380,7 +379,6 @@ target_link_libraries(VC3D
     vc_core
     vc_object_store::vc_object_geometry
     vc_fiber_view
-    vc_atlas
     vc_lasagna
     vc_fiber_tracer
     vc_tracer

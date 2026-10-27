@@ -5,7 +5,7 @@
 #include "vc/core/types/Volume.hpp"
 #include <QTemporaryDir>
 #include "FiberSliceGeometry.hpp"
-#include "LineAnnotationFiberClassification.hpp"
+#include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/lasagna/LineSpline.hpp"
@@ -3917,8 +3917,8 @@ TEST_CASE("line annotation fiber naming uses username timestamp and sequence")
 
 TEST_CASE("line annotation fiber h/v classification scores endpoint z distance")
 {
-    using vc3d::line_annotation::FiberHvTag;
-    using vc3d::line_annotation::classifyFiberHv;
+    using vc::fiber_tracer::FiberHvTag;
+    using vc::fiber_tracer::classifyFiberHv;
 
     const auto horizontal = classifyFiberHv({
         {0.0, 0.0, 0.0},
@@ -4033,8 +4033,8 @@ TEST_CASE("line annotation branch metadata json field set is a compatibility bou
 
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
 {
-    using vc3d::line_annotation::FiberHvClassification;
-    using vc3d::line_annotation::firstFiberDisplaysAsH;
+    using vc::fiber_tracer::FiberHvClassification;
+    using vc::fiber_tracer::firstFiberDisplaysAsH;
 
     FiberHvClassification first;
     first.horizontalScore = 0.25;

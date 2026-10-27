@@ -121,18 +121,6 @@ target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_i
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
 
-add_executable(vc_atlas_inspect src/vc_atlas_inspect.cpp)
-target_link_libraries(vc_atlas_inspect vc_atlas)
-
-add_executable(vc_atlas_constraints_export src/vc_atlas_constraints_export.cpp)
-target_link_libraries(vc_atlas_constraints_export vc_atlas)
-
-add_executable(vc_atlas_pred_snap_rebuild
-    src/vc_atlas_pred_snap_rebuild.cpp
-    VC3D/FiberSliceGeometry.cpp
-)
-target_link_libraries(vc_atlas_pred_snap_rebuild vc_atlas)
-
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
@@ -246,7 +234,6 @@ set(VC_CLI_TARGETS
     vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
     vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
     vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
     vc_merge_tifxyz vc_merge_patch vc_visualize
     vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
@@ -281,7 +268,7 @@ if(VC_USE_PCH)
         vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
         vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
         vc_calc_surface_metrics
-        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_atlas_inspect vc_atlas_constraints_export vc_tifxyz_gengt vc_diffuse_winding
+        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt vc_diffuse_winding
         vc_merge_tifxyz vc_merge_patch vc_visualize vc_volpkg_convert vc_transform_geom
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
         vc_thinning

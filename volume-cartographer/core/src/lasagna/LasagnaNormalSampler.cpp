@@ -173,9 +173,6 @@ public:
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
         }
-        if (manifest.groupForChannel("pred_dt") != nullptr) {
-            predDt_ = bindLasagnaChannel(manifest, "pred_dt");
-        }
     }
 
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const
@@ -185,27 +182,6 @@ public:
             return std::nullopt;
         }
         return *gradMag / gradMagDecodeScale_;
-    }
-
-    [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const
-    {
-        if (!predDt_.has_value()) {
-            return std::nullopt;
-        }
-        return sampleLasagnaChannel(*predDt_, volumePoint);
-    }
-
-    [[nodiscard]] bool hasPredDtChannel() const
-    {
-        return predDt_.has_value();
-    }
-
-    [[nodiscard]] std::optional<double> predDtSpacing() const
-    {
-        if (!predDt_.has_value()) {
-            return std::nullopt;
-        }
-        return predDt_->spacing;
     }
 
     [[nodiscard]] double windingDistance(const cv::Vec3d& a,
@@ -1004,13 +980,11 @@ public:
     void pinRegion(vc::render::PinnedChunkRegion& region,const cv::Vec3d& lo,const cv::Vec3d& hi) const
     {
         for(const auto* b:{&nx_,&ny_,&gradMag_}) pinLasagnaRegion(region,*b,lo,hi);
-        if(predDt_) pinLasagnaRegion(region,*predDt_,lo,hi);
     }
 private:
     LasagnaChannelBinding nx_;
     LasagnaChannelBinding ny_;
     LasagnaChannelBinding gradMag_;
-    std::optional<LasagnaChannelBinding> predDt_;
     bool maskInvalidCorners_ = false;
     double gradMagDecodeScale_ = 1000.0;
     std::unique_ptr<LasagnaChannelCornerSampler> gradMagCorners_;
@@ -1051,21 +1025,6 @@ NormalSample LasagnaNormalSampler::sampleNormal(const cv::Vec3d& volumePoint) co
 std::optional<double> LasagnaNormalSampler::sampleWindingDensity(const cv::Vec3d& volumePoint) const
 {
     return impl_->sampleWindingDensity(volumePoint);
-}
-
-std::optional<double> LasagnaNormalSampler::samplePredDt(const cv::Vec3d& volumePoint) const
-{
-    return impl_->samplePredDt(volumePoint);
-}
-
-bool LasagnaNormalSampler::hasPredDtChannel() const
-{
-    return impl_->hasPredDtChannel();
-}
-
-std::optional<double> LasagnaNormalSampler::predDtSpacing() const
-{
-    return impl_->predDtSpacing();
 }
 
 double LasagnaNormalSampler::windingDistance(const cv::Vec3d& a,

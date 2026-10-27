@@ -45,10 +45,8 @@ Spiral stages newly drawn and reopened fibers, including their linked endpoints,
 as input drafts. Subsequent edits refresh those drafts; applying them to the fit
 remains an explicit action. Fiber identity is the object UUID, not its display name.
 
-Atlas mappings require object-store revision pins. The atlas inspection,
-constraint export and pred-snap rebuild tools accept `--object-store PATH` and
-open that database read-only. Native JSON needed by external processing tools is
-materialized explicitly from pinned revisions into temporary transfer files.
+Native JSON needed by external processing tools is materialized explicitly from
+pinned revisions into temporary transfer files.
 
 The scroll umbilicus (Fiber Map unrolling, generated-view normal orientation,
 Patch Tracer single-wrap growth) is an `umbilicus` object in the attached store,
@@ -66,10 +64,9 @@ fixed-volume frame must be transformed before import: a binding is a scale.
 Example build and checks (existing configured Ninja build):
 
 ```sh
-ninja -C build VC3D test_atlas vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+ninja -C build VC3D test_fiber_side_strip_intersections
 QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
-build/bin/test_atlas
-build/bin/vc_atlas_inspect /path/to/atlas --object-store /path/to/objects.vcobj
+build/bin/test_fiber_side_strip_intersections
 ```
 
 ## CP direction annotations

@@ -24,7 +24,7 @@ step is required. Run from `vc_object_store`:
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C build -j2
 AGENTS_AGENT_MODE=1 ninja -C ../volume-cartographer/build -j2 \
-  VC3D test_atlas test_fiber_widget test_fiber_view \
+  VC3D test_fiber_widget test_fiber_view \
   test_line_annotation_structural_edits test_line_annotation_link_validation \
   test_line_annotation_generated_views test_line_annotation_fiber_deletion \
   test_spiral_input_workflow test_open_data_manifest test_ink_detection_overlay \
@@ -34,7 +34,7 @@ AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=build/python \
   python3 -m pytest tests/python -q -p no:cacheprovider
 QT_QPA_PLATFORM=offscreen SPIRAL_TEST_PYTHON=/home/sean/villa/spiral-fitting/.venv/bin/python \
   ctest --test-dir ../volume-cartographer/build --output-on-failure \
-  -R '(fiber|line_annotation|atlas|spiral|agent_bridge|object_store|surface_panel_store|surface_catalog|open_data|ink_detection|lasagna)'
+  -R '(fiber|line_annotation|spiral|agent_bridge|object_store|surface_panel_store|surface_catalog|open_data|ink_detection|lasagna)'
 AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=build/python \
   python3 ../volume-cartographer/apps/VC3D/agent_bridge/test/object_store_smoke.py \
   --vc3d /home/sean/villa/volume-cartographer/build/bin/VC3D

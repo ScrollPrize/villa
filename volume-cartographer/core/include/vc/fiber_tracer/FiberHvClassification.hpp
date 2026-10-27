@@ -7,7 +7,7 @@
 
 #include <opencv2/core/mat.hpp>
 
-namespace vc::atlas {
+namespace vc::fiber_tracer {
 
 enum class FiberHvTag {
     Unknown,
@@ -35,19 +35,6 @@ inline std::string fiberHvTagToString(FiberHvTag tag)
     case FiberHvTag::Unknown:
     default:
         return "unknown";
-    }
-}
-
-inline std::string fiberHvTagToPointCollectionString(FiberHvTag tag)
-{
-    switch (tag) {
-    case FiberHvTag::H:
-        return "h";
-    case FiberHvTag::V:
-        return "v";
-    case FiberHvTag::Unknown:
-    default:
-        return {};
     }
 }
 
@@ -149,4 +136,4 @@ inline FiberHvClassification classifyFiberHv(const std::vector<cv::Vec3d>& point
     return classification;
 }
 
-} // namespace vc::atlas
+} // namespace vc::fiber_tracer

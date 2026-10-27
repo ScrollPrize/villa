@@ -212,13 +212,6 @@ if(LAPACK_FOUND AND UNIX AND NOT APPLE)
     target_compile_definitions(vc_lasagna PRIVATE VC_POOLING_LAPACK)
 endif()
 
-add_library(vc_atlas
-    src/Atlas.cpp
-    src/AtlasConstraints.cpp
-    src/FiberIntersections.cpp
-)
-target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
-
 add_library(vc_fiber_tracer
     src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
     src/fiber_tracer/BinaryBeliefPropagation.cpp
@@ -257,6 +250,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletPipeline.cpp
     src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberSideStripIntersections.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
 target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
@@ -293,7 +287,7 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_fiber_tracer vc_tracer)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

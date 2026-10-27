@@ -762,13 +762,6 @@ if(VC_RUN_BENCHES)
     vc_register_ctest(bench_lasagna_line_edit bench_lasagna_line_edit)
 endif()
 
-add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
-target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
-vc_register_test_target(bench_fiber_intersections)
-if(VC_RUN_BENCHES)
-    add_test(NAME bench_fiber_intersections COMMAND bench_fiber_intersections --help)
-    vc_register_ctest(bench_fiber_intersections bench_fiber_intersections)
-endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
 # triggers a violation that the matching sanitizer must report; ctest
@@ -900,9 +893,8 @@ vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna Ce
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
 
-vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
+vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
-vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 
 # The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
 # with the command-line tool so the tested code is the shipped code).
@@ -943,7 +935,7 @@ if(TARGET vc_render_tifxyz)
     vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
 endif()
 
-vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
+vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fiber_tracer)
 
 vc_add_test(NAME test_remote_url)
 

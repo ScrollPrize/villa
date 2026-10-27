@@ -7,7 +7,6 @@
 #include "LineAnnotationController.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationFiberLinks.hpp"
-#include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 
 #include "vc/core/util/Logging.hpp"

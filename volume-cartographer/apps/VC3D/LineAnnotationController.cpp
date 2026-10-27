@@ -612,18 +612,18 @@ void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
 
 cv::Vec3f toVec3f(const cv::Vec3d& v);
 
-const char* sideStripProgressPhaseName(vc::atlas::FiberSideStripProgressPhase phase)
+const char* sideStripProgressPhaseName(vc::fiber_tracer::FiberSideStripProgressPhase phase)
 {
     switch (phase) {
-    case vc::atlas::FiberSideStripProgressPhase::BuildStripTriangles:
+    case vc::fiber_tracer::FiberSideStripProgressPhase::BuildStripTriangles:
         return "build strip triangles";
-    case vc::atlas::FiberSideStripProgressPhase::BuildTriangleIndex:
+    case vc::fiber_tracer::FiberSideStripProgressPhase::BuildTriangleIndex:
         return "build triangle index";
-    case vc::atlas::FiberSideStripProgressPhase::BranchLinks:
+    case vc::fiber_tracer::FiberSideStripProgressPhase::BranchLinks:
         return "branch links";
-    case vc::atlas::FiberSideStripProgressPhase::FiberSegments:
+    case vc::fiber_tracer::FiberSideStripProgressPhase::FiberSegments:
         return "fiber segments";
-    case vc::atlas::FiberSideStripProgressPhase::Deduplicate:
+    case vc::fiber_tracer::FiberSideStripProgressPhase::Deduplicate:
         return "deduplicate";
     default:
         return "unknown";
@@ -660,17 +660,13 @@ void combineSideStripPointHash(uint64_t& seed, const cv::Vec3f& point)
 
 // Hash of one fiber's query-relevant geometry, memoized alongside its
 // snapshot so an unchanged fiber is never re-hashed point by point.
-uint64_t sideStripFiberGeometryHash(const vc::atlas::FiberPolyline& fiber)
+uint64_t sideStripFiberGeometryHash(const vc::fiber_tracer::FiberPolyline& fiber)
 {
     uint64_t seed = 0x4649424552484153ULL;
     combineSideStripHash(seed, fiber.id);
     combineSideStripHash(seed, fiber.generation);
     combineSideStripHash(seed, static_cast<uint64_t>(fiber.points.size()));
     for (const auto& point : fiber.points) {
-        combineSideStripPointHash(seed, point.position);
-    }
-    combineSideStripHash(seed, static_cast<uint64_t>(fiber.controlPoints.size()));
-    for (const auto& point : fiber.controlPoints) {
         combineSideStripPointHash(seed, point);
     }
     return seed;
@@ -680,7 +676,7 @@ uint64_t sideStripRequestCacheKey(
     const cv::Mat_<cv::Vec3f>& stripPoints,
     const std::vector<LineAnnotationController::SideStripFiberSnapshot>& fibers,
     const std::vector<uint64_t>& excludedFiberIds,
-    const std::vector<vc::atlas::FiberSideStripLineQuery>& branchLinks)
+    const std::vector<vc::fiber_tracer::FiberSideStripLineQuery>& branchLinks)
 {
     uint64_t seed = 0x5349444553545249ULL;
     combineSideStripHash(seed, static_cast<uint64_t>(stripPoints.rows));
@@ -710,7 +706,7 @@ uint64_t sideStripRequestCacheKey(
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
 sideStripMarkersFromIntersections(
-    const std::vector<vc::atlas::FiberSideStripIntersection>& intersections)
+    const std::vector<vc::fiber_tracer::FiberSideStripIntersection>& intersections)
 {
     std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers;
     markers.reserve(intersections.size());
@@ -722,7 +718,7 @@ sideStripMarkersFromIntersections(
         marker.arclength = intersection.arclength;
         marker.distance = intersection.distance;
         marker.projectedBranchLink =
-            intersection.source == vc::atlas::FiberSideStripIntersectionSource::BranchLink;
+            intersection.source == vc::fiber_tracer::FiberSideStripIntersectionSource::BranchLink;
         if (marker.projectedBranchLink && finitePoint(intersection.connectorStart)) {
             marker.connectorStart = toVec3f(intersection.connectorStart);
         }
@@ -4602,8 +4598,8 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
 
 void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QString& tag)
 {
-    const auto normalizedTag = vc3d::line_annotation::fiberHvTagToString(
-        vc3d::line_annotation::fiberHvTagFromString(tag.toStdString()));
+    const auto normalizedTag = vc::fiber_tracer::fiberHvTagToString(
+        vc::fiber_tracer::fiberHvTagFromString(tag.toStdString()));
     const std::string manualTag = normalizedTag == "unknown" ? std::string{} : normalizedTag;
 
     auto fiber = readStoredFiber(fiberId);
@@ -4686,7 +4682,7 @@ QString LineAnnotationController::fiberHvDirectionTag(uint64_t fiberId) const
         return QString::fromStdString(fiber->manualHvTag);
     }
     const std::string automaticTag =
-        vc3d::line_annotation::fiberHvTagToString(fiber->hvClassification.automaticTag);
+        vc::fiber_tracer::fiberHvTagToString(fiber->hvClassification.automaticTag);
     if (automaticTag == "H" || automaticTag == "V") {
         return QString::fromStdString(automaticTag);
     }
@@ -4714,7 +4710,7 @@ void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId
         showError(tr("Fiber %1 is not in the attached object store.").arg(fiberId));
         return;
     }
-    fiber->hvClassification = vc3d::line_annotation::classifyFiberHv(
+    fiber->hvClassification = vc::fiber_tracer::classifyFiberHv(
         vc3d::line_annotation::storedControlPointPositions(fiber->controlPoints));
     try {
         commitFibers({&*fiber});
@@ -5802,7 +5798,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
     // rule as fiber_slice::annotatedLineLengthVx: without two finite
     // controls the whole line, otherwise the line between the outermost
     // ones - which is nothing when they all sit on one line point.
-    const double lineLength = vc3d::line_annotation::fiberLineLengthVx(fiber.linePoints);
+    const double lineLength = vc::fiber_tracer::fiberLineLengthVx(fiber.linePoints);
     double annotatedLength = 0.0;
     if (!spans.empty()) {
         for (const auto& span : spans) {
@@ -5831,7 +5827,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
         fiber.hvClassification.horizontalScore,
         fiber.hvClassification.verticalScore,
         fiber.hvClassification.automaticCertainty,
-        vc3d::line_annotation::fiberHvTagToString(fiber.hvClassification.automaticTag),
+        vc::fiber_tracer::fiberHvTagToString(fiber.hvClassification.automaticTag),
         fiber.manualHvTag,
         fiber.tags,
         linkedFiberCount >= 2 ? linkedFiberCount : 0,
@@ -5949,14 +5945,14 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
         entry.label = QStringLiteral("%1-%2")
                           .arg(separator >= 0 ? stem.left(separator) : stem)
                           .arg(fiber.sequence);
-        switch (vc::atlas::effectiveFiberHvTag(fiber.hvClassification, fiber.manualHvTag)) {
-        case vc3d::line_annotation::FiberHvTag::H:
+        switch (vc::fiber_tracer::effectiveFiberHvTag(fiber.hvClassification, fiber.manualHvTag)) {
+        case vc::fiber_tracer::FiberHvTag::H:
             entry.hvTag = 'H';
             break;
-        case vc3d::line_annotation::FiberHvTag::V:
+        case vc::fiber_tracer::FiberHvTag::V:
             entry.hvTag = 'V';
             break;
-        case vc3d::line_annotation::FiberHvTag::Unknown:
+        case vc::fiber_tracer::FiberHvTag::Unknown:
         default:
             entry.hvTag = '?';
             break;
@@ -12882,7 +12878,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                         stored.displayNormalSource = control.displayNormalSource;
                         fiber.controlPoints.push_back(std::move(stored));
                     }
-                    fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
+                    fiber.hvClassification = vc::fiber_tracer::classifyFiberHv(
                         vc3d::line_annotation::storedControlPointPositions(
                             fiber.controlPoints));
                     const uint64_t id = fiber.id;
@@ -13162,20 +13158,16 @@ LineAnnotationController::fiberSnapshotsForSideStripQuery(const std::vector<Stor
     const auto makePolyline = [](uint64_t id,
                                  uint64_t generation,
                                  const std::vector<cv::Vec3d>& linePoints,
-                                 std::vector<cv::Vec3d> controlPoints) {
+                                 const std::vector<cv::Vec3d>& controlPoints) {
         // Other fibers take part only between their outer control points:
         // extrapolated tails must not produce intersection markers.
         const std::vector<cv::Vec3d> controlledSpan =
             vc3d::line_annotation::linePointsBetweenOuterControlPoints(linePoints,
                                                                        controlPoints);
-        auto polyline = std::make_shared<vc::atlas::FiberPolyline>();
+        auto polyline = std::make_shared<vc::fiber_tracer::FiberPolyline>();
         polyline->id = id;
         polyline->generation = std::max<uint64_t>(uint64_t{1}, generation);
-        polyline->controlPoints = std::move(controlPoints);
-        polyline->points.reserve(controlledSpan.size());
-        for (const auto& point : controlledSpan) {
-            polyline->points.push_back(vc::atlas::FiberPoint{point, std::nullopt});
-        }
+        polyline->points = controlledSpan;
         SideStripFiberSnapshot snapshot;
         snapshot.geometryHash = sideStripFiberGeometryHash(*polyline);
         snapshot.polyline = std::move(polyline);
@@ -13503,7 +13495,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
             !finiteDirection(branch.branchControlPointDirection)) {
             continue;
         }
-        vc::atlas::FiberSideStripLineQuery query;
+        vc::fiber_tracer::FiberSideStripLineQuery query;
         query.fiberId = branch.branchFiberId;
         if (!branch.branchInVolume) continue;
         query.point = branch.branchControlPointPosition;
@@ -13668,7 +13660,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
                 publishProgress(stage, aggregateCompleted, totalProgressBudget);
             };
         auto convertIntersections =
-            [](const std::vector<vc::atlas::FiberSideStripIntersection>& intersections) {
+            [](const std::vector<vc::fiber_tracer::FiberSideStripIntersection>& intersections) {
                 std::vector<SideStripMarker> markers;
                 markers.reserve(intersections.size());
                 for (const auto& intersection : intersections) {
@@ -13679,7 +13671,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
                     marker.arclength = intersection.arclength;
                     marker.distance = intersection.distance;
                     marker.projectedBranchLink =
-                        intersection.source == vc::atlas::FiberSideStripIntersectionSource::BranchLink;
+                        intersection.source == vc::fiber_tracer::FiberSideStripIntersectionSource::BranchLink;
                     if (marker.projectedBranchLink && finitePoint(intersection.connectorStart)) {
                         marker.connectorStart = toVec3f(intersection.connectorStart);
                     }
@@ -13691,10 +13683,10 @@ LineAnnotationController::runSideStripIntersectionQuery(
             [&publishAggregateProgress,
              &scaledProgress,
              branchOffset,
-             branchBudget](vc::atlas::FiberSideStripProgressPhase phase,
+             branchBudget](vc::fiber_tracer::FiberSideStripProgressPhase phase,
                            size_t completed,
                            size_t total) {
-                if (phase != vc::atlas::FiberSideStripProgressPhase::BranchLinks) {
+                if (phase != vc::fiber_tracer::FiberSideStripProgressPhase::BranchLinks) {
                     return;
                 }
                 publishAggregateProgress(
@@ -13707,17 +13699,17 @@ LineAnnotationController::runSideStripIntersectionQuery(
              triangleIndexOffset,
              triangleIndexBudget,
              segmentOffset,
-             segmentBudget](vc::atlas::FiberSideStripProgressPhase phase,
+             segmentBudget](vc::fiber_tracer::FiberSideStripProgressPhase phase,
                             size_t completed,
                             size_t total) {
                 switch (phase) {
-                case vc::atlas::FiberSideStripProgressPhase::BuildTriangleIndex:
+                case vc::fiber_tracer::FiberSideStripProgressPhase::BuildTriangleIndex:
                     publishAggregateProgress(
                         sideStripProgressPhaseName(phase),
                         triangleIndexOffset +
                             scaledProgress(completed, total, triangleIndexBudget));
                     break;
-                case vc::atlas::FiberSideStripProgressPhase::FiberSegments:
+                case vc::fiber_tracer::FiberSideStripProgressPhase::FiberSegments:
                     publishAggregateProgress(
                         sideStripProgressPhaseName(phase),
                         segmentOffset +
@@ -13734,7 +13726,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
                 return result;
             }
             publishAggregateProgress("branch links", branchOffset);
-            vc::atlas::FiberSideStripQueryOptions branchOptions;
+            vc::fiber_tracer::FiberSideStripQueryOptions branchOptions;
             branchOptions.stripPoints = request.stripPoints;
             branchOptions.deduplicateStripDistance = 1.0e-3;
             branchOptions.aabbPadding = 1.0e-6;
@@ -13743,7 +13735,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
             branchOptions.branchLinks = request.branchLinks;
 
             const auto branchIntersections =
-                vc::atlas::fiberSideStripIntersections(branchOptions,
+                vc::fiber_tracer::fiberSideStripIntersections(branchOptions,
                                                    branchCoreProgress,
                                                    cancelCallback);
             if (cancelCallback && cancelCallback()) {
@@ -13762,7 +13754,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
         }
 
         if (segmentBudget > 0) {
-            vc::atlas::FiberSideStripQueryOptions options;
+            vc::fiber_tracer::FiberSideStripQueryOptions options;
             options.stripPoints = request.stripPoints;
             options.deduplicateStripDistance = 1.0e-3;
             options.aabbPadding = 1.0e-6;
@@ -13778,7 +13770,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
             publishAggregateProgress("fiber geometry", triangleIndexOffset);
 
             const auto intersections =
-                vc::atlas::fiberSideStripIntersections(options,
+                vc::fiber_tracer::fiberSideStripIntersections(options,
                                                                        fiberCoreProgress,
                                                                        cancelCallback);
             if (cancelCallback && cancelCallback()) {
@@ -14887,7 +14879,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     }
 
     vc3d::line_annotation::validateStoredControlPoints(fiber.controlPoints);
-    fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
+    fiber.hvClassification = vc::fiber_tracer::classifyFiberHv(
         vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
     fiber.manualHvTag = session.fiberManualHvTag;
     fiber.tags = session.fiberTags;
@@ -15126,7 +15118,7 @@ nlohmann::json LineAnnotationController::fiberSourceMetadata(const StoredFiber& 
             {"control_point_length", fiber.hvClassification.fiberLength},
             {"horizontal_score", fiber.hvClassification.horizontalScore},
             {"vertical_score", fiber.hvClassification.verticalScore},
-            {"automatic_tag", vc3d::line_annotation::fiberHvTagToString(fiber.hvClassification.automaticTag)},
+            {"automatic_tag", vc::fiber_tracer::fiberHvTagToString(fiber.hvClassification.automaticTag)},
             {"automatic_certainty", fiber.hvClassification.automaticCertainty}}}};
     if (fiber.coordinateBaseShapeZYX) source["coordinate_base_shape_zyx"] = *fiber.coordinateBaseShapeZYX;
     auto controls = fiber.controlPoints;
@@ -15352,7 +15344,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 }
                 for (const auto& point : geometry.linePoints)
                     fiber.linePoints.emplace_back(point[0], point[1], point[2]);
-                fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
+                fiber.hvClassification = vc::fiber_tracer::classifyFiberHv(
                     vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
             } catch (const std::exception& error) {
                 fiber.readOnly = true; fiber.editorError = error.what();
@@ -15608,7 +15600,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 for (size_t i = 0; i < stored.linePoints.size(); ++i)
                     stored.linePoints[i] = {canonical.linePoints[i][0], canonical.linePoints[i][1], canonical.linePoints[i][2]};
                 stored.width = fiber.width * inverse.lengthScale();
-                stored.hvClassification = vc3d::line_annotation::classifyFiberHv(
+                stored.hvClassification = vc::fiber_tracer::classifyFiberHv(
                     vc3d::line_annotation::storedControlPointPositions(stored.controlPoints));
                 // The object keeps the frame it was created in.
                 stored.coordinateBaseShapeZYX.reset();
@@ -15658,7 +15650,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             detail.length = geometry.length(); detail.width = stored.width; detail.widthGapFraction = fiber.widthGapFraction;
             detail.optimizationMode = vc3d::line_annotation::fiberOptimizationModeToString(fiber.optimizationMode);
             detail.manualFamily = !fiber.manualHvTag.empty();
-            detail.family = detail.manualFamily ? fiber.manualHvTag : vc3d::line_annotation::fiberHvTagToString(stored.hvClassification.automaticTag);
+            detail.family = detail.manualFamily ? fiber.manualHvTag : vc::fiber_tracer::fiberHvTagToString(stored.hvClassification.automaticTag);
             record.fiber = detail;
             const auto dataToSave = vc::geometry::encode(geometry);
             auto head = current ? db.currentGeometry(txn, fiber.uuid) : std::nullopt;

@@ -272,8 +272,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         # covered SHARED_LIBRARY targets only. With Homebrew clang/lld 22.1.8
         # the same corruption appears *within* the VC3D executable: opening a
         # volume-less project made resolveLasagnaForVolume's std::runtime_error
-        # bypass the `catch (...)` in CWindow::updateAtlasFiberDocks and abort
-        # the app. Relinking only the executables with Apple's ld — same
+        # bypass a `catch (...)` in CWindow and abort the app. Relinking only the executables with Apple's ld — same
         # objects, same dylibs — turns that back into the intended handled
         # error, so executables need the workaround too.
         #
@@ -526,7 +525,7 @@ if(VC_BUILD_UI_TRACER OR VC_BUILD_APPS)
     find_package(Boost CONFIG REQUIRED COMPONENTS program_options)
 endif()
 # Ceres is required unconditionally: core/CMakeLists.txt always builds
-# vc_inpaint, vc_lasagna, vc_atlas and vc_tracer, all of which link
+# vc_inpaint, vc_lasagna, vc_fiber_tracer and vc_tracer, all of which link
 # Ceres::ceres (vc_lasagna is also pulled into the Python bindings via
 # vc_lasagna_amgx).
 find_package(Ceres REQUIRED)
@@ -862,15 +861,13 @@ if(VC_TESTING)
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces
         test_lasagna_normal_sampler
-        test_atlas
-        test_fiber_intersections
+        test_fiber_side_strip_intersections
         test_chunked_tensor_meta
         test_growth_config
         test_growth_helpers
         test_surf_tracker_data
         test_neural_tracer_connection
-        bench_lasagna_line_edit
-        bench_fiber_intersections)
+        bench_lasagna_line_edit)
 
     function(vc_register_test_target target)
         if(NOT TARGET ${target})

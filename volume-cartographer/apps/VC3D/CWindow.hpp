@@ -32,7 +32,6 @@
 #include "CState.hpp"
 
 #include "OpenDataManifest.hpp"
-#include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
