@@ -6,7 +6,7 @@
 
 #include <opencv2/core/mat.hpp>
 
-namespace vc3d::fiber_slice {
+namespace vc3d::fiber_line {
 
 bool isFinitePoint(const cv::Vec3d& point);
 
@@ -50,4 +50,4 @@ std::optional<double> controlExtrapolationBoundaryLinePosition(
     double lineEndPosition,
     double maxDistanceBaseVoxels);
 
-} // namespace vc3d::fiber_slice
+} // namespace vc3d::fiber_line

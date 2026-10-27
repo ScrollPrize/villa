@@ -106,7 +106,7 @@ jobs:
               - 'volume-cartographer/core/**'
               - 'volume-cartographer/apps/CMakeLists.txt'
               - 'volume-cartographer/apps/src/**'
-              - 'volume-cartographer/apps/VC3D/FiberSliceGeometry.*'
+              - 'volume-cartographer/apps/VC3D/FiberLineGeometry.*'
               - 'volume-cartographer/utils/**'
               - 'volume-cartographer/libs/**'
               - 'vc_object_store/**'

@@ -18,7 +18,7 @@
 #include "FiberNameDisplay.hpp"
 #include "FiberSaveBatchTracker.hpp"
 #include "OpenDataLasagna.hpp"
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
@@ -3160,7 +3160,7 @@ std::optional<QString> LineAnnotationController::placePreparedControl(
     const size_t countBefore = session.controlPoints.size();
     const std::vector<cv::Vec3d> currentLinePoints = linePointPositions(session.optimizedLine);
     const auto cumulativeArclengths =
-        vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
+        vc3d::fiber_line::cumulativePolylineArclengths(currentLinePoints);
     std::vector<double> controlLinePositions;
     controlLinePositions.reserve(session.controlPoints.size());
     for (const auto& control : session.controlPoints) {
@@ -3211,7 +3211,7 @@ std::optional<QString> LineAnnotationController::placePreparedControl(
         // ordered scan for every control, on the spliced line AND on the
         // solved line, and so must the solver's own indices.
         for (size_t i = 0; i < controls.size(); ++i) {
-            if (vc3d::fiber_slice::nearestLinePointIndex(line, positions[i]) != (*ordered)[i] ||
+            if (vc3d::fiber_line::nearestLinePointIndex(line, positions[i]) != (*ordered)[i] ||
                 controls[i].optimizedIndex < 0 ||
                 static_cast<size_t>(controls[i].optimizedIndex) != (*ordered)[i]) {
                 return tr("%1 passes through one of its control points twice")
@@ -3335,13 +3335,13 @@ std::optional<QString> LineAnnotationController::planAutoLinkChoices(
         // controls by nearest vertex; it is only correct where that agrees
         // with the loader's ordered scan.
         for (size_t c = 0; c < controls.size(); ++c) {
-            if (vc3d::fiber_slice::nearestLinePointIndex(linePoints, controls[c]) !=
+            if (vc3d::fiber_line::nearestLinePointIndex(linePoints, controls[c]) !=
                 (*ordered)[c]) {
                 return tr("%1 passes through one of its control points twice.").arg(side.name);
             }
         }
         side.orderedIndex = *ordered;
-        side.cumulative = vc3d::fiber_slice::cumulativePolylineArclengths(linePoints);
+        side.cumulative = vc3d::fiber_line::cumulativePolylineArclengths(linePoints);
     }
     al::FiberSide sideA{sides[0].source.linePoints, &sides[0].cumulative,
                         sides[0].anchorPosition, sides[0].windowVx};
@@ -3930,7 +3930,7 @@ void LineAnnotationController::runDialogAutoLink(const DialogAutoLinkCapture& c)
         for (const auto& control : sessionA.controlPoints) {
             controlLinePositions.push_back(control.linePosition);
         }
-        return vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
+        return vc3d::fiber_line::linePositionWithinControlExtrapolationDistance(
             sideA.cumulative, sideA.choice.linePosition, controlLinePositions,
             static_cast<double>(c.extrapolationLimitVx));
     };
@@ -4012,7 +4012,7 @@ void LineAnnotationController::runDialogAutoLink(const DialogAutoLinkCapture& c)
             return refuseKeeping(tr("The pass lies beyond the placement limit of this annotation."));
         }
         const std::vector<cv::Vec3d> currentLinePoints = linePointPositions(sessionA.optimizedLine);
-        const auto cumulative = vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
+        const auto cumulative = vc3d::fiber_line::cumulativePolylineArclengths(currentLinePoints);
         std::vector<double> controlLinePositions;
         for (const auto& control : sessionA.controlPoints) {
             controlLinePositions.push_back(control.linePosition);
@@ -5179,7 +5179,7 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
         }
         controls.push_back({
             static_cast<int>(i),
-            vc3d::fiber_slice::nearestLinePointIndex(fiber.linePoints, control),
+            vc3d::fiber_line::nearestLinePointIndex(fiber.linePoints, control),
         });
     }
     std::sort(controls.begin(),
@@ -5205,7 +5205,7 @@ LineAnnotationController::controlSpansForFiber(const StoredFiber& fiber)
         span.firstLineIndex = left.lineIndex;
         span.lastLineIndex = right.lineIndex;
         span.linePointCount = static_cast<int>(right.lineIndex - left.lineIndex + 1);
-        span.lengthVx = vc3d::fiber_slice::polylineLengthRange(fiber.linePoints,
+        span.lengthVx = vc3d::fiber_line::polylineLengthRange(fiber.linePoints,
                                                                span.firstLineIndex,
                                                                span.lastLineIndex);
         spans.push_back(span);
@@ -5630,7 +5630,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
     }
     // The spans are cached per fiber generation; summing them is the
     // annotated length without another control-to-line scan. The same
-    // rule as fiber_slice::annotatedLineLengthVx: without two finite
+    // rule as fiber_line::annotatedLineLengthVx: without two finite
     // controls the whole line, otherwise the line between the outermost
     // ones - which is nothing when they all sit on one line point.
     const double lineLength = vc::fiber_tracer::fiberLineLengthVx(fiber.linePoints);
@@ -6123,9 +6123,9 @@ LineAnnotationController::applyGeometricControlPointEdit(
         std::vector<double> controlArcs;
         controlArcs.reserve(controlLinePositions.size());
         for (const double position : controlLinePositions)
-            controlArcs.push_back(vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, position));
+            controlArcs.push_back(vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, position));
         edit.displayNormal = vc::fiber_tracer::inheritedFiberDisplayNormal(field, controlArcs,
-            vc3d::fiber_slice::arclengthAtLinePosition(cumulativeArclengths, edit.linePosition),
+            vc3d::fiber_line::arclengthAtLinePosition(cumulativeArclengths, edit.linePosition),
             edit.linePosition);
         edit.manualDisplayNormal = false;
     }
@@ -6254,7 +6254,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             currentLinePoints, toVec3d(*lineAnchor), linePosition);
     }
     const auto cumulativeArclengths =
-        vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
+        vc3d::fiber_line::cumulativePolylineArclengths(currentLinePoints);
     std::vector<double> controlLinePositions;
     std::vector<bool> kollesisTerminations;
     controlLinePositions.reserve(session.controlPoints.size());
@@ -6288,7 +6288,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     if (pane->dialog &&
         pane->dialog->maxControlPointExtrapolationDistanceVx() > 0) {
-        if (!vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
+        if (!vc3d::fiber_line::linePositionWithinControlExtrapolationDistance(
                 cumulativeArclengths,
                 linePosition,
                 controlLinePositions,
@@ -6300,7 +6300,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     const cv::Vec3d clicked(volumePoint[0], volumePoint[1], volumePoint[2]);
 
     const std::vector<size_t> nearbyControlIndices =
-        vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
+        vc3d::fiber_line::linePositionIndicesWithinArclengthRadius(
             cumulativeArclengths,
             linePosition,
             controlLinePositions,
@@ -6972,7 +6972,7 @@ void LineAnnotationController::handleGeneratedOpenNearbyAnnotation(uint64_t fibe
         return;
     }
     const size_t linePointIndex =
-        vc3d::fiber_slice::nearestLinePointIndex(fiber->linePoints, toVec3d(volumePoint));
+        vc3d::fiber_line::nearestLinePointIndex(fiber->linePoints, toVec3d(volumePoint));
     openFiberAtLinePointIndex(fiberId, static_cast<int>(linePointIndex));
 }
 
@@ -12704,7 +12704,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                     initialLine.push_back(point.position);
                 size_t previous = 0;
                 for (size_t i = 0; i < controls.size(); ++i) {
-                    const size_t index = vc3d::fiber_slice::nearestLinePointIndex(
+                    const size_t index = vc3d::fiber_line::nearestLinePointIndex(
                         initialLine, controls[i].volumePoint);
                     if (i > 0 && index <= previous) {
                         throw std::runtime_error(
@@ -14484,7 +14484,7 @@ LineAnnotationController::makeIntersectionLineSession(
     for (size_t i = 0; i < fiber.controlPoints.size(); ++i) {
         const cv::Vec3d& controlPoint = fiber.controlPoints[i];
         const int index = static_cast<int>(
-            vc3d::fiber_slice::nearestLinePointIndex(fiber.linePoints, controlPoint));
+            vc3d::fiber_line::nearestLinePointIndex(fiber.linePoints, controlPoint));
         vc3d::line_annotation::LineControlPoint control;
         control.linePosition = static_cast<double>(index);
         control.volumePoint = controlPoint;

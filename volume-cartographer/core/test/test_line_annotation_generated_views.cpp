@@ -4,7 +4,7 @@
 #include "CState.hpp"
 #include "vc/core/types/Volume.hpp"
 #include <QTemporaryDir>
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSegments.hpp"
@@ -1822,7 +1822,7 @@ TEST_CASE("line annotation straight-ahead distance follows the marker's actual a
 
     // A notch that clamps at the line end moves the plane only as far as the
     // marker got (196 -> 200 is 4 vx, not 8), and a notch AT the end moves nothing.
-    from = vc3d::fiber_slice::linePositionAtArclength(arclengths, 196.0);
+    from = vc3d::fiber_line::linePositionAtArclength(arclengths, 196.0);
     to = shiftedLinePositionByArclength(from, 1, 1, arclengths);
     CHECK(to == doctest::Approx(15.0));
     CHECK(straightAheadDistanceForShiftScroll(from, to, arclengths) == doctest::Approx(4.0));
@@ -2376,7 +2376,7 @@ TEST_CASE("line annotation anchor remap keeps a pane position on its own fiber p
         // The regression this guards: resolving the position through the
         // click picked the return pass, thousands of vertices away on a real
         // fiber, so the edit collapsed into that pass's control point.
-        CHECK(vc3d::fiber_slice::nearestLinePointIndex(line, click) == 16);
+        CHECK(vc3d::fiber_line::nearestLinePointIndex(line, click) == 16);
     }
 
     SUBCASE("the anchor keeps the position on the outbound pass")

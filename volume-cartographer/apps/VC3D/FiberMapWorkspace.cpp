@@ -3,7 +3,7 @@
 #include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "LineAnnotationController.hpp"
 #include "CState.hpp"
 #include "FiberMapAutoLink.hpp"
@@ -1947,7 +1947,7 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
         inputs.reserve(job->snapshot.fibers.size());
         job->fiberLengthVx.reserve(job->snapshot.fibers.size());
         for (auto& fiber : job->snapshot.fibers) {
-            job->fiberLengthVx[fiber.id] = vc3d::fiber_slice::annotatedLineLengthVx(
+            job->fiberLengthVx[fiber.id] = vc3d::fiber_line::annotatedLineLengthVx(
                 fiber.linePoints, fiber.controlPoints);
             vc3d::fiber_map::InputFiber input;
             input.id = fiber.id;

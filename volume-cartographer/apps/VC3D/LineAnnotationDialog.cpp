@@ -4,7 +4,7 @@
 
 
 #include "FiberNameDisplay.hpp"
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
@@ -1438,15 +1438,15 @@ void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
     if (!_hasGeneratedViews || _closing) return;
     _angleControlIndex.reset();
     const auto& arcs = currentLineArclengths();
-    const double currentArc = vc3d::fiber_slice::arclengthAtLinePosition(arcs, _currentLinePosition);
+    const double currentArc = vc3d::fiber_line::arclengthAtLinePosition(arcs, _currentLinePosition);
     double nearest = vc::lasagna::kLineViewAlongSamplingDistanceBaseVoxels;
     std::vector<double> positions;
     for (const auto& cp : _generatedViews.controlPoints) positions.push_back(cp.linePosition);
-    const auto nearby = vc3d::fiber_slice::linePositionIndicesWithinArclengthRadius(
+    const auto nearby = vc3d::fiber_line::linePositionIndicesWithinArclengthRadius(
         arcs, _currentLinePosition, positions, nearest);
     for (const auto index : nearby) {
         const auto& cp = _generatedViews.controlPoints[index];
-        const double distance = std::abs(vc3d::fiber_slice::arclengthAtLinePosition(arcs, cp.linePosition) - currentArc);
+        const double distance = std::abs(vc3d::fiber_line::arclengthAtLinePosition(arcs, cp.linePosition) - currentArc);
         if (distance <= nearest && cp.controlIndex < _generatedViews.controlAngleOffsetsDegrees.size() &&
             std::isfinite(_generatedViews.controlAngleOffsetsDegrees[cp.controlIndex])) {
             nearest = distance;
@@ -4105,7 +4105,7 @@ std::vector<double> LineAnnotationDialog::arrowPanTargetPositions() const
     const double lastPosition =
         static_cast<double>(_generatedViews.linePoints.size() - 1);
     if (const auto left =
-            vc3d::fiber_slice::controlExtrapolationBoundaryLinePosition(
+            vc3d::fiber_line::controlExtrapolationBoundaryLinePosition(
                 _generatedViews.stripPositionMap.originalArclengths,
                 positions,
                 -1,
@@ -4114,7 +4114,7 @@ std::vector<double> LineAnnotationDialog::arrowPanTargetPositions() const
         positions.insert(positions.begin(), *left);
     }
     if (const auto right =
-            vc3d::fiber_slice::controlExtrapolationBoundaryLinePosition(
+            vc3d::fiber_line::controlExtrapolationBoundaryLinePosition(
                 _generatedViews.stripPositionMap.originalArclengths,
                 positions,
                 1,
@@ -4238,12 +4238,12 @@ void LineAnnotationDialog::tickArrowPan()
     const double maxCoordinate = arclengthUnits ? arclengths.back() : maxPosition;
     const auto toCoordinate = [&](double linePosition) {
         return arclengthUnits
-            ? vc3d::fiber_slice::arclengthAtLinePosition(arclengths, linePosition)
+            ? vc3d::fiber_line::arclengthAtLinePosition(arclengths, linePosition)
             : linePosition;
     };
     const auto toLinePosition = [&](double coordinate) {
         return arclengthUnits
-            ? vc3d::fiber_slice::linePositionAtArclength(arclengths, coordinate)
+            ? vc3d::fiber_line::linePositionAtArclength(arclengths, coordinate)
             : coordinate;
     };
     std::optional<double> stopTargetCoordinate;
@@ -4826,7 +4826,7 @@ bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) c
     for (const auto& control : _generatedViews.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    return vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
+    return vc3d::fiber_line::linePositionWithinControlExtrapolationDistance(
         _generatedViews.stripPositionMap.originalArclengths,
         linePosition,
         controlLinePositions,
@@ -4851,7 +4851,7 @@ LineAnnotationDialog::currentLineMarkerState() const
     for (const auto& control : _generatedViews.controlPoints) {
         controlLinePositions.push_back(control.linePosition);
     }
-    return vc3d::fiber_slice::linePositionWithinControlExtrapolationDistance(
+    return vc3d::fiber_line::linePositionWithinControlExtrapolationDistance(
                _generatedViews.stripPositionMap.originalArclengths,
                _currentLinePosition,
                controlLinePositions,

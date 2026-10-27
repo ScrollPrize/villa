@@ -241,8 +241,8 @@ qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.h
              ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 vc_add_test(NAME test_line_annotation_link_validation
     SOURCES test_line_annotation_link_validation.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
@@ -250,8 +250,8 @@ vc_add_test(NAME test_line_annotation_link_validation
 
 vc_add_test(NAME test_line_annotation_structural_edits
     SOURCES test_line_annotation_structural_edits.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationStructuralEdits.cpp
@@ -267,18 +267,18 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
     LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_fiber_slice_geometry
-    SOURCES test_fiber_slice_geometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
+vc_add_test(NAME test_fiber_line_geometry
+    SOURCES test_fiber_line_geometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
     LIBS doctest::doctest vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 

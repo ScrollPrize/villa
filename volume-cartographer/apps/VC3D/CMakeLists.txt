@@ -49,8 +49,8 @@ set(srcs
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp
-    FiberSliceGeometry.cpp
-    FiberSliceGeometry.hpp
+    FiberLineGeometry.cpp
+    FiberLineGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
     LineAnnotationFiberSegments.cpp

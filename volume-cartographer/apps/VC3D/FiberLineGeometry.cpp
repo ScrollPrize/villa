@@ -1,4 +1,4 @@
-#include "FiberSliceGeometry.hpp"
+#include "FiberLineGeometry.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -6,7 +6,7 @@
 
 #include <opencv2/core.hpp>
 
-namespace vc3d::fiber_slice {
+namespace vc3d::fiber_line {
 namespace {
 
 constexpr double kEpsilon = 1.0e-10;
@@ -308,4 +308,4 @@ std::optional<double> controlExtrapolationBoundaryLinePosition(
     return targetPosition;
 }
 
-} // namespace vc3d::fiber_slice
+} // namespace vc3d::fiber_line
