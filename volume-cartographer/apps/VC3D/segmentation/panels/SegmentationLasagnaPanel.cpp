@@ -184,10 +184,17 @@ QJsonObject recordMeta(const SurfaceCatalog::Row& row)
     return QJsonDocument::fromJson(QByteArray::fromStdString(row.record.meta)).object();
 }
 
-// The surfaces a job of `row` reads: those its own Lasagna job read, else itself.
-QJsonArray linkedSurfacesOf(const SurfaceCatalog::Row& row)
+// The surfaces a job of `row` reads: those the job that made it read (its
+// provenance sources), else itself.
+QJsonArray linkedSurfacesOf(const SurfaceCatalog::Row& row, const SurfaceCatalog& catalog)
 {
-    QJsonArray links = recordMeta(row)[QStringLiteral("lasagna_job")].toObject()[QStringLiteral("linked_surfaces")].toArray();
+    QJsonArray links;
+    const auto sources = recordMeta(row)[QStringLiteral("provenance")].toObject()[QStringLiteral("sources")].toArray();
+    for (const QJsonValue& source : sources) {
+        const auto uuid = source.toString().toStdString();
+        const auto* listed = catalog.row(uuid);
+        links.append(surfaceRef(uuid, listed ? listed->record.name : uuid));
+    }
     return links.isEmpty() ? QJsonArray{surfaceRef(row.record.uuid, row.record.name)} : links;
 }
 
@@ -1166,7 +1173,7 @@ void SegmentationLasagnaPanel::updateLinkedSurfaceTables()
 QStringList SegmentationLasagnaPanel::currentLinkedSurfaceNames() const
 {
     const auto* row = activeSurfaceRow(_state, _surfaceCatalog);
-    return row ? linkedSurfaceNamesFromRefs(linkedSurfacesOf(*row)) : QStringList{};
+    return row ? linkedSurfaceNamesFromRefs(linkedSurfacesOf(*row, *_surfaceCatalog)) : QStringList{};
 }
 
 void SegmentationLasagnaPanel::setSurfaceCatalog(SurfaceCatalog* catalog)
@@ -1485,6 +1492,13 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             showStatus(msg, 5000);
             return SubmissionResult::failure(msg);
         }
+        // An external service reads its own datasets; a local path means nothing there.
+        if (_datasetCombo->findData(dataInput) < 0) {
+            auto msg = tr("Choose one of the external service's datasets as the data input.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            showStatus(msg, 5000);
+            return SubmissionResult::failure(msg);
+        }
     } else {
         if (!mgr.ensureServiceRunning(
                 {}, QFileInfo(dataInput).absolutePath())) {
@@ -1678,7 +1692,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
             if (const auto head = db.currentGeometry(txn, activeUuid)) revision = head->uuid;
         });
-        linkedSurfaces = linkedSurfacesOf(*activeRow);
+        linkedSurfaces = linkedSurfacesOf(*activeRow, *_surfaceCatalog);
         for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {
             QJsonObject link = linkedSurfaces[i].toObject();
             if (link[QStringLiteral("uuid")].toString() == QString::fromStdString(activeUuid) && revision) {

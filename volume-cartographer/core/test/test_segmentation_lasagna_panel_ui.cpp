@@ -219,8 +219,8 @@ int main(int argc, char** argv)
         return uuid;
     };
     const auto referenceUuid = addSurface("reference_surface", nlohmann::json::object());
-    const auto fittedUuid = addSurface("sheet_v002", {{"lasagna_job", {{"linked_surfaces", nlohmann::json::array({
-        {{"type", "surface"}, {"uuid", referenceUuid}, {"name", "reference_surface"}}})}}}});
+    const auto fittedUuid = addSurface("sheet_v002", {{"provenance", {{"tool", "lasagna"},
+        {"sources", nlohmann::json::array({referenceUuid})}}}});
     addSurface("sheet_off1", nlohmann::json::object());
     const auto noModelUuid = addSurface("sheet_no_model", nlohmann::json::object());
     writeFile(QString::fromStdString((session->artifactDirectory(attachment, fittedUuid) / "model.pt").string()),
