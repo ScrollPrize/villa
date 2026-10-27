@@ -423,15 +423,6 @@ SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
                      &_module, [this]() { applyAlphaResult(); });
 }
 
-void SegmentationPushPullTool::setDependencies(SegmentationEditManager* editManager,
-                                               SegmentationWidget* widget,
-                                               CState* state)
-{
-    _editManager = editManager;
-    _widget = widget;
-    _state = state;
-}
-
 void SegmentationPushPullTool::setStepMultiplier(float multiplier)
 {
     _stepMultiplier = std::clamp(multiplier, 0.05f, 40.0f);

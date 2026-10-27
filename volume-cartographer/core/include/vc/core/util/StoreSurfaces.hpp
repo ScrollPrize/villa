@@ -52,9 +52,6 @@ public:
     // the revision it loaded; relationships are kept as recorded. The grid must
     // keep its size. Returns the new geometry revision.
     std::string update(const std::string& uuid, QuadSurface& surface);
-    // Replace the named channels ("mask" is validity) of a surface this tool
-    // loaded with the surface's, the same way. Returns the new geometry revision.
-    std::string updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names);
 
     vc::objects::ToolObjects& objects() { return objects_; }
 

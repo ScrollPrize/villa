@@ -52,9 +52,6 @@ struct C3dCodecParams {
 [[nodiscard]] std::vector<std::byte> c3d_decode_lod(
     std::span<const std::byte> compressed, std::uint8_t lod);
 
-// Magic sniff: buffer begins with "C3DC".
-[[nodiscard]] bool is_c3d_compressed(std::span<const std::byte> data) noexcept;
-
 // c3d chunks are always 256^3; returned as {Z, Y, X} for symmetry with
 // video_header_dims().
 [[nodiscard]] inline std::array<int, 3> c3d_header_dims(

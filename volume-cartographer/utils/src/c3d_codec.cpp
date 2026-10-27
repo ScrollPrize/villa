@@ -17,12 +17,6 @@ namespace utils {
 static constexpr std::size_t kC3dChunkBytes =
     static_cast<std::size_t>(C3D_CHUNK_SIDE) * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE;
 
-bool is_c3d_compressed(std::span<const std::byte> data) noexcept
-{
-    return c3d_is_chunk(
-        reinterpret_cast<const uint8_t*>(data.data()), data.size());
-}
-
 namespace {
 // C11 aligned_alloc is missing from the Windows UCRT; _aligned_malloc is the
 // equivalent but requires _aligned_free (plain free() is undefined on it).

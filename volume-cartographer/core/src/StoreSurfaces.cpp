@@ -64,19 +64,6 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     return revision;
 }
 
-std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
-{
-    const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto pins = objects_.writable(canonical);
-    std::string revision;
-    objects_.session()->editKeepingRelationships(objects_.attachment(), {{canonical, pins.objectRevision}}, {},
-        [&](auto& db, auto& txn, const auto&) {
-            revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, pins.geometryRevision);
-        });
-    objects_.wrote();
-    return revision;
-}
-
 bool StoreOutputArgs::parse(const std::string& arg)
 {
     auto value = [&](const char* option) -> std::optional<std::string> {

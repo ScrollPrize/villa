@@ -140,7 +140,6 @@ public:
 
     void markNextEditsAsGrowth();
 
-    bool markInvalidRegion(int centerRow, int centerCol, float radiusSteps);
     void clearInvalidatedEdits();
 
     void resetPointerSeed();

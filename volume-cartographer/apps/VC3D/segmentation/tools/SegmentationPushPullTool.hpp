@@ -30,10 +30,6 @@ public:
                              SegmentationWidget* widget,
                              CState* state);
 
-    void setDependencies(SegmentationEditManager* editManager,
-                         SegmentationWidget* widget,
-                         CState* state);
-
     void setStepMultiplier(float multiplier);
     [[nodiscard]] float stepMultiplier() const { return _stepMultiplier; }
 
