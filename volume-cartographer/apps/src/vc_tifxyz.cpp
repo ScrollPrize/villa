@@ -201,7 +201,9 @@ int main(int argc, char* argv[]) {
     if (vm.count("isometry") && has_transform) {
         // Grid isometry block (#2279): how close the grid is to the step its
         // meta.json scale promises. Written next to the area the writers store.
-        vc::surface::storeIsometryMeta(surf->meta, *surf);
+        // The grid has just been transformed, so use the surface's *current* scale
+        // (resample/rotate update it); meta["scale"] still holds the input's value.
+        vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
     }
 
     if (!has_transform) {
