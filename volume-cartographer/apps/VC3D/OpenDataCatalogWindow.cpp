@@ -210,19 +210,9 @@ QTableWidgetItem* numericItem(qulonglong value)
     return tableItem;
 }
 
-QString firstArtifactUrl(const std::vector<vcr::catalog::OpenDataArtifact>& artifacts, const QString& preferredType = {})
+QString firstArtifactUrl(const std::vector<vcr::catalog::OpenDataArtifact>& artifacts)
 {
-    const vcr::catalog::OpenDataArtifact* artifact = nullptr;
-    if (!preferredType.isEmpty()) {
-        artifact = vcr::catalog::findArtifact(artifacts, preferredType.toStdString());
-    }
-    if (!artifact && !artifacts.empty()) {
-        artifact = &artifacts.front();
-    }
-    if (!artifact) {
-        return {};
-    }
-    return qstr(artifact->url());
+    return artifacts.empty() ? QString() : qstr(artifacts.front().url());
 }
 
 QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
@@ -934,7 +924,7 @@ void OpenDataCatalogWindow::onFetchFinished()
 
 void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
 {
-    const auto path = cachedManifestPath();
+    const auto path = cachedOpenDataManifestPath();
     if (!std::filesystem::is_regular_file(path)) {
         return;
     }
@@ -1169,7 +1159,6 @@ void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample
     setOverviewPhotoText(tr("Loading photo..."));
 
     auto* watcher = new QFutureWatcher<PhotoLoadResult>(this);
-    _photoWatcher = watcher;
     _photoWatchers.push_back(watcher);
     connect(watcher, &QFutureWatcher<PhotoLoadResult>::finished, this, [this, watcher]() {
         onOverviewPhotoFinished(watcher);
@@ -1198,9 +1187,6 @@ void OpenDataCatalogWindow::onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResu
 {
     if (!watcher) {
         return;
-    }
-    if (_photoWatcher == watcher) {
-        _photoWatcher = nullptr;
     }
     _photoWatchers.erase(
         std::remove(_photoWatchers.begin(), _photoWatchers.end(), watcher),
@@ -1602,19 +1588,6 @@ void OpenDataCatalogWindow::refreshSelectedSample()
     if (!sample || !_refreshSampleHandler) return;
     setStatus(tr("Refreshing %1 from Open Data...").arg(qstr(sample->id)));
     setStatus(_refreshSampleHandler(*sample));
-}
-
-std::filesystem::path OpenDataCatalogWindow::cacheRoot() const
-{
-    // The manifest's readers (CWindow, normal grids, the fiber map's
-    // orientation lookup) share the one path; the writer's root is derived
-    // from it so the two cannot drift.
-    return vc3d::opendata::cachedOpenDataManifestPath().parent_path();
-}
-
-std::filesystem::path OpenDataCatalogWindow::cachedManifestPath() const
-{
-    return vc3d::opendata::cachedOpenDataManifestPath();
 }
 
 } // namespace vc3d::opendata

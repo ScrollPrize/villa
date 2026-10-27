@@ -100,8 +100,6 @@ private:
     [[nodiscard]] QString selectedVolumeUrl() const;
     [[nodiscard]] QString selectedRepresentationUrl() const;
     [[nodiscard]] QString selectedSegmentUrl() const;
-    [[nodiscard]] std::filesystem::path cacheRoot() const;
-    [[nodiscard]] std::filesystem::path cachedManifestPath() const;
 
     QLineEdit* _searchEdit{nullptr};
     QCheckBox* _segmentsOnlyCheck{nullptr};
@@ -134,7 +132,6 @@ private:
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
     bool _manifestRefreshPending{false};
-    QFutureWatcher<PhotoLoadResult>* _photoWatcher{nullptr};
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;
     std::function<bool(const vcr::catalog::OpenDataSample&)> _openSampleHandler;

@@ -22,7 +22,6 @@ struct OpenDataLasagnaInfo {
     std::string artifactUrl;
     std::string modelId;
     int sourceCoordinateLevel = 0;
-    bool levelWasExplicit = false;
     bool lasagnaVersionPresent = false;
     std::optional<int> lasagnaVersion;
     bool sourceToBasePresent = false;

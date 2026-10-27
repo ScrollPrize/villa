@@ -79,14 +79,12 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
     }
 
     // --- Optional resource selection. Validated in full against
-    // the resolved sample *before* any download or project mutation begins. ---
-    OpenDataSampleOpenOptions options;
-    // An explicit remote call is consent to replace the current project.
-    options.interactive = false;
+    // the resolved sample *before* any download or project mutation begins.
+    // An explicit remote call is consent to replace the current project. ---
+    vc3d::opendata::OpenDataResourceSelection selection;
 
     if (p.contains("resources")) {
         const QJsonObject res = p.value("resources").toObject();
-        auto& selection = options.selection;
 
         // Set of the sample's real volume ids (validation + zero-volume check).
         std::vector<std::string> sampleVolumeIds;
@@ -210,7 +208,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
     _catalogOpenSampleId = sampleId;
     QString err;
-    if (!mc->startOpenDataSampleOpen(sampleId, options, onFinished, onProgress, &err)) {
+    if (!mc->startOpenDataSampleOpen(sampleId, selection, onFinished, onProgress, &err)) {
         _catalogOpenSampleId.clear();
         QJsonObject data;
         data["detail"] = err.isEmpty()

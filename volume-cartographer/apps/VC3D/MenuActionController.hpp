@@ -29,13 +29,6 @@ struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
 
-// Options for opening an Open Data sample. `selection` restricts attached
-// resources; `interactive` permits prompts, progress dialogs, and message boxes.
-struct OpenDataSampleOpenOptions {
-    vc3d::opendata::OpenDataResourceSelection selection;
-    bool interactive{true};
-};
-
 class MenuActionController : public QObject
 {
     Q_OBJECT
@@ -67,18 +60,6 @@ public:
     QString objectStoreAuthor();
     void cloneHostedStore();
     void detachObjectStore();
-    // Resolves sampleId against the cached manifest and opens it. When
-    // interactive is false, prompts, progress dialogs, and message boxes are
-    // suppressed.
-    bool openOpenDataSampleById(const QString& sampleId, bool interactive = true);
-
-    // Opens a sample with explicit resource selection. resultOut receives the
-    // attachment counters and messages when provided.
-    bool openOpenDataSampleById(const QString& sampleId,
-                                const OpenDataSampleOpenOptions& options,
-                                QString* errorMessage = nullptr,
-                                vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
-
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
         bool success{false};
@@ -93,11 +74,11 @@ public:
     // window/state, empty/unknown id, manifest unavailable, or an open already in
     // flight). Returns true once the background task started; exactly one GUI-thread
     // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
-    // with the same stream the interactive QProgressDialog consumes.
-    // options.interactive is ignored; this entry point is always non-interactive.
+    // with the same stream the interactive QProgressDialog consumes. `selection`
+    // restricts the attached resources. This entry point is always non-interactive.
     bool startOpenDataSampleOpen(
         const QString& sampleId,
-        const OpenDataSampleOpenOptions& options,
+        const vc3d::opendata::OpenDataResourceSelection& selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
         std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},
         QString* errorMessage = nullptr);
@@ -163,11 +144,9 @@ private:
     void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
     void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
     struct LasagnaAttachTaskResult;
+    // Interactive: prompts before replacing the open project and shows progress.
     bool openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
-                            bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
-                            QString* errorMessage = nullptr,
-                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr,
                             const vc3d::opendata::OpenDataNewProject* newProject = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;

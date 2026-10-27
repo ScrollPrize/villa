@@ -579,7 +579,7 @@ void MenuActionController::showOpenDataCatalog()
     });
     dialog->setCreateProjectHandler([this](const auto& sample, const auto& selection,
                                            const auto& project) {
-        return openOpenDataSample(sample, true, &selection, nullptr, nullptr, &project);
+        return openOpenDataSample(sample, &selection, &project);
     });
     dialog->setRefreshSampleHandler([this](const vcr::catalog::OpenDataSample& sample) -> QString {
         if (!_window || !_window->_state) return tr("No viewer state.");
@@ -617,64 +617,11 @@ bool MenuActionController::isOpenDataCatalogVisible() const
     return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
-bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool interactive)
-{
-    if (!_window || sampleId.isEmpty()) {
-        return false;
-    }
-
-    const auto manifest = vc3d::opendata::cachedCatalog();
-    if (!manifest) {
-        return false;
-    }
-
-    const vcr::catalog::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        return false;
-    }
-
-    return openOpenDataSample(*sample, interactive);
-}
-
-bool MenuActionController::openOpenDataSampleById(
-    const QString& sampleId,
-    const OpenDataSampleOpenOptions& options,
-    QString* errorMessage,
-    vc3d::opendata::OpenDataSampleProjectResult* resultOut)
-{
-    if (!_window || sampleId.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
-        return false;
-    }
-
-    const auto manifest = vc3d::opendata::cachedCatalog();
-    if (!manifest) {
-        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
-        return false;
-    }
-
-    const vcr::catalog::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
-        return false;
-    }
-
-    return openOpenDataSample(*sample, options.interactive, &options.selection,
-                              errorMessage, resultOut);
-}
-
 bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
-                                             bool interactive,
                                              const vc3d::opendata::OpenDataResourceSelection* selection,
-                                             QString* errorMessage,
-                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut,
                                              const vc3d::opendata::OpenDataNewProject* newProject)
 {
     if (!_window || !_window->_state) {
-        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
         return false;
     }
 
@@ -691,7 +638,7 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
     }
 
     // Create and Open already explicitly confirms the project switch.
-    if (interactive && !newProject && _window->_state->vpkg()) {
+    if (!newProject && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Project"));
         prompt.setText(QObject::tr("Open sample %1?").arg(QString::fromStdString(sample.id)));
@@ -711,30 +658,25 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
     // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
     // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
         return false;
     }
 
     OpenDataSampleOpenOutcome outcome;
     QEventLoop loop;
     beginOpenDataSampleOpenTask(
-        sample, interactive, selection,
+        sample, /*interactive=*/true, selection,
         [&outcome, &loop](const OpenDataSampleOpenOutcome& o) {
             outcome = o;
             loop.quit();
         },
         {}, newProject);
     loop.exec(QEventLoop::ExcludeUserInputEvents);
-
-    if (errorMessage && !outcome.success) *errorMessage = outcome.error;
-    if (resultOut && outcome.success) *resultOut = outcome.result;
     return outcome.success;
 }
 
 bool MenuActionController::startOpenDataSampleOpen(
     const QString& sampleId,
-    const OpenDataSampleOpenOptions& options,
+    const vc3d::opendata::OpenDataResourceSelection& selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
     std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
     QString* errorMessage)
@@ -767,7 +709,7 @@ bool MenuActionController::startOpenDataSampleOpen(
 
     // This entry point is always non-interactive. Completion is delivered
     // through onFinished on the GUI thread.
-    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
+    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &selection,
                                 std::move(onFinished), std::move(onProgress));
     return true;
 }

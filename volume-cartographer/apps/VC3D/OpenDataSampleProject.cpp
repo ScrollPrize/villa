@@ -514,9 +514,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         const auto& volume = *candidate.volume;
         const int level = candidate.sourceCoordinateLevel;
         if (candidate.sourceUrl.empty() ||
-            (!(selection && selection->rawVolumeIds) &&
-             std::find(attachedLocations.begin(), attachedLocations.end(),
-                       candidate.sourceUrl) == attachedLocations.end())) {
+            std::find(attachedLocations.begin(), attachedLocations.end(),
+                      candidate.sourceUrl) == attachedLocations.end()) {
             ++result.failedVolumes;
             result.messages.push_back(
                 "Skipped virtual source for " +

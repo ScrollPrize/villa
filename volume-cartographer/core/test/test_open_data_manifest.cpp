@@ -308,7 +308,6 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     CHECK(artifacts.front().artifactUrl == "https://example.test/lasagna/volume");
     CHECK(artifacts.front().modelId == "model-7");
     CHECK(artifacts.front().sourceCoordinateLevel == 2);
-    CHECK(artifacts.front().levelWasExplicit);
     CHECK(artifacts.front().lasagnaVersion == 2);
     CHECK(artifacts.front().sourceToBase == doctest::Approx(1.0));
     CHECK(artifacts.front().baseShapeZYX == volume.shapeZYX);
@@ -396,7 +395,6 @@ TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
 TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
 {
     OpenDataLasagnaInfo info;
-    info.levelWasExplicit = true;
     info.sourceCoordinateLevel = 1;
     info.baseShapeZYX = std::array<std::size_t, 3>{100, 200, 300};
 
