@@ -1,51 +1,11 @@
 #include "vc/core/util/Umbilicus.hpp"
 
 #include <algorithm>
-#include <array>
-#include <cctype>
 #include <cmath>
-#include <numbers>
-#include <fstream>
-#include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
-#include <string>
-
-#include <vc_object_store/objects/UmbilicusFile.hpp>
-
-namespace {
-
-cv::Vec2f SeamDirectionVector(vc::core::util::Umbilicus::SeamDirection direction)
-{
-    using SeamDirection = vc::core::util::Umbilicus::SeamDirection;
-    switch (direction) {
-        case SeamDirection::PositiveX: return {1.0f, 0.0f};
-        case SeamDirection::NegativeX: return {-1.0f, 0.0f};
-        case SeamDirection::PositiveY: return {0.0f, 1.0f};
-        case SeamDirection::NegativeY: return {0.0f, -1.0f};
-    }
-    throw std::logic_error("Unhandled seam direction");
-}
-
-constexpr double DegreesPerRadian = 180.0 / std::numbers::pi_v<double>;
-
-} // namespace
 
 namespace vc::core::util {
-
-Umbilicus Umbilicus::FromFile(const std::filesystem::path& path, const cv::Vec3i& volume_shape)
-{
-    return Umbilicus(PointsOf(vc::objects::readUmbilicusFile(path)), volume_shape);
-}
-
-std::vector<cv::Vec3f> Umbilicus::PointsOf(const vc::objects::UmbilicusFile& file)
-{
-    std::vector<cv::Vec3f> points;
-    points.reserve(file.points.size());
-    for (const auto& p : file.points) points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
-    return points;
-}
 
 Umbilicus Umbilicus::FromPoints(std::vector<cv::Vec3f> control_points, const cv::Vec3i& volume_shape)
 {
@@ -62,14 +22,6 @@ const std::vector<cv::Vec3f>& Umbilicus::centers() const noexcept
     return dense_centers_;
 }
 
-const cv::Vec3f& Umbilicus::center_at(int z_index) const
-{
-    if (z_index < 0 || z_index >= static_cast<int>(dense_centers_.size())) {
-        throw std::out_of_range("z_index outside interpolated range");
-    }
-    return dense_centers_[z_index];
-}
-
 cv::Vec3f Umbilicus::vector_to_umbilicus(const cv::Vec3f& point) const
 {
     if (dense_centers_.empty()) {
@@ -77,94 +29,6 @@ cv::Vec3f Umbilicus::vector_to_umbilicus(const cv::Vec3f& point) const
     }
     const int index = clamp_z_index(point[2]);
     return dense_centers_[index] - point;
-}
-
-double Umbilicus::distance_to_umbilicus(const cv::Vec3f& point) const
-{
-    return cv::norm(vector_to_umbilicus(point));
-}
-
-void Umbilicus::set_seam(SeamDirection direction)
-{
-    set_seam_direction_xy(SeamDirectionVector(direction), direction);
-}
-
-void Umbilicus::set_seam_from_point(const cv::Vec3f& point)
-{
-    if (dense_centers_.empty()) {
-        throw std::logic_error("Umbilicus has no interpolated centers");
-    }
-
-    const int index = clamp_z_index(point[2]);
-    const auto& center = dense_centers_[index];
-    cv::Vec2f direction_xy{point[0] - center[0], point[1] - center[1]};
-
-    if (cv::norm(direction_xy) == 0.0f) {
-        throw std::invalid_argument("Cannot derive seam direction from coincident point");
-    }
-
-    set_seam_direction_xy(direction_xy, std::nullopt);
-}
-
-bool Umbilicus::has_seam() const noexcept
-{
-    return seam_direction_xy_.has_value();
-}
-
-Umbilicus::SeamDirection Umbilicus::seam_direction() const
-{
-    if (!seam_direction_hint_) {
-        throw std::logic_error("Umbilicus seam direction requested but no cardinal seam is set");
-    }
-    return *seam_direction_hint_;
-}
-
-std::pair<cv::Vec3f, cv::Vec3f> Umbilicus::seam_segment(int z_index) const
-{
-    if (!seam_direction_xy_) {
-        throw std::logic_error("Umbilicus seam requested before being set");
-    }
-    if (z_index < 0 || z_index >= static_cast<int>(dense_centers_.size())) {
-        throw std::out_of_range("z_index outside interpolated range");
-    }
-    return {dense_centers_[z_index], seam_endpoints_[z_index]};
-}
-
-const std::vector<cv::Vec3f>& Umbilicus::seam_endpoints() const
-{
-    if (!seam_direction_xy_) {
-        throw std::logic_error("Umbilicus seam requested before being set");
-    }
-    return seam_endpoints_;
-}
-
-double Umbilicus::theta(const cv::Vec3f& point, int wrap_count) const
-{
-    if (!seam_direction_xy_) {
-        throw std::logic_error("Umbilicus seam direction needed to compute theta");
-    }
-    if (dense_centers_.empty()) {
-        throw std::logic_error("Umbilicus has no interpolated centers");
-    }
-
-    const int index = clamp_z_index(point[2]);
-    const auto& center = dense_centers_[index];
-
-    const cv::Vec2f& base = *seam_direction_xy_;
-    cv::Vec2f ray{point[0] - center[0], point[1] - center[1]};
-
-    if (cv::norm(ray) == 0.0f) {
-        return static_cast<double>(wrap_count) * 360.0;
-    }
-
-    const double det = static_cast<double>(base[0]) * ray[1] - static_cast<double>(base[1]) * ray[0];
-    const double dot = static_cast<double>(base[0]) * ray[0] + static_cast<double>(base[1]) * ray[1];
-    double angle = std::atan2(det, dot) * DegreesPerRadian;
-    if (angle < 0.0) {
-        angle += 360.0;
-    }
-    angle += static_cast<double>(wrap_count) * 360.0;
-    return angle;
 }
 
 Umbilicus::Umbilicus(std::vector<cv::Vec3f> control_points, const cv::Vec3i& volume_shape)
@@ -260,89 +124,6 @@ int Umbilicus::clamp_z_index(double z) const
     int index = static_cast<int>(std::lround(z));
     index = std::clamp(index, 0, static_cast<int>(dense_centers_.size() - 1));
     return index;
-}
-
-void Umbilicus::set_seam_direction_xy(const cv::Vec2f& direction,
-                                      std::optional<SeamDirection> hint)
-{
-    if (dense_centers_.empty()) {
-        throw std::logic_error("Umbilicus has no interpolated centers");
-    }
-
-    const float length = cv::norm(direction);
-    if (length == 0.0f) {
-        throw std::invalid_argument("Seam direction must be non-zero");
-    }
-
-    seam_direction_xy_ = direction * (1.0f / length);
-    seam_direction_hint_ = hint;
-    seam_endpoints_.resize(dense_centers_.size());
-    compute_seam_endpoints();
-}
-
-void Umbilicus::compute_seam_endpoints()
-{
-    if (!seam_direction_xy_) {
-        throw std::logic_error("Seam direction must be set before computing endpoints");
-    }
-
-    if (dense_centers_.empty()) {
-        seam_endpoints_.clear();
-        return;
-    }
-
-    const float min_x = 0.0f;
-    const float min_y = 0.0f;
-    const float max_x = static_cast<float>(volume_shape_[2] - 1);
-    const float max_y = static_cast<float>(volume_shape_[1] - 1);
-
-    const cv::Vec2f& dir = *seam_direction_xy_;
-    const float dx = dir[0];
-    const float dy = dir[1];
-    constexpr float eps = 1e-6f;
-
-    for (std::size_t idx = 0; idx < dense_centers_.size(); ++idx) {
-        const cv::Vec3f& center = dense_centers_[idx];
-        float best_t = std::numeric_limits<float>::infinity();
-
-        auto consider_candidate = [&](float t) {
-            if (!std::isfinite(t) || t <= 0.0f) {
-                return;
-            }
-            const float x = center[0] + dx * t;
-            const float y = center[1] + dy * t;
-            if (x < min_x - 1e-3f || x > max_x + 1e-3f) {
-                return;
-            }
-            if (y < min_y - 1e-3f || y > max_y + 1e-3f) {
-                return;
-            }
-            best_t = std::min(best_t, t);
-        };
-
-        if (std::abs(dx) > eps) {
-            const float t = (dx > 0.0f)
-                                ? (max_x - center[0]) / dx
-                                : (min_x - center[0]) / dx;
-            consider_candidate(t);
-        }
-
-        if (std::abs(dy) > eps) {
-            const float t = (dy > 0.0f)
-                                ? (max_y - center[1]) / dy
-                                : (min_y - center[1]) / dy;
-            consider_candidate(t);
-        }
-
-        if (!std::isfinite(best_t)) {
-            best_t = 0.0f;
-        }
-
-        cv::Vec3f endpoint = center;
-        endpoint[0] = std::clamp(center[0] + dx * best_t, min_x, max_x);
-        endpoint[1] = std::clamp(center[1] + dy * best_t, min_y, max_y);
-        seam_endpoints_[idx] = endpoint;
-    }
 }
 
 } // namespace vc::core::util

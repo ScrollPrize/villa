@@ -5,7 +5,7 @@
 // it to the single point the sheet normals of that section point away from. This tool runs that
 // function, the one in core/src/normalgridtools.cpp and not a copy of it, over a set of slices
 // and writes the points it returns as an umbilicus file, which is the form
-// Umbilicus::FromFile and VC3D's Import Umbilicus read.
+// vc::objects::readUmbilicusFile and VC3D's Import Umbilicus read.
 //
 // Only the xy plane is offered, because an umbilicus is a curve with one point per z, and the xy
 // grids are the slices whose centre that point is. The xz and yz grids of the same volume hold
@@ -198,7 +198,7 @@ int main(int argc, char** argv)
         ("input,i", po::value<std::string>(),
             "Normal grid volume directory, a directory of NNNNNN.grid files, or one .grid file")
         ("output,o", po::value<std::string>(),
-            "Umbilicus json to write (control_points, as Umbilicus::FromFile reads them)")
+            "Umbilicus json to write (control_points, as Import Umbilicus reads them)")
         ("csv", po::value<std::string>(),
             "Also write every single estimate here, one row per slice and repeat")
         ("slices", po::value<std::string>(),

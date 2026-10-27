@@ -16,6 +16,25 @@ namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 
+enum class UmbilicusScaleSource {
+    StampedDimensions,
+    StampedVoxelSize,
+    InferredFromGrid,
+};
+// The factor that carries the file's coordinates into a target grid's voxels.
+struct UmbilicusScale {
+    double factor = 1.0;
+    UmbilicusScaleSource source = UmbilicusScaleSource::StampedDimensions;
+    std::string description;
+};
+// What frame the file states: a complete positive dimension triplet, a voxel size.
+struct UmbilicusFrameClaim {
+    bool dimensions = false;
+    bool voxelSize = false;
+    [[nodiscard]] bool any() const { return dimensions || voxelSize; }
+};
+
+
 std::string trimmed(const std::string& value)
 {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -162,19 +181,6 @@ std::string stampedGridText(const UmbilicusFile& file)
     return std::to_string(*file.volumeWidth) + "x" + std::to_string(*file.volumeHeight) + "x" +
            std::to_string(*file.volumeSlices);
 }
-}
-
-UmbilicusFile readUmbilicusFile(const std::filesystem::path& path)
-{
-    auto extension = path.extension().string();
-    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    if (extension == ".json") return readJsonFile(path);
-    std::ifstream stream(path);
-    if (!stream) throw std::runtime_error("Failed to open umbilicus text file: " + path.string());
-    UmbilicusFile file;
-    file.points = readTextPoints(stream);
-    return file;
-}
 
 std::optional<double> uniformRescaleFactor(const std::array<double, 3>& stampedXyz, const std::array<double, 3>& targetXyz)
 {
@@ -289,17 +295,19 @@ std::optional<std::string> umbilicusStampContradiction(const UmbilicusFile& file
     return std::nullopt;
 }
 
-UmbilicusLoadAction decideUmbilicusLoadAction(const std::optional<UmbilicusScale>& scale, const UmbilicusFrameClaim& claim,
-                                              bool haveTargetGrid, bool stampContradicted)
+
+}
+
+UmbilicusFile readUmbilicusFile(const std::filesystem::path& path)
 {
-    // A contradicted stamp refuses before anything else is weighed: any scale
-    // came from a statement the named volume disproves.
-    if (stampContradicted) return UmbilicusLoadAction::Refuse;
-    // No target grid means a stated frame cannot be checked, which is not the
-    // file stating nothing: only an unstated one keeps its legacy reading.
-    if (!haveTargetGrid) return claim.any() ? UmbilicusLoadAction::Refuse : UmbilicusLoadAction::UseLegacy;
-    if (scale) return UmbilicusLoadAction::Apply;
-    return claim.any() ? UmbilicusLoadAction::Refuse : UmbilicusLoadAction::UseLegacy;
+    auto extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (extension == ".json") return readJsonFile(path);
+    std::ifstream stream(path);
+    if (!stream) throw std::runtime_error("Failed to open umbilicus text file: " + path.string());
+    UmbilicusFile file;
+    file.points = readTextPoints(stream);
+    return file;
 }
 
 UmbilicusBinding umbilicusBinding(const UmbilicusFile& file, const UmbilicusTargetGrid& target,
@@ -319,18 +327,17 @@ UmbilicusBinding umbilicusBinding(const UmbilicusFile& file, const UmbilicusTarg
         binding.refusal = *contradiction;
         return binding;
     }
-    const auto action = decideUmbilicusLoadAction(derived, umbilicusFrameClaim(file), true);
-    if (action == UmbilicusLoadAction::Refuse) {
-        binding.refusal = "it states a frame that does not fit the volume";
+    // A stated frame that derives no scale does not fit; it is never read as
+    // though the file had stated nothing.
+    if (!derived) {
+        if (umbilicusFrameClaim(file).any()) binding.refusal = "it states a frame that does not fit the volume";
+        else binding.confirm = true;
         return binding;
     }
-    // A stated frame is taken as stated; an inferred one is confirmed, and a
-    // file stating nothing asks.
-    if (derived) {
-        binding.storedUnitsPerVoxel = 1.0 / derived->factor;
-        binding.frame = derived->description;
-    }
-    binding.confirm = action != UmbilicusLoadAction::Apply || derived->source == UmbilicusScaleSource::InferredFromGrid;
+    // A stated frame is taken as stated; an inferred one is confirmed.
+    binding.storedUnitsPerVoxel = 1.0 / derived->factor;
+    binding.frame = derived->description;
+    binding.confirm = derived->source == UmbilicusScaleSource::InferredFromGrid;
     return binding;
 }
 

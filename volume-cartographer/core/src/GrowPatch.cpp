@@ -7,7 +7,6 @@
 #include "vc/core/util/GrowthMask.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
@@ -19,8 +18,6 @@
 
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
-#include "vc/core/util/Umbilicus.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
@@ -73,7 +70,6 @@ DirectionField& DirectionField::operator=(DirectionField&&) noexcept = default;
 namespace { // Anonymous namespace for local helpers
 
 
-using Umbilicus = vc::core::util::Umbilicus;
 
 std::optional<uint32_t> environment_seed()
 {
@@ -541,15 +537,6 @@ struct TraceData {
     const std::vector<DirectionField> &direction_fields;
     cv::Mat_<uchar> allowed_growth_mask;
 
-    struct PatchNormalContext {
-        std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
-        std::unique_ptr<SurfacePatchIndex> index;
-        std::optional<Umbilicus> umbilicus;
-        float tolerance = 20.0f;
-        bool signed_normals = false;
-    };
-    std::unique_ptr<PatchNormalContext> patch_normals;
-
     Chunked3d<uint8_t, passTroughComputor>* raw_volume = nullptr;
     std::unique_ptr<lineLossDistance> space_line_compute;
     std::unique_ptr<Chunked3d<uint8_t, lineLossDistance>> space_line_volume;
@@ -700,175 +687,6 @@ private:
     mutable std::unique_ptr<CachedChunked3dInterpolator<uint8_t, passTroughComputor>> interp_;
 };
 
-static std::filesystem::path normalized_existing_path(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    auto normalized = std::filesystem::weakly_canonical(path, ec);
-    return ec ? path.lexically_normal() : normalized;
-}
-
-static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
-    const utils::Json& params,
-    const std::array<int, 3>& volume_shape_zyx,
-    QuadSurface* resume_surf,
-    std::optional<double> voxelsize_um = std::nullopt)
-{
-    std::string patches_path;
-    for (const char* key : {"patch_normal_path", "patch_normal_dir", "patch_normals_path"}) {
-        if (params.contains(key) && params[key].is_string()) {
-            patches_path = params[key].get_string();
-            break;
-        }
-    }
-    if (patches_path.empty()) {
-        return nullptr;
-    }
-
-    const std::filesystem::path root = patches_path;
-    if (!std::filesystem::exists(root) || !std::filesystem::is_directory(root)) {
-        throw std::runtime_error("patch normal path is not a directory: " + root.string());
-    }
-
-    auto ctx = std::make_unique<TraceData::PatchNormalContext>();
-    ctx->tolerance = std::max(0.0f, static_cast<float>(params.value("patch_normal_tolerance", 20.0)));
-
-    const std::filesystem::path resume_path =
-        resume_surf && !resume_surf->path.empty() ? normalized_existing_path(resume_surf->path) : std::filesystem::path();
-
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec)) {
-            continue;
-        }
-
-        const std::filesystem::path path = entry.path();
-        if (!resume_path.empty() && normalized_existing_path(path) == resume_path) {
-            continue;
-        }
-
-        try {
-            auto surface = load_quad_from_tifxyz(path.string());
-            if (surface) {
-                ctx->surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(surface.release()));
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Skipping patch-normal surface " << path << ": " << e.what() << std::endl;
-        }
-    }
-
-    if (ctx->surfaces.empty()) {
-        throw std::runtime_error("patch normal path contains no loadable tifxyz surfaces: " + root.string());
-    }
-
-    ctx->index = std::make_unique<SurfacePatchIndex>();
-    ctx->index->rebuild(ctx->surfaces, 0.0f);
-
-    if (params.contains("umbilicus_path") && params["umbilicus_path"].is_string()) {
-        // The tracing grid comes from volume.shape(level): authoritative, so
-        // a declared frame that does not fit it is refused rather than read
-        // as though it had declared nothing (which silently mis-orients the
-        // patch normals below).
-        const std::filesystem::path umbilicus_path =
-            params["umbilicus_path"].get_string();
-        const cv::Vec3i volume_shape(volume_shape_zyx[0],
-                                     volume_shape_zyx[1],
-                                     volume_shape_zyx[2]);
-        const std::array<double, 3> target_grid_xyz{
-            static_cast<double>(volume_shape_zyx[2]),
-            static_cast<double>(volume_shape_zyx[1]),
-            static_cast<double>(volume_shape_zyx[0])};
-        auto loaded = vc::core::util::loadUmbilicusWithFrameCheck(
-            umbilicus_path, target_grid_xyz, volume_shape,
-            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,
-            voxelsize_um);
-        if (!loaded.warning.empty()) {
-            std::cerr << "Warning: " << loaded.warning << std::endl;
-        }
-        if (!loaded.scaleDescription.empty()) {
-            std::cout << "Umbilicus " << umbilicus_path.string() << ": "
-                      << loaded.scaleDescription << std::endl;
-        }
-        if (!loaded.error.empty()) {
-            throw std::runtime_error(loaded.error);
-        }
-        ctx->umbilicus = std::move(loaded.umbilicus);
-        ctx->signed_normals = true;
-    } else if (params.contains("umbilicus_points") && params["umbilicus_points"].is_array()) {
-        // Control points already in the tracing grid's voxels (e.g. VC3D's
-        // stored umbilicus, whose frame was settled when it was stored).
-        std::vector<cv::Vec3f> points;
-        for (const auto& p : params["umbilicus_points"]) {
-            points.emplace_back(p[0].get_float(), p[1].get_float(), p[2].get_float());
-        }
-        ctx->umbilicus = Umbilicus::FromPoints(
-            std::move(points),
-            cv::Vec3i(volume_shape_zyx[0], volume_shape_zyx[1], volume_shape_zyx[2]));
-        ctx->signed_normals = true;
-    }
-
-    if (params.contains("patch_normal_signed")) {
-        if (params["patch_normal_signed"].is_boolean()) {
-            ctx->signed_normals = params["patch_normal_signed"].get_bool();
-        } else {
-            std::cerr << "patch_normal_signed must be boolean" << std::endl;
-        }
-    }
-
-    std::cout << "Loaded patch-normal index from " << root
-              << " surfaces=" << ctx->surfaces.size()
-              << " patches=" << ctx->index->patchCount()
-              << " tolerance=" << ctx->tolerance
-              << " signed=" << (ctx->signed_normals ? "true" : "false")
-              << std::endl;
-    return ctx;
-}
-
-class FixedPatchNormalAlignment {
-public:
-    FixedPatchNormalAlignment(cv::Vec3d target_normal, double weight, bool signed_alignment)
-        : target_normal_(target_normal), weight_(weight), signed_alignment_(signed_alignment) {}
-
-    template <typename T>
-    bool operator()(const T* const pA,
-                    const T* const pB1,
-                    const T* const pB2,
-                    const T* const pC,
-                    T* residual) const {
-        (void)pC;
-        const T u[3] = {pB1[0] - pA[0], pB1[1] - pA[1], pB1[2] - pA[2]};
-        const T v[3] = {pB2[0] - pA[0], pB2[1] - pA[1], pB2[2] - pA[2]};
-        const T n[3] = {
-            u[1] * v[2] - u[2] * v[1],
-            u[2] * v[0] - u[0] * v[2],
-            u[0] * v[1] - u[1] * v[0],
-        };
-        const T n_len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + T(1e-12));
-        T dot = (n[0] * T(target_normal_[0]) +
-                 n[1] * T(target_normal_[1]) +
-                 n[2] * T(target_normal_[2])) / n_len;
-        if (!signed_alignment_) {
-            using std::abs;
-            dot = abs(dot);
-        }
-        residual[0] = T(weight_) * (T(1) - dot);
-        return true;
-    }
-
-    static ceres::CostFunction* Create(cv::Vec3d target_normal, double weight, bool signed_alignment)
-    {
-        return new ceres::AutoDiffCostFunction<FixedPatchNormalAlignment, 1, 3, 3, 3, 3>(
-            new FixedPatchNormalAlignment(target_normal, weight, signed_alignment));
-    }
-
-private:
-    cv::Vec3d target_normal_;
-    double weight_;
-    bool signed_alignment_;
-};
-
 struct TraceParameters {
     cv::Mat_<uint8_t> state;
     cv::Mat_<cv::Vec3d> dpoints;
@@ -885,7 +703,6 @@ enum LossType {
     CORRECTION,
     REFERENCE_RAY,
     SPACELINE,
-    PATCH_NORMAL,
     COUNT
 };
 
@@ -903,7 +720,6 @@ struct LossSettings {
         w[LossType::CORRECTION] = 1.0f;
         w[LossType::REFERENCE_RAY] = 0.0f;
         w[LossType::SPACELINE] = 0.0f;
-        w[LossType::PATCH_NORMAL] = 0.0f;
     }
 
     struct ReferenceRaycastSettings {
@@ -940,7 +756,6 @@ struct LossSettings {
         set_weight("correction_weight", LossType::CORRECTION);
         set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
         set_weight("space_line_weight", LossType::SPACELINE);
-        set_weight("patch_normal_weight", LossType::PATCH_NORMAL);
     }
 
     float operator()(LossType type, const cv::Vec2i& p) const {
@@ -1548,7 +1363,7 @@ static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2
 
 static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TraceParameters &params, const TraceData &trace_data, const LossSettings &settings)
 {
-    if (!trace_data.ngv && !trace_data.patch_normals) return 0;
+    if (!trace_data.ngv) return 0;
 
     cv::Vec2i p_br = p + cv::Vec2i(1,1);
     if (!coord_valid(params.state(p)) || !coord_valid(params.state(p[0], p_br[1])) || !coord_valid(params.state(p_br[0], p[1])) || !coord_valid(params.state(p_br))) {
@@ -1586,42 +1401,6 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
             // Loss with p_bl as base point A
             problem.AddResidualBlock(NormalConstraintPlane::Create(*trace_data.ngv, i, settings(LossType::NORMAL, p), settings(LossType::SNAP, p), direction_aware, settings.z_min, settings.z_max), nullptr, pB2, pA, pC, pB1);
             count += 4;
-        }
-    }
-
-    if (trace_data.patch_normals) {
-        const float w = settings(LossType::PATCH_NORMAL, p);
-        if (w > 0.0f && trace_data.patch_normals->index && !trace_data.patch_normals->index->empty()) {
-            const cv::Vec3d center_d = (params.dpoints(p) + params.dpoints(p_tr) + params.dpoints(p_bl) + params.dpoints(p_br)) * 0.25;
-            const cv::Vec3f center_f(static_cast<float>(center_d[0]),
-                                     static_cast<float>(center_d[1]),
-                                     static_cast<float>(center_d[2]));
-            SurfacePatchIndex::PointQuery query;
-            query.worldPoint = center_f;
-            query.tolerance = trace_data.patch_normals->tolerance;
-            auto hit = trace_data.patch_normals->index->locate(query);
-            if (hit && hit->surface) {
-                cv::Vec3f normal_f = hit->surface->normal(hit->ptr);
-                const float norm = cv::norm(normal_f);
-                if (std::isfinite(norm) && norm > 1e-6f) {
-                    normal_f /= norm;
-                    if (trace_data.patch_normals->umbilicus) {
-                        const cv::Vec3f to_umbilicus = trace_data.patch_normals->umbilicus->vector_to_umbilicus(center_f);
-                        const cv::Vec3f outward = -to_umbilicus;
-                        if (normal_f.dot(outward) < 0.0f) {
-                            normal_f = -normal_f;
-                        }
-                    }
-
-                    const cv::Vec3d normal_d(normal_f[0], normal_f[1], normal_f[2]);
-                    const bool signed_alignment = trace_data.patch_normals->signed_normals;
-                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pA, pB1, pB2, pC);
-                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pC, pB2, pB1, pA);
-                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pB1, pC, pA, pB2);
-                    problem.AddResidualBlock(FixedPatchNormalAlignment::Create(normal_d, w, signed_alignment), nullptr, pB2, pA, pC, pB1);
-                    count += 4;
-                }
-            }
         }
     }
 
@@ -2506,42 +2285,9 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     TraceData trace_data(direction_fields);
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
-    const bool patch_normals_requested =
-        (params.contains("patch_normal_path") && params["patch_normal_path"].is_string()) ||
-        (params.contains("patch_normal_dir") && params["patch_normal_dir"].is_string()) ||
-        (params.contains("patch_normals_path") && params["patch_normals_path"].is_string());
-    if (patch_normals_requested &&
-        (!params.contains("patch_normal_weight") || params["patch_normal_weight"].is_null())) {
-        loss_settings[LossType::PATCH_NORMAL] = 1.0f;
-    }
     loss_settings.space_line_steps = std::max(2, params.value("space_line_steps", loss_settings.space_line_steps));
     loss_settings.space_line_threshold = std::clamp(static_cast<float>(params.value("space_line_threshold", loss_settings.space_line_threshold)), 0.0f, 255.0f);
     loss_settings.space_line_invert = params.value("space_line_invert", loss_settings.space_line_invert);
-
-    if (patch_normals_requested) {
-        try {
-            // voxelsize is the level-0 um/voxel figure. It is only used as
-            // the target voxel size when tracing at level 0. Deriving a
-            // coarser level's figure from shape ratios carries ceil()
-            // rounding that compounds with depth, and no threshold can
-            // separate that rounding noise from genuine mild anisotropy —
-            // so any inferred figure risks a wrong uniform conversion of a
-            // scalar stamped voxel size. The declared per-level scales are
-            // not exposed by Volume, and the only in-tree caller traces at
-            // level 0, so coarser levels deliberately leave a stamped voxel
-            // size on the unverifiable path instead of guessing.
-            std::optional<double> level_voxelsize_um;
-            if (level == 0) {
-                level_voxelsize_um = static_cast<double>(voxelsize);
-            }
-            trace_data.patch_normals = load_patch_normal_context(
-                params, volume_shape_zyx, resume_surf, level_voxelsize_um);
-        } catch (const std::exception& e) {
-            std::cerr << "Failed to load patch-normal constraints: " << e.what() << std::endl;
-            trace_data.patch_normals.reset();
-            loss_settings[LossType::PATCH_NORMAL] = 0.0f;
-        }
-    }
 
     std::unique_ptr<QuadSurface> reference_surface;
     if (params.contains("reference_surface")) {

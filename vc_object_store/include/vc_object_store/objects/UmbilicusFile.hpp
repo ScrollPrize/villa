@@ -39,54 +39,6 @@ struct UmbilicusFile {
 // Throws when the file cannot be read or holds no points.
 UmbilicusFile readUmbilicusFile(const std::filesystem::path&);
 
-// The single integer factor n (or 1/m), up to 64, that carries the stamped
-// voxel counts onto the target's (each axis floor or ceil of the other divided
-// by it), else nothing: the counts do not identify one.
-std::optional<double> uniformRescaleFactor(const std::array<double, 3>& stampedXyz,
-                                           const std::array<double, 3>& targetXyz);
-
-enum class UmbilicusScaleSource {
-    StampedDimensions,
-    StampedVoxelSize,
-    InferredFromGrid,
-};
-// The factor that carries the file's coordinates into a target grid's voxels.
-struct UmbilicusScale {
-    double factor = 1.0;
-    UmbilicusScaleSource source = UmbilicusScaleSource::StampedDimensions;
-    std::string description;
-};
-// From the stamped dimensions against the target grid (XYZ counts), else the
-// stamped voxel size against the target's, else (nothing stamped) the one
-// power-of-two grid the points nearly fill. Nothing when no reading applies.
-std::optional<UmbilicusScale> deriveUmbilicusScale(const UmbilicusFile&, const std::array<double, 3>& targetGridXyz,
-                                                   std::optional<double> targetVoxelSizeUm);
-
-// What frame the file states: a complete positive dimension triplet, a voxel size.
-struct UmbilicusFrameClaim {
-    bool dimensions = false;
-    bool voxelSize = false;
-    [[nodiscard]] bool any() const { return dimensions || voxelSize; }
-};
-UmbilicusFrameClaim umbilicusFrameClaim(const UmbilicusFile&);
-
-// Why the file's stamp is wrong about the volume it names (that volume's grid
-// and voxel size), or nothing when it is consistent with it.
-std::optional<std::string> umbilicusStampContradiction(const UmbilicusFile&,
-                                                       const std::array<double, 3>& namedVolumeGridXyz,
-                                                       std::optional<double> namedVolumeVoxelSizeUm);
-
-enum class UmbilicusLoadAction {
-    Apply,
-    Refuse,
-    UseLegacy,
-};
-// A contradicted stamp refuses; without a target grid a stated frame refuses
-// and an unstated one keeps the legacy reading; a derived scale applies; a
-// stated frame that derived none refuses.
-UmbilicusLoadAction decideUmbilicusLoadAction(const std::optional<UmbilicusScale>&, const UmbilicusFrameClaim&,
-                                              bool haveTargetGrid, bool stampContradicted = false);
-
 // A volume grid: XYZ voxel counts and voxel size.
 struct UmbilicusTargetGrid {
     std::array<double, 3> xyz{};

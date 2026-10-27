@@ -14,7 +14,6 @@
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
-#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
@@ -479,20 +478,6 @@ static int run_main(int argc, char *argv[])
     // Stored surfaces are read in volume_uuid's voxels, the units of the
     // selection, proximity queries and the output binding below.
 
-    // The volume's umbilicus, in its (level 0) voxels, unless the parameters name one.
-    if (store && volume_uuid && !params.contains("umbilicus_path") && !params.contains("umbilicus_points")) {
-        if (const auto umbilicus = vc::objects::volumeUmbilicus(*store->objects().session(), store->objects().attachment(), *volume_uuid)) {
-            auto points = Json::array();
-            for (const auto& p : umbilicus->points) {
-                auto xyz = Json::array();
-                xyz.push_back(p[0]);
-                xyz.push_back(p[1]);
-                xyz.push_back(p[2]);
-                points.push_back(std::move(xyz));
-            }
-            params["umbilicus_points"] = std::move(points);
-        }
-    }
     const bool resuming = !resume_path.empty() || !surface_uuid.empty();
     // Stored surfaces within `tolerance` of a point (in the bound volume's voxels when given).
     auto stored_surfaces_near = [&](const cv::Vec3d& p, double tolerance) {
@@ -1647,8 +1632,6 @@ static int run_main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
         if (!refine.contains("resume_opt")) refine["resume_opt"] = "local";
-        for (const char* key : {"umbilicus_points", "umbilicus_path"})
-            if (params.contains(key) && !refine.contains(key)) refine[key] = params[key];
         for (auto& p : *out_surf->rawPointsPtr())
             if (!vc::geometry::validSurfacePoint(p)) p = invalid_marker;
         if (const int threads = refine.value("thread_limit", 0); threads > 0) omp_set_num_threads(threads);

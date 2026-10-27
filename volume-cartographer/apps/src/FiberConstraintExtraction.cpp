@@ -4,7 +4,8 @@
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/core/util/AtomicFile.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Umbilicus.hpp"
+#include <vc_object_store/objects/UmbilicusFile.hpp>
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -190,16 +191,19 @@ int runFiberConstraintExtraction(int argc, char** argv)
     std::filesystem::create_directories(output.parent_path());
     const auto loadAxis=[&]() {
         // The volume's grid, as the Lasagna manifest states it; the umbilicus
-        // file's own voxel size is not cross-checked.
+        // file's own voxel size is not cross-checked. Only a frame the file
+        // states is used; an inferred or unstated one would need confirming.
         const auto& shape=baseShapeZYX;
-        auto loaded=vc::core::util::loadUmbilicusWithFrameCheck(cfg.at("umbilicus").get<std::string>(),
-            {double(shape[2]),double(shape[1]),double(shape[0])},
-            {int(shape[0]),int(shape[1]),int(shape[2])},
-            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,std::nullopt);
-        if(!loaded.umbilicus || !loaded.warning.empty() || loaded.scaleDescription.empty())
-            throw std::runtime_error("Umbilicus frame not verified: "+loaded.error+loaded.warning);
-        result["umbilicus_frame"]=loaded.scaleDescription;
-        return std::move(*loaded.umbilicus);
+        const auto file=vc::objects::readUmbilicusFile(cfg.at("umbilicus").get<std::string>());
+        const auto binding=vc::objects::umbilicusBinding(file,
+            {{double(shape[2]),double(shape[1]),double(shape[0])},std::nullopt},std::nullopt);
+        if(binding.refusal)throw std::runtime_error("Umbilicus refused: "+*binding.refusal);
+        if(binding.confirm || !binding.storedUnitsPerVoxel)
+            throw std::runtime_error("Umbilicus frame not verified: the file does not state its frame");
+        result["umbilicus_frame"]=binding.frame;
+        std::vector<cv::Vec3f> points;points.reserve(file.points.size());
+        for(const auto& p:file.points)points.emplace_back(cv::Vec3f(float(p[0]),float(p[1]),float(p[2]))/float(*binding.storedUnitsPerVoxel));
+        return vc::core::util::Umbilicus::FromPoints(std::move(points),{int(shape[0]),int(shape[1]),int(shape[2])});
     };
     if(cfg.contains("axial_prior_output")) {
         const auto target=std::filesystem::path(cfg.at("axial_prior_output").get<std::string>());
