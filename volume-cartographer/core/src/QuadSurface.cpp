@@ -8,6 +8,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
+#include <vc_object_store/Tiff.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 
@@ -250,6 +251,49 @@ bool readSamplesTiffFirst(const std::filesystem::path& path)
     uint16_t samples = 1;
     if (tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &samples);
     return samples == 2 || samples > 4;
+}
+
+// OpenCV depths as TIFF samples (TiffSamples::bits, sampleFormat).
+bool tiffSampleFormat(int depth, uint16_t& bits, uint16_t& format)
+{
+    switch (depth) {
+    case CV_8U: bits = 8; format = SAMPLEFORMAT_UINT; return true;
+    case CV_16U: bits = 16; format = SAMPLEFORMAT_UINT; return true;
+    case CV_32S: bits = 32; format = SAMPLEFORMAT_INT; return true;
+    case CV_32F: bits = 32; format = SAMPLEFORMAT_IEEEFP; return true;
+    case CV_64F: bits = 64; format = SAMPLEFORMAT_IEEEFP; return true;
+    }
+    return false;
+}
+
+// A channel image with any number of components through the store's TIFF
+// sample codec; empty when its samples have no OpenCV depth.
+cv::Mat readChannelSamples(const std::filesystem::path& path)
+{
+    const auto samples = readTiffSamples(path, false);
+    for (const int depth : {CV_8U, CV_16U, CV_32S, CV_32F, CV_64F}) {
+        uint16_t bits = 0, format = 0;
+        if (!tiffSampleFormat(depth, bits, format) || bits != samples.bits || format != samples.sampleFormat ||
+            samples.components > CV_CN_MAX)
+            continue;
+        cv::Mat image(int(samples.height), int(samples.width), CV_MAKETYPE(depth, samples.components));
+        std::memcpy(image.data, samples.bytes.data(), samples.bytes.size());
+        return image;
+    }
+    return {};
+}
+
+void writeChannelSamples(const std::filesystem::path& path, const cv::Mat& image)
+{
+    TiffSamples samples;
+    if (image.empty() || !tiffSampleFormat(image.depth(), samples.bits, samples.sampleFormat))
+        throw std::runtime_error("unsupported image for " + path.string());
+    const cv::Mat contiguous = image.isContinuous() ? image : image.clone();
+    samples.width = uint32_t(contiguous.cols);
+    samples.height = uint32_t(contiguous.rows);
+    samples.components = uint16_t(contiguous.channels());
+    samples.bytes.assign(contiguous.datastart, contiguous.dataend);
+    writeTiffSamples(path, samples);
 }
 
 void normalizeMaskChannel(cv::Mat& mask)
@@ -1314,7 +1358,7 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
                 std::vector<cv::Mat> layers;
                 // OpenCV rejects some sample layouts (e.g. two float components).
                 if (readSamplesTiffFirst(channel_path)) {
-                    channel = readSamplesTiff(channel_path);
+                    channel = readChannelSamples(channel_path);
                 } else {
                     cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
                     if (!layers.empty()) {
@@ -2263,7 +2307,7 @@ void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::
 
     // OpenCV writes 1, 3 or 4 channels; others (e.g. the two-component uv) keep their samples.
     if (!wrote && (mat.channels() == 2 || mat.channels() > 4)) {
-        writeSamplesTiff(dir / (name + ".tif"), mat);
+        writeChannelSamples(dir / (name + ".tif"), mat);
         wrote = true;
     }
     if (!wrote) {
