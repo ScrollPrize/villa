@@ -189,7 +189,8 @@ public:
     // An object of a fetched attachment is fetched first.
     void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
     // Restore an imported object to the version it was imported at (its first
-    // revision here), e.g. "Reset to Open Data Version".
+    // revision here), e.g. "Reset to Open Data Version"; its relationships are
+    // kept as recorded.
     void restoreImported(const AttachmentIdentity&, const std::string& objectUuid);
     // Queries across attachments in `order`: an object (by UUID) comes from the
     // first attachment holding it, so an imported copy hides the catalog one.

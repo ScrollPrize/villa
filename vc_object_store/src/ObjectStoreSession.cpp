@@ -246,7 +246,10 @@ void ObjectStoreSession::restoreImported(const AttachmentIdentity& identity, con
         current = store.currentObjectRevision(txn, uuid);
     });
     if (history.empty() || !current) throw std::runtime_error("object has no history: " + uuid);
-    act(identity, {{uuid, current->uuid}}, [&](auto& store, auto& txn) { store.restoreObject(txn, uuid, history.front().uuid); });
+    editKeepingRelationships(identity, {{uuid, current->uuid}}, {}, [&](auto& store, auto& txn, const auto&) {
+        store.restoreObject(txn, uuid, history.front().uuid);
+        store.keepRecordedRelationshipsOf(txn, uuid);
+    });
 }
 
 AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path& path, const OpenOptions& options,
