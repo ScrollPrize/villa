@@ -26,6 +26,7 @@ class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
+namespace vc3d { class PointCollectionSync; }
 
 struct POI
 {
@@ -156,6 +157,8 @@ private:
     std::string _activeSurfaceId;
 
     VCCollection* _pointCollection;
+    // Keeps the volume's point collections in the store (the main state only).
+    vc3d::PointCollectionSync* _pointCollectionSync = nullptr;
 
     bool _debugDownloadQueue = false;
 

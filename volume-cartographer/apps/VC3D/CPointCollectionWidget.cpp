@@ -15,7 +15,6 @@
 #include <vector>
 #include <algorithm>
 #include <QColorDialog>
-#include <QFileDialog>
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QLabel>
@@ -235,10 +234,6 @@ void CPointCollectionWidget::setupUi()
     layout->addStretch();
  
     QHBoxLayout *file_layout = new QHBoxLayout();
-    _load_button = new QPushButton("Load");
-    file_layout->addWidget(_load_button);
-    _save_button = new QPushButton("Save");
-    file_layout->addWidget(_save_button);
     _reset_button = new QPushButton("Clear All Points");
     _reset_button->setObjectName(QStringLiteral("pointCollectionClearAllButton"));
     file_layout->addWidget(_reset_button);
@@ -249,8 +244,6 @@ void CPointCollectionWidget::setupUi()
                                       "collection and uncheck Absolute Winding Number");
     layout->addWidget(_reset_winding_button);
 
-    connect(_load_button, &QPushButton::clicked, this, &CPointCollectionWidget::onLoadClicked);
-    connect(_save_button, &QPushButton::clicked, this, &CPointCollectionWidget::onSaveClicked);
     connect(_reset_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetClicked);
     connect(_reset_winding_button, &QPushButton::clicked, this, &CPointCollectionWidget::onResetWindingClicked);
  
@@ -838,36 +831,6 @@ void CPointCollectionWidget::onFillWindingEqualsClicked()
         _point_collection->autoFillWindingNumbers(*_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
     } else {
         _point_collection->setAutoFillMode(*_selected_collection_id, VCCollection::WindingFillMode::None);
-    }
-}
- 
-void CPointCollectionWidget::onSaveClicked()
-{
-    QString fileName = QFileDialog::getSaveFileName(this, tr("Save Point Collection"), "", tr("JSON Files (*.json)"));
-    if (fileName.isEmpty()) {
-        return;
-    }
- 
-    if (_point_collection) {
-        _point_collection->saveToJSON(fileName.toStdString());
-    }
-}
- 
-void CPointCollectionWidget::onLoadClicked()
-{
-    QString fileName = QFileDialog::getOpenFileName(this, tr("Load Point Collection"), "", tr("JSON Files (*.json)"));
-    if (fileName.isEmpty()) {
-        return;
-    }
- 
-    if (_point_collection) {
-       try {
-           if (_point_collection->loadFromJSON(fileName.toStdString())) {
-               refreshTree();
-           }
-       } catch (const std::exception& e) {
-           QMessageBox::critical(this, "Error Loading File", e.what());
-       }
     }
 }
  

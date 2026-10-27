@@ -455,7 +455,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List the surfaces of the open volume (your store and read-only catalog stores) by UUID, with name, tags and active/catalog/bound flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
-| `vc3d_load_points_json` | `points.load_json` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
@@ -478,7 +477,6 @@ is the sole bridge method without an MCP tool.
 | `vc3d_review_segments` | `segments.review` | List segments with review-tag state and optional server-side filtering (the programmatic equivalent of the surface panel's review filter checkboxes). |
 | `vc3d_rotate_viewer` | `viewer.rotate` | Rotate the "seg xz"/"seg yz" axis-aligned slice plane (middle-drag equivalent). Relative delta by default. |
 | `vc3d_run_trace` | `tracer.run_trace` |
-| `vc3d_save_points_json` | `points.save_json` |
 | `vc3d_save_segment` | `segmentation.save` | Write the active segment's pending edits to the store now. Idle no-op (`jobId:null`) when nothing is dirty; else an `"autosave"` job (`wait` defaults true). |
 | `vc3d_screenshot` | `screenshot.capture` | Capture a PNG of the whole VC3D window or one viewer pane. Returns the PNG as MCP image content when `file_path` is omitted, or a dict with the on-disk path when `file_path` is set (MCP-layer note below). |
 | `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |

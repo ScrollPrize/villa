@@ -122,6 +122,11 @@ public:
    // id). Parses every collection before installing any; collections without
    // anchor2d are skipped. Returns false (changing nothing) on malformed input.
    bool replaceAnchoredCollections(const std::map<uint64_t, utils::Json>& collections);
+   // Replace the collections without anchor2d (a volume's) with
+   // `collections` (collection JSON, new runtime ids; points keep theirs).
+   // Parses every collection before installing any; anchored ones are skipped.
+   // Returns false (changing nothing) on malformed input.
+   bool replaceUnanchoredCollections(const std::vector<utils::Json>& collections);
 
    // Apply grid offset to all anchor2d values (for surface growth remapping)
    void applyAnchorOffset(float offsetX, float offsetY);
@@ -138,6 +143,8 @@ protected:
     virtual void onPointsRemoved(const std::vector<vc::PointRef>&) {}
 
 private:
+    // Remove the anchored (or unanchored) collections and install `parsed`.
+    void installCollections(bool anchored, std::vector<Collection> parsed);
     uint64_t getNextPointId();
     uint64_t getNextCollectionId();
 

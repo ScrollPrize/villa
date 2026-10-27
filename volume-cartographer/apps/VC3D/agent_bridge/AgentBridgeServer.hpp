@@ -194,8 +194,6 @@ private:
     QJsonObject handlePointsSetAutoFillMode(const QJsonValue& params);
     QJsonObject handlePointsResetWindings(const QJsonValue& params);
     QJsonObject handlePointsApplyAnchorOffset(const QJsonValue& params);
-    QJsonObject handlePointsSaveJson(const QJsonValue& params);
-    QJsonObject handlePointsLoadJson(const QJsonValue& params);
     QJsonObject handleProjectCreate(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeAttach(const QJsonValue& params);

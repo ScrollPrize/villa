@@ -279,6 +279,8 @@ set(srcs
     ToolExecutable.hpp
     ToolProcess.cpp
     ToolProcess.hpp
+    PointCollectionSync.cpp
+    PointCollectionSync.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
     ConsoleOutputWidget.cpp

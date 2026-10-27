@@ -274,15 +274,3 @@ async def vc3d_apply_anchor_offset(
     return await _call(
         "points.apply_anchor_offset", {"offsetX": offset_x, "offsetY": offset_y}
     )
-
-
-@mcp.tool()
-async def vc3d_save_points_json(path: str) -> dict[str, Any]:
-    """Save all point collections to a JSON file. Returns {saved: bool}."""
-    return await _call("points.save_json", {"path": path})
-
-
-@mcp.tool()
-async def vc3d_load_points_json(path: str) -> dict[str, Any]:
-    """Load point collections from a JSON file. Returns {loaded: bool}."""
-    return await _call("points.load_json", {"path": path})

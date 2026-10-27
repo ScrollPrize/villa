@@ -1305,27 +1305,6 @@
         "type": "object"
       }
     },
-    "points.load_json": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_load_points_json"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
     "points.remove_collection_tag": {
       "errors": [
         -32000,
@@ -1437,27 +1416,6 @@
       },
       "params": {
         "properties": {},
-        "type": "object"
-      }
-    },
-    "points.save_json": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "tool": "vc3d_save_points_json"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
         "type": "object"
       }
     },

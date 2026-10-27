@@ -1,5 +1,6 @@
 #include "segmentation/SurfaceCorrections.hpp"
 
+#include "vc/core/StoredCollection.hpp"
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include "vc/core/types/Volume.hpp"
@@ -15,25 +16,11 @@ namespace {
 // Corrections are data attached to the surface, never graph links.
 constexpr const char* kRole = "corrections";
 
-// A VCCollection as an attached collection: its points, one annotation per
-// point (the point's other fields), and the rest of it as meta.source.
-AttachedCollection toStore(uint64_t id, const Json& collection)
+// A VC collection as an attached collection, remembering its VC id.
+AttachedCollection toStore(uint64_t id, const utils::Json& collection)
 {
-    AttachedCollection stored;
-    stored.uuid = collection.at("uuid").get<std::string>();
-    stored.name = collection.value("name", std::string{});
-    stored.source = collection;
-    for (const auto* key : {"points", "uuid", "name"}) stored.source.erase(key);
+    auto stored = vc::storedCollection(collection);
     stored.source["source_collection_id"] = std::to_string(id);
-    std::map<int64_t, Json> ordered;
-    for (const auto& [key, value] : collection.at("points").items()) ordered.emplace(std::stoll(key), value);
-    for (const auto& [pointId, entry] : ordered) {
-        stored.points.ids.push_back(pointId);
-        stored.points.points.push_back(entry.at("p").get<std::array<double, 3>>());
-        auto extra = entry;
-        extra.erase("p");
-        stored.annotations.push_back(std::move(extra));
-    }
     return stored;
 }
 }
@@ -42,20 +29,10 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
                                                         const std::string& surfaceUuid, const std::optional<vc::objects::ViewFrame>& view)
 {
     std::map<uint64_t, utils::Json> result;
-    for (const auto& stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
-        auto collection = stored.source;
-        const auto id = std::stoull(collection.value("source_collection_id", std::string("0")));
-        collection.erase("source_collection_id");
-        collection["uuid"] = stored.uuid;
-        collection["name"] = stored.name;
-        auto entries = Json::object();
-        for (size_t i = 0; i < stored.points.ids.size(); ++i) {
-            auto entry = i < stored.annotations.size() && stored.annotations[i].is_object() ? stored.annotations[i] : Json::object();
-            entry["p"] = stored.points.points[i];
-            entries[std::to_string(stored.points.ids[i])] = std::move(entry);
-        }
-        collection["points"] = std::move(entries);
-        result[id] = utils::Json::parse(collection.dump());
+    for (auto stored : attachedCollections(session, attachment, surfaceUuid, kRole, view)) {
+        const auto id = std::stoull(stored.source.value("source_collection_id", std::string("0")));
+        stored.source.erase("source_collection_id");
+        result[id] = vc::collectionJson(stored);
     }
     return result;
 }
@@ -65,7 +42,7 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                               const std::optional<vc::objects::ViewFrame>& view)
 {
     std::vector<AttachedCollection> stored;
-    for (const auto& [id, json] : collections) stored.push_back(toStore(id, Json::parse(json.dump())));
+    for (const auto& [id, json] : collections) stored.push_back(toStore(id, json));
     replaceAttachedCollections(session, attachment, surfaceUuid, kRole, stored,
                                vc::objects::volumeCoordinates(volume.id(), 1), view);
 }

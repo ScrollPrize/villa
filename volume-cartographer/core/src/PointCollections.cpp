@@ -721,24 +721,44 @@ bool PointCollections::replaceAnchoredCollections(const std::map<uint64_t, Json>
         std::cerr << "Invalid correction collections: " << e.what() << std::endl;
         return false;
     }
-
     // Switching surfaces replaces the previous surface's corrections.
+    installCollections(true, std::move(parsed));
+    return true;
+}
+
+bool PointCollections::replaceUnanchoredCollections(const std::vector<Json>& collections)
+{
+    std::vector<Collection> parsed;
+    try {
+        for (const auto& json : collections) {
+            Collection col;
+            from_json(json, col);
+            if (col.anchor2d.has_value()) {
+                continue;
+            }
+            col.id = 0;
+            parsed.push_back(std::move(col));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid point collections: " << e.what() << std::endl;
+        return false;
+    }
+    installCollections(false, std::move(parsed));
+    return true;
+}
+
+void PointCollections::installCollections(bool anchored, std::vector<Collection> parsed)
+{
     std::vector<uint64_t> toRemove;
     for (const auto& [id, col] : _collections) {
-        if (col.anchor2d.has_value()) {
+        if (col.anchor2d.has_value() == anchored) {
             toRemove.push_back(id);
         }
     }
     for (uint64_t id : toRemove) {
         clearCollection(id);
     }
-
-    std::vector<uint64_t> addedCollectionIds;
-    for (auto& col : parsed) {
-        _collections[col.id] = col;
-        for (auto& point_pair : _collections.at(col.id).points) {
-            point_pair.second.collectionId = col.id;
-        }
+    for (const auto& col : parsed) {
         if (col.id >= _next_collection_id) {
             _next_collection_id = col.id + 1;
         }
@@ -747,12 +767,23 @@ bool PointCollections::replaceAnchoredCollections(const std::map<uint64_t, Json>
                 _next_point_id = point_pair.first + 1;
             }
         }
+    }
+
+    std::vector<uint64_t> addedCollectionIds;
+    for (auto& col : parsed) {
+        // A collection keeps its id unless another holds it (or it has none).
+        if (col.id == 0 || _collections.contains(col.id)) {
+            col.id = getNextCollectionId();
+        }
+        for (auto& point_pair : col.points) {
+            point_pair.second.collectionId = col.id;
+        }
         addedCollectionIds.push_back(col.id);
+        _collections[col.id] = std::move(col);
     }
     if (!addedCollectionIds.empty()) {
         onCollectionsAdded(addedCollectionIds);
     }
-    return true;
 }
 
 uint64_t PointCollections::getNextPointId()

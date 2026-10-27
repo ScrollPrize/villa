@@ -103,7 +103,8 @@ vc_add_test(NAME test_segmentation_intersection_invalidation
 qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/InkDetectionOverlayController.hpp)
 qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(viewer_manager_overlay_test_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
-qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(surface_catalog_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_ink_detection_overlay
@@ -114,6 +115,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/VolumeViewerCmaps.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -196,7 +198,8 @@ vc_add_test(NAME test_lasagna_batch_window
 
 qt6_wrap_cpp(segmentation_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.hpp)
 qt6_wrap_cpp(collapsible_settings_group_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp)
-qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 qt6_wrap_cpp(vccollection_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(surface_catalog_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_segmentation_lasagna_panel_ui
@@ -206,6 +209,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             test_lasagna_service_manager_stub.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${segmentation_lasagna_panel_moc}
@@ -233,7 +237,8 @@ vc_add_test(NAME test_spiral_config_profile_editor
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
-qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
+qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
 vc_add_test(NAME test_line_annotation_link_validation
     SOURCES test_line_annotation_link_validation.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -260,6 +265,8 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp

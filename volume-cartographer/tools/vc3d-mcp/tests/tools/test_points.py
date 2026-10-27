@@ -29,12 +29,10 @@ from vc3d_mcp.tools.points import (
     vc3d_auto_fill_windings,
     vc3d_clear_all_points,
     vc3d_clear_point_collection,
-    vc3d_load_points_json,
     vc3d_remove_point,
     vc3d_remove_point_collection_tag,
     vc3d_rename_point_collection,
     vc3d_reset_windings,
-    vc3d_save_points_json,
     vc3d_set_auto_fill_mode,
     vc3d_set_point_collection_color,
     vc3d_set_point_collection_metadata,
@@ -191,14 +189,6 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         self._assert_passthrough(
             result, "points.apply_anchor_offset", {"offsetX": 1.5, "offsetY": -2.0}
         )
-
-    async def test_save_json(self) -> None:
-        await vc3d_save_points_json(path="/tmp/p.json")
-        self._assert_wire("points.save_json", {"path": "/tmp/p.json"})
-
-    async def test_load_json(self) -> None:
-        await vc3d_load_points_json(path="/tmp/p.json")
-        self._assert_wire("points.load_json", {"path": "/tmp/p.json"})
 
 
 if __name__ == "__main__":

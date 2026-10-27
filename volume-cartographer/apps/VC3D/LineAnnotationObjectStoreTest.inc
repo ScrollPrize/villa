@@ -6,6 +6,7 @@
 #include "SpiralWorkspace.hpp"
 #include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/objects/AttachedDocument.hpp>
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
@@ -143,6 +144,64 @@ int runObjectStoreControllerTests()
             require(controller.umbilicusStatus().text.contains("several") &&
                     controller.umbilicusFingerprint() != token,
                     "several umbilici bound to one volume are refused");
+            state.detachObjectStore();
+        }
+        {
+            // A volume's point collections live in the store: edits reach it in a
+            // debounced transaction, a new session loads them, and someone else's
+            // commit reloads them; corrections (anchored) stay out.
+            QTemporaryDir dir;
+            Volume::ZarrCreateOptions create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.compressor = "none"; create.uuid = "points-volume";
+            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions pointOptions; pointOptions.author = "vc3d-points-test";
+            { auto db = ObjectStore::create(storePath, pointOptions); }
+            auto settle = [](const std::function<bool()>& done) {
+                QElapsedTimer timer; timer.start();
+                while (!done() && timer.elapsed() < 5000) { QApplication::processEvents(); QThread::msleep(5); }
+                return done();
+            };
+            CState state;
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+            state.setCurrentVolume(volume);
+            auto* points = state.pointCollection();
+            const auto first = points->addPoint("seeds", {1, 2, 3});
+            points->addPoint("seeds", {4, 5, 6});
+            const auto anchored = points->addCollection("correction");
+            points->setCollectionAnchor2d(anchored, cv::Vec2f(1, 1));
+            points->addPoint("correction", {7, 7, 7});
+            const auto attachment = *state.objectStoreAttachment();
+            auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, volume->id()); };
+            require(settle([&] { return stored().size() == 1 && stored()[0].points.points.size() == 2; }),
+                    "an edited collection reaches the store after the debounce");
+            require(stored()[0].name == "seeds", "the store holds the collection's name");
+            auto moved = *points->getPoint({first.collectionId, first.id});
+            moved.p = {9, 9, 9};
+            points->updatePoint(moved);
+            require(settle([&] { return stored()[0].points.points[0] == std::array<double, 3>{9, 9, 9}; }),
+                    "a moved point is written back keeping its id");
+            {
+                CState other;
+                other.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+                other.setCurrentVolume(volume);
+                const auto& loaded = other.pointCollection()->getAllCollections();
+                require(loaded.size() == 1 && loaded.begin()->second.name == "seeds" && loaded.begin()->second.points.size() == 2,
+                        "a new session loads the volume's collections");
+                other.detachObjectStore();
+            }
+            auto edited = stored()[0];
+            edited.points.points[1] = {3, 3, 3};
+            vc::objects::writeVolumeCollections(*state.objectStoreSession(), attachment, volume->id(), {edited}, {});
+            state.pollObjectStoreChanges();
+            require(settle([&] {
+                        const auto found = points->getAllCollections().find(*points->getCollectionId("seeds"));
+                        return std::any_of(found->second.points.begin(), found->second.points.end(),
+                                           [](const auto& p) { return p.second.p == cv::Vec3f(3, 3, 3); });
+                    }), "someone else's commit reloads the collection");
+            require(points->getCollectionId("correction").has_value(), "a reload keeps the corrections");
+            points->clearCollection(*points->getCollectionId("seeds"));
+            require(settle([&] { return stored().empty(); }), "a removed collection is retired");
             state.detachObjectStore();
         }
         {

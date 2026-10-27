@@ -260,26 +260,4 @@ void AgentBridgeServer::registerPointsHandlers()
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_apply_anchor_offset")),
         },
         [this](const QJsonValue& p) { return handlePointsApplyAnchorOffset(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("points.save_json"),
-            .params = {
-                Params::requiredString(QStringLiteral("path")),
-            },
-            .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_save_points_json")),
-        },
-        [this](const QJsonValue& p) { return handlePointsSaveJson(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("points.load_json"),
-            .params = {
-                Params::requiredString(QStringLiteral("path")),
-            },
-            .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_load_points_json")),
-        },
-        [this](const QJsonValue& p) { return handlePointsLoadJson(p); });
 }

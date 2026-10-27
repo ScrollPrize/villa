@@ -1,4 +1,5 @@
 #include "CState.hpp"
+#include "PointCollectionSync.hpp"
 
 #include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
@@ -233,6 +234,7 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         journalTimer->start();
     }
     _pointCollection = new VCCollection(this);
+    if (!objectStoreOwner) _pointCollectionSync = new vc3d::PointCollectionSync(this);
 
     setSurface("xy plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
@@ -282,6 +284,7 @@ std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() c
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
     if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
+    _pointCollectionSync->flush();
     auto options = viewerOpenOptions();
     options.author = author.toStdString();
     options.readOnly = readOnly;
@@ -294,6 +297,7 @@ void CState::attachObjectStore(const QString& path, const QString& author, bool 
 void CState::detachObjectStore()
 {
     if (_objectStoreOwner) { _objectStoreOwner->detachObjectStore(); return; }
+    _pointCollectionSync->flush();
     if (_objectStoreAttachment) _objectStoreSession->detach(*_objectStoreAttachment);
     _objectStoreAttachment.reset();
     pollObjectStoreChanges();
@@ -482,6 +486,7 @@ void CState::closeAll()
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
+    if (_pointCollectionSync) _pointCollectionSync->unload();
     _pointCollection->clearAll();
 
     setVpkg(nullptr);

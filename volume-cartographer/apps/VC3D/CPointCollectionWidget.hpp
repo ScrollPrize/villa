@@ -84,8 +84,6 @@ private slots:
     void onFillWindingPlusClicked();
     void onFillWindingMinusClicked();
     void onFillWindingEqualsClicked();
-    void onSaveClicked();
-    void onLoadClicked();
     void onConvertToAnchorClicked();
     void onClearAnchorClicked();
     void showContextMenu(const QPoint& pos);
@@ -107,8 +105,6 @@ private slots:
     QTreeView *_tree_view;
     QStandardItemModel *_model;
  
-    QPushButton *_load_button;
-    QPushButton *_save_button;
     QPushButton *_reset_button;
     QPushButton *_reset_winding_button;
 
