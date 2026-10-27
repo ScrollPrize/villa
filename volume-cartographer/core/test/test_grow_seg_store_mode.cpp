@@ -8,6 +8,7 @@
 
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
@@ -41,18 +42,17 @@ std::string run(const std::string& command, const fs::path& log)
 void writeSheets(const fs::path& dir, const std::vector<int>& centres)
 {
     fs::create_directories(dir);
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {128, 128, 128};
-    options.compressor = "none";
     options.uuid = "test-volume";
     options.name = "test-volume";
-    auto volume = Volume::New(dir / "volume.zarr", options);
+    auto volume = vc::test::createZarrVolume(dir / "volume.zarr", options);
     Array3D<uint8_t> sheet({128, 128, 128}, 0);
     for (const int centre : centres)
         for (int z = centre - 4; z <= centre + 4; ++z)
             for (size_t y = 0; y < 128; ++y)
                 for (size_t x = 0; x < 128; ++x) sheet(size_t(z), y, x) = uint8_t(255 - 20 * std::abs(z - centre));
-    volume->writeZYX(sheet, {0, 0, 0});
+    vc::test::writeZYX(*volume, sheet, {0, 0, 0});
 }
 }
 

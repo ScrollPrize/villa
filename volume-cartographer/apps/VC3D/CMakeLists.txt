@@ -465,4 +465,6 @@ endif()
 
 if(VC_TESTING)
     set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    # The in-binary store tests build their fixture volumes with core/test/support.
+    target_include_directories(VC3D PRIVATE ${PROJECT_SOURCE_DIR}/core/test)
 endif()

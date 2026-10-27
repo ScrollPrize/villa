@@ -7,6 +7,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -426,14 +427,13 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
 TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries")
 {
     auto d = tmpDir("lasagna_batch_attach");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "lasagna-view";
     create.name = "presence";
-    create.compressor.clear();
-    auto volume = Volume::New(d / "backing.zarr", create);
+    auto volume = vc::test::createZarrVolume(d / "backing.zarr", create);
 
     VolumePkg::PreparedVolumeAttachment derived{
         (d / "backing.zarr").string(),
@@ -484,17 +484,16 @@ TEST_CASE("VolumePkg Lasagna attach fills but does not replace selected datasets
 TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning volumes")
 {
     auto d = tmpDir("lasagna_batch_reconcile");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "old-channel";
     create.name = "old";
-    create.compressor.clear();
-    auto oldVolume = Volume::New(d / "old.zarr", create);
+    auto oldVolume = vc::test::createZarrVolume(d / "old.zarr", create);
     create.uuid = "new-channel";
     create.name = "new";
-    auto newVolume = Volume::New(d / "new.zarr", create);
+    auto newVolume = vc::test::createZarrVolume(d / "new.zarr", create);
 
     const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
         (d / "old.zarr").string(),
@@ -528,14 +527,13 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
 TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular volumes")
 {
     auto d = tmpDir("lasagna_shared_ownership");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "shared-lasagna-view";
     create.name = "shared";
-    create.compressor.clear();
-    auto volume = Volume::New(d / "shared.zarr", create);
+    auto volume = vc::test::createZarrVolume(d / "shared.zarr", create);
 
     const VolumePkg::PreparedVolumeAttachment first{
         (d / "shared.zarr").string(),
@@ -564,15 +562,14 @@ TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular vol
 TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source volume")
 {
     auto d = tmpDir("lasagna_independent_ownership");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "independent-lasagna-source";
     create.name = "source";
-    create.compressor.clear();
     const auto location = (d / "source.zarr").string();
-    auto volume = Volume::New(location, create);
+    auto volume = vc::test::createZarrVolume(location, create);
 
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
@@ -601,15 +598,14 @@ TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source vol
 TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations")
 {
     auto d = tmpDir("lasagna_mismatched_location");
-    Volume::ZarrCreateOptions create;
+    vc::test::ZarrVolumeSpec create;
     create.shapeZYX = {2, 2, 2};
     create.chunkShapeZYX = {2, 2, 2};
     create.numLevels = 1;
     create.uuid = "source";
     create.name = "source";
-    create.compressor.clear();
     const auto location = (d / "source.zarr").string();
-    auto prepared = Volume::New(d / "other.zarr", create);
+    auto prepared = vc::test::createZarrVolume(d / "other.zarr", create);
 
     auto pkg = VolumePkg::newEmpty();
     const VolumePkg::PreparedVolumeAttachment derived{

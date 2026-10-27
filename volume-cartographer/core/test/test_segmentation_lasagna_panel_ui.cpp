@@ -27,6 +27,7 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "SurfaceCatalog.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -187,12 +188,11 @@ int main(int argc, char** argv)
     // The store jobs read: a volume's surfaces, one of them a Lasagna fit
     // (its model in the store, the reference surface it read in its meta).
     namespace vo = vc::objects;
-    Volume::ZarrCreateOptions volumeOptions;
+    vc::test::ZarrVolumeSpec volumeOptions;
     volumeOptions.shapeZYX = {4, 4, 4};
     volumeOptions.chunkShapeZYX = {4, 4, 4};
-    volumeOptions.compressor = "none";
     volumeOptions.uuid = "lasagna-test-volume";
-    const auto volume = Volume::New(std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString()),
+    const auto volume = vc::test::createZarrVolume(std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString()),
                                     volumeOptions);
     const auto storePath = std::filesystem::path(tempDir.filePath(QStringLiteral("objects.vcobj")).toStdString());
     vo::OpenOptions storeOptions;

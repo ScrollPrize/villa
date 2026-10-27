@@ -9,6 +9,7 @@
 #include <mutex>
 #include <QTreeWidget>
 #include <QDoubleSpinBox>
+#include "support/TestZarrVolume.hpp"
 // Built only with VC_TESTING. The surface panel over a real object store:
 // listing, filters, tags, activation and deletion through commit events; a
 // fetched catalog store (as an Open Data sample's) of a volume the open one
@@ -21,9 +22,9 @@ int runSurfacePanelStoreTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     try {
         QTemporaryDir dir;
-        Volume::ZarrCreateOptions create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.compressor = "none"; create.uuid = "panel-volume";
-        const auto volume = Volume::New(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        vc::test::ZarrVolumeSpec create;
+        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "panel-volume";
+        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-panel-test";
         { auto created = ObjectStore::create(path, options); }

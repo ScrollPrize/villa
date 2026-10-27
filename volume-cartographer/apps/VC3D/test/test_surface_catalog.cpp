@@ -14,6 +14,7 @@
 #include <vc_reader/registrations.hpp>
 #include "VolumeRegistrations.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <QCoreApplication>
@@ -38,9 +39,9 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     try {
         QTemporaryDir dir;
-        Volume::ZarrCreateOptions create;
-        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.compressor = "none"; create.uuid = "vol1";
-        const auto volume = Volume::New(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        vc::test::ZarrVolumeSpec create;
+        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.uuid = "vol1";
+        const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "ct.zarr", create);
         const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
         OpenOptions options; options.author = "surface-catalog-test";
         { auto created = ObjectStore::create(path, options); }
@@ -323,9 +324,9 @@ int main(int argc, char** argv)
         auto withCatalog = options;
         withCatalog.catalogTransforms = levels;
         const auto leveled = session->replace(attachment, path, withCatalog);
-        Volume::ZarrCreateOptions coarse = create;
+        vc::test::ZarrVolumeSpec coarse = create;
         coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = vcr::catalog::levelVolumeId("vol1", 1);
-        const auto level = Volume::New(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
+        const auto level = vc::test::createZarrVolume(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
         const auto atLevel = util::newUuid();
         session->act(leveled, {{atLevel, std::nullopt}}, [&](auto& db, auto& txn) {
             ObjectRecord record; record.uuid = atLevel; record.kind = "surface"; record.name = "at-level";

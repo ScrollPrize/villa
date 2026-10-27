@@ -7,6 +7,7 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
@@ -54,15 +55,13 @@ fs::path makeLocalVolume(const fs::path& root,
                          const std::string& id = "vol1")
 {
     auto volDir = root / "volumes" / id;
-    Volume::ZarrCreateOptions o;
+    vc::test::ZarrVolumeSpec o;
     o.shapeZYX = {16, 16, 16};
     o.chunkShapeZYX = {16, 16, 16};
     o.numLevels = 1;
-    o.compressor = "none";
-    o.overwriteExisting = true;
     o.uuid = id;
     o.name = id;
-    auto v = Volume::New(volDir, o);
+    auto v = vc::test::createZarrVolume(volDir, o);
     REQUIRE(v);
     return volDir;
 }

@@ -3,6 +3,7 @@
 
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -139,13 +140,12 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
 {
     using namespace vc::fiber_tracer;
     const auto directory = temporaryDirectory();
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {8,8,8};
     options.chunkShapeZYX = {4,4,4};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 2;
-    options.compressor = "none";
-    auto pyramid = Volume::New(directory / "ct", options);
+    auto pyramid = vc::test::createZarrVolume(directory / "ct", options);
     REQUIRE(pyramid);
     CHECK_THROWS(validateFiberReplayStripCtVolume(*pyramid, (directory / "ct").string()));
     pyramid.reset();
@@ -195,7 +195,7 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     volume.reset();
     options.dtype = vc::render::ChunkDtype::UInt16;
     options.numLevels = 1;
-    auto wider = Volume::New(directory / "uint16", options);
+    auto wider = vc::test::createZarrVolume(directory / "uint16", options);
     wider.reset();
     wider = Volume::New(directory / "uint16/0");
     CHECK_THROWS(validateFiberReplayStripCtVolume(*wider, (directory / "uint16/0").string()));
@@ -481,13 +481,12 @@ bool cyanDominant(const cv::Vec3b& pixel)
 TEST_CASE("long-span overview maps overlays and endpoint markers to resampled columns")
 {
     const auto directory = temporaryDirectory();
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {64, 64, 64};
     options.chunkShapeZYX = {16, 16, 16};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 1;
-    options.compressor = "none";
-    auto volume = Volume::New(directory / "ct", options);
+    auto volume = vc::test::createZarrVolume(directory / "ct", options);
     volume.reset();
     const auto ct = (directory / "ct/0").string();
     volume = Volume::New(ct);
@@ -544,17 +543,15 @@ TEST_CASE("long-span overview maps overlays and endpoint markers to resampled co
 TEST_CASE("full replay overview renders selected top and side strips with disconnected trace overlays")
 {
     const auto directory = temporaryDirectory() / "overview_ct";
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {32, 32, 32};
     options.chunkShapeZYX = {16, 16, 16};
     options.dtype = vc::render::ChunkDtype::UInt8;
     options.numLevels = 2;
-    options.compressor = "none";
-    options.overwriteExisting = true;
-    auto pyramid = Volume::New(directory, options);
+    auto pyramid = vc::test::createZarrVolume(directory, options);
     REQUIRE(pyramid);
     Array3D<uint8_t> values({32, 32, 32}, uint8_t(96));
-    pyramid->writeZYX(values, {0, 0, 0});
+    vc::test::writeZYX(*pyramid, values, {0, 0, 0});
     pyramid.reset();
     auto volume = Volume::New(directory / "1");
     REQUIRE(volume);

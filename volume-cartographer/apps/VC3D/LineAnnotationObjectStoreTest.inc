@@ -7,6 +7,7 @@
 #include "SpiralServiceManager.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/AttachedDocument.hpp>
+#include "support/TestZarrVolume.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
@@ -90,9 +91,9 @@ int runObjectStoreControllerTests()
         }
         {
             QTemporaryDir volumeDir;
-            Volume::ZarrCreateOptions create; create.shapeZYX = {4,4,4};
-            create.chunkShapeZYX = {4,4,4}; create.compressor = "none"; create.uuid = "20260411134726";
-            const auto volume = Volume::New(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {4,4,4};
+            create.chunkShapeZYX = {4,4,4}; create.uuid = "20260411134726";
+            const auto volume = vc::test::createZarrVolume(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
             const auto binding = nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 4)}};
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
             require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
@@ -100,9 +101,9 @@ int runObjectStoreControllerTests()
         {
             // The umbilicus is the store's, bound to a volume; its frame was set when stored.
             QTemporaryDir dir;
-            Volume::ZarrCreateOptions create; create.shapeZYX = {16,8,8};
-            create.chunkShapeZYX = {16,8,8}; create.compressor = "none"; create.uuid = "umbilicus-volume";
-            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.uuid = "umbilicus-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions umbilicusOptions; umbilicusOptions.author = "vc3d-umbilicus-test";
             { auto db = ObjectStore::create(storePath, umbilicusOptions); }
@@ -151,9 +152,9 @@ int runObjectStoreControllerTests()
             // debounced transaction, a new session loads them, and someone else's
             // commit reloads them; corrections (anchored) stay out.
             QTemporaryDir dir;
-            Volume::ZarrCreateOptions create; create.shapeZYX = {16,8,8};
-            create.chunkShapeZYX = {16,8,8}; create.compressor = "none"; create.uuid = "points-volume";
-            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.uuid = "points-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions pointOptions; pointOptions.author = "vc3d-points-test";
             { auto db = ObjectStore::create(storePath, pointOptions); }
@@ -208,9 +209,9 @@ int runObjectStoreControllerTests()
             // Fibers bound by scale or through a registration are read and edited
             // in the open volume's voxels and saved back to their stored frame.
             QTemporaryDir dir;
-            Volume::ZarrCreateOptions create; create.shapeZYX = {16,16,16};
-            create.chunkShapeZYX = {16,16,16}; create.compressor = "none"; create.uuid = "frame-volume";
-            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            vc::test::ZarrVolumeSpec create; create.shapeZYX = {16,16,16};
+            create.chunkShapeZYX = {16,16,16}; create.uuid = "frame-volume";
+            const auto volume = vc::test::createZarrVolume(fs::path(dir.path().toStdString())/"ct.zarr", create);
             const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
             OpenOptions frameOptions; frameOptions.author = "vc3d-frame-test";
             VolumeAffine shear; shear(0,0)=2; shear(0,1)=.5; shear(0,3)=1; shear(2,3)=3;

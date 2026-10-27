@@ -7,6 +7,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
@@ -47,14 +48,12 @@ fs::path tmpDir(const std::string& tag)
 fs::path makeLocalVolume(const fs::path& dir, size_t numLevels = 2,
                         vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8)
 {
-    Volume::ZarrCreateOptions opts;
+    vc::test::ZarrVolumeSpec opts;
     opts.shapeZYX = {64, 64, 64};
     opts.chunkShapeZYX = {32, 32, 32};
     opts.numLevels = numLevels;
-    opts.compressor = "none";
-    opts.overwriteExisting = true;
     opts.dtype = dtype;
-    auto v = Volume::New(dir, opts);
+    auto v = vc::test::createZarrVolume(dir, opts);
     REQUIRE(v);
     return dir;
 }
@@ -412,18 +411,16 @@ TEST_CASE("validateAndRebaseVcPyramid rejects gaps and invalid retained fill val
 TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
 {
     auto d = tmpDir("fetch_present");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);
     Array3D<uint8_t> in({32, 32, 32}, /*fill=*/200);
-    v->writeZYX(in, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, 0);
 
     auto opened = openLocalZarrPyramid(d);
     REQUIRE_FALSE(opened.fetchers.empty());
@@ -547,18 +544,16 @@ TEST_CASE("Delta3D cache is a regular unsharded Zarr with the source layout")
 {
     auto source = tmpDir("delta3d_zarr_source");
     auto cacheDir = tmpDir("delta3d_zarr_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -850,18 +845,16 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 {
     auto source = tmpDir("mirror_unsharded_source");
     auto mirror = tmpDir("mirror_unsharded_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -907,13 +900,11 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
 {
     auto d = tmpDir("fetch_missing");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);

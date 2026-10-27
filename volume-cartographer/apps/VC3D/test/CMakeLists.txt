@@ -667,7 +667,7 @@ add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.c
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
     ../OpenDataManifest.cpp ../VolumeRegistrations.cpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)
 add_test(NAME surface_catalog COMMAND test_surface_catalog)
 vc_register_test_target(test_surface_catalog)

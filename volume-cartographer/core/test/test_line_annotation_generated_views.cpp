@@ -3,6 +3,7 @@
 
 #include "CState.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include <QTemporaryDir>
 #include "FiberLineGeometry.hpp"
 #include "vc/fiber_tracer/FiberHvClassification.hpp"
@@ -1466,10 +1467,9 @@ TEST_CASE("focus bounds state distinguishes configured and active bounds")
 {
     QTemporaryDir directory;
     REQUIRE(directory.isValid());
-    Volume::ZarrCreateOptions options;
+    vc::test::ZarrVolumeSpec options;
     options.shapeZYX = {64, 64, 64};
-    options.compressor = "none";
-    auto volume = Volume::New(directory.path().toStdString(), options);
+    auto volume = vc::test::createZarrVolume(directory.path().toStdString(), options);
     REQUIRE(volume);
     CState state;
     state.setCurrentVolume(volume);

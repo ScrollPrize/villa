@@ -5,6 +5,7 @@
 #include "SurfaceCatalog.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -81,12 +82,11 @@ struct CatalogFixture {
         : root(tempRoot(tag))
     {
         namespace vo = vc::objects;
-        Volume::ZarrCreateOptions options;
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {4, 4, 4};
         options.chunkShapeZYX = {4, 4, 4};
-        options.compressor = "none";
         options.uuid = "catalog-volume";
-        volume = Volume::New(root / "ct.zarr", options);
+        volume = vc::test::createZarrVolume(root / "ct.zarr", options);
         const auto storePath = root / "sample.vcobj";
         vo::OpenOptions storeOptions;
         storeOptions.author = "ink-test";
