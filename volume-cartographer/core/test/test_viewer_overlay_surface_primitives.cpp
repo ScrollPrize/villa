@@ -127,7 +127,6 @@ public:
     float dsScale() const override { return 1.0f; }
     float normalOffset() const override { return 0.0f; }
     int datasetScaleIndex() const override { return 0; }
-    float datasetScaleFactor() const override { return 1.0f; }
 
     bool isShowSurfaceNormals() const override { return false; }
     float normalArrowLengthScale() const override { return 1.0f; }
@@ -140,7 +139,6 @@ public:
     bool isPlaneCompositeEnabled() const override { return false; }
     void setCompositeRenderSettings(const CompositeRenderSettings& settings) override { compositeSettings_ = settings; }
     void setVolumeWindow(float, float) override {}
-    void setBaseColormap(const std::string&) override {}
     void setResetViewOnSurfaceChange(bool) override {}
     void setPlaneIntersectionLinesVisible(bool) override {}
     void setShowSurfaceNormals(bool) override {}
@@ -159,10 +157,8 @@ public:
 
     std::optional<vc::PointRef> highlightedPoint() const override { return highlightedPoint_; }
     std::optional<vc::PointRef> selectedPoint() const override { return selectedPoint_; }
-    std::optional<uint64_t> selectedCollectionId() const override { return selectedCollection_; }
     void setHighlightedPoint(std::optional<vc::PointRef> point) { highlightedPoint_ = point; }
     void setSelectedPoint(std::optional<vc::PointRef> point) { selectedPoint_ = point; }
-    bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return false; }
     double sameWrapAnnotationPolylineOpacity() const override { return 1.0; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override { return paths_; }
@@ -183,17 +179,6 @@ public:
             delete item;
         }
         overlayGroups_.erase(it);
-    }
-
-    void clearAllOverlayGroups() override
-    {
-        auto keys = std::vector<std::string>{};
-        for (const auto& [key, _] : overlayGroups_) {
-            keys.push_back(key);
-        }
-        for (const auto& key : keys) {
-            clearOverlayGroup(key);
-        }
     }
 
     std::vector<std::pair<QRectF, QColor>> selections() const override { return {}; }
@@ -223,9 +208,7 @@ public:
         surfaceOverlays_ = overlays;
         ++surfaceOverlaysRevision_;
     }
-    void setSurfaceOverlapThreshold(float) override {}
 
-    const ActiveSegmentationHandle& activeSegmentationHandle() const override { return activeSegmentation_; }
     CVolumeViewerView* graphicsView() const override { return const_cast<CVolumeViewerView*>(&view_); }
     QObject* asQObject() override { return this; }
     QMetaObject::Connection connectOverlaysUpdated(QObject*, const std::function<void()>&) override { return {}; }
@@ -242,13 +225,11 @@ private:
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> surfaceOverlays_;
     std::uint64_t surfaceOverlaysRevision_{0};
-    ActiveSegmentationHandle activeSegmentation_;
     std::map<std::string, std::vector<QGraphicsItem*>> overlayGroups_;
     std::string surfName_{"fake"};
     VCCollection* pointCollection_{nullptr};
     std::optional<vc::PointRef> highlightedPoint_;
     std::optional<vc::PointRef> selectedPoint_;
-    std::optional<uint64_t> selectedCollection_;
     mutable int projectionCalls_{0};
     std::uint64_t projectionGeneration_{0};
     float depthLo_{0.0f};

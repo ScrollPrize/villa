@@ -1979,7 +1979,6 @@ struct CChunkedVolumeViewer::RenderContext {
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
-    std::string baseColormapId;
     std::shared_ptr<Surface> surf;
     std::shared_ptr<vc::render::ChunkCache> chunkArray;
     std::shared_ptr<Volume> overlayVolume;
@@ -2390,8 +2389,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto cam = volumetricCamera();
 
         std::array<uint32_t, 256> colorLut{};
-        vc::buildWindowLevelColormapLut(colorLut, ctx.windowLow, ctx.windowHigh,
-                                        ctx.baseColormapId);
+        vc::buildWindowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
         // Ray-segment length correction 1/|d_w| so tilted views don't look
         // artificially transparent (per-frame constant: parallel rays).
         const auto dir = vc3d::volumetric::viewDirection(cam);
@@ -3218,7 +3216,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.overlayTargetCoverage = overlayTargetCoverage;
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
+    vc::buildWindowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
     std::array<uint32_t, 256> overlayLut{};
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
@@ -3304,7 +3302,6 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
         job.compositeSettings.params.camAzimuthDeg = 0.0f;
     job.windowLow = _windowLow;
     job.windowHigh = _windowHigh;
-    job.baseColormapId = _baseColormapId;
     job.surf = surf;
     job.surfaceName = _surfName;
     job.chunkArray = _chunkArray;
@@ -3374,7 +3371,6 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.compositeSettings == b.compositeSettings &&
            a.windowLow == b.windowLow &&
            a.windowHigh == b.windowHigh &&
-           a.baseColormapId == b.baseColormapId &&
            a.surf.get() == b.surf.get() &&
            a.surfaceName == b.surfaceName &&
            a.chunkArray.get() == b.chunkArray.get() &&
@@ -3449,7 +3445,6 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.compositeSettings = job.compositeSettings;
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
-    ctx.baseColormapId = job.baseColormapId;
     ctx.surf = job.surf;
     ctx.chunkArray = job.chunkArray;
     ctx.overlayVolume = job.overlayVolume;
@@ -4299,7 +4294,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 
     if (button == Qt::LeftButton && modifiers == Qt::NoModifier) {
         if (const auto hit = pointAtScenePosition(scenePos)) {
-            _selectedCollectionId = hit->first;
             _selectedPoint = vc::PointRef{hit->first, hit->second};
             emit pointClicked(*_selectedPoint);
             emit overlaysUpdated();
@@ -4316,7 +4310,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 
 void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
 {
-    _selectedCollectionId = collectionId;
     if (_selectedPoint) {
         const auto point = _pointCollection ? _pointCollection->getPoint(*_selectedPoint)
                                             : std::optional<ColPoint>{};
@@ -4329,7 +4322,6 @@ void CChunkedVolumeViewer::onCollectionSelected(uint64_t collectionId)
 
 void CChunkedVolumeViewer::clearCollectionSelection()
 {
-    _selectedCollectionId.reset();
     _selectedPoint.reset();
     emit overlaysUpdated();
 }
@@ -4337,7 +4329,6 @@ void CChunkedVolumeViewer::clearCollectionSelection()
 void CChunkedVolumeViewer::onPointSelected(vc::PointRef point)
 {
     _selectedPoint = point;
-    _selectedCollectionId = point.collectionId;
     emit overlaysUpdated();
 }
 
@@ -4494,10 +4485,8 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
                     })) {
                 const vc::PointRef hitRef{hit->first, hit->second};
                 if (_pointCollection && _pointCollection->getPoint(hitRef)) {
-                    _selectedCollectionId = hit->first;
                     _selectedPoint = hitRef;
                 } else {
-                    _selectedCollectionId.reset();
                     _selectedPoint.reset();
                 }
                 _sameWrapManualMergePressConsumed = true;
@@ -5421,17 +5410,6 @@ void CChunkedVolumeViewer::clearOverlayGroup(const std::string& key)
     _overlayGroups.erase(it);
     for (auto* item : items)
         delete item;
-}
-
-void CChunkedVolumeViewer::clearAllOverlayGroups()
-{
-    // Detach before deleting, as in clearOverlayGroup.
-    const auto groups = std::move(_overlayGroups);
-    _overlayGroups.clear();
-    for (const auto& [_, items] : groups) {
-        for (auto* item : items)
-            delete item;
-    }
 }
 
 std::vector<std::pair<QRectF, QColor>> CChunkedVolumeViewer::selections() const
@@ -6822,12 +6800,6 @@ void CChunkedVolumeViewer::finishPlaneIntersectionCompute(
     // Clear the fp memo so the cache-hit early-out doesn't skip the scene-item build.
     _lastIntersectFp = {};
     renderIntersections("async intersection ready");
-}
-
-const VolumeViewerBase::ActiveSegmentationHandle& CChunkedVolumeViewer::activeSegmentationHandle() const
-{
-    static ActiveSegmentationHandle handle;
-    return handle;
 }
 
 const std::vector<ViewerOverlayControllerBase::PathPrimitive>& CChunkedVolumeViewer::drawingPaths() const

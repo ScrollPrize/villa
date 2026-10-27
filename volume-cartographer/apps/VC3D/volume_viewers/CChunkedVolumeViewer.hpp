@@ -117,7 +117,6 @@ public:
     // submitted or repainted, so no frame is ever shown off the pinned row.
     void setPinnedSurfaceY(std::optional<float> surfaceY);
     int datasetScaleIndex() const override { return _dsScaleIdx; }
-    float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
@@ -132,7 +131,6 @@ public:
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; submitRender("setBaseColormap"); }
     void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
@@ -158,12 +156,9 @@ public:
     void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
     void setSegmentationIntersectionDeferral(bool active) override;
     void setSegmentationCursorMirroring(bool enabled) override;
-    const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
     std::optional<vc::PointRef> highlightedPoint() const override { return _highlightedPoint; }
     std::optional<vc::PointRef> selectedPoint() const override { return _selectedPoint; }
-    std::optional<uint64_t> selectedCollectionId() const override { return _selectedCollectionId; }
-    bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
     double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
@@ -175,7 +170,6 @@ public:
     // group in place instead of rebuilding it.
     bool translateOverlayGroup(const std::string& key, const QPointF& delta);
     void clearOverlayGroup(const std::string& key) override;
-    void clearAllOverlayGroups() override;
 
     std::vector<std::pair<QRectF, QColor>> selections() const override;
     std::optional<QRectF> activeBBoxSceneRect() const override;
@@ -213,13 +207,6 @@ public:
         if (_closing || _surfaceOverlays == overlays) return;
         _surfaceOverlays = overlays;
         ++_surfaceOverlaysRevision;
-        emit overlaysUpdated();
-    }
-    void setSurfaceOverlapThreshold(float threshold) override
-    {
-        const float clamped = std::max(0.0f, threshold);
-        if (_closing || _surfaceOverlapThreshold == clamped) return;
-        _surfaceOverlapThreshold = clamped;
         emit overlaysUpdated();
     }
 
@@ -405,7 +392,6 @@ private:
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
-        std::string baseColormapId;
         std::shared_ptr<Surface> surf;
         std::string surfaceName;
         std::shared_ptr<vc::render::ChunkCache> chunkArray;
@@ -624,7 +610,6 @@ private:
 
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
-    std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
@@ -797,7 +782,6 @@ private:
     MeasurementState _measurement;
 
     std::optional<vc::PointRef> _highlightedPoint;
-    std::optional<uint64_t> _selectedCollectionId;
     std::optional<vc::PointRef> _selectedPoint;
 
     SameWrapAnnotationTool _sameWrapAnnotation;
