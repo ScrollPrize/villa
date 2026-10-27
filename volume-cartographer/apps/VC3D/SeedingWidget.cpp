@@ -1,5 +1,6 @@
 #include "SeedingWidget.hpp"
 #include "ToolExecutable.hpp"
+#include "VolumeCommandPath.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "SurfaceCatalog.hpp"
 #include <iostream>
@@ -45,22 +46,6 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 
 namespace {
-
-// Resolve the command-line volume argument for vc_grow_seg_from_seed, mirroring
-// SegmentationCommandHandler::commandPathForVolume: a fully remote/streaming-only volume
-// has an empty Volume::path(), so pass its remote locator instead (an empty path made the
-// child fail instantly — issue #1188). Kept as a file-local helper rather than a shared
-// header, matching how this codebase already duplicates such tiny cross-file helpers.
-QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (!volume) {
-        return QString();
-    }
-    if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteLocator());
-    }
-    return QString::fromStdString(volume->path().string());
-}
 
 struct SegmentTriangleHit {
     float pathT = 0.0f;
@@ -461,7 +446,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     }
 
     // Validate before begin(); otherwise an early return leaves a phantom batch.
-    _batchVolumePath = commandPathForVolume(currentVolume);
+    _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
                     "(no local mirror and no remote locator)."));
@@ -1363,7 +1348,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     }
 
     // Validate before begin() so an early return cannot leave a phantom batch.
-    _batchVolumePath = commandPathForVolume(currentVolume);
+    _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
                     "(no local mirror and no remote locator)."));

@@ -69,20 +69,10 @@
 #include "ToolDialogs.hpp"
 #include "ToolExecutable.hpp"
 #include "ToolProcess.hpp"
+#include "VolumeCommandPath.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
-
-static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (!volume) {
-        return QString();
-    }
-    if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteLocator());
-    }
-    return QString::fromStdString(volume->path().string());
-}
 
 struct CommandLaunchErrorSetter {
     CommandLaunchError* error;
@@ -757,7 +747,7 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
     if (_state->currentVolume() == nullptr) {
         return QString();
     }
-    return commandPathForVolume(_state->currentVolume());
+    return vc3d::commandPathForVolume(_state->currentVolume());
 }
 
 namespace {
@@ -911,7 +901,7 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
         VolumeSelector::VolumeOption opt;
         opt.id = QString::fromStdString(volumeId);
         opt.name = QString::fromStdString(volume->name());
-        opt.path = commandPathForVolume(volume);
+        opt.path = vc3d::commandPathForVolume(volume);
         options.push_back(opt);
     }
 
@@ -1254,7 +1244,7 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
         }
         renderVolume = _state->vpkg()->volume(params.volumeId.toStdString());
     }
-    const QString volumePath = commandPathForVolume(renderVolume);
+    const QString volumePath = vc3d::commandPathForVolume(renderVolume);
     if (volumePath.isEmpty()) {
         setErr(tr("Could not resolve a volume path for rendering."));
         return false;
@@ -2306,7 +2296,7 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
     if (sampled->isRemote()) {
         return fail(tr("Alpha-comp refinement accepts only local volumes."), CommandLaunchError::RemoteVolume);
     }
-    const QString volumePath = commandPathForVolume(sampled);
+    const QString volumePath = vc3d::commandPathForVolume(sampled);
     // Return a typed launch error before the runner reaches its interactive
     // missing-tool warning. Tool::AlphaCompRefine launches vc_objrefine.
     if (vc3d::findToolExecutable(QStringLiteral("vc_objrefine")).isEmpty()) {
