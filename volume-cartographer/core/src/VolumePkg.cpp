@@ -539,24 +539,6 @@ std::shared_ptr<VolumePkg> VolumePkg::load(const fs::path& jsonFile,
     return p;
 }
 
-std::shared_ptr<VolumePkg> VolumePkg::loadAutosave(const vc::project::LoadOptions& opts)
-{
-    const auto file = autosaveFile();
-    if (file.empty() || !fs::exists(file)) return nullptr;
-    auto p = std::shared_ptr<VolumePkg>(new VolumePkg());
-    p->opts_ = opts;
-    p->path_ = file;
-    p->readJsonFrom(file);
-    if (!opts.deferResolution)
-        p->resolveAll();
-    return p;
-}
-
-std::shared_ptr<VolumePkg> VolumePkg::New(const fs::path& jsonFile)
-{
-    return load(jsonFile);
-}
-
 fs::path VolumePkg::path() const { return path_; }
 std::string VolumePkg::name() const { return name_; }
 void VolumePkg::setName(const std::string& v) { name_ = v; persistProjectState(); }
@@ -743,14 +725,6 @@ bool VolumePkg::addLasagnaDatasetEntry(const std::string& location,
     lasagnaDatasets_.push_back({location, std::move(tags)});
     persistProjectState();
     return true;
-}
-
-bool VolumePkg::addFiberInferenceDatasetEntry(const std::string& location, std::vector<std::string> tags)
-{
-    if (std::find(tags.begin(), tags.end(), vc::project::kFiberLasagnaTag) == tags.end()) {
-        tags.emplace_back(vc::project::kFiberLasagnaTag);
-    }
-    return addLasagnaDatasetEntry(location, std::move(tags));
 }
 
 VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
@@ -963,13 +937,6 @@ void VolumePkg::clearSelectedLasagnaDataset()
     persistProjectState();
 }
 
-fs::path VolumePkg::selectedLasagnaDatasetPath() const
-{
-    if (!selectedLasagnaDataset_) return {};
-    if (vc::project::isLocationRemote(*selectedLasagnaDataset_)) return {};
-    return vc::project::resolveLocalPath(*selectedLasagnaDataset_, path_.parent_path());
-}
-
 std::string VolumePkg::selectedFiberInferenceDataset() const
 {
     return selectedFiberInferenceDataset_.value_or(std::string{});
@@ -990,13 +957,6 @@ void VolumePkg::clearSelectedFiberInferenceDataset()
     if (!selectedFiberInferenceDataset_) return;
     selectedFiberInferenceDataset_.reset();
     persistProjectState();
-}
-
-fs::path VolumePkg::selectedFiberInferenceDatasetPath() const
-{
-    if (!selectedFiberInferenceDataset_) return {};
-    if (vc::project::isLocationRemote(*selectedFiberInferenceDataset_)) return {};
-    return vc::project::resolveLocalPath(*selectedFiberInferenceDataset_, path_.parent_path());
 }
 
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
@@ -1033,27 +993,6 @@ std::shared_ptr<Volume> VolumePkg::volume() const
 {
     if (loadedVolumes_.empty()) return nullptr;
     return loadedVolumes_.begin()->second;
-}
-
-bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (!volume) {
-        Logger()->warn("Cannot add null volume to package");
-        return false;
-    }
-
-    const auto id = volume->id();
-    auto result = loadedVolumes_.emplace(id, volume);
-    if (!result.second) {
-        Logger()->warn("Volume '{}' already exists in package", id);
-        return false;
-    }
-
-    const auto source = volume->isRemote()
-        ? volume->remoteUrl()
-        : volume->path().string();
-    Logger()->info("Added external volume '{}' from '{}'", id, source);
-    return true;
 }
 
 bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
@@ -1094,27 +1033,6 @@ bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
         }
     }
     return false;
-}
-
-bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
-{
-    auto it = loadedVolumes_.find(volumeId);
-    if (it == loadedVolumes_.end() || !it->second) return false;
-    const auto vp = it->second->path();
-    std::vector<std::string> tags;
-    if (const auto t = volumeTagsByID_.find(volumeId); t != volumeTagsByID_.end()) tags = t->second;
-    loadedVolumes_.erase(it);
-    volumeTagsByID_.erase(volumeId);
-    try {
-        auto v = Volume::New(vp, utils::Json::object());
-        const auto id = v->id();
-        loadedVolumes_.emplace(id, v);
-        if (!tags.empty()) volumeTagsByID_[id] = tags;
-        return true;
-    } catch (const std::exception& ex) {
-        Logger()->warn("reloadSingleVolume('{}'): {}", volumeId, ex.what());
-        return false;
-    }
 }
 
 std::vector<fs::path> VolumePkg::normalGridPaths() const

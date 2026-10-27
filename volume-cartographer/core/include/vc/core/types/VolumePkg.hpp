@@ -98,9 +98,6 @@ public:
         const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
                                            const vc::project::LoadOptions& opts = {});
-    static std::shared_ptr<VolumePkg> loadAutosave(const vc::project::LoadOptions& opts = {});
-
-    static std::shared_ptr<VolumePkg> New(const std::filesystem::path& jsonFile);
 
     static void setAutosaveRoot(const std::filesystem::path& dir);
     static std::filesystem::path autosaveRoot();
@@ -135,8 +132,6 @@ public:
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addLasagnaDatasetEntry(const std::string& location,
                                 std::vector<std::string> tags = {});
-    bool addFiberInferenceDatasetEntry(const std::string& location,
-                                       std::vector<std::string> tags = {});
     AttachLasagnaResult attachPreparedLasagnaDataset(
         const std::string& manifestLocation,
         std::vector<std::string> manifestTags,
@@ -149,11 +144,9 @@ public:
     [[nodiscard]] std::string selectedLasagnaDataset() const;
     void setSelectedLasagnaDataset(std::string location);
     void clearSelectedLasagnaDataset();
-    [[nodiscard]] std::filesystem::path selectedLasagnaDatasetPath() const;
     [[nodiscard]] std::string selectedFiberInferenceDataset() const;
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
-    [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
     // Viewer bbox in volume coordinates; disabling retains the saved limits.
     [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
@@ -171,10 +164,8 @@ public:
     [[nodiscard]] bool hasLoadedVolumeEntry(const std::string& location) const;
     std::shared_ptr<Volume> volume() const;
     std::shared_ptr<Volume> volume(const std::string& id) const;
-    bool addVolume(const std::shared_ptr<Volume>& volume);
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
-    bool reloadSingleVolume(const std::string& volumeId);
 
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
 

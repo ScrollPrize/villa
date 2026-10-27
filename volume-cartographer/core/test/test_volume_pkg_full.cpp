@@ -98,30 +98,6 @@ TEST_CASE("VolumePkg::removeSingleVolume drops a volume by id")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg::reloadSingleVolume returns true after a successful reload")
-{
-    auto d = tmpDir("reloadvol");
-    makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
-    p->addVolumeEntry((d / "volumes").string());
-    p->addSingleVolume("vol1");
-    CHECK(p->reloadSingleVolume("vol1"));
-    CHECK_FALSE(p->reloadSingleVolume("unknown"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::addVolume directly inserts a constructed Volume")
-{
-    auto d = tmpDir("addvol_direct");
-    auto volDir = makeLocalVolume(d);
-    auto v = Volume::New(volDir);
-    REQUIRE(v);
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addVolume(v));
-    CHECK(p->volume(v->id()) != nullptr);
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotently")
 {
     auto d = tmpDir("attach_prepared");
@@ -287,7 +263,6 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists a directly loaded volume")
     package->save(project);
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
-    REQUIRE(package->addVolume(prepared));
 
     CHECK(
         package->attachPreparedVolume(

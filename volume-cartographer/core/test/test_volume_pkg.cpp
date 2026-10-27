@@ -293,7 +293,6 @@ TEST_CASE("VolumePkg: missing selected_lasagna_dataset loads as empty")
     auto loaded = VolumePkg::load(jsonPath);
     REQUIRE(loaded);
     CHECK(loaded->selectedLasagnaDataset().empty());
-    CHECK(loaded->selectedLasagnaDatasetPath().empty());
     fs::remove_all(d);
 }
 
@@ -312,44 +311,9 @@ TEST_CASE("VolumePkg: selected_lasagna_dataset round-trips through save/load")
     auto loaded = VolumePkg::load(jsonPath);
     REQUIRE(loaded);
     CHECK(loaded->selectedLasagnaDataset() == manifest);
-    CHECK(loaded->selectedLasagnaDatasetPath() == fs::path(manifest));
 
     loaded->clearSelectedLasagnaDataset();
     CHECK(loaded->selectedLasagnaDataset().empty());
-    CHECK(loaded->selectedLasagnaDatasetPath().empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: selectedLasagnaDatasetPath resolves relative to project file")
-{
-    auto d = tmpDir("lasagna_relative");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-        p->setSelectedLasagnaDataset("datasets/reference.lasagna.json");
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->selectedLasagnaDataset() == "datasets/reference.lasagna.json");
-    CHECK(loaded->selectedLasagnaDatasetPath() ==
-          d / "datasets" / "reference.lasagna.json");
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::New is an alias for load")
-{
-    auto d = tmpDir("new_alias");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->setName("Alias");
-        p->save(jsonPath);
-    }
-    auto loaded = VolumePkg::New(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->name() == "Alias");
     fs::remove_all(d);
 }
 
@@ -360,17 +324,6 @@ TEST_CASE("VolumePkg: autosave file path is settable")
     VolumePkg::setAutosaveRoot(d);
     CHECK(VolumePkg::autosaveRoot() == d);
     // Restore so other tests aren't affected.
-    VolumePkg::setAutosaveRoot(saved);
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::loadAutosave returns nullptr when no autosave file exists")
-{
-    auto saved = VolumePkg::autosaveRoot();
-    auto d = tmpDir("no_autosave");
-    VolumePkg::setAutosaveRoot(d);
-    auto p = VolumePkg::loadAutosave();
-    CHECK(p == nullptr);
     VolumePkg::setAutosaveRoot(saved);
     fs::remove_all(d);
 }
@@ -403,7 +356,7 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
     const auto project = d / "project.json";
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->addLasagnaDatasetEntry("regular.lasagna.json", {"user-tag"}));
-    REQUIRE(pkg->addFiberInferenceDatasetEntry("fiber.lasagna.json", {"model:v1"}));
+    REQUIRE(pkg->addLasagnaDatasetEntry("fiber.lasagna.json", {"model:v1", std::string(vc::project::kFiberLasagnaTag)}));
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
     pkg->save(project);
