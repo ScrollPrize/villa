@@ -452,6 +452,7 @@ int runObjectStoreControllerTests()
             live->fiberFileName=merged.fileName;live->fiberUsername=merged.username;
             live->fiberStartedAt=merged.startedAt;live->fiberSequence=merged.sequence;
             live->storePin=merged.storePin;live->coordinateBaseShapeZYX=merged.coordinateBaseShapeZYX;
+            live->coordinateIdentity=merged.coordinateIdentity;
             live->fiberOptimizationMode=merged.optimizationMode;live->suppressGeneratedViews=true;live->suppressErrorDialogs=true;
             for(size_t i=0;i<merged.controlPoints.size();++i) {
                 la::LineControlPoint control(double(i),merged.controlPoints[i],i==0,int(i));
@@ -468,6 +469,15 @@ int runObjectStoreControllerTests()
             const auto savedPin=live->storePin;
             controller.saveOpenFibers();
             require(live->storePin==savedPin,"Save barrier does not create another revision");
+            {
+                // Split and merge plan from session snapshots; new fibers must keep the stored frame.
+                const auto snapshot=controller.makeStoredFiberSessionSnapshot(*live).fiber;
+                require(snapshot.coordinateIdentity.value("coordinates",nlohmann::json())==frame,"session snapshot carries stored frame");
+                const auto halves=la::planFiberSplit(snapshot,1,identity("live-prefix.json"),identity("live-suffix.json"),false,&error);
+                if(!halves) throw std::runtime_error(error);
+                require(halves->prefix.coordinateIdentity.value("coordinates",nlohmann::json())==frame &&
+                        halves->suffix.coordinateIdentity.value("coordinates",nlohmann::json())==frame,"split of an open fiber keeps its frame");
+            }
             controller._panes.clear();
             auto db=ObjectStore::open(path,options);auto txn=db.read();
             const auto saved=std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn,*savedPin->geometryRevision)));
