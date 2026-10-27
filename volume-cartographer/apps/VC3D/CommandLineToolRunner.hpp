@@ -162,7 +162,6 @@ public:
     // Applies to the next execute() attempt only.
     void setNextOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
-    void setPreserveConsoleOutput(bool preserve);
 
 #ifdef VC_TESTING
     QStringList argumentsForTesting(Tool tool) { return buildArguments(tool); }
@@ -269,7 +268,6 @@ private:
     QStringList _createdSurfaces;
     QString _exportedObj;
     QString _partialLine;
-    bool _preserveConsoleOutput{false};
 
     // vc_merge_tifxyz parameters
     QString _mergeJsonPath;

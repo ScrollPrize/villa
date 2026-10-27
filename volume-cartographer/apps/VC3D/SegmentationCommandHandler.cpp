@@ -2120,7 +2120,7 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         return;
     }
 
-    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+    if (_neighborCopyJob) {
         QMessageBox::warning(_parentWidget, tr("Warning"), tr("Another neighbor copy request is already running."));
         return;
     }
@@ -2170,76 +2170,57 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
     }
 
-    QJsonObject pass1Params;
-    pass1Params["normal_grid_path"] = normalGridPath;
-    pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
-    pass1Params["neighbor_max_distance"] = dlg.neighborMaxDistance();
-    pass1Params["mode"] = QStringLiteral("gen_neighbor");
-    pass1Params["neighbor_min_clearance"] = dlg.neighborMinClearance();
-    pass1Params["neighbor_fill"] = dlg.neighborFill();
-    pass1Params["neighbor_interp_window"] = dlg.neighborInterpWindow();
-    pass1Params["generations"] = dlg.generations();
-    pass1Params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
-
-    auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
-    if (!pass1JsonFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
-        return;
-    }
-    pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
-    pass1JsonFile->flush();
-
-    QJsonObject pass2Params;
-    pass2Params["normal_grid_path"] = normalGridPath;
-    pass2Params["max_gen"] = 1;
-    pass2Params["generations"] = 1;
-    pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
-    pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
-    pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
-    pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
-
+    QJsonObject refine;
+    refine["normal_grid_path"] = normalGridPath;
+    refine["max_gen"] = 1;
+    refine["generations"] = 1;
+    refine["resume_local_opt_step"] = dlg.resumeLocalOptStep();
+    refine["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
+    refine["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
+    refine["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
+    refine["thread_limit"] = std::max(1, dlg.pass2OmpThreads());
     {
-        QString pass2Error;
-        auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
-        if (!pass2Error.isEmpty()) {
-            QMessageBox::warning(_parentWidget, tr("Error"), pass2Error);
+        QString refineError;
+        auto extraParams = dlg.pass2TracerParamsJson(&refineError);
+        if (!refineError.isEmpty()) {
+            QMessageBox::warning(_parentWidget, tr("Error"), refineError);
             return;
         }
         if (extraParams) {
             for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
-                pass2Params.insert(it.key(), it.value());
+                refine.insert(it.key(), it.value());
             }
         }
     }
 
-    auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
-    if (!pass2JsonFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file for pass 2."));
+    QJsonObject params;
+    params["normal_grid_path"] = normalGridPath;
+    params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
+    params["neighbor_max_distance"] = dlg.neighborMaxDistance();
+    params["mode"] = QStringLiteral("gen_neighbor");
+    params["neighbor_min_clearance"] = dlg.neighborMinClearance();
+    params["neighbor_fill"] = dlg.neighborFill();
+    params["neighbor_interp_window"] = dlg.neighborInterpWindow();
+    params["generations"] = dlg.generations();
+    params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
+    params["refine"] = refine;
+
+    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_XXXXXX.json"));
+    if (!paramsFile->open()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
         return;
     }
-    pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
-    pass2JsonFile->flush();
+    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
+    paramsFile->flush();
 
-    _neighborCopyJob = NeighborCopyJob{};
-    auto& job = *_neighborCopyJob;
-    job.stage = NeighborCopyJob::Stage::FirstPass;
-    job.segmentId = segmentId;
-    job.volumePath = selectedVolumePath;
-    job.volumeUuid = dlg.selectedVolumeId();
-    job.store = stored->store;
-    job.outputTag = outputTag;
-    job.pass1JsonPath = pass1JsonFile->fileName();
-    job.pass2JsonPath = pass2JsonFile->fileName();
-    job.copyOut = copyOut;
-    job.pass2OmpThreads = dlg.pass2OmpThreads();
-    job.pass1JsonFile = std::move(pass1JsonFile);
-    job.pass2JsonFile = std::move(pass2JsonFile);
-
-    if (!startNeighborCopyPass(job.pass1JsonPath,
-                               segmentId,
-                               QStringLiteral("skip"),
-                               -1)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch neighbor copy pass."));
+    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
+    _cmdRunner->setStore(stored->store);
+    _cmdRunner->setNeighborCopyParams(selectedVolumePath, paramsFile->fileName(), segmentId,
+                                      dlg.selectedVolumeId(), outputTag, QString());
+    _cmdRunner->showConsoleOutput();
+    _neighborCopyJob = NeighborCopyJob{copyOut, std::move(paramsFile)};
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch neighbor copy."));
         _neighborCopyJob.reset();
         return;
     }
@@ -2306,7 +2287,7 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         return;
     }
 
-    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+    if (_neighborCopyJob) {
         QMessageBox::warning(_parentWidget, tr("Warning"), tr("Another neighbor copy request is already running."));
         return;
     }
@@ -2422,7 +2403,7 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
         return fail(tr("vc_grow_seg_from_seed not found or not executable: %1").arg(toolPath),
                     CommandLaunchError::ToolUnavailable);
     }
-    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+    if (_neighborCopyJob) {
         return fail(tr("A neighbor copy request is already active."), CommandLaunchError::Busy);
     }
     if (_resumeLocalJob) {
@@ -3164,92 +3145,16 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
     if (!_neighborCopyJob) {
         return;
     }
-
-    auto& job = *_neighborCopyJob;
-    if (!success) {
-        _neighborCopyJob.reset();
-        return;
-    }
-
-    const QStringList created = _cmdRunner ? _cmdRunner->createdSurfaces() : QStringList{};
-    if (job.stage == NeighborCopyJob::Stage::FirstPass) {
-        if (created.size() != 1) {
-            QMessageBox::warning(_parentWidget, tr("Error"),
-                                 tr("The neighbor copy's first pass reported %1 new surfaces, expected one.")
-                                     .arg(created.size()));
-            _neighborCopyJob.reset();
-            return;
-        }
-
-        job.generatedSurface = created.front();
-        job.stage = NeighborCopyJob::Stage::SecondPass;
-
-        emit statusMessage(tr("Neighbor copy pass 1 complete: %1").arg(job.generatedSurface), 3000);
-
-        launchNeighborCopySecondPass();
-        return;
-    }
-
-    const bool copyOut = job.copyOut;
+    const bool copyOut = _neighborCopyJob->copyOut;
     _neighborCopyJob.reset();
-
+    if (!success) {
+        return;
+    }
+    const QStringList created = _cmdRunner ? _cmdRunner->createdSurfaces() : QStringList{};
     emit statusMessage(tr("Copy %1 complete: %2")
                                  .arg(copyOut ? tr("out") : tr("in"))
                                  .arg(created.join(QStringLiteral(", "))),
                              5000);
-}
-
-bool SegmentationCommandHandler::startNeighborCopyPass(const QString& paramsPath,
-                                    const QString& resumeSurface,
-                                    const QString& resumeOpt,
-                                    int ompThreads)
-{
-    if (!_cmdRunner || !_neighborCopyJob) {
-        return false;
-    }
-
-    auto& job = *_neighborCopyJob;
-    configureCommandRunnerRemoteAuthForVolumePath(job.volumePath);
-    _cmdRunner->setStore(job.store);
-    _cmdRunner->setNeighborCopyParams(
-        job.volumePath,
-        paramsPath,
-        resumeSurface,
-        job.volumeUuid,
-        job.outputTag,
-        resumeOpt);
-    _cmdRunner->setNextOmpThreads(ompThreads);
-    _cmdRunner->showConsoleOutput();
-    return _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
-}
-
-void SegmentationCommandHandler::launchNeighborCopySecondPass()
-{
-    if (!_neighborCopyJob) {
-        return;
-    }
-
-    const QString resumeSurface = _neighborCopyJob->generatedSurface;
-    const bool copyOut = _neighborCopyJob->copyOut;
-
-    QTimer::singleShot(0, this, [this, resumeSurface, copyOut]() {
-        if (!_neighborCopyJob || _neighborCopyJob->stage != NeighborCopyJob::Stage::SecondPass) {
-            return;
-        }
-        _cmdRunner->setPreserveConsoleOutput(true);
-        if (!startNeighborCopyPass(_neighborCopyJob->pass2JsonPath,
-                                   resumeSurface,
-                                   QStringLiteral("local"),
-                                   std::max(1, _neighborCopyJob->pass2OmpThreads))) {
-            QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
-            _neighborCopyJob.reset();
-            return;
-        }
-
-        emit statusMessage(
-            tr("Copy %1 pass 2 running").arg(copyOut ? tr("out") : tr("in")),
-            3000);
-    });
 }
 
 void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)

@@ -861,10 +861,6 @@ static int run_main(int argc, char *argv[])
         const int rows = src_points.rows;
         const int cols = src_points.cols;
 
-        const auto is_valid_vertex = [](const cv::Vec3f& p) -> bool {
-            return p[0] != -1.f && p[1] != -1.f && p[2] != -1.f;
-        };
-
         const cv::Vec3f invalid_marker(-1.f, -1.f, -1.f);
         cv::Mat_<cv::Vec3f> dst_points(src_points.size());
         dst_points.setTo(invalid_marker);
@@ -876,7 +872,7 @@ static int run_main(int argc, char *argv[])
         cv::Mat_<uchar> src_valid(rows, cols);
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
-                src_valid(r, c) = is_valid_vertex(src_points(r, c)) ? 1 : 0;
+                src_valid(r, c) = vc::geometry::validSurfacePoint(src_points(r, c)) ? 1 : 0;
             }
         }
 
@@ -968,7 +964,7 @@ static int run_main(int argc, char *argv[])
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 const cv::Vec3f start = src_points(r, c);
-                if (!is_valid_vertex(start)) {
+                if (!vc::geometry::validSurfacePoint(start)) {
                     continue;
                 }
 
@@ -1292,7 +1288,7 @@ static int run_main(int argc, char *argv[])
             cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
             for (int r = 0; r < pts.rows; ++r) {
                 for (int c = 0; c < pts.cols; ++c) {
-                    if (is_valid_vertex(pts(r, c))) {
+                    if (vc::geometry::validSurfacePoint(pts(r, c))) {
                         for (int i = 0; i < 3; ++i) {
                             min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
                             max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
@@ -1336,7 +1332,7 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 for (int col : cols_list) {
                     const cv::Vec3f& p = new_points(row, col);
-                    if (!is_valid_vertex(p)) {
+                    if (!vc::geometry::validSurfacePoint(p)) {
                         continue;
                     }
                     acc += p;
@@ -1358,7 +1354,7 @@ static int run_main(int argc, char *argv[])
             for (int r = 0; r < rows; ++r) {
                 valid_cols.clear();
                 for (int c = 0; c < cols; ++c) {
-                    if (is_valid_vertex(new_points(r, c))) {
+                    if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                         valid_cols.push_back(c);
                     }
                 }
@@ -1372,7 +1368,7 @@ static int run_main(int argc, char *argv[])
                 right_cols.reserve(window);
 
                 for (int c = 0; c < cols; ++c) {
-                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                    if (!src_valid(r, c) || vc::geometry::validSurfacePoint(new_points(r, c))) {
                         continue;
                     }
 
@@ -1416,7 +1412,7 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 for (int row : rows_list) {
                     const cv::Vec3f& p = new_points(row, col);
-                    if (!is_valid_vertex(p)) {
+                    if (!vc::geometry::validSurfacePoint(p)) {
                         continue;
                     }
                     acc += p;
@@ -1438,7 +1434,7 @@ static int run_main(int argc, char *argv[])
             for (int c = 0; c < cols; ++c) {
                 valid_rows.clear();
                 for (int r = 0; r < rows; ++r) {
-                    if (is_valid_vertex(new_points(r, c))) {
+                    if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                         valid_rows.push_back(r);
                     }
                 }
@@ -1452,7 +1448,7 @@ static int run_main(int argc, char *argv[])
                 lower_rows.reserve(window);
 
                 for (int r = 0; r < rows; ++r) {
-                    if (!src_valid(r, c) || is_valid_vertex(new_points(r, c))) {
+                    if (!src_valid(r, c) || vc::geometry::validSurfacePoint(new_points(r, c))) {
                         continue;
                     }
 
@@ -1493,7 +1489,7 @@ static int run_main(int argc, char *argv[])
                 if (!src_valid(r, c)) {
                     continue;
                 }
-                if (is_valid_vertex(new_points(r, c))) {
+                if (vc::geometry::validSurfacePoint(new_points(r, c))) {
                     dst_points(r, c) = new_points(r, c);
                     continue;
                 }
@@ -1504,14 +1500,14 @@ static int run_main(int argc, char *argv[])
                 int count = 0;
                 if (!row_interp.empty()) {
                     const cv::Vec3f& row_est = row_interp(r, c);
-                    if (is_valid_vertex(row_est)) {
+                    if (vc::geometry::validSurfacePoint(row_est)) {
                         acc += row_est;
                         ++count;
                     }
                 }
                 if (!col_interp.empty()) {
                     const cv::Vec3f& col_est = col_interp(r, c);
-                    if (is_valid_vertex(col_est)) {
+                    if (vc::geometry::validSurfacePoint(col_est)) {
                         acc += col_est;
                         ++count;
                     }
@@ -1535,7 +1531,7 @@ static int run_main(int argc, char *argv[])
             cv::Vec3f max_pos(-FLT_MAX, -FLT_MAX, -FLT_MAX);
             for (int r = 0; r < pts.rows; ++r) {
                 for (int c = 0; c < pts.cols; ++c) {
-                    if (is_valid_vertex(pts(r, c))) {
+                    if (vc::geometry::validSurfacePoint(pts(r, c))) {
                         for (int i = 0; i < 3; ++i) {
                             min_pos[i] = std::min(min_pos[i], pts(r, c)[i]);
                             max_pos[i] = std::max(max_pos[i], pts(r, c)[i]);
@@ -1590,8 +1586,8 @@ static int run_main(int argc, char *argv[])
                     int c1 = std::min(c0 + 1, cols - 1);
 
                     // Check all 4 corners are valid - skip if any are invalid
-                    if (!is_valid_vertex(dst_points(r0, c0)) || !is_valid_vertex(dst_points(r0, c1)) ||
-                        !is_valid_vertex(dst_points(r1, c0)) || !is_valid_vertex(dst_points(r1, c1))) {
+                    if (!vc::geometry::validSurfacePoint(dst_points(r0, c0)) || !vc::geometry::validSurfacePoint(dst_points(r0, c1)) ||
+                        !vc::geometry::validSurfacePoint(dst_points(r1, c0)) || !vc::geometry::validSurfacePoint(dst_points(r1, c1))) {
                         continue;  // Leave as invalid marker
                     }
 
@@ -1636,10 +1632,43 @@ static int run_main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        if (store) publish(*out_surf, uuid_local, neighbor_meta, {surface_uuid});
-        else out_surf->saveAsNew(out_dir, true);
+        if (!params.contains("refine")) {
+            if (store) publish(*out_surf, uuid_local, neighbor_meta, {surface_uuid});
+            else out_surf->saveAsNew(out_dir, true);
+            return EXIT_SUCCESS;
+        }
 
-        // Done
+        // "refine": tracer parameters for a local resume of the projected
+        // surface in this run, so the copy is one output surface.
+        Json refine = params["refine"];
+        if (!refine.is_object()) {
+            std::cerr << "ERROR: gen_neighbor \"refine\" must be an object of tracer parameters" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (!refine.contains("resume_opt")) refine["resume_opt"] = "local";
+        for (const char* key : {"umbilicus_points", "umbilicus_path"})
+            if (params.contains(key) && !refine.contains(key)) refine[key] = params[key];
+        for (auto& p : *out_surf->rawPointsPtr())
+            if (!vc::geometry::validSurfacePoint(p)) p = invalid_marker;
+        if (const int threads = refine.value("thread_limit", 0); threads > 0) omp_set_num_threads(threads);
+
+        Json refine_meta;
+        refine_meta["source"] = "vc_grow_seg_from_seed";
+        refine_meta["vc_gsfs_params"] = refine;
+        refine_meta["vc_gsfs_mode"] = std::string("resume");
+        refine_meta["vc_gsfs_version"] = "dev";
+        add_target_context(refine_meta, vol_path);
+        std::unique_ptr<QuadSurface> refined;
+        try {
+            refined.reset(tracer(*volume, 1.0, 0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
+                                 load_direction_fields(refine, cache_root), out_surf.get(),
+                                 store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: vc_grow_seg_from_seed: neighbor refinement failed: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (store) publish(*refined, uuid_local, refined->meta, {surface_uuid});
+        else refined->saveAsNew(out_dir, true);
         return EXIT_SUCCESS;
     }
 

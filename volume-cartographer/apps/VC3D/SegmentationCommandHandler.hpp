@@ -45,21 +45,10 @@ public:
     { _editingDestinationResolver = std::move(resolver); }
     // --- Job structs (moved from CWindow.hpp) ---
 
+    // One vc_grow_seg_from_seed run projects the surface and refines the copy.
     struct NeighborCopyJob {
-        enum class Stage { None, FirstPass, SecondPass };
-        Stage stage{Stage::None};
-        QString segmentId;
-        QString volumePath;
-        QString volumeUuid;          // outputs are bound to it
-        QString store;
-        QString outputTag;
-        QString generatedSurface;    // pass 1's surface, resumed by pass 2
-        QString pass1JsonPath;
-        QString pass2JsonPath;
-        int pass2OmpThreads{1};
         bool copyOut{true};
-        std::unique_ptr<QTemporaryFile> pass1JsonFile;
-        std::unique_ptr<QTemporaryFile> pass2JsonFile;
+        std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
     struct ResumeLocalJob {
@@ -229,9 +218,6 @@ public slots:
 
     void handleNeighborCopyToolFinished(bool success);
 
-    // Internal helpers exposed as slots for QTimer::singleShot
-    void launchNeighborCopySecondPass();
-
 public:
     /// Starts GrowPatch from a seed without opening a dialog. Returns true once
     /// vc_grow_seg_from_seed starts; completion uses toolFinished.
@@ -302,10 +288,6 @@ public:
                                   QString* errorMessage = nullptr);
 
 
-    bool startNeighborCopyPass(const QString& paramsPath,
-                               const QString& resumeSurface,
-                               const QString& resumeOpt,
-                               int ompThreads);
     // Marks a rasterized label volume and records its source surfaces (UUIDs).
     bool appendRasterizationMetadata(const QString& outputZarrPath,
                                    const QStringList& segmentIds) const;

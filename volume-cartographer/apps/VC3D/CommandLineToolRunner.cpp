@@ -235,12 +235,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         return false;
     }
 
-    if (_preserveConsoleOutput) {
-        _consoleOutput->appendOutput(tr("\n========== Next Pass ==========\n\n"));
-        _preserveConsoleOutput = false;
-    } else {
-        _consoleOutput->clear();
-    }
+    _consoleOutput->clear();
 
     if (isCustom && _customCommand.isEmpty()) {
         warn(tr("Error"), tr("Custom command not specified."));
@@ -497,11 +492,6 @@ void CommandLineToolRunner::hideConsoleOutput()
     if (_consoleDialog) {
         _consoleDialog->hide();
     }
-}
-
-void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
-{
-    _preserveConsoleOutput = preserve;
 }
 
 void CommandLineToolRunner::onProcessReadyRead()

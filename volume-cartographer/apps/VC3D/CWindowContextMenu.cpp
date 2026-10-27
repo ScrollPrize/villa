@@ -131,17 +131,10 @@ bool CWindow::initializeCommandLineRunner()
                         _segmentationCommandHandler->resumeLocalJob().has_value() &&
                         tool == CommandLineToolRunner::Tool::NeighborCopy;
 
-                    const bool neighborFirstPassSuppress = neighborJobActive && success &&
-                                           _segmentationCommandHandler->neighborCopyJob()->stage ==
-                                               SegmentationCommandHandler::NeighborCopyJob::Stage::FirstPass;
-
                     const bool silentExecution =
                         _cmdRunner && _cmdRunner->currentExecutionIsSilent();
 
-                    const bool suppressDialogs =
-                        silentExecution || neighborFirstPassSuppress;
-
-                    if (!suppressDialogs) {
+                    if (!silentExecution) {
                         if (success) {
                             QString displayMsg = message;
                             if (copyToClipboard) displayMsg += tr(" - Path copied to clipboard");
@@ -151,8 +144,6 @@ bool CWindow::initializeCommandLineRunner()
                             showStatusBarMessage(tr("Operation failed"), 5000);
                             QMessageBox::critical(this, tr("Error"), message);
                         }
-                    } else if (neighborFirstPassSuppress) {
-                        showStatusBarMessage(tr("Neighbor copy pass 1 complete"), 2000);
                     }
 
                     if (neighborJobActive) {
