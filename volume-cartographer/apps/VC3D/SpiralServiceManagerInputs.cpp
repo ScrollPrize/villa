@@ -54,69 +54,23 @@ void SpiralServiceManager::reportInputPreparation(const QString& message)
     if (!message.isEmpty()) emit logMessage(message);
 }
 
-void SpiralServiceManager::claimInputWorkspace()
+void SpiralServiceManager::claimSessionLease()
 {
-    reportInputPreparation(tr("Reading the service's input catalog…"));
-    const auto failed = [this](const QString& error) {
-        reportInputPreparation({});
-        emit errorOccurred(error);
-    };
-    get(QStringLiteral("/session/input-catalog"), Timeout::Load,
-        [this, failed](const QJsonObject& catalog) {
-            const auto workspace = catalog.value(QStringLiteral("workspace_id")).toString();
-            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
-                _inputOwner = false;
-                failed(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
-                return;
-            }
-    reportInputPreparation(catalog.value(QStringLiteral("ready")).toBool()
-        ? tr("Requesting editing access. The service is checking dataset inputs for changes…")
-        : tr("Requesting editing access. The service is preparing snapshots of dataset fibers, patches and point collections…"));
-    postWithRetry(QStringLiteral("/session/editing/claim"),
-        {{QStringLiteral("command_id"), commandId()}}, Timeout::Load, 2,
-        [this, failed](const QJsonObject& response) {
-            const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
-            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId && (hasInputDrafts() || _inputCommand)) {
-                failed(tr("The service editing workspace changed. Local drafts are preserved; reconnect to their original service before applying them."));
-                return;
-            }
-            if (!_inputWorkspaceId.isEmpty() && workspace != _inputWorkspaceId)
-                clearInputWorkspace();
-            _inputWorkspaceId = workspace;
-            reportInputPreparation(tr("Editing access acquired. Loading the input list…"));
-            get(QStringLiteral("/session/input-catalog"), Timeout::Command,
-                [this](const QJsonObject& catalog) {
-                    installInputCatalog(catalog.value(QStringLiteral("inputs")).toArray());
-                    _inputOwner = true;
-                    reportInputPreparation({});
-                    emit logMessage(tr("Editing workspace ready"));
-                    emit inputDraftsChanged();
-                    if (_inputCommand) resumeInputCommand();
-                }, failed);
-        }, [this, failed](const QString& error) {
-            _inputOwner = false;
-            failed(error);
-            refreshInputCatalog(); // Other clients can observe the catalog.
-        });
-        }, failed);
-}
-
-void SpiralServiceManager::refreshInputCatalog()
-{
-    get(QStringLiteral("/session/input-catalog"), Timeout::Command,
+    // The lease is ownership only: the service snapshots no inputs, since
+    // they come from its object store and are frozen for a resident fit.
+    postWithRetry(QStringLiteral("/session/lease/claim"),
+        {{QStringLiteral("command_id"), commandId()}}, Timeout::Command, 2,
         [this](const QJsonObject& response) {
-            const auto workspace = response.value(QStringLiteral("workspace_id")).toString();
-            if (workspace != _inputWorkspaceId) {
-                if (hasInputDrafts() || _inputCommand) return;
-                clearInputWorkspace();
-                _inputWorkspaceId = workspace;
-            }
-            // Reconcile a retained command before interpreting newer cursors.
-            if (_inputCommand && _inputOwner) {
-                resumeInputCommand();
-                return;
-            }
-            installInputCatalog(response.value(QStringLiteral("inputs")).toArray());
+            const auto lease = response.value(QStringLiteral("lease_id")).toString();
+            if (!_sessionLeaseId.isEmpty() && lease != _sessionLeaseId)
+                clearSessionLease();
+            _sessionLeaseId = lease;
+            _leaseOwner = true;
+            emit logMessage(tr("Session lease acquired"));
+            emit inputDraftsChanged();
+        }, [this](const QString& error) {
+            _leaseOwner = false;
+            emit errorOccurred(tr("Could not take the Spiral session lease: %1").arg(error));
         });
 }
 
@@ -440,7 +394,7 @@ void SpiralServiceManager::commitInputs() { applyInputDrafts(true); }
 
 void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& selection)
 {
-    if (!_inputOwner) {
+    if (!_leaseOwner) {
         emit inputBatchFinished(tr("This connection does not own dataset editing"));
         return;
     }
@@ -569,7 +523,7 @@ void SpiralServiceManager::applyInputDrafts(bool commit, const QStringList& sele
 
 void SpiralServiceManager::resumeInputCommand()
 {
-    if (!_inputCommand || _inputCommand->preparing || _inputCommandBusy || !_inputOwner || !isReady()) return;
+    if (!_inputCommand || _inputCommand->preparing || _inputCommandBusy || !_leaseOwner || !isReady()) return;
     _inputCommandBusy = true;
     if (_inputCommand->applied) { persistInputCommand(); return; }
     transferInput(0);
@@ -875,47 +829,19 @@ void SpiralServiceManager::editInputDraft(const QString& id)
     fetchInputContent(id, draft->accepted(), input.value(QStringLiteral("kind")).toString(), open);
 }
 
-void SpiralServiceManager::discardInputWorkspace(std::function<void()> done)
+void SpiralServiceManager::releaseSessionLease(std::function<void()> done)
 {
-    if (_inputCommand) {
-        _afterInputCommand = [this, done]() { discardInputWorkspace(done); };
-        resumeInputCommand();
-        return;
-    }
-    QJsonArray revisions;
-    for (auto it = _inputDrafts.cbegin(); it != _inputDrafts.cend(); ++it)
-        if (it.value()->accepted() > it.value()->persisted())
-            revisions.append(QJsonObject{{QStringLiteral("id"), it.key()},
-                {QStringLiteral("revision"), qint64(it.value()->accepted())}});
-    postWithRetry(QStringLiteral("/session/discard-inputs"),
-        {{QStringLiteral("command_id"), commandId()}, {QStringLiteral("revisions"), revisions}}, Timeout::LongCommand, 2,
-        [this, done](const QJsonObject& response) {
-            if (!response.value(QStringLiteral("discarded")).toBool()) { emit errorOccurred(tr("The inputs could not be discarded")); return; }
-            _inputDrafts.clear();
-            _inputOrder.clear();
-            _inputCatalog.clear();
-            _inputAliases.clear();
-            _inputErrors.clear();
-            _inputSelection.clear();
-            _inputSelectionExplicit = false;
-            emit inputDraftsChanged();
-            if (done) done();
-        }, [this](const QString& error) { emit errorOccurred(error); });
-}
-
-void SpiralServiceManager::releaseInputWorkspace(std::function<void()> done)
-{
-    if (!_inputOwner) { if (done) done(); return; }
+    if (!_leaseOwner) { if (done) done(); return; }
     // Stop local continuations before releasing their server-side workspace.
     if (_inputCommand) _inputSubmission.reconciled(_inputCommand->batch.commandId);
     _inputCommand.reset();
     _inputCommandBusy = false;
     _afterInputCommand = {};
     cancelWorkingCopies();
-    postWithRetry(QStringLiteral("/session/editing/release"),
+    postWithRetry(QStringLiteral("/session/lease/release"),
         {{QStringLiteral("command_id"), commandId()}}, Timeout::LongCommand, 2,
         [this, done](const QJsonObject&) {
-            clearInputWorkspace();
+            clearSessionLease();
             if (done) done();
         }, [this](const QString& error) { emit errorOccurred(error); });
 }
@@ -928,14 +854,14 @@ void SpiralServiceManager::cancelWorkingCopies()
     emit inputCopyProgress(0, {});
 }
 
-void SpiralServiceManager::clearInputWorkspace()
+void SpiralServiceManager::clearSessionLease()
 {
     cancelWorkingCopies();
     _workingCopies.clear();
     _inputWorkingCopySources.clear();
     emit inputCopyProgress(0, {});
-    _inputOwner = false;
-    _inputWorkspaceId.clear();
+    _leaseOwner = false;
+    _sessionLeaseId.clear();
     _inputDrafts.clear();
     _inputOrder.clear();
     _inputCatalog.clear();
@@ -943,7 +869,7 @@ void SpiralServiceManager::clearInputWorkspace()
     _inputErrors.clear();
     _inputSelection.clear();
     _inputSelectionExplicit = false;
-    emit inputWorkspaceReleased();
+    emit sessionLeaseReleased();
     emit inputDraftsChanged();
     // Editors must detach before background cleanup removes their files.
     _workingCopyDirectories.clear();

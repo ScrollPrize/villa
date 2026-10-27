@@ -83,7 +83,7 @@ private:
     void applyDescriptions();
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
                           bool directory);
-    void addPclItem(const QString& path, const QString& role, bool required = false);
+    void updateObjectStoreSummary();
     QJsonObject sessionRequest() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
@@ -150,12 +150,7 @@ private:
     QLabel* _sessionCheckpointLabel = nullptr;
     QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
-    QLineEdit* _pclPath = nullptr;
-    QListWidget* _pclList = nullptr;
-    QComboBox* _pclRole = nullptr;
-    QPushButton* _removePcl = nullptr;
-    QPushButton* _addPclButton = nullptr;
-    QToolButton* _browsePclButton = nullptr;
+    QLabel* _objectStoreSummary = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QCheckBox* _verticalFiberOffsetEnabled = nullptr;
@@ -240,6 +235,8 @@ private:
     bool _remoteMode = false;
     bool _connected = false;
     QString _editingAccessError;
+    // Why this profile's saved PCL documents or patch/fiber paths were dropped.
+    QString _legacyInputNote;
     bool _previewTransferActive = false;
     bool _checkpointDownloadActive = false;
     bool _localDraftsReady = false;

@@ -7,6 +7,8 @@
 #include "SpiralSshTunnel.hpp"
 #include "VCSettings.hpp"
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include <QCoreApplication>
 #include <QApplication>
 #include <QCryptographicHash>
@@ -319,8 +321,19 @@ void SpiralServiceManager::startLocalProcess()
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
         outputRoot = defaultLocalOutputRoot(_profile.datasetRoot.trimmed());
+    // Patches, PCLs and fibers come from an object store: the local service
+    // is launched bound to the one attached here.
+    if (_localStorePath.isEmpty()) {
+        const QString message = tr("The local Spiral service reads its patches, point "
+                                   "collections and fibers from an object store. "
+                                   "Attach one (File > Object store) and connect again.");
+        setConnectionState(ConnectionState::Failed, message);
+        emit errorOccurred(message);
+        return;
+    }
     QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
-                        QStringLiteral("--output"), outputRoot};
+                        QStringLiteral("--output"), outputRoot,
+                        QStringLiteral("--object-store"), _localStorePath};
     if (!_profile.cacheRoot.trimmed().isEmpty())
         binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
 
@@ -330,8 +343,8 @@ void SpiralServiceManager::startLocalProcess()
             beginHandshake();
             return;
         }
-        // A different dataset/output/cache selection restarts the owned
-        // process with the new binding.
+        // A different dataset/output/cache/store selection restarts the
+        // owned process with the new binding.
         emit logMessage(tr("Restarting the local Spiral service for a different "
                            "dataset binding"));
         stopService();
@@ -458,7 +471,7 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
             ? tr("session %1").arg(sessionName)
             : tr(" / session %1").arg(sessionName);
     setConnectionState(ConnectionState::Ready, identity);
-    claimInputWorkspace();
+    claimSessionLease();
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();
@@ -467,6 +480,12 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
         [this](const QJsonObject& catalog) {
             _configurationDefaults =
                 catalog.value(QStringLiteral("defaults")).toObject();
+            _serviceOwnedKeys.clear();
+            const QJsonObject fields = catalog.value(QStringLiteral("schema")).toObject()
+                                           .value(QStringLiteral("fields")).toObject();
+            for (auto it = fields.begin(); it != fields.end(); ++it)
+                if (it.value().toObject().value(QStringLiteral("service_owned")).toBool())
+                    _serviceOwnedKeys.insert(it.key());
             emit configurationCatalogChanged(catalog);
         });
     // Reconnect protocol: read the durable status snapshot first, then
@@ -483,15 +502,57 @@ void SpiralServiceManager::fetchAdvertisedDataset()
         [this, generation](const QJsonObject& dataset) {
             if (generation != _connectionGeneration) return;
             _advertisedDataset = dataset;
+            updateStoreBinding();
             emit datasetResolved(dataset);
         });
+}
+
+void SpiralServiceManager::setObjectStore(
+    std::shared_ptr<vc::objects::ObjectStoreSession> session,
+    std::optional<vc::objects::AttachmentIdentity> attachment)
+{
+    _storeSession = session;
+    QString path;
+    QString uuid;
+    if (session && attachment) {
+        path = QString::fromStdString(session->path(*attachment).string());
+        uuid = QString::fromStdString(attachment->storeUuid);
+    }
+    const bool changed = path != _localStorePath;
+    _localStorePath = path;
+    _storeBinding.localPath = path;
+    _storeBinding.localUuid = uuid;
+    emit storeBindingChanged();
+    // A local service is bound to the store at launch: follow the attachment.
+    if (changed && ownsProcess() && _profile.autoLaunch
+        && _connectionState != ConnectionState::Disconnected) {
+        emit logMessage(tr("The attached object store changed; restarting the local Spiral service"));
+        connectToService(_profile);
+    }
+}
+
+void SpiralServiceManager::updateStoreBinding()
+{
+    const QJsonObject store = _advertisedDataset.value(QStringLiteral("object_store")).toObject();
+    _storeBinding.serviceUuid = store.value(QStringLiteral("uuid")).toString();
+    _storeBinding.servicePath = store.value(QStringLiteral("path")).toString();
+    if (_storeBinding.advertised() && !_storeBinding.matches())
+        emit logMessage(
+            _storeBinding.localUuid.isEmpty()
+                ? tr("The Spiral service reads object store %1, and none is attached here: "
+                     "its fit inputs cannot be displayed")
+                      .arg(_storeBinding.serviceUuid)
+                : tr("The Spiral service reads object store %1, not the attached store %2: "
+                     "its fit inputs are not displayed as fitted")
+                      .arg(_storeBinding.serviceUuid, _storeBinding.localUuid));
+    emit storeBindingChanged();
 }
 
 void SpiralServiceManager::disconnectFromService()
 {
     cancelWorkingCopies();
     ++_connectionGeneration;
-    _inputOwner = false;
+    _leaseOwner = false;
     _inputCommandBusy = false;
     if (_inputCommand) _inputSubmission.transportInterrupted();
     _poll->stop();
@@ -518,7 +579,7 @@ void SpiralServiceManager::reconnect()
     if (ownsProcess()) {
         cancelWorkingCopies();
         ++_connectionGeneration;
-        _inputOwner = false;
+        _leaseOwner = false;
         _inputCommandBusy = false;
         _statusInFlight = false;
         _eventsInFlight = false;
@@ -558,7 +619,7 @@ QNetworkRequest SpiralServiceManager::makeRequest(const QString& path, int timeo
     if (!_credential.isEmpty())
         request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(_credential).toUtf8());
     request.setRawHeader("X-Spiral-Client", _clientId.toUtf8());
-    request.setRawHeader("X-Spiral-Workspace-Token", _clientId.toUtf8());
+    request.setRawHeader("X-Spiral-Session-Token", _clientId.toUtf8());
     request.setTransferTimeout(timeoutMs);
     return request;
 }
@@ -568,8 +629,9 @@ void SpiralServiceManager::initializeSession(QJsonObject request)
     prepareSessionRequest(std::move(request), true);
 }
 
-void SpiralServiceManager::rebuildSession(QJsonObject request)
+void SpiralServiceManager::rebuildSession(QJsonObject request, bool reloadInputs)
 {
+    if (reloadInputs) request[QStringLiteral("inputs")] = QStringLiteral("reload");
     prepareSessionRequest(std::move(request), false);
 }
 
@@ -585,6 +647,13 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
     const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
     if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
+    // The service's launch binding owns these (its object store and the
+    // author of its link refreshes); a request never chooses them.
+    QJsonObject run = request.value(QStringLiteral("run")).toObject();
+    QJsonObject config = run.value(QStringLiteral("config")).toObject();
+    for (const QString& key : _serviceOwnedKeys) config.remove(key);
+    run[QStringLiteral("config")] = config;
+    request[QStringLiteral("run")] = run;
 
     auto finish = [this, request, selectable, initialize](
                       const QString& checkpointHostPath) mutable {
@@ -1201,7 +1270,6 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         if (!request.isEmpty()) {
             _synchronizedSessionId = sessionId;
             emit sessionSynchronized(request, status);
-            if (_inputOwner) refreshInputCatalog();
         }
     }
     // Pausing no longer exports a preview by itself. Ask for one exactly

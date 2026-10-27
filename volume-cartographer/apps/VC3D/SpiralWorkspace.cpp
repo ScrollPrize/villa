@@ -283,6 +283,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
             _trackedFiberPaths.clear();
+            if (_service)
+                _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
         }
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
@@ -391,6 +393,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
 
     _service = new SpiralServiceManager(this);
+    // A local service is launched bound to the attached store, and any
+    // service's inputs are displayed only from the same store.
+    _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
 
     _pythonOutputDialog = new QDialog(this, Qt::Window);
     _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));
@@ -432,7 +437,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 copyLabel->setVisible(active > 0);
                 copyProgress->setVisible(active > 0);
             });
-    connect(_service, &SpiralServiceManager::inputWorkspaceReleased, this, [this]() {
+    connect(_service, &SpiralServiceManager::sessionLeaseReleased, this, [this]() {
         cancelLineAnnotationDraft();
         _trackedFiberPaths.clear();
         _managedPatchCopies.clear();
@@ -781,7 +786,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::sessionActiveChanged, this,
             [this](bool active) {
                 emit spiralSessionActiveChanged(active);
-                if (active || !_service->inputWorkspaceId().isEmpty()) return;
+                if (active || !_service->sessionLeaseId().isEmpty()) return;
                 cancelLineAnnotationDraft();
                 for (auto& state : _pclOverlays) {
                     state.manifestPath.clear();
@@ -1540,7 +1545,7 @@ bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& su
 QString SpiralWorkspace::provisionalBrushRoot() const
 {
     return QFileInfo(vc3d::settingsFilePath()).dir().filePath(
-        QStringLiteral("spiral-working/%1").arg(_service->inputWorkspaceId()));
+        QStringLiteral("spiral-working/%1").arg(_service->sessionLeaseId()));
 }
 
 void SpiralWorkspace::inputDraftPrepared(const QString&, const QString& error)
@@ -1713,7 +1718,7 @@ void SpiralWorkspace::discardBrushWork()
 void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
 {
     _state->objectStoreSession()->finalize();
-    auto exit = [this, continuation]() { _service->releaseInputWorkspace(continuation); };
+    auto exit = [this, continuation]() { _service->releaseSessionLease(continuation); };
     if (!hasPendingBrushWork()) {
         exit();
         return;

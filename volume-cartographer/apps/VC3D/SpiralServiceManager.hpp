@@ -20,6 +20,13 @@
 
 #include <array>
 #include <functional>
+#include <memory>
+#include <optional>
+
+namespace vc::objects {
+class ObjectStoreSession;
+struct AttachmentIdentity;
+}
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -48,7 +55,19 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 35;
+    static constexpr int kApiVersion = 36;
+
+    // The object store a service reads its fit inputs from, beside the one
+    // attached in this VC3D. Inputs are displayed as fitted only when both
+    // are the same store (the same UUID: a hub replica shares it).
+    struct StoreBinding {
+        QString serviceUuid;   // /dataset object_store.uuid
+        QString servicePath;   // where the service host opened it
+        QString localUuid;     // the attachment's store UUID
+        QString localPath;
+        bool advertised() const { return !serviceUuid.isEmpty(); }
+        bool matches() const { return advertised() && serviceUuid == localUuid; }
+    };
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
     ~SpiralServiceManager() override;
@@ -78,7 +97,9 @@ public:
     void initializeSession(QJsonObject request);
     // Replace an initialized session. This is also the only later verb that
     // may change the model domain or structural configuration.
-    void rebuildSession(QJsonObject request);
+    // ``reloadInputs`` asks for the whole build, which rereads the service's
+    // object store, even when the request changes nothing else.
+    void rebuildSession(QJsonObject request, bool reloadInputs = false);
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
@@ -94,6 +115,14 @@ public:
     // Every checkpoint the service says it can load: GET /dataset's
     // session_checkpoints (newest first) followed by detected_checkpoints.
     QStringList serviceCheckpoints() const;
+    // The store this VC3D has attached. A local service is launched bound to
+    // it (and relaunched when it changes); any service is compared with it.
+    void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
+                        std::optional<vc::objects::AttachmentIdentity> attachment);
+    const StoreBinding& storeBinding() const { return _storeBinding; }
+    // Configuration keys the service's launch binding owns
+    // (schema.fields[*].service_owned): requests never choose them.
+    const QSet<QString>& serviceOwnedKeys() const { return _serviceOwnedKeys; }
     // Load a checkpoint into the fit. Exactly one of hostPath (a checkpoint
     // the service advertised) and localPath (a file on this machine, uploaded
     // first) is set; the service, which owns the filesystem, resolves it
@@ -114,20 +143,20 @@ public:
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
     void commitInputs();
     void applyInputDrafts(bool commit = false, const QStringList& selection = {});
-    void refreshInputCatalog();
     QJsonArray inputDraftStatus() const;
     bool hasInputDrafts() const;
-    bool ownsInputWorkspace() const { return _inputOwner; }
+    // Whether this client holds the service's session lease, which every
+    // mutating request needs.
+    bool ownsSessionLease() const { return _leaseOwner; }
     void restoreInputDraft(const QString& id);
     void editInputDraft(const QString& id);
     void resolveInputConflict(const QJsonObject& conflict, const QString& action);
     void discardInputDraft(const QString& id);
-    void discardInputWorkspace(std::function<void()> done);
-    void releaseInputWorkspace(std::function<void()> done);
+    void releaseSessionLease(std::function<void()> done);
     void invalidateWorkingCopy(const QString& source);
     void workingCopyAsync(const QString& source, FetchPreviewFileCallback done);
     QString workingCopy(const QString& source, QString* error = nullptr);
-    QString inputWorkspaceId() const { return _inputWorkspaceId; }
+    QString sessionLeaseId() const { return _sessionLeaseId; }
     void setInputSelection(const QStringList& ids) { _inputSelection = ids; _inputSelectionExplicit = true; }
 
     void stagePatch(const QString& directory, const QString& inputId, bool deleted = false);
@@ -152,7 +181,8 @@ signals:
     void inputPreparationProgress(const QString& message);
     void inputCopyProgress(int activeCopies, const QString& message);
     void inputDraftsChanged();
-    void inputWorkspaceReleased();
+    void sessionLeaseReleased();
+    void storeBindingChanged();
     void inputDraftStaged(const QString& alias);
     void inputDraftDiscarded(const QString& alias);
     void inputConflict(const QJsonObject& conflict);
@@ -282,8 +312,9 @@ private:
     void failInputCommand(const QString& error, const QJsonObject& body = {});
     void finishInputCommand();
     void installInputCatalog(const QJsonArray& inputs);
-    void claimInputWorkspace();
-    void clearInputWorkspace();
+    void claimSessionLease();
+    void clearSessionLease();
+    void updateStoreBinding();
     QString logicalInputId(const QString& kind, const QString& alias,
                            const QString& role, const QString& targetCollection,
                            const QString& sourceIdentity);
@@ -303,8 +334,8 @@ private:
     void reportInputPreparation(const QString& message);
     QStringList _inputSelection;
     bool _inputSelectionExplicit = false;
-    QString _inputWorkspaceId;
-    bool _inputOwner = false;
+    QString _sessionLeaseId;
+    bool _leaseOwner = false;
     bool _inputCommandBusy = false;
     std::shared_ptr<DraftCommand> _inputCommand;
     std::function<void()> _afterInputCommand;
@@ -324,7 +355,11 @@ private:
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
-    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache of _process
+    QStringList _ownedLaunchBinding;    // --dataset/--output/--cache/--object-store of _process
+    std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
+    QString _localStorePath;
+    StoreBinding _storeBinding;
+    QSet<QString> _serviceOwnedKeys;
     QNetworkAccessManager* _network = nullptr;
     SpiralSshTunnel* _tunnel = nullptr;
     SpiralArtifactCache* _artifactCache = nullptr;

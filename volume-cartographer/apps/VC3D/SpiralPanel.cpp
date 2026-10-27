@@ -269,49 +269,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     describe(QStringLiteral("scroll_summary"), {_scrollSummary});
     addPathRow(pathsForm, "umbilicus", tr("Umbilicus"), false);
 
-    auto* pclContainer = new QWidget(pathsContents);
-    auto* pclLayout = new QVBoxLayout(pclContainer);
-    pclLayout->setContentsMargins(0, 0, 0, 0);
-    _pclList = new QListWidget(pclContainer);
-    _pclList->setObjectName(QStringLiteral("spiralPclList"));
-    _pclList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _pclList->setMinimumHeight(60);
-    // Two thirds of the default scroll-area height: the list rarely holds more
-    // than a few roles, and the space is better spent on the rows below it.
-    _pclList->setMaximumHeight(_pclList->sizeHint().height() * 2 / 3);
-    pclLayout->addWidget(_pclList);
-    auto* pclInputRow = new QHBoxLayout;
-    _pclRole = new QComboBox(pclContainer);
-    _pclRole->setObjectName(QStringLiteral("spiralPclRole"));
-    _pclRole->addItem(tr("Absolute"), QStringLiteral("absolute"));
-    _pclRole->addItem(tr("Relative"), QStringLiteral("relative"));
-    _pclRole->addItem(tr("Same winding"), QStringLiteral("same_winding"));
-    _pclRole->addItem(tr("Drawn control points"), QStringLiteral("drawn_control_points"));
-    _pclPath = new QLineEdit(pclContainer);
-    _pclPath->setObjectName(QStringLiteral("spiralPclPath"));
-    _pclPath->setPlaceholderText(tr("PCL path"));
-    _browsePclButton = new QToolButton(pclContainer);
-    _browsePclButton->setText(QStringLiteral("…"));
-    _addPclButton = new QPushButton(QStringLiteral("+"), pclContainer);
-    _addPclButton->setObjectName(QStringLiteral("spiralAddPcl"));
-    _removePcl = new QPushButton(QStringLiteral("-"), pclContainer);
-    _removePcl->setObjectName(QStringLiteral("spiralRemovePcl"));
-    _removePcl->setEnabled(false);
-    pclInputRow->addWidget(_pclRole);
-    pclInputRow->addWidget(_pclPath, 1);
-    pclInputRow->addWidget(_browsePclButton);
-    pclInputRow->addWidget(_addPclButton);
-    pclInputRow->addWidget(_removePcl);
-    pclLayout->addLayout(pclInputRow);
-    pathsForm->addRow(tr("PCLs"), pclContainer);
-    describe(QStringLiteral("pcl_list"), {pclContainer});
-    describe(QStringLiteral("pcl_role"), {_pclRole});
-    describe(QStringLiteral("pcl_path"), {_pclPath});
-    describe(QStringLiteral("pcl_browse"), {_browsePclButton});
-    describe(QStringLiteral("pcl_add"), {_addPclButton});
-    describe(QStringLiteral("pcl_remove"), {_removePcl});
-
-    addPathRow(pathsForm, "fibers", tr("Fibers"), true);
+    // Patches, point collections and fibers come from the object store the
+    // service was launched with, not from dataset files.
+    _objectStoreSummary = new QLabel(tr("No object store advertised"), pathsContents);
+    _objectStoreSummary->setObjectName(QStringLiteral("spiralObjectStoreSummary"));
+    _objectStoreSummary->setWordWrap(true);
+    _objectStoreSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pathsForm->addRow(tr("Object store"), _objectStoreSummary);
+    describe(QStringLiteral("object_store"), {_objectStoreSummary});
 
     // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
     // expect them a few voxels radially outside the winding it fits to the
@@ -394,7 +359,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     }
     updateTrackSamplingUi();
 
-    addPathRow(pathsForm, "verified_patches", tr("Verified patches"), true);
     addPathRow(pathsForm, "outer_shell", tr("Outer shell"), true);
 
     auto* lasagnaSection = makeSection(tr("Lasagna inputs"),
@@ -937,31 +901,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     };
     for (QLineEdit* edit : {_datasetRoot, _outputRoot, _cacheRoot})
         connect(edit, &QLineEdit::editingFinished, this, launchBindingEdited);
-    auto appendPcl = [this]() {
-        const QString path = _pclPath->text().trimmed();
-        if (path.isEmpty()) return;
-        addPclItem(path, _pclRole->currentData().toString());
-        _pclPath->clear();
-        _hasManualEdits = true;
-        refreshReloadRequired();
-    };
-    connect(_addPclButton, &QPushButton::clicked, this, appendPcl);
-    connect(_pclPath, &QLineEdit::returnPressed, this, appendPcl);
-    connect(_browsePclButton, &QToolButton::clicked, this, [this]() {
-        const QString chosen = QFileDialog::getOpenFileName(
-            this, tr("Select PCL file"), _pclPath->text(), tr("JSON files (*.json);;All files (*)"));
-        if (!chosen.isEmpty()) _pclPath->setText(chosen);
-    });
-    connect(_pclList, &QListWidget::itemSelectionChanged, this, [this]() {
-        _removePcl->setEnabled(!_remoteMode && _pclList->currentItem() != nullptr);
-    });
-    connect(_removePcl, &QPushButton::clicked, this, [this]() {
-        if (auto* item = _pclList->takeItem(_pclList->currentRow())) {
-            delete item;
-            _hasManualEdits = true;
-            refreshReloadRequired();
-        }
-    });
 
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString& message) {
@@ -1102,8 +1041,11 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::sessionSynchronized,
             this, &SpiralPanel::synchronizeSession);
+    connect(_service, &SpiralServiceManager::storeBindingChanged,
+            this, &SpiralPanel::updateObjectStoreSummary);
+    updateObjectStoreSummary();
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
-        if (_connected && !_service->ownsInputWorkspace())
+        if (_connected && !_service->ownsSessionLease())
             _editingAccessError = error;
         _warnings->setText(error);
     });
@@ -1180,14 +1122,20 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         // the same session again. Still allowed — starting a fit over is a
         // legitimate thing to want — but not by accident. A failed session
         // is exempt: rebuilding an identical request is the recovery.
-        if (!_reloadRequired && _sessionState != QStringLiteral("Error")
-            && QMessageBox::question(
-                   this, tr("Rebuild Fit"),
-                   tr("No fit input or session setting has changed. Rebuilding "
-                      "discards everything this session has trained and builds "
-                      "it again from the same request. Continue?"))
-                   != QMessageBox::Yes)
-            return;
+        bool reloadInputs = false;
+        if (!_reloadRequired && _sessionState != QStringLiteral("Error")) {
+            QMessageBox box(QMessageBox::Question, tr("Rebuild Fit"),
+                            tr("No session setting has changed. Rebuilding discards "
+                               "everything this session has trained and builds it "
+                               "again, reading the object store's current patches, "
+                               "point collections and fibers. Continue?"),
+                            QMessageBox::Cancel, this);
+            auto* reload = box.addButton(tr("Rebuild with Current Inputs"),
+                                         QMessageBox::AcceptRole);
+            box.exec();
+            if (box.clickedButton() != reload) return;
+            reloadInputs = true;
+        }
         // A model-stage rebuild keeps the loaded host inputs, and with
         // them everything already incorporated into the fit, so there is
         // nothing to warn about; only a full rebuild discards them.
@@ -1221,7 +1169,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (useDefaults)
             _service->rebuildWithDefaults();
         else
-            _service->rebuildSession(sessionRequest());
+            _service->rebuildSession(sessionRequest(), reloadInputs);
     });
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
@@ -1401,7 +1349,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_inputList, &QListWidget::itemSelectionChanged, this, [this]() {
         const auto* item = _inputList->currentItem();
         const auto row = item ? item->data(Qt::UserRole + 4).toJsonObject() : QJsonObject();
-        _removeInput->setEnabled(_connected && _service->ownsInputWorkspace() && item
+        _removeInput->setEnabled(_connected && _service->ownsSessionLease() && item
             && (!row.value(QStringLiteral("deleted")).toBool() || row.value(QStringLiteral("can_restore")).toBool()));
         _removeInput->setText(item && item->data(Qt::UserRole + 3).toBool() ? tr("Restore") : tr("Remove"));
     });
@@ -1435,7 +1383,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         auto* retry = menu.addAction(tr("Retry"));
         auto* discard = menu.addAction(tr("Discard Local Changes"));
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
-        const bool owner = _service->ownsInputWorkspace();
+        const bool owner = _service->ownsSessionLease();
         edit->setEnabled(owner && !row.value("local").toBool() && !row.value(QStringLiteral("deleted")).toBool());
         retry->setEnabled(owner && !row.value("local").toBool() && (!row.value(QStringLiteral("committed")).toBool()
             || !row.value(QStringLiteral("error")).toString().isEmpty()));
@@ -1678,13 +1626,6 @@ void SpiralPanel::setRemoteMode(bool remote)
         if (_pathBrowseButtons.contains(it.key()))
             _pathBrowseButtons[it.key()]->setVisible(false);
     }
-    // PCL collections are advertised by dataset resolution; extra collections
-    // join a session through ephemeral uploads, not the load request.
-    _pclRole->setEnabled(false);
-    _pclPath->setEnabled(false);
-    _addPclButton->setEnabled(false);
-    _browsePclButton->setVisible(false);
-    _removePcl->setEnabled(false);
     _save->setVisible(true);
     for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
         setToolTipNote(edit->parentWidget(), tr("Service-host path, owned by the service"));
@@ -1718,21 +1659,6 @@ QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const 
         }
     });
     return edit;
-}
-
-void SpiralPanel::addPclItem(const QString& path, const QString& role, bool required)
-{
-    if (path.trimmed().isEmpty()) return;
-    const int roleIndex = _pclRole->findData(role);
-    // A role the service no longer accepts (a retired role in settings saved
-    // by an older build) is dropped: sending it would fail session validation.
-    if (roleIndex < 0) return;
-    const QString roleLabel = _pclRole->itemText(roleIndex);
-    auto* item = new QListWidgetItem(tr("%1 — %2").arg(roleLabel, path), _pclList);
-    item->setData(Qt::UserRole, path);
-    item->setData(Qt::UserRole + 1, role);
-    item->setData(Qt::UserRole + 2, required);
-    item->setToolTip(path);
 }
 
 void SpiralPanel::setLossMapOptions(const QStringList& names)
@@ -1841,12 +1767,6 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     const QJsonObject resolved = resolution.value("resolved").toObject();
     for (auto it = resolved.begin(); it != resolved.end(); ++it)
         if (_paths.contains(it.key())) _paths[it.key()]->setText(it.value().toString());
-    _pclList->clear();
-    for (const QJsonValue& value : resolution.value("pcl_inputs").toArray()) {
-        const QJsonObject item = value.toObject();
-        addPclItem(item.value("path").toString(), item.value("role").toString(),
-                   item.value("required").toBool());
-    }
     _applyingResolution = false; _hasManualEdits = false;
     // A refreshed resolution that resolves to the very same inputs (e.g. the
     // re-advertisement after committing ephemeral inputs) must not disable Run
@@ -1859,6 +1779,27 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
     if (!checkpoints.isEmpty())
         notes << tr("Detected resume checkpoints on the service: %1").arg(checkpoints.join(", "));
     _warnings->setText(notes.join(QStringLiteral("\n")));
+}
+
+void SpiralPanel::updateObjectStoreSummary()
+{
+    const auto& binding = _service->storeBinding();
+    if (!binding.advertised()) {
+        _objectStoreSummary->setText(binding.localUuid.isEmpty()
+            ? tr("No object store attached in VC3D")
+            : tr("Attached here: %1 (%2)").arg(binding.localUuid, binding.localPath));
+        return;
+    }
+    QString text = tr("Service reads %1 (%2 on the service host)")
+                       .arg(binding.serviceUuid, binding.servicePath);
+    if (binding.matches())
+        text += tr("\nThe same store is attached here");
+    else if (binding.localUuid.isEmpty())
+        text += tr("\nNo store is attached here: fit inputs cannot be displayed");
+    else
+        text += tr("\nAnother store is attached here (%1): fit inputs are not displayed as fitted")
+                    .arg(binding.localUuid);
+    _objectStoreSummary->setText(text);
 }
 
 void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
@@ -1889,14 +1830,6 @@ QJsonObject SpiralPanel::sessionRequest() const
     QJsonObject paths;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         paths[it.key()] = it.value()->text();
-    QJsonArray pcls;
-    for (int row = 0; row < _pclList->count(); ++row) {
-        const QListWidgetItem* item = _pclList->item(row);
-        pcls.append(QJsonObject{{"path", item->data(Qt::UserRole).toString()},
-                                {"role", item->data(Qt::UserRole + 1).toString()},
-                                {"required", item->data(Qt::UserRole + 2).toBool()}});
-    }
-    paths["pcls"] = pcls;
     // Not a panel field: a rebuild resumes whatever the live session was
     // built from unless the checkpoint section replaces it.
     paths["checkpoint"] = _sessionCheckpoint;
@@ -1947,6 +1880,9 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
     }
     config.remove(QStringLiteral("z_begin"));
     config.remove(QStringLiteral("z_end"));
+    // The service's launch binding owns its object store and refresh author;
+    // an attached session reports them, and a request must not restate them.
+    for (const QString& key : _service->serviceOwnedKeys()) config.remove(key);
     return config;
 }
 
@@ -2089,13 +2025,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         paths.value(QStringLiteral("checkpoint")).toString();
     setSessionCheckpoint(checkpoint);
 
-    _pclList->clear();
-    for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
-        const QJsonObject item = value.toObject();
-        addPclItem(item.value(QStringLiteral("path")).toString(),
-                   item.value(QStringLiteral("role")).toString(),
-                   item.value(QStringLiteral("required")).toBool());
-    }
 
     _zBegin->setValue(run.value(QStringLiteral("z_begin")).toInt(_zBegin->value()));
     _zEnd->setValue(run.value(QStringLiteral("z_end")).toInt(_zEnd->value()));
@@ -2145,16 +2074,17 @@ void SpiralPanel::refreshInputVisibility()
 
 void SpiralPanel::updateWarnings(const QJsonObject& status)
 {
-    // A healthy status response does not mean the editing claim succeeded.
-    // Retain its error until editing access is acquired or a new connection starts.
-    if (_service->ownsInputWorkspace()) _editingAccessError.clear();
+    // A healthy status response does not mean the lease claim succeeded.
+    // Retain its error until the lease is acquired or a new connection starts.
+    if (_service->ownsSessionLease()) _editingAccessError.clear();
     QStringList diagnostics;
-    if (_connected && !_service->ownsInputWorkspace()) {
+    if (_connected && !_service->ownsSessionLease()) {
         diagnostics.push_back(_editingAccessError.isEmpty()
-            ? tr("Waiting to acquire editing access to the service…")
-            : tr("Editing access unavailable: %1\nIf another VC3D client or service owns editing, "
-                 "release it there, then disconnect and reconnect here.").arg(_editingAccessError));
+            ? tr("Waiting to acquire the service's session lease…")
+            : tr("Session lease unavailable: %1\nIf another VC3D client owns this service's "
+                 "session, release it there, then disconnect and reconnect here.").arg(_editingAccessError));
     }
+    if (!_legacyInputNote.isEmpty()) diagnostics.push_back(_legacyInputNote);
     const QString error = status.value(QStringLiteral("error")).toString();
     if (!error.isEmpty()) diagnostics.push_back(error);
     const QString previewError =
@@ -2349,7 +2279,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     if (_reloadRequired)
         stateText += QStringLiteral("\n")
             + tr("Reload required — fit inputs or training configuration changed");
-    if (_connected && !_service->ownsInputWorkspace())
+    if (_connected && !_service->ownsSessionLease())
         stateText += QStringLiteral("\n")
             + tr("Fit controls require editing access to the service. See warnings below.");
     _state->setText(stateText);
@@ -2365,12 +2295,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
-    _load->setEnabled(_connected && _service->ownsInputWorkspace()
+    _load->setEnabled(_connected && _service->ownsSessionLease()
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && runnable && !_reloadRequired);
-    _stop->setEnabled(_service->ownsInputWorkspace() && state == "Running");
-    _save->setEnabled(_connected && _service->ownsInputWorkspace() && runnable);
+    _run->setEnabled(_connected && _service->ownsSessionLease() && runnable && !_reloadRequired);
+    _stop->setEnabled(_service->ownsSessionLease() && state == "Running");
+    _save->setEnabled(_connected && _service->ownsSessionLease() && runnable);
     _downloadCheckpoint->setEnabled(
         _connected && runnable && !_checkpointDownloadActive);
     // An in-session load replaces resident model state, so it needs the same
@@ -2462,8 +2392,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         refreshInputVisibility();
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    _commitInputs->setEnabled(_connected && _service->ownsInputWorkspace() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));
-    _addInputs->setEnabled(_connected && _service->ownsInputWorkspace() && _hasSession && (_localDraftsReady || _service->hasInputDrafts()));
+    _commitInputs->setEnabled(_connected && _service->ownsSessionLease() && (commitAvailable || _localDraftsReady || _service->hasInputDrafts()));
+    _addInputs->setEnabled(_connected && _service->ownsSessionLease() && _hasSession && (_localDraftsReady || _service->hasInputDrafts()));
     _commitHint->setText(tr("Checked inputs are selected. Saves update local drafts; Apply changes future fit steps; Commit writes the selected revisions."));
 }
 
@@ -2531,7 +2461,7 @@ void SpiralPanel::refreshReloadRequired()
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
         != normalizedReloadRequest(_loadedSessionRequest);
-    _run->setEnabled(_connected && _service->ownsInputWorkspace() && _sessionRunnable && !_reloadRequired);
+    _run->setEnabled(_connected && _service->ownsSessionLease() && _sessionRunnable && !_reloadRequired);
     if (_reloadRequired)
         _state->setText(tr("Reload required — fit inputs or session configuration changed"));
     else if (wasReloadRequired)
@@ -2548,15 +2478,6 @@ void SpiralPanel::persist() const
     const QString prefix = formSettingsPrefix();
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
-    QJsonArray pcls;
-    for (int row = 0; row < _pclList->count(); ++row) {
-        const QListWidgetItem* item = _pclList->item(row);
-        pcls.append(QJsonObject{{"path", item->data(Qt::UserRole).toString()},
-                                {"role", item->data(Qt::UserRole + 1).toString()},
-                                {"required", item->data(Qt::UserRole + 2).toBool()}});
-    }
-    settings.setValue(prefix + QStringLiteral("pcls"),
-                      QJsonDocument(pcls).toJson(QJsonDocument::Compact));
     settings.setValue(prefix + "z_begin", _zBegin->value());
     settings.setValue(prefix + "z_end", _zEnd->value());
     settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
@@ -2586,17 +2507,19 @@ void SpiralPanel::restore()
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(settings.value(prefix + QStringLiteral("paths/") + it.key()).toString());
-    _pclList->clear();
-    const QByteArray savedPcls = settings.value(prefix + QStringLiteral("pcls")).toByteArray();
-    const QJsonDocument pclDocument = QJsonDocument::fromJson(savedPcls);
-    if (pclDocument.isArray()) {
-        for (const QJsonValue& value : pclDocument.array()) {
-            const QJsonObject item = value.toObject();
-            addPclItem(item.value(QStringLiteral("path")).toString(),
-                       item.value(QStringLiteral("role")).toString(),
-                       item.value(QStringLiteral("required")).toBool());
+    QStringList ignored;
+    for (const QString& key : {QStringLiteral("pcls"), QStringLiteral("paths/verified_patches"),
+                               QStringLiteral("paths/fibers")}) {
+        if (settings.contains(prefix + key)) {
+            ignored << key;
+            settings.remove(prefix + key);
         }
     }
+    if (!ignored.isEmpty())
+        _legacyInputNote = tr("Saved PCL documents and patch/fiber directories (%1) are no "
+                              "longer fit inputs and were dropped from this profile: the "
+                              "service reads patches, point collections and fibers from its "
+                              "object store.").arg(ignored.join(QStringLiteral(", ")));
     _zBegin->setValue(settings.value(prefix + "z_begin", 4000).toInt());
     _zEnd->setValue(settings.value(prefix + "z_end", 17000).toInt());
     _runTag->setText(settings.value(prefix + "run_tag").toString());
