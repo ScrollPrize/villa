@@ -59,8 +59,6 @@ public:
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
     [[nodiscard]] QString normal3dZarrPath() const;
-    [[nodiscard]] QString patchTracerSourceTag() const;
-    [[nodiscard]] utils::Json patchTracerParamsJson() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;

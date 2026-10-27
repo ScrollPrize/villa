@@ -400,8 +400,6 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
         method = SegmentationGrowthMethod::Tracer;
     else if (methodStr == QLatin1String("corrections"))
         method = SegmentationGrowthMethod::Corrections;
-    else if (methodStr == QLatin1String("patch_tracer"))
-        method = SegmentationGrowthMethod::PatchTracer;
     else {
         QJsonObject data;
         data["param"] = "method";

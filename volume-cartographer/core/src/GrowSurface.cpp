@@ -1385,8 +1385,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                               const std::vector<QuadSurface *> &surfs_v,
                                               const nlohmann::json &params,
-                                              float voxelsize,
-                                              SurfacePatchIndex* external_surface_patch_index = nullptr)
+                                              float voxelsize)
 {
     bool flip_x = params.value("flip_x", 0);
     bool bidirectional = params.value("bidirectional", false);
@@ -1495,9 +1494,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                   << " min_generations=" << sweep_prune_min_generations << std::endl;
     }
     std::cout << "  reopt_interval: " << reopt_interval << std::endl;
-    if (external_surface_patch_index) {
-        std::cout << "  external_surface_patch_index: true" << std::endl;
-    }
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1526,8 +1522,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "seed " << seed << " name " << surface_name(seed) << std::endl;
 
     SurfacePatchIndex surface_patch_index;
-    SurfacePatchIndex* surface_patch_index_ptr = external_surface_patch_index;
-    if (!surface_patch_index_ptr) {
+    {
         std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
         std::set<QuadSurface*> indexed_surfaces;
         patch_surfaces.reserve(surfs.size() + 1);
@@ -1549,11 +1544,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const double rebuild_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - rebuild_start).count();
         std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
-        surface_patch_index_ptr = &surface_patch_index;
         std::cout << "SurfacePatchIndex built for " << patch_surfaces.size()
                   << " surfaces patches=" << surface_patch_index.patchCount()
                   << std::endl;
     }
+    SurfacePatchIndex* surface_patch_index_ptr = &surface_patch_index;
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
     const bool resume_growth = looks_like_resume_surface(seed, params);
@@ -3571,15 +3566,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
 QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize)
 {
-    return grow_surf_from_surfs(seed, surfs_v, params, voxelsize, nullptr);
-}
-
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
-                                  const std::vector<QuadSurface*> &surfs_v,
-                                  const utils::Json &params,
-                                  float voxelsize,
-                                  SurfacePatchIndex* surface_patch_index)
-{
     if (!seed)
         return nullptr;
 
@@ -3600,5 +3586,5 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed,
     }
 
     nlohmann::json grow_params = json_from_utils(params);
-    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize, surface_patch_index);
+    return grow_surf_from_surfs_impl(seed_surf, grow_surfs, grow_params, voxelsize);
 }

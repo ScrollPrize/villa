@@ -49,7 +49,7 @@ Native JSON needed by external processing tools is materialized explicitly from
 pinned revisions into temporary transfer files.
 
 The scroll umbilicus (Fiber Map unrolling, generated-view normal orientation,
-Patch Tracer single-wrap growth) is an `umbilicus` object in the attached store,
+signed normals in `vc_grow_seg_from_seed`) is an `umbilicus` object in the attached store,
 bound to a volume like a fiber. **File → Import Umbilicus...** reads an umbilicus
 file (JSON, text or CSV) for the active volume and decides its frame once: a file
 stamping its grid (`volume_width/height/slices` or `voxelsize_um`) is scaled from

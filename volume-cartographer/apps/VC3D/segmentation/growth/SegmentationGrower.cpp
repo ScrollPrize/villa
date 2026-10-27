@@ -1,4 +1,3 @@
-#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
 
@@ -415,52 +414,6 @@ struct CopyDisplacementJob
     utils::Json customParams;
 };
 
-} // namespace
-
-std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTracerSource& source)
-{
-    std::vector<std::shared_ptr<QuadSurface>> surfaces;
-    for (const auto& entry : source.surfaces) {
-        try {
-            surfaces.push_back(SurfaceCatalog::open(source.session, entry.attachment, entry.targetVolume,
-                                                    entry.uuid).surface);
-        } catch (const std::exception& ex) {
-            // e.g. a catalog surface whose geometry was never fetched.
-            qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface" << QString::fromStdString(entry.uuid) << ex.what();
-        }
-    }
-    if (surfaces.empty()) {
-        throw std::runtime_error("Patch Tracer source tag has no loadable surfaces in this volume");
-    }
-    return surfaces;
-}
-
-namespace
-{
-
-std::shared_ptr<SurfacePatchIndex> buildPatchTracerIndex(const std::vector<std::shared_ptr<QuadSurface>>& surfaces,
-                                                         QuadSurface* seedSurface)
-{
-    std::vector<SurfacePatchIndex::SurfacePtr> patchSurfaces;
-    patchSurfaces.reserve(surfaces.size() + 1);
-    std::set<QuadSurface*> seen;
-    auto append = [&](const std::shared_ptr<QuadSurface>& surface) {
-        if (surface && seen.insert(surface.get()).second) {
-            patchSurfaces.emplace_back(surface);
-        }
-    };
-    for (const auto& surface : surfaces) {
-        append(surface);
-    }
-    if (seedSurface && seen.insert(seedSurface).second) {
-        patchSurfaces.emplace_back(SurfacePatchIndex::SurfacePtr(seedSurface, [](QuadSurface*) {}));
-    }
-
-    auto index = std::make_shared<SurfacePatchIndex>();
-    index->rebuild(patchSurfaces, 0.0f);
-    return index;
-}
-
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     return utils::Json::parse(vc3d::socketRequestLine(
@@ -597,171 +550,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     }
 
     ensureGenerationsChannel(segmentationSurface.get());
-
-    if (method == SegmentationGrowthMethod::PatchTracer) {
-        if (_context.module->growthInProgress()) {
-            showStatus(tr("Surface growth already in progress"), kStatusMedium);
-            return false;
-        }
-        if (!_context.widget->customParamsValid()) {
-            const QString errorText = _context.widget->customParamsError();
-            const QString message = errorText.isEmpty()
-                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
-                : tr("Custom params JSON is invalid: %1").arg(errorText);
-            showStatus(message, kStatusLong);
-            return false;
-        }
-
-        const int sanitizedSteps = std::max(1, steps);
-        const SegmentationGrowthDirection effectiveDirection = inpaintOnly
-            ? SegmentationGrowthDirection::All
-            : direction;
-
-        SegmentationGrowthRequest request;
-        request.method = method;
-        request.direction = effectiveDirection;
-        request.steps = sanitizedSteps;
-        request.inpaintOnly = false;
-
-        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
-            request.allowedDirections = std::move(*overrideDirs);
-        }
-        if (request.allowedDirections.empty()) {
-            request.allowedDirections = _context.widget->allowedGrowthDirections();
-        }
-        if (request.allowedDirections.empty()) {
-            request.allowedDirections = {
-                SegmentationGrowthDirection::Up,
-                SegmentationGrowthDirection::Down,
-                SegmentationGrowthDirection::Left,
-                SegmentationGrowthDirection::Right
-            };
-        }
-
-        request.customParams = _context.widget->patchTracerParamsJson();
-        auto customParams = _context.widget->customParamsJson();
-        if (!customParams.is_null()) {
-            if (request.customParams.is_null()) {
-                request.customParams = utils::Json::object();
-            }
-            for (auto it = customParams.begin(); it != customParams.end(); ++it) {
-                request.customParams[it.key()] = *it;
-            }
-        }
-
-        // The current volume's stored umbilicus, in its voxels (the tracer runs at level 0).
-        std::optional<vc::objects::VolumeUmbilicus> umbilicus;
-        QString umbilicusProblem = tr("no object store or volume");
-        if (const auto attachment = _context.state->objectStoreAttachment();
-            attachment && !_context.state->currentVolumeId().empty()) {
-            try {
-                umbilicus = vc::objects::volumeUmbilicus(*_context.state->objectStoreSession(), *attachment,
-                                                         _context.state->currentVolumeId());
-                umbilicusProblem = tr("no umbilicus maps to the volume");
-            } catch (const std::exception& error) {
-                umbilicusProblem = QString::fromUtf8(error.what());
-            }
-        }
-        if (umbilicus) {
-            auto points = utils::Json::array();
-            for (const auto& p : umbilicus->points) {
-                auto xyz = utils::Json::array();
-                xyz.push_back(float(p[0]));
-                xyz.push_back(float(p[1]));
-                xyz.push_back(float(p[2]));
-                points.push_back(std::move(xyz));
-            }
-            request.customParams["umbilicus_points"] = std::move(points);
-        } else if (request.customParams.value("single wrap", false)) {
-            showStatus(tr("Single-wrap growth needs an umbilicus: %1").arg(umbilicusProblem), kStatusLong);
-            return false;
-        }
-
-        // The source: the current volume's surfaces with the tag, other than the one growing.
-        const QString sourceTag = _context.widget->patchTracerSourceTag();
-        auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
-        if (!catalog || !catalog->attachment()) {
-            showStatus(tr("Patch Tracer needs an attached object store."), kStatusLong);
-            return false;
-        }
-        PatchTracerSource source{catalog->session(), {}, sourceTag};
-        for (const auto& [uuid, row] : catalog->rows()) {
-            if (!row.bound() || uuid == segmentationSurface->id ||
-                std::find(row.record.tags.begin(), row.record.tags.end(), sourceTag.toStdString()) == row.record.tags.end()) {
-                continue;
-            }
-            source.surfaces.push_back({row.source, uuid, catalog->volume()->id()});
-            source.key += QStringLiteral("|%1@%2").arg(QString::fromStdString(uuid), QString::fromStdString(row.record.changedAt));
-        }
-
-        TracerGrowthContext ctx;
-        ctx.resumeSurface = segmentationSurface.get();
-        ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
-        ctx.voxelSize = volumeContext.activeVolume ? volumeContext.activeVolume->voxelSize() : 1.0;
-
-        if (_patchTracerCachedIndex && source.key == _patchTracerCachedSourceKey) {
-            ctx.surfacePatchIndex = _patchTracerCachedIndex.get();
-            ctx.patchSurfaces = _patchTracerCachedSurfaces;
-        }
-
-        qCInfo(lcSegGrowth) << "Patch Tracer requested"
-                            << "source tag" << sourceTag
-                            << "surfaces" << source.surfaces.size()
-                            << "steps" << sanitizedSteps;
-
-        _running = true;
-        _context.module->setGrowthInProgress(true);
-
-        ActiveRequest pending;
-        pending.volumeContext = volumeContext;
-        pending.growthVolume = volumeContext.activeVolume;
-        pending.growthVolumeId = volumeContext.activeVolumeId;
-        pending.segmentationSurface = segmentationSurface;
-        pending.growthVoxelSize = ctx.voxelSize;
-        pending.usingCorrections = false;
-        pending.inpaintOnly = false;
-        _activeRequest = std::move(pending);
-
-        showStatus(ctx.surfacePatchIndex
-                       ? tr("Running Patch Tracer growth with cached source index...")
-                       : tr("Building Patch Tracer index and running growth..."),
-                   kStatusMedium);
-
-        auto future = QtConcurrent::run([request, ctx, source]() mutable {
-            try {
-                std::shared_ptr<SurfacePatchIndex> builtIndex;
-                std::vector<std::shared_ptr<QuadSurface>> builtSurfaces;
-                if (!ctx.surfacePatchIndex) {
-                    builtSurfaces = loadPatchTracerSurfaces(source);
-                    builtIndex = buildPatchTracerIndex(builtSurfaces, ctx.resumeSurface);
-                    ctx.surfacePatchIndex = builtIndex.get();
-                    ctx.patchSurfaces = builtSurfaces;
-                }
-                TracerGrowthResult result = runPatchTracerGrowth(request, ctx);
-                if (builtIndex) {
-                    result.patchTracerCacheSourceKey = source.key;
-                    result.patchTracerCachedSurfaces = std::move(builtSurfaces);
-                    result.patchTracerCachedIndex = std::move(builtIndex);
-                }
-                return result;
-            } catch (const std::exception& e) {
-                qCWarning(lcSegGrowth) << "Patch Tracer worker failed:" << e.what();
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Patch Tracer failed: %1").arg(e.what());
-                return result;
-            } catch (...) {
-                qCWarning(lcSegGrowth) << "Patch Tracer worker failed with an unknown exception";
-                TracerGrowthResult result;
-                result.error = QStringLiteral("Patch Tracer failed with an unknown exception");
-                return result;
-            }
-        });
-        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
-        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
-                this, &SegmentationGrower::onFutureFinished);
-        _watcher->setFuture(future);
-        return true;
-    }
 
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
@@ -1345,12 +1133,6 @@ void SegmentationGrower::onFutureFinished()
 
     ActiveRequest request = std::move(*_activeRequest);
     _activeRequest.reset();
-
-    if (result.patchTracerCachedIndex && !result.patchTracerCacheSourceKey.isEmpty()) {
-        _patchTracerCachedSourceKey = result.patchTracerCacheSourceKey;
-        _patchTracerCachedSurfaces = result.patchTracerCachedSurfaces;
-        _patchTracerCachedIndex = result.patchTracerCachedIndex;
-    }
 
     if (!result.error.isEmpty()) {
         qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;

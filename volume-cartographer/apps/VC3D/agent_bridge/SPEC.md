@@ -326,7 +326,7 @@ Methods on segments need an attached store and an open volume (-32000).
 ### Segmentation editing
 
 - Editing must have an active materialized segment.
-- `segmentation.grow` accepts tracer, corrections, and patch-tracer growth.
+- `segmentation.grow` accepts tracer and corrections growth.
   Manual add is an editing mode, not a growth method.
 - Explicit save returns `jobId:null` when nothing is dirty; otherwise it
   creates an `autosave` job completed by the real save signal.
@@ -439,7 +439,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
-| `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections/patch_tracer; direction; steps). Async: returns a jobId. |
+| `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
 | `vc3d_lasagna_cancel` | `lasagna.cancel` |
 | `vc3d_lasagna_ensure_service` | `lasagna.ensure_service` |

@@ -2,7 +2,6 @@
 
 #include "segmentation/SegmentationCommon.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
-#include "utils/Json.hpp"
 
 #include <QString>
 #include <QStringList>
@@ -15,7 +14,6 @@
 
 class QCheckBox;
 class QComboBox;
-class QDoubleSpinBox;
 class QGroupBox;
 class QLabel;
 class QLineEdit;
@@ -37,13 +35,6 @@ public:
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
     [[nodiscard]] int growthScale() const { return _growthScale; }
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
-    // Patch Tracer grows from the surfaces with this record tag.
-    static constexpr const char* kDefaultPatchTracerSourceTag = "paths";
-    [[nodiscard]] QString patchTracerSourceTag() const
-    {
-        return _patchTracerSourceTag.isEmpty() ? QString::fromLatin1(kDefaultPatchTracerSourceTag) : _patchTracerSourceTag;
-    }
-    [[nodiscard]] utils::Json patchTracerParamsJson() const;
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
@@ -82,10 +73,6 @@ private:
     static int normalizeGrowthDirectionMask(int mask);
     void updateGrowthUiState();
     void updateNormal3dUi();
-    void updatePatchTracerSourceUi();
-    void resetPatchTracerParams(bool persist);
-    void syncPatchTracerParamsUi();
-    void persistPatchTracerParams();
     void triggerGrowthRequest(SegmentationGrowthDirection direction, int steps, bool inpaintOnly);
     [[nodiscard]] QString determineDefaultVolumeId(const QVector<QPair<QString, QString>>& volumes,
                                                    const QString& requestedId) const;
@@ -111,36 +98,11 @@ private:
     QLabel* _lblNormal3d{nullptr};
     QComboBox* _comboNormal3d{nullptr};
     QLineEdit* _editNormal3dPath{nullptr};
-    QLabel* _lblPatchTracerSource{nullptr};
-    QWidget* _patchTracerSourceContainer{nullptr};
-    QLineEdit* _editPatchTracerSourceTag{nullptr};
-    QGroupBox* _groupPatchTracerParams{nullptr};
-    QPushButton* _btnPatchTracerResetDefaults{nullptr};
-    QSpinBox* _spinPatchGlobalStepsPerWindow{nullptr};
-    QSpinBox* _spinPatchSrcStep{nullptr};
-    QSpinBox* _spinPatchStep{nullptr};
-    QSpinBox* _spinPatchMaxWidth{nullptr};
-    QDoubleSpinBox* _spinPatchLocalCostInlierThreshold{nullptr};
-    QDoubleSpinBox* _spinPatchSameSurfaceThreshold{nullptr};
-    QDoubleSpinBox* _spinPatchStraightWeight{nullptr};
-    QDoubleSpinBox* _spinPatchStraightWeight3d{nullptr};
-    QDoubleSpinBox* _spinPatchSlidingWindowScale{nullptr};
-    QDoubleSpinBox* _spinPatchZLocationLossWeight{nullptr};
-    QDoubleSpinBox* _spinPatchDistLoss2dWeight{nullptr};
-    QDoubleSpinBox* _spinPatchDistLoss3dWeight{nullptr};
-    QDoubleSpinBox* _spinPatchStraightMinCount{nullptr};
-    QSpinBox* _spinPatchInlierBaseThreshold{nullptr};
-    QSpinBox* _spinPatchConsensusDefaultThreshold{nullptr};
-    QSpinBox* _spinPatchConsensusLimitThreshold{nullptr};
-    QCheckBox* _chkPatchFlipX{nullptr};
-    QCheckBox* _chkPatchDebugImages{nullptr};
-    QCheckBox* _chkPatchSingleWrap{nullptr};
 
     // State
     SegmentationGrowthMethod _growthMethod{SegmentationGrowthMethod::Corrections};
     int _growthSteps{5};
     int _tracerGrowthSteps{5};
-    int _patchTracerGrowthSteps{100000};
     int _growthDirectionMask{0};
     bool _growthKeybindsEnabled{true};
 
@@ -154,26 +116,6 @@ private:
     QString _normal3dHint;
     QString _normal3dSelectedPath;
     QString _volumePackagePath;
-    QString _patchTracerSourceTag;
-    int _patchGlobalStepsPerWindow{0};
-    int _patchSrcStep{20};
-    int _patchStep{10};
-    int _patchMaxWidth{80000};
-    double _patchLocalCostInlierThreshold{0.2};
-    double _patchSameSurfaceThreshold{2.0};
-    double _patchStraightWeight{0.7};
-    double _patchStraightWeight3d{4.0};
-    double _patchSlidingWindowScale{1.0};
-    double _patchZLocationLossWeight{0.1};
-    double _patchDistLoss2dWeight{1.0};
-    double _patchDistLoss3dWeight{2.0};
-    double _patchStraightMinCount{1.0};
-    int _patchInlierBaseThreshold{20};
-    int _patchConsensusDefaultThreshold{10};
-    int _patchConsensusLimitThreshold{2};
-    bool _patchFlipX{false};
-    bool _patchDebugImages{false};
-    bool _patchSingleWrap{false};
     QVector<QPair<QString, QString>> _volumeEntries;
     QString _activeVolumeId;
 

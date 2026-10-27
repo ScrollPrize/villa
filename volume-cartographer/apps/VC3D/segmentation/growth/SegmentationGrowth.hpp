@@ -17,13 +17,12 @@
 #include "vc/ui/VCCollection.hpp"
 
 class QuadSurface;
-class SurfacePatchIndex;
 class Volume;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
-    PatchTracer = 3,
+    // 3 was Patch Tracer; a persisted 3 now reads back as Tracer.
     ManualAdd = 4,
 };
 
@@ -34,8 +33,6 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Tracer");
     case SegmentationGrowthMethod::Corrections:
         return QStringLiteral("Corrections");
-    case SegmentationGrowthMethod::PatchTracer:
-        return QStringLiteral("Patch Tracer");
     case SegmentationGrowthMethod::ManualAdd:
         return QStringLiteral("Manual Add");
     }
@@ -46,9 +43,6 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
 {
     if (value == static_cast<int>(SegmentationGrowthMethod::Corrections)) {
         return SegmentationGrowthMethod::Corrections;
-    }
-    if (value == static_cast<int>(SegmentationGrowthMethod::PatchTracer)) {
-        return SegmentationGrowthMethod::PatchTracer;
     }
     if (value == static_cast<int>(SegmentationGrowthMethod::ManualAdd)) {
         return SegmentationGrowthMethod::ManualAdd;
@@ -163,8 +157,6 @@ struct TracerGrowthContext {
     QString normal3dZarrPath;
     cv::Mat allowedGrowthMask;
     std::string growthVolumeId;
-    SurfacePatchIndex* surfacePatchIndex{nullptr};
-    std::vector<std::shared_ptr<QuadSurface>> patchSurfaces;
 };
 
 struct TracerGrowthResult {
@@ -173,9 +165,6 @@ struct TracerGrowthResult {
     QString statusMessage;
     // UUIDs of the surfaces a displacement copy created (front, back).
     std::vector<std::string> createdSurfaces;
-    QString patchTracerCacheSourceKey;
-    std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
-    std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
 };
 
 // Give a surface without a "generations" channel one (every vertex generation
@@ -184,6 +173,4 @@ bool ensureGenerationsChannel(QuadSurface* surface);
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
-TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
-                                        const TracerGrowthContext& context);
 

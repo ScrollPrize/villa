@@ -4,7 +4,6 @@
 #include <QThread>
 #include <iostream>
 #include <vc_object_store/Uuid.hpp>
-#include "segmentation/growth/SegmentationGrower.hpp"
 #include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include <vc_reader/registrations.hpp>
 #include <mutex>
@@ -162,17 +161,6 @@ int runSurfacePanelStoreTests()
         require(!panel.opened()->editable, "catalog surfaces are read-only");
         require(panel.activateSurfaceById(remote, &error) && fetchedNow() == std::vector<std::string>{remote},
                 "a remote catalog surface is fetched when activated headlessly");
-
-        // The Patch Tracer reads each source surface from the store it is in.
-        PatchTracerSource tracerSource{state.objectStoreSession(), {}, {}};
-        for (const auto& [uuid, row] : catalog.rows())
-            if (row.mapping) tracerSource.surfaces.push_back({row.source, uuid, volume->id()});
-        const auto tracerSurfaces = loadPatchTracerSurfaces(tracerSource);
-        require(tracerSource.surfaces.size() == 3 && tracerSurfaces.size() == 3 &&
-                std::any_of(tracerSurfaces.begin(), tracerSurfaces.end(), [](const auto& surface) {
-                    return (*surface->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1);
-                }),
-                "Patch Tracer sources load from their own stores, catalog ones scaled to the volume");
 
         // Editing a catalog surface edits it in the user's store as the same
         // surface. The user's store relates the two volumes as the catalog does

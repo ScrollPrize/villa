@@ -4,8 +4,6 @@
 
 #include "SegmentationGrowth.hpp"
 
-#include "vc/core/util/SurfacePatchIndex.hpp"
-
 #include <QFutureWatcher>
 #include <QObject>
 #include <QPointer>
@@ -33,24 +31,6 @@ class SurfacePanelController;
 class VolumePkg;
 class Volume;
 class QuadSurface;
-
-// The Patch Tracer's source surfaces, read from the store in the volume's voxels.
-struct PatchTracerSource {
-    std::shared_ptr<vc::objects::ObjectStoreSession> session;
-    struct Surface {
-        // The store it is in (the user's or a read-only catalog store).
-        vc::objects::AttachmentIdentity attachment;
-        std::string uuid;
-        std::string targetVolume;
-    };
-    std::vector<Surface> surfaces;
-    // Identifies the source's content: tag, surfaces and their change stamps.
-    QString key;
-};
-
-// Each source surface from its own store; ones that cannot be read (e.g. a
-// catalog surface never fetched) are skipped. Throws when none can be.
-std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTracerSource& source);
 
 class SegmentationGrower : public QObject
 {
@@ -127,7 +107,4 @@ private:
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;
-    QString _patchTracerCachedSourceKey;
-    std::vector<std::shared_ptr<QuadSurface>> _patchTracerCachedSurfaces;
-    std::shared_ptr<SurfacePatchIndex> _patchTracerCachedIndex;
 };

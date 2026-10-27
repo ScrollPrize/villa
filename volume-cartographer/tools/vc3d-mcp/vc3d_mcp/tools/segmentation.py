@@ -109,7 +109,7 @@ async def vc3d_save_segment(
 @mcp.tool()
 async def vc3d_grow_segment(
     steps: int,
-    method: Literal["tracer", "corrections", "patch_tracer"] = "tracer",
+    method: Literal["tracer", "corrections"] = "tracer",
     direction: Literal["all", "up", "down", "left", "right", "fill"] = "all",
     inpaint_only: bool = False,
     wait: bool = False,
@@ -117,7 +117,7 @@ async def vc3d_grow_segment(
 ) -> dict[str, Any]:
     """Grow the active segmentation surface. Async: returns a jobId.
 
-    method: "tracer" | "corrections" | "patch_tracer". ("manual_add" is not a
+    method: "tracer" | "corrections". ("manual_add" is not a
     growth method -- it is an interactive editing mode; passing it is rejected
     with -32009. Use the segmentation.manual_add.* RPCs instead.)
     direction: "all" | "up" | "down" | "left" | "right" | "fill".

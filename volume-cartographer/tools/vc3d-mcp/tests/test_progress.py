@@ -409,7 +409,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
 
         # A sampling of required enum schemas are emitted as JSON-schema enums.
         grow = by_name["vc3d_grow_segment"]["properties"]
-        self.assertEqual(grow["method"]["enum"], ["tracer", "corrections", "patch_tracer"])
+        self.assertEqual(grow["method"]["enum"], ["tracer", "corrections"])
         self.assertEqual(
             grow["direction"]["enum"], ["all", "up", "down", "left", "right", "fill"]
         )
