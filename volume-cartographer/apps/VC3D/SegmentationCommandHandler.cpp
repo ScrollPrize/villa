@@ -1469,31 +1469,15 @@ void SegmentationCommandHandler::onStraighten(const std::string& segmentId)
     const auto stored = requireStoredSurface(segmentId, false, true);
     if (!stored) return;
 
-    const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
-    if (exe.isEmpty()) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Could not find the 'vc_straighten' executable.\n"
-               "Looked in known locations and PATH.\n\n"
-               "Tip: set an override via VC.ini [tools] vc_straighten, or put "
-               "the binary on PATH."));
-        emit statusMessage(tr("Straighten failed"), 5000);
-        return;
-    }
-
     StraightenDialog dlg(_parentWidget, stored->name + QStringLiteral("_straightened"));
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
-    const QString outputName = dlg.outputName();
-    const QStringList args = dlg.toArgs();
-    std::cout << "[straighten] surface=" << segmentId
-              << " out=" << outputName.toStdString()
-              << " exe=" << exe.toStdString()
-              << " args=" << args.join(' ').toStdString()
-              << std::endl;
-
-    new StraightenJob(_parentWidget, this, exe, stored->store, QString::fromStdString(stored->uuid),
-                      stored->volumeUuid, outputName, args);
+    CommandLaunchError error;
+    if (!startStraightenImpl(segmentId, dlg.request(), /*interactive=*/true, &error, nullptr)) {
+        QMessageBox::critical(_parentWidget, tr("Error"), error.message);
+        emit statusMessage(tr("Straighten failed"), 5000);
+    }
 }
 
 void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
@@ -1505,9 +1489,7 @@ void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
-
-    new ABFJob(_parentWidget, _surfacePanel->catalog(), this, stored->uuid, stored->name + QStringLiteral("_abf"),
-               dlg.iterations(), dlg.downsampleFactor());
+    startAbfFlattenImpl(segmentId, dlg.iterations(), dlg.downsampleFactor(), /*interactive=*/true, nullptr, nullptr);
 }
 
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
@@ -1825,6 +1807,16 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
                                                  CommandLaunchError* error,
                                                  QString* resolvedOutputName)
 {
+    return startAbfFlattenImpl(segmentId, iterations, downsampleFactor, /*interactive=*/false, error, resolvedOutputName);
+}
+
+bool SegmentationCommandHandler::startAbfFlattenImpl(const std::string& segmentId,
+                                                     int iterations,
+                                                     int downsampleFactor,
+                                                     bool interactive,
+                                                     CommandLaunchError* error,
+                                                     QString* resolvedOutputName)
+{
     const auto stored = storedSurface(segmentId, error, true);
     if (!stored) return false;
 
@@ -1832,7 +1824,7 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
     const QString outputName = stored->name + QStringLiteral("_abf");
     new ABFJob(_parentWidget, _surfacePanel->catalog(), this, stored->uuid, outputName,
                std::max(1, iterations), std::max(1, downsampleFactor),
-               /*suppressDialogs=*/true);
+               /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;
@@ -1843,6 +1835,15 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
                                                  CommandLaunchError* error,
                                                  QString* resolvedOutputName)
 {
+    return startStraightenImpl(segmentId, params, /*interactive=*/false, error, resolvedOutputName);
+}
+
+bool SegmentationCommandHandler::startStraightenImpl(const std::string& segmentId,
+                                                     const StraightenParams& params,
+                                                     bool interactive,
+                                                     CommandLaunchError* error,
+                                                     QString* resolvedOutputName)
+{
     const CommandLaunchErrorSetter setErr{error};
 
     const auto stored = storedSurface(segmentId, error, true);
@@ -1850,7 +1851,8 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
 
     const QString exe = vc3d::findToolExecutable(QStringLiteral("vc_straighten"));
     if (exe.isEmpty()) {
-        setErr(tr("vc_straighten not found or not executable."),
+        setErr(tr("Could not find the 'vc_straighten' executable (known locations and PATH). "
+                  "Set it in VC.ini [tools] vc_straighten, or put it on PATH."),
                CommandLaunchError::ToolUnavailable);
         return false;
     }
@@ -1858,23 +1860,11 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
     const QString outputName =
         params.outputName.isEmpty() ? stored->name + QStringLiteral("_straightened") : params.outputName;
 
-    // Keep argument construction aligned with StraightenDialog::toArgs().
-    QStringList args;
-    if (params.unbend) {
-        args << QStringLiteral("--unbend");
-        args << QStringLiteral("--unbend-smooth-cols")
-             << QString::number(params.unbendSmoothCols, 'f', 0);
-    }
-    args << QStringLiteral("--overlap-pairs") << QString::number(params.overlapPasses);
-    if (params.orthogonalize) args << QStringLiteral("--orthogonalize");
-    if (params.trim) {
-        args << QStringLiteral("--trim");
-        args << QStringLiteral("--trim-max-edge")
-             << QString::number(params.trimMaxEdge, 'f', 0);
-    }
-
+    const QStringList args = straightenArgs(params);
+    std::cout << "[straighten] surface=" << segmentId << " out=" << outputName.toStdString()
+              << " exe=" << exe.toStdString() << " args=" << args.join(' ').toStdString() << std::endl;
     new StraightenJob(_parentWidget, this, exe, stored->store, QString::fromStdString(stored->uuid),
-                      stored->volumeUuid, outputName, args, /*suppressDialogs=*/true);
+                      stored->volumeUuid, outputName, args, /*suppressDialogs=*/!interactive);
 
     if (resolvedOutputName) *resolvedOutputName = outputName;
     return true;

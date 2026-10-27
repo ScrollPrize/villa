@@ -16,6 +16,7 @@
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
+#include "StraightenRequest.hpp"
 #include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
@@ -120,16 +121,7 @@ public:
     };
 
     // Arguments accepted by startStraighten.
-    struct StraightenParams {
-        bool    unbend{true};
-        double  unbendSmoothCols{300.0};  // only emitted when unbend is true
-        int     overlapPasses{2};         // always emitted as --overlap-pairs
-        bool    orthogonalize{true};
-        bool    trim{true};
-        double  trimMaxEdge{100.0};       // only emitted when trim is true
-        QString outputName;               // the straightened surface's name; empty
-                                          // => <name>_straightened (dialog default)
-    };
+    using StraightenParams = StraightenRequest;
 
     // Inputs shared by the interactive dialog and dialog-free caller. Base
     // tracer params are fixed; paramOverrides merge over them last.
@@ -268,6 +260,13 @@ public:
                          int downsampleFactor,
                          CommandLaunchError* error = nullptr,
                          QString* resolvedOutputName = nullptr);
+    // The one ABF launch, from the dialog (interactive) or the bridge.
+    bool startAbfFlattenImpl(const std::string& segmentId,
+                             int iterations,
+                             int downsampleFactor,
+                             bool interactive,
+                             CommandLaunchError* error,
+                             QString* resolvedOutputName);
 
     /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
     /// validated before launch; completion uses flattenJobFinished.
@@ -275,6 +274,12 @@ public:
                          const StraightenParams& params,
                          CommandLaunchError* error = nullptr,
                          QString* resolvedOutputName = nullptr);
+    // The one straighten launch, from the dialog (interactive) or the bridge.
+    bool startStraightenImpl(const std::string& segmentId,
+                             const StraightenParams& params,
+                             bool interactive,
+                             CommandLaunchError* error,
+                             QString* resolvedOutputName);
 
     /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
     /// gathers the same ResumeLocalGrowParams and uses the same launch core.

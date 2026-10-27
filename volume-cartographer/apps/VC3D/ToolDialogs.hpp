@@ -19,6 +19,7 @@
 #include <optional>
 
 #include "AlphaCompRefineRequest.hpp"
+#include "StraightenRequest.hpp"
 #include "elements/VolumeSelector.hpp"
 
 class JsonProfileEditor;
@@ -563,11 +564,8 @@ class StraightenDialog : public QDialog {
 public:
     StraightenDialog(QWidget* parent, const QString& defaultOutputName);
 
-    QString outputName() const;
-    // CLI args (without input/output) derived from the dialog state. Always
-    // emits an explicit --overlap-pairs so the tool never falls back to its
-    // implicit "no flags = full pipeline" default.
-    QStringList toArgs() const;
+    // The run the dialog describes.
+    StraightenRequest request() const;
 
 private:
     static bool s_haveSession;

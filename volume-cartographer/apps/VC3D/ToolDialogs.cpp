@@ -1530,36 +1530,18 @@ StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutput
     });
 }
 
-QString StraightenDialog::outputName() const
+StraightenRequest StraightenDialog::request() const
 {
-    if (edtOutput_) {
-        const QString t = edtOutput_->text().trimmed();
-        if (!t.isEmpty()) return t;
-    }
-    return defaultOutput_;
-}
-
-QStringList StraightenDialog::toArgs() const
-{
-    QStringList a;
-    if (cbUnbend_ && cbUnbend_->isChecked()) {
-        a << QStringLiteral("--unbend");
-        if (spUnbendSmooth_)
-            a << QStringLiteral("--unbend-smooth-cols")
-              << QString::number(spUnbendSmooth_->value(), 'f', 0);
-    }
-    // Always explicit so vc_straighten never falls back to its implicit
-    // "no stage flags = full default pipeline" behavior.
-    a << QStringLiteral("--overlap-pairs")
-      << QString::number(spOverlap_ ? spOverlap_->value() : 2);
-    if (cbOrtho_ && cbOrtho_->isChecked()) a << QStringLiteral("--orthogonalize");
-    if (cbTrim_ && cbTrim_->isChecked()) {
-        a << QStringLiteral("--trim");
-        if (spTrimMaxEdge_)
-            a << QStringLiteral("--trim-max-edge")
-              << QString::number(spTrimMaxEdge_->value(), 'f', 0);
-    }
-    return a;
+    StraightenRequest request;
+    request.unbend = cbUnbend_ && cbUnbend_->isChecked();
+    if (spUnbendSmooth_) request.unbendSmoothCols = spUnbendSmooth_->value();
+    if (spOverlap_) request.overlapPasses = spOverlap_->value();
+    request.orthogonalize = cbOrtho_ && cbOrtho_->isChecked();
+    request.trim = cbTrim_ && cbTrim_->isChecked();
+    if (spTrimMaxEdge_) request.trimMaxEdge = spTrimMaxEdge_->value();
+    const QString name = edtOutput_ ? edtOutput_->text().trimmed() : QString();
+    request.outputName = name.isEmpty() ? defaultOutput_ : name;
+    return request;
 }
 
 // ================= VisLasagnaObjDialog =================
