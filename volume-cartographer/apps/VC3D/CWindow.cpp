@@ -2608,15 +2608,12 @@ void CWindow::updateCatalogSurfaceSources()
     // An Open Data volume shows its sample's catalog surfaces, through the
     // catalog's registrations (its pyramid levels among them).
     std::vector<vc::objects::AttachmentIdentity> sources;
-    const auto volume = _state->currentVolume();
-    const auto catalog = vc3d::opendata::cachedCatalog();
-    if (volume && catalog && volume->isRemote()) {
-        if (const auto view = catalog->volumeAt(volume->remoteUrl(), volume->baseScaleLevel())) {
-            try {
-                sources.push_back(_state->catalogAttachment(*catalog->findSample(view->sampleId)));
-            } catch (const std::exception& error) {
-                showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
-            }
+    const auto pkg = _state->vpkg();
+    if (const auto view = pkg ? pkg->catalogView(_state->currentVolumeId()) : std::nullopt) {
+        try {
+            sources.push_back(_state->catalogAttachment(*pkg->catalog()->findSample(view->sampleId)));
+        } catch (const std::exception& error) {
+            showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
         }
     }
     _surfaceCatalog->setCatalogSources(std::move(sources));
