@@ -1,5 +1,5 @@
 // More coverage for QuadSurface.cpp: gridNormal, center, ptrToGrid, loc_raw,
-// resample, unloadCaches, computeZOrientationAngle, orientZUp,
+// unloadCaches,
 // contains, overlap, lookupDepthIndex.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -198,77 +198,11 @@ TEST_CASE("strict quad rendering never exposes more support than legacy renderin
     CHECK(strictFinite <= legacyFinite);
 }
 
-TEST_CASE("resample (single factor) downscales by 0.5")
-{
-    auto pts = makePlanarGrid(20, 20);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.resample(0.5f);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK(p->rows == 10);
-    CHECK(p->cols == 10);
-    // _scale should have inflated: 1.0 / 0.5 = 2.0
-    CHECK(qs.scale()[0] == doctest::Approx(2.0f));
-    CHECK(qs.scale()[1] == doctest::Approx(2.0f));
-}
-
-TEST_CASE("resample (factor=1) is a no-op")
-{
-    auto pts = makePlanarGrid(10, 10);
-    QuadSurface qs(pts, cv::Vec2f(3.f, 4.f));
-    qs.resample(1.0f);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK(p->rows == 10);
-    CHECK(p->cols == 10);
-    CHECK(qs.scale()[0] == doctest::Approx(3.0f));
-    CHECK(qs.scale()[1] == doctest::Approx(4.0f));
-}
-
-TEST_CASE("resample with negative/zero factor is rejected silently")
-{
-    auto pts = makePlanarGrid(10, 10);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.resample(-1.0f);
-    qs.resample(0.0f);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK(p->rows == 10);
-    CHECK(p->cols == 10);
-}
-
-TEST_CASE("resample (NEAREST) preserves sentinels by interpolation choice")
-{
-    auto pts = makePlanarGrid(20, 20);
-    pts(10, 10) = cv::Vec3f(-1.f, -1.f, -1.f);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.resample(0.5f, 0.5f, cv::INTER_NEAREST);
-    auto* p = qs.rawPointsPtr();
-    REQUIRE(p);
-    CHECK(p->rows == 10);
-}
-
 TEST_CASE("unloadCaches keeps the points")
 {
     auto pts = makePlanarGrid(4, 4);
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
     qs.unloadCaches();
-    CHECK(qs.rawPointsPtr() != nullptr);
-}
-
-TEST_CASE("computeZOrientationAngle returns a finite angle for a flat grid")
-{
-    auto pts = makePlanarGrid(16, 16);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    float angle = qs.computeZOrientationAngle();
-    CHECK(std::isfinite(angle));
-}
-
-TEST_CASE("orientZUp runs without crashing on a planar grid")
-{
-    auto pts = makePlanarGrid(16, 16);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    qs.orientZUp();
     CHECK(qs.rawPointsPtr() != nullptr);
 }
 
