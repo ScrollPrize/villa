@@ -608,6 +608,29 @@ Notes from steps 5–8 that the remaining steps build on:
   - Not run on real data: a two-rank fit (one GPU here; the two-rank
     startup tests run on CPU ranks) and a resume against changed inputs
     (covered by the startup tests).
+- Re-ingest after the service plan's stage 0 merge of `tifxyz-to-obj-store`
+  (2026-10-27, schema 17, object kind `surface`): the same 181 surfaces
+  (listed from the step-12 store's `storage_ref`s), three PCL documents and
+  fibers, with that store's derivation namespace, in two runs:
+  `vc_object_ingest --db STORE --author stage0-acceptance --derive-uuids
+  4d388e94-79e1-5047-aed1-a901c3dcb146 --volume-uuid s1-reference
+  --scale-factor 1 --renumber-point-ids --surface DIR... --point-collections
+  {abs_winding,relative_windings,same_windings}.json`, then `--scale-factor 4
+  --drop-dangling-branches --fiber dataset/fibers`. 181 surfaces, 662
+  collections (202 same-winding renumbered), 111 fibers and 100 branches;
+  all 954 object UUIDs equal the step-12 store's (derived surface names keep
+  the `patch:` key). One surface has `mask.tif`, now its `valid` channel.
+  - Startup smoke (`OBJECT_STORE_SMOKE_STORE=<copy> OBJECT_STORE_SMOKE_Z=9000:9100
+    pytest -s tests/test_object_store_startup.py -k real_data`, centerline-only
+    normals): refresh created 553 PCL-surface, 6 fiber-surface and 444 overlap
+    links; the materialized counts (173 patches, 28 PCL and 6 fiber
+    attachments, 100 branches, 326 overlap edges as 805 pairs) and the
+    no-refresh rerun's digest agree. The 444 overlap edges are the step-12
+    store's endpoint pairs with the same inlier counts. Step 12's 327 edges
+    and 809 pairs predate stage 0: the pre-merge adapter and module give
+    326/805 on a copy of the step-12 store too.
+  - Not run: the 1,000-step GPU fit and its no-refresh rerun (the GPU was
+    busy with another job). This remains the stage 1 gate.
 
 Use existing environments and test entrypoints throughout; no bootstrap or
 installation is part of this sequence. Broader training runs validate the

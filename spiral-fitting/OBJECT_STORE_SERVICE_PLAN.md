@@ -6,7 +6,10 @@ Companion to [OBJECT_STORE_CLI_PLAN.md](OBJECT_STORE_CLI_PLAN.md). CLI steps
 11–12 are complete as of 2026-10-26: cleanup landed in `84757fd9d`, acceptance
 and documentation in `cb0e796d8`, and review fixes in `ebc43f070`. Normal
 sources are then addressed by array path rather than multiscales index
-(`89abe9606`, `b793e0b88`, superseding `743d6d6d2`). Stage 0 can now begin.
+(`89abe9606`, `b793e0b88`, superseding `743d6d6d2`). Stage 0 commits 1–3 landed
+on 2026-10-27 (`0ed53d4ce`, `6221efeba`, `0061bc9b8`); step 4's re-ingest and
+CPU startup smoke are recorded in the CLI acceptance notes, and its GPU fit is
+still to run.
 This document is a plan, not a claim that the service already supports that port:
 the current service cannot start a fit against the store-only `FitContext`
 (it still passes the removed `input_bindings` constructor argument).
@@ -17,7 +20,8 @@ counts/digest. They also record 19 unrelated pre-existing suite failures; real-d
 two-rank fitting and changed-input resume remain unrun (CPU startup/resume tests
 cover those contracts). These limits do not replace the service acceptance below.
 That run predates the array-path normal addressing and stage 0's store
-changes; stage 0 reruns it before stage 1 relies on it.
+changes; stage 0 reruns it before stage 1 relies on it (pending: the store was
+re-ingested and its startup refresh checked, but the GPU fit has not rerun).
 
 Port both `spiral-fitting`'s persistent HTTP service and the Spiral workspace in
 `volume-cartographer/apps/VC3D`. Deliver in two stages, after a prerequisite
@@ -400,8 +404,8 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
    naming the identity change, rather than refusing it. This is shared with
    the CLI. Test that two replicas of a fixture store give one digest, and
    that a metadata-only edit changes it. Make the replicas with `hub_init`
-   and two `hub_clone`s: stage 0's store has no `fork_replica` binding or
-   two-store `synchronize`, and a hub clone is the deployed case.
+   and two `hub_clone`s: stage 0's store has no two-store `synchronize`
+   (`fork_replica` is bound again), and a hub clone is the deployed case.
 3. **Service: bind the object store at launch.** Add required `--object-store`
    next to `--cache` (`spiral_service.py` argparse): resolve it absolutely,
    open it read-only once and record its store UUID. Fail startup with a clear
