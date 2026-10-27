@@ -3,6 +3,7 @@
 #include <map>
 #include <set>
 #include <deque>
+#include <string_view>
 namespace vcr::catalog {
 const TransformCandidate& TransformResolution::resolved() const {
     if(status!=TransformStatus::Resolved)throw std::runtime_error(status==TransformStatus::Ambiguous?"ambiguous volume transform; select a registration":"no volume transform");
@@ -85,5 +86,27 @@ std::vector<TransformResolution> RegistrationGraph::available(const std::string&
     std::vector<TransformResolution> result;
     for(const auto& target:volumes)if(target!=source){auto r=resolve(source,target);if(r.status!=TransformStatus::Unavailable)result.push_back(std::move(r));}
     return result;
+}
+std::vector<TransformResolution> RegistrationGraph::reaching(const std::string& target) const {
+    std::set<std::string> volumes;for(const auto& r:registrations_){volumes.insert(r.source);volumes.insert(r.target);}
+    std::vector<TransformResolution> result;
+    for(const auto& source:volumes)if(source!=target){auto r=resolve(source,target);if(r.status!=TransformStatus::Unavailable)result.push_back(std::move(r));}
+    return result;
+}
+std::string RegistrationGraph::describe(const std::vector<std::string>& path) const {
+    std::string text;
+    for(const auto& step:path) {
+        constexpr std::string_view inversePrefix="inverse:";
+        const bool inverse=step.starts_with(inversePrefix);
+        const auto key=inverse?step.substr(inversePrefix.size()):step;
+        std::string label=key;
+        for(const auto& r:registrations_)if(r.id+"@"+r.revision==key) {
+            label=(r.provenance.empty()?r.id:r.provenance)+" ("+r.source+" → "+r.target+")";
+            break;
+        }
+        if(!text.empty())text+=", then ";
+        text+=inverse?"inverse of "+label:label;
+    }
+    return text;
 }
 }

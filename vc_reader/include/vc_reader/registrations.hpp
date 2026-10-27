@@ -31,6 +31,11 @@ public:
     TransformResolution resolve(const std::string& source,const std::string& target,
                                 const std::optional<std::vector<std::string>>& choice=std::nullopt) const;
     std::vector<TransformResolution> available(const std::string& source) const;
+    // Every volume with a route to `target`: its resolution from that volume.
+    std::vector<TransformResolution> reaching(const std::string& target) const;
+    // A route's steps by registration provenance (else id), with the volumes
+    // each relates and inverse steps marked, e.g. "inverse of scan (a → b)".
+    std::string describe(const std::vector<std::string>& path) const;
     const std::vector<Registration>& registrations() const{return registrations_;}
 private:
     std::vector<Registration> registrations_;

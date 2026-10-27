@@ -31,6 +31,15 @@ int main(int argc,char** argv) {
         require(custom.resolve("a","c",c.path).status==TransformStatus::Resolved,"explicit choice");
         auto stale=c.path;stale[0]+="changed";
         require(custom.resolve("a","c",stale).status==TransformStatus::Unavailable,"stale choice");
+        RegistrationGraph star;
+        star.add({"x-y","1","x","y",Affine::scale(2),"scan x"});
+        star.add({"z-y","1","z","y",Affine::scale(4),""});
+        const auto into=star.reaching("y");
+        require(into.size()==2&&into[0].source=="x"&&into[1].source=="z"&&
+                into[0].status==TransformStatus::Resolved&&into[1].status==TransformStatus::Resolved,"volumes with a route into a target");
+        require(star.describe(into[0].candidates.front().path)=="scan x (x → y)"&&
+                star.describe(star.resolve("x","z").resolved().path)=="scan x (x → y), then inverse of z-y (z → y)",
+                "routes described by registration");
         require(custom.resolve("a","missing").status==TransformStatus::Unavailable,"missing path");
         try { auto invalid=Affine{};invalid(0,0)=0;(void)invalid.inverse();throw std::runtime_error("accepted singular"); }
         catch(const std::invalid_argument&){}
