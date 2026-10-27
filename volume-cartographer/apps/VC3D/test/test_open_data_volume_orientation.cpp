@@ -2,17 +2,14 @@
 
 #include "OpenDataVolumeOrientation.hpp"
 
-using vc3d::opendata::VolumeOrientation;
+using vcr::catalog::OpenDataOrientation;
 
 namespace
 {
 
-VolumeOrientation orientation(std::optional<bool> topToBottom, std::optional<bool> leftHanded)
+OpenDataOrientation orientation(std::optional<bool> topToBottom, std::optional<bool> leftHanded)
 {
-    VolumeOrientation value;
-    value.zTopToBottom = topToBottom;
-    value.leftHandedCoordinates = leftHanded;
-    return value;
+    return {topToBottom, leftHanded};
 }
 
 // A manifest with one sample and one volume carrying the given properties
@@ -47,16 +44,14 @@ private slots:
     {
         const auto manifest = vcr::catalog::parseOpenDataManifest(manifestText(
             R"({"z_direction_is_top_to_bottom": true, "left_handed_coordinates": false})"));
-        const auto found = vc3d::opendata::volumeOrientationOf(
-            *manifest.findSample("PHerc0139")->findVolume("20260102150214"));
+        const auto found = manifest.findSample("PHerc0139")->findVolume("20260102150214")->orientation;
         QCOMPARE(found.zTopToBottom, std::optional<bool>(true));
         QCOMPARE(found.leftHandedCoordinates, std::optional<bool>(false));
 
         // Absent, null, or anything else is unset - never a default.
         const auto unset = vcr::catalog::parseOpenDataManifest(manifestText(
             R"({"left_handed_coordinates": null, "z_direction_is_top_to_bottom": "true", "pixel_size_um": 2.399})"));
-        const auto partial = vc3d::opendata::volumeOrientationOf(
-            *unset.findSample("PHerc0139")->findVolume("20260102150214"));
+        const auto partial = unset.findSample("PHerc0139")->findVolume("20260102150214")->orientation;
         QVERIFY(!partial.zTopToBottom.has_value());
         QVERIFY(!partial.leftHandedCoordinates.has_value());
         QVERIFY(vc3d::opendata::orientationText(found) != vc3d::opendata::orientationText(partial));

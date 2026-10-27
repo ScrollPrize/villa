@@ -4,15 +4,7 @@
 
 namespace vc3d::opendata {
 
-VolumeOrientation volumeOrientationOf(const vcr::catalog::OpenDataVolume& volume)
-{
-    VolumeOrientation orientation;
-    orientation.zTopToBottom = volume.zDirectionIsTopToBottom;
-    orientation.leftHandedCoordinates = volume.leftHandedCoordinates;
-    return orientation;
-}
-
-std::optional<int> windingChiralityOf(const VolumeOrientation& orientation)
+std::optional<int> windingChiralityOf(const vcr::catalog::OpenDataOrientation& orientation)
 {
     if (!orientation.zTopToBottom || !orientation.leftHandedCoordinates) {
         return std::nullopt;
@@ -27,10 +19,10 @@ std::optional<CatalogVolumeSense> catalogVolumeSense(const VolumePkg& pkg, const
         return std::nullopt;
     }
     const auto* volume = pkg.catalog()->findSample(view->sampleId)->findVolume(view->volumeId);
-    return CatalogVolumeSense{view->sampleId + '/' + view->volumeId, volumeOrientationOf(*volume)};
+    return CatalogVolumeSense{view->sampleId + '/' + view->volumeId, volume->orientation};
 }
 
-std::string orientationText(const VolumeOrientation& orientation)
+std::string orientationText(const vcr::catalog::OpenDataOrientation& orientation)
 {
     const auto text = [](const std::optional<bool>& value) {
         return value ? (*value ? "1" : "0") : "?";
