@@ -519,3 +519,38 @@ def test_real_data_startup_smoke():
     assert inputs.counts['pcl attachments'] + inputs.counts['fiber attachments'] \
         + inputs.counts['overlap pairs'] > 0
     assert load(path, z_begin=z_begin, z_end=z_end).digest == inputs.digest
+
+
+
+def _attach_results(path, tag=None):
+    """A correctly framed fit-results collection attached to the near patch."""
+    with ObjectStore.open(path, author='fit', hostname='host') as db:
+        near = next(r['uuid'] for r in db.objects_by_kind('surface') if r['name'] == 'near')
+        results = put_pcl(db, _on(100.0, (12.0, 48.0)), name='results',
+                          **({'tags': [tag]} if tag else {}))
+        db.set_meta(results, 'role', 'fit_results')
+        whole = {'whole_geometry': True}
+        db.add_edge({'kind': 'attachment', 'a': results, 'b': near,
+                     'a_anchor': whole, 'b_anchor': whole, 'meta': {'role': 'fit_results'}})
+    return results
+
+
+@pytest.mark.parametrize('refresh', [True, False])
+def test_attached_collections_are_not_fit_inputs(store_path, refresh):
+    if not refresh:
+        load(store_path)  # the no-refresh read consumes links made earlier
+    results = _attach_results(store_path, tag='walks')
+    inputs = load(store_path, object_store_refresh_links=refresh)
+    assert inputs.counts['pcl attachments'] == 3
+    assert results not in json.dumps(inputs.manifest)
+    # A tag matching only the attached collection selects no PCL.
+    inputs = load(store_path, object_store_refresh_links=refresh,
+                  object_store_pcl_tags=['walks'])
+    assert inputs.counts['pcl attachments'] == 0
+    assert results not in json.dumps(inputs.manifest)
+
+
+def test_explicitly_selected_attached_collection_is_refused(store_path):
+    results = _attach_results(store_path)
+    with pytest.raises(osi.ObjectStoreInputError, match='attached data'):
+        load(store_path, object_store_pcl_uuids=[results])

@@ -218,11 +218,24 @@ class InputSnapshot:
         return manifest_digest(self.manifest())
 
 
+def attached_data(record):
+    """Whether an object is data attached to another (``meta.role``, e.g. fit
+    results) rather than a fit input. The store's PCL-surface detector refuses
+    such collections, so they are never selected as inputs."""
+    return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
+
+
 def resolve_selector(store, kind, selector):
-    """Explicit sorted UUIDs selected by ``selector`` among active objects."""
+    """Explicit sorted UUIDs selected by ``selector`` among active objects.
+
+    Default and tag selections leave out attached data; naming it by UUID is
+    an error."""
+    def matching(**query):
+        return [record['uuid'] for record in store.select_objects(
+            object_kind=kind, fields=['uuid', 'meta'], **query) if not attached_data(record)]
+
     if selector.is_default:
-        return sorted(record['uuid'] for record in store.select_objects(
-            object_kind=kind, fields=['uuid']))
+        return sorted(matching())
     selected = set()
     problems = []
     for uuid in selector.uuids or ():
@@ -233,13 +246,15 @@ def resolve_selector(store, kind, selector):
             problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
         elif record.get('retired'):
             problems.append(f'selected {kind} {uuid} is retired')
+        elif attached_data(record):
+            problems.append(f'selected {kind} {uuid} is attached data with role '
+                            f'{record["meta"]["role"]!r}, not a fit input')
         else:
             selected.add(record['uuid'])
     if problems:
         raise ObjectStoreInputError(problems)
     for tag in selector.tags or ():
-        selected.update(record['uuid'] for record in store.select_objects(
-            object_kind=kind, tag=tag, fields=['uuid']))
+        selected.update(matching(tag=tag))
     return sorted(selected)
 
 
