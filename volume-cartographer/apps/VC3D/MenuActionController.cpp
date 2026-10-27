@@ -675,7 +675,7 @@ bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample
 }
 
 bool MenuActionController::startOpenDataSampleOpen(
-    const QString& sampleId,
+    const vcr::catalog::OpenDataSample& sample,
     const vc3d::opendata::OpenDataResourceSelection& selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
     std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
@@ -683,22 +683,6 @@ bool MenuActionController::startOpenDataSampleOpen(
 {
     if (!_window || !_window->_state) {
         if (errorMessage) *errorMessage = QObject::tr("No application window available.");
-        return false;
-    }
-    if (sampleId.isEmpty()) {
-        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
-        return false;
-    }
-    const auto manifest = vc3d::opendata::cachedCatalog();
-    if (!manifest) {
-        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
-        return false;
-    }
-    const vcr::catalog::OpenDataSample* sample =
-        manifest->findSample(sampleId.toStdString());
-    if (!sample) {
-        if (errorMessage)
-            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
         return false;
     }
     if (_openDataSampleOpenInFlight) {
@@ -709,7 +693,7 @@ bool MenuActionController::startOpenDataSampleOpen(
 
     // This entry point is always non-interactive. Completion is delivered
     // through onFinished on the GUI thread.
-    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &selection,
+    beginOpenDataSampleOpenTask(sample, /*interactive=*/false, &selection,
                                 std::move(onFinished), std::move(onProgress));
     return true;
 }

@@ -13,8 +13,8 @@
 #include "utils/zarr.hpp"
 
 #include <QSaveFile>
-#include <QUrl>
-#include <QXmlStreamReader>
+
+#include <vc_reader/s3_listing.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -39,45 +39,6 @@ void writeMarker(const std::filesystem::path& path, const std::string& text)
         output.write(text.data(), qint64(text.size())) != qint64(text.size()) || !output.commit()) {
         throw std::runtime_error("failed to write " + path.string());
     }
-}
-
-std::string discoverManifestKey(const OpenDataLasagnaInfo& info)
-{
-    const auto remote = vc::splitRemotePrefixUrl(info.artifactUrl);
-    if (!remote)
-        throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " +
-                                 info.artifactUrl);
-    const std::string& origin = remote->origin;
-    const std::string& prefix = remote->keyPrefix;
-    const QString listUrl = QString::fromStdString(origin) +
-        QStringLiteral("/?list-type=2&max-keys=100&delimiter=%2F&prefix=") +
-        QString::fromUtf8(QUrl::toPercentEncoding(QString::fromStdString(prefix)));
-    const auto xmlText = vc::httpGetString(listUrl.toStdString());
-    QXmlStreamReader xml(QString::fromStdString(xmlText));
-    std::vector<std::string> keys;
-    while (!xml.atEnd()) {
-        xml.readNext();
-        if (xml.isStartElement() && xml.name() == QStringLiteral("Key")) {
-            const auto key = xml.readElementText().toStdString();
-            if (key.rfind(prefix, 0) != 0) continue;
-            const auto relative = key.substr(prefix.size());
-            if (!relative.empty() && relative.find('/') == std::string::npos &&
-                relative.ends_with(".lasagna.json")) {
-                keys.push_back(key);
-            }
-        }
-    }
-    if (xml.hasError())
-        throw std::runtime_error("Failed to parse Lasagna artifact listing: " +
-                                 xml.errorString().toStdString());
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    if (keys.size() != 1) {
-        throw std::runtime_error(
-            "Lasagna artifact must contain exactly one root .lasagna.json; found " +
-            std::to_string(keys.size()));
-    }
-    return keys.front();
 }
 
 void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest,
@@ -172,13 +133,27 @@ int dyadicLevelForShapes(const std::array<std::size_t, 3>& baseShape,
 
 std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
 {
-    OpenDataLasagnaInfo info;
-    info.artifactUrl = artifactUrl;
-    const auto key = discoverManifestKey(info);
-    const auto remote = vc::splitRemotePrefixUrl(artifactUrl);
-    if (!remote)
-        throw std::runtime_error("Invalid Lasagna artifact URL");
-    return vcr::catalog::joinOpenDataUrl(remote->origin, key);
+    const auto prefix = vcr::s3::splitPrefixUrl(artifactUrl);
+    if (!prefix)
+        throw std::runtime_error("Lasagna artifact URL is not a listable prefix: " + artifactUrl);
+    const auto page = vcr::s3::parseListPage(vc::httpGetString(vcr::s3::listUrl(*prefix, "/", {}, 100)));
+    std::vector<std::string> keys;
+    for (const auto& object : page.objects) {
+        if (object.key.rfind(prefix->key, 0) != 0) continue;
+        const auto relative = object.key.substr(prefix->key.size());
+        if (!relative.empty() && relative.find('/') == std::string::npos &&
+            relative.ends_with(".lasagna.json")) {
+            keys.push_back(object.key);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.size() != 1) {
+        throw std::runtime_error(
+            "Lasagna artifact must contain exactly one root .lasagna.json; found " +
+            std::to_string(keys.size()));
+    }
+    return vcr::catalog::joinOpenDataUrl(prefix->origin, keys.front());
 }
 
 OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
@@ -300,7 +275,7 @@ std::filesystem::path lasagnaCacheDir(
         for (const auto extent : *info.baseShapeZYX) identity << '\n' << extent;
     }
     return remoteCacheRoot / "open_data" / "lasagna" /
-           safePathComponent(info.sampleId) / safePathComponent(info.volumeId) /
+           vcr::catalog::safePathComponent(info.sampleId) / vcr::catalog::safePathComponent(info.volumeId) /
            cacheKey(identity.str());
 }
 

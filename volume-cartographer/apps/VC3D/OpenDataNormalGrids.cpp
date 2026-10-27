@@ -5,16 +5,11 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 
 #include <nlohmann/json.hpp>
 
-#include <QDir>
-#include <QStandardPaths>
-#include <QString>
-#include <QUrl>
-#include <QXmlStreamReader>
+#include <vc_reader/s3_listing.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -34,100 +29,44 @@ struct RemoteObject {
     std::uint64_t size = 0;
 };
 
-// Anonymous S3 ListObjectsV2 over the public bucket. Returns every object
-// under `prefix`, paginated 1000 keys at a time.
-std::vector<RemoteObject> listRemotePrefix(const std::string& origin,
-                                           const std::string& prefix,
+// Every object under `prefix` (anonymous ListObjectsV2), 1000 keys a page.
+std::vector<RemoteObject> listRemotePrefix(const vcr::s3::Prefix& prefix,
                                            const std::atomic<bool>* cancelRequested,
                                            std::string* errorOut)
 {
     std::vector<RemoteObject> objects;
-    QString continuationToken;
-
-    while (true) {
+    std::string continuationToken;
+    do {
         if (cancelRequested && cancelRequested->load(std::memory_order_acquire)) {
             if (errorOut) *errorOut = "cancelled";
             return {};
         }
-
-        QString listUrl = QString::fromStdString(origin) +
-                          QStringLiteral("/?list-type=2&max-keys=1000&prefix=") +
-                          QString::fromUtf8(QUrl::toPercentEncoding(QString::fromStdString(prefix)));
-        if (!continuationToken.isEmpty()) {
-            listUrl += QStringLiteral("&continuation-token=") +
-                       QString::fromUtf8(QUrl::toPercentEncoding(continuationToken));
-        }
-
-        std::string body;
+        vcr::s3::ListPage page;
         try {
-            body = vc::httpGetString(listUrl.toStdString());
+            const auto body = vc::httpGetString(vcr::s3::listUrl(prefix, {}, continuationToken));
+            if (body.empty()) {
+                if (errorOut) *errorOut = "listing returned no data for " + prefix.key;
+                return {};
+            }
+            page = vcr::s3::parseListPage(body);
         } catch (const std::exception& e) {
             if (errorOut) *errorOut = std::string("listing failed: ") + e.what();
             return {};
         }
-        if (body.empty()) {
-            if (errorOut) *errorOut = "listing returned no data for " + prefix;
-            return {};
-        }
-
-        QXmlStreamReader xml(QString::fromStdString(body));
-        QString nextToken;
-        bool truncated = false;
-        while (!xml.atEnd()) {
-            xml.readNext();
-            if (!xml.isStartElement()) {
+        for (const auto& object : page.objects) {
+            if (object.key.rfind(prefix.key, 0) != 0 || object.key.size() == prefix.key.size() ||
+                object.key.back() == '/') {
                 continue;
             }
-            if (xml.name() == QStringLiteral("Contents")) {
-                RemoteObject object;
-                while (!(xml.isEndElement() && xml.name() == QStringLiteral("Contents")) &&
-                       !xml.atEnd()) {
-                    xml.readNext();
-                    if (!xml.isStartElement()) {
-                        continue;
-                    }
-                    if (xml.name() == QStringLiteral("Key")) {
-                        const std::string key = xml.readElementText().toStdString();
-                        if (key.rfind(prefix, 0) == 0) {
-                            object.relativePath = key.substr(prefix.size());
-                        }
-                    } else if (xml.name() == QStringLiteral("Size")) {
-                        object.size = xml.readElementText().toULongLong();
-                    }
-                }
-                if (!object.relativePath.empty() && object.relativePath.back() != '/') {
-                    objects.push_back(std::move(object));
-                }
-            } else if (xml.name() == QStringLiteral("NextContinuationToken")) {
-                nextToken = xml.readElementText();
-            } else if (xml.name() == QStringLiteral("IsTruncated")) {
-                truncated = xml.readElementText() == QStringLiteral("true");
-            }
+            objects.push_back({object.key.substr(prefix.key.size()), object.size});
         }
-        if (xml.hasError()) {
-            if (errorOut) {
-                *errorOut = "failed to parse listing: " + xml.errorString().toStdString();
-            }
-            return {};
-        }
-
-        if (!truncated || nextToken.isEmpty()) {
-            break;
-        }
-        continuationToken = nextToken;
-    }
+        continuationToken = std::move(page.nextContinuationToken);
+    } while (!continuationToken.empty());
 
     if (objects.empty() && errorOut) {
-        *errorOut = "no objects found under " + prefix;
+        *errorOut = "no objects found under " + prefix.key;
     }
     return objects;
-}
-
-std::string encodedObjectUrl(const std::string& origin, const std::string& key)
-{
-    const QByteArray encoded =
-        QUrl::toPercentEncoding(QString::fromStdString(key), QByteArrayLiteral("/"));
-    return origin + "/" + std::string(encoded.constData(), encoded.size());
 }
 
 void writeFile(const std::filesystem::path& target, const std::vector<std::byte>& bytes)
@@ -238,8 +177,10 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const vcr::catalog::OpenDataVolume& volume)
 {
     std::vector<OpenDataNormalGridsInfo> result;
-    for (const auto& artifact : volume.artifacts) {
-        if (artifact.type != kNormalGridsArtifactType) {
+    for (std::size_t artifactIndex = 0; artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+        const auto& artifact = volume.artifacts[artifactIndex];
+        if (vcr::catalog::classifyDerivedRepresentation(artifact) !=
+            vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
             continue;
         }
         // Without parameters.level the grids cannot be paired with any volume.
@@ -257,6 +198,7 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
         info.volumeId = volume.id;
         info.url = url;
         info.sourceCoordinateLevel = *artifact.sourceCoordinateLevel;
+        info.artifactIndex = artifactIndex;
         const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
             return item.url == info.url &&
                    item.sourceCoordinateLevel == info.sourceCoordinateLevel;
@@ -286,8 +228,8 @@ std::filesystem::path normalGridsCacheDir(const std::filesystem::path& remoteCac
                                           std::string_view url)
 {
     return remoteCacheRoot / "normal_grids" /
-           safePathComponent(sampleId.empty() ? "sample" : sampleId) /
-           safePathComponent(volumeId.empty() ? "volume" : volumeId) /
+           vcr::catalog::safePathComponent(sampleId.empty() ? "sample" : sampleId) /
+           vcr::catalog::safePathComponent(volumeId.empty() ? "volume" : volumeId) /
            ("L" + std::to_string(sourceCoordinateLevel) + "-" + cacheKey(url));
 }
 
@@ -332,23 +274,11 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
             continue;
         }
         for (const auto& info : normalGridsArtifacts(sample.id, volume)) {
-            if (selection) {
-                // Map this representation back to its artifact index before
-                // applying the representation filter.
-                std::optional<std::size_t> artifactIndex;
-                for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
-                    const auto& art = volume.artifacts[ai];
-                    if (art.type == kNormalGridsArtifactType && art.url() == info.url) {
-                        artifactIndex = ai;
-                        break;
-                    }
-                }
-                if (!artifactIndex ||
-                    !selection->allowsRepresentation(
-                        volumeIndex, *artifactIndex,
-                        vcr::catalog::OpenDataRepresentationKind::NormalGrids, volume.id)) {
-                    continue;
-                }
+            if (selection &&
+                !selection->allowsRepresentation(
+                    volumeIndex, info.artifactIndex,
+                    vcr::catalog::OpenDataRepresentationKind::NormalGrids, volume.id)) {
+                continue;
             }
             if (attachStreamingNormalGridsEntry(pkg, info, remoteCacheRoot)) {
                 ++attached;
@@ -430,13 +360,11 @@ std::filesystem::path downloadOpenDataNormalGrids(
         return finalDir;
     }
 
-    const auto remote = vc::splitRemotePrefixUrl(info.url);
+    const auto remote = vcr::s3::splitPrefixUrl(info.url);
     if (!remote) {
         if (errorOut) *errorOut = "unsupported normal grids URL: " + info.url;
         return {};
     }
-    const std::string& origin = remote->origin;
-    const std::string& prefix = remote->keyPrefix;
 
     NormalGridsDownloadProgress state;
     state.status = "listing";
@@ -444,7 +372,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
         progress(state);
     }
 
-    const auto objects = listRemotePrefix(origin, prefix, cancelRequested, errorOut);
+    const auto objects = listRemotePrefix(*remote, cancelRequested, errorOut);
     if (objects.empty()) {
         return {};
     }
@@ -496,7 +424,7 @@ std::filesystem::path downloadOpenDataNormalGrids(
                     std::filesystem::create_hard_link(streamed, target, linkEc);
                 }
                 if (linkEc || !std::filesystem::is_regular_file(target, linkEc)) {
-                    const auto url = encodedObjectUrl(origin, prefix + object.relativePath);
+                    const auto url = vcr::s3::objectUrl(remote->origin, remote->key + object.relativePath);
                     const auto bytes = vc::httpGetBytes(url);
                     // httpGetBytes returns an empty body for 4xx misses; only
                     // accept it when the listing says the object really is empty.

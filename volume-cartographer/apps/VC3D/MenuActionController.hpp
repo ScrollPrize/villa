@@ -71,13 +71,12 @@ public:
     // returns immediately.
     //
     // Returns false (with *errorMessage) on synchronous precondition failure (no
-    // window/state, empty/unknown id, manifest unavailable, or an open already in
-    // flight). Returns true once the background task started; exactly one GUI-thread
+    // window/state, or an open already in flight). Returns true once the background task started; exactly one GUI-thread
     // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
     // with the same stream the interactive QProgressDialog consumes. `selection`
     // restricts the attached resources. This entry point is always non-interactive.
     bool startOpenDataSampleOpen(
-        const QString& sampleId,
+        const vcr::catalog::OpenDataSample& sample,
         const vc3d::opendata::OpenDataResourceSelection& selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
         std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},

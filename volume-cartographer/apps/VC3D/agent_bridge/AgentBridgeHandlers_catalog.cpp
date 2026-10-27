@@ -208,7 +208,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
     _catalogOpenSampleId = sampleId;
     QString err;
-    if (!mc->startOpenDataSampleOpen(sampleId, selection, onFinished, onProgress, &err)) {
+    if (!mc->startOpenDataSampleOpen(*sample, selection, onFinished, onProgress, &err)) {
         _catalogOpenSampleId.clear();
         QJsonObject data;
         data["detail"] = err.isEmpty()

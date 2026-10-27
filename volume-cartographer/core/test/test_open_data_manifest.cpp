@@ -687,7 +687,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
               ]
             },
             {
-              "type": "normal-grids",
+              "type": "normal_grids",
               "parameters": {
                 "level": 2
               },
@@ -730,9 +730,12 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
 })");
     const auto& sample = manifest.samples.front();
     const auto infos = normalGridsArtifacts(sample.id, sample.volumes.front());
+    // Any spelling the catalog classifies as normal grids, at its artifact index.
     REQUIRE(infos.size() == 2);
     CHECK(infos[0].sourceCoordinateLevel == 0);
+    CHECK(infos[0].artifactIndex == 0);
     CHECK(infos[1].sourceCoordinateLevel == 2);
+    CHECK(infos[1].artifactIndex == 1);
 
     const auto root = std::filesystem::path("/tmp/open-data-normal-grids-test");
     const auto first = normalGridsCacheDir(root, infos[0].sampleId, infos[0].volumeId,
@@ -1074,6 +1077,13 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 
     CHECK(result.supportedVolumes == 3);
     CHECK(result.preferredVolumeId == "vol-b");
+
+    // A segment is sourced by the volume it was derived from, as its surfaces are.
+    for (auto& derived : sample.segments)
+        if (derived.originalVolumeId == "vol-b")
+            derived.creation.derivedFrom = vcr::catalog::OpenDataReference{"volume", "vol-c"};
+    auto derivedPkg = VolumePkg::newEmpty();
+    CHECK(attachOpenDataSampleVolumes(*derivedPkg, sample).preferredVolumeId == "vol-c");
 }
 
 

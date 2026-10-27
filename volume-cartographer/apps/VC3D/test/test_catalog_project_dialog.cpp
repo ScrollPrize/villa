@@ -34,7 +34,7 @@ private slots:
             vcr::catalog::OpenDataArtifact artifact;
             artifact.type = type.toStdString();
             artifact.resolvedUrl = "https://example.invalid/" + artifact.type;
-            artifact.sourcePath = "predictions/fibers/" + artifact.type;
+            artifact.predictionType = "fibers";
             artifact.sourceCoordinateLevel = 2;
             volume.artifacts.push_back(artifact);
         }

@@ -7,6 +7,8 @@
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
+#include <vc_reader/s3_listing.hpp>
+
 #include <QApplication>
 #include <QButtonGroup>
 #include <QDir>
@@ -23,9 +25,7 @@
 #include <QStandardPaths>
 #include <QtConcurrent>
 #include <QUrl>
-#include <QUrlQuery>
 #include <QVBoxLayout>
-#include <QXmlStreamReader>
 
 #include <algorithm>
 #include <exception>
@@ -171,35 +171,15 @@ QString s3UriFor(const S3Location& loc, const QString& prefix)
     return withTrailingSlash(uri);
 }
 
-QString s3ListUrl(const S3Location& loc, const QString& continuationToken = {})
+// The bucket's virtual-hosted endpoint and the prefix a listing covers.
+vcr::s3::Prefix s3ListPrefix(const S3Location& loc)
 {
-    QUrl url;
-    url.setScheme(QStringLiteral("https"));
-    url.setHost(loc.bucket + QStringLiteral(".s3.") + loc.region + QStringLiteral(".amazonaws.com"));
-
-    QUrlQuery query;
-    query.addQueryItem(QStringLiteral("list-type"), QStringLiteral("2"));
-    query.addQueryItem(QStringLiteral("delimiter"), QStringLiteral("/"));
-    query.addQueryItem(QStringLiteral("encoding-type"), QStringLiteral("url"));
-    if (!loc.prefix.isEmpty()) {
-        query.addQueryItem(QStringLiteral("prefix"), loc.prefix);
-    }
-    if (!continuationToken.isEmpty()) {
-        query.addQueryItem(QStringLiteral("continuation-token"), continuationToken);
-    }
-    url.setQuery(query);
-    return url.toString(QUrl::FullyEncoded);
+    return {"https://" + loc.bucket.toStdString() + ".s3." + loc.region.toStdString() + ".amazonaws.com",
+            loc.prefix.toStdString()};
 }
 
-QString decodedS3Text(const QString& text)
+QString displayNameForPrefix(QString name, const QString& parent)
 {
-    return QUrl::fromPercentEncoding(text.toUtf8());
-}
-
-QString displayNameForPrefix(const QString& prefix, const QString& parentPrefix)
-{
-    QString name = decodedS3Text(prefix);
-    QString parent = decodedS3Text(parentPrefix);
     if (!parent.isEmpty() && name.startsWith(parent)) name = name.mid(parent.size());
     while (name.endsWith('/')) name.chop(1);
     const int slash = name.lastIndexOf('/');
@@ -239,67 +219,35 @@ RemoteListResult listS3Prefix(const QString& urlPrefix,
     }
 
     const std::string body = vc::httpGetString(
-        s3ListUrl(*loc, continuationToken).toStdString(), auth);
+        vcr::s3::listUrl(s3ListPrefix(*loc), "/", continuationToken.toStdString()), auth);
     if (body.empty()) {
         result.error = QObject::tr("No response while listing bucket.");
         return result;
     }
-
-    QXmlStreamReader xml(QString::fromStdString(body));
-    while (!xml.atEnd()) {
-        xml.readNext();
-        if (!xml.isStartElement()) continue;
-
-        if (xml.name() == QLatin1String("CommonPrefixes")) {
-            QString prefix;
-            while (!(xml.isEndElement() && xml.name() == QLatin1String("CommonPrefixes")) && !xml.atEnd()) {
-                xml.readNext();
-                if (xml.isStartElement() && xml.name() == QLatin1String("Prefix")) {
-                    prefix = xml.readElementText();
-                }
-            }
-            if (!prefix.isEmpty()) {
-                const QString decodedPrefix = decodedS3Text(prefix);
-                if (shouldHideVesuviusRootEntry(*loc, decodedPrefix)) continue;
-                result.entries.push_back({
-                    displayNameForPrefix(prefix, loc->prefix),
-                    s3UriFor(*loc, decodedPrefix),
-                    true
-                });
-            }
-        } else if (xml.name() == QLatin1String("Contents")) {
-            QString key;
-            while (!(xml.isEndElement() && xml.name() == QLatin1String("Contents")) && !xml.atEnd()) {
-                xml.readNext();
-                if (xml.isStartElement() && xml.name() == QLatin1String("Key")) {
-                    key = xml.readElementText();
-                }
-            }
-            if (!key.isEmpty()) {
-                const QString decodedKey = decodedS3Text(key);
-                if (shouldHideVesuviusRootEntry(*loc, decodedKey)) continue;
-                if (decodedKey == loc->prefix) continue;
-                QString name = decodedKey;
-                const QString parent = loc->prefix;
-                if (!parent.isEmpty() && name.startsWith(parent)) name = name.mid(parent.size());
-                if (name.contains('/')) continue;
-                const bool isDir = name.endsWith('/');
-                result.entries.push_back({
-                    isDir ? name : name,
-                    isDir ? s3UriFor(*loc, decodedKey) : loc->scheme + QStringLiteral("://") + loc->bucket + QStringLiteral("/") + decodedKey,
-                    isDir
-                });
-            }
-        } else if (xml.name() == QLatin1String("NextContinuationToken")) {
-            result.nextToken = xml.readElementText();
-        }
+    vcr::s3::ListPage page;
+    try {
+        page = vcr::s3::parseListPage(body);
+    } catch (const std::exception& e) {
+        result.error = QObject::tr("Could not parse S3 listing: %1").arg(QString::fromUtf8(e.what()));
+        return result;
     }
 
-    if (xml.hasError()) {
-        result.entries.clear();
-        result.nextToken.clear();
-        result.error = QObject::tr("Could not parse S3 listing: %1").arg(xml.errorString());
+    for (const auto& listedPrefix : page.commonPrefixes) {
+        const QString prefix = QString::fromStdString(listedPrefix);
+        if (shouldHideVesuviusRootEntry(*loc, prefix)) continue;
+        result.entries.push_back({displayNameForPrefix(prefix, loc->prefix), s3UriFor(*loc, prefix), true});
     }
+    for (const auto& object : page.objects) {
+        const QString key = QString::fromStdString(object.key);
+        if (shouldHideVesuviusRootEntry(*loc, key)) continue;
+        if (key == loc->prefix) continue;
+        QString name = key;
+        if (!loc->prefix.isEmpty() && name.startsWith(loc->prefix)) name = name.mid(loc->prefix.size());
+        if (name.contains('/')) continue;
+        result.entries.push_back(
+            {name, loc->scheme + QStringLiteral("://") + loc->bucket + QStringLiteral("/") + key, false});
+    }
+    result.nextToken = QString::fromStdString(page.nextContinuationToken);
 
     std::sort(result.entries.begin(), result.entries.end(), [](const RemoteEntry& a, const RemoteEntry& b) {
         if (a.isDir != b.isDir) return a.isDir > b.isDir;

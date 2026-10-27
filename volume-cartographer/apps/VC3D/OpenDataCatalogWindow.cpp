@@ -221,11 +221,7 @@ QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
     QStringList filenames;
     if (artifact) {
         for (const auto& origin : artifact->origins) {
-            const auto copy = origin.raw.find("copy_info");
-            if (copy == origin.raw.end() || !copy->is_object()) continue;
-            const auto source = copy->find("source_path");
-            if (source == copy->end() || !source->is_string()) continue;
-            const auto parts = qstr(source->get<std::string>()).split('/', Qt::SkipEmptyParts);
+            const auto parts = qstr(origin.copySourcePath).split('/', Qt::SkipEmptyParts);
             if (!parts.isEmpty() && !filenames.contains(parts.last()))
                 filenames.push_back(parts.last());
         }
@@ -233,12 +229,9 @@ QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
     return filenames.isEmpty() ? QStringLiteral("—") : filenames.join(QStringLiteral("\n"));
 }
 
-QString predictionType(const vcr::catalog::OpenDataArtifact& artifact)
+QString predictionTypeCell(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    const auto parts = qstr(artifact.sourcePath).split('/', Qt::SkipEmptyParts);
-    const auto index = parts.indexOf(QStringLiteral("predictions"));
-    return index >= 0 && index + 1 < parts.size()
-        ? parts[index + 1] : QStringLiteral("—");
+    return artifact.predictionType.empty() ? QStringLiteral("—") : qstr(artifact.predictionType);
 }
 
 bool canAttachRepresentation(const vcr::catalog::OpenDataArtifact& artifact)
@@ -248,10 +241,8 @@ bool canAttachRepresentation(const vcr::catalog::OpenDataArtifact& artifact)
     if (!kind) return false;
     if (*kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids && !artifact.sourceCoordinateLevel)
         return false;
-    if (*kind != vcr::catalog::OpenDataRepresentationKind::Prediction) return true;
     // Prediction artifacts are not necessarily volumes (e.g. meshes).
-    const auto type = qstr(artifact.type).toLower().replace('_', '-');
-    return type.endsWith("-zarr");
+    return *kind != vcr::catalog::OpenDataRepresentationKind::Prediction || vcr::catalog::isZarrArtifact(artifact);
 }
 
 QString representationCoordinates(const vcr::catalog::OpenDataArtifact& artifact,
@@ -286,7 +277,7 @@ QStringList volumeCells(const std::filesystem::path& remoteRoot,
 QStringList representationCells(const vcr::catalog::OpenDataVolume& volume, const vcr::catalog::OpenDataArtifact& artifact,
                                 vcr::catalog::OpenDataRepresentationKind kind)
 {
-    return {qstr(volume.id), predictionType(artifact), qstr(artifact.type),
+    return {qstr(volume.id), predictionTypeCell(artifact), qstr(artifact.type),
             qstr(artifact.modelId.value_or(std::string{})), representationCoordinates(artifact, kind),
             qstr(artifact.accessUsage), representationParameters(artifact), qstr(artifact.url()),
             artifact.sourceCoordinateLevel ? QString::number(*artifact.sourceCoordinateLevel)
@@ -511,7 +502,7 @@ void OpenDataCatalogWindow::createSelectedProject()
         const auto& artifact = volume.artifacts.at(ref.artifactIndex);
         const QString type = QString::fromUtf8(vcr::catalog::representationKindName(ref.kind).data(),
                                               int(vcr::catalog::representationKindName(ref.kind).size()));
-        const QString prediction = predictionType(artifact);
+        const QString prediction = qstr(artifact.predictionType);
         const QString label = prediction.isEmpty() ? type : type + " / " + prediction;
         if (!groups.contains(label)) groups[label] = group(representationTree, label);
         auto* item = leaf(groups[label], representationCells(volume, artifact, ref.kind));
@@ -822,7 +813,7 @@ void OpenDataCatalogWindow::buildUi()
         if (_manifestRefreshPending || !artifact || !canAttachRepresentation(*artifact)) return;
         const auto kind = *vcr::catalog::classifyDerivedRepresentation(*artifact);
         if (kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
-            emit attachLasagnaRequested(qstr(artifact->url()), predictionType(*artifact) == QStringLiteral("fibers"));
+            emit attachLasagnaRequested(qstr(artifact->url()), artifact->predictionType == "fibers");
         } else if (kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
             const auto* sample = selectedSample();
             const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);

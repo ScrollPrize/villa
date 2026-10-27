@@ -14,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <system_error>
 
 namespace vc3d::opendata {
@@ -27,65 +28,26 @@ std::string lowerCopy(std::string value)
     return value;
 }
 
-bool containsInsensitive(const std::string& haystack, const std::string& needle)
+// A catalog Zarr VC3D opens remotely: over http(s) or s3.
+bool isRemoteZarr(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    return lowerCopy(haystack).find(lowerCopy(needle)) != std::string::npos;
-}
-
-bool isSupportedRemoteZarr(const vcr::catalog::OpenDataVolume& volume,
-                           const vcr::catalog::OpenDataArtifact& artifact,
-                           const std::string& url)
-{
-    if (url.empty()) {
+    if (!vcr::catalog::isZarrArtifact(artifact) || artifact.url().empty()) {
         return false;
     }
     std::string networkUrl;
     try {
-        networkUrl = vc::parseRemoteVolumeSpec(url).sourceUrl;
+        networkUrl = lowerCopy(vc::parseRemoteVolumeSpec(artifact.url()).sourceUrl);
     } catch (...) {
         return false;
     }
-    const std::string loweredUrl = lowerCopy(networkUrl);
-    const auto query = loweredUrl.find('?');
-    const std::string pathOnly = loweredUrl.substr(0, query);
-    if (loweredUrl.rfind("http://", 0) != 0 &&
-        loweredUrl.rfind("https://", 0) != 0 &&
-        loweredUrl.rfind("s3://", 0) != 0) {
-        return false;
-    }
-    if (pathOnly.size() >= 5 &&
-        pathOnly.substr(pathOnly.size() - 5) == ".zarr") {
-        return true;
-    }
-    if (containsInsensitive(artifact.type, "zarr")) {
-        return true;
-    }
-    return artifact.type.empty() && containsInsensitive(volume.dataFormat, "zarr");
+    return networkUrl.starts_with("http://") || networkUrl.starts_with("https://") ||
+           networkUrl.starts_with("s3://");
 }
 
-bool isSupportedSurfacePrediction(const vcr::catalog::OpenDataArtifact& artifact)
+bool isPrediction(const vcr::catalog::OpenDataArtifact& artifact)
 {
-    return lowerCopy(artifact.type) == "surface-prediction-zarr";
-}
-
-bool isSupportedInk3dPrediction(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    const auto type = lowerCopy(artifact.type);
-    return type == "ink-detection-3d-zarr" ||
-           type == "ink_detection_3d_zarr";
-}
-
-bool isSupportedCoordinatePrediction(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return isSupportedSurfacePrediction(artifact) ||
-           isSupportedInk3dPrediction(artifact);
-}
-
-std::optional<int> predictionSourceCoordinateLevel(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    if (!isSupportedCoordinatePrediction(artifact))
-        return std::nullopt;
-    return artifact.sourceCoordinateLevel;
+    return vcr::catalog::classifyDerivedRepresentation(artifact) ==
+           vcr::catalog::OpenDataRepresentationKind::Prediction;
 }
 
 void preflightPredictionAndSource(const std::string& predictionUrl,
@@ -140,8 +102,8 @@ std::string segmentSourcePreferredVolumeId(
 
     std::map<std::string, std::size_t> segmentCountsByVolumeId;
     for (const auto& segment : sample.segments) {
-        if (!segment.originalVolumeId.empty()) {
-            ++segmentCountsByVolumeId[segment.originalVolumeId];
+        if (const auto volumeId = segment.sourceVolumeId(); !volumeId.empty()) {
+            ++segmentCountsByVolumeId[volumeId];
         }
     }
 
@@ -165,7 +127,7 @@ std::filesystem::path sampleProjectCachePath(
     const vcr::catalog::OpenDataSample& sample)
 {
     return remoteCacheRoot / "open_data" / "projects" /
-           (safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".volpkg.json");
+           (vcr::catalog::safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".volpkg.json");
 }
 
 bool isNonEmptyFile(const std::filesystem::path& path)
@@ -193,15 +155,15 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const auto cachedProjectPath = (remoteCacheRoot.empty() || newProject)
         ? std::filesystem::path{}
         : sampleProjectCachePath(remoteCacheRoot, sample);
+    // Catalog loads remain unresolved until normal-grid paths have been
+    // reconciled.
+    vc::project::LoadOptions loadOptions;
+    loadOptions.catalog = vc3d::opendata::cachedCatalog();
+    loadOptions.deferResolution = true;
 
     if (!cachedProjectPath.empty() && isNonEmptyFile(cachedProjectPath)) {
         try {
-            vc::project::LoadOptions opts;
-            opts.catalog = vc3d::opendata::cachedCatalog();
-            opts.deferResolution = true;
-            pkg = VolumePkg::load(
-                cachedProjectPath,
-                opts);
+            pkg = VolumePkg::load(cachedProjectPath, loadOptions);
             result.messages.push_back("Loaded cached sample project: " +
                                       cachedProjectPath.string());
         } catch (const std::exception& e) {
@@ -214,10 +176,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     }
 
     if (!pkg) {
-        vc::project::LoadOptions opts;
-        opts.catalog = vc3d::opendata::cachedCatalog();
-        opts.deferResolution = true;
-        pkg = newProject ? VolumePkg::newDetached(opts) : VolumePkg::newEmpty(opts);
+        pkg = newProject ? VolumePkg::newDetached(loadOptions) : VolumePkg::newEmpty(loadOptions);
     }
     pkg->setName(newProject ? newProject->name :
                  (sample.id.empty() ? "Open Data Sample" : sample.id));
@@ -246,18 +205,13 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                 " manifest-backed Lasagna dataset(s).");
         }
     }
-    // Catalog loads remain unresolved until normal-grid paths have been
-    // reconciled.
     if (newProject) {
         // Detached preparation must not overwrite the active project's autosave.
         // Reload the saved JSON to activate ordinary persistence and exercise
         // exactly the same entry resolution as reopening it later.
 
         pkg->save(newProject->path);
-        vc::project::LoadOptions opts;
-        opts.catalog = vc3d::opendata::cachedCatalog();
-        opts.deferResolution = true;
-        pkg = VolumePkg::load(newProject->path, opts);
+        pkg = VolumePkg::load(newProject->path, loadOptions);
     }
     if (pkg->entryResolutionDeferred()) {
         if (progressCallback) {
@@ -338,13 +292,9 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         bool foundSupportedArtifact = false;
         const auto* preferredSource = vcr::catalog::preferredVolumeArtifact(volume);
         std::string preferredSourceUrl;
-        if (preferredSource) {
+        if (preferredSource && !vcr::catalog::classifyDerivedRepresentation(*preferredSource) &&
+            isRemoteZarr(*preferredSource)) {
             preferredSourceUrl = preferredSource->url();
-            if (isSupportedCoordinatePrediction(*preferredSource) ||
-                !isSupportedRemoteZarr(volume, *preferredSource, preferredSourceUrl)) {
-                preferredSource = nullptr;
-                preferredSourceUrl.clear();
-            }
         }
         for (std::size_t artifactIndex = 0;
              artifactIndex < volume.artifacts.size(); ++artifactIndex) {
@@ -375,7 +325,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 }
                 continue;
             }
-            if (!isSupportedRemoteZarr(volume, artifact, url)) {
+            if (!isRemoteZarr(artifact)) {
                 continue;
             }
 
@@ -446,10 +396,10 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             if (hasVolumeEntry(pkg, url))
                 attachedLocations.push_back(url);
 
-            if (const auto level = predictionSourceCoordinateLevel(artifact)) {
+            if (isPrediction(artifact) && artifact.sourceCoordinateLevel) {
                 predictions.push_back(PredictionCandidate{
-                    &volume, &artifact, url, preferredSourceUrl, *level});
-            } else if (isSupportedCoordinatePrediction(artifact)) {
+                    &volume, &artifact, url, preferredSourceUrl, *artifact.sourceCoordinateLevel});
+            } else if (isPrediction(artifact)) {
                 result.messages.push_back(
                     "Kept " + label +
                     " coordinate-unspecified: parameters.level is missing or invalid.");
@@ -462,27 +412,33 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
     }
 
+    // Why a representation cannot be paired with its source volume's grid.
+    const auto pairingProblem = [&](const vcr::catalog::OpenDataVolume& volume,
+                                    const std::string& sourceUrl,
+                                    bool sourceMustBeAttached,
+                                    const std::string& label) -> std::optional<std::string> {
+        if (sourceUrl.empty() ||
+            (sourceMustBeAttached &&
+             std::find(attachedLocations.begin(), attachedLocations.end(), sourceUrl) ==
+                 attachedLocations.end())) {
+            return "Skipped virtual source for " + label +
+                   ": preferred source Zarr is unavailable or was not attached.";
+        }
+        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) || *volume.pixelSizeUm <= 0.0) {
+            return "Skipped coordinate pairing for " + label + ": source volume has no positive voxel size.";
+        }
+        return std::nullopt;
+    };
+
     for (const auto& candidate : predictions) {
         const auto& volume = *candidate.volume;
         const auto& prediction = *candidate.prediction;
         const auto predictionLabel = volumeArtifactLabel(volume, prediction);
         const int level = candidate.sourceCoordinateLevel;
-        if (candidate.sourceUrl.empty() ||
-            (!(selection && selection->rawVolumeIds) &&
-             std::find(attachedLocations.begin(), attachedLocations.end(),
-                       candidate.sourceUrl) == attachedLocations.end())) {
+        if (const auto problem = pairingProblem(volume, candidate.sourceUrl,
+                                                !(selection && selection->rawVolumeIds), predictionLabel)) {
             ++result.failedVolumes;
-            result.messages.push_back(
-                "Skipped virtual source for " + predictionLabel +
-                ": preferred source Zarr is unavailable or was not attached.");
-            continue;
-        }
-        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) ||
-            *volume.pixelSizeUm <= 0.0) {
-            ++result.failedVolumes;
-            result.messages.push_back(
-                "Skipped coordinate pairing for " + predictionLabel +
-                ": source volume has no positive voxel size.");
+            result.messages.push_back(*problem);
             continue;
         }
 
@@ -511,25 +467,11 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         // rebased source; native L0 Lasagna resolution is supported directly.
         if (selection && selection->rawVolumeIds)
             continue;
-        const auto& volume = *candidate.volume;
         const int level = candidate.sourceCoordinateLevel;
-        if (candidate.sourceUrl.empty() ||
-            std::find(attachedLocations.begin(), attachedLocations.end(),
-                      candidate.sourceUrl) == attachedLocations.end()) {
+        if (const auto problem = pairingProblem(*candidate.volume, candidate.sourceUrl, true,
+                                                candidate.representationLabel)) {
             ++result.failedVolumes;
-            result.messages.push_back(
-                "Skipped virtual source for " +
-                candidate.representationLabel +
-                ": preferred source Zarr is unavailable or was not attached.");
-            continue;
-        }
-        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) ||
-            *volume.pixelSizeUm <= 0.0) {
-            ++result.failedVolumes;
-            result.messages.push_back(
-                "Skipped coordinate pairing for " +
-                candidate.representationLabel +
-                ": source volume has no positive voxel size.");
+            result.messages.push_back(*problem);
             continue;
         }
 

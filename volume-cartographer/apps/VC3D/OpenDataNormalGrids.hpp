@@ -15,12 +15,8 @@ namespace vc::project { struct Entry; }
 
 namespace vc3d::opendata {
 
-
-
-
 struct OpenDataResourceSelection;
 
-inline constexpr std::string_view kNormalGridsArtifactType = "normal-grids";
 inline constexpr int kNormalGridsDownloadWorkers = 16;
 
 // Pairing of an open-data volume with its normal-grids artifact. `url` is the
@@ -30,6 +26,7 @@ struct OpenDataNormalGridsInfo {
     std::string volumeId;
     std::string url;
     int sourceCoordinateLevel = 0;
+    std::size_t artifactIndex = 0;  // in the volume's artifacts
 };
 
 [[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
