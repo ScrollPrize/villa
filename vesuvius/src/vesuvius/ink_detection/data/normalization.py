@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from vesuvius.ink_detection.config import NormalizationConfig
-from vesuvius.image_proc.intensity.normalization import normalize_robust
+from vesuvius.image_proc.intensity.normalization import normalize_robust_histogram
 
 
 def normalize_image(
@@ -29,7 +29,13 @@ def normalize_image(
         )
         return image_f32
     if config.mode == "robust_mad":
-        return normalize_robust(
+        # Bit-identical fast path for the uint8 render contract. This is the same
+        # config default (robust_mad, 1.0/99.0) that flat inference uses, and this
+        # function is the per-crop normaliser of ink training (dataset.py,
+        # coord_patch_dataset.py) and native 3D inference (infer_full3d_tifxyz.py).
+        # normalize_robust_histogram proves it reproduces normalize_robust for
+        # integer-valued crops and otherwise delegates, so crops keep identical values.
+        return normalize_robust_histogram(
             image_f32,
             percentile_lower=config.percentile_lower,
             percentile_upper=config.percentile_upper,

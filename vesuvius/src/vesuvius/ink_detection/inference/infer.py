@@ -111,9 +111,12 @@ def normalize_flat_patch(
     """Normalize one reader-processed ZYX patch by the legacy flat contract."""
 
     if preprocessing == "tifxyz_robust":
-        from vesuvius.image_proc.intensity.normalization import normalize_robust
+        # Render patches are uint8 values widened to float32, so the histogram fast path is
+        # bit-identical to `normalize_robust` here and several times faster; this call is a
+        # sizable share of flat-inference wall time (16-38 % in our measurements).
+        from vesuvius.image_proc.intensity.normalization import normalize_robust_histogram
 
-        return np.ascontiguousarray(normalize_robust(patch_ZYX))
+        return np.ascontiguousarray(normalize_robust_histogram(patch_ZYX))
     if preprocessing == "divide_255":
         normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
         normalized *= 1.0 / 255.0
@@ -1087,6 +1090,22 @@ def infer_single_zarr(
         blend_mode,
         bool(args.tta_mirror),
     )
+    # A patch read has to decompress every chunk it touches, so a chunk far larger than the
+    # patch makes inference CPU-bound while the GPU idles.  Measured on one PHerc0813 winding
+    # (693 patches, batch 8): the same data chunked (34, 768, 4096) took 71.9 s versus 22.3 s at
+    # (34, 64, 256) -- 3.2x -- with identical output.  Warn rather than silently crawl.
+    chunk_volume = max(1, depth) * max(1, chunk_h) * max(1, chunk_w)
+    patch_volume = max(1, configured_model.input_depth) * patch_size * patch_size
+    if chunk_volume > 8 * patch_volume:
+        LOGGER.warning(
+            "Surface-volume chunks are %.0fx the inference patch (%d vs %d voxels); each "
+            "patch read must decompress a whole chunk, which can dominate runtime with the "
+            "GPU idle. Re-chunking the render (chunks near 128x128 in y/x) removed 3.2x of "
+            "wall time on a real scroll winding in our measurements.",
+            chunk_volume / patch_volume,
+            chunk_volume,
+            patch_volume,
+        )
     reader = FlatPatchReader(
         input_path=input_zarr,
         resolution=resolution,
