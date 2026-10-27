@@ -232,7 +232,9 @@ struct OpenDataSurface {
     bool canonical = false;
     std::string volumeId;       // the catalog volume its coordinates are in
     double unitsPerVoxel = 1;   // coordinate units per voxel of volumeId
-    std::string id;             // stable representation id
+    // Stable across catalog revisions: the segment's stable id and which
+    // representation ("<lineage>-authored", "<lineage>-published-<volume>").
+    std::string id;
 };
 
 // A published per-segment image (ink detection), fetched beside the surface.

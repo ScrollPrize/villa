@@ -187,6 +187,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             for (auto& run : part.runs) {
                 merged.runs.push_back(std::move(run));
             }
+            merged.remote.insert(merged.remote.end(), part.remote.begin(), part.remote.end());
             if (part.stop == RegionStop::ObjectLimit) limited = true;
             else if (!part.complete()) { stopped = part.stop; break; }
         }
@@ -207,6 +208,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             objects.insert(uuid);
         }
         merged.runs.resize(kept);
+        std::sort(merged.remote.begin(), merged.remote.end());
+        merged.remote.erase(std::unique(merged.remote.begin(), merged.remote.end()), merged.remote.end());
         merged.intersectingObjects = objects.size();
         merged.stop = stopped ? *stopped : limited ? RegionStop::ObjectLimit : RegionStop::Exhausted;
         return merged;
@@ -491,6 +494,11 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         };
         if(selected)query(true);
         query(false);
+        if (kind.surface) {
+            result.remote = remoteSurfacesIn(db, bounds, includedIds, options.coordinates);
+            if (!result.remote.empty() && impl_->options.remoteGeometryReached)
+                impl_->options.remoteGeometryReached(result.remote);
+        }
     } catch (...) {
         auto error=scope.error ? scope.error : std::current_exception();
         try { std::rethrow_exception(error); } catch (const ReadStopped&) {} // real failures still propagate

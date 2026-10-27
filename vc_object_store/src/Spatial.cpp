@@ -1,3 +1,4 @@
+#include "internal/CoordinateFilter.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
@@ -47,6 +48,25 @@ std::string spatialOverlapSql(int firstParameter)
             " AND b.min_" + coordinate + "<=" + high;
     }
     return sql;
+}
+
+std::vector<std::string> remoteSurfacesIn(sqlite3* db, const Bounds& bounds, const std::optional<std::string>& includedIds,
+                                          const std::optional<std::string>& coordinates)
+{
+    std::string sql = "SELECT o.uuid FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id "
+        "CROSS JOIN objects o ON o.id=b.object_id LEFT JOIN geometry_heads h ON h.object_uuid=o.uuid "
+        "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind='surface' AND b.array_name='' "
+        "AND h.object_uuid IS NULL AND o.storage_kind!='' AND COALESCE(l.retired,0)=0 AND " + spatialOverlapSql();
+    if (includedIds) sql += " AND o.id IN (SELECT value FROM json_each(?8))";
+    if (coordinates) sql += coordinateFilterSql("o", "?7");
+    sql += " ORDER BY o.uuid";
+    Statement rows(db, sql);
+    for (int i = 0; i < 6; ++i) rows.bind(i + 1, bounds[i]);
+    if (coordinates) rows.bind(7, coordinateFilterValue(*coordinates));
+    if (includedIds) rows.bind(8, *includedIds);
+    std::vector<std::string> uuids;
+    while (rows.row()) uuids.push_back(formatUuid(rows.blob16(0)));
+    return uuids;
 }
 
 std::optional<Bounds> recordBounds(const ObjectRecord& object)

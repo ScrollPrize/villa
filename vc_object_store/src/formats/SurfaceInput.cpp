@@ -29,7 +29,7 @@ GeometryArray surfaceChannel(const std::string& name, const fs::path& path)
     if (samples.components != 1) shape.push_back(samples.components);
     return {name, dtype, shape, std::move(samples.bytes)};
 }
-Prepared surface(const fs::path& source)
+Prepared surfaceGeometry(const fs::path& source)
 {
     auto fingerprint = [&]() {
         std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
@@ -41,7 +41,7 @@ Prepared surface(const fs::path& source)
     const auto before = fingerprint();
     const auto root = readJson(source / "meta.json");
     Prepared p;
-    p.object = sourceObject(root, "surface", source); p.geometry.kind = "surface";
+    p.object.kind = "surface"; p.geometry.kind = "surface";
     detail::validateSurfaceFiles(source);
     auto surface = vc::object_links::readSurfaceGrid(source);
     const auto grid = surface.rawPoints();
@@ -77,6 +77,15 @@ Prepared surface(const fs::path& source)
     }
     if (before != fingerprint()) throw std::runtime_error("surface changed while reading; retry ingestion");
     p.geometry.attributes = Json{{"scale", root.at("scale")}}.dump();
+    return p;
+}
+
+Prepared surface(const fs::path& source)
+{
+    auto p = surfaceGeometry(source);
+    const auto detail = p.object.surface;
+    p.object = sourceObject(p.source, "surface", source);
+    p.object.surface = detail;
     return p;
 }
 }

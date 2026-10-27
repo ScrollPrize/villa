@@ -198,9 +198,9 @@ int main()
         require(surfaces[0].authored && surfaces[0].canonical && surfaces[0].volumeId == "vol1" &&
                     surfaces[0].unitsPerVoxel == 0.5 && surfaces[0].artifact == &segment.artifacts[0],
                 "authored canonical surface");
-        require(surfaces[0].id.starts_with("PHerc0139-seg-a-derived-native-L0-"), "authored id");
+        require(surfaces[0].id == "PHerc0139-seg-a-authored", "authored id");
         require(!surfaces[1].authored && !surfaces[1].canonical && surfaces[1].volumeId == "vol2" &&
-                    surfaces[1].unitsPerVoxel == 1 && surfaces[1].id.starts_with("PHerc0139-seg-a-published-vol2-L0-"),
+                    surfaces[1].unitsPerVoxel == 1 && surfaces[1].id == "PHerc0139-seg-a-published-vol2",
                 "published surface");
         auto withSource = *sample;
         auto& edited = withSource.segments.front();

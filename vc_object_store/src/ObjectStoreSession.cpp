@@ -1,3 +1,5 @@
+#include "FetchQueue.hpp"
+#include <set>
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "hub/HubWorker.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
@@ -21,6 +23,8 @@ struct ObjectStoreSession::Attachment {
     int64_t journalPosition = 0;
     // Hosted replicas only; declared after store so it stops first.
     std::unique_ptr<detail::HubWorker> hub;
+    // Fetched attachments only (attachFetched): fetches published geometry.
+    std::unique_ptr<detail::FetchQueue> fetches;
 };
 
 ObjectStoreSession::~ObjectStoreSession()
@@ -121,9 +125,11 @@ void ObjectStoreSession::retire(const std::shared_ptr<Attachment>& attachment)
     lock.lock();
     std::erase(attached_, attachment);
     events_.push_back({StoreSessionEvent::Kind::Detached, attachment->identity, attachment->journalPosition, {}});
-    // Stop the replica's sync outside the lock its status reports take.
+    // Stop the replica's sync and the catalog fetcher outside the lock their
+    // status reports take.
     lock.unlock();
     attachment->hub.reset();
+    attachment->fetches.reset();
 }
 
 void ObjectStoreSession::detach(const AttachmentIdentity& identity)
@@ -222,11 +228,226 @@ std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const
 void ObjectStoreSession::importObject(const AttachmentIdentity& from, const AttachmentIdentity& to,
                                       const std::string& objectUuid)
 {
+    ensureGeometry(from, objectUuid);
     std::optional<ObjectCopy> copy;
     read(from, [&](const auto& store, const auto& txn, const auto&) {
         copy = readObjectCopy(store, txn, objectUuid, util::canonicalUuid(objectUuid));
     });
     act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+}
+
+void ObjectStoreSession::restoreImported(const AttachmentIdentity& identity, const std::string& objectUuid)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::vector<ObjectRevision> history;
+    std::optional<ObjectRevision> current;
+    read(identity, [&](const auto& store, const auto& txn, const auto&) {
+        history = store.objectHistory(txn, uuid);
+        current = store.currentObjectRevision(txn, uuid);
+    });
+    if (history.empty() || !current) throw std::runtime_error("object has no history: " + uuid);
+    act(identity, {{uuid, current->uuid}}, [&](auto& store, auto& txn) { store.restoreObject(txn, uuid, history.front().uuid); });
+}
+
+AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path& path, const OpenOptions& options,
+                                                     GeometryFetcher fetch)
+{
+    std::lock_guard transition(transition_);
+    auto opened = options;
+    opened.readOnly = false;
+    // The queue reports through the attachment once it is registered.
+    auto owner = std::make_shared<AttachmentIdentity>();
+    auto queue = std::make_unique<detail::FetchQueue>(
+        [this, owner](const std::string& uuid, GeometryState state, const std::string& error) {
+            std::lock_guard lock(mutex_);
+            StoreSessionEvent event{StoreSessionEvent::Kind::Fetch, *owner, 0, {}};
+            event.objectUuid = uuid;
+            event.fetchState = state;
+            event.error = error;
+            events_.push_back(std::move(event));
+        });
+    auto* requests = queue.get();
+    opened.remoteGeometryReached = [requests](const std::vector<std::string>& uuids) { requests->request(uuids); };
+    auto next = std::make_shared<Attachment>(ObjectStore::open(path, opened));
+    next->writable = false;  // callers read; fetched geometry is written by the session
+    {
+        auto txn = next->store.read();
+        next->identity.storeUuid = next->store.uuid(txn);
+        next->journalPosition = next->store.journalPosition(txn);
+    }
+    {
+        std::lock_guard lock(mutex_);
+        if (std::any_of(attached_.begin(), attached_.end(),
+                        [&](const auto& a) { return a->identity.storeUuid == next->identity.storeUuid; }))
+            throw std::runtime_error("object store is already attached to this session");
+        next->identity.generation = ++generation_;
+        *owner = next->identity;
+        attached_.push_back(next);
+        events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
+    }
+    const auto identity = next->identity;
+    requests->start([this, identity, fetch = std::move(fetch)](const std::string& uuid) {
+        auto attachment = acquire(identity, false);
+        try {
+            fetch(attachment->store, uuid, [&](const RevisionSelection& expected, const Action& action) {
+                return fetchWrite(identity, expected, action);
+            });
+        } catch (...) { release(*attachment, false); throw; }
+        release(*attachment, false);
+    });
+    next->fetches = std::move(queue);
+    return identity;
+}
+
+RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RevisionSelection& expected,
+                                                 const Action& callback)
+{
+    RevisionSelection committed;
+    auto attachment = acquire(identity, false);
+    try {
+        if (!attachment->fetches) throw std::runtime_error("not a fetched attachment");
+        std::lock_guard writer(attachment->writer);
+        auto txn = attachment->store.write(expected);
+        callback(attachment->store, txn);
+        txn.commit();
+        committed = txn.committedRevisions();
+    } catch (...) { release(*attachment, false); throw; }
+    release(*attachment, false);
+    return committed;
+}
+
+void ObjectStoreSession::refetch(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids)
+{
+    auto attachment = acquire(identity, false);
+    if (attachment->fetches) attachment->fetches->refetch(objectUuids);
+    release(*attachment, false);
+}
+
+GeometryState ObjectStoreSession::geometryState(const AttachmentIdentity& identity, const std::string& objectUuid)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    auto attachment = acquire(identity, false);
+    GeometryState state = GeometryState::Remote;
+    try {
+        bool local = false;
+        {
+            auto txn = attachment->store.read();
+            local = attachment->store.currentGeometry(txn, uuid).has_value();
+        }
+        const auto fetching = attachment->fetches ? attachment->fetches->state(uuid) : std::nullopt;
+        if (fetching && (*fetching == GeometryState::Fetching || (!local && *fetching == GeometryState::Failed)))
+            state = *fetching;
+        else if (local) state = GeometryState::Local;
+    } catch (...) { release(*attachment, false); throw; }
+    release(*attachment, false);
+    return state;
+}
+
+void ObjectStoreSession::ensureGeometry(const AttachmentIdentity& identity, const std::string& objectUuid,
+                                        const std::function<bool()>& cancel)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    auto attachment = acquire(identity, false);
+    try {
+        bool local = false;
+        {
+            auto txn = attachment->store.read();
+            local = attachment->store.currentGeometry(txn, uuid).has_value();
+        }
+        if (!local) {
+            if (!attachment->fetches) throw GeometryUnavailable("object has no geometry: " + uuid);
+            std::string error;
+            if (!attachment->fetches->fetchNow(uuid, [&] { return attachment->cancelled.load() || (cancel && cancel()); },
+                                               &error))
+                throw GeometryUnavailable(error.empty() ? "fetching " + uuid + " was cancelled"
+                                                        : "cannot fetch " + uuid + ": " + error);
+        }
+    } catch (...) { release(*attachment, false); throw; }
+    release(*attachment, false);
+}
+
+void ObjectStoreSession::cancelFetches(const AttachmentIdentity& identity)
+{
+    auto attachment = acquire(identity, false);
+    if (attachment->fetches) attachment->fetches->cancelQueued();
+    release(*attachment, false);
+}
+
+namespace {
+// The UUIDs among `uuids` that one of `attachments` holds.
+template <class Session>
+std::set<std::string> heldBy(Session& session, const std::vector<AttachmentIdentity>& attachments,
+                             const std::set<std::string>& uuids)
+{
+    std::set<std::string> held;
+    if (uuids.empty()) return held;
+    for (const auto& attachment : attachments)
+        session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+            for (const auto& uuid : uuids)
+                if (!held.contains(uuid) && store.objectByUuid(txn, uuid)) held.insert(uuid);
+        });
+    return held;
+}
+}
+
+std::vector<AttachedRecord> ObjectStoreSession::selectObjects(const std::vector<AttachmentIdentity>& order,
+                                                              const ObjectSelection& selection)
+{
+    std::vector<AttachedRecord> result;
+    std::vector<AttachmentIdentity> earlier;
+    for (const auto& attachment : order) {
+        std::vector<ObjectRecord> records;
+        read(attachment, [&](const auto& store, const auto& txn, const auto&) { records = store.selectObjects(txn, selection); });
+        std::set<std::string> uuids;
+        for (const auto& record : records) uuids.insert(record.uuid);
+        const auto hidden = heldBy(*this, earlier, uuids);
+        for (auto& record : records)
+            if (!hidden.contains(record.uuid)) result.push_back({attachment, std::move(record)});
+        earlier.push_back(attachment);
+    }
+    return result;
+}
+
+std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector<AttachmentIdentity>& order,
+    const RegionSlice& slice, const RegionOptions& options, const RegionCancel& cancel)
+{
+    std::vector<AttachedRegion> result;
+    std::vector<AttachmentIdentity> earlier;
+    for (const auto& attachment : order) {
+        RegionResult region;
+        read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+            region = store.geometryRegion(txn, slice, options, cancel);
+        });
+        std::set<std::string> uuids(region.remote.begin(), region.remote.end());
+        for (const auto& run : region.runs) uuids.insert(run.objectUuid);
+        const auto hidden = heldBy(*this, earlier, uuids);
+        std::erase_if(region.runs, [&](const VisibleRun& run) { return hidden.contains(run.objectUuid); });
+        std::erase_if(region.remote, [&](const std::string& uuid) { return hidden.contains(uuid); });
+        result.push_back({attachment, std::move(region)});
+        earlier.push_back(attachment);
+    }
+    return result;
+}
+
+std::vector<AttachedHit> ObjectStoreSession::nearestSurfaces(const std::vector<AttachmentIdentity>& order,
+                                                             const SurfaceProximityQuery& query)
+{
+    std::vector<AttachedHit> result;
+    std::vector<AttachmentIdentity> earlier;
+    for (const auto& attachment : order) {
+        std::vector<SurfaceProximityHit> hits;
+        read(attachment, [&](const auto& store, const auto& txn, const auto&) { hits = store.nearestSurfaces(txn, query); });
+        std::set<std::string> uuids;
+        for (const auto& hit : hits) uuids.insert(hit.objectUuid);
+        const auto hidden = heldBy(*this, earlier, uuids);
+        for (auto& hit : hits)
+            if (!hidden.contains(hit.objectUuid)) result.push_back({attachment, std::move(hit)});
+        earlier.push_back(attachment);
+    }
+    std::stable_sort(result.begin(), result.end(), [](const AttachedHit& a, const AttachedHit& b) {
+        return a.hit.distance != b.hit.distance ? a.hit.distance < b.hit.distance : a.hit.objectUuid < b.hit.objectUuid;
+    });
+    return result;
 }
 
 std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIdentity& identity, const std::string& objectUuid,
@@ -342,6 +563,8 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
 
 bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) const
 {
+    // Catalog fetches are of surfaces.
+    if (kind == Kind::Fetch) return std::find(kinds.begin(), kinds.end(), "surface") != kinds.end();
     if (kind != Kind::Committed) return true;
     return std::any_of(changes.begin(), changes.end(), [&](const auto& change) {
         return std::find(kinds.begin(), kinds.end(), change.kind) != kinds.end();

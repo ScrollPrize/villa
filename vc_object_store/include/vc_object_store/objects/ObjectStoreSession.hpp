@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include <chrono>
 #include <initializer_list>
@@ -30,11 +31,22 @@ struct PinnedObject {
     bool operator==(const PinnedObject&) const = default;
 };
 
+// Where an object's geometry is: in the store, published but not fetched yet,
+// being fetched, or the last fetch failed (it is retried on a later read).
+enum class GeometryState { Local, Remote, Fetching, Failed };
+
+// An object's published geometry could not be fetched (offline, missing, invalid).
+struct GeometryUnavailable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct StoreSessionEvent {
     // Attached/Detached: an attachment joined or left the session (replace()
     // reports the old one's Detached before the new one's Attached).
     // Hub: that attachment's hubStatus() changed.
-    enum class Kind { Attached, Detached, Committed, Hub };
+    // Fetch: a fetched attachment's object changed state (objectUuid,
+    // fetchState, error); its geometry arriving is also a Committed event.
+    enum class Kind { Attached, Detached, Committed, Hub, Fetch };
     Kind kind = Kind::Attached;
     // Generations are unique within a session and increase on every attach,
     // including reattachment of the same file/UUID.
@@ -43,9 +55,26 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
+    std::string objectUuid;
+    GeometryState fetchState = GeometryState::Local;
+    std::string error;
     // Whether it may have changed records of these kinds: a commit touching
     // one, or any attachment or hub event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
+};
+
+// A record, region or proximity hit and the attachment it came from.
+struct AttachedRecord {
+    AttachmentIdentity attachment;
+    ObjectRecord record;
+};
+struct AttachedRegion {
+    AttachmentIdentity attachment;
+    RegionResult result;
+};
+struct AttachedHit {
+    AttachmentIdentity attachment;
+    SurfaceProximityHit hit;
 };
 
 // Hosted replicas (objects/Hub.hpp) attached to a session sync in the background.
@@ -109,6 +138,25 @@ public:
     AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&,
                                const HubSessionOptions& = {});
     void detach(const AttachmentIdentity&);
+    // Writes on a fetched attachment, by the code that owns its records.
+    using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
+    // Fetches one object's geometry and writes it with `write`; throws when it
+    // cannot. Runs on the attachment's fetch thread; must only read `store`.
+    using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
+    // A store whose objects without geometry are published elsewhere (e.g. an
+    // Open Data sample, objects/CatalogStore.hpp). Callers see it read-only.
+    // Geometry regions and nearest-surface queries that reach such an object
+    // queue its fetch (Fetch events, then the Committed write).
+    AttachmentIdentity attachFetched(const std::filesystem::path&, const OpenOptions&, GeometryFetcher);
+    RevisionSelection fetchWrite(const AttachmentIdentity&, const RevisionSelection& expected, const Action&);
+    // Fetch these again (their published geometry changed), read or not.
+    void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
+    GeometryState geometryState(const AttachmentIdentity&, const std::string& objectUuid);
+    // Block until the object's geometry is local, fetching it now on a fetched
+    // attachment. Throws GeometryUnavailable when the fetch fails or `cancel` returns true.
+    void ensureGeometry(const AttachmentIdentity&, const std::string& objectUuid, const std::function<bool()>& cancel = {});
+    // Drop queued fetches nobody waits for (e.g. the viewer closed).
+    void cancelFetches(const AttachmentIdentity&);
     std::vector<AttachmentIdentity> attachments() const;
     bool writable(const AttachmentIdentity&) const;
     bool current(const AttachmentIdentity&) const;
@@ -138,7 +186,17 @@ public:
     // its current record and geometry become its first revision there, so
     // restoring that revision returns to the source's version. Throws when the
     // destination already has the object.
+    // An object of a fetched attachment is fetched first.
     void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
+    // Restore an imported object to the version it was imported at (its first
+    // revision here), e.g. "Reset to Open Data Version".
+    void restoreImported(const AttachmentIdentity&, const std::string& objectUuid);
+    // Queries across attachments in `order`: an object (by UUID) comes from the
+    // first attachment holding it, so an imported copy hides the catalog one.
+    std::vector<AttachedRecord> selectObjects(const std::vector<AttachmentIdentity>& order, const ObjectSelection&);
+    std::vector<AttachedRegion> geometryRegion(const std::vector<AttachmentIdentity>& order, const RegionSlice&,
+                                               const RegionOptions&, const RegionCancel& = {});
+    std::vector<AttachedHit> nearestSurfaces(const std::vector<AttachmentIdentity>& order, const SurfaceProximityQuery&);
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory

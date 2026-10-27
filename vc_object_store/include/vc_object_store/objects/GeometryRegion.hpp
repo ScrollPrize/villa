@@ -63,6 +63,10 @@ struct VisibleRun {
 };
 struct RegionResult {
     std::vector<VisibleRun> runs;
+    // Surfaces that reach the region by their record bounds but whose geometry
+    // is not local yet (catalog placeholders), in UUID order. A catalog
+    // attachment fetches them; they appear in runs once their geometry is local.
+    std::vector<std::string> remote;
     RegionStats stats;
     uint64_t intersectingObjects = 0;
     RegionStop stop = RegionStop::Exhausted;

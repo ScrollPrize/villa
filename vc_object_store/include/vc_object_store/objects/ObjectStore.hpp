@@ -182,6 +182,10 @@ struct OpenOptions {
     // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
     // opens of a hub are rejected so they cannot switch it back to WAL.
     bool sharedFile = false;
+    // Called (on the reading thread, inside the read) with the surfaces a
+    // geometryRegion or nearestSurfaces query reached whose geometry is not
+    // local yet. Must only queue work; ObjectStoreSession::attachCatalog sets it.
+    std::function<void(const std::vector<std::string>&)> remoteGeometryReached;
 };
 
 struct ObjectSelection {

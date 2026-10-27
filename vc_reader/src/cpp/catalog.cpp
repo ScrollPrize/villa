@@ -41,19 +41,6 @@ std::string safePathComponent(std::string value)
     return value.empty() ? std::string("unnamed") : value;
 }
 
-// FNV-1a of a URL, as 16 hex digits: part of representation ids.
-std::string hashUrl(std::string_view value)
-{
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out(16, '0');
-    for (int i = 15; i >= 0; --i, hash >>= 4) out[size_t(i)] = hex[hash & 0xf];
-    return out;
-}
 
 // Fields of published records, by their published keys only.
 const nlohmann::json* member(const nlohmann::json& obj, const char* key)
@@ -611,7 +598,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
     }
     const auto published = [&](const std::string& target, const OpenDataArtifact& artifact) {
         return OpenDataSurface{&artifact, false, target == sourceId, target, 1.0,
-                               lineage + "-published-" + safePathComponent(target) + "-L0-" + hashUrl(artifact.url())};
+                               lineage + "-published-" + safePathComponent(target)};
     };
 
     if (const auto onSource = publishedByTarget.find(sourceId); onSource != publishedByTarget.end()) {
@@ -627,8 +614,7 @@ std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& seg
                 return lowerCopy(artifact.type) == type && !artifact.url().empty();
             });
             if (it == segment.artifacts.end()) continue;
-            result.push_back({&*it, true, true, sourceId, 1.0 / segment.originalVolumeDownscale,
-                              lineage + "-derived-native-L0-" + hashUrl(it->url())});
+            result.push_back({&*it, true, true, sourceId, 1.0 / segment.originalVolumeDownscale, lineage + "-authored"});
             break;
         }
     }
