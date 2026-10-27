@@ -1152,7 +1152,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
@@ -1366,7 +1366,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_loc = seed;
     data.seed_coord = points(seed);
 
-    if (debug_images) {
+    if (debug_images && !tgt_dir.empty()) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
@@ -1396,7 +1396,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
     std::cout << "bidirectional: " << bidirectional << std::endl;
-    std::filesystem::path tgt_dir = params["tgt_dir"].get<std::string>();
+    // Debug output (generation snapshots, inliers_sum.tif, debug_images) goes
+    // here; there is none without it.
+    const std::filesystem::path tgt_dir = params.value("tgt_dir", std::string{});
 
     std::unordered_map<std::string,QuadSurface *> surfs;
     float src_step = params.value("src_step", 20);
@@ -3102,7 +3104,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (!global_steps_per_window && reopt_interval == 0)
             update_mapping = false;
 
-        if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
+        if (!tgt_dir.empty() && (generation % 50 == 0 || update_mapping)) {
             {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
@@ -3116,16 +3118,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
                 const std::filesystem::path snapshot_path = tgt_dir / uuid;
                 dbg_surf->saveAsNew(snapshot_path, true);
 
                 std::error_code cleanup_ec;
-                if (legacy_current_path != snapshot_path) {
-                    std::filesystem::remove_all(legacy_current_path, cleanup_ec);
-                }
-                cleanup_ec.clear();
                 if (current_snapshot_path && *current_snapshot_path != snapshot_path) {
                     std::filesystem::remove_all(*current_snapshot_path, cleanup_ec);
                 }
@@ -3189,7 +3186,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 reseed_fringe_from_valid(active);
             }
 
-            if (debug_images) {
+            if (debug_images && !tgt_dir.empty()) {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
@@ -3486,7 +3483,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
 
-        cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
+        if (!tgt_dir.empty())
+            cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);

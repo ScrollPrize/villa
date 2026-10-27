@@ -536,14 +536,7 @@ TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request
         params["cache_root"] = context.cacheRoot.toStdString();
     }
 
-    std::filesystem::path targetDir;
-    if (!context.cacheRoot.isEmpty()) {
-        targetDir = std::filesystem::path(context.cacheRoot.toStdString());
-    }
-    if (targetDir.empty()) {
-        targetDir = std::filesystem::temp_directory_path();
-    }
-    params["tgt_dir"] = targetDir.string();
+    // No tgt_dir: in-process growth writes no debug tifxyz.
 
     std::vector<QuadSurface*> surfaces;
     surfaces.reserve(context.patchSurfaces.size() + 1);
