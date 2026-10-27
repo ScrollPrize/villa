@@ -464,6 +464,8 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto affected = affectedEdges(*this, txn, objectUuid, current, plan->after);
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected,
                                              decide ? (*decide)(affected) : edgeEdits);
+    // The cells whose area the edit changes, measured before it.
+    const auto areaBefore = editedSurfaceCells(db, current.uuid, edits);
     if (geometryDeltaRawSize(plan->changes) > std::min(impl_->options.maxGeometryDeltaBytes, maxGeometryDeltaBytes)) {
         // Too large for one sparse delta: publish a full revision. Unchanged
         // arrays are inherited; changed arrays reference their chunks by hash,
@@ -497,7 +499,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
         clearGeometryMaterialization(db, objectUuid);
         execute(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
         const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
-        updateEditedGeometryBounds(db, id, uuid, edits);
+        updateEditedGeometryBounds(db, id, uuid, edits, areaBefore);
         stampGeometry(db, *this, objectUuid, id, hash);
         applyEdgeDecisions(*this, txn, db, affected, decisions);
         savepoint.release();
@@ -530,7 +532,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
         parseUuid(uuid), plan->manifest.dump());
     execute(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
-    updateEditedGeometryBounds(db, id, uuid, edits);
+    updateEditedGeometryBounds(db, id, uuid, edits, areaBefore);
     stampGeometry(db, *this, objectUuid, id, hash);
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();

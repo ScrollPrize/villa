@@ -226,7 +226,9 @@ int main() try {
         {auto txn=db.write();const std::array<float,3> vertex{7*1.25f,5,1.f};
          db.editGeometry(txn,uuid,{{"points",(5*large.columns+7)*3,vc::objects::detail::scalarBytes(std::span<const float>(vertex))}},head);
          txn.commit();}
-        require(db.objectByUuid(db.read(),uuid)->surface->area==complete,"an edit updates the area");
+        {auto r=db.read();const auto area=db.objectByUuid(r,uuid)->surface->area;
+         require(std::abs(area-complete)<=1e-12*complete&&std::abs(area-db.surfaceAreaInVolume(r,uuid,"a"))<=1e-12*complete,
+                 "an edit updates the area by its cells' change");}
     }
     {
         // Importing an umbilicus file: the store reads it, decides its frame

@@ -5,7 +5,9 @@
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
+#include <algorithm>
 #include <bit>
+#include <set>
 #include <tuple>
 
 namespace vc::objects::detail {
@@ -306,17 +308,94 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
         }, manifest.at("kind") == "surface" && manifest.at("arrays").at("points").contains("storage"));
 }
 
+namespace {
+// Of an edit list: does it change a surface's points or validity?
+bool editsSurfaceArea(const std::vector<GeometryArrayEdit>& edits)
+{
+    return std::any_of(edits.begin(), edits.end(), [](const auto& edit) {
+        return edit.array == "points" || edit.array == surfaceValidChannel;
+    });
+}
+
+// The area of `cells` (row-major) in a surface revision, read row by row.
+double cellsArea(GeometryReader& reader, const std::vector<std::pair<int64_t, int64_t>>& cells)
+{
+    const bool hasValid = reader.manifest().at("arrays").contains(surfaceValidChannel);
+    double total = 0;
+    for (size_t first = 0; first < cells.size();) {
+        const auto row = cells[first].first;
+        size_t last = first;
+        while (last + 1 < cells.size() && cells[last + 1].first == row) ++last;
+        const auto c0 = cells[first].second, columns = cells[last].second - c0 + 2;
+        const auto points = xyzValues<float>(reader.rectangle("points", row, c0, 2, columns));
+        const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row, c0, 2, columns) : std::vector<uint8_t>{};
+        for (size_t i = first; i <= last; ++i) {
+            const auto c = cells[i].second - c0;
+            total = vc::geometry::surfaceGridArea(2, 2,
+                [&](int64_t r, int64_t k) -> const std::array<float, 3>& { return points[size_t(r * columns + c + k)]; },
+                [&](int64_t r, int64_t k) {
+                    const auto at = size_t(r * columns + c + k);
+                    return vc::geometry::validSurfacePoint(points[at]) && (!hasValid || valid[at]);
+                }, total);
+        }
+        first = last + 1;
+    }
+    return total;
+}
+}
+
+std::optional<EditedSurfaceCells> editedSurfaceCells(sqlite3* db, const std::string& revision,
+                                                     const std::vector<GeometryArrayEdit>& edits)
+{
+    if (!editsSurfaceArea(edits)) return std::nullopt;
+    GeometryReader reader(db, revision, false);
+    if (reader.manifest().at("kind") != "surface") return std::nullopt;
+    const auto shape = reader.manifest().at("arrays").at("points").at("shape").get<std::vector<int64_t>>();
+    const int64_t rows = shape.at(0), columns = shape.at(1);
+    if (rows < 2 || columns < 2) return std::nullopt;
+    // Past about a quarter of the grid a full pass is no slower.
+    const int64_t limit = std::max<int64_t>(1, (rows - 1) * (columns - 1) / 4);
+    std::set<std::pair<int64_t, int64_t>> cells;
+    for (const auto& edit : edits) {
+        int64_t first = 0, count = 0;
+        if (edit.array == "points") {
+            first = edit.elementOffset / 3;
+            count = (edit.elementOffset + int64_t(edit.bytes.size() / sizeof(float)) + 2) / 3 - first;
+        } else if (edit.array == surfaceValidChannel) {
+            first = edit.elementOffset;
+            count = int64_t(edit.bytes.size());
+        } else {
+            continue;
+        }
+        if (count > limit) return std::nullopt;
+        for (auto vertex = first; vertex < first + count; ++vertex) {
+            const auto r = vertex / columns, c = vertex % columns;
+            for (auto cr = std::max<int64_t>(0, r - 1); cr <= std::min(r, rows - 2); ++cr)
+                for (auto cc = std::max<int64_t>(0, c - 1); cc <= std::min(c, columns - 2); ++cc) cells.emplace(cr, cc);
+        }
+        if (int64_t(cells.size()) > limit) return std::nullopt;
+    }
+    EditedSurfaceCells result{{cells.begin(), cells.end()}, 0};
+    result.area = cellsArea(reader, result.cells);
+    return result;
+}
+
 void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision,
-                                const std::vector<GeometryArrayEdit>& edits)
+                                const std::vector<GeometryArrayEdit>& edits, const std::optional<EditedSurfaceCells>& before)
 {
     GeometryReader reader(db, revision);
     const auto& manifest = reader.manifest();
     const std::string kind = manifest.at("kind");
     // No edits list: a channel rewrite, which may replace validity.
-    if (kind == "surface" && (edits.empty() || std::any_of(edits.begin(), edits.end(), [](const auto& edit) {
-            return edit.array == "points" || edit.array == surfaceValidChannel;
-        })))
-        refreshSurfaceArea(db, objectId, revision);
+    if (kind == "surface" && (edits.empty() || editsSurfaceArea(edits))) {
+        Statement stored(db, "SELECT area FROM surfaces WHERE object_id=?", objectId);
+        if (before && stored.row()) {
+            const auto area = stored.f64(0) - before->area + cellsArea(reader, before->cells);
+            execute(db, "UPDATE surfaces SET area=? WHERE object_id=?", std::max(0.0, area), objectId);
+        } else {
+            refreshSurfaceArea(db, objectId, revision);
+        }
+    }
     std::set<RegionKey> dirty;
     for (const auto& edit : edits) {
         if (edit.bytes.empty() || !coordinates(kind, edit.array)) continue;

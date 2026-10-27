@@ -8,8 +8,21 @@ using Bounds = std::array<double, 6>;
 void validateBounds(const Bounds&);
 std::optional<Bounds> recordBounds(const ObjectRecord&);
 void indexGeometryBounds(sqlite3*, int64_t objectId, const std::string& revision, const GeometryData&);
+// The grid cells a sparse edit of a surface revision touches (cells with an
+// edited vertex or validity) and their area in that revision; nullopt when the
+// edit is no surface point/validity edit, or touches too much of the grid to
+// update the area cell by cell.
+struct EditedSurfaceCells {
+    std::vector<std::pair<int64_t, int64_t>> cells;  // (row, column), row-major
+    double area = 0;
+};
+std::optional<EditedSurfaceCells> editedSurfaceCells(sqlite3*, const std::string& revision,
+                                                     const std::vector<GeometryArrayEdit>&);
+// After an edit: bounds of the dirty regions, and the area (by the cells'
+// change when `before` holds them, else recomputed).
 void updateEditedGeometryBounds(sqlite3*, int64_t objectId, const std::string& revision,
-                                const std::vector<GeometryArrayEdit>&);
+                                const std::vector<GeometryArrayEdit>&,
+                                const std::optional<EditedSurfaceCells>& before = std::nullopt);
 std::string spatialOverlapSql(int firstParameter = 1);
 // Surfaces whose geometry is not local yet (catalog placeholders) whose record
 // bounds overlap `bounds` (source XYZ), filtered like a geometry query: optional
