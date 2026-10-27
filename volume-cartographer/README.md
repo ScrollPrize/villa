@@ -367,6 +367,8 @@ _Main UI widget for adjusting the ROI and display of the volume viewers_
 _Keybinds:_
 > - `Right mouse + drag` : pans the current viewer
 > - `Scroll wheel` : zooms the current viewer
+> - `Ctrl + C` (`Cmd + C` on macOS) : copies the volume coordinates under the mouse as `x, y, z`, without moving the focus point
+> - `Ctrl + Shift + C` (`Cmd + Shift + C` on macOS) : copies the focus point as `x, y, z`, as shown in `Focus`
 > - `Ctrl + left mouse button` : centers the focus point on the cursor position
 > - `Scroll wheel click + drag` : rotates the slicing pane in the XZ or XY volume viewers
 > - `Spacebar` : toggles the overlay on / off

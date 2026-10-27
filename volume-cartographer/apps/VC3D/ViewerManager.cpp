@@ -638,6 +638,48 @@ bool ViewerManager::centerFocusOnCursor()
     return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId);
 }
 
+std::optional<cv::Vec3f> ViewerManager::hoveredVolumePosition() const
+{
+    // Only the viewer the mouse is over, never one covered by a panel or by a
+    // maximized viewer, so whatever is copied is what the user points at.
+    const QPoint globalPos = QCursor::pos();
+    CChunkedVolumeViewer* viewer = nullptr;
+    for (QWidget* widget = QApplication::widgetAt(globalPos); widget && !viewer;
+         widget = widget->parentWidget()) {
+        viewer = qobject_cast<CChunkedVolumeViewer*>(widget);
+    }
+    auto* gv = viewer ? viewer->graphicsView() : nullptr;
+    auto* viewport = gv ? gv->viewport() : nullptr;
+    if (!viewport) {
+        return std::nullopt;
+    }
+    const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
+    if (!viewport->rect().contains(viewportPos)) {
+        return std::nullopt;
+    }
+    // Sample the pixel the readout used: its mouse position can be fractional
+    // and differ by a pixel from QCursor::pos(). If the mouse has moved on
+    // since, use where it is now.
+    QPointF scenePos = gv->mapToScene(viewportPos);
+    const QPointF readoutPos = viewer->lastScenePosition();
+    if ((gv->mapFromScene(readoutPos) - viewportPos).manhattanLength() <= 2) {
+        scenePos = readoutPos;
+    }
+    // sampleSceneVolume() is what the readout shows: it applies the viewer's
+    // normal offset and rejects non-finite positions.
+    const auto sample = viewer->sampleSceneVolume(scenePos);
+    if (!sample) {
+        return std::nullopt;
+    }
+    // A flattened segment has no point off its mesh, where sceneToVolume()
+    // gives (-1, -1, -1); check before the normal offset moves that marker.
+    if (!dynamic_cast<PlaneSurface*>(sample->surface) &&
+        viewer->sceneToVolume(scenePos) == cv::Vec3f(-1, -1, -1)) {
+        return std::nullopt;
+    }
+    return sample->position;
+}
+
 void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
                                         Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {

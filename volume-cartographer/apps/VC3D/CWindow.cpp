@@ -30,6 +30,7 @@
 #include <functional>
 #include <optional>
 
+#include "CoordinateCopy.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
 #include "OpenDataNormalGrids.hpp"
@@ -8426,12 +8427,24 @@ void CWindow::CreateWidgets(void)
 
     // Set up validator for location input (accepts digits, commas, and spaces)
     QRegularExpressionValidator* validator = new QRegularExpressionValidator(
-        QRegularExpression("^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$"), this);
+        QRegularExpression(vc3d::kFocusFieldPattern), this);
     lblLocFocus->setValidator(validator);
     connect(lblLocFocus, &QLineEdit::editingFinished, this, &CWindow::onManualLocationChanged);
 
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
+    // Ctrl+Shift+C copies the focus point. A window shortcut, so it also works
+    // while typing in a field or from a floating dock, but not in separate
+    // windows such as the console output, where users copy selected text.
+    const QKeySequence copyFocusKeys =
+        vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CopyFocusCoordinates);
+    auto* copyFocusShortcut = new QShortcut(copyFocusKeys, this);
+    copyFocusShortcut->setContext(Qt::WindowShortcut);
+    copyFocusShortcut->setAutoRepeat(false);
+    connect(copyFocusShortcut, &QShortcut::activated, this, &CWindow::onCopyFocusCoordinates);
+    // Replaces the tooltip from VCMain.ui so that it names the key.
+    btnCopyCoords->setToolTip(tr("Copy the focus coordinates to the clipboard (%1)")
+                                  .arg(copyFocusKeys.toString(QKeySequence::NativeText)));
 
     const QRegularExpression coordinateTriple(
         "^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$");
@@ -8521,6 +8534,19 @@ void CWindow::keyPressEvent(QKeyEvent* event)
             event->accept();
             return;
         }
+    }
+
+    // Reached only when no focused widget took the key, so Ctrl+C still
+    // copies selected text in line edits, the console and other text views.
+    if (event->key() == vc3d::keybinds::keypress::CopyCursorCoordinates.key &&
+        event->modifiers() == vc3d::keybinds::keypress::CopyCursorCoordinates.modifiers &&
+        !vc3d::focusedWidgetHandlesCopy(QApplication::focusWidget())) {
+        if (!vc3d::keybinds::keypress::CopyCursorCoordinates.requireNoAutoRepeat ||
+            !event->isAutoRepeat()) {
+            onCopyCursorCoordinates();
+        }
+        event->accept();
+        return;
     }
 
     if (_viewerManager && _wrapAnnotationWidget && _wrapAnnotationWidget->sameWrapAnnotationEnabled()) {
@@ -10680,6 +10706,47 @@ void CWindow::onCopyCoordinates()
         QApplication::clipboard()->setText(coords);
         showStatusBarMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
+}
+
+void CWindow::onCopyFocusCoordinates()
+{
+    // From the focus point rather than the Focus field, which may hold an
+    // entry that is still being typed and not applied yet. The Spiral tab
+    // keeps its own focus point.
+    ViewerManager* manager = activeWorkspaceViewerManager();
+    CState* state = manager && manager->state() ? manager->state() : _state;
+    POI* poi = state->poi("focus");
+    if (!poi) {
+        showStatusBarMessage(tr("No focus point to copy"), 2000);
+        return;
+    }
+    const QString coords = QString("%1, %2, %3")
+        .arg(static_cast<int>(poi->p[0]))
+        .arg(static_cast<int>(poi->p[1]))
+        .arg(static_cast<int>(poi->p[2]));
+    QApplication::clipboard()->setText(coords);
+    showStatusBarMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+}
+
+void CWindow::onCopyCursorCoordinates()
+{
+    ViewerManager* manager = activeWorkspaceViewerManager();
+    CState* state = manager && manager->state() ? manager->state() : _state;
+    const auto volume = state->currentVolume();
+    const std::optional<cv::Vec3f> position =
+        manager && volume ? manager->hoveredVolumePosition() : std::nullopt;
+    if (!position) {
+        showStatusBarMessage(tr("No volume position under the mouse to copy"), 2000);
+        return;
+    }
+    const auto [w, h, d] = volume->shapeXyz();
+    if (!vc3d::roundsInsideVolume(*position, w, h, d)) {
+        showStatusBarMessage(tr("The mouse is outside the volume: nothing copied"), 2000);
+        return;
+    }
+    const QString coords = vc3d::coordinateTripleText(*position);
+    QApplication::clipboard()->setText(coords);
+    showStatusBarMessage(tr("Cursor coordinates copied to clipboard: %1").arg(coords), 2000);
 }
 
 void CWindow::onResetAxisAlignedRotations()

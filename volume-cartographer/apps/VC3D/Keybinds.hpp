@@ -46,6 +46,7 @@ extern const ShortcutDef CyclePrevSegment;
 extern const ShortcutDef ApplyApprovedTag;
 extern const ShortcutDef ApplyDefectiveTag;
 extern const ShortcutDef FocusedView;
+extern const ShortcutDef CopyFocusCoordinates;
 extern const ShortcutDef CycleViewers;
 } // namespace shortcuts
 
@@ -53,6 +54,7 @@ namespace keypress {
 extern const KeyPressDef ToggleVolumeOverlay;
 extern const KeyPressDef CenterFocusOnCursor;
 extern const KeyPressDef RecenterFocus;
+extern const KeyPressDef CopyCursorCoordinates;
 extern const KeyPressDef SliceStepDecrease;
 extern const KeyPressDef SliceStepIncrease;
 
