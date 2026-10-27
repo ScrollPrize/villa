@@ -53,16 +53,6 @@ vc_register_ctest(intersection_layer_item test_intersection_layer_item)
 set_tests_properties(intersection_layer_item PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
-set_target_properties(test_spiral_input_draft PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_spiral_input_draft PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_spiral_input_draft PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME spiral_input_draft COMMAND test_spiral_input_draft)
-vc_register_test_target(test_spiral_input_draft)
-vc_register_ctest(spiral_input_draft test_spiral_input_draft)
-
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
 

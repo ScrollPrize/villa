@@ -1,7 +1,6 @@
 #include "SpiralPanel.hpp"
 #include "SpiralPreviewProvenance.hpp"
 #include "SpiralInputRows.hpp"
-#include "SpiralActivityWidget.hpp"
 #include "SpiralDescriptions.hpp"
 #include "SpiralInputFilter.hpp"
 
@@ -82,16 +81,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* statusDock = new QWidget(this);
     auto* statusDockLayout = new QVBoxLayout(statusDock);
     statusDockLayout->setContentsMargins(0, 0, 0, 0);
-    auto* inputActivity = new SpiralActivityWidget(statusDock);
-    statusDockLayout->addWidget(inputActivity);
-    connect(_service, &SpiralServiceManager::inputPreparationProgress,
-            inputActivity, &SpiralActivityWidget::setPreparation);
-    connect(_service, &SpiralServiceManager::inputCopyProgress,
-            inputActivity, &SpiralActivityWidget::setCopy);
-    connect(_service, &SpiralServiceManager::connectionStateChanged, inputActivity,
-            [inputActivity](SpiralServiceManager::ConnectionState state, const QString&) {
-                if (state != SpiralServiceManager::ConnectionState::Ready) inputActivity->reset();
-            });
 
     auto makeSection = [this, contents, layout](const QString& title,
                                                 const QString& objectName,
@@ -612,13 +601,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
              {"output", "Output"}, {"verified", "Verified patches"},
-             {"pending_only", "Pending patches only"},
              {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
         auto* check = new QCheckBox(tr(item.second), _displayDialog);
         const QString key = QString::fromLatin1(item.first);
         _visibilityChecks[key] = check;
-        if (key == QStringLiteral("pending_only"))
-            check->setObjectName(QStringLiteral("spiralPendingPatchesOnly"));
         describe(QStringLiteral("display_") + key, {check});
         check->setChecked(key == QStringLiteral("output"));
         connect(check, &QCheckBox::toggled, this, [this, key = QString::fromLatin1(item.first)](bool shown) {
@@ -1097,14 +1083,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _checkpointTotalBytes = total;
                 refreshCheckpointDownload();
             });
-    connect(_service, &SpiralServiceManager::inputUploadFinished, this,
-            [this](const QString& inputId, const QString& error) {
-                if (error.isEmpty())
-                    _warnings->setText(tr("Added %1 to the current fit; it is used on the next run").arg(inputId));
-                else
-                    _warnings->setText(tr("Adding %1 failed: %2").arg(inputId, error));
-            });
-
     connect(_load, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
         const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
@@ -1146,16 +1124,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             if (box.clickedButton() != reload) return;
             reloadInputs = true;
         }
-        // A model-stage rebuild keeps the loaded host inputs, and with
-        // them everything already incorporated into the fit, so there is
-        // nothing to warn about; only a full rebuild discards them.
-        if (_uncommittedCount > 0 && pendingRebuildStage() != QStringLiteral("model")
-            && QMessageBox::question(
-                   this, tr("Uncommitted inputs"),
-                   tr("The current session has %1 added input(s) that were not committed "
-                      "to the dataset. Rebuilding discards them. Continue?").arg(_uncommittedCount))
-                   != QMessageBox::Yes)
-            return;
         // A session that failed to build may have failed because of what
         // it was pointed at — a poisoned autosave, or an input the panel
         // still names. The recovery case therefore also offers the
@@ -1337,75 +1305,29 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(true); });
     connect(_addInputs, &QPushButton::clicked, this, [this]() { emit addDraftsRequested(false); });
-    connect(_service, &SpiralServiceManager::inputConflict, this, [this](const QJsonObject& conflict) {
-        QMessageBox dialog(QMessageBox::Warning, tr("Input changed in the dataset"),
-            tr("Review this input's base, current dataset content, and local draft. Other drafts are preserved."),
-            QMessageBox::NoButton, this);
-        dialog.setDetailedText(QString::fromUtf8(QJsonDocument(conflict).toJson(QJsonDocument::Indented)));
-        auto* current = dialog.addButton(conflict.value(QStringLiteral("current")).isNull()
-            ? tr("Discard Local") : tr("Use Current"), QMessageBox::AcceptRole);
-        auto* local = conflict.value(QStringLiteral("current")).isNull() ? nullptr
-            : dialog.addButton(tr("Apply Local After Review"), QMessageBox::ActionRole);
-        auto* copy = dialog.addButton(tr("Save Local as New"), QMessageBox::ActionRole);
-        dialog.addButton(QMessageBox::Cancel);
-        dialog.exec();
-        if (dialog.clickedButton() == current) _service->resolveInputConflict(conflict, QStringLiteral("use_current"));
-        else if (local && dialog.clickedButton() == local) _service->resolveInputConflict(conflict, QStringLiteral("apply_local_after_review"));
-        else if (dialog.clickedButton() == copy) _service->resolveInputConflict(conflict, QStringLiteral("save_as_new"));
-    });
-    connect(_service, &SpiralServiceManager::inputDraftsChanged, this, [this]() {
-        if (!_lastInputStatus.isEmpty()) updateStatus(_lastInputStatus);
-    });
+    // The list holds only local drawings: a frozen fit's inputs are shown
+    // from its manifest, and nothing here edits them.
     connect(_inputList, &QListWidget::itemSelectionChanged, this, [this]() {
         const auto* item = _inputList->currentItem();
-        const auto row = item ? item->data(Qt::UserRole + 4).toJsonObject() : QJsonObject();
-        _removeInput->setEnabled(_connected && _service->ownsSessionLease() && item
-            && (!row.value(QStringLiteral("deleted")).toBool() || row.value(QStringLiteral("can_restore")).toBool()));
-        _removeInput->setText(item && item->data(Qt::UserRole + 3).toBool() ? tr("Restore") : tr("Remove"));
-    });
-    connect(_inputList, &QListWidget::itemChanged, this, [this]() {
-        QStringList selected;
-        for (int index = 0; index < _inputList->count(); ++index) {
-            const auto* item = _inputList->item(index);
-            if (item->checkState() == Qt::Checked) selected.push_back(item->data(Qt::UserRole + 1).toString());
-        }
-        _service->setInputSelection(selected);
+        _removeInput->setEnabled(item != nullptr);
     });
     connect(_removeInput, &QPushButton::clicked, this, [this]() {
         const auto* item = _inputList->currentItem();
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
-        if (row.value("local").toBool()) {
-            emit removeLocalPatchRequested(row.value("alias").toString(id));
-            return;
-        }
-        if (item->data(Qt::UserRole + 3).toBool()) _service->restoreInputDraft(id);
-        else _service->removeInputDraft(id);
+        emit removeLocalPatchRequested(row.value("alias").toString(id));
     });
     _inputList->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(_inputList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& position) {
         const auto* item = _inputList->itemAt(position);
         if (!item) return;
         const auto id = item->data(Qt::UserRole + 1).toString();
-        QMenu menu(this);
-        auto* edit = menu.addAction(tr("Edit"));
-        auto* retry = menu.addAction(tr("Retry"));
-        auto* discard = menu.addAction(tr("Discard Local Changes"));
         const auto row = item->data(Qt::UserRole + 4).toJsonObject();
-        const bool owner = _service->ownsSessionLease();
-        edit->setEnabled(owner && !row.value("local").toBool() && !row.value(QStringLiteral("deleted")).toBool());
-        retry->setEnabled(owner && !row.value("local").toBool() && (!row.value(QStringLiteral("committed")).toBool()
-            || !row.value(QStringLiteral("error")).toString().isEmpty()));
-        discard->setEnabled(owner && (row.value("local").toBool() || row.value(QStringLiteral("dirty")).toBool()));
-        const auto* choice = menu.exec(_inputList->viewport()->mapToGlobal(position));
-        if (row.value("local").toBool()) {
-            if (choice == discard) emit removeLocalPatchRequested(row.value("alias").toString(id));
-            return;
-        }
-        if (choice == edit) _service->editInputDraft(id);
-        else if (choice == retry) _service->applyInputDrafts(false, {id});
-        else if (choice == discard) _service->discardInputDraft(id);
+        QMenu menu(this);
+        auto* discard = menu.addAction(tr("Discard Local Changes"));
+        if (menu.exec(_inputList->viewport()->mapToGlobal(position)) == discard)
+            emit removeLocalPatchRequested(row.value("alias").toString(id));
     });
     for (QSpinBox* spin : {_zBegin, _zEnd, _renderVolumeScale})
         connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int) { refreshReloadRequired(); });
@@ -2361,55 +2283,29 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             _connected, state,
             !_checkpointChoice->currentData().toString().isEmpty()));
 
-    // Baseline catalog entries and local revisioned drafts.
-    const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows(
-        _service->inputDraftStatus(), _localPatchDrafts);
+    // Local drawings, which a frozen fit does not take.
+    const QJsonArray ephemeral = vc3d::spiral::mergePatchDraftRows({}, _localPatchDrafts);
     // Rebuild only on change: the 1 Hz status poll must not wipe the row the
     // user selected while aiming for Remove.
     if (ephemeral != _lastInputDrafts) {
         _lastInputDrafts = ephemeral;
-        _uncommittedCount = 0;
         QString selectedKind, selectedId;
         if (const QListWidgetItem* current = _inputList->currentItem()) {
             selectedKind = current->data(Qt::UserRole).toString();
             selectedId = current->data(Qt::UserRole + 1).toString();
         }
-        QSet<QString> excluded;
-        for (int index = 0; index < _inputList->count(); ++index) {
-            const auto* item = _inputList->item(index);
-            if (item->checkState() != Qt::Checked) excluded.insert(item->data(Qt::UserRole + 1).toString());
-        }
         const QSignalBlocker blocker(_inputList);
         QSet<QString> present;
-        QStringList selected;
         for (const QJsonValue& value : ephemeral) {
             const QJsonObject input = value.toObject();
             const QString kind = input.value(QStringLiteral("kind")).toString();
             const QString id = input.value(QStringLiteral("id")).toString();
             present.insert(id);
-            if (!input.value(QStringLiteral("committed")).toBool()) ++_uncommittedCount;
             auto* item = _inputItems.value(id);
-            if (item && item->data(Qt::UserRole + 4).toJsonObject() == input) {
-                if (item->checkState() == Qt::Checked) selected.push_back(id);
-                continue;
-            }
+            if (item && item->data(Qt::UserRole + 4).toJsonObject() == input) continue;
             const QString inputState =
                 input.value(QStringLiteral("state")).toString();
-            QString stateLabel = inputState;
-            if (inputState == QStringLiteral("queued"))
-                stateLabel = tr("queued for next optimizer step");
-            else if (inputState == QStringLiteral("pending"))
-                stateLabel = tr("pending for next Run");
-            QString name = input.value(QStringLiteral("name")).toString();
-            if (name.isEmpty()) name = QFileInfo(input.value(QStringLiteral("source")).toString()).fileName();
-            if (kind == QStringLiteral("pcl") && input.contains(QStringLiteral("collection_id")))
-                name += QStringLiteral(" #%1").arg(input.value(QStringLiteral("collection_id")).toInteger());
-            QString label = tr("%1 %2 — %3").arg(kind, name.isEmpty() ? id : name, stateLabel);
-            if (input.value(QStringLiteral("deleted")).toBool()) label += tr(" (removed)");
-            if (input.value(QStringLiteral("committed")).toBool())
-                label += tr(", committed");
-            const QString role = input.value(QStringLiteral("role")).toString();
-            if (!role.isEmpty()) label += tr(" (%1)").arg(role);
+            QString label = tr("%1 %2 — %3").arg(kind, id, inputState);
             if (!item) {
                 item = new QListWidgetItem(_inputList);
                 _inputItems[id] = item;
@@ -2421,23 +2317,15 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             item->setData(Qt::UserRole, kind);
             item->setData(Qt::UserRole + 1, id);
             item->setData(Qt::UserRole + 2, inputState);
-            item->setData(Qt::UserRole + 3, input.value(QStringLiteral("can_restore")).toBool());
-            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-            item->setCheckState(excluded.contains(id) ? Qt::Unchecked : Qt::Checked);
-            if (!excluded.contains(id)) selected.push_back(id);
-            const QString incorporationError =
-                input.value(QStringLiteral("error")).toString();
-            if (!incorporationError.isEmpty()) {
-                item->setToolTip(tr("Input update failed: %1")
-                                     .arg(incorporationError));
-                label += tr(": %1").arg(incorporationError);
-                item->setText(label);
+            const QString error = input.value(QStringLiteral("error")).toString();
+            if (!error.isEmpty()) {
+                item->setToolTip(error);
+                item->setText(label + tr(": %1").arg(error));
             }
             if (kind == selectedKind && id == selectedId) _inputList->setCurrentItem(item);
         }
         for (const auto& id : _inputItems.keys())
             if (!present.contains(id)) delete _inputItems.take(id);
-        _service->setInputSelection(selected);
         refreshInputVisibility();
     }
     const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();

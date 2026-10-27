@@ -68,7 +68,6 @@ private slots:
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
-        QSignalSpy batches(&manager, &SpiralServiceManager::inputBatchFinished);
         QSignalSpy errors(&manager, &SpiralServiceManager::errorOccurred);
         SpiralServiceProfile profile;
         profile.id = QStringLiteral("protocol");
@@ -102,11 +101,6 @@ private slots:
         QVERIFY(inputs.resolved());
         QCOMPARE(inputs.surfaces.size(), std::size_t{1});
         QCOMPARE(inputs.surfaces.front().state, vc3d::spiral::PinState::Current);
-
-        // Inputs are frozen: no input change reaches the service.
-        manager.applyInputDrafts();
-        QTRY_COMPARE(batches.count(), 1);
-        QCOMPARE(batches.at(0).at(0).toString(), SpiralServiceManager::inputsFrozenMessage());
 
         // The reload rebuild is accepted and rebuilds the session.
         errors.clear();

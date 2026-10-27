@@ -104,7 +104,6 @@ QString formatEventRecord(const QJsonObject& event)
 
 SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
 {
-    connect(this, &SpiralServiceManager::inputDraftsChanged, this, [this]() { _inputRowsDirty = true; });
     _network = new QNetworkAccessManager(this);
     _artifactCache = new SpiralArtifactCache(this);
     _tunnel = new SpiralSshTunnel(this);
@@ -548,11 +547,8 @@ void SpiralServiceManager::updateStoreBinding()
 
 void SpiralServiceManager::disconnectFromService()
 {
-    cancelWorkingCopies();
     ++_connectionGeneration;
     _leaseOwner = false;
-    _inputCommandBusy = false;
-    if (_inputCommand) _inputSubmission.transportInterrupted();
     _poll->stop();
     _eventPoll->stop();
     _statusInFlight = false;
@@ -575,10 +571,8 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     if (ownsProcess()) {
-        cancelWorkingCopies();
         ++_connectionGeneration;
         _leaseOwner = false;
-        _inputCommandBusy = false;
         _statusInFlight = false;
         _eventsInFlight = false;
         _synchronizedSessionId.clear();

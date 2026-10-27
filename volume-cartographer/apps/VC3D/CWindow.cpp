@@ -950,10 +950,6 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
             &CWindow::openLineAnnotationWorkspace);
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
-            });
     _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
     _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
     const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
@@ -3028,7 +3024,7 @@ void CWindow::CreateWidgets(void)
             showStatusBarMessage(error, 15000);
             return false;
         }
-        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+        return true;
     });
     // Edits of the active surface commit to the store object it was opened from.
     _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {

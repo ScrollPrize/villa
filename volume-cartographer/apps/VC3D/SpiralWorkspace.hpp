@@ -69,10 +69,6 @@ public:
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
-    bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
-    void refreshTrackedFibers();
-    void noteFiberRetired(const QString& objectUuid);
-    bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
@@ -181,9 +177,6 @@ private:
                                         bool preserveFocus, int attempt);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
-    void registerPendingPatchSurface(const QString& inputId,
-                                     const std::shared_ptr<QuadSurface>& surface,
-                                     const std::optional<QColor>& color = std::nullopt);
     void finalizeBrushPaint();
     void finalizeLineAnnotationDraft();
     void cancelLineAnnotationDraft();
@@ -197,14 +190,10 @@ private:
         resolveFiberBaseShape(QString* errorMessage) const;
     void updatePreviewCoordinateScale();
     void submitReadyDrafts(bool commitAfterAdd);
-    void maybeCommitForPendingExit();
-    QString provisionalBrushRoot() const;
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
-    void updatePendingPatchIds(const QJsonObject& status);
     void pruneBrushPreviewSurfaces();
     QSet<QString> _retainedBrushPreviewIds;
-    void inputDraftPrepared(const QString& alias, const QString& error = {});
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();
@@ -246,7 +235,6 @@ private:
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
     QJsonObject _sessionRunConfig;
-    QHash<QString, QString> _trackedFiberPaths;
     struct LineAnnotationDraft {
         std::shared_ptr<QuadSurface> surface;
         std::vector<QPointF> surfacePoints;
@@ -257,8 +245,6 @@ private:
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
-    QSet<QString> _pendingPatchIds;
-    QSet<QString> _visibleUncommittedPointCollectionIds;
     std::map<std::string, std::size_t> _surfaceOverlayColorAssignments;
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
@@ -299,31 +285,10 @@ private:
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
     bool _showSurfaceOverlap = true;
-    bool _pendingPatchesOnly = false;
     bool _runDiffVisible = false;
     bool _windingTransitionsVisible = true;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
     bool _shuttingDown = false;
-    struct PendingBrushPatch {
-        QString path;
-        QColor color;
-        std::shared_ptr<QuadSurface> surface;
-        QString operation;
-    };
-    QHash<QString, PendingBrushPatch> _pendingBrushPatches;
-    QHash<QString, QString> _brushProvisionalPaths;
-    QSet<QString> _uncommittedBrushPatchIds;
-    QHash<QString, QString> _pendingPointCollectionPaths;
-    QHash<QString, QString> _pointCollectionProvisionalPaths;
-    QSet<QString> _uncommittedPointCollectionIds;
-    // Role of each staged collection replacement, for user-facing messages.
-    std::function<void()> _pendingExitAction;
-    bool _commitAfterBrushUploads = false;
-    QHash<QString, QString> _managedPatchCopies;
-    int _draftPreparationRemaining = 0;
-    bool _draftPreparationFailed = false;
-    // Keyed by Spiral input id (the fiber file stem), never by runtime
-    // fiber id: runtime ids are reassigned whenever the fiber list reloads.
 };

@@ -250,7 +250,6 @@ private:
     QString _previewTransferText;
     // Last reported session lifecycle state; "Error" is the recovery case.
     QString _sessionState;
-    int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;
     bool _runningGuardedExit = false;
 };
