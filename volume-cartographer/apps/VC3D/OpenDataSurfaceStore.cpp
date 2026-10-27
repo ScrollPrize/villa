@@ -29,72 +29,6 @@ namespace {
 namespace fs = std::filesystem;
 using vc::objects::ObjectStore;
 
-std::string lowerCopy(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
-std::string trimTrailingSlashes(std::string value)
-{
-    while (!value.empty() && value.back() == '/') {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    return trimTrailingSlashes(artifact.resolvedUrl.empty()
-                                  ? artifact.sourcePath
-                                  : artifact.resolvedUrl);
-}
-
-std::string urlPathWithoutQuery(std::string value)
-{
-    if (const auto pos = value.find('#'); pos != std::string::npos) {
-        value.erase(pos);
-    }
-    if (const auto pos = value.find('?'); pos != std::string::npos) {
-        value.erase(pos);
-    }
-    while (!value.empty() && value.back() == '/') {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string imageExtensionForUrl(const std::string& url)
-{
-    const std::string path = lowerCopy(urlPathWithoutQuery(url));
-    for (const auto* ext : {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp"}) {
-        if (path.size() >= std::strlen(ext) &&
-            path.compare(path.size() - std::strlen(ext), std::strlen(ext), ext) == 0) {
-            return ext;
-        }
-    }
-    return {};
-}
-
-bool isJpegExtension(const std::string& ext)
-{
-    return ext == ".jpg" || ext == ".jpeg";
-}
-
-bool isSupportedInkImageArtifact(const vcr::catalog::OpenDataArtifact& artifact)
-{
-    const std::string type = lowerCopy(artifact.type);
-    if (type.find("ink") == std::string::npos) {
-        return false;
-    }
-    if (type.find("zarr") != std::string::npos || type.find("3d") != std::string::npos) {
-        return false;
-    }
-    return !imageExtensionForUrl(artifactUrl(artifact)).empty();
-}
-
 std::string safePathComponent(std::string value)
 {
     for (char& c : value) {
@@ -109,316 +43,52 @@ std::string safePathComponent(std::string value)
     return value.empty() ? std::string("unnamed") : value;
 }
 
-std::string segmentLabel(const vcr::catalog::OpenDataSegment& segment)
+void applySourceCoordinateMetadata(nlohmann::json& meta, const vcr::catalog::OpenDataSample& sample,
+                                   const std::string& volumeId)
 {
-    return segment.id.empty() ? std::string("<unnamed segment>") : segment.id;
-}
-
-std::string segmentStableId(const vcr::catalog::OpenDataSegment& segment)
-{
-    if (!segment.longId.empty()) {
-        return segment.longId;
-    }
-    if (!segment.id.empty()) {
-        return segment.id;
-    }
-    return safePathComponent(segment.suffix);
-}
-
-std::string surfaceTimestampFromCatalogDate(std::string_view date)
-{
-    const auto isDigit = [&](std::size_t index) {
-        return index < date.size() &&
-               std::isdigit(static_cast<unsigned char>(date[index]));
-    };
-    if ((date.size() == 14 || date.size() == 17) &&
-        std::all_of(date.begin(), date.end(), [](unsigned char c) {
-            return std::isdigit(c);
-        })) {
-        return std::string(date.substr(0, 14));
-    }
-    if (date.size() < 20 || date[4] != '-' || date[7] != '-' ||
-        date[10] != 'T' || date[13] != ':' || date[16] != ':' ||
-        !isDigit(0) || !isDigit(1) || !isDigit(2) || !isDigit(3) ||
-        !isDigit(5) || !isDigit(6) || !isDigit(8) || !isDigit(9) ||
-        !isDigit(11) || !isDigit(12) || !isDigit(14) || !isDigit(15) ||
-        !isDigit(17) || !isDigit(18)) {
-        return std::string(date);
-    }
-
-    if (date[19] == 'Z') {
-        if (date.size() != 20) {
-            return std::string(date);
-        }
-    } else if (date[19] == '.') {
-        constexpr std::size_t fraction = 20;
-        auto suffix = fraction;
-        while (suffix < date.size() &&
-               std::isdigit(static_cast<unsigned char>(date[suffix]))) {
-            ++suffix;
-        }
-        if (suffix == fraction || suffix + 1 != date.size() ||
-            date[suffix] != 'Z') {
-            return std::string(date);
-        }
-    } else {
-        return std::string(date);
-    }
-
-    std::string timestamp;
-    timestamp.reserve(14);
-    for (const auto [begin, count] : {
-             std::pair<std::size_t, std::size_t>{0, 4},
-             {5, 2}, {8, 2}, {11, 2}, {14, 2}, {17, 2}}) {
-        timestamp.append(date.substr(begin, count));
-    }
-
-    return timestamp;
-}
-
-std::optional<double> jsonNumberLike(const nlohmann::json& obj, const char* key)
-{
-    if (!obj.is_object()) {
-        return std::nullopt;
-    }
-    const auto it = obj.find(key);
-    if (it == obj.end()) {
-        return std::nullopt;
-    }
-    if (it->is_number()) {
-        return it->get<double>();
-    }
-    if (it->is_string()) {
-        try {
-            return std::stod(it->get<std::string>());
-        } catch (...) {
-            return std::nullopt;
-        }
-    }
-    return std::nullopt;
-}
-
-double originalVolumeDownscale(const vcr::catalog::OpenDataSegment& segment)
-{
-    for (const auto* key : {"original_volume_downscale",
-                            "originalVolumeDownscale",
-                            "volume_downscale",
-                            "volumeDownscale"}) {
-        if (const auto value = jsonNumberLike(segment.properties, key);
-            value.has_value() && std::isfinite(*value) && *value > 0.0) {
-            return *value;
-        }
-    }
-    return 1.0;
-}
-
-std::string derivedVolumeId(const vcr::catalog::OpenDataSegment& segment)
-{
-    if (segment.raw.is_object()) {
-        const auto creation = segment.raw.find("creation");
-        if (creation != segment.raw.end() && creation->is_object()) {
-            const auto derived = creation->find("derived_from");
-            if (derived != creation->end() && derived->is_object()) {
-                const auto type = derived->find("type");
-                const auto id = derived->find("id");
-                if (type != derived->end() && type->is_string() &&
-                    id != derived->end() && id->is_string() &&
-                    lowerCopy(type->get<std::string>()) == "volume") {
-                    return id->get<std::string>();
-                }
-            }
-        }
-    }
-    return segment.originalVolumeId;
-}
-
-std::string sourceVolumeIdForSegment(const vcr::catalog::OpenDataSegment& segment)
-{
-    const auto derived = derivedVolumeId(segment);
-    return derived.empty() ? segment.originalVolumeId : derived;
-}
-
-bool applyCatalogCreationMetadata(nlohmann::json& meta,
-                                  const vcr::catalog::OpenDataSegment& segment)
-{
-    if (segment.createdAt.empty()) {
-        return false;
-    }
-    const auto timestamp = surfaceTimestampFromCatalogDate(segment.createdAt);
-    const bool changed =
-        meta.value("date_last_modified", std::string{}) != timestamp ||
-        meta.value("vc_open_data_creation_date", std::string{}) !=
-            segment.createdAt;
-    meta["date_last_modified"] = timestamp;
-    meta["vc_open_data_creation_date"] = segment.createdAt;
-    return changed;
-}
-
-void applyOpenDataMetadata(nlohmann::json& meta,
-                           const std::string& baseUrl,
-                           const vcr::catalog::OpenDataSegment& segment)
-{
-    meta["vc_open_data_tifxyz_url"] = baseUrl;
-    meta["vc_open_data_segment_id"] = segment.id;
-    meta["vc_open_data_segment_long_id"] = segment.longId;
-    meta["vc_open_data_original_volume_id"] = segment.originalVolumeId;
-    if (const auto derivedId = derivedVolumeId(segment); !derivedId.empty()) {
-        meta["vc_open_data_derived_volume_id"] = derivedId;
-    }
-    meta["vc_open_data_original_volume_downscale"] = originalVolumeDownscale(segment);
-    applyCatalogCreationMetadata(meta, segment);
-}
-
-const vcr::catalog::OpenDataVolume* findSampleVolume(const vcr::catalog::OpenDataSample& sample,
-                                       const std::string& volumeId)
-{
-    const auto it = std::find_if(
-        sample.volumes.begin(), sample.volumes.end(), [&](const auto& volume) {
-            return volume.id == volumeId;
-        });
-    return it == sample.volumes.end() ? nullptr : &*it;
-}
-
-void applySourceCoordinateMetadata(nlohmann::json& meta,
-                                   const vcr::catalog::OpenDataSample& sample,
-                                   const std::string& volumeId,
-                                   int coordinateLevel)
-{
-    const auto* volume = findSampleVolume(sample, volumeId);
-    if (!volume || !volume->pixelSizeUm ||
-        !std::isfinite(*volume->pixelSizeUm) || *volume->pixelSizeUm <= 0.0) {
+    const auto* volume = sample.findVolume(volumeId);
+    if (!volume || !volume->pixelSizeUm || !std::isfinite(*volume->pixelSizeUm) || *volume->pixelSizeUm <= 0.0) {
         return;
     }
     const auto* source = vcr::catalog::preferredVolumeArtifact(*volume);
-    if (!source)
+    if (!source || source->url().empty())
         return;
-    const std::string sourcePath = artifactUrl(*source);
-    if (sourcePath.empty())
-        return;
-    meta["vc_open_data_source_path"] = sourcePath;
-    meta["vc_open_data_source_coordinate_scale_factor"] =
-        std::uint64_t{1} << coordinateLevel;
+    meta["vc_open_data_source_path"] = source->url();
+    meta["vc_open_data_source_coordinate_scale_factor"] = 1;
     meta["vc_open_data_source_original_resolution"] = *volume->pixelSizeUm;
 }
 
-std::string inkDetectionLabel(const vcr::catalog::OpenDataSegment& segment,
-                              const vcr::catalog::OpenDataArtifact& artifact,
-                              std::size_t index)
-{
-    std::string label = segment.suffix.empty() ? segmentLabel(segment) : segment.suffix;
-    if (!artifact.type.empty()) {
-        label += " - " + artifact.type;
-    } else {
-        label += " - ink detection";
-    }
-    if (index > 0) {
-        label += " " + std::to_string(index + 1);
-    }
-    return label;
-}
-
-nlohmann::json inkDetectionMaterializationRecipe(
-    const vcr::catalog::OpenDataSample& sample,
-    const vcr::catalog::OpenDataSegment& segment)
-{
-    std::vector<const vcr::catalog::OpenDataArtifact*> supportedArtifacts;
-    bool hasJpegArtifact = false;
-    for (const auto& artifact : segment.artifacts) {
-        if (!isSupportedInkImageArtifact(artifact)) {
-            continue;
-        }
-        const std::string ext = imageExtensionForUrl(artifactUrl(artifact));
-        hasJpegArtifact = hasJpegArtifact || isJpegExtension(ext);
-        supportedArtifacts.push_back(&artifact);
-    }
-
-    nlohmann::json recipe = nlohmann::json::array();
-    std::size_t supportedIndex = 0;
-    for (const auto* artifactPtr : supportedArtifacts) {
-        const auto& artifact = *artifactPtr;
-        const std::string url = artifactUrl(artifact);
-        const std::string ext = imageExtensionForUrl(url);
-        if (url.empty() || ext.empty() ||
-            (hasJpegArtifact && !isJpegExtension(ext))) {
-            continue;
-        }
-
-        std::string baseName = artifact.type.empty() ? "ink_detection"
-                                                     : artifact.type;
-        if (supportedIndex > 0) {
-            baseName += "_" + std::to_string(supportedIndex + 1);
-        }
-        const auto relative = std::filesystem::path("ink-detections") /
-            (safePathComponent(baseName) + ext);
-        recipe.push_back({
-            {"download_url", url},
-            {"label", inkDetectionLabel(segment, artifact, supportedIndex)},
-            {"sample_id", sample.id},
-            {"segment_id", segment.id},
-            {"segment_long_id", segment.longId},
-            {"artifact_type", artifact.type},
-            {"original_source_uri", artifact.sourcePath},
-            {"resolved_http_url", artifact.resolvedUrl.empty()
-                                      ? artifact.sourcePath
-                                      : artifact.resolvedUrl},
-            {"local_file", relative.generic_string()}
-        });
-        ++supportedIndex;
-    }
-    return recipe;
-}
-
-// The record meta of a representation: the catalog's creation metadata and
-// the vc_open_data_* identity keys (coordinate space, source, lineage).
-nlohmann::json surfaceRecordMeta(
-    const vcr::catalog::OpenDataSample& sample,
-    const vcr::catalog::OpenDataSegment& segment,
-    const std::string& representation,
-    const std::string& coordinateVolumeId,
-    const std::string& coordinateSpace,
-    const std::string& sourceUrl = {})
+// The record meta of a surface: the catalog's creation metadata and the
+// vc_open_data_* identity keys (coordinate space, source, lineage).
+nlohmann::json surfaceRecordMeta(const vcr::catalog::OpenDataSample& sample,
+                                 const vcr::catalog::OpenDataSegment& segment,
+                                 const vcr::catalog::OpenDataSurface& surface)
 {
     nlohmann::json meta = nlohmann::json::object();
-    if (segment.raw.is_object()) {
-        const auto creation = segment.raw.find("creation");
-        if (creation != segment.raw.end() && creation->is_object()) {
-            const auto metadata = creation->find("metadata");
-            if (metadata != creation->end() && metadata->is_object()) {
-                meta = *metadata;
-            }
+    if (const auto creation = segment.raw.find("creation"); creation != segment.raw.end() && creation->is_object()) {
+        if (const auto metadata = creation->find("metadata"); metadata != creation->end() && metadata->is_object()) {
+            meta = *metadata;
         }
     }
     for (const char* key : {"uuid", "name", "type", "format", "scale", "bbox", "coordinates", "provenance"}) {
         meta.erase(key);
     }
-    applyOpenDataMetadata(meta, sourceUrl, segment);
-    meta["vc_open_data_catalog_segment_lineage_id"] = segmentStableId(segment);
-    meta["vc_open_data_representation"] = representation;
+    meta["vc_open_data_tifxyz_url"] = surface.artifact->url();
+    meta["vc_open_data_segment_id"] = segment.id;
+    meta["vc_open_data_segment_long_id"] = segment.longId;
+    meta["vc_open_data_original_volume_id"] = segment.originalVolumeId;
+    meta["vc_open_data_derived_volume_id"] = segment.sourceVolumeId();
+    meta["vc_open_data_original_volume_downscale"] = segment.originalVolumeDownscale;
+    if (!segment.createdAt.empty()) {
+        meta["date_last_modified"] = vcr::catalog::catalogTimestamp(segment.createdAt);
+        meta["vc_open_data_creation_date"] = segment.createdAt;
+    }
+    meta["vc_open_data_catalog_segment_lineage_id"] = segment.stableId();
+    meta["vc_open_data_representation"] = surface.authored ? "derived-native" : "published-transformed";
     meta["vc_open_data_source_coordinate_level"] = 0;
-    meta["vc_open_data_coordinate_space"] = coordinateSpace;
-    applySourceCoordinateMetadata(meta, sample, coordinateVolumeId, 0);
+    meta["vc_open_data_coordinate_space"] = sample.id + "/" + surface.volumeId + "@L0";
+    applySourceCoordinateMetadata(meta, sample, surface.volumeId);
     return meta;
-}
-
-std::string hashUrl(std::string_view value)
-{
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    std::ostringstream out;
-    out << std::hex << std::setfill('0') << std::setw(16) << hash;
-    return out.str();
-}
-
-const char* representationName(OpenDataSegmentRepresentationKind kind)
-{
-    switch (kind) {
-    case OpenDataSegmentRepresentationKind::DerivedNative: return "derived-native";
-    case OpenDataSegmentRepresentationKind::PublishedTransformed: return "published-transformed";
-    }
-    return "";
 }
 
 vc::objects::OpenOptions importerOptions()
@@ -433,144 +103,47 @@ bool selected(const vcr::catalog::OpenDataSegment& segment, const std::optional<
     return !segmentIds || std::find(segmentIds->begin(), segmentIds->end(), segment.id) != segmentIds->end();
 }
 
-// A surface record for a representation: named like the segment, bound to its
-// catalog volume at L0, with what materializing it needs in meta.open_data.
-vc::objects::ObjectRecord representationRecord(const vcr::catalog::OpenDataSample& sample,
-                                               const vcr::catalog::OpenDataSegment& segment,
-                                               const OpenDataSegmentRepresentation& representation)
+// A surface record: named like the segment, bound to its catalog volume at L0,
+// with what materializing it needs in meta.open_data.
+vc::objects::ObjectRecord surfaceRecord(const vcr::catalog::OpenDataSample& sample,
+                                        const vcr::catalog::OpenDataSegment& segment,
+                                        const vcr::catalog::OpenDataSurface& surface)
 {
-    const std::string url = representation.artifact ? artifactUrl(*representation.artifact) : std::string{};
-    auto meta = surfaceRecordMeta(sample, segment, representationName(representation.kind),
-                                  representation.coordinateVolumeId, representation.coordinateSpace, url);
-    // Authored coordinates are the source volume's downscaled voxels.
-    const double storedPerVoxel = representation.kind == OpenDataSegmentRepresentationKind::DerivedNative
-        ? 1.0 / originalVolumeDownscale(segment)
-        : 1.0;
+    const std::string url = surface.artifact->url();
+    auto meta = surfaceRecordMeta(sample, segment, surface);
     meta["coordinates"] = vc::objects::geometryCoordinates(
-        {{"volume_uuid", representation.coordinateVolumeId}, {"scale_factor", storedPerVoxel}});
-    nlohmann::json openData{
+        {{"volume_uuid", surface.volumeId}, {"scale_factor", surface.unitsPerVoxel}});
+    nlohmann::json images = nlohmann::json::array();
+    for (const auto& image : vcr::catalog::inkDetectionImages(segment)) {
+        images.push_back({{"download_url", image.url},
+                          {"label", image.label},
+                          {"artifact_type", image.artifact->type},
+                          {"local_file", (fs::path("ink-detections") / image.fileName).generic_string()}});
+    }
+    meta["open_data"] = {
         {"sample_id", sample.id},
         {"segment_id", segment.id},
         {"segment_long_id", segment.longId},
-        {"lineage", segmentStableId(segment)},
-        {"representation_id", representation.representationId},
-        {"representation", representationName(representation.kind)},
-        {"ink_detections", inkDetectionMaterializationRecipe(sample, segment)},
+        {"lineage", segment.stableId()},
+        {"representation_id", surface.id},
+        {"representation", surface.authored ? "derived-native" : "published-transformed"},
+        {"ink_detections", std::move(images)},
+        {"source_url", url},
     };
-    if (!url.empty()) openData["source_url"] = url;
-    meta["open_data"] = std::move(openData);
 
     vc::objects::ObjectRecord record;
-    record.uuid = surfaceUuidForRepresentation(representation.representationId);
+    record.uuid = surfaceUuidForRepresentation(surface.id);
     record.kind = "surface";
-    record.name = segment.suffix.empty() ? segmentLabel(segment) : segment.suffix;
+    record.name = segment.suffix.empty() ? (segment.id.empty() ? std::string("<unnamed segment>") : segment.id)
+                                         : segment.suffix;
     record.meta = meta.dump();
-    if (!url.empty()) {
-        // Registered: the store fetches the tifxyz when it is first opened.
-        record.storageKind = "url";
-        record.storageRef = url;
-    }
+    // Registered: the store fetches the tifxyz when it is first opened.
+    record.storageKind = "url";
+    record.storageRef = url;
     return record;
 }
 
 } // namespace
-
-std::vector<OpenDataSegmentRepresentation>
-classifyOpenDataSegmentRepresentations(const vcr::catalog::OpenDataSample& sample,
-                                       const vcr::catalog::OpenDataSegment& segment)
-{
-    std::vector<OpenDataSegmentRepresentation> result;
-    std::set<std::string> volumeIds;
-    for (const auto& volume : sample.volumes) {
-        if (!volume.id.empty())
-            volumeIds.insert(volume.id);
-    }
-
-    const auto levelForDownscale = [&]() -> std::optional<int> {
-        const double downscale = originalVolumeDownscale(segment);
-        for (int level = 0; level <= 5; ++level) {
-            if (std::abs(downscale - std::ldexp(1.0, level)) <=
-                1.0e-9 * std::max(1.0, std::abs(downscale))) {
-                return level;
-            }
-        }
-        return std::nullopt;
-    }();
-
-    const std::string sourceId = sourceVolumeIdForSegment(segment);
-    if (sourceId.empty() || volumeIds.find(sourceId) == volumeIds.end()) {
-        return result;
-    }
-
-    const vcr::catalog::OpenDataArtifact* canonicalAuthored = nullptr;
-    for (const auto* preferredType :
-         {"tifxyz-flattened", "tifxyz", "tifxyz-normalized"}) {
-        const auto it = std::find_if(
-            segment.artifacts.begin(), segment.artifacts.end(),
-            [&](const vcr::catalog::OpenDataArtifact& artifact) {
-                return lowerCopy(artifact.type) == preferredType &&
-                       !artifactUrl(artifact).empty();
-            });
-        if (it != segment.artifacts.end()) {
-            canonicalAuthored = &*it;
-            break;
-        }
-    }
-
-    std::map<std::string, const vcr::catalog::OpenDataArtifact*> publishedByTarget;
-    for (const auto& artifact : segment.artifacts) {
-        const auto type = lowerCopy(artifact.type);
-        if (type != "tifxyz-transformed" || artifactUrl(artifact).empty() ||
-            !artifact.targetVolumeId || artifact.targetVolumeId->empty() ||
-            volumeIds.find(*artifact.targetVolumeId) == volumeIds.end()) {
-            continue;
-        }
-        publishedByTarget.emplace(*artifact.targetVolumeId, &artifact);
-    }
-
-    const std::string lineage = segmentStableId(segment);
-    const auto makePublished = [&](const std::string& targetId,
-                                   const vcr::catalog::OpenDataArtifact& artifact,
-                                   bool canonicalSource) {
-        OpenDataSegmentRepresentation published;
-        published.artifact = &artifact;
-        published.kind = OpenDataSegmentRepresentationKind::PublishedTransformed;
-        published.canonicalSource = canonicalSource;
-        published.coordinateVolumeId = targetId;
-        published.coordinateSpace = sample.id + "/" + targetId + "@L0";
-        published.representationId = lineage + "-published-" +
-            safePathComponent(targetId) + "-L0-" + hashUrl(artifactUrl(artifact));
-        return published;
-    };
-
-    if (const auto publishedSource = publishedByTarget.find(sourceId);
-        publishedSource != publishedByTarget.end()) {
-        result.push_back(makePublished(sourceId, *publishedSource->second, true));
-    } else if (canonicalAuthored && levelForDownscale) {
-        OpenDataSegmentRepresentation canonical;
-        canonical.artifact = canonicalAuthored;
-        canonical.kind = OpenDataSegmentRepresentationKind::DerivedNative;
-        canonical.canonicalSource = true;
-        canonical.coordinateVolumeId = sourceId;
-        canonical.coordinateSpace = sample.id + "/" + sourceId + "@L0";
-        canonical.representationId = lineage + "-derived-native-L0-" +
-            hashUrl(artifactUrl(*canonicalAuthored));
-        result.push_back(std::move(canonical));
-    }
-
-    for (const auto& [targetId, artifact] : publishedByTarget) {
-        if (targetId == sourceId) {
-            continue;
-        }
-        result.push_back(makePublished(targetId, *artifact, false));
-    }
-
-    if (result.empty() || !result.front().canonicalSource) {
-        return result;
-    }
-    // Registered destinations are views of the canonical object, not copied geometry.
-    return result;
-}
 
 std::filesystem::path surfaceStorePath(const std::filesystem::path& remoteCacheRoot, const std::string& sampleId)
 {
@@ -665,8 +238,8 @@ SurfaceImportResult importSampleSurfaces(const std::filesystem::path& remoteCach
     std::vector<vc::objects::ObjectRecord> records;
     for (const auto& segment : sample.segments) {
         if (!selected(segment, segmentIds)) continue;
-        for (const auto& representation : classifyOpenDataSegmentRepresentations(sample, segment)) {
-            records.push_back(representationRecord(sample, segment, representation));
+        for (const auto& surface : sample.surfaces(segment)) {
+            records.push_back(surfaceRecord(sample, segment, surface));
         }
     }
     result.representations = static_cast<int>(records.size());
@@ -714,10 +287,10 @@ SurfaceState surfaceStateForSegment(const std::filesystem::path& remoteCacheRoot
                                     const vcr::catalog::OpenDataSample& sample,
                                     const vcr::catalog::OpenDataSegment& segment)
 {
-    const auto representations = classifyOpenDataSegmentRepresentations(sample, segment);
+    const auto surfaces = sample.surfaces(segment);
     const auto path = surfaceStorePath(remoteCacheRoot, sample.id);
-    if (representations.empty() || !fs::exists(path)) return SurfaceState::Missing;
-    const auto uuid = surfaceUuidForRepresentation(representations.front().representationId);
+    if (surfaces.empty() || !fs::exists(path)) return SurfaceState::Missing;
+    const auto uuid = surfaceUuidForRepresentation(surfaces.front().id);
     vc::objects::OpenOptions options;
     options.readOnly = true;
     auto db = ObjectStore::open(path, options);

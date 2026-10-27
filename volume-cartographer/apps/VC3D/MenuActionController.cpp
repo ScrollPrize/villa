@@ -780,7 +780,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
     const auto selectedSegmentCount = std::count_if(
         sampleCopy.segments.begin(), sampleCopy.segments.end(), [&](const auto& segment) {
-            return segment.hasTifxyz() && (!selectionCopy.segmentIds ||
+            return !sampleCopy.surfaces(segment).empty() && (!selectionCopy.segmentIds ||
                 std::find(selectionCopy.segmentIds->begin(), selectionCopy.segmentIds->end(),
                           segment.id) != selectionCopy.segmentIds->end());
         });

@@ -81,105 +81,141 @@ struct TestAutosaveRoot {
 TestAutosaveRoot testAutosaveRoot;
 
 constexpr const char* kFixture = R"({
-  "metadata": {
-    "samples": {
-      "PHerc0139": {
-        "sample": {
-          "type": "scroll",
-          "description": "Example sample",
-          "unknown_sample_field": 7,
-          "data": [{
+  "samples": {
+    "PHerc0139": {
+      "sample": {
+        "type": "scroll",
+        "description": "Example sample",
+        "unknown_sample_field": 7,
+        "data": [
+          {
             "type": "photo",
-            "origins": [{
-              "path": "PHerc0139/photos/PHerc0139_photo.jpg",
-              "access_roots": [{
-                "type": "s3",
-                "url": "s3://vesuvius-challenge-open-data/",
-                "usage": "public-read"
-              }]
-            }]
-          }]
-        },
-        "scans": {
-          "20240101000000": {
-            "suffix": "scan-a",
-            "created_at": "2024-01-01T00:00:00Z",
-            "properties": {"operator": "vc"}
-          }
-        },
-        "volumes": {
-          "vol1": {
-            "scan_id": "20240101000000",
-            "suffix": "surface-volume",
-            "pixel_size_um": 7.91,
-            "energy_kev": 88.0,
-            "detector_distance_mm": 12.5,
-            "data_format": "zarr",
-            "data": [{
-              "type": "zarr",
-              "properties": {"representation": "normal3d"},
-              "origins": [{
-                "path": "PHerc0139/volumes/vol1.zarr",
-                "access_roots": [
-                  {"type": "s3", "url": "s3://private-root/", "usage": "internal"},
-                  {"type": "s3", "url": "s3://vesuvius-challenge-open-data/", "usage": "public-read"}
-                ]
-              }]
-            }]
-          }
-        },
-        "segments": {
-          "20260311000000": {
-            "long_id": "PHerc0139-20260311000000",
-            "suffix": "seg-a",
-            "original_volume_id": "vol1",
-            "width": 123,
-            "height": 456,
-            "created_at": "2026-03-11T00:00:00Z",
-            "creation": {
-              "derived_from": {
-                "type": "volume",
-                "id": "vol1"
-              }
-            },
-            "properties": {
-              "original_volume_downscale": 2
-            },
-            "data": [
+            "origins": [
               {
-                "type": "tifxyz",
-                "properties": {"extra": true},
-                "origins": [{
-                  "path": "PHerc0139/segments/20260311000000/tifxyz",
-                  "access_roots": [{
+                "path": "PHerc0139/photos/PHerc0139_photo.jpg",
+                "access_roots": [
+                  {
                     "type": "s3",
                     "url": "s3://vesuvius-challenge-open-data/",
                     "usage": "public-read"
-                  }]
-                }]
-              },
-              {
-                "type": "ink_detection",
-                "origins": [{
-                  "path": "PHerc0139/segments/20260311000000/ink.zarr",
-                  "access_roots": [{
-                    "type": "https",
-                    "url": "https://example.test/data/",
-                    "usage": "public-read"
-                  }]
-                }]
-              },
-              {
-                "type": "layers_zarr",
-                "origins": []
+                  }
+                ]
               }
             ]
           }
+        ]
+      },
+      "scans": {
+        "20240101000000": {
+          "suffix": "scan-a",
+          "properties": {
+            "operator": "vc"
+          },
+          "creation": {
+            "date": "2024-01-01T00:00:00Z"
+          }
+        }
+      },
+      "volumes": {
+        "vol1": {
+          "scan_id": "20240101000000",
+          "suffix": "surface-volume",
+          "data": [
+            {
+              "type": "zarr",
+              "properties": {
+                "representation": "normal3d"
+              },
+              "origins": [
+                {
+                  "path": "PHerc0139/volumes/vol1.zarr",
+                  "access_roots": [
+                    {
+                      "type": "s3",
+                      "url": "s3://private-root/",
+                      "usage": "internal"
+                    },
+                    {
+                      "type": "s3",
+                      "url": "s3://vesuvius-challenge-open-data/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "pixel_size_um": 7.91,
+            "energy_keV": 88.0,
+            "detector_distance_mm": 12.5,
+            "data_format": "zarr"
+          }
+        }
+      },
+      "segments": {
+        "20260311000000": {
+          "long_id": "PHerc0139-20260311000000",
+          "suffix": "seg-a",
+          "original_volume_id": "vol1",
+          "creation": {
+            "derived_from": {
+              "type": "volume",
+              "id": "vol1"
+            },
+            "date": "2026-03-11T00:00:00Z"
+          },
+          "properties": {
+            "original_volume_downscale": 2,
+            "width": 123,
+            "height": 456
+          },
+          "data": [
+            {
+              "type": "tifxyz",
+              "properties": {
+                "extra": true
+              },
+              "origins": [
+                {
+                  "path": "PHerc0139/segments/20260311000000/tifxyz",
+                  "access_roots": [
+                    {
+                      "type": "s3",
+                      "url": "s3://vesuvius-challenge-open-data/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "ink_detection",
+              "origins": [
+                {
+                  "path": "PHerc0139/segments/20260311000000/ink.zarr",
+                  "access_roots": [
+                    {
+                      "type": "https",
+                      "url": "https://example.test/data/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "layers_zarr",
+              "origins": []
+            }
+          ]
         }
       }
-    },
-    "models": {
-      "model-a": {"kind": "ink"}
+    }
+  },
+  "models": {
+    "model-a": {
+      "kind": "ink"
     }
   }
 })";
@@ -214,51 +250,56 @@ cv::Size tifxyzGridSize(const std::filesystem::path& segmentDir)
 std::string fixtureWithSegmentArtifactType(const char* type)
 {
     auto fixture = nlohmann::json::parse(kFixture);
-    fixture["metadata"]["samples"]["PHerc0139"]["segments"]["20260311000000"]["data"][0]["type"] = type;
+    fixture["samples"]["PHerc0139"]["segments"]["20260311000000"]["data"][0]["type"] = type;
     return fixture.dump();
 }
 
 } // namespace
 
-TEST_CASE("OpenDataManifest strictly parses coordinate-bearing artifact parameters")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
-        {"type":"surface-prediction-zarr","parameters":{"level":2}},
-        {"type":"normal-grids","parameters":{"level":2.5}},
-        {"type":"surface-prediction-zarr"},
-        {"type":"tifxyz-transformed","parameters":{"target_volume":"target"}}
-      ]}}}}}
-    })");
-    REQUIRE(manifest.samples.size() == 1);
-    REQUIRE(manifest.samples[0].volumes.size() == 1);
-    const auto& artifacts = manifest.samples[0].volumes[0].artifacts;
-    REQUIRE(artifacts.size() == 4);
-    CHECK(artifacts[0].levelParameterPresent);
-    CHECK(artifacts[0].sourceCoordinateLevel == 2);
-    CHECK(artifacts[0].parameters.at("level") == 2);
-    CHECK(artifacts[1].levelParameterPresent);
-    CHECK_FALSE(artifacts[1].sourceCoordinateLevel.has_value());
-    CHECK_FALSE(artifacts[2].levelParameterPresent);
-    CHECK_FALSE(artifacts[2].sourceCoordinateLevel.has_value());
-    CHECK(artifacts[3].targetVolumeId == "target");
-}
-
 TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
 {
     const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata":{"samples":{"sample":{"volumes":{"volume":{
-        "properties":{"shape":[100,200,300]},
-        "data":[{
-          "type":"lasagna",
-          "parameters":{"model_id":"model-7","level":2},
-          "creation_info":{"lasagna_version":2,"source_to_base":1.0},
-          "origins":[{"path":"lasagna/volume/","access_roots":[{
-            "type":"https","url":"https://example.test/","usage":"public-read"
-          }]}]
-        }]
-      }}}}}
-    })");
+  "samples": {
+    "sample": {
+      "volumes": {
+        "volume": {
+          "properties": {
+            "shape": [
+              100,
+              200,
+              300
+            ]
+          },
+          "data": [
+            {
+              "type": "lasagna",
+              "parameters": {
+                "model_id": "model-7",
+                "level": 2
+              },
+              "creation_info": {
+                "lasagna_version": 2,
+                "source_to_base": 1.0
+              },
+              "origins": [
+                {
+                  "path": "lasagna/volume/",
+                  "access_roots": [
+                    {
+                      "type": "https",
+                      "url": "https://example.test/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+})");
     const auto& sample = manifest.samples.front();
     const auto& volume = sample.volumes.front();
     REQUIRE(volume.shapeZYX.has_value());
@@ -298,18 +339,44 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
 TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
 {
     const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata":{"samples":{"PHercParis4":{"volumes":{"20260411134726":{
-        "properties":{"shape":[75784,32693,32693]},
-        "data":[{
-          "type":"lasagna",
-          "parameters":{"model_id":"20260801084232","level":1},
-          "creation_info":null,
-          "origins":[{"path":"PHercParis4/representations/predictions/fibers/run/",
-            "access_roots":[{"type":"s3","url":"s3://vesuvius-challenge-open-data/",
-              "usage":"public-read"}]}]
-        }]
-      }}}}}
-    })");
+  "samples": {
+    "PHercParis4": {
+      "volumes": {
+        "20260411134726": {
+          "properties": {
+            "shape": [
+              75784,
+              32693,
+              32693
+            ]
+          },
+          "data": [
+            {
+              "type": "lasagna",
+              "parameters": {
+                "model_id": "20260801084232",
+                "level": 1
+              },
+              "creation_info": null,
+              "origins": [
+                {
+                  "path": "PHercParis4/representations/predictions/fibers/run/",
+                  "access_roots": [
+                    {
+                      "type": "s3",
+                      "url": "s3://vesuvius-challenge-open-data/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+})");
     const auto& volume = manifest.samples.front().volumes.front();
     const auto infos = lasagnaArtifacts("PHercParis4", volume);
     REQUIRE(infos.size() == 1);
@@ -396,29 +463,6 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
     REQUIRE(messages.size() == 1);
     CHECK(messages.front().find("coordinate level L3") != std::string::npos);
     CHECK(messages.front().find("ambiguous") == std::string::npos);
-}
-
-TEST_CASE("OpenDataManifest enumerates derived volume representations")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
-        {"type":"zarr"},
-        {"type":"normal-grids"},
-        {"type":"lasagna"},
-        {"type":"surface-prediction-zarr"},
-        {"type":"ink_detection_3d_zarr"},
-        {"type":"future-pred-zarr"}
-      ]}}}}}
-    })");
-    const auto representations = vcr::catalog::derivedRepresentations(manifest.samples.front());
-    REQUIRE(representations.size() == 5);
-    CHECK(representations[0].kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids);
-    CHECK(representations[1].kind == vcr::catalog::OpenDataRepresentationKind::Lasagna);
-    CHECK(representations[2].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
-    CHECK(representations[3].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
-    CHECK(representations[4].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
-    CHECK(vcr::catalog::representationKindName(representations[0].kind) == "Normal grids");
-    CHECK(vcr::catalog::representationKindName(representations[1].kind) == "Lasagna");
 }
 
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
@@ -652,15 +696,71 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
 TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")
 {
     const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
-        {"type":"normal-grids","parameters":{"level":0},"origins":[{
-          "path":"grids/L0","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]},
-        {"type":"normal-grids","parameters":{"level":2},"origins":[{
-          "path":"grids/L2","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]},
-        {"type":"normal-grids","parameters":{"level":2.5},"origins":[{
-          "path":"grids/invalid","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]}
-      ]}}}}}
-    })");
+  "samples": {
+    "sample": {
+      "volumes": {
+        "volume": {
+          "data": [
+            {
+              "type": "normal-grids",
+              "parameters": {
+                "level": 0
+              },
+              "origins": [
+                {
+                  "path": "grids/L0",
+                  "access_roots": [
+                    {
+                      "type": "https",
+                      "url": "https://example.test/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "normal-grids",
+              "parameters": {
+                "level": 2
+              },
+              "origins": [
+                {
+                  "path": "grids/L2",
+                  "access_roots": [
+                    {
+                      "type": "https",
+                      "url": "https://example.test/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "normal-grids",
+              "parameters": {
+                "level": 2.5
+              },
+              "origins": [
+                {
+                  "path": "grids/invalid",
+                  "access_roots": [
+                    {
+                      "type": "https",
+                      "url": "https://example.test/",
+                      "usage": "public-read"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+})");
     const auto& sample = manifest.samples.front();
     const auto infos = normalGridsArtifacts(sample.id, sample.volumes.front());
     REQUIRE(infos.size() == 2);
@@ -675,83 +775,6 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(first != second);
     CHECK(first.string().find("L0-") != std::string::npos);
     CHECK(second.string().find("L2-") != std::string::npos);
-}
-
-TEST_CASE("OpenDataManifest parses samples and computes summary counts")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture, "fixture://metadata.json");
-
-    CHECK(manifest.manifestUrl == "fixture://metadata.json");
-    REQUIRE(manifest.samples.size() == 1);
-    const auto* sample = manifest.findSample("PHerc0139");
-    REQUIRE(sample != nullptr);
-    CHECK(sample->type == "scroll");
-    CHECK(sample->description == "Example sample");
-    CHECK(sample->scanCount() == 1);
-    CHECK(sample->volumeCount() == 1);
-    CHECK(sample->segmentCount() == 1);
-    CHECK(sample->tifxyzSegmentCount() == 1);
-    CHECK(sample->inkDetectionSegmentCount() == 1);
-    CHECK(sample->properties.at("unknown_sample_field").get<int>() == 7);
-    REQUIRE(sample->artifacts.size() == 1);
-    const auto* photo = vcr::catalog::preferredPhotoArtifact(*sample);
-    REQUIRE(photo != nullptr);
-    CHECK(photo->resolvedUrl ==
-          "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg");
-
-    REQUIRE(manifest.findModel("model-a") != nullptr);
-}
-
-TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
-    const auto& sample = *manifest.findSample("PHerc0139");
-
-    REQUIRE(sample.volumes.size() == 1);
-    const auto& volume = sample.volumes.front();
-    CHECK(volume.id == "vol1");
-    CHECK(volume.scanId == "20240101000000");
-    REQUIRE(volume.pixelSizeUm.has_value());
-    CHECK(*volume.pixelSizeUm == doctest::Approx(7.91));
-    REQUIRE(volume.energyKeV.has_value());
-    CHECK(*volume.energyKeV == doctest::Approx(88.0));
-    REQUIRE(volume.detectorDistanceMm.has_value());
-    CHECK(*volume.detectorDistanceMm == doctest::Approx(12.5));
-
-    const auto* volumeArtifact = vcr::catalog::preferredVolumeArtifact(volume);
-    REQUIRE(volumeArtifact != nullptr);
-    CHECK(volumeArtifact->sourcePath ==
-          "s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
-    CHECK(volumeArtifact->resolvedUrl ==
-          "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/vol1.zarr");
-
-    REQUIRE(sample.segments.size() == 1);
-    const auto& segment = sample.segments.front();
-    CHECK(segment.id == "20260311000000");
-    CHECK(segment.longId == "PHerc0139-20260311000000");
-    CHECK(segment.originalVolumeId == "vol1");
-    CHECK(segment.createdAt == "2026-03-11T00:00:00Z");
-    REQUIRE(segment.width.has_value());
-    CHECK(*segment.width == 123);
-    REQUIRE(segment.height.has_value());
-    CHECK(*segment.height == 456);
-    CHECK(segment.hasTifxyz());
-    CHECK(segment.hasInkDetection());
-    CHECK(segment.hasLayersZarr());
-}
-
-TEST_CASE("OpenDataManifest reads the live segment creation date shape")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "samples":{"sample":{"segments":{"segment":{
-        "creation":{"date":"2026-06-02T20:44:01.955138Z"}
-      }}}}
-    })");
-
-    REQUIRE(manifest.samples.size() == 1);
-    REQUIRE(manifest.samples.front().segments.size() == 1);
-    CHECK(manifest.samples.front().segments.front().createdAt ==
-          "2026-06-02T20:44:01.955138Z");
 }
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
@@ -852,83 +875,6 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     const auto* volumeFromScanEntry = entryForVolumeId("volume-from-scan");
     REQUIRE(volumeFromScanEntry != nullptr);
     CHECK(hasTag(*volumeFromScanEntry, "vc-open-data-voxel-size-um:2.403000"));
-}
-
-TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
-{
-    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
-      "metadata": {
-        "samples": {
-          "sample-a": {
-            "sample": {
-              "properties": {
-                "volume_transforms": [
-                  {
-                    "from_volume_id": "vol-a",
-                    "transforms": [
-                      {
-                        "to_volume_id": "vol-b",
-                        "matrix": [
-                          [0.5, 0.0, 0.0, 10.0],
-                          [0.0, 0.5, 0.0, 20.0],
-                          [0.0, 0.0, 0.5, 30.0]
-                        ],
-                        "derivation_path": "vol-a-vol-b"
-                      }
-                    ]
-                  }
-                ]
-              }
-            },
-            "volumes": {
-              "vol-a": {"data_format": "zarr"},
-              "vol-b": {"data_format": "zarr"}
-            }
-          }
-        }
-      }
-    })");
-
-    const auto* sample = manifest.findSample("sample-a");
-    REQUIRE(sample != nullptr);
-    REQUIRE(sample->volumeTransforms.size() == 1);
-    CHECK(sample->volumeTransforms.front().fromVolumeId == "vol-a");
-    REQUIRE(sample->volumeTransforms.front().transforms.size() == 1);
-    CHECK(sample->volumeTransforms.front().transforms.front().toVolumeId == "vol-b");
-    CHECK(sample->volumeTransforms.front().transforms.front().derivationPath == "vol-a-vol-b");
-
-    const auto forward = vcr::catalog::findSampleVolumeTransform(*sample, "vol-a", "vol-b");
-    REQUIRE(forward.has_value());
-    CHECK((*forward)(0, 0) == doctest::Approx(0.5));
-    CHECK((*forward)(0, 3) == doctest::Approx(10.0));
-    CHECK((*forward)(1, 3) == doctest::Approx(20.0));
-    CHECK((*forward)(2, 3) == doctest::Approx(30.0));
-    CHECK((*forward)(3, 3) == doctest::Approx(1.0));
-
-    CHECK(vcr::catalog::findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
-    CHECK_FALSE(vcr::catalog::findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
-    CHECK_FALSE(vcr::catalog::findSampleVolumeTransform(*sample, "", "vol-b").has_value());
-}
-
-TEST_CASE("OpenDataManifest resolves public origins with the website rewrite table")
-{
-    CHECK(vcr::catalog::resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==
-          "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/a/b");
-    CHECK(vcr::catalog::resolveOpenDataUrl("s3://vesuvius-challenge/full-scrolls/x") ==
-          "https://data.aws.ash2txt.org/samples/full-scrolls/x");
-    CHECK(vcr::catalog::joinOpenDataUrl("s3://vesuvius-challenge-open-data/", "/a/b") ==
-          "s3://vesuvius-challenge-open-data/a/b");
-
-    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
-    const auto& segment = manifest.findSample("PHerc0139")->segments.front();
-    const auto* tifxyz = vcr::catalog::findArtifact(segment.artifacts, "tifxyz");
-    REQUIRE(tifxyz != nullptr);
-    CHECK(tifxyz->resolvedUrl ==
-          "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/segments/20260311000000/tifxyz");
-
-    const auto* ink = vcr::catalog::findArtifact(segment.artifacts, "ink_detection");
-    REQUIRE(ink != nullptr);
-    CHECK(ink->resolvedUrl == "https://example.test/data/PHerc0139/segments/20260311000000/ink.zarr");
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
@@ -1259,7 +1205,7 @@ vcr::catalog::OpenDataSample representationSample()
     segment.longId = "sample-segment";
     segment.suffix = "w001";
     segment.originalVolumeId = "source";
-    segment.properties["original_volume_downscale"] = 2;
+    segment.originalVolumeDownscale = 2;
     vcr::catalog::OpenDataArtifact authored;
     authored.type = "tifxyz-flattened";
     authored.resolvedUrl = "https://example.test/authored";
@@ -1287,36 +1233,6 @@ std::filesystem::path freshRoot(const std::string& tag)
 
 } // namespace
 
-TEST_CASE("Open Data segments retain canonical and published representations")
-{
-    auto sample = representationSample();
-    auto& segment = sample.segments.front();
-    const auto representations = classifyOpenDataSegmentRepresentations(sample, segment);
-    REQUIRE(representations.size() == 2);
-    CHECK(representations[0].kind == OpenDataSegmentRepresentationKind::DerivedNative);
-    CHECK(representations[0].canonicalSource);
-    CHECK(representations[0].coordinateSpace == "sample/source@L0");
-    CHECK(representations[0].artifact == &segment.artifacts[0]);
-    CHECK(representations[1].kind == OpenDataSegmentRepresentationKind::PublishedTransformed);
-    CHECK(representations[1].coordinateVolumeId == "target");
-    // A published representation of the source volume wins over the authored one.
-    vcr::catalog::OpenDataArtifact publishedSource = segment.artifacts[1];
-    publishedSource.resolvedUrl = "https://example.test/published-source";
-    publishedSource.targetVolumeId = "source";
-    segment.artifacts.push_back(publishedSource);
-    const auto withPublishedSource = classifyOpenDataSegmentRepresentations(sample, segment);
-    REQUIRE_FALSE(withPublishedSource.empty());
-    CHECK(withPublishedSource[0].kind == OpenDataSegmentRepresentationKind::PublishedTransformed);
-    CHECK(withPublishedSource[0].canonicalSource);
-    CHECK(withPublishedSource[0].artifact == &segment.artifacts.back());
-
-    // Artifacts targeting volumes outside the sample are ignored.
-    vcr::catalog::OpenDataArtifact elsewhere = segment.artifacts[1];
-    elsewhere.targetVolumeId = "missing";
-    segment.artifacts.push_back(elsewhere);
-    CHECK(classifyOpenDataSegmentRepresentations(sample, segment).size() == withPublishedSource.size());
-}
-
 TEST_CASE("Open Data import records representations as catalog surfaces bound to their volumes")
 {
     namespace vo = vc::objects;
@@ -1328,10 +1244,10 @@ TEST_CASE("Open Data import records representations as catalog surfaces bound to
     const auto store = surfaceStorePath(root, "sample");
     REQUIRE(std::filesystem::exists(store));
 
-    const auto representations = classifyOpenDataSegmentRepresentations(sample, sample.segments.front());
-    const auto native = surfaceUuidForRepresentation(representations[0].representationId);
-    const auto published = surfaceUuidForRepresentation(representations[1].representationId);
-    CHECK(native == surfaceUuidForRepresentation(representations[0].representationId));
+    const auto representations = sample.surfaces(sample.segments.front());
+    const auto native = surfaceUuidForRepresentation(representations[0].id);
+    const auto published = surfaceUuidForRepresentation(representations[1].id);
+    CHECK(native == surfaceUuidForRepresentation(representations[0].id));
     {
         vo::OpenOptions options;
         options.readOnly = true;

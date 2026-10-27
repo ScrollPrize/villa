@@ -4,34 +4,6 @@
 
 namespace vc3d::opendata {
 
-namespace {
-
-std::optional<bool> booleanProperty(const nlohmann::json& properties, const char* key)
-{
-    if (!properties.is_object()) {
-        return std::nullopt;
-    }
-    const auto it = properties.find(key);
-    if (it == properties.end()) {
-        return std::nullopt;
-    }
-    if (it->is_boolean()) {
-        return it->get<bool>();
-    }
-    if (it->is_string()) {
-        const std::string& text = it->get_ref<const std::string&>();
-        if (text == "true") {
-            return true;
-        }
-        if (text == "false") {
-            return false;
-        }
-    }
-    return std::nullopt;
-}
-
-} // namespace
-
 std::optional<std::pair<std::string, std::string>> sampleAndVolumeOfCoordinateSpace(
     std::string_view coordinateSpace)
 {
@@ -62,10 +34,8 @@ std::string catalogVolumeOfCoordinateSpace(std::string_view coordinateSpace)
 VolumeOrientation volumeOrientationOf(const vcr::catalog::OpenDataVolume& volume)
 {
     VolumeOrientation orientation;
-    orientation.zTopToBottom =
-        booleanProperty(volume.properties, "z_direction_is_top_to_bottom");
-    orientation.leftHandedCoordinates =
-        booleanProperty(volume.properties, "left_handed_coordinates");
+    orientation.zTopToBottom = volume.zDirectionIsTopToBottom;
+    orientation.leftHandedCoordinates = volume.leftHandedCoordinates;
     return orientation;
 }
 

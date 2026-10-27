@@ -225,7 +225,7 @@ SampleCacheSummary sampleCacheSummary(const std::filesystem::path& remoteCacheRo
 {
     SampleCacheSummary summary;
     for (const auto& segment : sample.segments) {
-        if (!segment.hasTifxyz()) {
+        if (sample.surfaces(segment).empty()) {
             continue;
         }
         ++summary.total;
@@ -378,7 +378,7 @@ QStringList segmentCells(const std::filesystem::path& remoteRoot,
                          const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataSegment& segment)
 {
     return {qstr(segment.id), qstr(segment.suffix), qstr(segment.originalVolumeId),
-            optionalInt(segment.width), optionalInt(segment.height), yesNo(segment.hasTifxyz()),
+            optionalInt(segment.width), optionalInt(segment.height), yesNo(!sample.surfaces(segment).empty()),
             yesNo(segment.hasInkDetection()), yesNo(segment.hasLayersZarr()),
             cacheStateDisplay(surfaceStateForSegment(remoteRoot, sample, segment)), qstr(segment.createdAt)};
 }
@@ -603,7 +603,7 @@ void OpenDataCatalogWindow::createSelectedProject()
     auto* segmentGroup = group(segmentTree, tr("Segments (tifxyz)"));
     for (std::size_t row = 0; row < sample.segments.size(); ++row) {
         const auto& segment = sample.segments[row];
-        if (segment.hasTifxyz())
+        if (!sample.surfaces(segment).empty())
             segments.emplace_back(leaf(segmentGroup, segmentCells(remoteRoot, sample, segment)), segment.id);
     }
     const std::array trees{volumeTree, representationTree, segmentTree};
@@ -1150,7 +1150,7 @@ void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* 
             .arg(sample->volumeCount())
             .arg(sample->segmentCount())
             .arg(representations.size())
-            .arg(sample->tifxyzSegmentCount())
+            .arg(sample->surfaceSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
             .arg(sample->artifacts.size())
             .arg(localDataText(cacheSummary).toHtmlEscaped())
@@ -1457,15 +1457,17 @@ QString OpenDataCatalogWindow::selectedRepresentationUrl() const
 
 QString OpenDataCatalogWindow::selectedSegmentUrl() const
 {
+    const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    if (!segment) {
+    if (!sample || !segment) {
         return {};
     }
-    const auto* artifact = vcr::catalog::preferredTifxyzArtifact(*segment);
-    if (!artifact) {
+    // The canonical surface: the representation opening the sample imports.
+    const auto surfaces = sample->surfaces(*segment);
+    if (surfaces.empty()) {
         return firstArtifactUrl(segment->artifacts);
     }
-    return artifactUrl(*artifact);
+    return artifactUrl(*surfaces.front().artifact);
 }
 
 void OpenDataCatalogWindow::updateActionButtons()
@@ -1483,7 +1485,7 @@ void OpenDataCatalogWindow::updateActionButtons()
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    const bool canCacheSegment = manifestReady && segment && segment->hasTifxyz();
+    const bool canCacheSegment = manifestReady && segment && !sample->surfaces(*segment).empty();
     const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto sampleSummary = sample
         ? sampleCacheSummary(remoteRoot, *sample)
@@ -1539,7 +1541,7 @@ void OpenDataCatalogWindow::updateActionButtons()
     if (_cacheSegmentButton) {
         _cacheSegmentButton->setEnabled(canCacheSegment);
         _cacheSegmentButton->setText(
-            sample && segment && segment->hasTifxyz() &&
+            sample && segment && !sample->surfaces(*segment).empty() &&
                     surfaceStateForSegment(remoteRoot, *sample, *segment) == SurfaceState::Stored
                 ? tr("Re-import Selected")
                 : tr("Fetch Selected"));
@@ -1737,7 +1739,7 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
 {
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    if (!sample || !segment || !segment->hasTifxyz()) {
+    if (!sample || !segment || sample->surfaces(*segment).empty()) {
         return;
     }
     const auto remoteRoot = vc3d::remoteCachePathFs();
@@ -1745,12 +1747,12 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
     QString message;
     try {
         const auto imported = importSampleSurfaces(remoteRoot, *sample, std::vector<std::string>{segment->id});
-        const auto representations = classifyOpenDataSegmentRepresentations(*sample, *segment);
+        const auto representations = sample->surfaces(*segment);
         if (representations.empty()) {
             message = tr("Segment %1 has no representation in this sample's volumes.").arg(qstr(segment->id));
         } else {
             materializeSurface(surfaceStorePath(remoteRoot, sample->id),
-                               surfaceUuidForRepresentation(representations.front().representationId));
+                               surfaceUuidForRepresentation(representations.front().id));
             message = tr("Stored segment %1 (%2 representation(s) imported).")
                           .arg(qstr(segment->id))
                           .arg(imported.representations);
@@ -1766,7 +1768,7 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
 void OpenDataCatalogWindow::syncSelectedSampleCache()
 {
     const auto* sample = selectedSample();
-    if (!sample || sample->tifxyzSegmentCount() == 0) {
+    if (!sample || sample->surfaceSegmentCount() == 0) {
         return;
     }
     const auto remoteRoot = vc3d::remoteCachePathFs();
@@ -1778,14 +1780,14 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         (void)importSampleSurfaces(remoteRoot, *sample);
         const auto store = surfaceStorePath(remoteRoot, sample->id);
         for (const auto& segment : sample->segments) {
-            const auto representations = classifyOpenDataSegmentRepresentations(*sample, segment);
-            if (!segment.hasTifxyz() || representations.empty()) {
+            const auto representations = sample->surfaces(segment);
+            if (representations.empty()) {
                 continue;
             }
             setStatus(tr("Fetching %1 (%2 stored)...").arg(qstr(segment.id)).arg(stored));
             QCoreApplication::processEvents();
             try {
-                materializeSurface(store, surfaceUuidForRepresentation(representations.front().representationId));
+                materializeSurface(store, surfaceUuidForRepresentation(representations.front().id));
                 ++stored;
             } catch (const std::exception& error) {
                 ++failed;

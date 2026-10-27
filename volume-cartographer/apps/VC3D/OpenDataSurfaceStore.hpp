@@ -23,33 +23,10 @@
 
 namespace vc3d::opendata {
 
-enum class OpenDataSegmentRepresentationKind {
-    // The authored tifxyz of the source volume, in its downscaled voxels.
-    DerivedNative,
-    // A published tifxyz in a target volume's L0 voxels.
-    PublishedTransformed
-};
-
-struct OpenDataSegmentRepresentation {
-    const vcr::catalog::OpenDataArtifact* artifact = nullptr;  // registered ones
-    OpenDataSegmentRepresentationKind kind = OpenDataSegmentRepresentationKind::DerivedNative;
-    bool canonicalSource = false;
-    std::string coordinateVolumeId;
-    std::string coordinateSpace;
-    std::string representationId;
-};
-
-// The representations of a segment, at most one per sample volume. The source
-// volume's is canonical: an explicit published representation targeting it
-// wins, otherwise the authored artifact in native L0. Published ones win for
-// every other volume. Other compatible volumes use transformed store views.
-[[nodiscard]] std::vector<OpenDataSegmentRepresentation>
-classifyOpenDataSegmentRepresentations(const vcr::catalog::OpenDataSample& sample,
-                                       const vcr::catalog::OpenDataSegment& segment);
-
 [[nodiscard]] std::filesystem::path surfaceStorePath(const std::filesystem::path& remoteCacheRoot,
                                                      const std::string& sampleId);
-// Deterministic across machines: a UUIDv5 of the representation id.
+// Deterministic across machines: a UUIDv5 of the representation id
+// (vcr::catalog::OpenDataSurface::id).
 [[nodiscard]] std::string surfaceUuidForRepresentation(const std::string& representationId);
 
 // The catalog volume an open Open Data volume shows, from its volume tags.

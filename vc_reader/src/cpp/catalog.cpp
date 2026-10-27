@@ -4,6 +4,9 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <map>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace vcr::catalog {
@@ -28,94 +31,84 @@ bool containsInsensitive(std::string_view haystack, std::string_view needle)
     return lowerCopy(haystack).find(lowerCopy(needle)) != std::string::npos;
 }
 
-std::optional<std::string> stringValue(const nlohmann::json& obj,
-                                       std::initializer_list<std::string_view> keys)
+std::string safePathComponent(std::string value)
 {
-    if (!obj.is_object()) {
-        return std::nullopt;
+    for (char& c : value) {
+        const auto uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc) && c != '-' && c != '_' && c != '.') c = '_';
     }
-    for (const auto key : keys) {
-        const auto it = obj.find(std::string(key));
-        if (it == obj.end() || it->is_null()) {
-            continue;
-        }
-        if (it->is_string()) {
-            return it->get<std::string>();
-        }
-        if (it->is_number_integer() || it->is_number_unsigned()) {
-            return std::to_string(it->get<long long>());
-        }
-        if (it->is_number_float()) {
-            return std::to_string(it->get<double>());
-        }
+    while (!value.empty() && (value.front() == '.' || value.front() == '_')) value.erase(value.begin());
+    return value.empty() ? std::string("unnamed") : value;
+}
+
+// FNV-1a of a URL, as 16 hex digits: part of representation ids.
+std::string hashUrl(std::string_view value)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char c : value) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
     }
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i, hash >>= 4) out[size_t(i)] = hex[hash & 0xf];
+    return out;
+}
+
+// Fields of published records, by their published keys only.
+const nlohmann::json* member(const nlohmann::json& obj, const char* key)
+{
+    if (!obj.is_object()) return nullptr;
+    const auto it = obj.find(key);
+    return it == obj.end() || it->is_null() ? nullptr : &*it;
+}
+
+std::optional<std::string> stringValue(const nlohmann::json& obj, const char* key)
+{
+    const auto* value = member(obj, key);
+    if (!value) return std::nullopt;
+    if (value->is_string()) return value->get<std::string>();
+    if (value->is_number_integer() || value->is_number_unsigned()) return std::to_string(value->get<long long>());
     return std::nullopt;
 }
 
-std::optional<std::string> nestedStringValue(const nlohmann::json& obj,
-                                             std::initializer_list<std::string_view> keys)
+std::optional<double> numberValue(const nlohmann::json& obj, const char* key)
 {
-    if (auto value = stringValue(obj, keys)) {
-        return value;
-    }
-    if (obj.is_object()) {
-        if (const auto it = obj.find("properties"); it != obj.end()) {
-            if (auto value = stringValue(*it, keys)) {
-                return value;
-            }
-        }
-        if (const auto it = obj.find("sample"); it != obj.end()) {
-            if (auto value = stringValue(*it, keys)) {
-                return value;
-            }
-        }
-    }
-    return std::nullopt;
+    const auto* value = member(obj, key);
+    if (!value || !value->is_number()) return std::nullopt;
+    return value->get<double>();
 }
 
-std::optional<double> numberValue(const nlohmann::json& obj,
-                                  std::initializer_list<std::string_view> keys)
+std::optional<int> intValue(const nlohmann::json& obj, const char* key)
 {
-    if (!obj.is_object()) {
-        return std::nullopt;
-    }
-    for (const auto key : keys) {
-        const auto it = obj.find(std::string(key));
-        if (it == obj.end() || it->is_null()) {
-            continue;
-        }
-        if (it->is_number()) {
-            return it->get<double>();
-        }
-        if (it->is_string()) {
-            try {
-                return std::stod(it->get<std::string>());
-            } catch (const std::exception&) {
-                continue;
-            }
-        }
-    }
-    if (const auto it = obj.find("properties"); it != obj.end()) {
-        return numberValue(*it, keys);
-    }
-    return std::nullopt;
-}
-
-std::optional<int> intValue(const nlohmann::json& obj,
-                            std::initializer_list<std::string_view> keys)
-{
-    if (auto value = numberValue(obj, keys); value && std::isfinite(*value) &&
+    if (auto value = numberValue(obj, key); value && std::isfinite(*value) &&
         *value >= std::numeric_limits<int>::min() && *value <= std::numeric_limits<int>::max() && std::floor(*value)==*value) {
         return static_cast<int>(*value);
     }
     return std::nullopt;
 }
 
+std::optional<bool> boolValue(const nlohmann::json& obj, const char* key)
+{
+    const auto* value = member(obj, key);
+    if (!value || !value->is_boolean()) return std::nullopt;
+    return value->get<bool>();
+}
+
+std::optional<std::vector<std::string>> stringList(const nlohmann::json& obj, const char* key)
+{
+    const auto* value = member(obj, key);
+    if (!value || !value->is_array()) return std::nullopt;
+    std::vector<std::string> list;
+    for (const auto& item : *value)
+        if (item.is_string()) list.push_back(item.get<std::string>());
+    return list;
+}
+
 std::optional<std::array<std::size_t, 3>> shapeValue(const nlohmann::json& obj)
 {
-    if (!obj.is_object()) return std::nullopt;
-    const auto it = obj.find("shape");
-    if (it == obj.end() || !it->is_array() || it->size() != 3)
+    const auto* it = member(obj, "shape");
+    if (!it || !it->is_array() || it->size() != 3)
         return std::nullopt;
     std::array<std::size_t, 3> shape{};
     for (std::size_t i = 0; i < shape.size(); ++i) {
@@ -130,90 +123,72 @@ std::optional<std::array<std::size_t, 3>> shapeValue(const nlohmann::json& obj)
 
 nlohmann::json objectOrEmpty(const nlohmann::json& obj, const char* key)
 {
-    if (!obj.is_object()) {
-        return nlohmann::json::object();
-    }
-    const auto it = obj.find(key);
-    if (it != obj.end() && it->is_object()) {
-        return *it;
-    }
-    return nlohmann::json::object();
+    const auto* value = member(obj, key);
+    return value && value->is_object() ? *value : nlohmann::json::object();
 }
 
-std::optional<Affine> matrixValue(const nlohmann::json& obj,
-                                       std::initializer_list<std::string_view> keys)
+std::optional<OpenDataBounds> boundsValue(const nlohmann::json& obj, const char* key)
 {
-    if (!obj.is_object()) return std::nullopt;
-    for (const auto key : keys) {
-        const auto it = obj.find(std::string(key));
-        if (it == obj.end()) continue;
-        try { return Affine::fromJson(*it); }
-        catch (const std::invalid_argument&) { return std::nullopt; }
+    const auto* value = member(obj, key);
+    if (!value || !value->is_array() || value->size() != 2) return std::nullopt;
+    OpenDataBounds bounds;
+    for (int corner = 0; corner < 2; ++corner) {
+        const auto& point = (*value)[corner];
+        if (!point.is_array() || point.size() != 3) return std::nullopt;
+        auto& out = corner == 0 ? bounds.low : bounds.high;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!point[axis].is_number()) return std::nullopt;
+            out[axis] = point[axis].get<double>();
+        }
     }
-    return std::nullopt;
+    return bounds;
+}
+
+OpenDataCreation parseCreation(const nlohmann::json& creationJson)
+{
+    OpenDataCreation creation;
+    creation.date = stringValue(creationJson, "date").value_or("");
+    creation.process = stringValue(creationJson, "process").value_or("");
+    const auto derived = objectOrEmpty(creationJson, "derived_from");
+    const auto type = stringValue(derived, "type"), id = stringValue(derived, "id");
+    if (type && id) creation.derivedFrom = OpenDataReference{*type, *id};
+    return creation;
+}
+
+std::optional<Affine> matrixValue(const nlohmann::json& obj, const char* key)
+{
+    const auto* value = member(obj, key);
+    if (!value) return std::nullopt;
+    try { return Affine::fromJson(*value); }
+    catch (const std::invalid_argument&) { return std::nullopt; }
 }
 
 std::vector<OpenDataVolumeTransformGroup> parseVolumeTransforms(const nlohmann::json& propertiesJson)
 {
     std::vector<OpenDataVolumeTransformGroup> groups;
-    if (!propertiesJson.is_object()) {
-        return groups;
-    }
-    auto groupsIt = propertiesJson.find("volume_transforms");
-    const nlohmann::json* groupsJson =
-        (groupsIt != propertiesJson.end() && groupsIt->is_array()) ? &*groupsIt : nullptr;
-    if (!groupsJson) {
-        const auto nestedPropertiesIt = propertiesJson.find("properties");
-        if (nestedPropertiesIt != propertiesJson.end() && nestedPropertiesIt->is_object()) {
-            groupsIt = nestedPropertiesIt->find("volume_transforms");
-            if (groupsIt != nestedPropertiesIt->end() && groupsIt->is_array()) {
-                groupsJson = &*groupsIt;
-            }
-        }
-    }
-    if (!groupsJson) {
-        return groups;
-    }
-
+    const auto* groupsJson = member(propertiesJson, "volume_transforms");
+    if (!groupsJson || !groupsJson->is_array()) return groups;
     groups.reserve(groupsJson->size());
     for (const auto& groupJson : *groupsJson) {
-        if (!groupJson.is_object()) {
-            continue;
-        }
+        if (!groupJson.is_object()) continue;
         OpenDataVolumeTransformGroup group;
         group.raw = groupJson;
-        group.fromVolumeId = stringValue(groupJson, {"from_volume_id", "fromVolumeId"}).value_or("");
-        const auto transformsIt = groupJson.find("transforms");
-        if (group.fromVolumeId.empty() ||
-            transformsIt == groupJson.end() ||
-            !transformsIt->is_array()) {
-            continue;
-        }
-
-        group.transforms.reserve(transformsIt->size());
-        for (const auto& transformJson : *transformsIt) {
-            if (!transformJson.is_object()) {
-                continue;
-            }
-            auto matrix = matrixValue(transformJson, {"matrix", "transformation_matrix"});
-            if (!matrix) {
-                continue;
-            }
+        group.fromVolumeId = stringValue(groupJson, "from_volume_id").value_or("");
+        const auto* transformsJson = member(groupJson, "transforms");
+        if (group.fromVolumeId.empty() || !transformsJson || !transformsJson->is_array()) continue;
+        group.transforms.reserve(transformsJson->size());
+        for (const auto& transformJson : *transformsJson) {
+            auto matrix = matrixValue(transformJson, "matrix");
+            if (!matrix) continue;
             OpenDataVolumeTransform transform;
             transform.raw = transformJson;
-            transform.toVolumeId = stringValue(transformJson, {"to_volume_id", "toVolumeId"}).value_or("");
-            transform.derivationPath = stringValue(transformJson, {"derivation_path", "derivationPath"}).value_or("");
+            transform.toVolumeId = stringValue(transformJson, "to_volume_id").value_or("");
+            transform.derivationPath = stringValue(transformJson, "derivation_path").value_or("");
             transform.matrix = *matrix;
-            if (!transform.toVolumeId.empty()) {
-                group.transforms.push_back(std::move(transform));
-            }
+            if (!transform.toVolumeId.empty()) group.transforms.push_back(std::move(transform));
         }
-
-        if (!group.transforms.empty()) {
-            groups.push_back(std::move(group));
-        }
+        if (!group.transforms.empty()) groups.push_back(std::move(group));
     }
-
     return groups;
 }
 
@@ -225,20 +200,16 @@ bool startsWith(std::string_view value, std::string_view prefix)
 std::vector<OpenDataAccessRoot> parseAccessRoots(const nlohmann::json& rootsJson)
 {
     std::vector<OpenDataAccessRoot> roots;
-    if (!rootsJson.is_array()) {
-        return roots;
-    }
+    if (!rootsJson.is_array()) return roots;
     roots.reserve(rootsJson.size());
     for (const auto& rootJson : rootsJson) {
-        if (!rootJson.is_object()) {
-            continue;
-        }
+        if (!rootJson.is_object()) continue;
         OpenDataAccessRoot root;
         root.raw = rootJson;
         root.properties = objectOrEmpty(rootJson, "properties");
-        root.type = stringValue(rootJson, {"type"}).value_or("");
-        root.url = stringValue(rootJson, {"url"}).value_or("");
-        root.usage = stringValue(rootJson, {"usage"}).value_or("");
+        root.type = stringValue(rootJson, "type").value_or("");
+        root.url = stringValue(rootJson, "url").value_or("");
+        root.usage = stringValue(rootJson, "usage").value_or("");
         roots.push_back(std::move(root));
     }
     return roots;
@@ -247,21 +218,15 @@ std::vector<OpenDataAccessRoot> parseAccessRoots(const nlohmann::json& rootsJson
 std::vector<OpenDataOrigin> parseOrigins(const nlohmann::json& originsJson)
 {
     std::vector<OpenDataOrigin> origins;
-    if (!originsJson.is_array()) {
-        return origins;
-    }
+    if (!originsJson.is_array()) return origins;
     origins.reserve(originsJson.size());
     for (const auto& originJson : originsJson) {
-        if (!originJson.is_object()) {
-            continue;
-        }
+        if (!originJson.is_object()) continue;
         OpenDataOrigin origin;
         origin.raw = originJson;
         origin.properties = objectOrEmpty(originJson, "properties");
-        origin.path = stringValue(originJson, {"path", "url", "uri"}).value_or("");
-        if (const auto it = originJson.find("access_roots"); it != originJson.end()) {
-            origin.accessRoots = parseAccessRoots(*it);
-        }
+        origin.path = stringValue(originJson, "path").value_or("");
+        if (const auto* roots = member(originJson, "access_roots")) origin.accessRoots = parseAccessRoots(*roots);
         origins.push_back(std::move(origin));
     }
     return origins;
@@ -288,41 +253,23 @@ void selectPreferredOrigin(OpenDataArtifact& artifact)
 
 std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
 {
-    const nlohmann::json* dataJson = nullptr;
-    if (ownerJson.is_object()) {
-        if (const auto it = ownerJson.find("data"); it != ownerJson.end() && it->is_array()) {
-            dataJson = &*it;
-        } else if (const auto it = ownerJson.find("artifacts"); it != ownerJson.end() && it->is_array()) {
-            dataJson = &*it;
-        }
-    }
-    if (!dataJson) {
-        return {};
-    }
-
+    const auto* dataJson = member(ownerJson, "data");
+    if (!dataJson || !dataJson->is_array()) return {};
     std::vector<OpenDataArtifact> artifacts;
     artifacts.reserve(dataJson->size());
     for (const auto& itemJson : *dataJson) {
-        if (!itemJson.is_object()) {
-            continue;
-        }
+        if (!itemJson.is_object()) continue;
         OpenDataArtifact artifact;
         artifact.raw = itemJson;
         artifact.parameters = objectOrEmpty(itemJson, "parameters");
         artifact.properties = objectOrEmpty(itemJson, "properties");
         artifact.creationInfo = objectOrEmpty(itemJson, "creation_info");
-        artifact.type = stringValue(itemJson, {"type"}).value_or("");
-        artifact.modelId = stringValue(artifact.parameters, {"model_id", "modelId"});
-        artifact.lasagnaVersionPresent =
-            artifact.creationInfo.contains("lasagna_version") ||
-            artifact.creationInfo.contains("lasagnaVersion");
-        artifact.lasagnaVersion = intValue(
-            artifact.creationInfo, {"lasagna_version", "lasagnaVersion"});
-        artifact.sourceToBasePresent =
-            artifact.creationInfo.contains("source_to_base") ||
-            artifact.creationInfo.contains("sourceToBase");
-        artifact.sourceToBase = numberValue(
-            artifact.creationInfo, {"source_to_base", "sourceToBase"});
+        artifact.type = stringValue(itemJson, "type").value_or("");
+        artifact.modelId = stringValue(artifact.parameters, "model_id");
+        artifact.lasagnaVersionPresent = artifact.creationInfo.contains("lasagna_version");
+        artifact.lasagnaVersion = intValue(artifact.creationInfo, "lasagna_version");
+        artifact.sourceToBasePresent = artifact.creationInfo.contains("source_to_base");
+        artifact.sourceToBase = numberValue(artifact.creationInfo, "source_to_base");
         if (artifact.sourceToBase &&
             (!std::isfinite(*artifact.sourceToBase) || *artifact.sourceToBase <= 0.0)) {
             artifact.sourceToBase.reset();
@@ -340,14 +287,24 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
                     artifact.sourceCoordinateLevel = static_cast<int>(value);
             }
         }
-        if (const auto targetIt = artifact.parameters.find("target_volume");
-            targetIt != artifact.parameters.end() && targetIt->is_string() &&
-            !targetIt->get_ref<const std::string&>().empty()) {
-            artifact.targetVolumeId = targetIt->get<std::string>();
-        }
-        if (const auto it = itemJson.find("origins"); it != itemJson.end()) {
-            artifact.origins = parseOrigins(*it);
-        }
+        if (auto target = stringValue(artifact.parameters, "target_volume"); target && !target->empty())
+            artifact.targetVolumeId = std::move(*target);
+        artifact.renderLevel = intValue(artifact.parameters, "render_level");
+        artifact.downscale = numberValue(artifact.parameters, "downscale");
+        artifact.format = stringValue(artifact.parameters, "format").value_or("");
+        artifact.compositeMode = stringValue(artifact.parameters, "composite_mode").value_or("");
+        artifact.labelSet = stringValue(artifact.parameters, "label_set").value_or("");
+        artifact.width = intValue(artifact.properties, "width");
+        artifact.height = intValue(artifact.properties, "height");
+        artifact.arrays = stringList(artifact.properties, "arrays").value_or(std::vector<std::string>{});
+        if (auto single = stringValue(artifact.properties, "supersedes")) artifact.supersedes = {*single};
+        else artifact.supersedes = stringList(artifact.properties, "supersedes").value_or(std::vector<std::string>{});
+        artifact.registration = stringValue(artifact.properties, "registration").value_or("");
+        artifact.annotatedOn = stringValue(artifact.properties, "annotated_on").value_or("");
+        artifact.mappingCoverage = numberValue(artifact.properties, "mapping_coverage");
+        artifact.creation = parseCreation(artifact.creationInfo);
+        artifact.publicationTier = stringValue(objectOrEmpty(artifact.creationInfo, "publication"), "tier").value_or("");
+        if (const auto* origins = member(itemJson, "origins")) artifact.origins = parseOrigins(*origins);
         selectPreferredOrigin(artifact);
         artifacts.push_back(std::move(artifact));
     }
@@ -357,11 +314,21 @@ std::vector<OpenDataArtifact> parseArtifacts(const nlohmann::json& ownerJson)
 OpenDataScan parseScan(std::string id, const nlohmann::json& scanJson)
 {
     OpenDataScan scan;
-    scan.id = nestedStringValue(scanJson, {"id"}).value_or(std::move(id));
-    scan.suffix = nestedStringValue(scanJson, {"suffix"}).value_or("");
-    scan.createdAt = nestedStringValue(scanJson, {"created_at", "createdAt", "created"}).value_or("");
-    scan.pixelSizeUm = numberValue(scanJson, {"pixel_size_um", "pixelSizeUm", "resolution_um"});
+    scan.id = stringValue(scanJson, "id").value_or(std::move(id));
+    scan.longId = stringValue(scanJson, "long_id").value_or("");
+    scan.suffix = stringValue(scanJson, "suffix").value_or("");
+    const auto creationJson = objectOrEmpty(scanJson, "creation");
+    scan.creation = parseCreation(creationJson);
+    scan.createdAt = scan.creation.date;
     scan.properties = objectOrEmpty(scanJson, "properties");
+    scan.pixelSizeUm = numberValue(scan.properties, "pixel_size_um");
+    scan.energyKeV = numberValue(scan.properties, "energy_keV");
+    scan.detectorDistanceMm = numberValue(scan.properties, "detector_distance_mm");
+    const auto metadata = objectOrEmpty(creationJson, "metadata");
+    scan.location = stringValue(metadata, "location").value_or("");
+    scan.beamline = stringValue(metadata, "beamline").value_or("");
+    const auto acquisition = objectOrEmpty(objectOrEmpty(objectOrEmpty(metadata, "metadata"), "tomo"), "acquisition");
+    scan.name = stringValue(acquisition, "scanRadix").value_or(stringValue(metadata, "scan_name").value_or(""));
     scan.artifacts = parseArtifacts(scanJson);
     scan.raw = scanJson.is_object() ? scanJson : nlohmann::json::object();
     return scan;
@@ -370,16 +337,35 @@ OpenDataScan parseScan(std::string id, const nlohmann::json& scanJson)
 OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
 {
     OpenDataVolume volume;
-    volume.id = nestedStringValue(volumeJson, {"id"}).value_or(std::move(id));
-    volume.scanId = nestedStringValue(volumeJson, {"scan_id", "scanId", "scan"}).value_or("");
-    volume.suffix = nestedStringValue(volumeJson, {"suffix"}).value_or("");
-    volume.pixelSizeUm = numberValue(volumeJson, {"pixel_size_um", "pixelSizeUm", "resolution_um"});
-    volume.energyKeV = numberValue(volumeJson, {"energy_keV", "energy_kev", "energyKeV"});
-    volume.detectorDistanceMm = numberValue(volumeJson, {"detector_distance_mm", "detectorDistanceMm"});
-    volume.dataFormat = nestedStringValue(volumeJson, {"data_format", "dataFormat", "format"}).value_or("");
-    volume.createdAt = nestedStringValue(volumeJson, {"created_at", "createdAt", "created"}).value_or("");
+    volume.id = stringValue(volumeJson, "id").value_or(std::move(id));
+    volume.longId = stringValue(volumeJson, "long_id").value_or("");
+    volume.scanId = stringValue(volumeJson, "scan_id").value_or("");
+    volume.suffix = stringValue(volumeJson, "suffix").value_or("");
+    const auto creationJson = objectOrEmpty(volumeJson, "creation");
+    volume.creation = parseCreation(creationJson);
+    volume.createdAt = volume.creation.date;
     volume.properties = objectOrEmpty(volumeJson, "properties");
-    volume.shapeZYX = shapeValue(volume.properties);
+    const auto& p = volume.properties;
+    volume.pixelSizeUm = numberValue(p, "pixel_size_um");
+    volume.energyKeV = numberValue(p, "energy_keV");
+    volume.detectorDistanceMm = numberValue(p, "detector_distance_mm");
+    volume.dataFormat = stringValue(p, "data_format").value_or("");
+    volume.shapeZYX = shapeValue(p);
+    volume.zDirectionIsTopToBottom = boolValue(p, "z_direction_is_top_to_bottom");
+    volume.leftHandedCoordinates = boolValue(p, "left_handed_coordinates");
+    volume.textSide = stringValue(p, "text_side").value_or("");
+    if (const auto superseded = objectOrEmpty(p, "superseded_by"); auto target = stringValue(superseded, "volume_id"))
+        volume.supersededBy = OpenDataSupersession{*target, stringValue(superseded, "date").value_or(""),
+                                                   stringValue(superseded, "reason").value_or("")};
+    if (const auto license = objectOrEmpty(p, "license"); auto name = stringValue(license, "name"))
+        volume.license = OpenDataLicense{*name, stringValue(license, "url").value_or("")};
+    volume.renderLevel = intValue(p, "render_level").value_or(0);
+    volume.renderSegments = boolValue(p, "render_segments");
+    const auto metadata = objectOrEmpty(creationJson, "metadata");
+    volume.windowU16Min = numberValue(metadata, "window_u16_min");
+    volume.windowU16Max = numberValue(metadata, "window_u16_max");
+    volume.targetWindowF32Min = numberValue(metadata, "target_window_f32_min");
+    volume.targetWindowF32Max = numberValue(metadata, "target_window_f32_max");
     volume.artifacts = parseArtifacts(volumeJson);
     volume.raw = volumeJson.is_object() ? volumeJson : nlohmann::json::object();
     return volume;
@@ -388,24 +374,44 @@ OpenDataVolume parseVolume(std::string id, const nlohmann::json& volumeJson)
 OpenDataSegment parseSegment(std::string id, const nlohmann::json& segmentJson)
 {
     OpenDataSegment segment;
-    segment.id = nestedStringValue(segmentJson, {"id"}).value_or(id);
-    segment.longId = nestedStringValue(segmentJson, {"long_id", "longId"}).value_or("");
-    segment.suffix = nestedStringValue(segmentJson, {"suffix"}).value_or("");
-    segment.originalVolumeId = nestedStringValue(
-        segmentJson,
-        {"original_volume_id", "originalVolumeId", "volume_id", "volumeId"}).value_or("");
-    segment.width = intValue(segmentJson, {"width"});
-    segment.height = intValue(segmentJson, {"height"});
-    segment.createdAt = nestedStringValue(segmentJson, {"created_at", "createdAt", "created"}).value_or("");
-    if (segment.createdAt.empty() && segmentJson.is_object()) {
-        const auto creation = segmentJson.find("creation");
-        if (creation != segmentJson.end() && creation->is_object()) {
-            segment.createdAt = stringValue(
-                *creation, {"date", "created_at", "createdAt", "created"})
-                                    .value_or("");
+    segment.id = stringValue(segmentJson, "id").value_or(id);
+    segment.longId = stringValue(segmentJson, "long_id").value_or("");
+    segment.suffix = stringValue(segmentJson, "suffix").value_or("");
+    segment.originalVolumeId = stringValue(segmentJson, "original_volume_id").value_or("");
+    const auto creationJson = objectOrEmpty(segmentJson, "creation");
+    segment.creation = parseCreation(creationJson);
+    segment.createdAt = segment.creation.date;
+    segment.properties = objectOrEmpty(segmentJson, "properties");
+    const auto& p = segment.properties;
+    segment.width = intValue(p, "width");
+    segment.height = intValue(p, "height");
+    if (const auto downscale = numberValue(p, "original_volume_downscale"); downscale && std::isfinite(*downscale) && *downscale > 0)
+        segment.originalVolumeDownscale = *downscale;
+    if (const auto* render = member(p, "render")) segment.render = *render;
+    segment.inkModelsAllow = stringList(p, "ink_models_allow");
+    segment.inkModelsDeny = stringList(p, "ink_models_deny");
+    segment.spiralDatasetRevision = stringValue(p, "spiral_dataset_revision").value_or("");
+    if (const auto* coverage = member(p, "volume_coverage"); coverage && coverage->is_object()) {
+        for (auto it = coverage->begin(); it != coverage->end(); ++it) {
+            const auto bbox = boundsValue(it.value(), "bbox_transformed");
+            if (!bbox) continue;
+            segment.volumeCoverage.push_back({it.key(), *bbox, numberValue(it.value(), "overlap_ratio").value_or(0),
+                                              stringValue(it.value(), "computed_at").value_or("")});
         }
     }
-    segment.properties = objectOrEmpty(segmentJson, "properties");
+    const auto metadata = objectOrEmpty(creationJson, "metadata");
+    if (stringValue(metadata, "format") == std::optional<std::string>("tifxyz")) {
+        const auto* scale = member(metadata, "scale");
+        if (scale && scale->is_array() && scale->size() == 2 && (*scale)[0].is_number() && (*scale)[1].is_number()) {
+            OpenDataTifxyzInfo info;
+            info.scale = {(*scale)[0].get<double>(), (*scale)[1].get<double>()};
+            info.bbox = boundsValue(metadata, "bbox");
+            if (const auto* dims = member(metadata, "tiff_dimensions");
+                dims && dims->is_array() && dims->size() == 2 && (*dims)[0].is_number_integer() && (*dims)[1].is_number_integer())
+                info.tiffDimensions = std::array<int64_t, 2>{(*dims)[0].get<int64_t>(), (*dims)[1].get<int64_t>()};
+            segment.originalTifxyz = info;
+        }
+    }
     segment.artifacts = parseArtifacts(segmentJson);
     segment.raw = segmentJson.is_object() ? segmentJson : nlohmann::json::object();
     return segment;
@@ -416,15 +422,10 @@ auto parseObjectMap(const nlohmann::json& ownerJson, const char* key, ParseFn pa
 {
     using Value = decltype(parse(std::string(), nlohmann::json::object()));
     std::vector<Value> values;
-    if (!ownerJson.is_object()) {
-        return values;
-    }
-    const auto it = ownerJson.find(key);
-    if (it == ownerJson.end() || !it->is_object()) {
-        return values;
-    }
-    values.reserve(it->size());
-    for (auto item = it->begin(); item != it->end(); ++item) {
+    const auto* items = member(ownerJson, key);
+    if (!items || !items->is_object()) return values;
+    values.reserve(items->size());
+    for (auto item = items->begin(); item != items->end(); ++item) {
         values.push_back(parse(item.key(), item.value()));
     }
     return values;
@@ -433,25 +434,15 @@ auto parseObjectMap(const nlohmann::json& ownerJson, const char* key, ParseFn pa
 OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
 {
     OpenDataSample sample;
-    sample.id = nestedStringValue(sampleJson, {"id", "sample_id", "sampleId"}).value_or(std::move(id));
-    sample.type = nestedStringValue(sampleJson, {"type", "sample_type", "sampleType"}).value_or("");
-    sample.description = nestedStringValue(sampleJson, {"description"}).value_or("");
-    sample.properties = objectOrEmpty(sampleJson, "sample");
-    if (sample.properties.empty()) {
-        sample.properties = objectOrEmpty(sampleJson, "properties");
-    }
-    if (sample.properties.contains("properties") && sample.properties["properties"].is_object())
-        sample.properties = sample.properties["properties"].get<nlohmann::json>();
-    sample.type = stringValue(sample.properties, {"type"}).value_or(sample.type);
+    const auto record = objectOrEmpty(sampleJson, "sample");
+    sample.id = stringValue(record, "id").value_or(std::move(id));
+    sample.description = stringValue(record, "description").value_or("");
+    sample.canonicalVolumeId = stringValue(record, "canonical_volume_id").value_or("");
+    sample.properties = objectOrEmpty(record, "properties");
+    sample.type = stringValue(sample.properties, "type").value_or("");
+    if (const auto* mappings = member(sample.properties, "public_access_mappings")) sample.publicAccessMappings = *mappings;
     sample.volumeTransforms = parseVolumeTransforms(sample.properties);
-    if (sampleJson.is_object()) {
-        if (const auto sampleIt = sampleJson.find("sample"); sampleIt != sampleJson.end()) {
-            sample.artifacts = parseArtifacts(*sampleIt);
-        }
-    }
-    if (sample.artifacts.empty()) {
-        sample.artifacts = parseArtifacts(sampleJson);
-    }
+    sample.artifacts = parseArtifacts(record);
     sample.scans = parseObjectMap(sampleJson, "scans", parseScan);
     sample.volumes = parseObjectMap(sampleJson, "volumes", parseVolume);
     for (auto& volume : sample.volumes) {
@@ -479,15 +470,10 @@ OpenDataSample parseSample(std::string id, const nlohmann::json& sampleJson)
 std::vector<OpenDataSample> parseSamples(const nlohmann::json& metadataJson)
 {
     std::vector<OpenDataSample> samples;
-    if (!metadataJson.is_object()) {
-        return samples;
-    }
-    const auto samplesIt = metadataJson.find("samples");
-    if (samplesIt == metadataJson.end() || !samplesIt->is_object()) {
-        return samples;
-    }
-    samples.reserve(samplesIt->size());
-    for (auto it = samplesIt->begin(); it != samplesIt->end(); ++it) {
+    const auto* items = member(metadataJson, "samples");
+    if (!items || !items->is_object()) return samples;
+    samples.reserve(items->size());
+    for (auto it = items->begin(); it != items->end(); ++it) {
         if (it.value().is_object()) {
             samples.push_back(parseSample(it.key(), it.value()));
         }
@@ -498,21 +484,21 @@ std::vector<OpenDataSample> parseSamples(const nlohmann::json& metadataJson)
 std::vector<OpenDataModel> parseModels(const nlohmann::json& metadataJson)
 {
     std::vector<OpenDataModel> models;
-    if (!metadataJson.is_object()) {
-        return models;
-    }
-    const auto modelsIt = metadataJson.find("models");
-    if (modelsIt == metadataJson.end() || !modelsIt->is_object()) {
-        return models;
-    }
-    models.reserve(modelsIt->size());
-    for (auto it = modelsIt->begin(); it != modelsIt->end(); ++it) {
+    const auto* items = member(metadataJson, "models");
+    if (!items || !items->is_object()) return models;
+    models.reserve(items->size());
+    for (auto it = items->begin(); it != items->end(); ++it) {
         OpenDataModel model;
-        model.id = it.key();
         model.raw = it.value().is_object() ? it.value() : nlohmann::json::object();
-        if (auto parsedId = nestedStringValue(model.raw, {"id", "model_id", "modelId"})) {
-            model.id = *parsedId;
-        }
+        model.id = stringValue(model.raw, "id").value_or(it.key());
+        model.longId = stringValue(model.raw, "long_id").value_or("");
+        model.suffix = stringValue(model.raw, "suffix").value_or("");
+        model.creation = parseCreation(objectOrEmpty(model.raw, "creation"));
+        model.properties = objectOrEmpty(model.raw, "properties");
+        model.task = stringValue(model.properties, "task").value_or("");
+        model.architecture = stringValue(model.properties, "architecture").value_or("");
+        model.compatibleSamples = stringList(model.properties, "compatible_samples");
+        model.excludedSamples = stringList(model.properties, "excluded_samples");
         models.push_back(std::move(model));
     }
     return models;
@@ -530,14 +516,37 @@ bool OpenDataArtifact::hasResolvedUrl() const noexcept
     return !resolvedUrl.empty();
 }
 
+std::string OpenDataArtifact::url() const
+{
+    std::string value = resolvedUrl.empty() ? sourcePath : resolvedUrl;
+    while (!value.empty() && value.back() == '/') value.pop_back();
+    return value;
+}
+
+std::string OpenDataSegment::sourceVolumeId() const
+{
+    if (creation.derivedFrom && iequals(creation.derivedFrom->type, "volume") && !creation.derivedFrom->id.empty())
+        return creation.derivedFrom->id;
+    return originalVolumeId;
+}
+
+std::string OpenDataSegment::stableId() const
+{
+    if (!longId.empty()) return longId;
+    if (!id.empty()) return id;
+    return safePathComponent(suffix);
+}
+
+const OpenDataVolumeCoverage* OpenDataSegment::coverage(std::string_view volumeId) const noexcept
+{
+    const auto it = std::find_if(volumeCoverage.begin(), volumeCoverage.end(),
+                                 [&](const auto& c) { return c.volumeId == volumeId; });
+    return it == volumeCoverage.end() ? nullptr : &*it;
+}
+
 bool OpenDataSegment::hasArtifactType(std::string_view type) const
 {
     return findArtifact(artifacts, type) != nullptr;
-}
-
-bool OpenDataSegment::hasTifxyz() const
-{
-    return preferredTifxyzArtifact(*this) != nullptr;
 }
 
 bool OpenDataSegment::hasInkDetection() const
@@ -572,12 +581,60 @@ std::size_t OpenDataSample::segmentCount() const noexcept
     return segments.size();
 }
 
-std::size_t OpenDataSample::tifxyzSegmentCount() const
+std::size_t OpenDataSample::surfaceSegmentCount() const
 {
     return static_cast<std::size_t>(std::count_if(
-        segments.begin(), segments.end(), [](const OpenDataSegment& segment) {
-            return segment.hasTifxyz();
+        segments.begin(), segments.end(), [&](const OpenDataSegment& segment) {
+            return !surfaces(segment).empty();
         }));
+}
+
+const OpenDataVolume* OpenDataSample::findVolume(std::string_view id) const noexcept
+{
+    const auto it = std::find_if(volumes.begin(), volumes.end(), [&](const auto& v) { return v.id == id; });
+    return it == volumes.end() ? nullptr : &*it;
+}
+
+std::vector<OpenDataSurface> OpenDataSample::surfaces(const OpenDataSegment& segment) const
+{
+    std::vector<OpenDataSurface> result;
+    const std::string sourceId = segment.sourceVolumeId();
+    if (sourceId.empty() || !findVolume(sourceId)) return result;
+    const std::string lineage = segment.stableId();
+
+    std::map<std::string, const OpenDataArtifact*> publishedByTarget;
+    for (const auto& artifact : segment.artifacts) {
+        if (lowerCopy(artifact.type) != "tifxyz-transformed" || artifact.url().empty() ||
+            !artifact.targetVolumeId || !findVolume(*artifact.targetVolumeId))
+            continue;
+        publishedByTarget.emplace(*artifact.targetVolumeId, &artifact);
+    }
+    const auto published = [&](const std::string& target, const OpenDataArtifact& artifact) {
+        return OpenDataSurface{&artifact, false, target == sourceId, target, 1.0,
+                               lineage + "-published-" + safePathComponent(target) + "-L0-" + hashUrl(artifact.url())};
+    };
+
+    if (const auto onSource = publishedByTarget.find(sourceId); onSource != publishedByTarget.end()) {
+        result.push_back(published(sourceId, *onSource->second));
+    } else if (std::optional<int> level; [&] {
+                   for (int l = 0; l <= 5; ++l)
+                       if (std::abs(segment.originalVolumeDownscale - std::ldexp(1.0, l)) <=
+                           1.0e-9 * std::max(1.0, segment.originalVolumeDownscale)) { level = l; break; }
+                   return level.has_value();
+               }()) {
+        for (const auto* type : {"tifxyz-flattened", "tifxyz", "tifxyz-normalized"}) {
+            const auto it = std::find_if(segment.artifacts.begin(), segment.artifacts.end(), [&](const auto& artifact) {
+                return lowerCopy(artifact.type) == type && !artifact.url().empty();
+            });
+            if (it == segment.artifacts.end()) continue;
+            result.push_back({&*it, true, true, sourceId, 1.0 / segment.originalVolumeDownscale,
+                              lineage + "-derived-native-L0-" + hashUrl(it->url())});
+            break;
+        }
+    }
+    for (const auto& [target, artifact] : publishedByTarget)
+        if (target != sourceId) result.push_back(published(target, *artifact));
+    return result;
 }
 
 std::size_t OpenDataSample::inkDetectionSegmentCount() const
@@ -662,15 +719,10 @@ OpenDataManifest parseOpenDataManifest(std::string_view jsonText, std::string ma
         throw std::runtime_error("Open-data manifest root must be a JSON object");
     }
 
-    const nlohmann::json* metadata = &root;
-    if (const auto it = root.find("metadata"); it != root.end() && it->is_object()) {
-        metadata = &*it;
-    }
-
     OpenDataManifest manifest;
     manifest.manifestUrl = std::move(manifestUrl);
-    manifest.samples = parseSamples(*metadata);
-    manifest.models = parseModels(*metadata);
+    manifest.samples = parseSamples(root);
+    manifest.models = parseModels(root);
     manifest.raw = std::move(root);
     return manifest;
 }
@@ -744,36 +796,70 @@ const OpenDataArtifact* findArtifact(const std::vector<OpenDataArtifact>& artifa
     return it == artifacts.end() ? nullptr : &*it;
 }
 
-const OpenDataArtifact* preferredTifxyzArtifact(const OpenDataSegment& segment) noexcept
+std::vector<OpenDataSegmentImage> inkDetectionImages(const OpenDataSegment& segment)
 {
-    for (const auto* type : {"tifxyz-flattened", "tifxyz-transformed", "tifxyz", "tifxyz-normalized"}) {
-        if (const auto* artifact = findArtifact(segment.artifacts, type)) {
-            return artifact;
-        }
+    const auto imageExtension = [](std::string url) -> std::string {
+        if (const auto pos = url.find_first_of("?#"); pos != std::string::npos) url.erase(pos);
+        url = lowerCopy(url);
+        for (const auto* ext : {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp", ".webp"})
+            if (url.ends_with(ext)) return ext;
+        return {};
+    };
+    const auto isJpeg = [](const std::string& ext) { return ext == ".jpg" || ext == ".jpeg"; };
+    std::vector<const OpenDataArtifact*> images;
+    bool anyJpeg = false;
+    for (const auto& artifact : segment.artifacts) {
+        const auto type = lowerCopy(artifact.type);
+        if (type.find("ink") == std::string::npos || type.find("zarr") != std::string::npos ||
+            type.find("3d") != std::string::npos)
+            continue;
+        const auto ext = imageExtension(artifact.url());
+        if (ext.empty()) continue;
+        anyJpeg = anyJpeg || isJpeg(ext);
+        images.push_back(&artifact);
     }
-    const auto flattened = std::find_if(
-        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
-            const auto type = lowerCopy(artifact.type);
-            return type.find("tifxyz") != std::string::npos &&
-                   type.find("flattened") != std::string::npos;
-        });
-    if (flattened != segment.artifacts.end()) {
-        return &*flattened;
+    std::vector<OpenDataSegmentImage> result;
+    for (const auto* artifact : images) {
+        const auto ext = imageExtension(artifact->url());
+        if (anyJpeg && !isJpeg(ext)) continue;
+        const auto index = result.size();
+        std::string base = artifact->type.empty() ? "ink_detection" : artifact->type;
+        if (index > 0) base += "_" + std::to_string(index + 1);
+        std::string label = (segment.suffix.empty() ? (segment.id.empty() ? std::string("<unnamed segment>") : segment.id)
+                                                    : segment.suffix) +
+                            " - " + (artifact->type.empty() ? std::string("ink detection") : artifact->type);
+        if (index > 0) label += " " + std::to_string(index + 1);
+        result.push_back({artifact, artifact->url(), safePathComponent(base) + ext, std::move(label)});
     }
-    const auto transformed = std::find_if(
-        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
-            const auto type = lowerCopy(artifact.type);
-            return type.find("tifxyz") != std::string::npos &&
-                   type.find("transformed") != std::string::npos;
-        });
-    if (transformed != segment.artifacts.end()) {
-        return &*transformed;
+    return result;
+}
+
+std::string catalogTimestamp(std::string_view date)
+{
+    const auto isDigit = [&](std::size_t index) {
+        return index < date.size() && std::isdigit(static_cast<unsigned char>(date[index]));
+    };
+    if ((date.size() == 14 || date.size() == 17) &&
+        std::all_of(date.begin(), date.end(), [](unsigned char c) { return std::isdigit(c); }))
+        return std::string(date.substr(0, 14));
+    if (date.size() < 20 || date[4] != '-' || date[7] != '-' || date[10] != 'T' || date[13] != ':' ||
+        date[16] != ':')
+        return std::string(date);
+    for (const std::size_t i : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18})
+        if (!isDigit(i)) return std::string(date);
+    if (date[19] == 'Z') {
+        if (date.size() != 20) return std::string(date);
+    } else if (date[19] == '.') {
+        std::size_t end = 20;
+        while (end < date.size() && std::isdigit(static_cast<unsigned char>(date[end]))) ++end;
+        if (end == 20 || end + 1 != date.size() || date[end] != 'Z') return std::string(date);
+    } else {
+        return std::string(date);
     }
-    const auto anyTifxyz = std::find_if(
-        segment.artifacts.begin(), segment.artifacts.end(), [](const OpenDataArtifact& artifact) {
-            return containsInsensitive(artifact.type, "tifxyz");
-        });
-    return anyTifxyz == segment.artifacts.end() ? nullptr : &*anyTifxyz;
+    std::string timestamp;
+    for (const auto [begin, count] : {std::pair<std::size_t, std::size_t>{0, 4}, {5, 2}, {8, 2}, {11, 2}, {14, 2}, {17, 2}})
+        timestamp.append(date.substr(begin, count));
+    return timestamp;
 }
 
 const OpenDataArtifact* preferredVolumeArtifact(const OpenDataVolume& volume) noexcept

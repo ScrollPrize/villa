@@ -424,7 +424,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     // manifest on every open (geometry is fetched when a surface is opened).
     if (progressCallback) {
         OpenDataSampleDownloadProgress progress;
-        progress.totalSegments = static_cast<int>(sample.tifxyzSegmentCount());
+        progress.totalSegments = static_cast<int>(sample.surfaceSegmentCount());
         progress.status = "importing-surfaces";
         progressCallback(progress);
     }
@@ -828,14 +828,14 @@ void importOpenDataSampleSurfaces(
     OpenDataSampleProjectResult& result,
     const std::optional<std::vector<std::string>>& segmentIds)
 {
-    result.supportedTifxyzSegments += static_cast<int>(sample.tifxyzSegmentCount());
+    result.supportedTifxyzSegments += static_cast<int>(sample.surfaceSegmentCount());
     try {
         const auto imported = importSampleSurfaces(remoteCacheRoot, sample, segmentIds);
         result.importedSurfaces += imported.representations;
         result.addedSurfaces += imported.added;
         result.messages.insert(result.messages.end(), imported.messages.begin(), imported.messages.end());
     } catch (const std::exception& error) {
-        result.failedTifxyzSegments += static_cast<int>(sample.tifxyzSegmentCount());
+        result.failedTifxyzSegments += static_cast<int>(sample.surfaceSegmentCount());
         result.messages.push_back(std::string("Importing Open Data surfaces failed: ") + error.what());
     }
 }

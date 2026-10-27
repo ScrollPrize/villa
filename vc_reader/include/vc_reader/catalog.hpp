@@ -17,6 +17,25 @@ namespace vcr::catalog {
 inline constexpr std::string_view kDefaultManifestUrl =
     "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/metadata.json";
 
+// creation.derived_from: what a record was made from ({"type": "volume", "id": ...}).
+struct OpenDataReference {
+    std::string type;
+    std::string id;
+};
+
+// A record's creation block (creation, or an artifact's creation_info).
+struct OpenDataCreation {
+    std::string date;     // as published (ISO 8601)
+    std::string process;
+    std::optional<OpenDataReference> derivedFrom;
+};
+
+// An axis-aligned box in a volume's voxels (x, y, z).
+struct OpenDataBounds {
+    std::array<double, 3> low{0, 0, 0};
+    std::array<double, 3> high{0, 0, 0};
+};
+
 struct OpenDataAccessRoot {
     std::string type;
     std::string url;
@@ -52,12 +71,33 @@ struct OpenDataArtifact {
     bool sourceToBasePresent = false;
     std::optional<double> sourceToBase;
 
+    // Typed parameters and properties of rendered and labelled artifacts.
+    std::optional<int> renderLevel;
+    std::optional<double> downscale;
+    std::string format;
+    std::string compositeMode;
+    std::string labelSet;
+    std::optional<int> width;   // properties.width/height (OBJ and layer artifacts)
+    std::optional<int> height;
+    // ink-labels properties: label arrays, superseded label sets, how the
+    // labels reached this artifact's volume and how much of it they cover.
+    std::vector<std::string> arrays;
+    std::vector<std::string> supersedes;
+    std::string registration;
+    std::string annotatedOn;
+    std::optional<double> mappingCoverage;
+    OpenDataCreation creation;  // from creation_info
+    std::string publicationTier;  // creation_info.publication.tier
+
     // Preferred public origin selected from origins/access_roots.
     std::string sourcePath;
     std::string resolvedUrl;
     std::string accessUsage;
 
     [[nodiscard]] bool hasResolvedUrl() const noexcept;
+    // The artifact's URL: the resolved public URL, else its source path,
+    // without trailing slashes. Empty when it has no public origin.
+    [[nodiscard]] std::string url() const;
 };
 
 std::vector<OpenDataArtifact> parseCatalogArtifacts(const nlohmann::json& entries);
@@ -77,18 +117,52 @@ struct OpenDataVolumeTransformGroup {
 
 struct OpenDataScan {
     std::string id;
+    std::string longId;
     std::string suffix;
     std::string createdAt;
+    OpenDataCreation creation;
     std::optional<double> pixelSizeUm;
+    std::optional<double> energyKeV;
+    std::optional<double> detectorDistanceMm;
+    // Acquisition, from creation.metadata: facility location and beamline, and
+    // the facility's scan name (ESRF scanRadix, DLS scan_name).
+    std::string location;
+    std::string beamline;
+    std::string name;
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
     nlohmann::json raw = nlohmann::json::object();
 };
 
+// properties.superseded_by: the volume that replaces this one.
+struct OpenDataSupersession {
+    std::string volumeId;
+    std::string date;
+    std::string reason;
+};
+
+struct OpenDataLicense {
+    std::string name;
+    std::string url;
+};
+
 struct OpenDataVolume {
     std::string id;
+    std::string longId;
     std::string scanId;
     std::string suffix;
+    OpenDataCreation creation;
+    // Orientation of the volume's axes against the scroll.
+    std::optional<bool> zDirectionIsTopToBottom;
+    std::optional<bool> leftHandedCoordinates;
+    std::string textSide;
+    std::optional<OpenDataSupersession> supersededBy;
+    std::optional<OpenDataLicense> license;
+    int renderLevel = 0;
+    std::optional<bool> renderSegments;
+    // Intensity windowing of the export (creation.metadata).
+    std::optional<double> windowU16Min, windowU16Max;
+    std::optional<double> targetWindowF32Min, targetWindowF32Max;
     std::optional<std::array<std::size_t, 3>> shapeZYX;
     std::optional<double> pixelSizeUm;
     std::optional<double> energyKeV;
@@ -100,6 +174,21 @@ struct OpenDataVolume {
     nlohmann::json raw = nlohmann::json::object();
 };
 
+// properties.volume_coverage[volume]: where a segment lies in a volume.
+struct OpenDataVolumeCoverage {
+    std::string volumeId;
+    OpenDataBounds bbox;       // bbox_transformed, in that volume's voxels
+    double overlapRatio = 0;   // 0: the segment does not reach the volume
+    std::string computedAt;
+};
+
+// The original tifxyz recorded at segment creation (creation.metadata).
+struct OpenDataTifxyzInfo {
+    std::array<double, 2> scale{0, 0};
+    std::optional<OpenDataBounds> bbox;
+    std::optional<std::array<int64_t, 2>> tiffDimensions;  // as published
+};
+
 struct OpenDataSegment {
     std::string id;
     std::string longId;
@@ -108,20 +197,65 @@ struct OpenDataSegment {
     std::optional<int> width;
     std::optional<int> height;
     std::string createdAt;
+    OpenDataCreation creation;
+    // Voxels of the original volume per authored coordinate unit.
+    double originalVolumeDownscale = 1;
+    std::vector<OpenDataVolumeCoverage> volumeCoverage;
+    nlohmann::json render;  // properties.render, as published (null when absent)
+    std::optional<std::vector<std::string>> inkModelsAllow;
+    std::optional<std::vector<std::string>> inkModelsDeny;
+    std::string spiralDatasetRevision;
+    std::optional<OpenDataTifxyzInfo> originalTifxyz;
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
     nlohmann::json raw = nlohmann::json::object();
 
     [[nodiscard]] bool hasArtifactType(std::string_view type) const;
-    [[nodiscard]] bool hasTifxyz() const;
     [[nodiscard]] bool hasInkDetection() const;
     [[nodiscard]] bool hasLayersZarr() const;
+    // The volume the segment was authored in: creation.derived_from when it
+    // names a volume, else original_volume_id.
+    [[nodiscard]] std::string sourceVolumeId() const;
+    // The segment's identity across catalog revisions: long_id, else id.
+    [[nodiscard]] std::string stableId() const;
+    [[nodiscard]] const OpenDataVolumeCoverage* coverage(std::string_view volumeId) const noexcept;
 };
+
+// A tifxyz representation of a segment that can be opened as a surface.
+struct OpenDataSurface {
+    const OpenDataArtifact* artifact = nullptr;
+    // Authored: the segment's own tifxyz, in its source volume's downscaled
+    // voxels. Published: a tifxyz-transformed onto volumeId.
+    bool authored = false;
+    // The segment's own surface (in its source volume), not a published copy
+    // in another volume.
+    bool canonical = false;
+    std::string volumeId;       // the catalog volume its coordinates are in
+    double unitsPerVoxel = 1;   // coordinate units per voxel of volumeId
+    std::string id;             // stable representation id
+};
+
+// A published per-segment image (ink detection), fetched beside the surface.
+struct OpenDataSegmentImage {
+    const OpenDataArtifact* artifact = nullptr;
+    std::string url;
+    std::string fileName;  // e.g. "ink-detection.jpg"
+    std::string label;
+};
+// The segment's ink detection images: one file per ink artifact with an image
+// URL, preferring JPEG renders when the segment publishes any.
+[[nodiscard]] std::vector<OpenDataSegmentImage> inkDetectionImages(const OpenDataSegment&);
+
+// A catalog date as the 14-digit yyyymmddhhmmss surface timestamp; dates in
+// another form are returned unchanged.
+[[nodiscard]] std::string catalogTimestamp(std::string_view date);
 
 struct OpenDataSample {
     std::string id;
     std::string type;
     std::string description;
+    std::string canonicalVolumeId;
+    nlohmann::json publicAccessMappings;  // properties.public_access_mappings (null when absent)
     nlohmann::json properties = nlohmann::json::object();
     std::vector<OpenDataArtifact> artifacts;
     std::vector<OpenDataScan> scans;
@@ -133,8 +267,16 @@ struct OpenDataSample {
     [[nodiscard]] std::size_t scanCount() const noexcept;
     [[nodiscard]] std::size_t volumeCount() const noexcept;
     [[nodiscard]] std::size_t segmentCount() const noexcept;
-    [[nodiscard]] std::size_t tifxyzSegmentCount() const;
+    // Segments with at least one surface (surfaces() is not empty).
+    [[nodiscard]] std::size_t surfaceSegmentCount() const;
     [[nodiscard]] std::size_t inkDetectionSegmentCount() const;
+    [[nodiscard]] const OpenDataVolume* findVolume(std::string_view id) const noexcept;
+    // The segment's surfaces, the canonical one first: a tifxyz-transformed
+    // published onto its source volume, else its authored tifxyz (preferring
+    // tifxyz-flattened, then tifxyz, then tifxyz-normalized) when its downscale
+    // is a power of two; then its tifxyz-transformed onto the sample's other
+    // volumes. Empty when its source volume is not in the sample.
+    [[nodiscard]] std::vector<OpenDataSurface> surfaces(const OpenDataSegment&) const;
 };
 
 enum class OpenDataRepresentationKind {
@@ -164,6 +306,14 @@ classifyDerivedRepresentation(const OpenDataArtifact& artifact);
 
 struct OpenDataModel {
     std::string id;
+    std::string longId;
+    std::string suffix;
+    OpenDataCreation creation;
+    std::string task;
+    std::string architecture;
+    std::optional<std::vector<std::string>> compatibleSamples;
+    std::optional<std::vector<std::string>> excludedSamples;
+    nlohmann::json properties = nlohmann::json::object();
     nlohmann::json raw = nlohmann::json::object();
 };
 
@@ -195,9 +345,6 @@ struct OpenDataManifest {
 [[nodiscard]] const OpenDataArtifact* findArtifact(
     const std::vector<OpenDataArtifact>& artifacts,
     std::string_view type) noexcept;
-
-[[nodiscard]] const OpenDataArtifact* preferredTifxyzArtifact(
-    const OpenDataSegment& segment) noexcept;
 
 [[nodiscard]] const OpenDataArtifact* preferredVolumeArtifact(
     const OpenDataVolume& volume) noexcept;

@@ -16,18 +16,6 @@ from .names import COMMUNITY_ALIASES, SampleNameIndex
 DEFAULT_RESOLUTION_REL_TOL = 0.005
 PYRAMID_LEVELS = 6
 
-def _num(x: Any) -> float | None:
-    return None if x is None else float(x)
-
-def _scan_name(md: Mapping[str, Any]) -> str | None:
-    """The facility's name for a scan, from ``creation.metadata``.
-
-    ESRF records the acquisition's ``scanRadix`` (``2.4um_PHerc-Paris4_B_HA``),
-    DLS a ``scan_name`` (``PHercParis4 54keV stitched_part_2, …``).
-    """
-    acq = ((md.get("metadata") or {}).get("tomo") or {}).get("acquisition") or {}
-    return acq.get("scanRadix") or md.get("scan_name") or None
-
 @dataclass(frozen=True)
 class VolumeCoverage:
     """How much of a segment lies inside a volume (``segment.properties.volume_coverage``)."""
@@ -39,9 +27,9 @@ class VolumeCoverage:
     computed_at: str | None = None
 
     @classmethod
-    def from_json(cls, volume_id: str, d: Mapping[str, Any]) -> VolumeCoverage:
-        lo, hi = d["bbox_transformed"]
-        return cls(volume_id, tuple(lo), tuple(hi), float(d["overlap_ratio"]), d.get("computed_at"))
+    def from_native(cls, native) -> VolumeCoverage:
+        return cls(native.volume_id, tuple(native.bbox.low), tuple(native.bbox.high), native.overlap_ratio,
+                   native.computed_at or None)
 
 @dataclass(frozen=True)
 class License:
@@ -51,14 +39,14 @@ class License:
 class Model:
     """An ML model referenced by predictions (``parameters.model_id``)."""
 
-    def __init__(self, d: Mapping[str, Any]):
-        self.raw = d
-        self.id: str = d['id']
-        self.long_id: str | None = d.get('long_id')
-        self.name: str | None = d.get('suffix') or None
-        self.properties: Mapping[str, Any] = d.get('properties') or {}
-        self.task: str | None = self.properties.get('task')
-        self.architecture: str | None = self.properties.get('architecture')
+    def __init__(self, native):
+        self.raw = native.raw
+        self.id: str = native.id
+        self.long_id: str | None = native.long_id or None
+        self.name: str | None = native.suffix or None
+        self.properties: Mapping[str, Any] = native.properties
+        self.task: str | None = native.task or None
+        self.architecture: str | None = native.architecture or None
 
     def __repr__(self) -> str:
         return f'Model({self.id!r}, name={self.name!r}, task={self.task!r})'
@@ -66,21 +54,16 @@ class Model:
 class Scan:
 
     def __init__(self, sample: _SampleRecord, native):
-        d = native.raw
         self.sample = sample
-        self.raw = d
+        self.raw = native.raw
         self.id: str = native.id
-        self.long_id: str | None = d.get('long_id')
-        self.creation: Mapping[str, Any] = d.get('creation') or {}
-        p = d.get('properties') or {}
+        self.long_id: str | None = native.long_id or None
         self.pixel_size_um = native.pixel_size_um
-        self.energy_kev = _num(p.get('energy_keV'))
-        self.detector_distance_mm = _num(p.get('detector_distance_mm'))
-        self.name: str | None = _scan_name(self.creation.get('metadata') or {})
-
-    @property
-    def date(self) -> str | None:
-        return self.creation.get('date')
+        self.energy_kev = native.energy_kev
+        self.detector_distance_mm = native.detector_distance_mm
+        # The facility's scan name (ESRF scanRadix, DLS scan_name).
+        self.name: str | None = native.name or None
+        self.date: str | None = native.creation.date or None
 
     def __repr__(self) -> str:
         return f'Scan({self.long_id or self.id!r})'
@@ -88,30 +71,28 @@ class Scan:
 class _VolumeRecord:
 
     def __init__(self, sample: _SampleRecord, native):
-        d = native.raw
         self.sample = sample
-        self.raw = d
+        self.raw = native.raw
         self.id: str = native.id
-        self.long_id: str | None = d.get('long_id')
-        self.suffix: str | None = d.get('suffix')
+        self.long_id: str | None = native.long_id or None
+        self.suffix: str | None = native.suffix or None
         self.scan_id: str | None = native.scan_id or None
-        self.creation: Mapping[str, Any] = d.get('creation') or {}
-        p = self.properties = d.get('properties') or {}
+        self.properties = native.properties
         self.pixel_size_um = native.pixel_size_um
         self.energy_kev = native.energy_kev
         self.detector_distance_mm = native.detector_distance_mm
         self.dtype: str | None = native.dtype or None
         shape = native.shape_zyx
         self.shape_zyx: tuple[int, int, int] | None = tuple(shape) if shape else None
-        lic = p.get('license')
-        self.license = License(lic['name'], lic['url']) if lic else None
-        sup = p.get('superseded_by')
-        self.superseded_by_id: str | None = sup['volume_id'] if sup else None
-        self.render_level: int = int(p.get('render_level') or 0)
-        self.render_segments: bool | None = p.get('render_segments')
-        self.left_handed_coordinates: bool | None = p.get('left_handed_coordinates')
-        self.z_direction_is_top_to_bottom: bool | None = p.get('z_direction_is_top_to_bottom')
-        self.text_side: str | None = p.get('text_side')
+        lic = native.license
+        self.license = License(lic.name, lic.url) if lic else None
+        sup = native.superseded_by
+        self.superseded_by_id: str | None = sup.volume_id if sup else None
+        self.render_level: int = native.render_level
+        self.render_segments: bool | None = native.render_segments
+        self.left_handed_coordinates: bool | None = native.left_handed_coordinates
+        self.z_direction_is_top_to_bottom: bool | None = native.z_direction_is_top_to_bottom
+        self.text_side: str | None = native.text_side or None
         self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
 
     def __repr__(self) -> str:
@@ -128,19 +109,17 @@ class _VolumeRecord:
 class _SegmentRecord:
 
     def __init__(self, sample: _SampleRecord, native):
-        d = native.raw
         self.sample = sample
-        self.raw = d
+        self.raw = native.raw
         self.id: str = native.id
-        self.long_id: str | None = d.get('long_id')
-        self.suffix: str | None = d.get('suffix') or None
+        self.long_id: str | None = native.long_id or None
+        self.suffix: str | None = native.suffix or None
         self.original_volume_id: str = native.original_volume_id
-        self.creation: Mapping[str, Any] = d.get('creation') or {}
-        p = self.properties = d.get('properties') or {}
+        self.properties = native.properties
         self.width: int | None = native.width
         self.height: int | None = native.height
-        self.original_volume_downscale: int = int(p.get('original_volume_downscale') or 1)
-        self.coverage: dict[str, VolumeCoverage] = {vid: VolumeCoverage.from_json(vid, c) for vid, c in (p.get('volume_coverage') or {}).items()}
+        self.original_volume_downscale: int = int(native.original_volume_downscale)
+        self.coverage: dict[str, VolumeCoverage] = {c.volume_id: VolumeCoverage.from_native(c) for c in native.volume_coverage}
         self.artifacts = tuple(Artifact.from_native(a) for a in native.artifacts)
 
     def __repr__(self) -> str:
@@ -153,12 +132,10 @@ class _SegmentRecord:
 class _SampleRecord:
 
     def __init__(self, catalog: Catalog, native):
-        tree = native.raw
         self.catalog = catalog
-        self.raw = tree
-        s = tree.get('sample') or tree
+        self.raw = native.raw
         self.id: str = native.id
-        self.description: str | None = s.get('description')
+        self.description: str | None = native.description or None
         p = self.properties = native.properties
         self.type: str | None = native.type or None
         self.display_name: str | None = p.get('description')
@@ -200,12 +177,10 @@ class Catalog:
     def __init__(self, data: Mapping[str, Any], source: str | None=None):
         self._native = data if isinstance(data, _catalog.Catalog) else _catalog.parse(json.dumps(data))
         data = self._native.raw
-        if 'metadata' in data:
-            data = data['metadata']
         self.raw = data
         self.source = source
         self.schema_url: str | None = data.get('$schema')
-        self.models: dict[str, Model] = {v.id: Model(dict(v.raw, id=v.id)) for v in self._native.models}
+        self.models: dict[str, Model] = {v.id: Model(v) for v in self._native.models}
         self._samples: dict[str, _SampleRecord] = {v.id: _SampleRecord(self, v) for v in self._native.samples}
         self._names = SampleNameIndex()
         for s in self._samples.values():

@@ -125,6 +125,12 @@ class Origin:
         return tuple(join_url(r.url, self.path) for r in self.access_roots)
 
 
+def _native_values(native) -> dict[str, Any]:
+    return dict(level=native.level, target=native.target_volume_id, model=native.model_id, url=native.url,
+                source_path=native.source_path, label_set=native.label_set, render_level=native.render_level,
+                arrays=tuple(native.arrays), supersedes=tuple(native.supersedes))
+
+
 @dataclass(frozen=True, eq=False)
 class Artifact:
     """One data entry of a sample, volume or segment."""
@@ -144,8 +150,7 @@ class Artifact:
                 parameters=dict(self.parameters), properties=dict(self.properties), origins=[
                 dict(path=o.path, access_roots=[dict(type=r.type, url=r.url, usage=r.usage) for r in o.access_roots])
                 for o in self.origins])])[0]
-            object.__setattr__(self, '_parsed', dict(level=native.level, target=native.target_volume_id,
-                model=native.model_id, url=native.url, source_path=native.source_path))
+            object.__setattr__(self, '_parsed', _native_values(native))
         return self._parsed
 
     @classmethod
@@ -160,8 +165,7 @@ class Artifact:
                                         o.raw.get('copy_info')) for o in native.origins),
                    parameters=native.parameters, properties=native.properties,
                    creation_info=native.creation_info or None, id=d.get('id'), raw=d,
-                   _parsed=dict(level=native.level, target=native.target_volume_id, model=native.model_id,
-                                url=native.url, source_path=native.source_path))
+                   _parsed=_native_values(native))
 
     def __repr__(self) -> str:
         params = ", ".join(f"{k}={v!r}" for k, v in self.parameters.items())
@@ -189,12 +193,22 @@ class Artifact:
 
     @property
     def label_set(self) -> str | None:
-        return self.parameters.get("label_set")
+        return self._native_values()["label_set"] or None
 
     @property
     def render_level(self) -> int:
         """Pyramid level of ``target_volume`` a render was computed from (0 when absent)."""
-        return int(self.parameters.get("render_level") or 0)
+        return self._native_values()["render_level"] or 0
+
+    @property
+    def arrays(self) -> tuple[str, ...]:
+        """Label arrays of an ``ink-labels`` artifact (``properties.arrays``)."""
+        return self._native_values()["arrays"]
+
+    @property
+    def supersedes(self) -> tuple[str, ...]:
+        """Artifacts this one replaces (``properties.supersedes``)."""
+        return self._native_values()["supersedes"]
 
     @property
     def level(self) -> int | None:

@@ -23,11 +23,9 @@ void RegistrationGraph::addSample(const OpenDataSample& s) {
         add({key,t.matrix.json().dump(),g.fromVolumeId,t.toVolumeId,t.matrix,t.derivationPath});
     }
     for(const auto& v:s.volumes) {
-        const auto sup=v.properties.find("superseded_by");
-        if(sup!=v.properties.end()&&sup->is_object()&&sup->contains("volume_id")&&(*sup)["volume_id"].is_string()) {
-            const auto target=(*sup)["volume_id"].get<std::string>();
-            if(target!=v.id&&!target.empty())add({"superseded:"+s.id+":"+v.id,target,v.id,target,Affine{},"superseded volume"});
-        }
+        if(!v.supersededBy)continue;
+        const auto& target=v.supersededBy->volumeId;
+        if(target!=v.id&&!target.empty())add({"superseded:"+s.id+":"+v.id,target,v.id,target,Affine{},"superseded volume"});
     }
 }
 void RegistrationGraph::addCatalog(const OpenDataManifest& c){for(const auto& s:c.samples)addSample(s);}
