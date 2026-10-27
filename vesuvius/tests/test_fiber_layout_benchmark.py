@@ -31,7 +31,7 @@ def configured(tmp_path):
                       distance_weight=.25, devices='old', output_root='old',
                       gpu_manager=dict(exclusive=True))
         if arm == 'joint':
-            config['force_keep_source_ids'] = [101]
+            config['force_keep_source_ids'] = ['00000000-0000-4000-8000-000000000101']
         path = tmp_path / arm
         write(path / 'config.json', dict(fiber_implicit_winding=config))
         write(path / 'events.json', [])
@@ -43,7 +43,7 @@ def configured(tmp_path):
         settings['arms'][arm] = dict(solver_config=f'{arm}/config.json', events=f'{arm}/events.json',
                                     historical_solve=f'{arm}/historical', expected_report=f'{arm}/expected.json')
         if arm != 'free':
-            settings['arms'][arm].update(gt_source_ids=[101], force_gt_enabled=arm == 'joint')
+            settings['arms'][arm].update(gt_source_ids=['00000000-0000-4000-8000-000000000101'], force_gt_enabled=arm == 'joint')
     runtime = dict(output_root='output', devices=dict(zip(bench.ARMS, ['0', '1', '2'])),
                    gpu_manager=dict(exclusive=False, cpu_cores=4, priority=100))
     config_path = Path(write(tmp_path / 'benchmark.json', settings))
@@ -77,7 +77,7 @@ def test_prepare_checks_initializer_and_forcing(configured):
     write(path, config)
     with pytest.raises(ValueError, match='forced GT policy'):
         bench.prepare(settings, runtime)
-    config['fiber_implicit_winding']['force_keep_source_ids'] = [101]
+    config['fiber_implicit_winding']['force_keep_source_ids'] = ['00000000-0000-4000-8000-000000000101']
     write(path, config)
     init = Path(config['fiber_implicit_winding']['initial_solution']).parent / 'config.json'
     meta = bench.read(init)

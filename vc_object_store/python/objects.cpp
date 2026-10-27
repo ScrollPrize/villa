@@ -1,9 +1,11 @@
 #include "StorageBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
-#include "FiberRegionBindings.hpp"
+#include "GeometryRegionBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/sftp/Sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -234,6 +236,38 @@ void bindMutations(nb::class_<T>& cls)
 
 }  // namespace
 
+namespace {
+nb::list hubLeases(const std::vector<vo::HubLease>& leases)
+{
+    nb::list result;
+    for (const auto& lease : leases) {
+        nb::dict item; item["uuid"] = lease.objectUuid; item["holder"] = lease.holder;
+        item["author"] = lease.author; item["host"] = lease.host;
+        item["acquired_us"] = lease.acquiredUs; item["expires_us"] = lease.expiresUs;
+        result.append(item);
+    }
+    return result;
+}
+
+nb::list hubConflicts(const std::vector<vo::HubConflict>& conflicts)
+{
+    nb::list result;
+    for (const auto& conflict : conflicts) {
+        nb::dict item; item["uuid"] = conflict.uuid; item["hub_version"] = conflict.hubVersion;
+        item["hub"] = jsonLoads(conflict.hubRecord); item["local"] = jsonLoads(conflict.localRecord);
+        result.append(item);
+    }
+    return result;
+}
+
+nb::dict hubReport(const vo::HubSyncReport& report)
+{
+    nb::dict result; result["pulled"] = report.pulled; result["pushed"] = report.pushed;
+    result["conflicts"] = hubConflicts(report.conflicts);
+    return result;
+}
+}
+
 NB_MODULE(_native, m)
 {
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
@@ -253,8 +287,51 @@ NB_MODULE(_native, m)
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
     bindGraphReadView(m);
-    bindFiberRegion(m);
+    bindGeometryRegion(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
+
+    m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
+          "Turn a local store with no other connections into a hub for a network share.");
+    m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
+        vo::OpenOptions options; options.author = author;
+        nb::gil_scoped_release release;
+        vo::cloneHub(hub, replica, options);
+    }, nb::arg("hub"), nb::arg("replica"), nb::arg("author"), "Copy a hub into a new local replica.");
+    m.def("hub_detach", &vo::detachHub, nb::arg("replica"), nb::arg("author"),
+          "Drop a replica's hub tables, leaving an ordinary store.");
+    m.def("hub_lock_age", [](const std::filesystem::path& hub) {
+        nb::gil_scoped_release release;
+        return vo::hubLockAge(hub);
+    }, nb::arg("hub"), "Seconds since the hub's lock was taken, or None when it is unlocked.");
+    m.def("hub_remove_lock", [](const std::filesystem::path& hub) {
+        nb::gil_scoped_release release;
+        vo::removeHubLock(hub);
+    }, nb::arg("hub"), "Remove a stale lock left by a crashed client, once no client is syncing.");
+
+    // ssh prompts arrive on a helper thread while hub calls run with the GIL released.
+    m.def("set_sftp_authenticator", [](nb::object callback) {
+        if (callback.is_none()) return vc::sftp::setAuthenticator({});
+        auto held = std::shared_ptr<nb::object>(new nb::object(std::move(callback)), [](nb::object* object) {
+            nb::gil_scoped_acquire acquire;
+            delete object;
+        });
+        vc::sftp::setAuthenticator([held](const vc::sftp::Prompt& prompt) -> std::optional<std::string> {
+            nb::gil_scoped_acquire acquire;
+            const auto answer = (*held)(prompt.destination, prompt.text, prompt.confirmation);
+            if (answer.is_none()) return std::nullopt;
+            return nb::cast<std::string>(answer);
+        });
+    }, nb::arg("callback").none(),
+       "Answer ssh prompts for sftp:// hubs: callback(destination, prompt, confirmation) returns the answer, "
+       "or None to cancel. Without one, ssh runs in batch mode (keys and agent only).");
+    m.def("use_terminal_sftp_prompts", [] {
+        auto authenticator = vc::sftp::terminalAuthenticator();
+        const bool available = static_cast<bool>(authenticator);
+        vc::sftp::setAuthenticator(std::move(authenticator));
+        return available;
+    }, "Ask ssh prompts on the controlling terminal; returns False when there is none.");
+    // A callback must not outlive the interpreter.
+    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vc::sftp::setAuthenticator({}); }));
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -288,6 +365,8 @@ NB_MODULE(_native, m)
              nb::arg("include_retired") = false)
         .def("objects_by_tag", readMethod<&vo::ObjectStore::objectsByTag>(),
              nb::arg("tag"), nb::arg("include_retired") = false)
+        .def("object_tags", readMethod<&vo::ObjectStore::objectTags>(),
+             nb::arg("kind") = std::nullopt)
         .def("delete_object", writeMethod<&vo::ObjectStore::deleteObject>(),
              nb::arg("uuid"))
         .def("edge", readMethod<&vo::ObjectStore::edgeByUuid>(),
@@ -333,6 +412,7 @@ NB_MODULE(_native, m)
                     nb::dict d;
                     d["seq"] = e.seq;
                     d["record_uuid"] = e.recordUuid;
+                    d["kind"] = e.kind;
                     d["generation"] = e.generation;
                     d["author"] = e.author;
                     d["hostname"] = e.hostname;
@@ -391,9 +471,9 @@ NB_MODULE(_native, m)
             return self.withStore<true>([&](auto& db) {
                 return vo::exportGeometry(db, object, destination, revision, overwrite);
             });
-        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("revision_uuid") = std::nullopt,
+        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("object_revision_uuid") = std::nullopt,
            nb::arg("overwrite") = false,
-           "Export one immutable revision to native files; return its UUID. Does not modify the store.")
+           "Export an object revision to native files; return its geometry revision UUID. Does not modify the store.")
         .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
             nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
@@ -449,10 +529,12 @@ NB_MODULE(_native, m)
             const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields,
             const std::optional<std::string>& family, const std::optional<double>& minLength,
             const std::string& orderBy, const std::optional<std::string>& afterUuid,
-            const std::optional<double>& afterLength, bool includeRetired) {
+            const std::optional<double>& afterLength, bool includeRetired,
+            const std::optional<std::string>& volume, bool includeUnbound) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
+            selection.volume = volume; selection.includeUnbound = includeUnbound;
             const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); });
             const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list result;
@@ -463,16 +545,19 @@ NB_MODULE(_native, m)
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
-           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false)
-        .def("fiber_region", &fiberRegionFromPy, nb::arg("slice"),
-             nb::arg("options") = vo::FiberRegionOptions{}, nb::arg("cancel") = nb::none())
+           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false)
+        .def("geometry_region", &geometryRegionFromPy, nb::arg("slice"),
+             nb::arg("options") = vo::RegionOptions{}, nb::arg("cancel") = nb::none())
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
             const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset,
-            const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired) {
+            const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired,
+            const std::optional<std::string>& volume) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
+            selection.volume = volume;
             const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); });
             nb::list result;
             for (const auto& r : regions) {
@@ -486,6 +571,7 @@ NB_MODULE(_native, m)
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("volume") = std::nullopt,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
@@ -522,6 +608,47 @@ NB_MODULE(_native, m)
             result["conflicts"] = conflicts; return result;
         }, nb::arg("peer"), nb::arg("dry_run") = false,
            nb::arg("resolutions") = std::map<std::string, std::string>{}, nb::arg("expected_plan") = std::nullopt)
+        .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");
+            vo::HubSyncReport report;
+            { nb::gil_scoped_release release;
+              report = pull && push ? vo::hubSync(db) : pull ? vo::hubPull(db) : vo::hubPush(db); }
+            return hubReport(report);
+        }, nb::arg("pull") = true, nb::arg("push") = true,
+           "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases.")
+        .def("acquire_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
+            auto& db = self.require();
+            std::vector<vo::HubLease> leases;
+            { nb::gil_scoped_release release; leases = vo::acquireLeases(db, uuids, seconds); }
+            return hubLeases(leases);
+        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
+        .def("renew_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
+            auto& db = self.require();
+            std::vector<vo::HubLease> leases;
+            { nb::gil_scoped_release release; leases = vo::renewLeases(db, uuids, seconds); }
+            return hubLeases(leases);
+        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
+        .def("release_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids) {
+            auto& db = self.require();
+            nb::gil_scoped_release release;
+            vo::releaseLeases(db, uuids);
+        }, nb::arg("uuids"))
+        .def("hub_status", [](PyObjectStore& self) -> nb::object {
+            const auto status = vo::hubStatus(self.require());
+            if (!status) return nb::none();
+            nb::dict result; result["hub"] = status->hub.string(); result["replica"] = status->replica;
+            result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
+            result["leases"] = hubLeases(status->leases);
+            return result;
+        }, "Local hosting state of a replica, or None for an ordinary store.")
+        .def("resolve_hub_conflict", [](PyObjectStore& self, const std::string& uuid, const std::string& keep) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("resolve_hub_conflict requires an idle store");
+            vo::HubSyncReport report;
+            { nb::gil_scoped_release release; report = vo::resolveHubConflict(db, uuid, keep); }
+            return hubReport(report);
+        }, nb::arg("uuid"), nb::arg("keep"))
         .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
              nb::arg("json_text"))
         .def(

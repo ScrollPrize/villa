@@ -1,6 +1,7 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/SourceMetadata.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryOutput.hpp"
 #include <nlohmann/json.hpp>
@@ -71,20 +72,36 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     if (!fs::is_directory(dest.parent_path())) throw std::runtime_error("export parent directory must exist");
     Snapshot snapshot;
     Json attributes;
+    std::string fiberJson;
     {
         auto read = db.read();
-        const auto object = db.objectByUuid(read, objectUuid);
-        if (!object) throw std::runtime_error("object not found");
-        const auto revision = revisionUuid ? db.geometryRevision(read, *revisionUuid) : db.currentGeometry(read, objectUuid);
+        const auto object = revisionUuid ? db.objectRevision(read, *revisionUuid) : db.currentObjectRevision(read, objectUuid);
+        if (!object || object->objectUuid != util::canonicalUuid(objectUuid) || object->deleted || object->record.retired)
+            throw std::runtime_error("active object revision not found for this object");
+        if (!object->geometryRevision) throw std::runtime_error("object revision has no geometry");
+        const auto revision = db.geometryRevision(read, *object->geometryRevision);
         if (!revision) throw std::runtime_error("geometry revision not found");
-        if (revision->objectUuid != object->uuid) throw std::runtime_error("geometry revision belongs to another object");
+        RevisionSelection selection;
+        if (revisionUuid) {
+            if (!object->publishedAtUs) throw std::runtime_error("object revision has no publication time");
+            selection = db.revisionSelectionAt(read, *object->publishedAtUs, true);
+        } else {
+            ObjectSelection all; all.includeRetired = true;
+            for (const auto& record : db.selectObjects(read, all))
+                selection[record.uuid] = db.currentObjectRevision(read, record.uuid)->uuid;
+        }
         snapshot.revision = *revision;
-        attributes = detail::nativeMetadata(db, read, *object, *revision);
+        if (revision->kind == "fiber") {
+            RevisionSelection fibers;
+            for (const auto& [uuid, pin] : selection)
+                if (pin && db.objectRevision(read, *pin)->record.kind == "fiber") fibers.emplace(uuid, pin);
+            fiberJson = fiberNetworkJson(db, read, fibers, {object->objectUuid}, std::numeric_limits<uint64_t>::max()).at(object->objectUuid);
+        } else attributes = detail::nativeMetadata(db, read, object->record, *revision, selection);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
             revision->kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
-        for (const auto& array : revision->arrays) {
+        if (revision->kind != "fiber") for (const auto& array : revision->arrays) {
             if (!names.contains(array.name)) throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
             snapshot.arrays[array.name] = db.readGeometryArray(read, revision->uuid, array.name);
         }
@@ -96,7 +113,12 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     Stage stage{stagingPath};
     const auto output = stage.root / "payload";
     if (directory) fs::create_directory(output);
-    if (kind == "fiber") formats::fiber(snapshot, attributes, output);
+    if (kind == "fiber") {
+        std::ofstream file(output);
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        file << fiberJson << '\n';
+        file.close();
+    }
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
     else if (kind == "patch") formats::patch(snapshot, attributes, output);
     else if (kind == "track") formats::track(snapshot, attributes, output);

@@ -60,7 +60,7 @@ def load_config(path):
             value, base = read(source), Path(source).parent
         else:
             value = dict(value)
-        for key in ('afv', 'umbilicus', 'tensor_cache'):
+        for key in ('fibers', 'umbilicus', 'tensor_cache'):
             value[key] = file(base, value[key])
         return value
 

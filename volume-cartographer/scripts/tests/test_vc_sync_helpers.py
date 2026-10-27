@@ -1,9 +1,8 @@
-"""Tests for vc_sync content hashing, shadow bases, and conflict analysis.
+"""Tests for vc_sync content hashing and conflict analysis.
 
 Pure-local: a temp directory stands in for the sync dir and tracked rows are
 written straight into the SQLite DB. No S3 or network access.
 """
-import copy
 import hashlib
 import json
 import os
@@ -15,8 +14,6 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import fiber_merge
-import test_fiber_merge
 import vc_sync
 from vc_sync import S3SyncManager, SyncAction
 
@@ -50,12 +47,6 @@ def track_row(manager, path, local_size, local_mtime, s3_size, s3_etag,
             '(path, local_size, local_mtime, s3_size, s3_mtime, s3_etag, local_md5) '
             'VALUES (?, ?, ?, ?, ?, ?, ?)',
             (path, local_size, local_mtime, s3_size, 0.0, s3_etag, local_md5))
-
-
-def plan3(manager, *args, **kwargs):
-    """Legacy planner call: (pending, peer_fixes, manual) by attribute."""
-    result = manager._plan_conflict_resolutions(*args, **kwargs)
-    return result.pending, result.peer_fixes, result.manual
 
 
 def local_info(manager, relpath):
@@ -104,10 +95,8 @@ class TestEtagIsMd5:
 
 
 class TestIgnoreRules:
-    def test_shadow_and_conflict_dirs_are_ignored(self):
+    def test_conflict_dirs_are_ignored(self):
         # Load-bearing: the tool's own dirs must never sync
-        assert S3SyncManager._is_ignored(
-            f'{vc_sync.BASE_DIR_NAME}/fibers/f1.json')
         assert S3SyncManager._is_ignored(
             f'{vc_sync.CONFLICT_DIR_NAME}/fibers/f1.conflict-x-local.json')
 
@@ -168,7 +157,7 @@ class TestAnalyzeChanges:
         assert actions['f.json'][0] == SyncAction.SKIP
         assert 'converged' in actions['f.json'][1].lower()
 
-    def test_converged_with_record_updates_tracking_and_shadow(self, manager):
+    def test_converged_with_record_updates_tracking(self, manager):
         write_local(manager, 'f.json', '{"a": 4}')
         info = local_info(manager, 'f.json')
         remote = s3_info(info['local_size'], info['local_md5'])
@@ -180,7 +169,6 @@ class TestAnalyzeChanges:
                 ('f.json',)).fetchone()
         assert row[0] == info['local_md5']
         assert row[1] == info['local_md5']
-        assert os.path.exists(manager._shadow_path('f.json'))
 
     def test_untracked_same_size_different_content_is_conflict(self, manager,
                                                                monkeypatch):
@@ -277,95 +265,6 @@ class TestAnalyzeChanges:
         assert actions['vol.tif'][0] == SyncAction.SKIP
 
 
-class TestLegacyRegressionUpload:
-    def test_stripped_fiber_is_a_conflict_not_an_upload(self, manager):
-        """The shadow had adjacent links; an older VC3D dropped their array. A plain
-        "local modified" upload would spread the loss: conflict instead."""
-        import test_fiber_merge as fm
-        knowing = fm.make_fiber(fm.BASE_CPS,
-                                branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
-        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
-        write_local(manager, 'fibers/f.json', json.dumps(knowing))
-        manager._update_shadow('fibers/f.json')
-        base_info = local_info(manager, 'fibers/f.json')
-        stripped = copy.deepcopy(knowing)
-        stripped.pop('adjacent_branches')
-        stripped['generation'] = 2
-        write_local(manager, 'fibers/f.json', json.dumps(stripped))
-        info = local_info(manager, 'fibers/f.json')
-        remote = s3_info(base_info['local_size'], base_info['local_md5'])
-        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
-                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
-        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
-        assert actions['fibers/f.json'][0] == SyncAction.CONFLICT
-        assert 'older VC3D' in actions['fibers/f.json'][1]
-
-    def test_mixed_base_stripped_adjacent_link_is_a_conflict(self, manager):
-        """The shadow has both kinds of link; the local file lost the
-        adjacent array: still a conflict."""
-        import test_fiber_merge as fm
-        adjacent = fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)
-        legacy = fm.link('kb_c.json', fm.BASE_CPS[4], [7.0, 7.0, 7.0], 4)
-        base = fm.make_fiber(fm.BASE_CPS, branches=[legacy], adjacent_branches=[adjacent])
-        write_local(manager, 'fibers/f.json', json.dumps(base))
-        manager._update_shadow('fibers/f.json')
-        base_info = local_info(manager, 'fibers/f.json')
-        stripped = copy.deepcopy(base)
-        stripped.pop('adjacent_branches')
-        stripped['generation'] = 2
-        write_local(manager, 'fibers/f.json', json.dumps(stripped))
-        info = local_info(manager, 'fibers/f.json')
-        remote = s3_info(base_info['local_size'], base_info['local_md5'])
-        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
-                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
-        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
-        assert actions['fibers/f.json'][0] == SyncAction.CONFLICT
-
-    def test_ordinary_edit_still_uploads(self, manager):
-        """The same setup with the array kept is a normal upload."""
-        import test_fiber_merge as fm
-        knowing = fm.make_fiber(fm.BASE_CPS,
-                                branches=[fm.link('kb_a.json', fm.BASE_CPS[2], fm.OTHER, 2)])
-        knowing['adjacent_branches'], knowing['branches'] = knowing['branches'], []
-        write_local(manager, 'fibers/f.json', json.dumps(knowing))
-        manager._update_shadow('fibers/f.json')
-        base_info = local_info(manager, 'fibers/f.json')
-        edited = copy.deepcopy(knowing)
-        edited['tags'] = ['reviewed']
-        edited['generation'] = 2
-        write_local(manager, 'fibers/f.json', json.dumps(edited))
-        info = local_info(manager, 'fibers/f.json')
-        remote = s3_info(base_info['local_size'], base_info['local_md5'])
-        track_row(manager, 'fibers/f.json', base_info['local_size'], base_info['local_mtime'],
-                  base_info['local_size'], base_info['local_md5'], base_info['local_md5'])
-        actions = manager.analyze_changes({'fibers/f.json': info}, {'fibers/f.json': remote})
-        assert actions['fibers/f.json'][0] == SyncAction.UPLOAD
-
-
-class TestShadow:
-    def test_update_and_remove(self, manager):
-        write_local(manager, 'fibers/f.json', '{"x": 1}')
-        manager._update_shadow('fibers/f.json')
-        shadow = manager._shadow_path('fibers/f.json')
-        assert os.path.exists(shadow)
-        assert open(shadow).read() == '{"x": 1}'
-        manager._remove_shadow('fibers/f.json')
-        assert not os.path.exists(shadow)
-        # empty shadow subdir cleaned up too
-        assert not os.path.exists(os.path.dirname(shadow))
-
-    def test_non_hashable_files_get_no_shadow(self, manager):
-        write_local(manager, 'vol.tif', 'data')
-        manager._update_shadow('vol.tif')
-        assert not os.path.exists(manager._shadow_path('vol.tif'))
-
-    def test_shadow_not_scanned(self, manager):
-        write_local(manager, 'fibers/f.json', '{"x": 1}')
-        manager._update_shadow('fibers/f.json')
-        files = manager.scan_local_files()
-        assert all(not p.startswith(vc_sync.BASE_DIR_NAME) for p in files)
-
-
 class TestConflictStash:
     def test_stash_local_copy(self, manager):
         write_local(manager, 'fibers/f.json', '{"mine": true}')
@@ -417,243 +316,6 @@ class TestConflictStash:
         assert len(stashed) == 1
 
 
-class TestAutoMerge:
-    """_attempt_auto_merge with a stubbed remote fetch — no S3."""
-
-    @staticmethod
-    def fiber(cps_z, branches=None, generation=1):
-        cps = [[100.0 + 10.0 * i, 200.0, 300.0 + z] for i, z in enumerate(cps_z)]
-        return {
-            'type': 'vc3d_fiber', 'version': 1, 'filename': 'f.json',
-            'generation': generation,
-            'control_points': cps,
-            'line_points': cps,  # coarse but valid for the merge
-            'branches': branches or [], 'tags': [],
-        }
-
-    @staticmethod
-    def link(target, anchor_cp):
-        return {
-            'control_point_index': 0, 'branch_fiber_id': 1,
-            'branch_control_point_index': 0, 'branch_file': target,
-            'control_point_direction': [1.0, 0.0, 0.0],
-            'branch_control_point_direction': [0.0, 1.0, 0.0],
-            'control_point_position': list(anchor_cp),
-            'branch_control_point_position': [9.0, 9.0, 9.0],
-            'pending': True,
-        }
-
-    def setup_scenario(self, manager, monkeypatch, base, local, remote):
-        path = 'fibers/f.json'
-        local_path = write_local(manager, path, json.dumps(local))
-        # Shadow holds the base; tracked local_md5 records the base content
-        # (the local file has diverged from it since the last sync).
-        shadow = manager._shadow_path(path)
-        os.makedirs(os.path.dirname(shadow), exist_ok=True)
-        with open(shadow, 'w') as f:
-            json.dump(base, f)
-        base_md5 = manager._file_md5(shadow)
-        info = local_info(manager, path)
-        track_row(manager, path, 10, 0.0, 10, 'a' * 32, base_md5)
-
-        def fake_fetch(p):
-            tmp = manager._merge_tmp_path(p, '.remote')
-            with open(tmp, 'w') as f:
-                json.dump(remote, f)
-            return remote, tmp
-
-        monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
-        return path, local_path, info
-
-    def test_clean_merge_deferred_until_applied(self, manager, monkeypatch):
-        """Planning never touches the local file; _apply_pending_merges (run
-        after user confirmation) performs the swap and the stashing."""
-        base = self.fiber([0, 0, 0, 0])
-        local = self.fiber([0, 0, 0, 0], generation=2)
-        local['branches'] = [self.link('kb_b.json', local['control_points'][1])]
-        remote = self.fiber([0, 0, 0, 0], generation=2)
-        remote['branches'] = [self.link('kb_c.json', remote['control_points'][2])]
-        path, local_path, info = self.setup_scenario(
-            manager, monkeypatch, base, local, remote)
-        before = open(local_path).read()
-
-        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
-
-        assert isinstance(plan, dict) and os.path.exists(plan['pending'])
-        assert open(local_path).read() == before  # untouched until confirmed
-        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-
-        def stashes():
-            # Actual conflict copies only — not the .tmp planning scratch
-            return [f for _, _, fs_ in os.walk(stash_root)
-                    for f in fs_ if '.conflict-' in f]
-
-        assert stashes() == []
-
-        manager._apply_pending_merges([(path, plan)])
-
-        merged = json.load(open(local_path))
-        targets = sorted(b['branch_file'] for b in merged['branches'])
-        assert targets == ['kb_b.json', 'kb_c.json']
-        assert merged['generation'] == 3
-        assert len(stashes()) == 2  # local + remote pre-merge copies
-        assert not os.path.exists(plan['pending'])
-        assert not os.path.exists(plan['remote_tmp'])
-
-    def test_cancelled_merge_discarded_without_touching_local(self, manager,
-                                                              monkeypatch):
-        base = self.fiber([0, 0, 0, 0])
-        local = self.fiber([0, 0, 0, 0], generation=2)
-        local['tags'] = ['from-local']
-        remote = self.fiber([0, 0, 0, 0], generation=2)
-        remote['tags'] = ['from-remote']
-        path, local_path, info = self.setup_scenario(
-            manager, monkeypatch, base, local, remote)
-        before = open(local_path).read()
-
-        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
-        assert isinstance(plan, dict)
-        manager._discard_pending_merges([(path, plan)])
-
-        assert open(local_path).read() == before
-        assert not os.path.exists(plan['pending'])
-        assert not os.path.exists(plan['remote_tmp'])
-        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-        assert [f for _, _, fs_ in os.walk(stash_root)
-                for f in fs_ if '.conflict-' in f] == []
-
-    def test_dry_run_probes_without_writing(self, manager, monkeypatch):
-        base = self.fiber([0, 0, 0, 0])
-        local = self.fiber([0, 0, 0, 0], generation=2)
-        local['tags'] = ['from-local']
-        remote = self.fiber([0, 0, 0, 0], generation=2)
-        remote['tags'] = ['from-remote']
-        path, local_path, info = self.setup_scenario(
-            manager, monkeypatch, base, local, remote)
-        before = open(local_path).read()
-
-        outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32),
-                                              dry_run=True)
-
-        assert outcome and 'summary' in outcome and 'reason' not in outcome
-        assert open(local_path).read() == before
-        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-        stashed = [f for _, _, fs_ in os.walk(stash_root) for f in fs_]
-        assert stashed == []  # probing writes nothing
-
-    @pytest.mark.parametrize('local_uuid', [None, test_fiber_merge.FIBER_UUID_A])
-    def test_uuid_adoption_without_base_is_deferred(self, manager, monkeypatch,
-                                                   local_uuid):
-        local = self.fiber([0, 0, 0, 0])
-        remote = {**copy.deepcopy(local), 'uuid': test_fiber_merge.FIBER_UUID_B}
-        if local_uuid is not None:
-            local['uuid'] = local_uuid
-        path, local_path, info = self.setup_scenario(
-            manager, monkeypatch, local, local, remote)
-        monkeypatch.setattr(manager, '_load_base', lambda *args: None)
-        before = open(local_path).read()
-
-        dry = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque'),
-                                         dry_run=True)
-        assert dry['merged_doc']['uuid'] == remote['uuid']
-        assert open(local_path).read() == before
-        assert not os.path.exists(manager._merge_tmp_path(path, '.remote'))
-
-        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque'))
-        assert plan['merged_doc']['uuid'] == remote['uuid']
-        assert open(local_path).read() == before
-        manager._apply_pending_merges([(path, plan)])
-        assert json.load(open(local_path))['uuid'] == remote['uuid']
-
-    def test_dry_run_reports_reason_without_base(self, manager, monkeypatch):
-        doc = TestLinkConsistency.fiber('n.json', TestLinkConsistency.CPS_A)
-        path = 'fibers/n.json'
-        write_local(manager, path, json.dumps(doc))
-        remote = {**copy.deepcopy(doc), 'tags': ['remote edit']}
-        monkeypatch.setattr(manager, '_fetch_remote_json', lambda p: (remote, None))
-        info = local_info(manager, path)
-        outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1'),
-                                              dry_run=True)
-        assert outcome == {'reason': 'no merge base'}
-        assert manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1')) is None
-
-    @pytest.mark.parametrize('migrated_uuids', [False, True])
-    def test_conflicting_merge_stashes_all_three(self, manager, monkeypatch,
-                                               migrated_uuids):
-        base = self.fiber([0, 0, 0, 0])
-        local = self.fiber([0, 5, 0, 0], generation=2)   # both move CP1
-        remote = self.fiber([0, -5, 0, 0], generation=2)
-        if migrated_uuids:
-            local['uuid'] = test_fiber_merge.FIBER_UUID_A
-            remote['uuid'] = test_fiber_merge.FIBER_UUID_B
-        path, local_path, info = self.setup_scenario(
-            manager, monkeypatch, base, local, remote)
-        before = open(local_path).read()
-
-        outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
-
-        assert outcome is None
-        assert open(local_path).read() == before
-        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-        stashed = sorted(f for _, _, fs_ in os.walk(stash_root) for f in fs_)
-        assert len(stashed) == 3  # local + remote + base
-        assert any('-base' in name for name in stashed)
-
-    def test_same_basename_conflicts_do_not_collide(self, manager, monkeypatch):
-        """Two conflicting files sharing a basename in different directories
-        must get independent pending/remote temp files; flattening to the
-        basename cross-contaminated their merged content."""
-        plans = {}
-        for pkg, tag in (('pkgA', 'from-a'), ('pkgB', 'from-b')):
-            base = self.fiber([0, 0, 0, 0])
-            local = self.fiber([0, 0, 0, 0], generation=2)
-            local['tags'] = [tag + '-local']
-            remote = self.fiber([0, 0, 0, 0], generation=2)
-            remote['tags'] = [tag + '-remote']
-            path = f'{pkg}/fibers/f.json'
-            local_path = write_local(manager, path, json.dumps(local))
-            shadow = manager._shadow_path(path)
-            os.makedirs(os.path.dirname(shadow), exist_ok=True)
-            with open(shadow, 'w') as f:
-                json.dump(base, f)
-            info = local_info(manager, path)
-            track_row(manager, path, 10, 0.0, 10, 'a' * 32,
-                      manager._file_md5(shadow))
-
-            def fake_fetch(p, remote_doc=remote):
-                tmp = manager._merge_tmp_path(p, '.remote')
-                with open(tmp, 'w') as f:
-                    json.dump(remote_doc, f)
-                return remote_doc, tmp
-
-            monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
-            plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
-            assert isinstance(plan, dict)
-            plans[path] = (local_path, plan)
-
-        pending_paths = [plan['pending'] for _, plan in plans.values()]
-        assert len(set(pending_paths)) == 2  # no shared temp file
-
-        manager._apply_pending_merges(
-            [(path, plan) for path, (_, plan) in plans.items()])
-        for path, (local_path, _) in plans.items():
-            merged = json.load(open(local_path))
-            marker = 'from-a' if 'pkgA' in path else 'from-b'
-            assert any(marker in t for t in merged['tags']), \
-                f"{path} received another file's merged content"
-
-    def test_no_base_means_no_merge(self, manager, monkeypatch):
-        local = self.fiber([0, 0, 0, 0], generation=2)
-        path = 'fibers/f.json'
-        write_local(manager, path, json.dumps(local))
-        info = local_info(manager, path)
-        track_row(manager, path, 10, 0.0, 10, 'not-an-md5-etag-4', 'c' * 32)
-        monkeypatch.setattr(manager, '_fetch_remote_json',
-                            lambda p: (self.fiber([0, 0, 0, 1]), None))
-
-        assert manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32)) is None
-
-
 class TestRecordUntrackedSynced:
     def test_same_size_divergent_content_not_healed(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')
@@ -686,9 +348,8 @@ class TestRecordUntrackedSynced:
         with sqlite3.connect(manager.db_file) as conn:
             rows = conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
         assert rows == 1
-        assert os.path.exists(manager._shadow_path('f.json'))
 
-    def test_verified_pair_healed_with_shadow(self, manager):
+    def test_verified_pair_healed(self, manager):
         write_local(manager, 'f.json', '{"a": 1}')
         info = local_info(manager, 'f.json')
         remote = s3_info(info['local_size'], info['local_md5'])
@@ -696,12 +357,10 @@ class TestRecordUntrackedSynced:
         with sqlite3.connect(manager.db_file) as conn:
             row = conn.execute('SELECT local_md5 FROM files').fetchone()
         assert row[0] == info['local_md5']
-        assert os.path.exists(manager._shadow_path('f.json'))
 
 
-class TestBackfillTrackedBases:
-    """The 'update' command must seed hashes + merge bases for tracked
-    files that predate content hashing (the shadow-base backfill)."""
+class TestBackfillTrackedHashes:
+    """The update command verifies content before recording missing hashes."""
 
     def test_tracked_row_without_md5_gets_seeded(self, manager):
         write_local(manager, 'f.json', '{"a": 1}')
@@ -709,11 +368,10 @@ class TestBackfillTrackedBases:
         remote = s3_info(info['local_size'], info['local_md5'])
         track_row(manager, 'f.json', info['local_size'], info['local_mtime'],
                   info['local_size'], info['local_md5'], None)  # pre-hash row
-        manager._backfill_tracked_bases({'f.json': info}, {'f.json': remote})
+        manager._backfill_tracked_hashes({'f.json': info}, {'f.json': remote})
         with sqlite3.connect(manager.db_file) as conn:
             row = conn.execute('SELECT local_md5 FROM files').fetchone()
         assert row[0] == info['local_md5']
-        assert os.path.exists(manager._shadow_path('f.json'))
 
     def test_divergent_tracked_pair_left_alone(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')
@@ -722,11 +380,10 @@ class TestBackfillTrackedBases:
         track_row(manager, 'f.json', info['local_size'], info['local_mtime'],
                   info['local_size'], 'e' * 32, None)
         monkeypatch.setattr(manager, '_remote_md5', lambda p: 'e' * 32)
-        manager._backfill_tracked_bases({'f.json': info}, {'f.json': remote})
+        manager._backfill_tracked_hashes({'f.json': info}, {'f.json': remote})
         with sqlite3.connect(manager.db_file) as conn:
             row = conn.execute('SELECT local_md5 FROM files').fetchone()
         assert row[0] is None
-        assert not os.path.exists(manager._shadow_path('f.json'))
 
     def test_unverifiable_pair_left_alone(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')
@@ -735,8 +392,7 @@ class TestBackfillTrackedBases:
         track_row(manager, 'f.json', info['local_size'], info['local_mtime'],
                   info['local_size'], 'abc123-4', None)
         monkeypatch.setattr(manager, '_remote_md5', lambda p: None)
-        manager._backfill_tracked_bases({'f.json': info}, {'f.json': remote})
-        assert not os.path.exists(manager._shadow_path('f.json'))
+        manager._backfill_tracked_hashes({'f.json': info}, {'f.json': remote})
 
     def test_refresh_tracking_wires_in_the_backfill(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')
@@ -747,7 +403,8 @@ class TestBackfillTrackedBases:
         monkeypatch.setattr(manager, 'scan_s3_files',
                             lambda include_backups=False: {'f.json': remote})
         manager.refresh_tracking()
-        assert os.path.exists(manager._shadow_path('f.json'))
+        with sqlite3.connect(manager.db_file) as conn:
+            assert conn.execute('SELECT local_md5 FROM files').fetchone()[0] == info['local_md5']
 
 
 class TestProbeSideEffects:
@@ -765,294 +422,6 @@ class TestProbeSideEffects:
         assert manager._remote_md5('fibers/f.json')
         assert not os.path.exists(
             os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME))
-        assert not os.path.exists(
-            os.path.join(manager.local_dir, vc_sync.BASE_DIR_NAME))
-
-
-class TestLinkConsistency:
-    """_plan_link_consistency + _apply_peer_fixes: reciprocal mirroring of
-    a merged fiber's link decisions into its peer files."""
-
-    CPS_A = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]
-    CPS_B = [[0.0, 50.0, 0.0], [10.0, 50.0, 0.0]]
-
-    @staticmethod
-    def fiber(name, cps, branches=None, generation=1):
-        return {'type': 'vc3d_fiber', 'version': 1, 'filename': name,
-                'generation': generation,
-                'control_points': [list(p) for p in cps],
-                'line_points': [list(p) for p in cps],
-                'branches': branches or [], 'tags': []}
-
-    @classmethod
-    def entry(cls, target, local_cps, local_index, far_cps, far_index):
-        return {
-            'control_point_index': local_index, 'branch_fiber_id': 3,
-            'branch_control_point_index': far_index, 'branch_file': target,
-            'control_point_direction':
-                fiber_merge.endpoint_tangent(local_cps, local_cps[local_index]),
-            'branch_control_point_direction':
-                fiber_merge.endpoint_tangent(far_cps, far_cps[far_index]),
-            'control_point_position': list(local_cps[local_index]),
-            'branch_control_point_position': list(far_cps[far_index]),
-            'pending': True,
-        }
-
-    def make_plan(self, manager, path, merged_doc, base_doc, peers):
-        pending = manager._merge_tmp_path(path, '.merged')
-        with open(pending, 'w') as f:
-            json.dump(merged_doc, f)
-        return {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': merged_doc, 'base_doc': base_doc,
-                'peer_files': peers}
-
-    def test_missing_reciprocal_planned_and_applied(self, manager):
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('b.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        b = self.fiber('b.json', self.CPS_B)   # reciprocal missing
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['b.json'])
-
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert demoted == []
-        assert list(peer_fixes) == ['fibers/b.json']
-        reciprocal = peer_fixes['fibers/b.json']['branches'][0]
-        assert reciprocal['branch_file'] == 'a.json'
-        assert reciprocal['control_point_index'] == 0
-        assert reciprocal['branch_control_point_index'] == 1
-        assert reciprocal['pending'] is True
-
-        manager._apply_peer_fixes(peer_fixes)
-        with open(os.path.join(manager.local_dir, 'fibers/b.json')) as f:
-            assert json.load(f) == peer_fixes['fibers/b.json']
-        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-        stashed = [name for _, _, files in os.walk(stash_root) for name in files]
-        assert any('-peer' in name for name in stashed)
-
-    def test_consistent_peer_needs_no_fix(self, manager):
-        a_entry = self.entry('b.json', self.CPS_A, 1, self.CPS_B, 0)
-        b_entry = self.entry('a.json', self.CPS_B, 0, self.CPS_A, 1)
-        a = self.fiber('a.json', self.CPS_A, branches=[a_entry])
-        b = self.fiber('b.json', self.CPS_B, branches=[b_entry])
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert demoted == []
-        assert peer_fixes == {}
-
-    def test_missing_peer_demotes_merge(self, manager):
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('b.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert peer_fixes == {}
-        assert demoted and demoted[0][0] == 'fibers/a.json'
-        assert 'missing' in demoted[0][1]
-
-    def _dropped_link_plan(self, manager, peers):
-        """a's merged doc links b only; base linked c too (dropped link)."""
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('b.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        base = self.fiber('a.json', self.CPS_A,
-                          branches=[self.entry('b.json', self.CPS_A, 1,
-                                               self.CPS_B, 0),
-                                    self.entry('c.json', self.CPS_A, 0,
-                                               self.CPS_B, 1)])
-        b = self.fiber('b.json', self.CPS_B,
-                       branches=[self.entry('a.json', self.CPS_B, 0,
-                                            self.CPS_A, 1)])
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-        return self.make_plan(manager, 'fibers/a.json', a, base, peers)
-
-    def test_dropped_link_to_vanished_peer_does_not_demote(self, manager):
-        """The incident: c was deleted on both sides, the merged doc has no
-        branch to it, but peer_files still lists it (base peers are kept so
-        a surviving peer's stale reciprocal can be stripped). Nothing to
-        reciprocate -> skip, not "missing"."""
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set(), remote_paths=set())
-        assert demoted == []
-        assert peer_fixes == {}
-        assert notes == [('fibers/a.json', 'c.json')]
-        assert 'fibers/c.json' not in manager._peer_doc_cache
-
-    def test_absent_peer_without_remote_inventory_still_demotes(self, manager):
-        """Legacy 2-arg call: absence cannot be established -> as before."""
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert demoted and 'missing' in demoted[0][1]
-        assert notes == []
-
-    def test_absent_peer_still_present_remotely_demotes(self, manager):
-        """Pending DELETE_REMOTE: the delete has not happened; do not
-        assume it will."""
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set(), remote_paths={'fibers/c.json'})
-        assert demoted and 'still present on S3' in demoted[0][1]
-        assert notes == []
-
-    def test_dropped_link_to_unreadable_peer_still_demotes(self, manager):
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        write_local(manager, 'fibers/c.json', 'not-json')
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set(), remote_paths=set())
-        assert demoted and 'unreadable' in demoted[0][1]
-
-    def test_dropped_link_to_downloading_peer_strips_stale_reciprocal(
-            self, manager, monkeypatch):
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        remote_c = self.fiber('c.json', self.CPS_B, generation=4,
-                              branches=[self.entry('a.json', self.CPS_B, 1,
-                                                   self.CPS_A, 0)])
-
-        def fake_fetch(path):
-            tmp = manager._merge_tmp_path(path, '.remote')
-            with open(tmp, 'w') as f:
-                json.dump(remote_c, f)
-            return remote_c, tmp
-
-        monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], {'fibers/c.json'}, remote_paths=set())
-        assert demoted == [] and notes == []
-        assert peer_fixes['fibers/c.json']['branches'] == []
-
-    def test_vanishing_peer_is_never_read_or_fixed(self, manager):
-        """c is present locally with a stale reciprocal but pending local
-        deletion: skip without reading it (a fix would be uploaded)."""
-        plan = self._dropped_link_plan(manager, ['b.json', 'c.json'])
-        stale_c = self.fiber('c.json', self.CPS_B,
-                             branches=[self.entry('a.json', self.CPS_B, 1,
-                                                  self.CPS_A, 0)])
-        write_local(manager, 'fibers/c.json', json.dumps(stale_c))
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set(),
-            vanishing_paths={'fibers/c.json'}, remote_paths=set())
-        assert demoted == []
-        assert 'fibers/c.json' not in peer_fixes
-        assert 'fibers/c.json' not in manager._peer_doc_cache
-        assert notes == [('fibers/a.json', 'c.json')]
-
-    def test_live_link_to_vanishing_peer_demotes(self, manager):
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('c.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        write_local(manager, 'fibers/c.json', json.dumps(
-            self.fiber('c.json', self.CPS_B)))
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['c.json'])
-        peer_fixes, demoted, notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set(),
-            vanishing_paths={'fibers/c.json'}, remote_paths=set())
-        assert demoted and 'pending deletion' in demoted[0][1]
-
-    def test_peer_scheduled_for_download_uses_remote_content(self, manager,
-                                                             monkeypatch):
-        """A peer being downloaded is fixed against its REMOTE content —
-        the fix lands after the download and re-uploads."""
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('b.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        remote_b = self.fiber('b.json', self.CPS_B, generation=5)
-        write_local(manager, 'fibers/b.json',
-                    json.dumps(self.fiber('b.json', [[9.0, 9.0, 9.0]])))
-
-        def fake_fetch(path):
-            tmp = manager._merge_tmp_path(path, '.remote')
-            with open(tmp, 'w') as f:
-                json.dump(remote_b, f)
-            return remote_b, tmp
-
-        monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['b.json'])
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], {'fibers/b.json'})
-        assert demoted == []
-        fixed = peer_fixes['fibers/b.json']
-        # Based on the remote doc (gen 5), bumped by the rewrite
-        assert fixed['generation'] == 6
-        assert fixed['branches'][0]['branch_file'] == 'a.json'
-
-    def test_v3_consistent_pair_needs_no_fix(self, manager):
-        """v3 control points are {'position': ...} dicts; the consistency
-        pass must unwrap them (regression: a TypeError here demoted every
-        conflicting linked v3 fiber to a manual conflict)."""
-        a, b = test_fiber_merge.make_v3_pair(
-            'a.json', 'b.json', test_fiber_merge.BASE_CPS,
-            test_fiber_merge.B_CPS_V3, 2, 1)
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              copy.deepcopy(a), ['b.json'])
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert demoted == []
-        assert peer_fixes == {}
-
-    def test_refresh_crash_demotes_with_location(self, manager, monkeypatch,
-                                                 capsys):
-        """A merge-machinery bug must read as a bug, not as undiagnosable
-        data: the demotion reason names the innermost frame. The full
-        traceback prints ONLY under VC_SYNC_DEBUG=1 — unconditional stacks
-        would bury the merge preview and the conflict prompt."""
-        a = self.fiber('a.json', self.CPS_A,
-                       branches=[self.entry('b.json', self.CPS_A, 1,
-                                            self.CPS_B, 0)])
-        b = self.fiber('b.json', self.CPS_B)
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-
-        def boom(*args, **kwargs):
-            raise TypeError('synthetic refresh crash')
-
-        monkeypatch.setattr(vc_sync.fiber_merge, 'refresh_pair_links', boom)
-        plan = self.make_plan(manager, 'fibers/a.json', a,
-                              self.fiber('a.json', self.CPS_A), ['b.json'])
-
-        monkeypatch.delenv('VC_SYNC_DEBUG', raising=False)
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert peer_fixes == {} and len(demoted) == 1
-        reason = demoted[0][1]
-        assert 'synthetic refresh crash' in reason
-        assert 'test_vc_sync_helpers.py' in reason and 'boom' in reason
-        assert 'Traceback' not in capsys.readouterr().out
-
-        monkeypatch.setenv('VC_SYNC_DEBUG', '1')
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert len(demoted) == 1
-        assert 'Traceback' in capsys.readouterr().out
-
-
-class TestExceptionLocation:
-    """_exception_location: the compact frame reference appended to
-    demotion reasons."""
-
-    def test_names_innermost_frame(self):
-        def inner():
-            raise ValueError('x')
-
-        try:
-            inner()
-        except ValueError as ex:
-            location = vc_sync._exception_location(ex)
-        assert location.startswith(' at test_vc_sync_helpers.py:')
-        assert location.endswith(' in inner')
-
-    def test_exception_without_traceback_is_empty(self):
-        assert vc_sync._exception_location(ValueError('x')) == ''
 
 
 class TestAnalyzeDeleteActions:
@@ -1113,520 +482,6 @@ class TestOldSchemaMigration:
         assert row == ('old.json', 'e' * 32, None)
 
 
-class TestStagingPath:
-    def test_staged_files_are_ignored_by_scans(self):
-        """A crash between staging and os.replace must not leave a file the
-        next sync would upload as a new object."""
-        staged = S3SyncManager._staging_path('fibers/proj/f.json')
-        assert S3SyncManager._is_ignored(staged)
-
-
-class TestDemotionFixpoint:
-    """_plan_conflict_resolutions: demotions from link-consistency planning
-    must feed back into the blocked-peer cascade (the #1246 review's M3 —
-    a peer fix must never override a user's manual conflict choice)."""
-
-    CPS = TestLinkConsistency.CPS_A
-
-    def make_plan_for(self, manager, path, peers, branches=None):
-        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS,
-                                        branches=branches)
-        pending = manager._merge_tmp_path(path, '.merged')
-        with open(pending, 'w') as f:
-            json.dump(doc, f)
-        return {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': doc,
-                'base_doc': TestLinkConsistency.fiber(os.path.basename(path),
-                                                      self.CPS),
-                'peer_files': peers}
-
-    def test_plan_demotion_cascades_to_dependents(self, manager, monkeypatch):
-        """A merges with peer B; B's own merge demotes (its peer C is
-        missing). B becoming manual must demote A too — no peer fix may be
-        computed for B from stale content."""
-        plans = {
-            'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
-                                                ['b.json']),
-            # B's merged doc still LINKS the missing c: a dangling link,
-            # not a dropped one, so it must keep demoting.
-            'fibers/b.json': self.make_plan_for(
-                manager, 'fibers/b.json', ['c.json'],
-                branches=[TestLinkConsistency.entry(
-                    'c.json', self.CPS, 1, TestLinkConsistency.CPS_B, 0)]),
-        }
-        write_local(manager, 'fibers/a.json', json.dumps(plans['fibers/a.json']['merged_doc']))
-        write_local(manager, 'fibers/b.json', json.dumps(plans['fibers/b.json']['merged_doc']))
-        monkeypatch.setattr(manager, '_attempt_auto_merge',
-                            lambda path, li, si: plans[path])
-        conflicts = [('fibers/a.json', 'both changed'),
-                     ('fibers/b.json', 'both changed')]
-        pending, peer_fixes, manual = plan3(manager,
-            conflicts, {}, {}, set(), set(), auto_merge=True)
-        assert pending == []
-        assert peer_fixes == {}
-        assert sorted(p for p, _ in manual) == ['fibers/a.json',
-                                                'fibers/b.json']
-
-    def test_dropped_link_to_locally_deleted_peer_does_not_block(
-            self, manager, monkeypatch):
-        """A peer pending local deletion blocks stage 1 only while the
-        merged doc still links it. A dropped link needs no reciprocal fix,
-        and the going-away peer must not be read (a fix over it would be
-        uploaded while it is deleted)."""
-        plan = self.make_plan_for(manager, 'fibers/a.json', ['p.json'])
-        write_local(manager, 'fibers/a.json', json.dumps(plan['merged_doc']))
-        stale = TestLinkConsistency.fiber(
-            'p.json', TestLinkConsistency.CPS_B,
-            branches=[TestLinkConsistency.entry(
-                'a.json', TestLinkConsistency.CPS_B, 0, self.CPS, 1)])
-        write_local(manager, 'fibers/p.json', json.dumps(stale))
-        monkeypatch.setattr(manager, '_attempt_auto_merge',
-                            lambda path, li, si: plan)
-        pending, peer_fixes, manual = plan3(manager,
-            [('fibers/a.json', 'both changed')], {}, {}, set(),
-            {'fibers/p.json'}, auto_merge=True)
-        assert [p for p, _ in pending] == ['fibers/a.json']
-        assert manual == []
-        assert peer_fixes == {}
-        assert 'fibers/p.json' not in manager._peer_doc_cache
-
-    def test_live_link_to_locally_deleted_peer_blocks(self, manager,
-                                                      monkeypatch):
-        plan = self.make_plan_for(
-            manager, 'fibers/a.json', ['p.json'],
-            branches=[TestLinkConsistency.entry(
-                'p.json', self.CPS, 1, TestLinkConsistency.CPS_B, 0)])
-        write_local(manager, 'fibers/a.json', json.dumps(plan['merged_doc']))
-        write_local(manager, 'fibers/p.json', json.dumps(
-            TestLinkConsistency.fiber('p.json', TestLinkConsistency.CPS_B)))
-        monkeypatch.setattr(manager, '_attempt_auto_merge',
-                            lambda path, li, si: plan)
-        pending, peer_fixes, manual = plan3(manager,
-            [('fibers/a.json', 'both changed')], {}, {}, set(),
-            {'fibers/p.json'}, auto_merge=True)
-        assert pending == []
-        assert [p for p, _ in manual] == ['fibers/a.json']
-        assert 'pending deletion' in manual[0][1]
-
-    def test_manual_peer_blocks_merge_upfront(self, manager, monkeypatch):
-        plans = {'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
-                                                     ['b.json'])}
-        write_local(manager, 'fibers/a.json',
-                    json.dumps(plans['fibers/a.json']['merged_doc']))
-        write_local(manager, 'fibers/b.json', 'not-json')
-
-        def attempt(path, li, si):
-            return plans.get(path)
-
-        monkeypatch.setattr(manager, '_attempt_auto_merge', attempt)
-        conflicts = [('fibers/a.json', 'both changed'),
-                     ('fibers/b.json', 'both changed')]
-        pending, peer_fixes, manual = plan3(manager,
-            conflicts, {}, {}, set(), set(), auto_merge=True)
-        assert pending == [] and peer_fixes == {}
-        assert {p for p, _ in manual} == {'fibers/a.json', 'fibers/b.json'}
-
-    def test_partial_peer_failure_rolls_back_fixes(self, manager):
-        """Two peers, second missing: the first peer's tentative fix must
-        not leak into peer_fixes when the merge demotes."""
-        a = TestLinkConsistency.fiber(
-            'a.json', TestLinkConsistency.CPS_A,
-            branches=[TestLinkConsistency.entry(
-                          'b.json', TestLinkConsistency.CPS_A, 1,
-                          TestLinkConsistency.CPS_B, 0),
-                      TestLinkConsistency.entry(
-                          'c.json', TestLinkConsistency.CPS_A, 0,
-                          TestLinkConsistency.CPS_B, 1)])
-        b = TestLinkConsistency.fiber('b.json', TestLinkConsistency.CPS_B)
-        write_local(manager, 'fibers/b.json', json.dumps(b))  # c.json missing
-        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
-        with open(pending, 'w') as f:
-            json.dump(a, f)
-        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': a,
-                'base_doc': TestLinkConsistency.fiber(
-                    'a.json', TestLinkConsistency.CPS_A),
-                'peer_files': ['b.json', 'c.json']}
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert demoted and demoted[0][0] == 'fibers/a.json'
-        assert peer_fixes == {}
-
-
-class TestPromptThenPlan:
-    """_plan_conflict_resolutions with a resolve callback: content
-    conflicts are decided BEFORE link planning, so a decided root un-blocks
-    its dependents in the same run; only skipped files cascade."""
-
-    CPS = TestLinkConsistency.CPS_A
-
-    @pytest.fixture(params=['manager', 'sftp_manager'])
-    def mgr(self, request):
-        return request.getfixturevalue(request.param)
-
-    def plan_for(self, mgr, path, peers, branches=None):
-        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS,
-                                        branches=branches)
-        pending = mgr._merge_tmp_path(path, '.merged')
-        with open(pending, 'w') as f:
-            json.dump(doc, f)
-        write_local(mgr, path, json.dumps(doc))
-        return {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': doc,
-                'base_doc': TestLinkConsistency.fiber(os.path.basename(path),
-                                                      self.CPS),
-                'peer_files': peers}
-
-    def install(self, mgr, monkeypatch, plans, roots):
-        """plans: path -> plan (auto-mergeable); roots: content failures.
-        Returns (merge_calls, fetched) recorders."""
-        merge_calls = []
-        fetched = []
-
-        def attempt(path, li, si):
-            merge_calls.append(path)
-            return plans.get(path)
-
-        def fetch(path):
-            fetched.append(path)
-            doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS)
-            tmp = mgr._merge_tmp_path(path, '.remote')
-            with open(tmp, 'w') as f:
-                json.dump(doc, f)
-            return doc, tmp
-
-        for root in roots:
-            write_local(mgr, root, json.dumps(
-                TestLinkConsistency.fiber(os.path.basename(root), self.CPS)))
-        monkeypatch.setattr(mgr, '_attempt_auto_merge', attempt)
-        monkeypatch.setattr(mgr, '_fetch_remote_json', fetch)
-        return merge_calls, fetched
-
-    @staticmethod
-    def resolver(answers, default=SyncAction.SKIP):
-        prompts = []
-        reasons = {}
-
-        def resolve(path, reason):
-            prompts.append(path)
-            reasons[path] = reason
-            return answers.get(path, default)
-        resolve.prompts = prompts
-        resolve.reasons = reasons
-        return resolve
-
-    @staticmethod
-    def conflicts(*paths):
-        return [(p, 'Both local and S3 modified since last sync') for p in paths]
-
-    def test_resolve_none_is_legacy_fixpoint(self, mgr, monkeypatch):
-        """R manual; A->R, B->A, C->R. Today's eager stage 1 yields manual
-        order R, A, B, C (B sees A demoted within the same pass)."""
-        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json']),
-                 'fibers/b.json': self.plan_for(mgr, 'fibers/b.json', ['a.json']),
-                 'fibers/c.json': self.plan_for(mgr, 'fibers/c.json', ['r.json'])}
-        self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/a.json', 'fibers/b.json', 'fibers/c.json',
-                           'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True)
-        assert result.pending == [] and result.peer_fixes == {}
-        assert [p for p, _ in result.manual] == [
-            'fibers/r.json', 'fibers/a.json', 'fibers/b.json', 'fibers/c.json']
-        assert 'r.json' in result.manual[1][1]
-        assert 'a.json' in result.manual[2][1]
-        assert result.resolved == []
-
-    def test_download_decision_unblocks_dependents(self, mgr, monkeypatch):
-        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
-        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        resolve = self.resolver({'fibers/r.json': SyncAction.DOWNLOAD})
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/a.json', 'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
-        assert resolve.prompts == ['fibers/r.json']
-        assert [p for p, _ in result.pending] == ['fibers/a.json']
-        assert result.resolved == [('fibers/r.json', SyncAction.DOWNLOAD)]
-        assert result.manual == []
-        assert fetched == ['fibers/r.json']      # planned against remote R
-
-    def test_upload_decision_unblocks_dependents(self, mgr, monkeypatch):
-        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
-        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        resolve = self.resolver({'fibers/r.json': SyncAction.UPLOAD})
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/a.json', 'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
-        assert [p for p, _ in result.pending] == ['fibers/a.json']
-        assert result.resolved == [('fibers/r.json', SyncAction.UPLOAD)]
-        assert fetched == []                      # planned against local R
-
-    def test_skip_decision_cascades_and_prompts_dependent_once(
-            self, mgr, monkeypatch):
-        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json'])}
-        merge_calls, _ = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        resolve = self.resolver({'fibers/a.json': SyncAction.UPLOAD})  # R skipped
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/a.json', 'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
-        assert resolve.prompts == ['fibers/r.json', 'fibers/a.json']
-        assert result.pending == []
-        assert result.manual == [('fibers/r.json',
-                                  'Both local and S3 modified since last sync')]
-        assert result.resolved == [('fibers/a.json', SyncAction.UPLOAD)]
-        # the dependent's prompt names the peer that blocked it
-        assert resolve.reasons['fibers/a.json'].endswith(
-            'auto-merge failed: linked fiber(s) with unresolved conflicts '
-            'or pending deletion: r.json')
-        # content merge exactly once per conflict; no path prompted twice
-        assert sorted(merge_calls) == ['fibers/a.json', 'fibers/r.json']
-        assert len(resolve.prompts) == len(set(resolve.prompts))
-
-    def test_awaiting_peer_does_not_block(self, mgr, monkeypatch):
-        """d1 depends on skipped R (demoted, awaiting); d2 depends on d1.
-        d2 must wait for d1's DECISION, not be demoted with it."""
-        plans = {'fibers/d1.json': self.plan_for(mgr, 'fibers/d1.json', ['r.json']),
-                 'fibers/d2.json': self.plan_for(mgr, 'fibers/d2.json', ['d1.json'])}
-        _, fetched = self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        resolve = self.resolver({'fibers/d1.json': SyncAction.DOWNLOAD})
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/d1.json', 'fibers/d2.json', 'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
-        assert resolve.prompts == ['fibers/r.json', 'fibers/d1.json']
-        assert [p for p, _ in result.pending] == ['fibers/d2.json']
-        assert fetched == ['fibers/d1.json']      # d2 planned against remote d1
-
-    def test_all_skips_terminate_with_each_path_prompted_once(
-            self, mgr, monkeypatch):
-        """Every answer SKIP (what EOF at the prompt resolves to): the loop
-        must still drain every dependent, once each."""
-        plans = {'fibers/a.json': self.plan_for(mgr, 'fibers/a.json', ['r.json']),
-                 'fibers/b.json': self.plan_for(mgr, 'fibers/b.json', ['a.json'])}
-        self.install(mgr, monkeypatch, plans, ['fibers/r.json'])
-        resolve = self.resolver({})
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts('fibers/a.json', 'fibers/b.json', 'fibers/r.json'),
-            {}, {}, set(), set(), auto_merge=True, resolve=resolve)
-        assert resolve.prompts == ['fibers/r.json', 'fibers/a.json',
-                                   'fibers/b.json']
-        assert result.pending == [] and result.resolved == []
-        assert [p for p, _ in result.manual] == resolve.prompts
-
-    # --- the 2026-09-08 incident topology --------------------------------
-    ROOTS = ['fibers/r1.json', 'fibers/r2.json', 'fibers/r3.json']
-    GRAPH = {'fibers/d1.json': ['r1.json'], 'fibers/d2.json': ['r1.json'],
-             'fibers/d3.json': ['d2.json'],
-             'fibers/d4.json': ['d3.json', 'gone.json'],   # base-only peer
-             'fibers/d5.json': ['r2.json'],
-             'fibers/d6.json': ['d5.json'], 'fibers/d7.json': ['d5.json'],
-             'fibers/d8.json': ['r3.json']}
-
-    def incident(self, mgr, monkeypatch, answers, s3_files=None,
-                 resolve_none=False):
-        plans = {p: self.plan_for(mgr, p, peers) for p, peers in self.GRAPH.items()}
-        self.install(mgr, monkeypatch, plans, self.ROOTS)
-        resolve = None if resolve_none else self.resolver(answers)
-        result = mgr._plan_conflict_resolutions(
-            self.conflicts(*sorted(list(self.GRAPH) + self.ROOTS)),
-            {}, s3_files or {}, set(), set(), auto_merge=True, resolve=resolve)
-        return result, resolve
-
-    def test_incident_rrr_one_round(self, mgr, monkeypatch):
-        result, resolve = self.incident(
-            mgr, monkeypatch, {r: SyncAction.DOWNLOAD for r in self.ROOTS})
-        assert resolve.prompts == self.ROOTS
-        assert len(result.pending) == 8 and result.manual == []
-
-    def test_incident_all_skips(self, mgr, monkeypatch):
-        result, resolve = self.incident(mgr, monkeypatch, {})
-        assert len(resolve.prompts) == 11
-        assert len(set(resolve.prompts)) == 11
-        assert result.pending == [] and len(result.manual) == 11
-
-    def test_incident_rsl_dependent_decided_remote(self, mgr, monkeypatch):
-        result, resolve = self.incident(mgr, monkeypatch, {
-            'fibers/r1.json': SyncAction.DOWNLOAD,
-            'fibers/r3.json': SyncAction.UPLOAD,
-            'fibers/d5.json': SyncAction.DOWNLOAD})      # r2 skipped
-        assert resolve.prompts == self.ROOTS + ['fibers/d5.json']
-        assert len(result.pending) == 7
-        assert [p for p, _ in result.manual] == ['fibers/r2.json']
-
-    def test_incident_rsl_dependent_skipped(self, mgr, monkeypatch):
-        result, resolve = self.incident(mgr, monkeypatch, {
-            'fibers/r1.json': SyncAction.DOWNLOAD,
-            'fibers/r3.json': SyncAction.UPLOAD})        # r2, d5 skipped
-        assert resolve.prompts == self.ROOTS + [
-            'fibers/d5.json', 'fibers/d6.json', 'fibers/d7.json']
-        assert len(result.pending) == 5
-
-    def test_incident_legacy_all_manual(self, mgr, monkeypatch):
-        result, _ = self.incident(mgr, monkeypatch, {}, resolve_none=True)
-        assert result.pending == [] and len(result.manual) == 11
-
-    def test_incident_peer_still_on_remote_prompts_without_cascade(
-            self, mgr, monkeypatch):
-        """Run-1 inventory: gone.json still exists remotely (pending
-        DELETE_REMOTE) -> d4 is prompted once instead of auto-merged; its
-        answer does not cascade."""
-        result, resolve = self.incident(
-            mgr, monkeypatch,
-            dict({r: SyncAction.DOWNLOAD for r in self.ROOTS},
-                 **{'fibers/d4.json': SyncAction.UPLOAD}),
-            s3_files={'fibers/gone.json': s3_info(1, 'e')})
-        assert resolve.prompts == self.ROOTS + ['fibers/d4.json']
-        assert len(result.pending) == 7 and result.manual == []
-        assert result.resolved[-1] == ('fibers/d4.json', SyncAction.UPLOAD)
-
-
-class TestSyncPromptThenPlan:
-    """sync() wiring of the decided-root flow: a decided root that receives
-    a reciprocal correction is uploaded once as a peer fix (never also as a
-    resolved transfer), skip counts come from decisions, and cancelling
-    leaves every local file untouched."""
-
-    CPS_A = TestLinkConsistency.CPS_A
-    CPS_B = TestLinkConsistency.CPS_B
-
-    def arrange(self, manager, monkeypatch, answers):
-        """Local a (auto-mergeable, merged doc links r at cp1<->cp0) and r
-        (content failure: no merge base). Both are 'both modified'
-        conflicts. Transfers are recorded, not performed."""
-        fib = TestLinkConsistency.fiber
-        entry = TestLinkConsistency.entry
-        merged_a = fib('a.json', self.CPS_A,
-                       branches=[entry('r.json', self.CPS_A, 1, self.CPS_B, 0)])
-        local_a = fib('a.json', self.CPS_A, generation=2)
-        local_r = fib('r.json', self.CPS_B, generation=2)     # no reciprocal
-        remote_r = fib('r.json', self.CPS_B, generation=3)    # no reciprocal
-        write_local(manager, 'a.json', json.dumps(local_a))
-        write_local(manager, 'r.json', json.dumps(local_r))
-        remote = {'a.json': json.dumps(fib('a.json', self.CPS_A, generation=3)),
-                  'r.json': json.dumps(remote_r)}
-        s3 = {p: {'path': p, 's3_size': len(b), 's3_mtime': 0.0,
-                  's3_etag': hashlib.md5(b.encode()).hexdigest(),
-                  'is_backup': False} for p, b in remote.items()}
-        for p in ('a.json', 'r.json'):
-            track_row(manager, p, 1, 0.0, 1, 'old-etag', local_md5='0' * 32)
-
-        plan = {'pending': manager._merge_tmp_path('a.json', '.merged'),
-                'remote_tmp': None, 'summary': 's', 'merged_doc': merged_a,
-                'base_doc': fib('a.json', self.CPS_A), 'peer_files': ['r.json']}
-        with open(plan['pending'], 'w') as f:
-            json.dump(merged_a, f)
-
-        def fetch_json(path):
-            tmp = manager._merge_tmp_path(path, '.remote')
-            with open(tmp, 'w') as f:
-                f.write(remote[path])
-            return json.loads(remote[path]), tmp
-
-        def fetch_file(path, dst):
-            with open(dst, 'w') as f:
-                f.write(remote[path])
-
-        rec = {'downloads': [], 'uploads': [], 'deletes': []}
-        prompts = []
-
-        def prompt(message, choices):
-            prompts.append(choices)
-            return answers.pop(0) if answers else 's'
-
-        monkeypatch.setattr(manager, 'scan_s3_files', lambda inc=False: s3)
-        monkeypatch.setattr(manager, '_attempt_auto_merge',
-                            lambda path, li, si: plan if path == 'a.json' else None)
-        monkeypatch.setattr(manager, '_fetch_remote_json', fetch_json)
-        monkeypatch.setattr(manager, '_fetch_remote_file', fetch_file)
-        monkeypatch.setattr(manager, '_remote_md5', lambda path: 'f' * 32)
-        monkeypatch.setattr(manager, '_bucket_versioning_enabled', lambda: False)
-        monkeypatch.setattr(manager, 'perform_downloads_batch',
-                            lambda paths, s3f: rec['downloads'].extend(paths) or len(paths))
-        monkeypatch.setattr(manager, 'perform_uploads_batch',
-                            lambda paths, inc=False: rec['uploads'].extend(paths) or len(paths))
-        monkeypatch.setattr(manager, 'perform_deletes_remote_batch',
-                            lambda paths, inc=False: rec['deletes'].extend(paths) or len(paths))
-        monkeypatch.setattr(vc_sync, 'prompt_choice', prompt)
-        manager.use_rclone = True
-        rec['prompts'] = prompts
-        return rec
-
-    def test_remote_decided_root_with_fix_uploaded_once(self, manager,
-                                                        monkeypatch, capsys):
-        rec = self.arrange(manager, monkeypatch, answers=['r'])
-        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: True)
-        manager.sync()
-        out = capsys.readouterr().out
-        assert rec['prompts'] == [('l', 'r', 's')]
-        assert rec['uploads'].count('r.json') == 1
-        assert rec['uploads'].count('a.json') == 1
-        assert rec['downloads'] == []            # fix supersedes the download
-        assert 'Conflictsunresolved:0' in out.replace(' ', '')
-        assert 'your choice (S3) is applied together with a reciprocal link fix' in out
-        # on disk: r carries the reciprocal, based on the REMOTE doc (gen 3 -> 4)
-        r = json.load(open(os.path.join(manager.local_dir, 'r.json')))
-        assert r['generation'] == 4
-        assert r['branches'][0]['branch_file'] == 'a.json'
-
-    def test_local_decided_root_with_fix_uploaded_once(self, manager,
-                                                       monkeypatch, capsys):
-        rec = self.arrange(manager, monkeypatch, answers=['l'])
-        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: True)
-        manager.sync()
-        out = capsys.readouterr().out
-        assert rec['uploads'].count('r.json') == 1   # not also "Resolved conflict"
-        assert 'your choice (local) is applied together with a reciprocal link fix' in out
-        r = json.load(open(os.path.join(manager.local_dir, 'r.json')))
-        assert r['generation'] == 3                  # local (gen 2) + fix
-
-    def test_skip_cascades_and_cancel_touches_nothing(self, manager,
-                                                     monkeypatch, capsys):
-        rec = self.arrange(manager, monkeypatch, answers=['s', 's'])
-        before = {p: open(os.path.join(manager.local_dir, p), 'rb').read()
-                  for p in ('a.json', 'r.json')}
-        monkeypatch.setattr(vc_sync, 'confirm', lambda msg: False)
-        manager.sync()
-        out = capsys.readouterr().out
-        assert len(rec['prompts']) == 2              # r skipped -> a prompted
-        assert 'Conflictsunresolved:2' in out.replace(' ', '')
-        assert rec['uploads'] == [] and rec['downloads'] == []
-        after = {p: open(os.path.join(manager.local_dir, p), 'rb').read()
-                 for p in ('a.json', 'r.json')}
-        assert after == before
-
-
-class TestPlanStats:
-    """PlanResult.stats: demotion classes counted once per merge."""
-
-    def test_incident_stats(self, manager, monkeypatch):
-        tp = TestPromptThenPlan()
-        result, _ = tp.incident(manager, monkeypatch,
-                                {r: SyncAction.DOWNLOAD for r in tp.ROOTS})
-        assert result.stats == {
-            'merged': 8, 'content_conflicts': 3, 'blocked_by_skip': 0,
-            'blocked_by_delete': 0, 'link_state': 0,
-            'decisions': {'l': 0, 'r': 3, 's': 0}}
-        result, _ = tp.incident(manager, monkeypatch, {})
-        assert result.stats['merged'] == 0
-        assert result.stats['blocked_by_skip'] == 8
-        assert result.stats['decisions'] == {'l': 0, 'r': 0, 's': 11}
-
-    def test_skip_wins_over_delete(self, manager, monkeypatch):
-        """A merge blocked by a skipped peer AND a still-linked deleting
-        peer counts once, as blocked_by_skip."""
-        tp = TestPromptThenPlan()
-        plan = tp.plan_for(
-            manager, 'fibers/a.json', ['r.json', 'p.json'],
-            branches=[TestLinkConsistency.entry(
-                'p.json', tp.CPS, 1, TestLinkConsistency.CPS_B, 0)])
-        tp.install(manager, monkeypatch, {'fibers/a.json': plan}, ['fibers/r.json'])
-        result = manager._plan_conflict_resolutions(
-            tp.conflicts('fibers/a.json', 'fibers/r.json'), {}, {}, set(),
-            {'fibers/p.json'}, auto_merge=True)
-        assert result.stats['blocked_by_skip'] == 1
-        assert result.stats['blocked_by_delete'] == 0
-        assert result.stats['link_state'] == 0
-
-
 class TestDeleteLocalSafety:
     def test_divergent_local_copy_stashed_before_deletion(self, manager):
         """Remote deleted the file, local edited it since the last sync —
@@ -1649,389 +504,6 @@ class TestDeleteLocalSafety:
         action, reason = actions['f.json']
         assert action == SyncAction.DELETE_LOCAL
         assert 'unsynced edits' in reason
-
-
-class TestPlannerInputHardening:
-    def test_nul_byte_peer_name_demotes_instead_of_crashing(self, manager):
-        """A remote-crafted branch_file with an embedded NUL must demote
-        the merge, not abort the sync with a ValueError traceback."""
-        doc = TestLinkConsistency.fiber('a.json', TestLinkConsistency.CPS_A)
-        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
-        with open(pending, 'w') as f:
-            json.dump(doc, f)
-        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': doc, 'base_doc': doc,
-                'peer_files': ['b\x00.json']}
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert peer_fixes == {}
-        assert demoted and 'invalid linked fiber name' in demoted[0][1]
-
-    def test_nan_in_merged_doc_demotes(self, manager):
-        """A NaN smuggled through an opaque subtree would serialize as
-        invalid JSON (unloadable by nlohmann); planning demotes it."""
-        a = TestLinkConsistency.fiber(
-            'a.json', TestLinkConsistency.CPS_A,
-            branches=[TestLinkConsistency.entry(
-                'b.json', TestLinkConsistency.CPS_A, 1,
-                TestLinkConsistency.CPS_B, 0)])
-        a['opaque_extra'] = float('nan')
-        b = TestLinkConsistency.fiber('b.json', TestLinkConsistency.CPS_B)
-        write_local(manager, 'fibers/b.json', json.dumps(b))
-        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
-        with open(pending, 'w') as f:
-            f.write('{}')
-        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
-                'merged_doc': a,
-                'base_doc': TestLinkConsistency.fiber(
-                    'a.json', TestLinkConsistency.CPS_A),
-                'peer_files': ['b.json']}
-        peer_fixes, demoted, _notes = manager._plan_link_consistency(
-            [('fibers/a.json', plan)], set())
-        assert peer_fixes == {}
-        assert demoted and 'refresh against' in demoted[0][1]
-
-
-class TestClassifyFibers:
-    """hfsync publishes outward, so classify_fibers is a gate: what it puts
-    in `tagged` is uploaded to a Hugging Face bucket, and what it puts in
-    `untagged` is deleted from one."""
-
-    @staticmethod
-    def fiber(tags, **extra):
-        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': 'f.json',
-               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'generation': 1, 'branches': [], 'tags': tags}
-        doc.update(extra)
-        return doc
-
-    @staticmethod
-    def write(tmp_path, name, doc):
-        path = tmp_path / name
-        path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
-        return path
-
-    def test_tagged_fiber_publishes(self, tmp_path):
-        self.write(tmp_path, 'a.json', self.fiber(['reviewed']))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert (tagged, untagged, invalid, deferred) == (['a.json'], [], [], [])
-
-    def test_untagged_fiber_is_removable(self, tmp_path):
-        self.write(tmp_path, 'a.json', self.fiber(['draft']))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert (tagged, untagged, deferred) == ([], ['a.json'], [])
-
-    def test_needs_reoptimization_is_held_back(self, tmp_path):
-        """A sync-merged fiber's line is a straight-segment placeholder until
-        VC3D re-fits it; publishing it presents unfitted geometry as
-        reviewed."""
-        self.write(tmp_path, 'a.json',
-                   self.fiber(['reviewed', vc_sync.REOPTIMIZE_TAG]))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert tagged == []
-        # NOT untagged: a held-back local file must not delete the good copy
-        # already published.
-        assert untagged == []
-        assert invalid == []
-        assert [name for name, _ in deferred] == ['a.json']
-        assert vc_sync.REOPTIMIZE_TAG in deferred[0][1]
-
-    def test_untagged_and_unfitted_is_still_removable(self, tmp_path):
-        """Holding back applies only to fibers claiming the publish tag."""
-        self.write(tmp_path, 'a.json', self.fiber([vc_sync.REOPTIMIZE_TAG]))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert (tagged, untagged, deferred) == ([], ['a.json'], [])
-
-    def test_string_tags_do_not_substring_match(self, tmp_path):
-        """`tag in tags` over a string publishes 'unreviewed' as 'reviewed'."""
-        self.write(tmp_path, 'a.json', self.fiber('unreviewed'))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert tagged == []
-        assert [name for name, _ in invalid] == ['a.json']
-
-    def test_null_tags_does_not_crash(self, tmp_path):
-        """`tags: null` used to raise TypeError and abort the whole run."""
-        self.write(tmp_path, 'a.json', self.fiber(None))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert [name for name, _ in invalid] == ['a.json']
-
-    def test_non_object_root_does_not_crash(self, tmp_path):
-        """A JSON root that isn't an object used to raise AttributeError."""
-        self.write(tmp_path, 'a.json', '[1, 2, 3]')
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert [name for name, _ in invalid] == ['a.json']
-
-    def test_unloadable_fiber_is_invalid_not_untagged(self, tmp_path):
-        """An unloadable doc is quarantined, not treated as a deletion
-        request for its published namesake."""
-        self.write(tmp_path, 'a.json', self.fiber(['reviewed'], version=2))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert (tagged, untagged) == ([], [])
-        assert [name for name, _ in invalid] == ['a.json']
-
-    def test_existing_skips_still_apply(self, tmp_path):
-        (tmp_path / 'empty.json').write_text('')
-        (tmp_path / 'bad.json').write_text('{not json')
-        (tmp_path / '.hidden.json').write_text(json.dumps(self.fiber(['reviewed'])))
-        (tmp_path / 'notes.txt').write_text('x')
-        (tmp_path / 'sub.json').mkdir()
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed')
-        assert tagged == []
-        assert sorted(name for name, _ in invalid) == ['bad.json', 'empty.json']
-
-    # --- exclude_tags / tagless publishing -------------------------------
-
-    def test_exclude_tag_withholds_fiber(self, tmp_path):
-        """A fiber carrying an excluded tag is never published, even when it
-        also carries the publish tag."""
-        self.write(tmp_path, 'a.json', self.fiber(['reviewed', 'problems']))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), 'reviewed', ['problems'])
-        assert tagged == []
-        # untagged, not deferred: 'problems' is a judgement that it should not
-        # be public, so a published copy must come down too.
-        assert untagged == ['a.json']
-        assert (invalid, deferred) == ([], [])
-
-    def test_no_include_tag_publishes_every_loadable_fiber(self, tmp_path):
-        self.write(tmp_path, 'a.json', self.fiber([]))
-        self.write(tmp_path, 'b.json', self.fiber(['anything']))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None)
-        assert tagged == ['a.json', 'b.json']
-        assert (untagged, invalid, deferred) == ([], [], [])
-
-    def test_no_include_tag_still_honours_excludes(self, tmp_path):
-        self.write(tmp_path, 'a.json', self.fiber([]))
-        self.write(tmp_path, 'b.json', self.fiber(['problems']))
-        self.write(tmp_path, 'c.json', self.fiber(['possible_duplicate']))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None, ['problems', 'possible_duplicate'])
-        assert tagged == ['a.json']
-        assert untagged == ['b.json', 'c.json']
-
-    def test_no_include_tag_still_holds_back_unfitted(self, tmp_path):
-        """Publishing everything must not publish placeholder geometry."""
-        self.write(tmp_path, 'a.json', self.fiber([vc_sync.REOPTIMIZE_TAG]))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None)
-        assert (tagged, untagged, invalid) == ([], [], [])
-        assert [name for name, _ in deferred] == ['a.json']
-
-    def test_no_include_tag_still_quarantines_invalid(self, tmp_path):
-        """Publishing everything must not publish unloadable documents."""
-        self.write(tmp_path, 'a.json', self.fiber('problems'))
-        self.write(tmp_path, 'b.json', '[1, 2, 3]')
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None, ['problems'])
-        assert (tagged, untagged) == ([], [])
-        assert sorted(name for name, _ in invalid) == ['a.json', 'b.json']
-
-    def test_excluded_and_unfitted_is_removable(self, tmp_path):
-        """Exclusion wins over holding back: the fiber is withheld outright."""
-        self.write(tmp_path, 'a.json',
-                   self.fiber(['problems', vc_sync.REOPTIMIZE_TAG]))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None, ['problems'])
-        assert (tagged, deferred) == ([], [])
-        assert untagged == ['a.json']
-
-    def test_default_classify_call_is_unchanged(self, tmp_path):
-        """Omitting exclude_tags keeps the pre-existing behaviour."""
-        self.write(tmp_path, 'a.json', self.fiber(['reviewed']))
-        assert vc_sync.classify_fibers(str(tmp_path), 'reviewed')[0] == ['a.json']
-
-
-class TestLegacyConfigGainsDefaultExclusions:
-    """A config written before `exclude_tags` existed now also withholds
-    problem fibers. That is intended -- the withhold list is meant to win over
-    the include tag -- and it retracts an already published fiber, so it is
-    pinned here rather than left to be rediscovered."""
-
-    @staticmethod
-    def write(tmp_path, name, tags):
-        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': name,
-               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'generation': 1, 'branches': [], 'tags': tags}
-        (tmp_path / name).write_text(json.dumps(doc))
-
-    def test_reviewed_and_problems_is_withheld_under_a_legacy_tag_config(
-            self, tmp_path):
-        (tmp_path / vc_sync.HFSYNC_CONFIG_NAME).write_text(json.dumps(
-            {'hf_bucket_path': 'hf://buckets/org/bucket/path',
-             'hf_cli': 'sh', 'tag': 'reviewed'}))
-        config = vc_sync.load_hfsync_config(str(tmp_path))
-        assert config['exclude_tags'] == ['problems', 'possible_duplicate']
-
-        self.write(tmp_path, 'good.json', ['reviewed'])
-        self.write(tmp_path, 'bad.json', ['reviewed', 'problems'])
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), config['tag'], config['exclude_tags'])
-        assert tagged == ['good.json']
-        # untagged, not deferred: the published copy is retracted.
-        assert untagged == ['bad.json']
-        assert (invalid, deferred) == ([], [])
-
-
-class TestLoadHfsyncConfig:
-    """The config decides what leaves the machine, so bad shapes must raise
-    rather than silently widen what gets published."""
-
-    @staticmethod
-    def write(tmp_path, config):
-        (tmp_path / vc_sync.HFSYNC_CONFIG_NAME).write_text(json.dumps(config))
-        return str(tmp_path)
-
-    BASE = {'hf_bucket_path': 'hf://buckets/org/bucket/path', 'hf_cli': 'sh'}
-
-    def test_absent_config_returns_none(self, tmp_path):
-        assert vc_sync.load_hfsync_config(str(tmp_path)) is None
-
-    def test_defaults_publish_all_minus_the_standard_excludes(self, tmp_path):
-        """With nothing configured, publishing is broad but never includes a
-        fiber someone marked bad."""
-        config = vc_sync.load_hfsync_config(self.write(tmp_path, dict(self.BASE)))
-        assert config['tag'] is None
-        assert config['exclude_tags'] == ['problems', 'possible_duplicate']
-
-    def test_config_can_narrow_to_a_tag(self, tmp_path):
-        """An existing config pinning a tag keeps its behaviour."""
-        config = vc_sync.load_hfsync_config(
-            self.write(tmp_path, dict(self.BASE, tag='reviewed')))
-        assert config['tag'] == 'reviewed'
-
-    def test_empty_exclude_list_is_honoured(self, tmp_path):
-        """[] must mean "exclude nothing", not "use the defaults"."""
-        config = vc_sync.load_hfsync_config(
-            self.write(tmp_path, dict(self.BASE, exclude_tags=[])))
-        assert config['exclude_tags'] == []
-
-    def test_null_tag_means_publish_all(self, tmp_path):
-        config = vc_sync.load_hfsync_config(
-            self.write(tmp_path, dict(self.BASE, tag=None,
-                                      exclude_tags=['problems'])))
-        assert config['tag'] is None
-        assert config['exclude_tags'] == ['problems']
-
-    def test_reviewed_only_overrides_the_configured_tag(self, tmp_path, monkeypatch):
-        """The flag must win over the config, and must not disturb the
-        exclusions."""
-        seen = {}
-
-        def fake_classify(local_dir, tag, exclude_tags=()):
-            seen['tag'] = tag
-            seen['exclude_tags'] = list(exclude_tags)
-            return [], [], [], []
-
-        monkeypatch.setattr(vc_sync, 'classify_fibers', fake_classify)
-        monkeypatch.setattr(vc_sync.subprocess, 'run',
-                            lambda *a, **k: types.SimpleNamespace(
-                                returncode=0, stdout='', stderr=''))
-        # A configured tag the flag must override, and custom exclusions it
-        # must leave alone.
-        directory = self.write(tmp_path, dict(self.BASE, tag='approved',
-                                              exclude_tags=['private']))
-        vc_sync.hf_sync(directory, dry_run=True, reviewed_only=True)
-        assert seen['tag'] == vc_sync.REVIEWED_TAG
-        assert seen['exclude_tags'] == ['private']
-
-    def test_without_the_flag_no_include_filter_is_applied(self, tmp_path, monkeypatch):
-        seen = {}
-
-        def fake_classify(local_dir, tag, exclude_tags=()):
-            seen['tag'] = tag
-            return [], [], [], []
-
-        monkeypatch.setattr(vc_sync, 'classify_fibers', fake_classify)
-        monkeypatch.setattr(vc_sync.subprocess, 'run',
-                            lambda *a, **k: types.SimpleNamespace(
-                                returncode=0, stdout='', stderr=''))
-        vc_sync.hf_sync(self.write(tmp_path, dict(self.BASE)), dry_run=True)
-        assert seen['tag'] is None
-
-    def test_empty_tag_is_refused(self, tmp_path):
-        """"" could mean "no filter" or "a tag nothing carries"; those differ
-        by the whole bucket, so it must not be guessed."""
-        with pytest.raises(ValueError, match="'tag' is empty"):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, tag='', exclude_tags=['x'])))
-
-    def test_whitespace_tag_is_refused(self, tmp_path):
-        with pytest.raises(ValueError, match="'tag' is empty"):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, tag='   ')))
-
-    def test_non_string_tag_raises(self, tmp_path):
-        with pytest.raises(ValueError, match="'tag' must be"):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, tag=['reviewed'])))
-
-    def test_non_list_exclude_tags_raises(self, tmp_path):
-        """A bare string would make the intersection a per-character test."""
-        with pytest.raises(ValueError, match="'exclude_tags' must be"):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, exclude_tags='problems')))
-
-    def test_non_string_exclude_entry_raises(self, tmp_path):
-        with pytest.raises(ValueError, match="'exclude_tags' must be"):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, exclude_tags=[1])))
-
-    def test_bad_bucket_scheme_still_raises(self, tmp_path):
-        with pytest.raises(ValueError, match='hf://buckets/'):
-            vc_sync.load_hfsync_config(
-                self.write(tmp_path, dict(self.BASE, hf_bucket_path='s3://x/y')))
-
-
-    def test_without_fiber_merge_nothing_is_publishable(self, monkeypatch):
-        """is_fiber_doc is the contract, and a hand-rolled subset of it would
-        publish documents the loader rejects. With it unavailable every doc is
-        unpublishable, which uploads nothing and removes nothing."""
-        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
-        fiber = {'type': 'vc3d_fiber', 'version': 1,
-                 'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                 'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                 'tags': ['reviewed']}
-        assert vc_sync.unpublishable_reason(fiber)
-        # version 2 is the case a partial validator would have let through
-        assert vc_sync.unpublishable_reason(dict(fiber, version=2))
-        assert vc_sync.unpublishable_reason([1, 2, 3])
-
-    def test_without_fiber_merge_classification_removes_nothing(
-            self, tmp_path, monkeypatch):
-        """Invalid is not the same as withheld: a file we refused to validate
-        must not take its published copy down."""
-        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
-        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': 'a.json',
-               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-               'generation': 1, 'branches': [], 'tags': ['reviewed']}
-        (tmp_path / 'a.json').write_text(json.dumps(doc))
-        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
-            str(tmp_path), None, ['problems'])
-        assert (tagged, untagged, deferred) == ([], [], [])
-        assert [name for name, _ in invalid] == ['a.json']
-
-    def test_hf_sync_refuses_to_run_without_fiber_merge(
-            self, tmp_path, monkeypatch, capsys):
-        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
-        called = []
-        monkeypatch.setattr(vc_sync, 'classify_fibers',
-                            lambda *a, **k: called.append(1) or ([], [], [], []))
-        vc_sync.hf_sync(self.write(tmp_path, dict(self.BASE)), dry_run=True)
-        assert called == []
-        assert 'fiber_merge' in capsys.readouterr().out
 
 
 # --- SFTP (ash) sync -------------------------------------------------------
@@ -2118,16 +590,14 @@ class TestSftpManagerState:
     def test_state_files_are_independent_of_s3_sync(self, sftp_manager):
         assert sftp_manager.config_file.endswith(vc_sync.ASH_CONFIG_NAME)
         assert sftp_manager.db_file.endswith(vc_sync.ASH_DB_NAME)
-        assert sftp_manager.BASE_DIR == vc_sync.ASH_BASE_DIR_NAME
         assert sftp_manager.CONFLICT_DIR == vc_sync.ASH_CONFLICT_DIR_NAME
-        assert vc_sync.ASH_BASE_DIR_NAME != vc_sync.BASE_DIR_NAME
 
     def test_ash_state_files_are_ignored_by_scans(self):
         # Load-bearing: the ash sync's own state must never be synced,
         # by either the S3 sync or the ash sync itself
         for name in (vc_sync.ASH_CONFIG_NAME, vc_sync.ASH_DB_NAME):
             assert S3SyncManager._is_ignored(name)
-        for dirname in (vc_sync.ASH_BASE_DIR_NAME, vc_sync.ASH_CONFLICT_DIR_NAME):
+        for dirname in (vc_sync.ASH_CONFLICT_DIR_NAME,):
             assert S3SyncManager._is_ignored(f'{dirname}/fibers/f1.json')
 
     def test_rclone_remote_and_env(self, sftp_manager):
@@ -2174,10 +644,8 @@ class TestSftpManagerState:
         assert sftp_manager._get_s3_url('a/b.json') == (
             'sftp://user1@ash.example.org:2022/srv/backup/a/b.json')
 
-    def test_no_versioning_and_no_history_base(self, sftp_manager):
+    def test_no_versioning(self, sftp_manager):
         assert sftp_manager._bucket_versioning_enabled() is False
-        assert sftp_manager._fetch_base_from_history(
-            'a.json', 'd41d8cd98f00b204e9800998ecf8427e') is None
 
     def test_aws_cli_calls_are_a_bug(self, sftp_manager):
         with pytest.raises(RuntimeError):
@@ -2393,46 +861,31 @@ class TestSftpAnalyzeIntegration:
         assert actions[path][0] == SyncAction.CONFLICT
 
 
-class TestRemoteRegression:
-    """A changed REMOTE fiber that an older build re-saved as version 3 over a
-    version-4 base with span tags is a manual conflict, not a plain download;
-    a base with nothing to lose never fetches the remote."""
+@pytest.mark.parametrize("choice", [SyncAction.UPLOAD, SyncAction.DOWNLOAD, SyncAction.SKIP])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_sync_uses_explicit_file_conflict_choice(manager, monkeypatch, choice, confirmed):
+    path = "annotation.json"
+    write_local(manager, path, '{"value": 1}')
+    local = {path: local_info(manager, path)}
+    remote = {path: s3_info(local[path]['local_size'], 'b' * 32)}
+    manager.use_rclone = False
+    monkeypatch.setattr(manager, 'scan_local_files', lambda *args: local)
+    monkeypatch.setattr(manager, 'scan_s3_files', lambda *args: remote)
+    monkeypatch.setattr(manager, 'analyze_changes',
+                        lambda *args, **kwargs: {path: (SyncAction.CONFLICT, 'Both changed')})
+    monkeypatch.setattr(manager, '_record_untracked_synced', lambda *args: None)
+    monkeypatch.setattr(manager, 'resolve_conflict', lambda *args: choice)
+    monkeypatch.setattr(manager, '_stash_divergent_local_copies', lambda *args: None)
+    monkeypatch.setattr(vc_sync, 'confirm', lambda *args: confirmed)
+    transfers = []
+    monkeypatch.setattr(manager, 'perform_upload', lambda p: transfers.append((p, SyncAction.UPLOAD)))
+    monkeypatch.setattr(manager, 'perform_download', lambda p, remote: transfers.append((p, SyncAction.DOWNLOAD)))
+    manager.sync()
+    assert transfers == ([(path, choice)] if confirmed and choice != SyncAction.SKIP else [])
 
-    def _v4_gap_base(self):
-        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
-        test_fiber_merge.make_v4_gap(base, 1)
-        return base
 
-    def test_downgraded_remote_is_a_conflict(self, manager, monkeypatch):
-        base = self._v4_gap_base()
-        stale = copy.deepcopy(base)
-        stale['version'] = 3
-        for cp in stale['control_points'][:-1]:
-            cp['segment_to_next'].pop('tags', None)
-        stale['generation'] = 2
-        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
-        fetched = []
-        monkeypatch.setattr(manager, '_fetch_remote_json',
-                            lambda path: (fetched.append(path) or (stale, None)))
-        message = manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'})
-        assert message and 'span tags' in message
-        assert fetched == ['dj_x_000001.json']
-
-    def test_remote_that_kept_the_tags_downloads(self, manager, monkeypatch):
-        base = self._v4_gap_base()
-        remote = copy.deepcopy(base)
-        remote['generation'] = 2
-        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
-        monkeypatch.setattr(manager, '_fetch_remote_json', lambda path: (remote, None))
-        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
-
-    def test_base_without_regressable_metadata_never_fetches(self, manager, monkeypatch):
-        base = test_fiber_merge.make_v3_fiber(test_fiber_merge.BASE_CPS)
-        base['version'] = 4
-        monkeypatch.setattr(manager, '_load_base', lambda path, tracked: base)
-        def boom(path):
-            raise AssertionError('remote fetched although nothing could be lost')
-        monkeypatch.setattr(manager, '_fetch_remote_json', boom)
-        assert manager._fiber_remote_regression('dj_x_000001.json', {'s3_etag': 'x'}) is None
-        assert not fiber_merge.base_carries_regressable_metadata(base)
-        assert fiber_merge.base_carries_regressable_metadata(self._v4_gap_base())
+def test_retired_fiber_publishing_command_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['vc_sync.py', 'hfsync', '/unused', '--dry-run'])
+    with pytest.raises(SystemExit) as error:
+        vc_sync.main()
+    assert error.value.code == 2

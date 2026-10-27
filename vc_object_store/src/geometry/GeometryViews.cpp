@@ -66,15 +66,6 @@ template<class T> std::vector<std::array<T, 3>> points(const State& state, const
             if (!std::isfinite(v)) throw std::invalid_argument("geometry requires finite coordinates");
     return result;
 }
-template<class T> GeometryArrayEdit pointEdit(const State& state, const char* name, int64_t index, const std::array<T, 3>& value)
-{
-    const auto count = state.array(name).shape[0];
-    if (index < 0 || index >= count) throw std::out_of_range("geometry point out of bounds");
-    if constexpr (std::is_floating_point_v<T>)
-        for (auto v : value)
-            if (!std::isfinite(v)) throw std::invalid_argument("geometry requires finite coordinates");
-    return {name, index * 3, detail::scalarBytes<T>(value)};
-}
 }
 
 GeometrySnapshot::GeometrySnapshot(ObjectStore& db) : state_(std::make_shared<detail::GeometryReadState>(db)) {}
@@ -128,7 +119,6 @@ GeometrySnapshot ObjectStore::geometrySnapshot() { return GeometrySnapshot(*this
 GeometryView::GeometryView(std::shared_ptr<State> state) : state_(std::move(state)) {}
 const GeometryRevision& GeometryView::revision() const { state_->read->require(); return state_->revision; }
 const std::string& GeometryView::objectRevision() const { state_->read->require(); return state_->objectRevision; }
-GeometryEdit GeometryView::edit() const { state_->read->require(); return GeometryEdit(state_); }
 geometry::Geometry GeometryView::loadGeometry() const
 {
     state_->read->require();
@@ -187,60 +177,4 @@ geometry::Patch PatchView::readTile(int64_t row, int64_t column, int64_t rows, i
 }
 geometry::Patch PatchView::load() const { return std::get<geometry::Patch>(loadGeometry()); }
 
-GeometryEdit::GeometryEdit(std::shared_ptr<State> state) : state_(std::move(state)) {}
-void GeometryEdit::requireKind(const char* kind) const
-{
-    state_->read->require();
-    if (committed_) throw std::runtime_error("geometry edit is already committed");
-    if (state_->revision.kind != kind) throw std::invalid_argument("geometry edit kind mismatch");
-}
-void GeometryEdit::movePoint(int64_t id, const geometry::Point& p)
-{
-    requireKind("point_collection");
-    const auto index = state_->indexOf(id);
-    if (!index) throw std::out_of_range("point ID not found");
-    edits_.push_back(pointEdit(*state_, "points", *index, p));
-}
-void GeometryEdit::moveControlPoint(int64_t index, const geometry::Point& p) { requireKind("fiber"); edits_.push_back(pointEdit(*state_, "control_points", index, p)); }
-void GeometryEdit::moveLinePoint(int64_t index, const geometry::Point& p) { requireKind("fiber"); edits_.push_back(pointEdit(*state_, "line_points", index, p)); }
-void GeometryEdit::moveTrackPoint(int64_t index, const geometry::TrackPoint& p) { requireKind("track"); edits_.push_back(pointEdit(*state_, "points", index, p)); }
-void GeometryEdit::moveVertex(int64_t row, int64_t column, const geometry::PatchPoint& p)
-{
-    requireKind("patch");
-    const auto& shape = state_->array("points").shape;
-    if (row < 0 || column < 0 || row >= shape[0] || column >= shape[1])
-        throw std::out_of_range("patch vertex out of bounds");
-    if (!geometry::validPatchPoint(p) && p != geometry::PatchPoint{-1, -1, -1})
-        throw std::invalid_argument("invalid patch vertices must use (-1,-1,-1)");
-    edits_.push_back({"points", (row * shape[1] + column) * 3, detail::scalarBytes<float>(p)});
-}
-std::vector<EdgeRecord> GeometryEdit::affectedRelationships() const
-{
-    requireKind(state_->revision.kind.c_str());
-    return state_->read->db->affectedGeometryEditEdges(*state_->read->txn, state_->revision.objectUuid, edits_, state_->revision.uuid);
-}
-std::string GeometryEdit::commit(const std::vector<GeometryEdgeEdit>& decisions)
-{
-    requireKind(state_->revision.kind.c_str());
-    auto& db = *state_->read->db;
-    RevisionSelection expected{{state_->revision.objectUuid, state_->objectRevision}};
-    // A relationship action also revises its other endpoint. Pin those heads
-    // to the same snapshot, leaving the existing edge checks authoritative.
-    for (const auto& decision : decisions) {
-        const auto edge = db.edgeByUuid(*state_->read->txn, decision.edgeUuid);
-        if (!edge) throw std::invalid_argument("relationship not found in snapshot");
-        if (edge->aUuid != state_->revision.objectUuid && edge->bUuid != state_->revision.objectUuid)
-            throw std::invalid_argument("relationship does not belong to edited object");
-        for (const auto& id : {edge->aUuid, edge->bUuid}) {
-            const auto revision = db.currentObjectRevision(*state_->read->txn, id);
-            if (!revision) throw std::invalid_argument("relationship endpoint not found");
-            expected[id] = revision->uuid;
-        }
-    }
-    auto write = db.write(expected);
-    const auto result = db.editGeometry(write, state_->revision.objectUuid, edits_, state_->revision.uuid, decisions);
-    write.commit();
-    committed_ = true;
-    return result;
-}
 } // namespace vc::objects

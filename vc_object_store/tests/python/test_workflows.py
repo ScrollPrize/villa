@@ -44,17 +44,23 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
             db.close()
     with pytest.raises(RuntimeError, match='closed'):
         view.load()
-    coordinates = {'volume_uuid': '12345678-1234-1234-1234-123456789abc', 'scale_factor': 2**60 + 1}
+    coordinates = {'volume_uuid': '20260411134726', 'scale_factor': 2**60 + 1}
     db.set_meta(uid, 'coordinates', coordinates)
+    binding = {'active_volume_id': 'display-only', 'shape_zyx': [8, 9, 10]}
+    db.set_meta(uid, 'coordinate_binding', binding)
+    db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
     assert db.export_geometry(uid, output) == revision
     with pytest.raises((RuntimeError, ValueError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
-        report = other.ingest_geometry_source(kind, output, coordinate_context=coordinates)
+        report = other.ingest_geometry_source(kind, output)
         assert not report['problems'] and report['ingested'] == 1
         imported = other.objects_by_kind(kind)[0]['uuid']
         assert other.object(imported)['meta']['coordinates'] == coordinates
+        assert other.object(imported)['meta']['coordinate_binding'] == binding
+        assert other.object(imported)['meta']['source']['retained_note'] == 'native'
+        assert 'coordinates' not in other.object(imported)['meta']['source']
         current = other.current_geometry(imported)['uuid']
         expected = raw if kind != 'point_collection' else np.asarray(geometry.points, dtype='<f8')[np.argsort(geometry.ids)].tobytes()
         assert other.read_geometry_array(current, array_name) == expected
@@ -177,9 +183,9 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     with db.geometry_snapshot() as snapshot:
         view = snapshot.point_collection(uid)
         assert view.point(30) == [7, 8, 9]
-        edit = view.edit()
-        edit.move_point(30, [10, 11, 12])
-        third = edit.commit()
+        with db.write(expected_revisions={uid: view.object_revision}) as tx:
+            third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
+                data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
     with ObjectStore.create(db.path + '.peer', author='peer') as peer:
@@ -273,3 +279,261 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
         with db.write() as tx:
             tx.upsert_object(dict(kind=kind, **{kind: {'bbox': [1, 2]}}))
     assert db.object_count(kind) == 1
+
+
+def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tmp_path):
+    import json
+    import uuid
+    ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    edge_uuid = str(uuid.uuid4())
+    for uid in ids:
+        db.upsert_object(dict(uuid=uid, kind='fiber', name='same name'))
+        geometry = Fiber([[1, 2, 3], [4, 5, 6]], [[1, 2, 3], [4, 5, 6]])
+        geometry.control_point_ids = [90, 10]
+        db.put_geometry(uid, geometry)
+    anchor = lambda ident, position: dict(points=[dict(array='control_point_ids', index=[ident])],
+                                        position=position, direction=[1, 0, 0])
+    db.add_edge(dict(uuid=edge_uuid, kind='fiber_branch', a=ids[0], b=ids[1],
+                    a_anchor=anchor(10, [4, 5, 6]), b_anchor=anchor(90, [1, 2, 3])))
+    db.set_approval(edge_uuid, 'approved')
+    directory = tmp_path / 'fibers'
+    directory.mkdir()
+    for uid in ids:
+        db.export_geometry(uid, directory / (uid + '.json'))
+    first = json.loads((directory / (ids[0] + '.json')).read_text())
+    branch = first['branches'][0]
+    assert branch['edge_uuid'] == edge_uuid and branch['pending'] is False
+    assert branch['control_point_index'] == 1 and branch['branch_control_point_index'] == 0
+    assert branch['target_uuid'] == ids[1]
+    assert 'optimization_mode' not in first
+    with ObjectStore.create(str(tmp_path / 'imported.vcobj'), author='test') as other:
+        report = other.ingest_geometry_source('fiber', directory)
+        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        edge = other.edges_by_kind('fiber_branch')[0]
+        assert edge['uuid'] == edge_uuid and edge['approval_state'] == 'approved'
+    # Conflicting reciprocal declarations must roll back the whole batch.
+    first['branches'][0]['pending'] = True
+    (directory / (ids[0] + '.json')).write_text(json.dumps(first))
+    with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', directory)['problems']
+        assert other.object_count('fiber') == 0
+
+
+def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path):
+    import json
+    import uuid
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    def fiber(uid, target, filename):
+        return dict(type='vc3d_fiber', version=4, uuid=uid, name='same label',
+                    control_point_ids=[10, 20], control_points=[{'position': [0, 0, 0]}, {'position': [1, 0, 0]}],
+                    line_points=[[0, 0, 0], [1, 0, 0]], branches=[dict(
+                        target_uuid=target, branch_file=filename, control_point_index=0,
+                        branch_control_point_index=0, control_point_position=[0, 0, 0],
+                        branch_control_point_position=[0, 0, 0], control_point_direction=[1, 0, 0],
+                        branch_control_point_direction=[1, 0, 0])])
+    first, second = fiber(a, b, 'peer.json'), fiber(b, a, 'root.json')
+    root = tmp_path / 'root.json'
+    root.write_text(json.dumps(first))
+    (tmp_path / 'peer.json').write_text(json.dumps(second))
+    result = db.ingest_geometry_source('fiber', root)
+    assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
+    # Exported UUID-addressed documents can be bundled without their original files.
+    documents = []
+    for uid in (a, b):
+        output = tmp_path / (uid + '.json')
+        db.export_geometry(uid, output)
+        documents.append(json.loads(output.read_text()))
+    db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
+    historical_pin = db.current_object_revision(a)['uuid']
+    with db.write(expected_revisions=heads(db, a, b)) as tx:
+        tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
+    historical = tmp_path / 'historical-graph.json'
+    db.export_geometry(a, historical, object_revision_uuid=historical_pin)
+    assert json.loads(historical.read_text()) == documents[0]
+    current = tmp_path / 'current-graph.json'
+    db.export_geometry(a, current)
+    assert not json.loads(current.read_text())['branches']
+    collection = tmp_path / 'collection.json'
+    collection.write_text(json.dumps(dict(type='vc3d_fiber_collection', version=1, point_collections=documents)))
+    with ObjectStore.create(str(tmp_path / 'roundtrip.vcobj'), author='test') as other:
+        result = other.ingest_geometry_source('fiber', collection)
+        assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
+    # No filename-based endpoint repair, even when both files are available.
+    del first['branches'][0]['target_uuid']
+    root.write_text(json.dumps(first))
+    with ObjectStore.create(str(tmp_path / 'invalid.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', root)['problems']
+        assert other.object_count('fiber') == 0
+    collection.write_text(json.dumps(documents))
+    with ObjectStore.create(str(tmp_path / 'bare.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', collection)['problems']
+        assert other.object_count('fiber') == 0
+
+
+def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
+    import json
+    import uuid
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    files = [f'anon_{i}.json' for i in range(3)]
+
+    def branch(target, own, other, direction, branch_direction):
+        return dict(branch_file=files[target], branch_fiber_id=target, control_point_index=own,
+                    branch_control_point_index=other, control_point_position=[0, 0, 0],
+                    branch_control_point_position=[0, 0, 0], control_point_direction=direction,
+                    branch_control_point_direction=branch_direction)
+
+    def write(directory, noise):
+        directory.mkdir()
+        documents = [dict(type='vc3d_fiber', version=3, uuid=uid, filename=name, sequence=i,
+                          control_points=[{'position': [i, 0, 0]}, {'position': [i, 1, 0]}],
+                          line_points=[[i, 0, 0], [i, 1, 0]], branches=[])
+                     for i, (uid, name) in enumerate(zip(ids, files))]
+        documents[0].update(vc_open_data_coordinate_space='Sample/20260411134726@L0',
+                            vc_open_data_source_coordinate_scale_factor=1)
+        # VC3D v3 wrote each link from both ends; directions differ by float noise.
+        documents[0]['branches'].append(branch(1, 1, 0, [1, 0, 0], [0, 1, 0]))
+        documents[1]['branches'].append(branch(0, 0, 1, [0, 1 + noise, 0], [1, 0, 0]))
+        for i, document in enumerate(documents):
+            (directory / files[i]).write_text(json.dumps(document))
+
+    write(tmp_path / 'fibers', 1e-16)
+    with ObjectStore.create(str(tmp_path / 'v3.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source(
+            'fiber', tmp_path / 'fibers', coordinate_context=dict(volume_uuid='20260411134726', scale_factor=1))
+        assert report == dict(ingested=3, edges_imported=1, problems=[])
+        edge = store.edges_by_kind('fiber_branch')[0]
+        assert {edge['a'], edge['b']} == set(ids[:2]) and edge['approval_state'] == 'approved'
+        for uid in ids:
+            assert store.object(uid)['meta']['coordinates'] == dict(volume_uuid='20260411134726', scale_factor=1)
+    # Reciprocal declarations that genuinely disagree still roll back the batch.
+    write(tmp_path / 'conflict', 1e-3)
+    with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as store:
+        assert store.ingest_geometry_source('fiber', tmp_path / 'conflict')['problems']
+        assert store.object_count('fiber') == 0
+
+
+def test_uuidless_fiber_files_are_named_from_their_file_names(tmp_path):
+    import json
+    import uuid
+    files = ['kb_20260713T041915396_000154.json', 'lt_20260707T055926767_000404.json']
+    (tmp_path / 'fibers').mkdir()
+    for i, name in enumerate(files):
+        document = dict(type='vc3d_fiber', version=3, filename=name, sequence=i,
+                        control_points=[{'position': [i, 0, 0]}, {'position': [i, 1, 0]}],
+                        line_points=[[i, 0, 0], [i, 1, 0]],
+                        branches=[dict(branch_file=files[1 - i], branch_fiber_id=1 - i, control_point_index=i,
+                                       branch_control_point_index=1 - i, control_point_position=[0, 0, 0],
+                                       branch_control_point_position=[0, 0, 0],
+                                       control_point_direction=[1, 0, 0] if i == 0 else [0, 1, 0],
+                                       branch_control_point_direction=[0, 1, 0] if i == 0 else [1, 0, 0])])
+        (tmp_path / 'fibers' / name).write_text(json.dumps(document))
+    # Version 1 shares the folder: bare XYZ control points, no optimization_mode.
+    version1 = 'kb_20260712T101010101_000003.json'
+    (tmp_path / 'fibers' / version1).write_text(json.dumps(dict(
+        type='vc3d_fiber', version=1, filename=version1, sequence=3, branches=[],
+        control_points=[[5, 0, 0], [5, 1, 0]], line_points=[[5, 0, 0], [5, 1, 0]])))
+    # RFC 4122 version 5 in the store's fixed namespace: every machine mints the same UUIDs.
+    namespace = uuid.UUID('e14f6968-9145-494d-8b06-ab2f2fac7f3b')
+    expected = {str(uuid.uuid5(namespace, 'vc3d_fiber/' + name)) for name in files}
+    for store_name in ('a.vcobj', 'b.vcobj'):
+        with ObjectStore.create(str(tmp_path / store_name), author='test') as store:
+            assert store.ingest_geometry_source('fiber', tmp_path / 'fibers') == dict(
+                ingested=3, edges_imported=1, problems=[])
+            edge = store.edges_by_kind('fiber_branch')[0]
+            assert {edge['a'], edge['b']} == expected
+            assert store.object(str(uuid.uuid5(namespace, 'vc3d_fiber/' + version1)))['kind'] == 'fiber'
+    # A single-file import resolves its UUID-less branch peer by file name too.
+    with ObjectStore.create(str(tmp_path / 'single.vcobj'), author='test') as store:
+        assert store.ingest_geometry_source('fiber', tmp_path / 'fibers' / files[0])['problems'] == []
+        assert {store.object(uid)['uuid'] for uid in expected} == expected
+
+
+@pytest.mark.parametrize('kind,geometry', [
+    ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], [])),
+    ('point_collection', PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]])),
+])
+def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geometry):
+    import json
+    uid, first_geometry = put(db, geometry, kind)
+    db.set_meta(uid, 'coordinates', {'scale_factor': 2})
+    before = db.current_object_revision(uid)['uuid']
+    db.set_meta(uid, 'coordinates', {'scale_factor': 4})
+    output = tmp_path / 'historical.json'
+    assert db.export_geometry(uid, output, object_revision_uuid=before) == first_geometry
+    doc = json.loads(output.read_text())
+    if kind == 'point_collection':
+        doc = next(iter(doc['collections'].values()))
+    assert doc['coordinates']['scale_factor'] == 2
+    with pytest.raises(RuntimeError, match='object revision'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', object_revision_uuid=first_geometry)
+
+
+def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
+    import vc_object_store as vos
+    hub = tmp_path / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    with pytest.raises(RuntimeError, match='hosted hub'):
+        ObjectStore.open(str(hub), author='curator')
+    for name in ('script', 'viewer'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    with ObjectStore.open(str(tmp_path / 'script.vcobj'), author='script') as script, \
+            ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
+        with pytest.raises(RuntimeError, match='not leased'):
+            script.set_meta(fiber, 'review', 'done')
+        [lease] = script.acquire_leases([fiber])
+        assert lease['author'] == 'script'
+        script.set_meta(fiber, 'review', 'done')
+        assert script.hub_status()['pending'] == [fiber]
+        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
+        assert viewer.hub_sync()['pulled'] == 1
+        assert viewer.object(fiber)['meta']['review'] == 'done'
+        with pytest.raises(RuntimeError, match='leased to script'):
+            viewer.acquire_leases([fiber])
+        script.release_leases([fiber])
+        assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
+
+
+def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkeypatch):
+    """The C++ SFTP test executable acts as ssh and serves files with the installed sftp-server."""
+    import os
+    from urllib.parse import quote
+    import vc_object_store as vos
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    fixture = Path(build).resolve().parent / 'bin' / 'test_object_store_sftp' if build else None
+    server = next((p for p in ('/usr/lib/openssh/sftp-server', '/usr/lib/ssh/sftp-server', '/usr/libexec/sftp-server',
+                               '/usr/libexec/openssh/sftp-server') if Path(p).exists()), None)
+    if not fixture or not fixture.exists() or not server:
+        pytest.skip('needs the built test_object_store_sftp and an installed OpenSSH sftp-server')
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'ssh').symlink_to(fixture)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    monkeypatch.setenv('VC_SFTP_TEST_SERVER', server)
+    monkeypatch.setenv('VC_SFTP_TEST_PASSWORD', 'hunter2')
+    hub = tmp_path / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    url = 'sftp://annotator@test-host' + quote(str(hub))
+    prompts = []
+    vos.set_sftp_authenticator(lambda destination, prompt, confirmation: prompts.append(destination) or 'hunter2')
+    try:
+        vos.hub_clone(url, str(tmp_path / 'replica.vcobj'), 'script')
+        vos.hub_clone(str(hub), str(tmp_path / 'local.vcobj'), 'viewer')
+        with ObjectStore.open(str(tmp_path / 'replica.vcobj'), author='script') as script, \
+                ObjectStore.open(str(tmp_path / 'local.vcobj'), author='viewer') as viewer:
+            assert script.hub_status()['hub'] == url
+            script.acquire_leases([fiber])
+            script.set_meta(fiber, 'review', 'remote')
+            assert script.hub_sync()['pushed'] == 1
+            assert viewer.hub_sync()['pulled'] == 1 and viewer.object(fiber)['meta']['review'] == 'remote'
+        assert prompts and set(prompts) == {'annotator@test-host'}
+        assert vos.hub_lock_age(url) is None
+    finally:
+        vos.set_sftp_authenticator(None)

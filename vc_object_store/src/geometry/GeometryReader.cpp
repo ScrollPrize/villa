@@ -185,7 +185,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     const ChunkKey key{name, index};
     auto found = chunks_.find(key);
     if (found != chunks_.end()) {
-        requestBytes(found->second.bytes.size(), &FiberRegionStats::cacheBytes);
+        requestBytes(found->second.bytes.size(), &RegionStats::cacheBytes);
         recency_.splice(recency_.end(), recency_, found->second.recency);
         visit(found->second.bytes);
         return;
@@ -198,7 +198,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
         if (readRequest) {
             Statement size(db_, "SELECT length(data) FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?",
                 parseUuid(materializedObject_), name, index);
-            if (size.row()) requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+            if (size.row()) requestBytes(size.i64(0), &RegionStats::payloadBytes);
         }
         Statement current(db_, "SELECT data,hash FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?",
             parseUuid(materializedObject_), name, index);
@@ -235,7 +235,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
                     "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
                     baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
                 if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
-                requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+                requestBytes(size.i64(0), &RegionStats::payloadBytes);
             }
             Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
                                  "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
@@ -282,7 +282,7 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
     if (offset < 0 || offset > length) throw std::out_of_range("geometry: invalid byte offset");
     const int64_t size = count.value_or(length - offset);
     if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
-    requestBytes(size, &FiberRegionStats::reconstructedBytes);
+    requestBytes(size, &RegionStats::reconstructedBytes);
     std::vector<uint8_t> result(size);
     if (!size) return result;
     if (offset == 0 && size == length) {

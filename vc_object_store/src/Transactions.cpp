@@ -1,10 +1,12 @@
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
 #include "imports/SourceIdentityIndex.hpp"
+#include "hub/HubRules.hpp"
 
 namespace vc::objects {
 using namespace detail;
-Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_)
+Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
+    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_))
 {
     other.handle_ = nullptr;
 }
@@ -39,11 +41,18 @@ void Txn::release(bool commit)
         if (commit && write_) {
             refreshSourceIdentityIndex(conn);
             publishHistory(conn);
+            enforceHubRules(conn, *activeStatementPools.at(conn), db_->impl_->hubRole);
+            for (const auto& [uuid, expected] : expectedRevisions_) {
+                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
+                               formatUuid(parseUuid(uuid)));
+                committedRevisions_[uuid] = head.row() ? std::optional(head.text(0)) : std::nullopt;
+            }
         }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
     }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
+        committedRevisions_.clear();
         releaseConnection(); throw;
     }
     releaseConnection();
@@ -87,8 +96,11 @@ WriteTxn ObjectStore::write()
     impl_->statementPools.at(impl_->writer)->readSnapshot = false;
     impl_->statementPools.at(impl_->writer)->checkedAction = false;
     impl_->statementPools.at(impl_->writer)->actionConflict = false;
-    try { exec(impl_->writer, "BEGIN IMMEDIATE;"); }
-    catch (...) { activeStatementPools.erase(impl_->writer); throw; }
+    try {
+        exec(impl_->writer, "BEGIN IMMEDIATE;");
+        if (impl_->hubRole != HubRole::None) beginHubWrite(impl_->writer, *impl_->statementPools.at(impl_->writer));
+    }
+    catch (...) { sqlite3_exec(impl_->writer, "ROLLBACK;", nullptr, nullptr, nullptr); activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);
 }
@@ -97,6 +109,7 @@ WriteTxn ObjectStore::write(const RevisionSelection& expected)
 {
     auto txn = write();
     expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
+    txn.expectedRevisions_ = expected;
     return txn;
 }
 

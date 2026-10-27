@@ -20,9 +20,9 @@ namespace {
 
 struct Options {
     fs::path atlasDir;
+    fs::path objectStore;
     fs::path projectVolpkgJson;
     fs::path volpkgRoot;
-    fs::path fiberPathRoot;
     fs::path lasagnaManifest;
     fs::path output;
     vc::atlas::AtlasConstraintExportOptions exportOptions;
@@ -32,13 +32,13 @@ struct Options {
 void printUsage(const char* argv0)
 {
     std::cerr
+        << "Object store: --object-store PATH (required for mapped fibers)\n"
         << "Usage: " << argv0
         << " <atlas_dir> [project.volpkg.json] --output <pointcollections.json>\n\n"
         << "Exports atlas line and cross-winding constraints as VC3D point collections.\n"
         << "Options:\n"
         << "  --output PATH                         Output point collection JSON (required)\n"
         << "  --lasagna-manifest PATH               Override selected Lasagna dataset\n"
-        << "  --fiber-path PATH                     Base directory for atlas fiber JSON paths\n"
         << "  --debug-image PATH                    Write one debug image; extension selects format\n"
         << "  --dbg-dir DIR                         Write aggregate/per-constraint LZW TIFFs, including wrapped cross overlays\n"
         << "  --link-table                          Print base and temporary atlas link debug table\n"
@@ -105,6 +105,8 @@ Options parseArgs(int argc, char** argv)
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--object-store" && i + 1 < argc) { options.objectStore = argv[++i]; continue; }
+        if (arg.starts_with("--object-store=")) { options.objectStore = arg.substr(15); continue; }
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             std::exit(0);
@@ -131,10 +133,6 @@ Options parseArgs(int argc, char** argv)
         }
         if (auto value = optionValue(arg, "--lasagna-manifest", i, argc, argv); !value.empty()) {
             options.lasagnaManifest = value;
-            continue;
-        }
-        if (auto value = optionValue(arg, "--fiber-path", i, argc, argv); !value.empty()) {
-            options.fiberPathRoot = value;
             continue;
         }
         if (auto value = optionValue(arg, "--debug-image", i, argc, argv); !value.empty()) {
@@ -269,11 +267,15 @@ int main(int argc, char** argv)
         Options options = parseArgs(argc, argv);
         resolveProjectContext(options);
 
+        auto store = std::make_shared<vc::objects::ObjectStoreSession>();
+        vc::objects::OpenOptions storeOptions; storeOptions.readOnly = true;
+        if (options.objectStore.empty()) throw std::invalid_argument("missing --object-store");
+        store->attach(options.objectStore, storeOptions);
         const auto exportData =
             vc::atlas::loadLasagnaAtlasExport(
                 options.atlasDir,
                 options.volpkgRoot,
-                options.fiberPathRoot);
+                store);
         QuadSurface baseSurface(exportData.basePath);
 
         auto result = vc::atlas::exportAtlasConstraints(

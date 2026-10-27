@@ -166,7 +166,7 @@ const QColor kSuspect(QStringLiteral("#ff6b6b"));
 // H/V links are violet, same-type (H-H, V-V) links orange, both go pale
 // blue / pale orange while they await review, and an unreviewed automatic
 // link is cyan / pink. Every row is built from the one shared table
-// (line_annotation::linkStateRgb), as the slice overlay and the generated
+// (line_annotation::linkStateRgb), as the store overlay and the generated
 // views build theirs.
 struct LinkPalette {
     QColor pen;
@@ -1980,7 +1980,6 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                                                link.branchControlPointIndex,
                                                link.pending,
                                                link.adjacent,
-                                               link.adjacentExplicit,
                                                link.autoLink});
             }
             inputs.push_back(std::move(input));
@@ -4206,7 +4205,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     // re-compared when an action fires, because bestIndex indexes the control
     // points as they were when the menu was built — an edit in between could
     // have made it mean a different point, or none; and the fiber must still
-    // be loaded under the captured id and file name at that same moment.
+    // be in the store under the captured id and file name at that same moment.
     const vc3d::fiber_map::FiberMapDependencies menuDependencies =
         currentDependencies();
     // Parentless: exec() runs a nested event loop, and a parented stack menu would
@@ -4252,12 +4251,12 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     return;
                 }
                 // The defense the generation cannot give: a fiber no longer
-                // loaded under its id and name under an unchanged generation
+                // in the store under its id and name under an unchanged generation
                 // means a bump was missed somewhere, and this map cannot be
                 // trusted until it is rebuilt — the one staleness that latches.
-                if (!_controller->hasLoadedFiber(fiberId, fileName)) {
+                if (!_controller->storedFiberHasFileName(fiberId, fileName)) {
                     markStale(tr("Fibers changed — press Update"));
-                    Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
+                    Logger()->warn("Fiber map: {} is no longer in the store; not navigating",
                                    fileName);
                     return;
                 }
@@ -4453,8 +4452,8 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
         otherFile = entry->fiber.fileName;
     }
     if (subjectFile.empty() || otherFile.empty() ||
-        !_controller->hasLoadedFiber(subjectId, subjectFile) ||
-        !_controller->hasLoadedFiber(otherId, otherFile)) {
+        !_controller->storedFiberHasFileName(subjectId, subjectFile) ||
+        !_controller->storedFiberHasFileName(otherId, otherFile)) {
         markStale(tr("Fibers changed — press Update"));
         return;
     }
@@ -4477,7 +4476,7 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
     // Phase B.
     LineAnnotationController::FiberMapAutoLinkOutcome prepared;
     try {
-        prepared = controller->prepareFiberMapAutoLink(subjectId, subjectFile, otherId, otherFile);
+        prepared = controller->prepareFiberMapAutoLink(subjectId, otherId);
     } catch (const std::exception& ex) {
         prepared.ok = false;
         prepared.message = tr("Could not prepare the link: %1").arg(QString::fromUtf8(ex.what()));
@@ -4545,10 +4544,10 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
                       _controller->fiberDisplayName(otherId)));
         return;
     }
-    const auto sourcePosition = [this, controller](uint64_t fiberId, const std::string& fileName,
+    const auto sourcePosition = [this, controller](uint64_t fiberId,
                                                    const vc3d::fiber_map::PlacedFiber& placed,
                                                    double arclength) -> std::optional<double> {
-        const std::vector<cv::Vec3d>* linePoints = controller->storedFiberLinePoints(fiberId, fileName);
+        const auto linePoints = controller->fiberMapLinePoints(fiberId);
         if (!linePoints || linePoints->empty()) {
             return std::nullopt;
         }
@@ -4557,9 +4556,9 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
             _layout.rRefVx);
         return vc3d::fiber_map::autolink::sourcePositionAtArclength(raw, arclength);
     };
-    const auto positionA = sourcePosition(subjectId, subjectFile, subjectEntry->fiber,
+    const auto positionA = sourcePosition(subjectId, subjectEntry->fiber,
                                           meeting->a.arclength);
-    const auto positionB = sourcePosition(otherId, otherFile, otherEntry->fiber,
+    const auto positionB = sourcePosition(otherId, otherEntry->fiber,
                                           meeting->b.arclength);
     if (!positionA || !positionB) {
         bail(tr("Fibers changed — press Update"));
@@ -4569,11 +4568,9 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
     // Phase D.
     LineAnnotationController::FiberMapAutoLinkEndpoint endpointA;
     endpointA.fiberId = subjectId;
-    endpointA.fileName = subjectFile;
     endpointA.linePosition = *positionA;
     LineAnnotationController::FiberMapAutoLinkEndpoint endpointB;
     endpointB.fiberId = otherId;
-    endpointB.fileName = otherFile;
     endpointB.linePosition = *positionB;
     const uint64_t mapGeneration = _layoutGeneration;
     const auto mapStillFresh = [self, menuDependencies, mapGeneration]() {
@@ -4765,7 +4762,7 @@ void FiberMapWorkspace::deleteConfirmedFiber(
     }
     // Anything could have happened while the dialog stood open (a reload, a
     // package switch): the dependency set is checked again, and then the
-    // fiber must still be loaded under the id AND the name the menu named
+    // fiber must still be in the store under the id AND the name the menu named
     // (runtime ids are stable and unique across sources; a bare name is
     // not, so the id is what is deleted). A fiber gone under unchanged
     // dependencies means the map is not to be trusted until rebuilt - the
@@ -4779,9 +4776,9 @@ void FiberMapWorkspace::deleteConfirmedFiber(
                        fileName);
         return;
     }
-    if (!_controller->hasLoadedFiber(fiberId, fileName)) {
+    if (!_controller->storedFiberHasFileName(fiberId, fileName)) {
         markStale(tr("Fibers changed — press Update"));
-        Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
+        Logger()->warn("Fiber map: {} is no longer in the store; not deleting", fileName);
         return;
     }
     Logger()->info("Fiber map: deleting fiber {}", fileName);

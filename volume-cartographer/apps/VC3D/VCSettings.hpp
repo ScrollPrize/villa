@@ -74,6 +74,14 @@ namespace project {
 }
 
 // -----------------------------------------------------------------------------
+// Object Store Settings
+// -----------------------------------------------------------------------------
+namespace object_store {
+    // Settings array, most recent first; entries hold path, read_only, remote.
+    constexpr auto RECENT = "object_store/recent";
+}
+
+// -----------------------------------------------------------------------------
 // Viewer Settings
 // -----------------------------------------------------------------------------
 namespace viewer {
@@ -342,6 +350,10 @@ namespace line_annotation {
     // app-global "Sync cursor across views" toggle.
     constexpr auto MIRROR_CURSOR_ACROSS_PANES = "lineAnnotation/mirror_cursor_across_panes";
     constexpr bool MIRROR_CURSOR_ACROSS_PANES_DEFAULT = true;
+    // Stored fibers the user opens start with editing enabled instead of
+    // read-only. Agent-driven opens and collection inspections ignore it.
+    constexpr auto OPEN_FIBERS_EDITABLE = "lineAnnotation/open_fibers_editable";
+    constexpr bool OPEN_FIBERS_EDITABLE_DEFAULT = false;
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
@@ -518,8 +530,8 @@ namespace volume_overlay {
     constexpr auto OPACITY = "opacity";
     constexpr auto WINDOW_LOW = "window_low";
     constexpr auto WINDOW_HIGH = "window_high";
-    constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto INTENSITY_AS_ALPHA = "intensity_as_alpha";
     constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";

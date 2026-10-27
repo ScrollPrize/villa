@@ -1332,23 +1332,13 @@
        </property>
       </widget>
      </item>
-     <item row="2" column="0">
-      <widget class="QLabel" name="labelOverlayThreshold">
+     <item row="2" column="0" colspan="2">
+      <widget class="QCheckBox" name="overlayIntensityAsAlphaCheck">
        <property name="text">
-        <string>Overlay threshold</string>
+        <string>Intensity as alpha</string>
        </property>
-      </widget>
-     </item>
-     <item row="2" column="1">
-      <widget class="QSpinBox" name="overlayThresholdSpin">
-       <property name="minimum">
-        <number>0</number>
-       </property>
-       <property name="maximum">
-        <number>255</number>
-       </property>
-       <property name="value">
-        <number>0</number>
+       <property name="toolTip">
+        <string>Use the windowed overlay intensity as blend alpha (transparent below the window, opaque above it) instead of blending uniformly inside the window.</string>
        </property>
       </widget>
      </item>
