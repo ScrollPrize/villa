@@ -54,7 +54,8 @@ bool sameRuns(const std::vector<VisibleRun>& a, const std::vector<VisibleRun>& b
 {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i)
-        if (a[i].objectUuid != b[i].objectUuid || a[i].firstSegment != b[i].firstSegment || a[i].points != b[i].points)
+        if (a[i].objectUuid != b[i].objectUuid || a[i].firstSegment != b[i].firstSegment || a[i].points != b[i].points ||
+            a[i].grid != b[i].grid)
             return false;
     return true;
 }
@@ -85,6 +86,13 @@ int main() try
 
     const auto committed = runsOf(session.geometryRegion(order, slice, surfaces()));
     require(!committed.empty() && committed[0].revisionUuid.size(), "committed surface crosses the plane");
+    // Stored x and y are the grid column and row, at twice the volume's voxels.
+    for (const auto& run : committed) {
+        require(run.grid.size() == run.points.size(), "a grid position per point");
+        for (size_t i = 0; i < run.points.size(); ++i)
+            require(std::abs(run.grid[i][0] - 2 * run.points[i][0]) < 1e-9 &&
+                    std::abs(run.grid[i][1] - 2 * run.points[i][1]) < 1e-9, "runs carry where they cross the grid");
+    }
     SurfaceProximityQuery near; near.volume = volume; near.point = {10, 20, 10.7}; near.tolerance = 1;
     const auto committedHits = session.nearestSurfaces(order, near);
     require(committedHits.size() == 1, "committed surface is near the point");

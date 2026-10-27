@@ -60,6 +60,9 @@ struct VisibleRun {
     std::string objectUuid, revisionUuid, arrayName, family;
     int64_t firstSegment = 0;
     std::vector<std::array<double, 3>> points;
+    // Surfaces: where each point lies on the points grid (column, row; fractional
+    // along the cut grid edge). Empty for polyline kinds.
+    std::vector<std::array<double, 2>> grid;
 };
 struct RegionResult {
     std::vector<VisibleRun> runs;

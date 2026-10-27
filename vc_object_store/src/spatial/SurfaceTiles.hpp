@@ -24,18 +24,20 @@ std::vector<SurfaceTileRect> surfaceTiles(int64_t rows, int64_t columns);
 class SurfaceCut {
 public:
     using Point = std::array<double, 3>;
+    // A point of the cut and where it lies on the grid (column, row).
+    struct Crossing { Point point; std::array<double, 2> grid; };
     SurfaceCut(const RegionSlice& view, const std::optional<VolumeAffine>& toTarget, int64_t columns);
     // Returns the triangles tested.
     uint64_t add(const SurfaceTile&, int64_t row, int64_t column, int64_t rows, int64_t columns);
     // The chained polylines clipped to the slice's u/v extent, one segment at a
     // time in run order: `piece(segment, continues, start, end)`, where
     // `continues` means the piece extends the previous run (only `end` is new)
-    // and otherwise starts a run at `start`.
+    // and otherwise starts a run at `start`. Each end is a Crossing.
     template <class Piece> void pieces(Piece&& piece) const;
 
 private:
     using GridEdge = std::pair<int64_t, int64_t>;
-    struct Slot { GridEdge edge; Point point{}; std::array<size_t, 2> segments{none, none}; };
+    struct Slot { GridEdge edge; Crossing crossing{}; std::array<size_t, 2> segments{none, none}; };
     static constexpr size_t none = SIZE_MAX;
     std::pair<size_t, bool> insert(const GridEdge&);
     void grow();
@@ -58,16 +60,18 @@ template <class Piece> void SurfaceCut::pieces(Piece&& piece) const
     for (const auto& chain : chains()) {
         bool open = false;
         for (size_t i = 0; i + 1 < chain.size(); ++i) {
-            const auto& a = slots_[chain[i]].point;
-            const auto& b = slots_[chain[i + 1]].point;
+            const auto& a = slots_[chain[i]].crossing;
+            const auto& b = slots_[chain[i + 1]].crossing;
             double first, last;
-            if (!clip(a, b, first, last)) { open = false; continue; }
+            if (!clip(a.point, b.point, first, last)) { open = false; continue; }
             auto at = [&](double t) {
                 if (t <= 0) return a;
                 if (t >= 1) return b;
                 // a and b are crossings of target-space vertices.
-                Point p; for (int k = 0; k < 3; ++k) p[k] = a[k] + t * (b[k] - a[k]);
-                return p;
+                Crossing c;
+                for (int k = 0; k < 3; ++k) c.point[k] = a.point[k] + t * (b.point[k] - a.point[k]);
+                for (int k = 0; k < 2; ++k) c.grid[k] = a.grid[k] + t * (b.grid[k] - a.grid[k]);
+                return c;
             };
             piece(int64_t(i), open && first <= 0, at(first), at(last));
             open = last >= 1;

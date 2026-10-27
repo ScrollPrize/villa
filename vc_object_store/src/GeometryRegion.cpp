@@ -217,11 +217,13 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             result.stats.segmentTests += cut.add(surfaceTile(reader, row0, col0, rows, cols), row0, col0, rows, cols);
         }
         bool hit = false;
-        cut.pieces([&](int64_t segment, bool continues, const Point& start, const Point& end) {
-            const uint64_t added = continues ? 24 : 48;
+        cut.pieces([&](int64_t segment, bool continues, const auto& start, const auto& end) {
+            // Each point is XYZ and its grid position.
+            const uint64_t added = continues ? 40 : 80;
             if (added > options.outputByteBudget - result.stats.outputBytes) request.stop(RegionStop::OutputBudget);
-            if (!continues) result.runs.push_back({uuid, revision, "points", "", segment, {start}});
-            result.runs.back().points.push_back(end);
+            if (!continues) result.runs.push_back({uuid, revision, "points", "", segment, {start.point}, {start.grid}});
+            result.runs.back().points.push_back(end.point);
+            result.runs.back().grid.push_back(end.grid);
             result.stats.outputBytes += added;
             if (!hit) { hit = true; ++result.intersectingObjects; }
         });

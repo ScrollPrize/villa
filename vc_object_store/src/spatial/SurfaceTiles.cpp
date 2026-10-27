@@ -88,7 +88,11 @@ uint64_t SurfaceCut::add(const SurfaceTile& tile, int64_t row0, int64_t col0, in
         const auto [slot, inserted] = insert({ga, gb});
         if (inserted) {
             const double t = distance_[a] / (distance_[a] - distance_[b]);
-            for (int k = 0; k < 3; ++k) slots_[slot].point[k] = world_[a][k] + t * (world_[b][k] - world_[a][k]);
+            auto& crossing = slots_[slot].crossing;
+            for (int k = 0; k < 3; ++k) crossing.point[k] = world_[a][k] + t * (world_[b][k] - world_[a][k]);
+            const std::array<double, 2> ca{double(ga % columns_), double(ga / columns_)};
+            const std::array<double, 2> cb{double(gb % columns_), double(gb / columns_)};
+            for (int k = 0; k < 2; ++k) crossing.grid[k] = ca[k] + t * (cb[k] - ca[k]);
         }
         return slot;
     };
