@@ -1,18 +1,4 @@
-"""The histogram fast path must be bit-identical to `normalize_robust`.
-
-`normalize_robust_histogram` replaces the four order-statistic reductions in
-`normalize_robust` (percentiles 1 and 99, the median, and the MAD) with a single
-256-bin histogram pass, which is only sound for integer-valued patches -- the
-uint8 CT render widened to float32 that flat inference feeds it.  Because the
-flat path is the reader every downstream reading depends on, the only acceptable
-contract is *exactness*: for any input the fast path handles, its output must
-compare equal to `normalize_robust` element for element, in bits.
-
-These tests pin that contract on the shapes, dtypes and value distributions the
-flat reader actually produces, on the delegation cases (mask, non-integer,
-non-default percentiles, other target dtype), and on the degenerate-MAD branch
-where the fast path must hand back to `normalize_robust` rather than guess.
-"""
+"""The histogram fast path must be bit-identical to `normalize_robust`, including all delegation cases."""
 from __future__ import annotations
 
 import numpy as np
@@ -26,7 +12,6 @@ from vesuvius.image_proc.intensity.normalization import (
     normalize_robust_histogram,
 )
 
-# The patch `FlatBlockDataset` hands to `normalize_flat_patch`: depth x patch x patch.
 FLAT_PATCH_SHAPE = (17, 128, 128)
 _REFERENCE_SHAPE = (3, 48, 48)
 
@@ -46,19 +31,14 @@ def _assert_fast_matches_reference(patch: np.ndarray) -> None:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Bit-identity on the value distributions the flat reader produces
-# --------------------------------------------------------------------------- #
-
 def _render_like_patch(shape, seed):
-    """A patch with the texture statistics of a real CT render: mostly mid-grey
-    papyrus, a dark air band, and a few bright voxels, all as uint8 levels."""
+    """Render-like uint8 patch: mid-grey papyrus, a dark air band, bright specks."""
     rng = np.random.default_rng(seed)
     base = rng.normal(loc=118.0, scale=11.0, size=shape)
     base[base < 0] = 0.0
     base[base > 255] = 255.0
-    base[..., : shape[-1] // 8] = 0.0                       # air column
-    base[rng.random(shape) < 0.01] = 255.0                   # saturated specks
+    base[..., : shape[-1] // 8] = 0.0
+    base[rng.random(shape) < 0.01] = 255.0
     return np.rint(base).astype(np.uint8)
 
 
@@ -82,10 +62,6 @@ def test_bit_identical_across_dtypes(dtype):
     _assert_fast_matches_reference(patch.astype(dtype))
 
 
-# --------------------------------------------------------------------------- #
-# Edge-case value distributions (all previously observed to be tricky)
-# --------------------------------------------------------------------------- #
-
 @pytest.mark.parametrize(
     "name,make",
     [
@@ -100,8 +76,6 @@ def test_bit_identical_across_dtypes(dtype):
     ],
 )
 def test_bit_identical_on_edge_cases(name, make):
-    # Degenerate patches (constant, two-level) take `normalize_robust`'s MAD fallback and must be
-    # delegated, so they exercise the fallback path rather than the histogram one.
     _assert_fast_matches_reference(make(_REFERENCE_SHAPE))
 
 
@@ -122,10 +96,6 @@ def test_non_contiguous_input_matches_reference():
     patch = _render_like_patch((34, 128, 128), seed=13).astype(np.float32)[::2]
     _assert_fast_matches_reference(patch)
 
-
-# --------------------------------------------------------------------------- #
-# Every delegation case must go through `normalize_robust` exactly
-# --------------------------------------------------------------------------- #
 
 def test_delegates_for_non_integer_values():
     patch = _render_like_patch(FLAT_PATCH_SHAPE, seed=14).astype(np.float32) + 0.25
@@ -164,13 +134,7 @@ def test_delegates_when_masked():
     )
 
 
-# --------------------------------------------------------------------------- #
-# The flat-inference entry point must be unchanged
-# --------------------------------------------------------------------------- #
-
 def test_normalize_flat_patch_is_unchanged():
-    """`normalize_flat_patch` for the tifxyz_robust contract is bit-identical to
-    the old `normalize_robust` result, which is what shipped reads depend on."""
     infer = pytest.importorskip("vesuvius.ink_detection.inference.infer")
     for seed in (0, 1, 2):
         patch = _render_like_patch(FLAT_PATCH_SHAPE, seed=seed).astype(np.float32)
@@ -179,10 +143,6 @@ def test_normalize_flat_patch_is_unchanged():
             np.ascontiguousarray(normalize_robust(patch)),
         )
 
-
-# --------------------------------------------------------------------------- #
-# The statistics themselves, against numpy, on the hard cases
-# --------------------------------------------------------------------------- #
 
 def test_percentile_matches_numpy_on_random_multisets():
     rng = np.random.default_rng(21)
@@ -211,34 +171,21 @@ def test_median_matches_numpy_on_random_multisets():
 
 
 def test_percentile_between_two_different_order_statistics():
-    """Regression for the class real-patch sampling catches only ~0.3 % of the time:
-
-    when the percentile's two bracketing order statistics are *equal* the
-    interpolation weight is irrelevant, so a wrong weight stays hidden.  Here the
-    1st and 99th percentiles are each deliberately placed between two different
-    levels, which only an exact float64 virtual index reproduces.
-    """
+    """Both percentiles land between two different levels, so the interpolation weight matters."""
     n = FLAT_PATCH_SHAPE[0] * FLAT_PATCH_SHAPE[1] * FLAT_PATCH_SHAPE[2]
     blocks = [(40, 2786), (50, 136214), (51, 136742), (52, 2786)]
     assert sum(count for _, count in blocks) == n
     flat = np.concatenate([np.full(count, level, np.float32) for level, count in blocks])
     patch = flat.reshape(FLAT_PATCH_SHAPE)
 
-    # Both percentiles straddle a level boundary ...
     assert float(np.percentile(patch, 1.0)) == pytest.approx(40.0 + 0.27 * (50.0 - 40.0), rel=1e-6)
     assert float(np.percentile(patch, 99.0)) == pytest.approx(51.0 + 0.73 * (52.0 - 51.0), rel=1e-6)
-    # ... and the patch is NOT degenerate, so the fast path (not the fallback) runs.
     _, _, _, _, degenerate = _histogram_robust_statistics(np.rint(patch).astype(np.int64).ravel())
     assert degenerate is False
     _assert_fast_matches_reference(patch)
 
 
-# --------------------------------------------------------------------------- #
-# Adversarial degenerate cases a reviewer worries about
-# --------------------------------------------------------------------------- #
-
 def _adversarial_patches():
-    """The value distributions most likely to break an order-statistic shortcut."""
     rng = np.random.default_rng(20261027)
     yield "render-like float32", np.rint(rng.normal(118.0, 11.0, (17, 128, 128))).clip(0, 255).astype(np.float32)
     yield "three levels", rng.choice(np.array([0.0, 3.0, 255.0], np.float32), size=(24, 24))
@@ -250,13 +197,10 @@ def _adversarial_patches():
 
 @pytest.mark.parametrize("name,patch", list(_adversarial_patches()))
 def test_adversarial_patches_are_bit_identical(name: str, patch: np.ndarray) -> None:
-    """Constant, spiked, MAD-collapsing and extreme patches stay bit-identical:
-    each is either handled exactly or handed back to `normalize_robust`."""
     _assert_fast_matches_reference(patch)
 
 
 def test_delegation_kwargs_are_bit_identical() -> None:
-    """Non-default arguments fall through to `normalize_robust` unchanged."""
     patch = np.rint(np.random.default_rng(7).normal(118.0, 11.0, (17, 64, 64))).clip(0, 255).astype(np.float32)
     for kwargs in (
         dict(percentile_lower=0.5, percentile_upper=99.5),

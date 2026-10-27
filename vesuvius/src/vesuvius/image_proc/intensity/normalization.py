@@ -238,24 +238,8 @@ def normalize_robust(
     return arr
 
 
-# --------------------------------------------------------------------------- #
-# Exact histogram fast path for robust normalisation
-# --------------------------------------------------------------------------- #
-#
-# `normalize_robust` spends most of its time in four order-statistic reductions over the (large) float32
-# patch: percentile 1, percentile 99, the median and the median absolute deviation.  CT render patches are
-# integer-valued (the 9 um volumes are uint8 and are only widened to float32 for the model input), so every
-# one of those statistics is exactly recoverable from a 256-bin histogram.  `normalize_robust_histogram`
-# reproduces `normalize_robust` **bit for bit** for such patches while replacing the order statistics with a
-# single histogram pass.  Measured on the flat-inference patch shape (17 x 128 x 128 float32, the layout
-# `normalize_flat_patch` receives) it is 1.9x-3.9x faster per patch, and the call is 16-38 % of flat
-# inference wall time, so the saving reaches wall time in proportion (1.41x end to end on a real winding
-# with the render in RAM; less when store latency dominates).  The contract is bit-identity (asserted by the
-# tests); any patch the fast path cannot prove it reproduces is handed to `normalize_robust` unchanged.
-
-
 def _is_integer_valued_uint8(image: np.ndarray) -> bool:
-    """True when every value is an integer in ``[0, 255]`` (the uint8 render contract)."""
+    """True when every value is an integer in ``[0, 255]``."""
 
     if image.size == 0 or image.dtype.kind not in "iuf":
         return False
@@ -263,14 +247,14 @@ def _is_integer_valued_uint8(image: np.ndarray) -> bool:
         return bool(float(image.min()) >= 0.0 and float(image.max()) <= 255.0)
     if float(image.min()) < 0.0 or float(image.max()) > 255.0:
         return False
-    # Integers cannot be NaN/inf, but floats can, and a NaN would pass the bounds test above.
+    # NaN would pass the bounds test above.
     if not bool(np.isfinite(image).all()):
         return False
     return bool(np.array_equal(image, np.rint(image)))
 
 
 def _histogram_input(image: np.ndarray) -> np.ndarray:
-    """The flat uint8 view of an integer-valued ``[0, 255]`` patch, for ``np.bincount``."""
+    """Flat uint8 view for ``np.bincount``."""
 
     if image.dtype == np.uint8:
         return image.reshape(-1)
@@ -278,27 +262,14 @@ def _histogram_input(image: np.ndarray) -> np.ndarray:
 
 
 def _virtual_index(n: int, percentile: float) -> float:
-    """numpy's linear-method virtual index for ``(n, percentile)``, in float64.
-
-    numpy evaluates ``n * q + (alpha + q * (1 - alpha - beta)) - 1`` with ``q = percentile / 100`` and
-    ``alpha = beta = 1`` **entirely in float64** -- the index is not computed in the array's dtype, even
-    though the interpolated result is cast back to it.  Keeping the exact float64 fraction is what makes
-    this module's fast path bit-identical: rounding the position to float32 first (for ``n=278528, q=99``
-    that is 275741.71875 instead of 275741.72999999998) shifts the clipped bound by ~1e-2 grey levels on
-    every patch whose two neighbouring order statistics differ.
-    """
+    """numpy's linear-method virtual index for ``(n, percentile)``, in float64 for bit-identity."""
 
     quantile = np.true_divide(float(percentile), 100.0)
     return float(n) * quantile + (1.0 + quantile * (1.0 - 1.0 - 1.0)) - 1.0
 
 
 def _percentile_from_histogram(histogram: np.ndarray, percentile: float) -> np.float32:
-    """Linear-method percentile of an integer multiset given its ``0..255`` histogram.
-
-    Mirrors numpy's ``_get_indexes`` + ``_lerp``: the two bracketing order statistics are interpolated in
-    float64 and the result is cast back to the input dtype (float32), which is what ``np.percentile``
-    returns for a float32 array.
-    """
+    """Linear-method percentile from a ``0..255`` histogram, mirroring ``np.percentile`` bit for bit."""
 
     cumulative = np.cumsum(histogram)
     total = int(cumulative[-1])
@@ -320,12 +291,7 @@ def _percentile_from_histogram(histogram: np.ndarray, percentile: float) -> np.f
 
 
 def _median_weighted(values: np.ndarray, weights: np.ndarray) -> np.float32:
-    """``np.median`` of a weighted float32 value list, mirroring numpy **exactly**.
-
-    numpy's median is not ``np.percentile(x, 50)``: for even ``n`` it takes the float32 mean of the two
-    middle values ``(a + b) / 2``, whereas the linear percentile computes ``a + 0.5 * (b - a)``.  The two
-    differ by one ulp for some pairs.
-    """
+    """``np.median`` of a weighted value list, mirroring numpy exactly (even n: float32 mean)."""
 
     cumulative = np.cumsum(weights)
     total = int(cumulative[-1])
@@ -346,10 +312,8 @@ def _histogram_robust_statistics(
 ) -> Tuple[np.float32, np.float32, np.float32, np.float32, bool]:
     """Return ``(lower, upper, median, scaled_mad, degenerate)`` for an integer multiset.
 
-    ``lower``/``upper`` are needed by the caller as well, because villa's final ``(x - median) /
-    scaled_mad`` is applied to the **clipped** array.  ``degenerate`` is True when the MAD collapses and
-    ``normalize_robust`` would take its ``np.std`` fallback, whose value depends on numpy's float32
-    accumulation order and which the fast path therefore must not guess.
+    ``degenerate`` is True when the MAD collapsed and ``normalize_robust`` must take its ``np.std``
+    fallback, which the fast path must not guess.
     """
 
     histogram = np.bincount(values, minlength=256).astype(np.float64)
@@ -392,15 +356,8 @@ def normalize_robust_histogram(
 ) -> np.ndarray:
     """Bit-identical fast path of :func:`normalize_robust` for integer-valued patches.
 
-    The arguments mirror :func:`normalize_robust` and the return value is identical for any input the fast
-    path handles.  It applies only when the input is integer-valued in ``[0, 255]`` (the CT render
-    contract), no mask is used, the default ``1.0``/``99.0`` percentiles are requested, clipping is on and
-    the target dtype is float32; otherwise, and whenever the fast path cannot *prove* it reproduces
-    :func:`normalize_robust` (the degenerate-MAD branch), the call is delegated to :func:`normalize_robust`
-    unchanged.
-
-    ``vesuvius.ink_detection.inference.infer.normalize_flat_patch`` uses this for its ``tifxyz_robust``
-    contract, where every patch is a uint8 render widened to float32.
+    Used only for integer values in ``[0, 255]``, no mask, default percentiles, clipping and float32
+    target; anything else, including the degenerate-MAD case, is delegated to :func:`normalize_robust`.
     """
 
     arr = np.asarray(image)

@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""Check bit-identity and measure the speedup of the histogram fast path.
+"""Check bit-identity and speed of the histogram fast path on uint8 render zarrs.
 
-`normalize_robust_histogram` is only acceptable if it is *exact* for integer-valued
-patches, so this tool does two things on the data the flat reader actually sees --
-uint8 CT surface renders held as zarr arrays:
+Usage: python benchmark_robust_normalization.py /path/to/render.zarr [more.zarr ...]
 
-1. **Correctness.** For every sampled patch, compare the fast path against
-   `normalize_robust` bit for bit, and count how many took the delegated
-   (degenerate-MAD / non-integer) route.
-2. **Speed.** Time both per patch, and report the end-to-end factor implied by the
-   measured share of a screen depth spent in normalisation (the flat inference
-   contract normalises one patch, once, per block).
-
-Usage:
-
-    python benchmark_robust_normalization.py /path/to/render.zarr [more.zarr ...]
-    python benchmark_robust_normalization.py --patches 400 --repeats 3 render.zarr
-
-With no path it synthesises render-like uint8 patches, so the tool still runs
-without any scroll data.
+With no path it synthesises render-like uint8 patches.
 """
 from __future__ import annotations
 
@@ -35,12 +20,9 @@ from vesuvius.image_proc.intensity.normalization import (
     normalize_robust_histogram,
 )
 
-# The patch `FlatBlockDataset` normalises: depth 17 x patch 128 x patch 128.
 PATCH = 128
 DEPTH = 17
-# Share of a screen depth's wall time measured to be spent inside `normalize_robust`
-# (project profile, journal 2026-10-15 §88).  Used only to translate the per-patch
-# factor into an end-to-end estimate; the per-patch numbers stand on their own.
+# Measured share of flat-inference wall time spent inside `normalize_robust`.
 NORMALIZE_TIME_SHARE = 0.68
 
 
@@ -66,7 +48,6 @@ def _iter_patches(paths: list[str], rng: np.random.Generator, count: int) -> Ite
         try:
             array = zarr.open_array(path, mode="r")
         except Exception:
-            # Render zarrs are groups whose pyramid level "0" holds the data.
             group = zarr.open_group(path, mode="r")
             try:
                 array = group["0"]
@@ -116,8 +97,6 @@ def main() -> int:
         else:
             mismatched += 1
             worst = max(worst, float(np.abs(reference - fast).max()))
-        # Report how often the fast path had to hand back to `normalize_robust`
-        # (degenerate MAD), which is expected for near-flat / two-level patches.
         if _is_integer_valued_uint8(patch):
             if _histogram_robust_statistics(np.rint(patch).astype(np.int64).ravel())[4]:
                 delegated += 1

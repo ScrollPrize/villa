@@ -1,13 +1,4 @@
-"""`normalize_image`'s robust_mad mode must stay bit-identical after the fast path.
-
-`normalize_image` is the per-crop normaliser of the ink pipeline: ink training
-(`data/dataset.py`, `data/coord_patch_dataset.py`) and native 3D inference
-(`inference/infer_full3d_tifxyz.py`) all hand it a uint8 CT crop widened to float32 and the
-default `NormalizationConfig` (`robust_mad`, percentiles 1.0/99.0). It now routes that mode
-through `normalize_robust_histogram`, so the contract is the same as flat inference's:
-element-for-element identical output, with every case the fast path cannot prove delegated
-back to `normalize_robust`.
-"""
+"""`normalize_image`'s robust_mad mode must stay bit-identical through the fast path."""
 from __future__ import annotations
 
 import numpy as np
@@ -17,14 +8,11 @@ from vesuvius.image_proc.intensity.normalization import normalize_robust
 from vesuvius.ink_detection.config import NormalizationConfig
 from vesuvius.ink_detection.data.normalization import normalize_image
 
-# Crops the ink datasets produce: depth x patch x patch and a single 2D slice.
 CROP_SHAPES = [(17, 128, 128), (4, 32, 32), (128, 128), (7, 64, 64)]
 
 
 def _uint8_crop(shape, seed):
     rng = np.random.default_rng(seed)
-    # Real CT crops are mostly a smooth background with sparse structure, and they
-    # saturate at 0 and 255 far more often than a uniform sample would.
     crop = rng.normal(96.0, 40.0, size=shape).round().clip(0, 255).astype(np.uint8)
     flat = crop.reshape(-1)
     flat[rng.random(flat.size) < 0.05] = 0
@@ -50,7 +38,6 @@ def test_robust_mad_is_bit_identical_for_integer_crops(shape):
 
 
 def test_non_contiguous_view_still_matches_normalize_robust():
-    """The datasets normalise `image[valid_slices]` -- a view into a padded crop."""
     config = NormalizationConfig()
     padded = np.zeros((9, 64, 64), dtype=np.uint8)
     padded[1:9, 2:62, 3:61] = _uint8_crop((8, 60, 58), seed=21)
@@ -68,7 +55,7 @@ def test_non_contiguous_view_still_matches_normalize_robust():
 def test_non_integer_crops_still_match_normalize_robust():
     config = NormalizationConfig()
     rng = np.random.default_rng(11)
-    crop = (rng.normal(0.3, 0.02, size=(8, 48, 48)).astype(np.float32) + 0.5)  # not integer-valued
+    crop = (rng.normal(0.3, 0.02, size=(8, 48, 48)).astype(np.float32) + 0.5)
     assert not np.array_equal(crop, np.rint(crop))
 
     expected = normalize_robust(
