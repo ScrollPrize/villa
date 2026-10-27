@@ -187,9 +187,13 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
     if (area.empty()) return revision.uuid;
-    // Without a transformed view the surface holds stored coordinates.
+    // Without a transformed view the surface holds stored coordinates; an
+    // edit made through one is refused once the object or its registration
+    // has moved on since the view was opened.
     std::optional<vc::objects::TransformedGeometryView> stored;
-    if (!transformed) {
+    if (transformed) {
+        transformed->validateForWrite(db, txn);
+    } else {
         stored.emplace(vc::objects::GeometrySnapshot(db, txn).viewStored(objectUuid, revision.uuid));
         transformed = &*stored;
     }
