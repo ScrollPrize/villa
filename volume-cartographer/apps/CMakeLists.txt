@@ -53,9 +53,6 @@ add_subdirectory(VC3D)
 # CMD Line Apps #
 #################
 
-add_executable(vc_render_video src/vc_render_video.cpp)
-target_link_libraries(vc_render_video opencv_core vc_core opencv_videoio)
-
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
 target_link_libraries(vc_render_tifxyz vc_core Boost::program_options TIFF::TIFF)
 
@@ -90,23 +87,8 @@ target_link_libraries(vc_obj2tifxyz vc_core)
 add_executable(vc_obj2tifxyz_legacy src/vc_obj2tifxyz_legacy.cpp)
 target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 
-add_executable(vc_tifxyz_inp_mask src/vc_tifxyz_inp_mask.cpp)
-target_link_libraries(vc_tifxyz_inp_mask vc_core)
-
-add_executable(vc_tifxyz_trim src/vc_tifxyz_trim.cpp)
-target_link_libraries(vc_tifxyz_trim vc_core opencv_core opencv_imgcodecs TIFF::TIFF)
-
 add_executable(vc_straighten src/vc_straighten.cpp)
 target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann TIFF::TIFF)
-
-add_executable(vc_cut_windings src/vc_cut_windings.cpp)
-target_link_libraries(vc_cut_windings vc_core opencv_core)
-
-add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
-target_link_libraries(vc_tifxyz_winding vc_core)
-
-add_executable(vc_tifxyz_selfcross src/vc_tifxyz_selfcross.cpp)
-target_link_libraries(vc_tifxyz_selfcross vc_core Boost::program_options opencv_core)
 
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
 target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
@@ -114,31 +96,17 @@ target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
 target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
 
-
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
 
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
-add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
-target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
-
 add_executable(vc_merge_tifxyz src/vc_merge_tifxyz.cpp)
 target_link_libraries(vc_merge_tifxyz vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
 
 add_executable(vc_merge_patch src/vc_merge_patch.cpp)
 target_link_libraries(vc_merge_patch vc_core Boost::program_options opencv_imgcodecs opencv_imgproc opencv_flann Eigen3::Eigen)
-
-add_executable(vc_visualize src/vc_visualize.cpp)
-target_link_libraries(vc_visualize vc_core Boost::program_options)
-
-
-
-# Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
-add_executable(vc_transform_geom src/vc_transform_geom.cpp)
-target_link_libraries(vc_transform_geom vc_core Boost::program_options)
-
 
 add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp)
 target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc OpenMP::OpenMP_CXX)
@@ -151,60 +119,24 @@ target_link_libraries(vc_gen_umbilicus vc_core Boost::program_options opencv_cor
 add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
 
-add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
-target_link_libraries(vc_tifxyz2rgb
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-)
-
-add_executable(vc_rgb2tifxyz src/vc_rgb2tifxyz.cpp)
-target_link_libraries(vc_rgb2tifxyz
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-    # nlohmann_json::nlohmann_json
-)
-
 add_executable(vc_thinning src/vc_thinning.cpp)
 target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
-add_executable(vc_project_tifxyz src/vc_project_tifxyz.cpp)
-target_link_libraries(vc_project_tifxyz vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
-
-add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
-target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
-
-add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
-target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
-
-add_executable(vc_zarr_download_bench src/vc_zarr_download_bench.cpp)
-target_link_libraries(vc_zarr_download_bench vc_core Boost::program_options)
-
-add_executable(vc_zarr_download_region src/vc_zarr_download_region.cpp)
-target_link_libraries(vc_zarr_download_region vc_core Boost::program_options)
-
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
-    vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+    vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
     vc_grow_seg_from_segments vc_tifxyz2obj
     vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
-    vc_obj2tifxyz_legacy vc_tifxyz_inp_mask vc_tifxyz_trim
-    vc_straighten vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
-    vc_calc_surface_metrics
+    vc_obj2tifxyz_legacy vc_straighten vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
     vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_tifxyz_gengt vc_tifxyz_mmap_prepare
-    vc_merge_tifxyz vc_merge_patch vc_visualize
-    vc_transform_geom vc_gen_normalgrids vc_gen_umbilicus
-    vc_ngrids
-    vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
-    vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
-    vc_zarr_download_region)
+    vc_tifxyz_gengt vc_merge_tifxyz vc_merge_patch
+    vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
+    vc_thinning vc_tifxyz)
 if(VC_BUILD_FIBERLETS)
     list(APPEND VC_CLI_TARGETS vc_fiberlets)
 endif()
@@ -222,22 +154,16 @@ endif()
 add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
 
 # Reuse the neutral common PCH on the CLI apps that link vc_core.
-# vc_tifxyz_mmap_prepare is omitted — it doesn't link vc_core (no shared
-# include paths), so REUSE_FROM would fail to compile against it.
 if(VC_USE_PCH)
     foreach(_app
-        vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+        vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
         vc_grow_seg_from_segments vc_tifxyz2obj
         vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
-        vc_obj2tifxyz_legacy vc_tifxyz_inp_mask vc_tifxyz_trim
-        vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
-        vc_calc_surface_metrics
+        vc_obj2tifxyz_legacy vc_calc_surface_metrics
         vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt
-        vc_merge_tifxyz vc_merge_patch vc_visualize vc_transform_geom
-        vc_gen_normalgrids vc_gen_umbilicus vc_ngrids vc_tifxyz2rgb vc_rgb2tifxyz
-        vc_thinning
-        vc_tifxyz vc_project_tifxyz vc_zarr_to_tiff vc_zarr_recompress
-        vc_zarr_download_bench vc_zarr_download_region
+        vc_merge_tifxyz vc_merge_patch
+        vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
+        vc_thinning vc_tifxyz
         vc_straighten
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)

@@ -114,9 +114,8 @@ std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
     out.resize(n);
     // c3d_chunk_encode_max_size is ~16 MiB but typical compressed payloads
     // are 200 KiB-2 MiB.  resize() alone keeps the full capacity around,
-    // so callers that retain many encoded chunks (e.g. vc_zarr_recompress
-    // accumulating 4096 chunks per shard) were paying 16 MiB × N of dead
-    // heap per shard.  Release the slack.
+    // so callers that retain many encoded chunks were paying 16 MiB × N of
+    // dead heap.  Release the slack.
     out.shrink_to_fit();
     return out;
 }

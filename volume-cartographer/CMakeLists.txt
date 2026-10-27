@@ -545,7 +545,7 @@ endif()
 # absolute dylib path so it never degrades into a bare, unresolvable -l flag.
 if(APPLE)
     set(_vc_opencv_modules
-        core imgproc imgcodecs video videoio flann ximgproc)
+        core imgproc imgcodecs video flann ximgproc)
     if(OpenCV_VERSION_MAJOR GREATER_EQUAL 5)
         list(APPEND _vc_opencv_modules calib geometry)
     else()

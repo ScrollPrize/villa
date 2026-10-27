@@ -26,8 +26,6 @@ add_library(vc_core
         src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
-        src/TransformSurface.cpp
-        src/ScaleTifxyz.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
@@ -62,7 +60,6 @@ add_library(vc_core
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
-        src/render/ZarrDownloadBenchmark.cpp
         src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp

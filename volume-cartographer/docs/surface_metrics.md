@@ -7,14 +7,9 @@ vc_calc_surface_metrics can calculate surface metrics from point collection grou
     ```shell
     vc_object_export --db <objects.vcobj> --uuid <surface uuid> --output <tifxyz_path>
     ```
-- calculate relative surface winding number using vc_tifxyz_winding (only required of inter winding metrics)
+- run vc_calc_surface_metrics on the surface (and, for the inter winding metrics, a per-cell relative winding number `.tif` of the same size) to get metrics json
     ```shell
-    vc_tifxyz_winding <tifxyz_path>
-    ```
-    This will create files in the working directory (you need the winding.tif); running it in the exported tifxyz directory overwrites winding information already there
-- run vc_calc_surface_metrics on surface and winding to get metrics json
-    ```shell
-    vc_calc_surface_metrics --surface <tifxyz_path> winding <winding.tif> --collection <annnotated_gt.json> --output <metrics.json>
+    vc_calc_surface_metrics --surface <tifxyz_path> --winding <winding.tif> --collection <annnotated_gt.json> --output <metrics.json>
     ```
     This will create the json file with the metrics:
     - surface_missing_fraction : fraction of inter-winding GT points that were completely missing in surface

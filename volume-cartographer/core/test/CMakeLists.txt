@@ -904,22 +904,6 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 
 
-# The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
-# with the command-line tool so the tested code is the shipped code).
-vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
-
-# End-to-end CLI contract for the same tool: exit codes, report
-# serialization, collection envelope. Needs the binary, so it only exists
-# in configurations that build the apps -- the test shards configure with
-# VC_BUILD_APPS=OFF and apps/ returns before the target is created, which
-# would make the TARGET_FILE expression a configure error.
-if(TARGET vc_tifxyz_selfcross)
-    vc_add_test(NAME test_tifxyz_selfcross_cli
-        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
-        DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
-    add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
-endif()
-
 if(TARGET vc_render_tifxyz)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     vc_register_test_target(vc_render_tifxyz)
@@ -951,7 +935,6 @@ vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
-vc_add_test(NAME test_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
 vc_add_test(NAME test_quadsurface_smooth)

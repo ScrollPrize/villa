@@ -2,8 +2,7 @@
 //
 // QuadSurface does not auto-trim on load or save. A surface with a
 // sparse valid region surrounded by (-1,-1,-1) cells round-trips
-// at its original grid size; cropping to the valid bbox is only
-// done when the user explicitly invokes vc_tifxyz_trim.
+// at its original grid size.
 //
 // Verified here:
 //  1) Size is preserved across save+load cycles for a sparse-but-

@@ -36,8 +36,6 @@ def catalog_surface(tmp_path):
 
 @pytest.mark.parametrize("tool,args,in_place", [
     ("vc_straighten", ["--overlap-pairs", "0"], False),
-    ("vc_tifxyz_trim", [], False),
-    ("vc_tifxyz_trim", [], True),
 ])
 def test_catalog_identity_for_cli_outputs(catalog_surface, tmp_path, tool, args, in_place):
     binary = ROOT / "build/bin" / tool

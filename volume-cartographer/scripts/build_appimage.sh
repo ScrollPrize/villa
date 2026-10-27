@@ -50,10 +50,8 @@
 #   BUNDLE_GLIBC  Bundle glibc for old-distro support (1/0)   (default 1)
 #   GLIBC_SRCDIR  Where to copy glibc libs from  (default /usr/lib/<arch>-linux-gnu)
 #   EXCLUDE_TOOLS Space-separated executables to drop from the AppImage before
-#                 dependency bundling. Default drops vc_render_video — the
-#                 only thing that pulls the ~87MB opencv_videoio/ffmpeg chain.
-#                 Set EXCLUDE_TOOLS=
-#                 to keep everything. (Excluded tools remain in the Docker image.)
+#                 dependency bundling.                       (default: none)
+#                 (Excluded tools remain in the Docker image.)
 
 set -euo pipefail
 
@@ -68,7 +66,7 @@ TOOLS_DIR="${TOOLS_DIR:-$BUILD_DIR/.appimage-tools}"
 QMAKE="${QMAKE:-$(command -v qmake6 || command -v qmake || true)}"
 BUNDLE_GLIBC="${BUNDLE_GLIBC:-1}"
 GLIBC_SRCDIR="${GLIBC_SRCDIR:-/usr/lib/${ARCH}-linux-gnu}"
-EXCLUDE_TOOLS="${EXCLUDE_TOOLS-vc_render_video}"
+EXCLUDE_TOOLS="${EXCLUDE_TOOLS-}"
 STRIP_FLAGS="${STRIP_FLAGS---strip-debug}"   # unset (STRIP_FLAGS=) to skip
 DEBUG_BUNDLE="${DEBUG_BUNDLE:-1}"            # also emit VC3D-<version>-linux-<arch>-debug.tar.* companion
 
