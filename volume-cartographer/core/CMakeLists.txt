@@ -167,8 +167,6 @@ add_library(vc_lasagna
     src/lasagna/ChannelSampler.cpp
     src/lasagna/Dataset.cpp
     src/lasagna/PredictionPooling.cpp
-    src/lasagna/EclMaxflow.cpp
-    src/lasagna/EclMaxflowCut.cpp
     src/lasagna/LaplaceAmgx.cpp
     src/lasagna/LaplaceRank.cpp
     src/lasagna/LasagnaNormalSampler.cpp
@@ -179,19 +177,6 @@ add_library(vc_lasagna
     src/lasagna/MaxflowGraph.cpp
     src/lasagna/ProjectVolumes.cpp
 )
-if(VC_ENABLE_ECL_MAXFLOW)
-    target_sources(vc_lasagna PRIVATE src/lasagna/EclMaxflow.cu)
-    set_source_files_properties(src/lasagna/EclMaxflow.cpp PROPERTIES HEADER_FILE_ONLY ON)
-    target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_ECL_MAXFLOW=1)
-    target_include_directories(vc_lasagna PRIVATE
-        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/src
-        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/lib)
-    set_source_files_properties(src/lasagna/EclMaxflow.cu PROPERTIES
-        LANGUAGE CUDA
-        CUDA_SEPARABLE_COMPILATION OFF)
-    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD 20)
-    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD_REQUIRED ON)
-endif()
 if(VC_ENABLE_AMGX)
     target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_AMGX=1)
     target_link_libraries(vc_lasagna PRIVATE AMGX::amgx)

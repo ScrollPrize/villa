@@ -90,12 +90,6 @@ target_link_libraries(vc_obj2tifxyz_legacy vc_core)
 add_executable(vc_straighten src/vc_straighten.cpp)
 target_link_libraries(vc_straighten vc_core Boost::program_options opencv_core opencv_imgproc opencv_imgcodecs opencv_flann TIFF::TIFF)
 
-add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
-target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
-
-add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
-target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
-
 add_executable(vc_tifxyz_gengt src/vc_tifxyz_gengt.cpp)
 target_link_libraries(vc_tifxyz_gengt vc_core Boost::program_options)
 
@@ -119,9 +113,6 @@ target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres
 add_executable(vc_thinning src/vc_thinning.cpp)
 target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 
-add_executable(vc_tifxyz src/vc_tifxyz.cpp)
-target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
-
 # Stable compile-coverage entry point for CI. Keep every command-line
 # executable here so the CLI shard cannot silently omit a newly added tool.
 set(VC_CLI_TARGETS
@@ -129,11 +120,10 @@ set(VC_CLI_TARGETS
     vc_grow_seg_from_segments vc_tifxyz2obj
     vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
     vc_obj2tifxyz_legacy vc_straighten
-    vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
-    vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
+    vc_fiber_trace_metric vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
     vc_tifxyz_gengt vc_merge_tifxyz vc_merge_patch
     vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
-    vc_thinning vc_tifxyz)
+    vc_thinning)
 if(VC_BUILD_FIBERLETS)
     list(APPEND VC_CLI_TARGETS vc_fiberlets)
 endif()
@@ -157,10 +147,10 @@ if(VC_USE_PCH)
         vc_grow_seg_from_segments vc_tifxyz2obj
         vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
         vc_obj2tifxyz_legacy
-        vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph vc_tifxyz_gengt
+        vc_fiber_trace_metric vc_tifxyz_gengt
         vc_merge_tifxyz vc_merge_patch
         vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
-        vc_thinning vc_tifxyz
+        vc_thinning
         vc_straighten
     )
         target_precompile_headers(${_app} REUSE_FROM vc_common_pch)

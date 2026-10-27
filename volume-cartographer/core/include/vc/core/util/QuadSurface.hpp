@@ -517,18 +517,6 @@ public:
     /** Rotate the surface by arbitrary angle (degrees). Expands canvas to fit. */
     void rotate(float angleDeg);
 
-    /** Resample the surface by a scale factor. factor > 1 increases density, < 1 decreases.
-     *  Uses bilinear interpolation by default (cv::INTER_LINEAR), matching rotate(). */
-    void resample(float factor, int interpolation = 1);  // 1 = cv::INTER_LINEAR
-    /** Resample the surface independently in X and Y. */
-    void resample(float factor_x, float factor_y, int interpolation);
-
-    /** Compute optimal rotation angle to place highest Z values at row 0 */
-    float computeZOrientationAngle() const;
-
-    /** Rotate to place highest Z values at top (row 0) */
-    void orientZUp();
-
     /** Flip the surface over the U axis (reverses rows/V direction) */
     void flipU();
 

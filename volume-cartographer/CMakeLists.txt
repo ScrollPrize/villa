@@ -73,23 +73,10 @@ option(VC_LIBBACKTRACE_UPDATE_DISCONNECTED
 option(VC_USE_PCH "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" OFF)
 option(VC_USE_CCACHE "Route the compiler through ccache" OFF)
 option(VC_USE_SCCACHE "Route the compiler through sccache" OFF)
-option(VC_ENABLE_ECL_MAXFLOW "Build CUDA ECL-MaxFlow integration for Lasagna maxflow" OFF)
 option(VC_ENABLE_AMGX "Build external AMGX-backed Lasagna screened-Laplace solver" OFF)
 set(AMGX_ROOT "" CACHE PATH "External AMGX installation prefix")
 set(VC_CCACHE_PCH_SLOPPINESS "pch_defines,time_macros" CACHE STRING
     "ccache sloppiness required when VC_USE_PCH and VC_USE_CCACHE are both ON")
-
-if(VC_ENABLE_ECL_MAXFLOW)
-    include(CheckLanguage)
-    check_language(CUDA)
-    if(NOT CMAKE_CUDA_COMPILER)
-        message(FATAL_ERROR "VC_ENABLE_ECL_MAXFLOW=ON requires a CUDA compiler")
-    endif()
-    enable_language(CUDA)
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
-        set(CMAKE_CUDA_ARCHITECTURES 70 CACHE STRING "CUDA architectures for ECL-MaxFlow" FORCE)
-    endif()
-endif()
 
 set(VC_QUICKBUILD_OPT_LEVEL "1" CACHE STRING
     "Optimization level used by QuickBuild (0, 1, 2, or 3)")

@@ -938,14 +938,6 @@ and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
 or publish fibers to Hugging Face. S3/SFTP fiber merging, one-off fiber tag
 migration scripts and `vc_sync.py` have been retired.
 
-`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent version-4
-Lasagna result: exact CP positions and existing goals are retained, actual span
-modes become `lasagna`, the input normal manifest and per-span maximum normal
-alignment error are recorded, trace-only diagnostics are cleared, and geometry
-and descriptors receive one generation update. The probe validates this result
-before atomically replacing its output. Without either optimization flag,
-`--output` copies the validated input without inventing new producer metadata.
-
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
 fiber tracer after converting the requested distance to trace voxels. That
