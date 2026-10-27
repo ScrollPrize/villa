@@ -57,7 +57,6 @@ option(VC_ENABLE_COVERAGE "Code coverage instrumentation"                OFF)
 option(VC_TESTING         "Build and run unit tests"                     OFF)
 option(VC_RUN_RENDER_BENCHMARKS
        "Register deterministic Linux-amd64 Callgrind rendering benchmarks" OFF)
-option(VC_DEAD_CODE_REPORT "Enable dead-code reporting (curated -Wunused* + linker --print-gc-sections; use a Debug build to avoid LTO)" OFF)
 option(VC_PROFILE_COMPILE  "Emit per-TU compile-time profiles (-ftime-trace on clang, -ftime-report on gcc)" OFF)
 # flatboi drags in PaStiX (Fortran + autotools + Scotch), which has no
 # practical Windows build — default it off there.
@@ -200,9 +199,6 @@ set(VC_VERSION_STRING "${GIT_SHA1_SHORT}-${GIT_COMMIT_DATE}")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(VC_DEAD_CODE_REPORT)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-endif()
 if(VC_BUILD_PYTHON)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
@@ -493,26 +489,6 @@ if(VC_PROFILE_COMPILE)
     else()
         add_compile_options(-ftime-report)
     endif()
-endif()
-
-if(VC_DEAD_CODE_REPORT AND NOT MSVC)
-    add_compile_options(
-        -Wunused -Wunused-function -Wunused-variable -Wunused-parameter
-        -Wunused-value -Wunused-result
-        -Wunused-but-set-variable -Wunused-but-set-parameter
-        -Wunused-local-typedef
-        -Wunused-macros
-        -Wunreachable-code
-    )
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        add_compile_options(
-            -Wunused-template
-            -Wunused-member-function
-            -Wunused-private-field
-            -Wunreachable-code-aggressive
-        )
-    endif()
-    add_link_options(-Wl,--print-gc-sections)
 endif()
 
 # ---- Dependencies -----------------------------------------------------------
