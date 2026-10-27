@@ -1442,25 +1442,6 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
     if (j.contains("lasagna_datasets"))
         lasagnaDatasets_ = entriesFromJson(j.at("lasagna_datasets"));
-    if (j.contains("fiber_inference_datasets")) {
-        for (auto legacy : entriesFromJson(j.at("fiber_inference_datasets"))) {
-            if (std::find(legacy.tags.begin(), legacy.tags.end(), vc::project::kFiberLasagnaTag) == legacy.tags.end()) {
-                legacy.tags.emplace_back(vc::project::kFiberLasagnaTag);
-            }
-            auto existing = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
-                return entry.location == legacy.location;
-            });
-            if (existing == lasagnaDatasets_.end()) {
-                lasagnaDatasets_.push_back(std::move(legacy));
-                continue;
-            }
-            for (const auto& tag : legacy.tags) {
-                if (std::find(existing->tags.begin(), existing->tags.end(), tag) == existing->tags.end()) {
-                    existing->tags.push_back(tag);
-                }
-            }
-        }
-    }
     if (j.contains("selected_lasagna_dataset")) {
         selectedLasagnaDataset_ = j.at("selected_lasagna_dataset").get_string();
         if (selectedLasagnaDataset_->empty()) selectedLasagnaDataset_.reset();

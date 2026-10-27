@@ -409,7 +409,6 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
 
     const auto json = utils::Json::parse_file(project);
     REQUIRE(json.contains("lasagna_datasets"));
-    CHECK_FALSE(json.contains("fiber_inference_datasets"));
     REQUIRE(json.at("lasagna_datasets").size() == 2);
 
     vc::project::LoadOptions options;
@@ -421,41 +420,6 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical a
     CHECK(vc::project::isFiberLasagnaEntry(loaded->fiberInferenceDatasetEntries().front()));
     CHECK(loaded->selectedLasagnaDataset() == "regular.lasagna.json");
     CHECK(loaded->selectedFiberInferenceDataset() == "fiber.lasagna.json");
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg migrates the legacy fiber inference array without losing tags")
-{
-    auto d = tmpDir("legacy_fiber_lasagna");
-    const auto project = d / "project.json";
-    {
-        std::ofstream out(project);
-        out << R"({
-          "name":"legacy",
-          "version":1,
-          "lasagna_datasets":[
-            {"location":"shared.lasagna.json","tags":["canonical-tag"]}
-          ],
-          "fiber_inference_datasets":[
-            {"location":"shared.lasagna.json","tags":["legacy-tag"]},
-            {"location":"fiber.lasagna.json","tags":[]}
-          ],
-          "selected_fiber_inference_dataset":"fiber.lasagna.json"
-        })";
-    }
-    vc::project::LoadOptions options;
-    options.deferResolution = true;
-    const auto loaded = VolumePkg::load(project, options);
-    REQUIRE(loaded->fiberInferenceDatasetEntries().size() == 2);
-    REQUIRE(loaded->allLasagnaDatasetEntries().size() == 2);
-    const auto& shared = loaded->allLasagnaDatasetEntries().front();
-    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "canonical-tag") != shared.tags.end());
-    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "legacy-tag") != shared.tags.end());
-    CHECK(vc::project::isFiberLasagnaEntry(shared));
-
-    loaded->save(project);
-    const auto saved = utils::Json::parse_file(project);
-    CHECK_FALSE(saved.contains("fiber_inference_datasets"));
     fs::remove_all(d);
 }
 
