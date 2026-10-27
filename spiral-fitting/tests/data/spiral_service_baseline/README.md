@@ -40,7 +40,9 @@ python spiral-fitting/tests/display_geometry_dump.py compare \
 ```
 
 Against the stage 0 acceptance store (`vc_object_ingest` with the README's
-frames and repairs) every coordinate is identical. The one difference is
+frames and repairs) every coordinate is identical, read either by the store
+mode above or by VC3D's pinned reader (`test_spiral_store_inputs` with
+`SPIRAL_STORE_INPUTS_DUMP=STORE|MANIFEST|OUT` writes the same format). The one difference is
 expected: `same_windings:210`'s point IDs are 7542-7544 in the store and 0-2
 in the file, because the ingest's `--renumber-point-ids` repair renumbers
 same-winding collections whose IDs repeat across collections.
@@ -56,6 +58,10 @@ From the pre-port checkout's `spiral-fitting/`:
 PYTHONPATH=. python <this branch>/spiral-fitting/tests/service_lifecycle_transcript.py \
   --out lifecycle_transcript_preport.json
 ```
+
+`lifecycle_transcript_store.json` is the same run against the store-backed
+service (step 12); it differs only in the fields the port renamed or
+removed, listed in OBJECT_STORE_SERVICE_PLAN.md's stage 1 acceptance record.
 
 Not captured: the real short session's preview manifest and checkpoint
 provenance keys. It needs the GPU, which another job held throughout

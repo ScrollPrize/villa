@@ -553,6 +553,68 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
     exact commands, config, revisions, counts, finite losses and
     checkpoint/preview provenance. This is the stage 2 gate.
 
+### Stage 1 acceptance record (step 12, 2026-10-27)
+
+Steps 1-11 landed as `99643ee9c` (baselines), `cc15e5480` (replica digest),
+`93a7c1539`, `d2c4958ad`, `4810151fd`, `579b1cac2`, `a2ed6078e`, `684de4926`
+(service), `fd407d9ba`, `d3efcb54f`, `efd29f25c` (VC3D). Environment: the
+`villa-latest` checkout's `spiral-fitting/.venv` Python with this tree first
+on `PYTHONPATH` and a fresh Release `vc_object_store` build of this tree's
+store; VC3D RelWithDebInfo configured with `VC_TESTING=ON` (neither existing
+VC3D build directory had tests enabled).
+
+- Display geometry (`tests/data/spiral_service_baseline/`). VC3D's pinned
+  reader (`SpiralStoreInputs`, the code that draws the overlays) read the
+  baseline's nine objects from the stage 0 acceptance store at the pins of a
+  manifest the Python adapter wrote:
+  `SPIRAL_STORE_INPUTS_DUMP='STORE|MANIFEST|OUT' test_spiral_store_inputs`, then
+  `display_geometry_dump.py compare display_geometry_files.json OUT`. Every
+  coordinate, invalid and masked vertex count matches the file-backed
+  workspace's. The one difference is expected: `same_windings:210` has point
+  IDs 7542-7544 in the store and 0-2 in the file, the ingest's
+  `--renumber-point-ids` repair.
+- Service lifecycle. `service_lifecycle_transcript.py` against the store-backed
+  service (`lifecycle_transcript_store.json`) makes the same 14 requests with
+  the same HTTP statuses, lifecycle states and event kinds as the pre-port
+  transcript. Expected differences: the claim is the session lease (`lease_id`
+  added); status loses `commit_available`, `commit_unavailable_reason`,
+  `same_winding_artifact` and `relative_winding_artifact` and gains
+  `input_manifest_artifact` and `lease_id`; `/dataset` loses `pcl_inputs` and
+  gains `object_store`, `inputs` and `capabilities`; the stranger's refusal
+  names the session lease.
+- CLI versus service (`test_runtime_object_store.py`): one store and
+  configuration give the same digest, constraint counts and views through a
+  CLI `FitContext` and a service session, with absolute, relative and
+  same-winding PCLs by metadata and annotations, a patch and a fiber at scale
+  2, approved, pending, rejected and stale links, in approved-only mode, and
+  with explicitly empty selectors. The same file runs the service, runtime and
+  fitter on the CPU (device stages stubbed): the session reads the bound
+  store, reports the adapter's lines and refusals, keeps frozen inputs across
+  a model rebuild, rereads them on `"inputs": "reload"`, refuses Run changes
+  to input-shaping settings, and two gloo ranks refresh once and both start or
+  both fail before Idle.
+- Replicas (`test_object_store_startup.py`): two hub clones of one store, after
+  a push and a pull that gave them different object and relationship revision
+  UUIDs, give one digest.
+- VC3D against the real service: `spiral_service_protocol`
+  (`SPIRAL_TEST_PYTHON` set) connects `SpiralServiceManager` to
+  `spiral_service.py` (runtime faked by `tests/protocol_client_service.py`,
+  inputs from a real store): lease, matching store binding, a saved profile's
+  `object_store_path` stripped, the input manifest artifact fetched and its
+  pins resolved in the attached store, input changes refused as frozen, the
+  reload rebuild accepted, and the lease released.
+- Suites: the regression command below plus `test_service_object_store.py`,
+  `test_runtime_object_store.py`, `test_preview_restore.py` and
+  `test_spiral_headless.py`: 426 passed, 1 skipped (the opt-in real-data
+  smoke). `ctest -R spiral`: 10 passed, including `spiral_store_inputs` and
+  `spiral_service_protocol`.
+
+Not run, because the GPU was held by another job throughout: stage 0's
+1,000-step GPU fit, the real short session of step 1 (preview manifest and
+checkpoint provenance keys), and step 14's real-data service fit inspected in
+VC3D. The VC3D workspace was built and its logic tested, but not driven
+interactively.
+
 Stage 2 has its own sequence (below), after the stage 1 gate. It depends on
 step 2's replica-independent identities, step 4's lease, step 10's pinned
 reads and step 11's freshness tracking. It also depends on the hub

@@ -633,6 +633,22 @@ vc_register_test_target(test_line_annotation_optimization_queue)
 vc_register_ctest(line_annotation_optimization_queue
     test_line_annotation_optimization_queue)
 
+add_executable(test_spiral_service_protocol
+    test_spiral_service_protocol.cpp
+    ../SpiralServiceManager.cpp ../SpiralServiceManager.hpp
+    ../SpiralServiceManagerInputs.cpp
+    ../SpiralArtifactCache.cpp ../SpiralArtifactCache.hpp
+    ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp
+    ../SpiralStoreInputs.cpp ../SpiralStoreInputs.hpp)
+set_target_properties(test_spiral_service_protocol PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_spiral_service_protocol PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_compile_definitions(test_spiral_service_protocol PRIVATE
+    SPIRAL_PROTOCOL_SERVICE_FIXTURE="${PROJECT_SOURCE_DIR}/../spiral-fitting/tests/protocol_client_service.py")
+target_link_libraries(test_spiral_service_protocol PRIVATE vc_core Qt6::Core Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Test)
+add_test(NAME spiral_service_protocol COMMAND test_spiral_service_protocol)
+vc_register_test_target(test_spiral_service_protocol)
+vc_register_ctest(spiral_service_protocol test_spiral_service_protocol)
+set_tests_properties(spiral_service_protocol PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 add_executable(test_spiral_brush_patch test_spiral_brush_patch.cpp)
 set_target_properties(test_spiral_brush_patch PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_spiral_brush_patch PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
