@@ -130,6 +130,7 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;
     surface->meta = utils::Json::parse(object->meta);
+    surface->setComponents(surface_components(surface->meta));
     surface->meta["uuid"] = object->uuid;
     surface->meta["name"] = object->name;
     // Record tags in the meta.json form core code reads ({"approved": {}, ...}).

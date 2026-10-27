@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 using namespace vc::objects;
@@ -138,6 +139,42 @@ TEST_CASE("QuadSurface round trip through the object store")
     CHECK(cv::countNonZero(reloaded->channel("generations", SURF_CHANNEL_NORESIZE) != 9) == 0);
     CHECK((*reloaded->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1));
     CHECK(storedValid(store, uuid, 0, 0) == 0);
+}
+
+TEST_CASE("A stored multi-component surface does not interpolate across its seams")
+{
+    // Two components side by side in the grid, far apart in the volume.
+    cv::Mat_<cv::Vec3f> points(4, 16);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 16; ++c) points(r, c) = {float(c), float(r), c < 8 ? 10.f : 200.f};
+    QuadSurface source(points, {1.f, 1.f});
+    Store store;
+    const auto put = [&](const char* meta) {
+        const auto uuid = util::newUuid();
+        store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.meta = meta;
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, quad_surface_geometry(source));
+        });
+        return uuid;
+    };
+    // Rendered depth along the middle row, across the seam between columns 7 and 8.
+    const auto seamDepths = [&](const std::string& uuid) {
+        const auto loaded = store.load(uuid);
+        cv::Mat_<cv::Vec3f> coords;
+        loaded->gen(&coords, nullptr, cv::Size(64, 1), cv::Vec3f(0, 0, 0), 4.f, cv::Vec3f(-8, 0, 0));
+        std::vector<float> depths;
+        for (int c = 0; c < coords.cols; ++c)
+            if (std::isfinite(coords(0, c)[2])) depths.push_back(coords(0, c)[2]);
+        return depths;
+    };
+    const auto between = [](const std::vector<float>& depths) {
+        return std::count_if(depths.begin(), depths.end(), [](float z) { return z > 10.5f && z < 199.5f; });
+    };
+    CHECK(between(seamDepths(put("{}"))) > 0);
+    const auto split = seamDepths(put(R"({"components":[[0,8],[8,16]]})"));
+    CHECK(split.size() > 32);
+    CHECK(between(split) == 0);
 }
 
 TEST_CASE("A stored vertex without coordinates loads as missing")

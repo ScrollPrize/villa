@@ -542,7 +542,7 @@ protected:
     cv::Rect _bounds;
     cv::Vec3f _center;
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
-    // Column ranges of disconnected surface components (from meta.json "components").
+    // Column ranges of disconnected surface components (meta "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
     bool _strictQuadRenderValidity = strictQuadRenderValidityDefault();
@@ -582,6 +582,10 @@ private:
 // as the (-1,-1,-1) sentinel and `valid` is exposed as the "mask" channel (255/0);
 // record tags appear as meta["tags"] keys;
 // writes touch only vertices that changed, so masked coordinates stay stored.
+
+// Column ranges [c0, c1) of disconnected components recorded as meta
+// "components" (Lasagna multi-component fits); empty for one component.
+std::vector<std::pair<int, int>> surface_components(const utils::Json& meta);
 
 // A surface object's geometry revision (default: its current one). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.

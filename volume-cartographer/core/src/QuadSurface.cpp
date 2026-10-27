@@ -1004,6 +1004,18 @@ static Rect3D rect_from_json(const utils::Json &json)
 }
 } // anonymous namespace
 
+std::vector<std::pair<int, int>> surface_components(const utils::Json& meta)
+{
+    std::vector<std::pair<int, int>> components;
+    if (meta.contains("components") && meta["components"].is_array()) {
+        for (const auto& c : meta["components"]) {
+            if (c.is_array() && c.size() >= 2)
+                components.emplace_back(c[0].get_int(), c[1].get_int());
+        }
+    }
+    return components;
+}
+
 QuadSurface::QuadSurface(const std::filesystem::path &path_)
 {
     recoverIncompleteSave(path_);
@@ -1015,12 +1027,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     if (meta.contains("bbox"))
         _bbox = rect_from_json(meta["bbox"]);
 
-    if (meta.contains("components") && meta["components"].is_array()) {
-        for (const auto& c : meta["components"]) {
-            if (c.is_array() && c.size() >= 2)
-                _components.emplace_back(c[0].get_int(), c[1].get_int());
-        }
-    }
+    _components = surface_components(meta);
 
     const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
     _scale = geometry.scale;
@@ -1039,12 +1046,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
     if (json.contains("bbox"))
         _bbox = rect_from_json(json["bbox"]);
 
-    if (json.contains("components") && json["components"].is_array()) {
-        for (const auto& c : json["components"]) {
-            if (c.is_array() && c.size() >= 2)
-                _components.emplace_back(c[0].get_int(), c[1].get_int());
-        }
-    }
+    _components = surface_components(json);
 
     const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
     _scale = geometry.scale;
