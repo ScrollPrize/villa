@@ -1,51 +1,28 @@
 # Spiral input list
 
-The Spiral workspace lists inputs added or modified during the editing session
-by default. Applied and committed changes remain visible. Enable **Show original
-dataset inputs** to also see unchanged inputs loaded from the dataset. The text
-filter applies to both views. Inputs with errors remain visible in the default
-view so a failed edit cannot disappear.
+A Spiral fit's patches, point collections and fibers come from the Spiral
+service's object store and are frozen for the resident fit; see "Object store
+and frozen inputs" and "Connecting from VC3D" in the
+[Spiral fitting README](../../spiral-fitting/README.md). The workspace shows
+them from the attached store at the revisions the fit pinned, and *Fit inputs*
+in the Spiral panel reports their digest, counts and freshness.
 
-Visibility does not change which inputs are checked, used for fitting, or selected
-for Apply/Commit. Session activity resets when a new service editing workspace is
-created; rebuilding the fit within that workspace does not reset it.
+The input list holds only local drawings: brush patches and drawn point
+collections that a frozen fit does not take. The text filter applies to it.
+Remove (or *Discard Local Changes* in its context menu) discards a drawing.
+Leaving the workspace with drawings asks before discarding them.
 
-Build from the repository root using the existing configured build directory:
+Build and run the Spiral tests from the repository root using the existing
+configured build directory:
 
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build -j2 VC3D \
-  test_spiral_input_draft test_spiral_input_workflow
-ctest --test-dir volume-cartographer/build -R '^spiral_input_draft$' --output-on-failure
+  test_spiral_brush_patch test_spiral_store_inputs test_spiral_service_protocol
 QT_QPA_PLATFORM=offscreen \
   SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
-  volume-cartographer/build/bin/test_spiral_input_workflow
-volume-cartographer/build/bin/VC3D
+  PYTHONPATH=<vc_object_store build>/python \
+  ctest --test-dir volume-cartographer/build -R '^spiral_' --output-on-failure
 ```
 
-The Qt workflow test runs its own temporary local service. It requires permission
-to bind loopback sockets. Snapshot implementation and benchmark details are in
-the [Spiral fitting README](../../spiral-fitting/README.md).
-
-PCL editors load the selected accepted revision after local changes are discarded,
-including collections applied but not yet committed. Active local brush edits are
-retained when reselecting an input. The `pclEditorsReopenAcceptedRevision` workflow
-test covers reopening existing and newly added collections. To run it with real
-scroll geometry, set `SPIRAL_TEST_PCL_SOURCE` to a point-collection JSON file:
-
-```sh
-QT_QPA_PLATFORM=offscreen \
-  SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
-  SPIRAL_TEST_PCL_SOURCE=/path/to/dataset/same_windings.json \
-  volume-cartographer/build/bin/test_spiral_input_workflow pclEditorsReopenAcceptedRevision
-```
-
-The test copies one collection into its temporary workspace and changes its name;
-the source file remains unchanged.
-
-Fiber editing uses the attached object store. Opening a service-only fiber imports
-its linked component from the immutable service artifact; opening an existing
-object UUID uses the stored geometry. Staged exports preserve the service input ID
-through an explicit association with the object UUID. Fiber editors do not create
-writable service working copies. Discard removes the service draft and stops its
-automatic updates; it does not roll back durable object-store edits. Patch and PCL
-working-copy behavior is unchanged.
+`spiral_service_protocol` runs its own temporary service on loopback and is
+skipped without `SPIRAL_TEST_PYTHON`.
