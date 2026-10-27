@@ -4,14 +4,10 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/AttachedDocument.hpp"
 #include "vc_object_store/objects/SurfaceCreate.hpp"
-#include "GeometryRegionBindings.hpp"
 #include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
-#include "vc_object_store/object_links/ObjectLinks.hpp"
-#include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
 namespace {
 nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
@@ -25,27 +21,12 @@ nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
     return d;
 }
 
-nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
-{
-    nb::dict d;
-    d["uuid"] = revision.uuid; d["record"] = edgeToPy(revision.record);
-    d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
-    d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
-    return d;
-}
-
 // Convert native results after the transaction (and any GIL release) ends.
 nb::object toPy(const vo::ObjectRecord& value) { return objectToPy(value); }
-nb::object toPy(const vo::EdgeRecord& value) { return edgeToPy(value); }
 nb::object toPy(const vo::GeometryRevision& value) { return geometryToPy(value); }
 nb::object toPy(const vo::ObjectRevision& value) { return objectRevisionToPy(value); }
-nb::object toPy(const vo::RelationshipRevision& value) { return relationshipRevisionToPy(value); }
-nb::bytes toPy(const std::vector<uint8_t>& value) {
-    return nb::bytes(reinterpret_cast<const char*>(value.data()), value.size());
-}
 template<class T> T toPy(T value) { return value; }
 std::vector<std::string> toPy(std::vector<std::string> value) { return value; }
-std::optional<std::filesystem::path> toPy(std::optional<std::filesystem::path> value) { return value; }
 template<class T> nb::object toPy(const std::optional<T>& value) {
     return value ? toPy(*value) : nb::none();
 }
@@ -77,86 +58,6 @@ auto writeMethod()
     }(Method);
 }
 
-nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
-{
-    const auto relationships = db.relationshipsAt(txn, selection);
-    nb::dict result, resolved;
-    nb::list objects, edges;
-    for (const auto& [uuid, selected] : selection) {
-        const auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
-        objects.append(objectRevisionToPy(*revision)); // selection was validated above
-        resolved[pyStr(revision->objectUuid)] = revision->uuid;
-    }
-    for (const auto& relationship : relationships) {
-        auto edge = relationshipRevisionToPy(relationship.relationship);
-        edge["applicable"] = relationship.applicable; edges.append(edge);
-    }
-    result["objects"] = objects; result["relationships"] = edges; result["selection"] = resolved;
-    return result;
-}
-
-
-vo::EdgeGeometryRepair repairFromPy(const nb::dict& d)
-{
-    vo::EdgeGeometryRepair repair;
-    repair.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
-    repair.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
-    repair.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
-    repair.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
-    repair.aAnchor = anchorFromPy(d["a_anchor"]);
-    repair.bAnchor = anchorFromPy(d["b_anchor"]);
-    return repair;
-}
-
-nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
-{
-    nb::dict d;
-    d["objects_considered"] = rep.objectsConsidered;
-    d["candidates_found"] = rep.candidatesFound;
-    d["edges_created"] = rep.edgesCreated;
-    d["edges_updated"] = rep.edgesUpdated;
-    d["edges_skipped_existing"] = rep.edgesSkippedExisting;
-    d["stale_removed"] = rep.staleRemoved;
-    d["problems"] = rep.problems;
-    return d;
-}
-
-bool setLineSurfaceParameter(vc::object_links::LineSurfaceParams& p, const std::string& key, nb::handle val)
-{
-    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
-    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(val);
-    else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
-    else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
-    else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
-    else if (key == "proximity") p.proximity = nb::cast<double>(val);
-    else if (key == "min_contacts") p.minContacts = nb::cast<std::size_t>(val);
-    else if (key == "strip_spacing") p.stripSpacing = nb::cast<double>(val);
-    else if (key == "strip_rows_each_side") p.stripRowsEachSide = nb::cast<int>(val);
-    else if (key == "strip_march_step") p.stripMarchStep = nb::cast<double>(val);
-    else if (key == "contact_gap") p.contactGap = nb::cast<double>(val);
-    else if (key == "anchor_contact") p.anchorContact = nb::cast<double>(val);
-    else if (key == "same_sheet") p.sameSheet = nb::cast<double>(val);
-    else if (key == "adjacent_low") p.adjacentLow = nb::cast<double>(val);
-    else if (key == "adjacent_high") p.adjacentHigh = nb::cast<double>(val);
-    else if (key == "same_normal") p.sameNormal = nb::cast<double>(val);
-    else if (key == "adjacent_normal") p.adjacentNormal = nb::cast<double>(val);
-    else if (key == "grow_same") p.growSame = nb::cast<double>(val);
-    else if (key == "grow_ratio") p.growRatio = nb::cast<double>(val);
-    else if (key == "strip_gate_ratio") p.stripGateRatio = nb::cast<double>(val);
-    else if (key == "strip_gate_margin") p.stripGateMargin = nb::cast<double>(val);
-    else if (key == "strip_margin") p.stripMargin = nb::cast<double>(val);
-    else if (key == "max_rounds") p.maxRounds = nb::cast<int>(val);
-    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
-    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-    else if (key == "strip_weights") {
-        const auto weights = nb::cast<std::vector<double>>(val);
-        if (weights.size() != p.stripWeights.size())
-            throw std::runtime_error("strip_weights requires four values");
-        std::copy(weights.begin(), weights.end(), p.stripWeights.begin());
-    } else return false;
-    return true;
-}
-
 template<class T>
 void bindMutations(nb::class_<T>& cls)
 {
@@ -167,19 +68,6 @@ void bindMutations(nb::class_<T>& cls)
                 return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.upsertObject(t, objectFromPy(rec)); });
             },
             nb::arg("record"), "Create or update an object from a dict; returns its uuid.")
-        .def(
-            "add_edge",
-            [](T& self, const nb::dict& rec) {
-                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.addEdge(t, edgeFromPy(rec)); });
-            },
-            nb::arg("record"), "Create an edge from a dict (keys: a, b, kind, anchors, tags, meta); returns uuid.")
-        .def(
-            "attach",
-            [](T& self, const std::string& data, const std::string& owner, const std::string& role) {
-                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.attach(t, data, owner, role); });
-            },
-            nb::arg("data_uuid"), nb::arg("owner_uuid"), nb::arg("role"),
-            "Attach object data to owner in role (an attachment relationship); returns the edge uuid.")
         .def(
             "attach_document",
             [](T& self, const std::string& owner, const std::string& collection, const nb::object& document,
@@ -212,10 +100,6 @@ void bindMutations(nb::class_<T>& cls)
             nb::arg("parameters"), nb::arg("sources"), nb::arg("meta"), nb::arg("geometry"),
             "Create surface uuid holding geometry (objects/SurfaceCreate.hpp): bound by coordinates, with "
             "meta.provenance {tool, parameters, sources} and the rest of meta without tifxyz file keys.")
-        .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge, T>(),
-             nb::arg("uuid"))
-        .def("set_approval", writeMethod<&vo::ObjectStore::setApproval, T>(),
-             nb::arg("uuid"), nb::arg("state"), "state: 'pending', 'approved' or 'rejected' (objects and edges).")
         .def(
             "set_meta",
             [](T& self, const std::string& uuid, const std::string& key, const nb::object& value) {
@@ -225,90 +109,22 @@ void bindMutations(nb::class_<T>& cls)
                 });
             },
             nb::arg("uuid"), nb::arg("key"), nb::arg("value").none(), "Set one open-ended metadata key (any JSON value).")
-        .def("remove_meta", writeMethod<&vo::ObjectStore::removeMeta, T>(),
-             nb::arg("uuid"), nb::arg("key"))
         .def("put_geometry", [](T& self, const std::string& uuid, const nb::object& input,
                                const std::optional<std::string>& expected, const nb::list& choices, int64_t surfaceTileSize) {
             const auto data = geometryInputFromPy(input);
             const auto edits = edgeEditsFromPy(choices);
             return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{surfaceTileSize}); });
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list(), nb::arg("surface_tile_size") = vo::GeometryStorageOptions{}.surfaceTileSize)
-        .def("edit_transformed_coordinates", [](T& self,const vo::TransformedGeometryView& view,
-            const std::string& array,int64_t start,const std::vector<vc::geometry::Point>& points,const nb::list& choices) {
-            const auto edges=edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](auto& db,auto& txn){return view.writeCoordinates(db,txn,array,start,points,edges);});
-        },nb::arg("view"),nb::arg("array"),nb::arg("start"),nb::arg("points"),nb::arg("edge_edits")=nb::list())
-        .def("edit_transformed_surface", [](T& self,const vo::TransformedGeometryView& view,
-            int64_t row,int64_t column,int64_t rows,int64_t columns,const std::vector<vc::geometry::SurfacePoint>& points,const nb::list& choices) {
-            const auto edges=edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](auto& db,auto& txn){return view.writeSurface(db,txn,row,column,rows,columns,points,edges);});
-        },nb::arg("view"),nb::arg("row"),nb::arg("column"),nb::arg("rows"),nb::arg("columns"),nb::arg("points"),nb::arg("edge_edits")=nb::list())
-        .def("edit_geometry", [](T& self, const std::string& uuid, const nb::list& input,
-                                const std::string& expected, const nb::list& choices) {
-            const auto edits = geometryEditsFromPy(input);
-            const auto edges = edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) {
-                return db.editGeometry(txn, uuid, edits, expected, edges);
-            });
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("update_surface_channels", [](T& self, const std::string& uuid, const nb::list& channels,
-                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
-            nb::dict input; input["kind"] = "surface"; input["arrays"] = channels;
-            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](auto& db, auto& txn) { return db.updateSurfaceChannels(txn, uuid, data.arrays, remove, expected, edges); });
-        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("edit_geometry_rectangle", [](T& self, const std::string& uuid, const std::string& name,
-                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
-                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
-            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
-            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](auto& db, auto& txn) {
-                return db.editGeometryRectangle(txn, uuid, name, row, column, rows, columns, bytes, expected, edges);
-            });
-        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
-           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("affected_geometry_edit_edges", [](T& self, const std::string& uuid,
-                                                const nb::list& input, const std::string& expected) {
-            const auto edits = geometryEditsFromPy(input);
-            const auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) {
-                return db.affectedGeometryEditEdges(txn, uuid, edits, expected);
-            });
-            return toPy(edges);
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
-        .def("affected_geometry_edges", [](T& self, const std::string& uuid, const nb::object& input) {
-            const auto data = geometryInputFromPy(input);
-            auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
-            return toPy(edges);
-        }, nb::arg("object_uuid"), nb::arg("geometry"))
-        .def("repair_edge_geometry", [](T& self, const nb::dict& input) {
-            const auto repair = repairFromPy(input);
-            self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { db.repairEdgeGeometry(txn, repair);  });
-        }, nb::arg("repair"), "Atomically publish anchors and checked revisions; reject changed endpoints or edge generation.");
+           nb::arg("edge_edits") = nb::list(), nb::arg("surface_tile_size") = vo::GeometryStorageOptions{}.surfaceTileSize);
 }
 
 }  // namespace
 
 NB_MODULE(_native, m)
 {
-    nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
-        .def(nb::init<const std::filesystem::path&, int, double>(),
-             nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
-        .def("sample_normal", [](const vc::CtSheetNormalSampler& self, const std::array<double, 3>& xyz) {
-            vc::CtSheetNormal sample;
-            { nb::gil_scoped_release release; sample = self.sampleNormal({xyz[0], xyz[1], xyz[2]}); }
-            nb::dict result;
-            result["normal"] = std::array<double, 3>{sample.normal[0], sample.normal[1], sample.normal[2]};
-            result["valid"] = sample.valid;
-            result["gap"] = sample.gap;
-            result["reason"] = sample.reason;
-            return result;
-        }, nb::arg("point_xyz"));
-
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
     bindGraphReadView(m);
-    bindGeometryRegion(m);
     bindObjectStoreSession(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
@@ -323,41 +139,6 @@ NB_MODULE(_native, m)
         nb::gil_scoped_release release;
         vo::cloneHub(hub, replica, options);
     }, nb::arg("hub"), nb::arg("replica"), nb::arg("author"), "Copy a hub into a new local replica.");
-    m.def("hub_detach", &vo::detachHub, nb::arg("replica"), nb::arg("author"),
-          "Drop a replica's hub tables, leaving an ordinary store.");
-    m.def("hub_lock_age", [](const std::filesystem::path& hub) {
-        nb::gil_scoped_release release;
-        return vo::hubLockAge(hub);
-    }, nb::arg("hub"), "Seconds since the hub's lock was taken, or None when it is unlocked.");
-    m.def("hub_remove_lock", [](const std::filesystem::path& hub) {
-        nb::gil_scoped_release release;
-        vo::removeHubLock(hub);
-    }, nb::arg("hub"), "Remove a stale lock left by a crashed client, once no client is syncing.");
-
-    // ssh prompts arrive on a helper thread while hub calls run with the GIL released.
-    m.def("set_sftp_authenticator", [](nb::object callback) {
-        if (callback.is_none()) return vc::sftp::setAuthenticator({});
-        auto held = std::shared_ptr<nb::object>(new nb::object(std::move(callback)), [](nb::object* object) {
-            nb::gil_scoped_acquire acquire;
-            delete object;
-        });
-        vc::sftp::setAuthenticator([held](const vc::sftp::Prompt& prompt) -> std::optional<std::string> {
-            nb::gil_scoped_acquire acquire;
-            const auto answer = (*held)(prompt.destination, prompt.text, prompt.confirmation);
-            if (answer.is_none()) return std::nullopt;
-            return nb::cast<std::string>(answer);
-        });
-    }, nb::arg("callback").none(),
-       "Answer ssh prompts for sftp:// hubs: callback(destination, prompt, confirmation) returns the answer, "
-       "or None to cancel. Without one, ssh runs in batch mode (keys and agent only).");
-    m.def("use_terminal_sftp_prompts", [] {
-        auto authenticator = vc::sftp::terminalAuthenticator();
-        const bool available = static_cast<bool>(authenticator);
-        vc::sftp::setAuthenticator(std::move(authenticator));
-        return available;
-    }, "Ask ssh prompts on the controlling terminal; returns False when there is none.");
-    // A callback must not outlive the interpreter.
-    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vc::sftp::setAuthenticator({}); }));
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -387,86 +168,15 @@ NB_MODULE(_native, m)
              nb::arg("uuid"))
         .def("objects_by_kind", readMethod<&vo::ObjectStore::objectsByKind>(),
              nb::arg("kind"), nb::arg("approval_state") = std::nullopt, nb::arg("include_retired") = false)
-        .def("object_count", readMethod<&vo::ObjectStore::objectCount>(), nb::arg("kind"),
-             nb::arg("include_retired") = false)
         .def("unbound_object_count", readMethod<&vo::ObjectStore::unboundObjectCount>(), nb::arg("kind"), nb::arg("volume"),
              "Live objects of kind not bound to volume (no coordinates in its voxels).")
-        .def("objects_by_tag", readMethod<&vo::ObjectStore::objectsByTag>(),
-             nb::arg("tag"), nb::arg("include_retired") = false)
-        .def("object_tags", readMethod<&vo::ObjectStore::objectTags>(),
-             nb::arg("kind") = std::nullopt)
-        .def("delete_object", writeMethod<&vo::ObjectStore::deleteObject>(),
-             nb::arg("uuid"))
-        .def("edge", readMethod<&vo::ObjectStore::edgeByUuid>(),
-             nb::arg("uuid"))
-        .def("edges_of", readMethod<&vo::ObjectStore::edgesOf>(),
-             nb::arg("uuid"), nb::arg("include_retired") = false)
-        .def("edges_by_kind", readMethod<&vo::ObjectStore::edgesByKind>(),
-             nb::arg("edge_kind"), nb::arg("include_retired") = false)
         .def("neighbours", readMethod<&vo::ObjectStore::neighbours>(),
              nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt, nb::arg("include_retired") = false,
              nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
-        .def("component",
-             [](PyObjectStore& self, const std::string& uuid, const std::vector<std::string>& edgeKinds, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.componentOf(t, uuid, edgeKinds, nullptr, includeRetired, adjacent, applicableOnly); });
-             },
-             nb::arg("uuid"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
-             nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
-        .def("reachable_within",
-             [](PyObjectStore& self, const std::string& uuid, int maxDepth, const std::vector<std::string>& edgeKinds, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.reachableWithin(t, uuid, maxDepth, edgeKinds, nullptr, includeRetired, adjacent, applicableOnly); });
-             },
-             nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
-             nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
-        .def("set_meta_many", [](PyObjectStore& self, const nb::list& updates) {
-            struct Update { std::string uuid, key, value; };
-            std::vector<Update> batch;
-            for (nb::handle item : updates) {
-                auto row = nb::cast<nb::sequence>(item);
-                if (nb::len(row) != 3) throw std::invalid_argument("metadata updates must be (uuid,key,value) triples");
-                batch.push_back({nb::cast<std::string>(row[0]), nb::cast<std::string>(row[1]), jsonDumps(row[2])});
-            }
-            self.withWrite<true>([&](auto& db, auto& txn) {
-                for (const auto& update : batch) db.setMeta(txn, update.uuid, update.key, update.value);
-                return 0;
-            });
-        }, nb::arg("updates"), "Apply metadata triples atomically in one durable transaction.")
-        .def(
-            "journal_since",
-            [](PyObjectStore& self, int64_t afterSeq) {
-                auto entries = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.journalSince(t, afterSeq); });
-                nb::list out;
-                for (const auto& e : entries) {
-                    nb::dict d;
-                    d["seq"] = e.seq;
-                    d["record_uuid"] = e.recordUuid;
-                    d["kind"] = e.kind;
-                    d["generation"] = e.generation;
-                    d["author"] = e.author;
-                    d["hostname"] = e.hostname;
-                    d["timestamp"] = e.timestamp;
-                    d["change_kind"] = e.changeKind;
-                    d["approval_state"] = e.approvalState;
-                    d["approved_by"] = e.approvedBy;
-                    d["approved_at"] = e.approvedAt;
-                    d["approved_host"] = e.approvedHost;
-                    d["approved_generation"] = e.approvedGeneration;
-                    out.append(d);
-                }
-                return out;
-            },
-            nb::arg("after_seq") = 0)
-        .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
-            return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
-        },nb::arg("revision_uuid"),nb::arg("array_name"))
         .def("current_geometry", readMethod<&vo::ObjectStore::currentGeometry>(),
              nb::arg("object_uuid"))
         .def("geometry_revision", readMethod<&vo::ObjectStore::geometryRevision>(),
              nb::arg("revision_uuid"))
-        .def("geometry_history", readMethod<&vo::ObjectStore::geometryHistory>(),
-             nb::arg("object_uuid"))
-        .def("read_geometry_array", readMethod<&vo::ObjectStore::readGeometryArray, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
-             nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
         .def("read_geometry_arrays", [](PyObjectStore& self, const std::vector<std::string>& revisions,
                                        const std::string& name) {
             return PyPackedGeometryArray{self.withRead<true>([&](auto& db, auto& txn) {
@@ -474,18 +184,6 @@ NB_MODULE(_native, m)
             })};
         }, nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets.")
-        .def("read_geometry_rectangle", readMethod<&vo::ObjectStore::readGeometryRectangle, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
-             nb::arg("rows"), nb::arg("columns"), "Read a dense row-major surface rectangle, preserving native dtype and component bytes.")
-        .def("read_geometry_rectangles", readMethod<&vo::ObjectStore::readGeometryRectangles, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),
-             "Read [row,column,rows,columns] rectangles in order, sharing verified chunks.")
-        .def("read_geometry_ranges", readMethod<&vo::ObjectStore::readGeometryRanges, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
-             nb::arg("ranges"))
-        .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
-                                             const std::vector<std::string>& uuids) {
-            return geometryReportToPy(self.withStore<true>([&](auto& db) {
-                return vo::ingestRegisteredGeometry(db, root, uuids, {});
-            }));
-        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
         .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
                                          const nb::dict& context) {
             const auto declarations = jsonDumps(context);
@@ -493,22 +191,6 @@ NB_MODULE(_native, m)
                 return vo::ingestGeometrySource(db, kind, source, {}, declarations);
             }));
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
-        .def("export_geometry", [](PyObjectStore& self, const std::string& object,
-                                   const std::filesystem::path& destination,
-                                   const std::optional<std::string>& revision, bool overwrite, bool validOnly) {
-            return self.withStore<true>([&](auto& db) {
-                return vo::exportGeometry(db, object, destination, revision, overwrite, validOnly);
-            });
-        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("object_revision_uuid") = std::nullopt,
-           nb::arg("overwrite") = false, nb::arg("valid_only") = false,
-           "Export an object revision to native files; return its geometry revision UUID. Does not modify the store.")
-        .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
-            const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
-            nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
-        }, nb::arg("edge_uuid"))
-        .def("resolve_storage_path", readMethod<&vo::ObjectStore::resolveStoragePath>(), nb::arg("uuid"),
-             nb::arg("dataset_root") = std::nullopt,
-             "Find a surface/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
         .def("attached_document", [](PyObjectStore& self, const std::string& owner, const std::string& role) -> nb::object {
             const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(db, txn, owner, role); });
@@ -528,52 +210,19 @@ NB_MODULE(_native, m)
             return out;
         }, nb::arg("uuids"), nb::arg("volume"),
            "Point collections by UUID (any role), in the volume's voxels: uuid, name, ids, points, annotations, source.")
-        .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
-            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
-            nb::list out; for (const auto& record : records) out.append(edgeToPy(record));
-            return out;
-        }, nb::arg("owner_uuid"), nb::arg("role") = std::nullopt,
-           "Attachment relationships of owner (in role when given); the attached object is the other endpoint.")
-        .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
-            const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
-            bool both, const std::optional<std::string>& tag, const std::optional<int64_t>& limit,
-            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
-            vo::EdgeSelection selection; selection.kind = kind; selection.approvalStates = states;
-            selection.endpointUuids = endpoints; selection.bothEndpoints = both;
-            selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
-            selection.adjacent = adjacent; selection.applicableOnly = applicableOnly;
-            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); });
-            const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
-            nb::list out; for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
-            return out;
-        }, nb::arg("edge_kind") = std::nullopt, nb::arg("approval_states") = std::vector<std::string>{},
-           nb::arg("endpoint_uuids") = std::nullopt, nb::arg("both_endpoints") = false,
-           nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
-           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false,
-           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
-            const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
-            const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
-            const std::optional<std::string>& tag, bool includeRetired, std::optional<bool> adjacent,
-            bool applicableOnly, const std::optional<vo::RevisionSelection>& revisions) {
+            const std::vector<std::string>& ids) {
             self.require();
-            if (revisions && (kind || !ids.empty() || bbox || includeRetired))
-                throw std::invalid_argument("revisions specifies the complete graph object selection; cannot combine with object filters or include_retired");
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
-            vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
-            vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
-            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;
+            vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids;
+            vo::EdgeSelection edges; edges.approvalStates = {"approved"};
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
-              view->graph = std::make_shared<vo::GraphReadView>(revisions ? view->store->graphReadViewAt(*view->txn, *revisions, edges)
-                        : view->store->graphReadView(*view->txn, objects, edges)); }
+              view->graph = std::make_shared<vo::GraphReadView>(view->store->graphReadView(*view->txn, objects, edges)); }
             return view.release();
         }, nb::rv_policy::take_ownership, nb::arg("object_kind") = std::nullopt,
-           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("edge_kind") = std::nullopt,
-           nb::arg("approval_states") = std::vector<std::string>{"approved"},
-           nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
-           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("revisions") = std::nullopt,
-           "Pin a store graph read view; use as a context manager and close before checkpointing.")
+           nb::arg("object_uuids") = std::vector<std::string>{},
+           "Pin the selected objects in one read snapshot; use as a context manager and close before checkpointing.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
@@ -599,23 +248,6 @@ NB_MODULE(_native, m)
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
            nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false)
-        .def("geometry_region", &geometryRegionFromPy, nb::arg("slice"),
-             nb::arg("options") = vo::RegionOptions{}, nb::arg("cancel") = nb::none())
-        .def("nearest_surfaces", [](PyObjectStore& self, const std::array<double, 3>& point, double tolerance,
-            const std::optional<std::vector<std::string>>& uuids, const std::optional<std::string>& coordinates,
-            const std::optional<std::string>& volume, double targetScale) {
-            vo::SurfaceProximityQuery query{point, tolerance, uuids, coordinates, volume, targetScale};
-            const auto hits = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.nearestSurfaces(txn, query); });
-            nb::list result;
-            for (const auto& hit : hits) {
-                nb::dict row; row["object_uuid"] = hit.objectUuid; row["revision_uuid"] = hit.revisionUuid;
-                row["grid"] = hit.grid; row["point"] = hit.point; row["distance"] = hit.distance;
-                result.append(row);
-            }
-            return result;
-        }, nb::arg("point"), nb::arg("tolerance"), nb::arg("uuids") = std::nullopt,
-           nb::arg("coordinates") = std::nullopt, nb::arg("volume") = std::nullopt, nb::arg("target_scale") = 1.0,
-           "Nearest point of each surface within tolerance, ordered by distance.")
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
@@ -640,21 +272,6 @@ NB_MODULE(_native, m)
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt, nb::arg("include_retired") = false,
            nb::arg("volume") = std::nullopt,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
-        .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
-            const std::optional<std::string>& tag, const std::vector<std::string>& ids,
-            const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
-            const std::vector<std::string>& fields, bool includeRetired) {
-            vo::JsonExportOptions options{{kind, tag, connected, ids, edgeKinds}, fields}; options.selection.includeRetired = includeRetired;
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.exportJson(txn, options); });
-        }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
-           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
-           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{}, nb::arg("include_retired") = false)
-        .def_prop_ro("replica_uuid", readMethod<&vo::ObjectStore::replicaUuid>())
-        .def("fork_replica", [](PyObjectStore& self) {
-            self.require();
-            if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
-            return self.require().forkReplica();
-        })
         .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");
@@ -670,191 +287,9 @@ NB_MODULE(_native, m)
             { nb::gil_scoped_release release; leases = vo::acquireLeases(db, uuids, seconds); }
             return hubLeases(leases);
         }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
-        .def("renew_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
-            auto& db = self.require();
-            std::vector<vo::HubLease> leases;
-            { nb::gil_scoped_release release; leases = vo::renewLeases(db, uuids, seconds); }
-            return hubLeases(leases);
-        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
-        .def("release_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids) {
-            auto& db = self.require();
-            nb::gil_scoped_release release;
-            vo::releaseLeases(db, uuids);
-        }, nb::arg("uuids"))
-        .def("hub_status", [](PyObjectStore& self) -> nb::object {
-            const auto status = vo::hubStatus(self.require());
-            if (!status) return nb::none();
-            nb::dict result; result["hub"] = status->hub.string(); result["replica"] = status->replica;
-            result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
-            result["leases"] = hubLeases(status->leases);
-            return result;
-        }, "Local hosting state of a replica, or None for an ordinary store.")
-        .def("resolve_hub_conflict", [](PyObjectStore& self, const std::string& uuid, const std::string& keep) {
-            auto& db = self.require();
-            if (self.db.use_count() != 1) throw std::runtime_error("resolve_hub_conflict requires an idle store");
-            vo::HubSyncReport report;
-            { nb::gil_scoped_release release; report = vo::resolveHubConflict(db, uuid, keep); }
-            return hubReport(report);
-        }, nb::arg("uuid"), nb::arg("keep"))
-        .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
-             nb::arg("json_text"))
-        .def(
-            "link_point_collections_to_surfaces",
-            [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::PointCollectionSurfaceParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle value = item.second;
-                    if (key == "collection_uuids") p.collectionUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "tolerance") p.tolerance = nb::cast<double>(value);
-                    else if (key == "point_scale") p.pointScale = nb::cast<double>(value);
-                    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(value);
-                    else if (key == "window_points") p.windowPoints = nb::cast<int>(value);
-                    else if (key == "window_min_points") p.windowMinPoints = nb::cast<int>(value);
-                    else if (key == "absolute_winding") p.absoluteWinding = nb::cast<std::optional<bool>>(value);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
-                    else throw std::runtime_error("link_point_collections_to_surfaces: unknown parameter '" + key + "'");
-                }
-                return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkPointCollectionsToSurfaces(db, p);
-                }));
-            },
-            nb::arg("kwargs"),
-            "Link regular PCL points to surfaces using Spiral's largest-area/nearest-named-pair rules. "
-            "Point IDs anchor the edges; winding annotations and surface grid coordinates are retained. "
-            "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
-        .def(
-            "link_surface_overlaps",
-            [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::SurfaceOverlapParams p;
-                for (auto item : kwargs) {
-                    const std::string key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (key == "workers") p.workers = nb::cast<int>(val);
-                    else if (key == "tolerance") p.tolerance = nb::cast<double>(val);
-                    else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
-                    else if (key == "thinning_spacing") p.thinningSpacing = nb::cast<double>(val);
-                    else if (key == "max_correspondences") p.maxCorrespondences = nb::cast<std::size_t>(val);
-                    else if (key == "uv_inlier_tolerance") p.uvInlierTolerance = nb::cast<double>(val);
-                    else if (key == "min_inliers") p.minInliers = nb::cast<std::size_t>(val);
-                    else if (key == "min_major_spread") p.minMajorSpread = nb::cast<double>(val);
-                    else if (key == "min_minor_spread") p.minMinorSpread = nb::cast<double>(val);
-                    else if (key == "max_refit_rms") p.maxRefitRms = nb::cast<double>(val);
-                    else if (key == "min_agreement_ratio") p.minAgreementRatio = nb::cast<double>(val);
-                    else if (key == "min_overlap_fraction") p.minOverlapFraction = nb::cast<double>(val);
-                    else if (key == "ransac_confidence") p.ransacConfidence = nb::cast<double>(val);
-                    else if (key == "ransac_max_hypotheses") p.ransacMaxHypotheses = nb::cast<std::size_t>(val);
-                    else if (key == "allow_reflection") p.allowReflection = nb::cast<bool>(val);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-                    else throw std::runtime_error("link_surface_overlaps: unknown parameter '" + key + "'");
-                }
-                return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkSurfaceOverlaps(db, p);
-                }));
-            },
-            "Run surface-overlap discovery using stored geometry; surface_uuids optionally selects objects. "
-            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...).")
-        .def(
-            "link_tracks_to_tracks",
-            [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::TrackTrackParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle value = item.second;
-                    if (key == "min_angle_degrees") p.minAngleDegrees = nb::cast<double>(value);
-                    else if (key == "tangent_radius_voxels") p.tangentRadiusVoxels = nb::cast<double>(value);
-                    else if (key == "cluster_index_radius") p.clusterIndexRadius = nb::cast<int>(value);
-                    else if (key == "workers") p.workers = nb::cast<int>(value);
-                    else if (key == "dataset_ref") p.datasetRef = nb::cast<std::string>(value);
-                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
-                    else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
-                    else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
-                }
-                return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkTracksToTracks(db, p);
-                }));
-            },
-            nb::arg("kwargs"),
-            "Discover crossings from stored tracks, optionally selected by track_uuids and dataset_ref. "
-            "Anchors are raw point indices and source XYZ positions.")
-        .def(
-            "link_tracks_to_surfaces",
-            [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::TrackSurfaceParams p;
-                for (auto item : kwargs) {
-                    const auto key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "track_scale") p.trackScale = nb::cast<double>(val);
-                    else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (!setLineSurfaceParameter(p, key, val))
-                        throw std::runtime_error("link_tracks_to_surfaces: unknown parameter '" + key + "'");
-                }
-                return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkTracksToSurfaces(db, ctVolume, p);
-                }));
-            },
-            nb::arg("ct_volume") = "", nb::arg("kwargs"),
-            "Link stored tracks to stored surfaces; select with track_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Anchors retain raw indices and source XYZ.")
-        .def(
-            "link_fibers_to_surfaces",
-            [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::FiberSurfaceParams p;
-                for (auto item : kwargs) {
-                    const std::string key = nb::cast<std::string>(item.first);
-                    const nb::handle val = item.second;
-                    if (key == "fiber_uuids") p.fiberUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (key == "cache_directory") p.cacheDirectory = nb::cast<std::string>(val);
-                    else if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
-                    else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
-                    else if (!setLineSurfaceParameter(p, key, val))
-                        throw std::runtime_error("link_fibers_to_surfaces: unknown parameter '" + key + "'");
-                }
-                return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkFibersToSurfaces(db, ctVolume, p);
-                }));
-            },
-            nb::arg("ct_volume") = "", nb::arg("kwargs"),
-            "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
-            "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
              nb::arg("object_uuid"))
-        .def("object_revision", readMethod<&vo::ObjectStore::objectRevision>(),
-             nb::arg("revision_uuid"))
-        .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
-             nb::arg("object_uuid"))
-        .def("recorded_relationships", readMethod<&vo::ObjectStore::recordedRelationships>(),
-             nb::arg("object_revision_uuid"))
-        .def("relationships_at", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
-            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, selection); });
-            nb::list result;
-            for (const auto& revision : revisions) {
-                auto d = relationshipRevisionToPy(revision.relationship);
-                d["applicable"] = revision.applicable;
-                result.append(d);
-            }
-            return result;
-        }, nb::arg("selection"))
-        .def("revision_read_view", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, selection);
-            });
-        }, nb::arg("selection"),
-           "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
-        .def("revision_selection_at", readMethod<&vo::ObjectStore::revisionSelectionAt>(), nb::arg("published_at_us"),
-             nb::arg("include_retired") = false)
-        .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
-            });
-        }, nb::arg("published_at_us"), nb::arg("include_retired") = false,
-           "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
         .def(
             "write",
             [](PyObjectStore& self, const std::optional<vo::RevisionSelection>& expected) {
@@ -866,18 +301,10 @@ NB_MODULE(_native, m)
             nb::arg("expected_revisions") = std::nullopt, nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
 
-    store.def("available_transforms",[](PyObjectStore& self,const std::string& uuid){
-        return volumeTransformsToPy(self.withRead([&](auto& db,auto& txn){return db.availableTransforms(txn,uuid);}));
-    },nb::arg("object_uuid"));
-    store.def("geometry_length_in_volume",readMethod<&vo::ObjectStore::geometryLengthInVolume>(),
-        nb::arg("object_uuid"),nb::arg("target_volume"),nb::arg("target_scale")=1.0);
     store.def("register_volume_transform",[](PyObjectStore& self,const std::string& source,const std::string& target,const nb::object& rows,const std::string& name){
         const auto matrix=vo::VolumeAffine::fromJson(nlohmann::json::parse(jsonDumps(rows)));
         return self.withWrite([&](auto& db,auto& txn){return db.registerVolumeTransform(txn,source,target,matrix,name);});
     },nb::arg("source_volume"),nb::arg("target_volume"),nb::arg("matrix"),nb::arg("name")="volume registration");
-    store.def("choose_volume_transform",[](PyObjectStore& self,const std::string& source,const std::string& target,const std::vector<std::string>& path){
-        return self.withWrite([&](auto& db,auto& txn){return db.chooseVolumeTransform(txn,source,target,path);});
-    },nb::arg("source_volume"),nb::arg("target_volume"),nb::arg("path"));
     auto writer = nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
         .def("__enter__", [](nb::object self) {
             nb::cast<PyObjectWriteTxn&>(self).enter();
@@ -887,21 +314,7 @@ NB_MODULE(_native, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
-        .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"))
-        .def("restore_object", writeMethod<&vo::ObjectStore::restoreObject, PyObjectWriteTxn>(),
-             nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
-        .def("retain_relationship", writeMethod<&vo::ObjectStore::retainRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
-        .def("keep_recorded_relationship", writeMethod<&vo::ObjectStore::keepRecordedRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
-        .def("keep_recorded_relationships_of", writeMethod<&vo::ObjectStore::keepRecordedRelationshipsOf, PyObjectWriteTxn>(), nb::arg("object_uuid"))
-        .def("update_edge", [](PyObjectWriteTxn& self, const nb::dict& record) {
-            self.owner->require().updateEdge(self.require(), edgeFromPy(record));
-        })
-        .def("edit_geometry_sequence", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
-            return self.owner->require().editGeometrySequence(self.require(),uuid,sequenceEditFromPy(input),expected,edgeEditsFromPy(choices));
-        },nb::arg("object_uuid"),nb::arg("edit"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list())
-        .def("resize_surface", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
-            return self.owner->require().resizeSurface(self.require(),uuid,surfaceResizeFromPy(input),expected,edgeEditsFromPy(choices));
-        },nb::arg("object_uuid"),nb::arg("resize"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list());
+        .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"));
     bindMutations(store);
     bindMutations(writer);
 }

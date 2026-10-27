@@ -253,7 +253,12 @@ int main() try
             for (const auto& array : mine->arrays)
                 require(alice.readGeometryArray(x, mine->uuid, array.name) == bob.readGeometryArray(y, theirs->uuid, array.name),
                         "same array bytes");
-            require(alice.geometryHistory(x, uuid).size() == bob.geometryHistory(y, uuid).size(), "same geometry history");
+            const auto history = [](ObjectStore& store, const Txn& txn, std::optional<std::string> revision) {
+                std::vector<std::string> chain;
+                for (; revision; revision = store.geometryRevision(txn, *revision)->parentUuid) chain.push_back(*revision);
+                return chain;
+            };
+            require(history(alice, x, mine->uuid) == history(bob, y, theirs->uuid), "same geometry history");
             require(nlohmann::json::parse(alice.objectByUuid(x, uuid)->meta) == nlohmann::json::parse(bob.objectByUuid(y, uuid)->meta),
                     "same metadata");
         };
@@ -276,12 +281,16 @@ int main() try
             for (const auto& [kind, uuid] : objects) {
                 auto revision = alice.currentGeometry(txn, uuid)->uuid;
                 if (kind != "surface") { updateGeometryArrays(alice, txn, uuid, geometry.at(kind).second, revision); continue; }
-                std::vector<uint8_t> moved(2 * 2 * 3 * sizeof(float));
-                for (size_t i = 0; i < moved.size() / sizeof(float); ++i) {
-                    const float value = 1000.0f + float(i);
-                    std::memcpy(moved.data() + i * sizeof(float), &value, sizeof(float));
+                std::vector<GeometryArrayEdit> moved;
+                for (int64_t row = 0; row < 2; ++row) {
+                    std::vector<uint8_t> bytes(2 * 3 * sizeof(float));
+                    for (size_t i = 0; i < 6; ++i) {
+                        const float value = 1000.0f + float(row * 6 + int64_t(i));
+                        std::memcpy(bytes.data() + i * sizeof(float), &value, sizeof(float));
+                    }
+                    moved.push_back({"points", ((130 + row) * surface.columns + 140) * 3, std::move(bytes)});
                 }
-                revision = alice.editGeometryRectangle(txn, uuid, "points", 130, 140, 2, 2, moved, revision);
+                revision = alice.editGeometry(txn, uuid, moved, revision);
                 GeometryArray mask{"valid", "|u1", {surface.rows, surface.columns},
                                    std::vector<uint8_t>(size_t(surface.rows * surface.columns), 1)};
                 alice.updateSurfaceChannels(txn, uuid, {mask}, {}, revision);

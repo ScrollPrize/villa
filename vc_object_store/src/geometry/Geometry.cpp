@@ -46,16 +46,6 @@ std::optional<GeometryRevision> ObjectStore::currentGeometry(const Txn& txn, con
     return head ? geometryRevision(txn, *head) : std::nullopt;
 }
 
-std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const std::string& objectUuid) const
-{
-    (void)connection(txn);
-    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation",
-        parseUuid(objectUuid));
-    std::vector<GeometryRevision> result;
-    while (s.row()) result.push_back(readGeometryRevision(s));
-    return result;
-}
-
 namespace {
 int64_t revisionSurfaceTileSize(const Txn& txn, const GeometryRevision& revision)
 {
@@ -364,19 +354,6 @@ std::shared_ptr<SparseGeometryEdit> prepareEdit(const ObjectStore& store, const 
 }
 }
 
-std::vector<EdgeRecord> ObjectStore::affectedGeometryEditEdges(const Txn& txn, const std::string& objectId,
-    const std::vector<GeometryArrayEdit>& edits, const std::string& expected) const
-{
-    (void)connection(txn);
-    const auto objectUuid = formatUuid(parseUuid(objectId));
-    DependencyScope scope;
-    const auto current=currentGeometry(txn,objectUuid);
-    if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(ObjectStoreImplAccess::conn(txn),"geometry: current revision changed; reload before committing");
-    const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
-    if (plan->changes.empty()) return {};
-    return affectedEdges(*this, txn, objectUuid, currentGeometry(txn, objectUuid), plan->after);
-}
-
 namespace {
 // Structural snapshots compare by array fingerprint: an edge whose arrays are
 // untouched is unaffected, even when it records a point that no longer exists.
@@ -613,29 +590,6 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();
     return uuid;
-}
-
-std::string ObjectStore::editGeometryRectangle(WriteTxn& txn, const std::string& objectUuid,
-    const std::string& name, int64_t row, int64_t column, int64_t rows, int64_t columns,
-    const std::vector<uint8_t>& bytes, const std::string& expected, const std::vector<GeometryEdgeEdit>& edgeEdits)
-{
-    const auto revision = currentGeometry(txn, objectUuid);
-    if (!revision || revision->uuid != formatUuid(parseUuid(expected)))
-        historyConflict(static_cast<sqlite3*>(connection(txn)), "geometry: current revision changed; reload before committing");
-    if (revision->kind != "surface") throw std::invalid_argument("rectangle edit requires a surface");
-    const auto found = std::find_if(revision->arrays.begin(), revision->arrays.end(), [&](const auto& a) { return a.name == name; });
-    if (found == revision->arrays.end()) throw std::invalid_argument("geometry: array not found: " + name);
-    const auto pixel = surfacePixelBytes(found->dtype, found->shape);
-    const auto& shape = found->shape;
-    if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > shape[0] || column > shape[1] ||
-        rows > shape[0]-row || columns > shape[1]-column || uint64_t(rows*columns*pixel) != bytes.size())
-        throw std::invalid_argument("geometry: invalid rectangle or byte length");
-    const auto components = shape.size() == 3 ? shape[2] : 1;
-    std::vector<GeometryArrayEdit> edits;
-    if (columns) for (int64_t r = 0; r < rows; ++r)
-        edits.push_back({name, ((row+r)*shape[1]+column)*components,
-            {bytes.begin()+r*columns*pixel, bytes.begin()+(r+1)*columns*pixel}});
-    return editGeometry(txn, objectUuid, edits, expected, edgeEdits);
 }
 
 } // namespace vc::objects

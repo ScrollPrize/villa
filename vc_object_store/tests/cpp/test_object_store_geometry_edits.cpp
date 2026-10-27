@@ -136,17 +136,17 @@ int main() try {
         });
         auto target = first; target.arrays.back().bytes = {3,0,4,0};
         pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
-            updated = updateGeometryArrays(db, txn, id, target, initial);
-            require(db.readGeometryArray(txn, updated, "review") == target.arrays.back().bytes, "auxiliary edits use sparse store updates");
+            updated = db.updateSurfaceChannels(txn, id, {target.arrays.back()}, {}, initial);
+            require(db.readGeometryArray(txn, updated, "review") == target.arrays.back().bytes, "channel updates replace the channel");
             require(db.readGeometryArray(txn, updated, "points") == first.arrays[0].bytes, "exact non-finite bits survive channel edits");
             require(db.readGeometryArray(txn, initial, "review") == first.arrays.back().bytes, "channel history remains immutable");
         });
         auto malformed = target; malformed.arrays.back().bytes.pop_back();
         mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
-            updateGeometryArrays(db, txn, id, malformed, updated);
+            db.updateSurfaceChannels(txn, id, {malformed.arrays.back()}, {}, updated);
         }); });
     }
-    // Surfaces larger than any whole-read budget update in place; a changed run
+    // Surfaces larger than any whole-read budget edit in place; a changed run
     // that crosses a read window stays one sparse edit.
     {
         const auto id = util::newUuid();
@@ -164,8 +164,10 @@ int main() try {
         const size_t window = 1024 * 1024 / 12; // the vertex containing the first window boundary
         for (size_t i = window - 3; i < window + 3; ++i) surface.points[i][2] = 9;
         const auto target = vc::geometry::encode(surface);
+        std::vector<uint8_t> run(6 * 12);
+        std::memcpy(run.data(), surface.points.data() + (window - 3), run.size());
         pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
-            updated = updateGeometryArrays(db, txn, id, target, initial);
+            updated = db.editGeometry(txn, id, {{"points", int64_t(window - 3) * 3, run}}, initial);
         });
         session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
             require(db.readGeometryArray(txn, updated, "points") == target.arrays[0].bytes, "large surfaces update exactly");
@@ -238,7 +240,7 @@ int main() try {
                 const auto* b = reinterpret_cast<const uint8_t*>(p.data()); bytes.insert(bytes.end(), b, b + 12);
             }
             auto txn = store.write();
-            head = store.editGeometryRectangle(txn, uuid, "points", row, 0, rows, 300, bytes, head);
+            head = store.editGeometry(txn, uuid, {{"points", int64_t(row) * 300 * 3, bytes}}, head);
             txn.commit();
             return head;
         };
@@ -304,6 +306,58 @@ int main() try {
             require(db.readGeometryData(txn, head).arrays.size() == 3, "reoptimized seed is published");
         });
         require(asked == 1, "the replaced linked point asks once");
+    }
+    {
+        // A splice keeps stable point IDs and their annotations in order; a
+        // snapshot view keeps reading its revision after a later edit.
+        auto store = ObjectStore::create(directory.path / "splice.vcobj", options);
+        const Json label{{"label", "A"}, {"note", std::string(70000, 'x')}};
+        std::string uid, first;
+        {
+            auto txn = store.write();
+            ObjectRecord record; record.kind = "point_collection";
+            record.meta = Json{{"source", {{"point_attributes", Json::array({label, Json{{"label", "B"}}})}}}}.dump();
+            uid = store.upsertObject(txn, record);
+            first = store.putGeometry(txn, uid, vc::geometry::encode(vc::geometry::PointCollection{{10, 20}, {{1, 2, 3}, {4, 5, 6}}}));
+            txn.commit();
+        }
+        const auto doubles = [](std::initializer_list<double> values) {
+            std::vector<uint8_t> bytes(values.size() * sizeof(double)); std::memcpy(bytes.data(), values.begin(), bytes.size()); return bytes;
+        };
+        std::string second;
+        {
+            auto read = store.read();
+            const auto head = store.currentObjectRevision(read, uid)->uuid;
+            auto txn = store.write({{uid, head}});
+            GeometrySequencePart part; part.count = 1; part.ids = {30}; part.bytes = doubles({7, 8, 9});
+            part.annotations = R"([{"label":"C"}])";
+            GeometrySequenceEdit splice; splice.array = "points"; splice.start = 1; splice.parts = {part};
+            second = store.editGeometrySequence(txn, uid, splice, first);
+            store.setMeta(txn, uid, "coordinates", R"({"scale_factor":4})");
+            txn.commit();
+        }
+        {
+            auto read = store.read();
+            require(Json::parse(store.geometryPointAnnotations(read, second, "points")) ==
+                    Json::array({label, Json{{"label", "C"}}, Json{{"label", "B"}}}), "annotations follow their points");
+            require(scalarsFromBytes<int64_t>(store.readGeometryArray(read, second, "point_ids")) == std::vector<int64_t>{10, 30, 20},
+                    "stable IDs in sequence order");
+            require(Json::parse(store.objectByUuid(read, uid)->meta).at("coordinates") ==
+                    Json{{"volume_uuid", nullptr}, {"scale_factor", 4}}, "coordinates are normalized");
+        }
+        GeometrySnapshot snapshot(store);
+        const auto view = snapshot.pointCollection(uid);
+        require(view.point(30) == vc::geometry::Point{7, 8, 9}, "lookup by stable ID");
+        std::string third;
+        {
+            auto txn = store.write({{uid, view.objectRevision()}});
+            third = store.editGeometry(txn, uid, {{"points", 3, doubles({10, 11, 12})}}, view.revision().uuid);
+            txn.commit();
+        }
+        require(view.point(30) == vc::geometry::Point{7, 8, 9}, "the snapshot keeps its revision");
+        auto read = store.read();
+        const auto points = store.readGeometryArray(read, third, "points");
+        require(std::vector<uint8_t>(points.begin() + 24, points.begin() + 48) == doubles({10, 11, 12}), "the edit lands by element offset");
     }
     std::cout << "generic geometry editing and coordinates passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

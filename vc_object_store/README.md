@@ -14,12 +14,11 @@ PCL to Surface edges can be absolute winding, relative winding, or same-winding 
 
 Modifications to geometry are stored as the delta to the previous iteration and contain a timestamp. If the object requires modifications to its shape a "checkpoint" is created, and any later deltas for history refer to this checkpoint. "Point-in-time" database views can be recovered by simply providing the timestamp 
 
-```python
-view = store.revision_read_view_at(timestamp_us)
-
-view["objects"]       # Historical object records and geometry revision references
-view["relationships"] # Recorded relationships, with applicability flags
-view["selection"]     # Object UUID → selected revision UUID
+```cpp
+auto txn = store.read();
+auto selection = store.revisionSelectionAt(txn, timestampUs); // object UUID → revision UUID
+auto relationships = store.relationshipsAt(txn, selection);   // recorded relationships, with applicability
+auto record = store.objectRevision(txn, *selection.at(uuid)); // historical record and geometry revision
 ```
 
 The object store can be used in place of tifxyz files, fiber jsons, track crossings/dbm files, and pcl jsons in any workflow where these are used and edit history is desired. The store contains the information necessary for any tool which works with these files to instead use the db. The object store can export these files after revision if this is needed. 
@@ -101,8 +100,7 @@ and scale options use working voxels. CT normals use uint8 Zarr data with comple
 pyramid levels; credentials and disk-cache configuration are not exposed by this
 adapter. Codec support follows vc_reader.
 
-`nearest_surfaces(point, tolerance, uuids=None, coordinates=None, volume=None)`
-(C++ `ObjectStore::nearestSurfaces`) returns the nearest point of each surface
+`ObjectStore::nearestSurfaces(txn, SurfaceProximityQuery)` returns the nearest point of each surface
 within tolerance, ordered by distance: object and geometry revision, fractional
 grid `[column, row]`, the surface point and distance. It reads only the persisted
 spatial tiles near the point and tests their exact valid triangles (the same
@@ -118,7 +116,7 @@ Canonical geometry stays in its recorded volume. Request another coordinate fram
 explicitly; the object store resolves the registration and applies it while reading:
 
 ```cpp
-auto snapshot = store.geometrySnapshot();
+vc::objects::GeometrySnapshot snapshot(store);
 auto surface = snapshot.surface(uuid).viewTransformedAt(targetVolume);
 auto tile = surface.readTile(row, column, rows, columns);
 // Equivalently, for any geometry kind:
@@ -136,17 +134,13 @@ with store.geometry_snapshot() as snapshot:
 
 Views retain the canonical revision and snapshot lifetime. Surface validity is
 separate from transformed coordinates; track views return floating coordinates.
-`coordinateEdits` and `surfaceEdits` map changed positions back to canonical
-storage, preserving untouched values. Track edits round to nearest integers,
-with ties away from zero. Call `validateForWrite` in the checked write transaction
-before applying edits; changed geometry or registrations invalidate the view.
-Alternatively, `writeCoordinates` and `writeSurface` validate and apply an edit in
-one call. Python exposes these as `store.edit_transformed_coordinates(view, ...)`
-and `store.edit_transformed_surface(view, ...)`.
+`surfaceEdits` maps changed surface positions back to canonical storage,
+preserving untouched values; `canonicalFiber` and `canonicalPointCollection` do
+the same for whole edited fibers and point collections. Call `validateForWrite`
+in the checked write transaction, then apply the edits with `editGeometry`;
+changed geometry or registrations invalidate the view.
 
-`availableTransforms(txn, uuid)` and each geometry view’s `availableTransforms()`
-(`available_transforms` in Python) list reachable
-volumes and ambiguity. Incompatible or ambiguous view requests fail explicitly.
+Incompatible or ambiguous view requests fail explicitly.
 Registrations and path choices are revisioned store objects. Open Data registrations
 can be supplied through `OpenOptions::catalogTransforms`, or `catalog=catalog`
 when opening a Python store with a `vc_reader.Catalog`. Catalog parsing, affine

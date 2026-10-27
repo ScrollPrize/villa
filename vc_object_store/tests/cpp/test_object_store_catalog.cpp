@@ -199,30 +199,28 @@ int main() try
     near.bbox = std::array<double, 6>{0, 0, 25, 20, 20, 35};
     near.volume = "vol";
     require(session.selectObjects({catalog}, near).size() == 1, "placeholder found by its bounds");
-    require(session.geometryState(catalog, uuid) == GeometryState::Remote, "remote before a read reaches it");
+    const auto local = [&](const std::string& object) {
+        bool found = false;
+        session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { found = db.currentGeometry(txn, object).has_value(); });
+        return found;
+    };
+    require(!local(uuid), "no geometry before a read reaches it");
     require(server.requests("seg-a.tifxyz/x.tif") == 0, "nothing fetched at open");
 
     // A region reaching it reports it and queues one fetch; the geometry arrives.
     auto first = regionAt(session, catalog, 30);
     require(first.runs.empty() && first.remote == std::vector<std::string>{uuid}, "region reports the placeholder");
     (void)regionAt(session, catalog, 30);
-    waitFor([&] { return session.geometryState(catalog, uuid) != GeometryState::Remote &&
-                         session.geometryState(catalog, uuid) != GeometryState::Fetching; }, "fetch finished");
+    waitFor([&] { return local(uuid); }, "fetched");
     auto events = session.takeEvents();
-    for (const auto& event : events)
-        if (event.kind == StoreSessionEvent::Kind::Fetch && !event.error.empty()) std::cerr << "fetch: " << event.error << '\n';
-    require(session.geometryState(catalog, uuid) == GeometryState::Local, "fetched");
     require(server.requests("seg-a.tifxyz/x.tif") == 1, "concurrent reads share one fetch");
     const auto fetched = regionAt(session, catalog, 30);
     require(!fetched.runs.empty() && fetched.remote.empty(), "region has the geometry once local");
-    bool sawFetch = false, sawCommit = false;
+    bool sawCommit = false;
     for (auto& event : session.takeEvents()) events.push_back(std::move(event));
-    for (const auto& event : events) {
-        sawFetch |= event.kind == StoreSessionEvent::Kind::Fetch && event.objectUuid == uuid &&
-                    event.fetchState == GeometryState::Local;
+    for (const auto& event : events)
         sawCommit |= event.kind == StoreSessionEvent::Kind::Committed && event.attachment == catalog;
-    }
-    require(sawFetch && sawCommit, "fetch and commit events");
+    require(sawCommit, "the fetched geometry is a commit event");
     session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
         const auto geometry = db.currentGeometry(txn, uuid);
         require(geometry && nlohmann::json::parse(geometry->attributes).at("source_url") == server.url("seg-a.tifxyz"),
@@ -234,13 +232,10 @@ int main() try
     // A failed fetch reports unavailable, caches nothing, and is retried.
     const auto offline = catalogSurfaceUuid(sample.surfaces(sample.segments[1]).front());
     mustFail([&] { session.ensureGeometry(catalog, offline); });
-    require(session.geometryState(catalog, offline) == GeometryState::Failed, "failed state");
-    bool cached = false;
-    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { cached = db.currentGeometry(txn, offline).has_value(); });
-    require(!cached, "failure not cached");
+    require(!local(offline), "failure not cached");
     writeSurface(served / "missing.tifxyz", 900);
     session.ensureGeometry(catalog, offline);
-    require(session.geometryState(catalog, offline) == GeometryState::Local, "retried on the next read");
+    require(local(offline), "retried on the next read");
 
     // Published files land in the artifact directory.
     const auto ink = publishedFile(session, catalog, uuid, "ink-detection.jpg");
@@ -281,9 +276,7 @@ int main() try
                              .samples.front();
     const auto refreshed = refreshCatalog(session, catalog, revised);
     require(refreshed.updated == 1 && refreshed.stale == 1, "refresh updates and marks stale");
-    waitFor([&] { return server.requests("seg-a-v2.tifxyz/x.tif") == 1 &&
-                         session.geometryState(catalog, uuid) == GeometryState::Local; },
-            "stale surface fetched again");
+    waitFor([&] { return server.requests("seg-a-v2.tifxyz/x.tif") == 1; }, "stale surface fetched again");
     waitFor([&] {
         bool fresh = false;
         session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {

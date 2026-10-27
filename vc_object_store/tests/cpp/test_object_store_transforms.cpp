@@ -41,8 +41,6 @@ int main() try {
         const auto ordered=db.selectObjects(txn,select);
         require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
                 "registered rows carry the target length they were ordered by");
-        require(db.surfaceAreaInVolume(txn,surface,"a")==4&&db.surfaceAreaInVolume(txn,surface,"b")==8&&
-                db.surfaceAreaInVolume(txn,surface,"b",.5)==2,"surface area in target voxels");
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");
@@ -76,7 +74,7 @@ int main() try {
     std::string objectRevision,geometryRevision;
     std::vector<GeometryArrayEdit> changes;
     {
-        auto snapshot=db.geometrySnapshot();const auto view=snapshot.track(track).viewTransformedAt("b");
+        GeometrySnapshot snapshot(db);const auto view=snapshot.track(track).viewTransformedAt("b");
         require(snapshot.pointCollection(points).viewTransformedAt("b").points("points",0,1).front()==std::array<double,3>{13,2,23},"point collections share transformed accessor");
         require(snapshot.umbilicus(umbilicus).viewTransformedAt("b").points("points",0,1).front()==std::array<double,3>{13,2,23},"umbilici share transformed accessor");
         require(snapshot.fiber(fiber).viewTransformedAt("b").points("control_points",0,2).back()==std::array<double,3>{16,0,20},"fibers share transformed accessor");
@@ -112,9 +110,6 @@ int main() try {
         bool unavailable=false;try{snapshot.track(track).viewTransformedAt("missing");}catch(const std::exception&){unavailable=true;}
         require(unavailable,"unavailable target is explicit");
         require(view.points("points",0,2).back()==std::array<double,3>{16,0,20},"floating track view");
-        require(view.coordinateEdits("points",0,view.points("points",0,2)).empty(),"unchanged positions remain byte-identical");
-        changes=view.coordinateEdits("points",1,{{17,0,20}}); // inverse x=3.5 -> 4
-        objectRevision=view.objectRevision();geometryRevision=view.revision().uuid;
         const auto tile=snapshot.viewTransformedAt(surface,"b").readTile(0,0,1,2);
         require(tile.points.size()==2&&tile.validity[0],"bounded surface tile");
         const auto surfaceView=snapshot.surface(surface).viewTransformedAt("b");
@@ -123,15 +118,24 @@ int main() try {
         require(surfaceChanges.size()==1,"surface inverse edits supplied by store");
         const auto changedPoint=vc::objects::xyzFromBytes<float>(surfaceChanges.front().bytes).front();
         require(changedPoint==std::array<float,3>{1,0,1},"surface inverse uses registration");
+        changes=surfaceChanges;objectRevision=surfaceView.objectRevision();geometryRevision=surfaceView.revision().uuid;
         snapshot.close();
         bool closed=false;try{view.points("points",0,1);}catch(const std::exception&){closed=true;}require(closed,"snapshot lifetime retained");
     }
     {
-        auto txn=db.write({{track,objectRevision}});db.editGeometry(txn,track,changes,geometryRevision);txn.commit();
-        auto snapshot=db.geometrySnapshot();require(snapshot.track(track).points(1,1).front()[0]==4,"canonical track rounding");
+        GeometrySnapshot snapshot(db);const auto view=snapshot.surface(surface).viewTransformedAt("b");
+        auto txn=db.write({{surface,objectRevision}});view.validateForWrite(db,txn);
+        db.editGeometry(txn,surface,changes,geometryRevision);txn.commit();
     }
+    GeometrySnapshot pinned(db);const auto stale=pinned.surface(surface).viewTransformedAt("b");
+    require(stale.canonical().index()==3&&std::get<SurfaceView>(stale.canonical()).vertex(0,0)==vc::geometry::SurfacePoint{1,0,1},
+            "the inverse edit lands in canonical coordinates");
     {
         auto txn=db.write();db.registerVolumeTransform(txn,"a","b",VolumeAffine::scale(3),"alternative");txn.commit();
+        auto check=db.read();bool changed=false;
+        try{stale.validateForWrite(db,check);}catch(const std::exception& error){changed=std::string(error.what()).find("registration")!=std::string::npos;}
+        require(changed,"a view refuses writes after its registration changed");
+        pinned.close();
         auto read=db.read();const auto context=db.volumeTransforms(read);const auto conflict=context.resolve("a","b");
         require(conflict.status==vcr::catalog::TransformStatus::Ambiguous,"conflicting store registrations");
         bool ambiguous=false;try{GeometrySnapshot(db,read).surface(surface).viewTransformedAt("b");}catch(const std::exception&){ambiguous=true;}
@@ -199,8 +203,8 @@ int main() try {
         require(conflict,"a different frame is refused");
     }
     {
-        // Areas are read in row bands; they sum like the whole grid, and
-        // vertices without coordinates drop their triangles.
+        // The store keeps a surface's area with its geometry; vertices without
+        // coordinates drop their triangles.
         vc::geometry::Surface large;large.rows=1800;large.columns=640;
         for(int64_t r=0;r<large.rows;++r)for(int64_t c=0;c<large.columns;++c)
             large.points.push_back({float(c)*1.25f,float(r),1.f});
@@ -212,7 +216,6 @@ int main() try {
             [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return large.vertex(r,c);},
             [&](int64_t r,int64_t c){return vc::geometry::validSurfacePoint(large.vertex(r,c));});
         auto read=db.read();
-        require(db.surfaceAreaInVolume(read,uuid,"a")==whole,"banded area equals the whole grid's");
         auto restored=large;restored.points[size_t(5*large.columns+7)]={7*1.25f,5,1.f};
         const auto complete=vc::geometry::surfaceGridArea(restored.rows,restored.columns,
             [&](int64_t r,int64_t c)->const vc::geometry::SurfacePoint&{return restored.vertex(r,c);},
@@ -227,8 +230,7 @@ int main() try {
          db.editGeometry(txn,uuid,{{"points",(5*large.columns+7)*3,vc::objects::detail::scalarBytes(std::span<const float>(vertex))}},head);
          txn.commit();}
         {auto r=db.read();const auto area=db.objectByUuid(r,uuid)->surface->area;
-         require(std::abs(area-complete)<=1e-12*complete&&std::abs(area-db.surfaceAreaInVolume(r,uuid,"a"))<=1e-12*complete,
-                 "an edit updates the area by its cells' change");}
+         require(std::abs(area-complete)<=1e-12*complete,"an edit updates the area by its cells' change");}
     }
     {
         // Importing an umbilicus file: the store reads it, decides its frame

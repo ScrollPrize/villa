@@ -12,7 +12,7 @@ The package separates geometry, stored objects and file formats:
 Link `vc_geometry` for owned geometry alone, or `vc_objects` for stored geometry.
 Installed CMake targets have the `vc_object_store::` prefix. Owned geometry has no
 SQLite, OpenCV, Qt, volume-cartographer or spiral-fitting dependency.
-All five types and the snapshot/edit API are also available in Python.
+All five types and the snapshot views are also available in Python.
 
 ## Owned geometry
 
@@ -86,7 +86,7 @@ native value.
 ```cpp
 #include <vc_object_store/store/GeometryViews.hpp>
 
-auto snapshot = store.geometrySnapshot();
+vc::objects::GeometrySnapshot snapshot(store);
 auto collection = snapshot.pointCollection(collectionUuid);
 auto xyz = collection.point(42);
 auto surface = snapshot.surface(surfaceUuid);
@@ -130,20 +130,22 @@ snapshots. Returned owned geometry remains valid after snapshot closure.
 Views are read-only. Use the existing checked store transaction for mutations;
 there is no separate typed editor or commit path.
 
-```python
-import struct
-with store.geometry_snapshot() as snapshot:
-    collection = snapshot.point_collection(collection_uuid)
-    with store.write(expected_revisions={collection_uuid: collection.object_revision}) as tx:
-        new_revision = tx.edit_geometry(collection_uuid, [dict(
-            array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
-        )], collection.revision["uuid"])
-    # collection still reads the original revision.
+```cpp
+vc::objects::GeometrySnapshot snapshot(store);
+auto collection = snapshot.pointCollection(collectionUuid);
+auto txn = store.write({{collectionUuid, collection.objectRevision()}});
+const double xyz[3] = {10, 20, 30};
+std::vector<uint8_t> bytes(sizeof xyz);
+std::memcpy(bytes.data(), xyz, sizeof xyz);
+store.editGeometry(txn, collectionUuid, {{"points", 0, bytes}}, collection.revision().uuid);
+txn.commit();
+// collection still reads the original revision.
 ```
 
 The transaction checks the pinned object and geometry revisions, including for
 no-ops. Affected relationships require explicit retain, update, remove or keep
-recorded decisions through `edit_geometry(edge_edits=...)`; include the affected
+recorded decisions through `editGeometry`'s edge edits (or its `EdgeDecider`
+overload); include the affected
 endpoints in the transaction's expected revisions. No relationship meaning is
 inferred by the geometry layer.
 
@@ -152,8 +154,8 @@ uses these same sparse and structural transactions, preserves auxiliary
 channels and exact scalar bytes, and accepts explicit annotation transforms.
 
 For adding/removing/reordering points or changing dimensions, use
-[structural edits](structural-editing.md). Full `put_geometry` replacement remains
-available before structural management begins; `affected_geometry_edges()` previews
+[structural edits](structural-editing.md). Full `putGeometry` replacement remains
+available before structural management begins; `affectedGeometryEdges()` previews
 its relationship dependencies. Multi-object actions use checked write transactions.
 
 ## Validation
@@ -167,7 +169,7 @@ Native directory export currently requires Linux `renameat2`.
 Sequence geometry (fibers, point collections, tracks) is created once with
 `putGeometry` / `put_geometry`. Initial per-point annotations supplied in source
 metadata are consumed into that geometry revision. Read them with
-`geometryPointAnnotations` / `geometry_point_annotations`; edit them through
+`geometryPointAnnotations`; edit them through
 sequence operations, alongside the points they describe. Fiber controls and
 point collections have stable IDs from creation. Fiber JSON transfer preserves
 `control_point_ids` and allocates IDs when a new input omits them.

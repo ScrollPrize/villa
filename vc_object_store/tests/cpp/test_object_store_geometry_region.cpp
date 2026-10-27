@@ -128,5 +128,50 @@ int main() try
         region = store.geometryRegion(masked, plane, surfaces);
         require(region.runs.size() == 2 && region.intersectingObjects == 1, "invalid vertices break the cut");
     }
+    {
+        // Nearest surfaces: pick, restrict by UUID, a volume target, and holes.
+        auto sheets = ObjectStore::create(directory.path / "nearest.vcobj", open);
+        auto sheet = [&](float z) {
+            vc::geometry::Surface surface{40, 40, {1, 1}, {}};
+            for (int r = 0; r < 40; ++r) for (int c = 0; c < 40; ++c) surface.points.push_back({float(c), float(r), z});
+            auto write = sheets.write();
+            ObjectRecord record; record.kind = "surface";
+            record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":2}})";
+            const auto uuid = sheets.upsertObject(write, record);
+            sheets.putGeometry(write, uuid, vc::geometry::encode(surface));
+            write.commit();
+            return uuid;
+        };
+        const auto near = sheet(10), far = sheet(14);
+        auto nearest = [&](std::array<double, 3> point, double tolerance, std::optional<std::vector<std::string>> uuids = std::nullopt,
+                           std::optional<std::string> volume = std::nullopt) {
+            SurfaceProximityQuery query; query.point = point; query.tolerance = tolerance; query.uuids = std::move(uuids);
+            query.volume = std::move(volume);
+            auto read = sheets.read();
+            return sheets.nearestSurfaces(read, query);
+        };
+        auto hits = nearest({12.25, 20.5, 11}, 5);
+        require(hits.size() == 2 && hits[0].objectUuid == near && hits[1].objectUuid == far, "nearest first");
+        require(hits[0].distance == 1 && hits[0].grid == std::array<double, 2>{12.25, 20.5} &&
+                hits[0].point == std::array<double, 3>{12.25, 20.5, 10}, "hit point, grid and distance");
+        require(nearest({12.25, 20.5, 11}, 0.5).empty(), "tolerance is a bound");
+        hits = nearest({12.25, 20.5, 11}, 5, std::vector<std::string>{far});
+        require(hits.size() == 1 && hits[0].objectUuid == far, "restricted to the selected surfaces");
+        require(nearest({12.25, 20.5, 11}, 5, std::vector<std::string>{}).empty(), "an empty selection matches nothing");
+        // Volume voxels are half the stored coordinates.
+        hits = nearest({6.125, 10.25, 5.5}, 2.5, std::nullopt, std::string("vol"));
+        require(hits.size() == 2 && hits[0].objectUuid == near && hits[0].distance == 0.5 &&
+                hits[0].point == std::array<double, 3>{6.125, 10.25, 5} && hits[0].grid == std::array<double, 2>{12.25, 20.5},
+                "volume target");
+        {
+            auto write = sheets.write();
+            std::vector<uint8_t> valid(40 * 40, 1);
+            for (int r = 19; r < 23; ++r) for (int c = 11; c < 15; ++c) valid[size_t(r * 40 + c)] = 0;
+            sheets.updateSurfaceChannels(write, near, {{"valid", "|u1", {40, 40}, valid}}, {}, sheets.currentGeometry(write, near)->uuid);
+            write.commit();
+        }
+        hits = nearest({12.25, 20.5, 11}, 5);
+        require(hits[0].objectUuid == near && hits[0].distance > 2, "invalid vertices are holes");
+    }
     std::cout << "geometry region tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

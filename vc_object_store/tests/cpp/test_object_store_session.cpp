@@ -343,7 +343,7 @@ int main() try
             const auto head = store.currentGeometry(txn, sheet)->uuid;
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             const std::vector<GeometryArrayEdit> edits{{"points", 0, moved}};
-            store.editGeometry(txn, sheet, edits, head, keep(store.affectedGeometryEditEdges(txn, sheet, edits, head)));
+            store.editGeometry(txn, sheet, edits, head, [&](const std::vector<EdgeRecord>& affected) { return keep(affected); });
         });
         session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
             require(store.edgeByUuid(txn, link).has_value(), "relationships survive kept-as-recorded edits");

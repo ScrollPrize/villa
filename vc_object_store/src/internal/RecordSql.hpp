@@ -57,7 +57,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
 
 std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid);
 
-// Shared content-mutation stamp for setMeta/removeMeta: bumps
+// Content-mutation stamp for setMeta: bumps
 // generation, restamps changed_*, resets approval, journals.
 void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
                         int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind);

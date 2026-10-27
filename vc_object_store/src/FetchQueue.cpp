@@ -3,7 +3,7 @@
 
 namespace vc::objects::detail {
 
-FetchQueue::FetchQueue(Notify notify) : notify_(std::move(notify)) {}
+FetchQueue::FetchQueue() = default;
 
 FetchQueue::~FetchQueue()
 {
@@ -82,22 +82,6 @@ bool FetchQueue::fetchNow(const std::string& uuid, const std::function<bool()>& 
     }
 }
 
-std::optional<GeometryState> FetchQueue::state(const std::string& uuid) const
-{
-    std::lock_guard lock(mutex_);
-    const auto found = entries_.find(uuid);
-    if (found == entries_.end()) return std::nullopt;
-    return found->second.state;
-}
-
-void FetchQueue::cancelQueued()
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& uuid : queue_)
-        if (entries_[uuid].waiters == 0) entries_[uuid].state = GeometryState::Remote;
-    std::erase_if(queue_, [&](const std::string& uuid) { return entries_[uuid].waiters == 0; });
-}
-
 void FetchQueue::run()
 {
     std::unique_lock lock(mutex_);
@@ -113,7 +97,6 @@ void FetchQueue::run()
         }
         entry.state = GeometryState::Fetching;
         lock.unlock();
-        if (notify_) notify_(uuid, GeometryState::Fetching, {});
         std::string error;
         try {
             fetch_(uuid);
@@ -126,11 +109,7 @@ void FetchQueue::run()
         finished.kept = false;
         finished.error = error;
         if (!error.empty()) finished.failedAt = std::chrono::steady_clock::now();
-        const auto state = finished.state;
-        lock.unlock();
-        if (notify_) notify_(uuid, state, error);
         done_.notify_all();
-        lock.lock();
     }
 }
 

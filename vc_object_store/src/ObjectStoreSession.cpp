@@ -292,17 +292,7 @@ AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path
     std::lock_guard transition(transition_);
     auto opened = options;
     opened.readOnly = false;
-    // The queue reports through the attachment once it is registered.
-    auto owner = std::make_shared<AttachmentIdentity>();
-    auto queue = std::make_unique<detail::FetchQueue>(
-        [this, owner](const std::string& uuid, GeometryState state, const std::string& error) {
-            std::lock_guard lock(mutex_);
-            StoreSessionEvent event{StoreSessionEvent::Kind::Fetch, *owner, 0, {}};
-            event.objectUuid = uuid;
-            event.fetchState = state;
-            event.error = error;
-            events_.push_back(std::move(event));
-        });
+    auto queue = std::make_unique<detail::FetchQueue>();
     auto* requests = queue.get();
     opened.remoteGeometryReached = [requests](const std::vector<std::string>& uuids) { requests->request(uuids); };
     auto next = std::make_shared<Attachment>(ObjectStore::open(path, opened));
@@ -318,7 +308,6 @@ AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path
                         [&](const auto& a) { return a->identity.storeUuid == next->identity.storeUuid; }))
             throw std::runtime_error("object store is already attached to this session");
         next->identity.generation = ++generation_;
-        *owner = next->identity;
         attached_.push_back(next);
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
@@ -360,26 +349,6 @@ void ObjectStoreSession::refetch(const AttachmentIdentity& identity, const std::
     release(*attachment, false);
 }
 
-GeometryState ObjectStoreSession::geometryState(const AttachmentIdentity& identity, const std::string& objectUuid)
-{
-    const auto uuid = util::canonicalUuid(objectUuid);
-    auto attachment = acquire(identity, false);
-    GeometryState state = GeometryState::Remote;
-    try {
-        bool local = false;
-        {
-            auto txn = attachment->store.read();
-            local = attachment->store.currentGeometry(txn, uuid).has_value();
-        }
-        const auto fetching = attachment->fetches ? attachment->fetches->state(uuid) : std::nullopt;
-        if (fetching && (*fetching == GeometryState::Fetching || (!local && *fetching == GeometryState::Failed)))
-            state = *fetching;
-        else if (local) state = GeometryState::Local;
-    } catch (...) { release(*attachment, false); throw; }
-    release(*attachment, false);
-    return state;
-}
-
 void ObjectStoreSession::ensureGeometry(const AttachmentIdentity& identity, const std::string& objectUuid,
                                         const std::function<bool()>& cancel)
 {
@@ -400,13 +369,6 @@ void ObjectStoreSession::ensureGeometry(const AttachmentIdentity& identity, cons
                                                         : "cannot fetch " + uuid + ": " + error);
         }
     } catch (...) { release(*attachment, false); throw; }
-    release(*attachment, false);
-}
-
-void ObjectStoreSession::cancelFetches(const AttachmentIdentity& identity)
-{
-    auto attachment = acquire(identity, false);
-    if (attachment->fetches) attachment->fetches->cancelQueued();
     release(*attachment, false);
 }
 
@@ -618,8 +580,6 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
 
 bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) const
 {
-    // Catalog fetches are of surfaces.
-    if (kind == Kind::Fetch) return std::find(kinds.begin(), kinds.end(), "surface") != kinds.end();
     if (kind != Kind::Committed) return true;
     return std::any_of(changes.begin(), changes.end(), [&](const auto& change) {
         return std::find(kinds.begin(), kinds.end(), change.kind) != kinds.end();

@@ -31,10 +31,6 @@ struct PinnedObject {
     bool operator==(const PinnedObject&) const = default;
 };
 
-// Where an object's geometry is: in the store, published but not fetched yet,
-// being fetched, or the last fetch failed (it is retried on a later read).
-enum class GeometryState { Local, Remote, Fetching, Failed };
-
 // An object's published geometry could not be fetched (offline, missing, invalid).
 struct GeometryUnavailable : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -44,9 +40,8 @@ struct StoreSessionEvent {
     // Attached/Detached: an attachment joined or left the session (replace()
     // reports the old one's Detached before the new one's Attached).
     // Hub: that attachment's hubStatus() changed.
-    // Fetch: a fetched attachment's object changed state (objectUuid,
-    // fetchState, error); its geometry arriving is also a Committed event.
-    enum class Kind { Attached, Detached, Committed, Hub, Fetch };
+    // A fetched object's geometry arriving is a Committed event.
+    enum class Kind { Attached, Detached, Committed, Hub };
     Kind kind = Kind::Attached;
     // Generations are unique within a session and increase on every attach,
     // including reattachment of the same file/UUID.
@@ -55,9 +50,6 @@ struct StoreSessionEvent {
     // Generic record UUIDs: objects AND relationships, including deleted records.
     // Consumers invalidate by identity, never by names or storage paths.
     std::vector<JournalEntry> changes;
-    std::string objectUuid;
-    GeometryState fetchState = GeometryState::Local;
-    std::string error;
     // Whether it may have changed records of these kinds: a commit touching
     // one, or any attachment or hub event.
     bool touches(std::initializer_list<std::string_view> kinds) const;
@@ -146,17 +138,14 @@ public:
     // A store whose objects without geometry are published elsewhere (e.g. an
     // Open Data sample, objects/CatalogStore.hpp). Callers see it read-only.
     // Geometry regions and nearest-surface queries that reach such an object
-    // queue its fetch (Fetch events, then the Committed write).
+    // queue its fetch (then the Committed write).
     AttachmentIdentity attachFetched(const std::filesystem::path&, const OpenOptions&, GeometryFetcher);
     RevisionSelection fetchWrite(const AttachmentIdentity&, const RevisionSelection& expected, const Action&);
     // Fetch these again (their published geometry changed), read or not.
     void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
-    GeometryState geometryState(const AttachmentIdentity&, const std::string& objectUuid);
     // Block until the object's geometry is local, fetching it now on a fetched
     // attachment. Throws GeometryUnavailable when the fetch fails or `cancel` returns true.
     void ensureGeometry(const AttachmentIdentity&, const std::string& objectUuid, const std::function<bool()>& cancel = {});
-    // Drop queued fetches nobody waits for (e.g. the viewer closed).
-    void cancelFetches(const AttachmentIdentity&);
     std::vector<AttachmentIdentity> attachments() const;
     bool writable(const AttachmentIdentity&) const;
     bool current(const AttachmentIdentity&) const;

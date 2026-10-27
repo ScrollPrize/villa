@@ -132,7 +132,7 @@ struct ObjectRevision {
 
 // Edge kind tying a data object to the object it describes (e.g. fit results
 // attached to a surface). Attachments are not graph links: traversal
-// (componentOf, reachableWithin, connectedTo), neighbours() and graph read views
+// (componentOf, connectedTo), neighbours() and graph read views
 // skip them unless the attachment kind is requested explicitly. Edge listings
 // and exports include them. Point collections attached this way carry a record
 // meta "role" and are never linked to surfaces by the point-collection linker.
@@ -254,14 +254,6 @@ struct GraphReadView {
     std::vector<uint64_t> offsets, neighbours, edgeIndices;
     std::vector<std::array<uint64_t, 2>> endpoints;
     int64_t journalSequence = 0;
-    // Present for selected-revision graphs; records align with nodes/edges.
-    // These retain historical metadata and pins, including deleted current records.
-    std::optional<std::vector<ObjectRevision>> selectedObjects;
-    std::optional<std::vector<RelationshipRevision>> selectedRelationships;
-    std::vector<std::string> reachableWithin(const std::string& objectUuid, int maxDepth,
-                                            const std::atomic_bool* cancel = nullptr) const;
-    std::vector<std::string> componentOf(const std::string& objectUuid,
-                                       const std::atomic_bool* cancel = nullptr) const;
 };
 
 // Homogeneous arrays concatenated along their first dimension. Offsets index
@@ -366,17 +358,9 @@ public:
     ObjectStore& operator=(const ObjectStore&) = delete;
     ~ObjectStore();
     ReadTxn read();
-    // Typed, bounded geometry reads. Include store/GeometryViews.hpp to use.
-    GeometrySnapshot geometrySnapshot();
     VolumeTransforms volumeTransforms(const Txn&) const;
-    std::vector<vcr::catalog::TransformResolution> availableTransforms(const Txn&, const std::string& objectUuid) const;
     // Exact polyline length after mapping to target voxels; reads bounded chunks.
     double geometryLengthInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1) const;
-    // A surface's area (current geometry, or `geometryRevision`) in target voxels
-    // squared, mapped through its binding or a registration (geometry::surfaceGridArea);
-    // reads the grid in row bands.
-    double surfaceAreaInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1,
-                               const std::optional<std::string>& geometryRevision = std::nullopt) const;
     std::string registerVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
         const VolumeAffine&, const std::string& name, const std::optional<std::string>& uuid = std::nullopt);
     // The route from `source` to `target` (registration keys as a resolution's
@@ -398,7 +382,6 @@ public:
     // The current revisions of the selected objects (a pin for each), without a
     // query per object.
     RevisionSelection currentRevisions(const Txn&, const ObjectSelection&) const;
-    std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
@@ -433,7 +416,6 @@ public:
     // finite positive scale declared for volume). Reads only the unbound index
     // ranges, so a store bound to one volume is not scanned.
     int64_t unboundObjectCount(const Txn&, const std::string& kind, const std::string& volume) const;
-    std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
     // Distinct tags on active objects, optionally of one kind, sorted.
     std::vector<std::string> objectTags(const Txn&, const std::optional<std::string>& kind = std::nullopt) const;
     // Require write(expected). Decisions use keepRecordedRelationship,
@@ -460,31 +442,23 @@ public:
                                                 const GeometryData&) const;
     // Sparse, lossless, compressed edits. One call publishes one revision in
     // the caller's transaction. expectedRevision is mandatory, even for no-ops.
-    // No automatic checkpoints. Use editGeometrySequence/resizeSurface for structure.
+    // No automatic checkpoints. Use editGeometrySequence for structure.
     std::string editGeometry(WriteTxn&, const std::string& objectUuid,
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision,
                              const std::vector<GeometryEdgeEdit>& edgeEdits = {});
     // As above, choosing the decisions for the relationships the edit affects
-    // from the same plan (affectedGeometryEditEdges + editGeometry plans twice).
+    // from the same plan.
     using EdgeDecider = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
     std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision, const EdgeDecider& decide);
-    std::vector<EdgeRecord> affectedGeometryEditEdges(const Txn&, const std::string& objectUuid,
-                             const std::vector<GeometryArrayEdit>&,
-                             const std::string& expectedRevision) const;
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
-    std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
     // Byte ranges allow bounded loading without materializing a whole array.
     // Every touched chunk is verified against its SHA-256 content address.
     std::vector<uint8_t> readGeometryArray(const Txn& txn, const std::string& revisionUuid,
         const std::string& arrayName, int64_t byteOffset = 0,
         const std::optional<int64_t>& byteCount = std::nullopt) const;
-
-    // Batched byte ranges [offset,count], in caller order, sharing verified chunks.
-    std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
-        const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
 
     // One packed buffer, caller revision order (including duplicates).
     // Dtype and trailing dimensions must match. All chunks remain verified.
@@ -492,7 +466,7 @@ public:
         const std::string& arrayName) const;
 
     // Owned pinned payload with an explicit aggregate byte bound. Reads are
-    // chunked; callers needing larger objects should use ranges/rectangles.
+    // chunked; callers needing larger objects should read byte ranges or rectangles.
     GeometryData readGeometryData(const Txn&, const std::string& revisionUuid,
         uint64_t byteBudget = 64 * 1024 * 1024) const;
 
@@ -501,11 +475,6 @@ public:
     std::string updateSurfaceChannels(WriteTxn&, const std::string& objectUuid,
         const std::vector<GeometryArray>& channels, const std::vector<std::string>& remove,
         const std::string& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits = {});
-    // Dense C-order rectangle edit; dtype/components match the existing array.
-    std::string editGeometryRectangle(WriteTxn&, const std::string& objectUuid,
-        const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns,
-        const std::vector<uint8_t>& bytes, const std::string& expectedRevision,
-        const std::vector<GeometryEdgeEdit>& edgeEdits = {});
 
     // Structural mutations require write(expected object revisions). References
     // to another object's revision require that object's expected head too.
@@ -514,23 +483,16 @@ public:
     std::string editGeometrySequence(WriteTxn&, const std::string& objectUuid,
         const GeometrySequenceEdit&, const std::string& expectedRevision,
         const std::vector<GeometryEdgeEdit>& edgeEdits = {});
-    std::string resizeSurface(WriteTxn&, const std::string& objectUuid,
-        const GeometrySurfaceResize&, const std::string& expectedRevision,
-        const std::vector<GeometryEdgeEdit>& edgeEdits = {});
     // Aligned annotations for a geometry revision, derived from stable IDs.
     std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned surface array. Exact
     // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.
-    // Rectangle/range reads may reuse verified bytes on a pooled reader until
+    // Rectangle reads may reuse verified bytes on a pooled reader until
     // its next snapshot observes a commit. Writes always use fresh readers.
     std::vector<uint8_t> readGeometryRectangle(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns) const;
-
-    // [row,column,rows,columns], in caller order, sharing manifest/chunk reads.
-    std::vector<std::vector<uint8_t>> readGeometryRectangles(const Txn&, const std::string& revisionUuid,
-        const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const;
 
     // Stamp current generation without bumping it: pending, approved or rejected.
     void setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state);
@@ -543,7 +505,6 @@ public:
     // jsonValue is JSON text (e.g. "\"reviewed\"", "3", "true").
     // Both bump generation and reset approval, like any content change.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
-    void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
     // Declare an object's coordinate frame: stored at `storedUnitsPerVoxel`
     // units per voxel of `volume`, merged into its meta.coordinates, refusing a
     // conflict with what it already declares.
@@ -583,11 +544,6 @@ public:
     // generations and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
-    // Requires a ReadTxn. Closed selection, null revisions resolve to latest in this snapshot.
-    // Always includes only applicable relationships. Retains isolated objects,
-    // including explicitly selected retired objects (which have no applicable edges).
-    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&,
-                                 const EdgeSelection& = {}) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
     std::vector<std::string> neighbours(const Txn& txn, const std::string& objectUuid,
@@ -602,10 +558,6 @@ public:
                                          const std::vector<std::string>& edgeKindFilter = {},
                                          const std::atomic_bool* cancel = nullptr, bool includeRetired = false,
                                          std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
-    std::vector<std::string> reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
-                                             const std::vector<std::string>& edgeKindFilter = {},
-                                             const std::atomic_bool* cancel = nullptr, bool includeRetired = false,
-                                             std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
 
     // No fields argument loads complete records. With fields, only requested
     // top-level fields plus uuid/kind are loaded; other C++ members stay default.
