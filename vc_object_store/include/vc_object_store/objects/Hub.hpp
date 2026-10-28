@@ -10,6 +10,7 @@
 
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/Progress.hpp"
+#include <functional>
 #include <stdexcept>
 
 namespace vc::objects {
@@ -28,13 +29,28 @@ struct HubConflict {
     std::string hubRecord, localRecord;  // canonical sync JSON, "null" when absent
 };
 
+// A hub position names one immutable hub state: the hub's journal sequence
+// after a hub write. Every replica and the hub agree on it; read it with
+// readHubPosition.
 struct HubSyncReport {
     int64_t pulled = 0, pushed = 0;  // records installed here / published to the hub
     std::vector<HubConflict> conflicts;
+    // The hub state a pull installed (0 without a pull).
+    int64_t pulledPosition = 0;
+    // The hub state holding this push: the position of its publication, or,
+    // when it had nothing to publish under an expected head, that head (N=H).
+    // 0 when nothing was published.
+    int64_t publishedPosition = 0;
+    // A push with an expected head found the hub elsewhere and published
+    // nothing; hubHead is where the hub was.
+    bool headMismatch = false;
+    int64_t hubHead = 0;
 };
 
 struct HubStatus {
     std::filesystem::path hub;
+    std::string hubReplica;  // the hub's own identity: positions belong to it
+    int64_t position = 0;    // the hub state this replica last pulled
     std::string replica;  // this replica's UUID, the lease holder identity
     std::vector<std::string> pending;  // records changed here and not yet pushed
     std::vector<HubConflict> conflicts;
@@ -67,8 +83,13 @@ void removeHubLock(const std::filesystem::path& hub);
 // Install hub changes. Records with unpushed local changes become conflicts.
 HubSyncReport hubPull(ObjectStore& replica);
 // Publish local changes atomically. Refuses while conflicts are unresolved;
-// throws if a changed hub object is not leased by this replica.
-HubSyncReport hubPush(ObjectStore& replica);
+// throws if a changed hub object is not leased by this replica. With
+// expectedHead, the hub write checks that the hub is still at that position
+// and otherwise publishes nothing (headMismatch), even for unrelated hub
+// commits; with nothing to publish it validates the head the same way. A
+// retry whose earlier publication on top of expectedHead succeeded but whose
+// response was lost reports that publication's position again.
+HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead = std::nullopt);
 // Pull, then push.
 HubSyncReport hubSync(ObjectStore& replica);
 
@@ -81,6 +102,16 @@ std::vector<HubLease> renewLeases(ObjectStore& replica, const std::vector<std::s
                                   int64_t seconds = kDefaultLeaseSeconds);
 // Refuses objects with unpushed changes. Leases of other holders are untouched.
 void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects);
+
+// Read the hub's state at a position through the hub's own history: `read`
+// gets the hub, a read transaction and the hub's revision of every object
+// present at that position, retired ones included. Records, tags, deletions
+// and relationship membership/approval come from the hub; geometry revisions
+// are shared, and every one the position references must already be in this
+// replica (pull to the position, or publish it, first). Throws for a position
+// that is not a hub state.
+void readHubPosition(ObjectStore& replica, int64_t position,
+                     const std::function<void(ObjectStore& hub, const ReadTxn&, const RevisionSelection&)>& read);
 
 // Local state only; no hub contact.
 std::optional<HubStatus> hubStatus(ObjectStore& store);

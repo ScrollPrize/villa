@@ -424,10 +424,11 @@ HubSyncReport hubPull(ObjectStore& replica)
     writeLeases(db, leases);
     txn.commit();
     report.pulled = int64_t(install.size());
+    report.pulledPosition = cursor.journal;
     return report;
 }
 
-HubSyncReport hubPush(ObjectStore& replica)
+HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead)
 {
     DependencyScope dependencyScope;
     HubSyncReport report;
@@ -449,7 +450,16 @@ HubSyncReport hubPush(ObjectStore& replica)
             changes.emplace(rows.text(0), std::move(change));
         }
     }
-    if (changes.empty()) return report;
+    if (changes.empty()) {
+        if (!expectedHead) return report;
+        // Nothing to publish: the position is the expected head, if it still is one.
+        const auto handle = openHub(replica, local, up);
+        auto hubTxn = handle->read();
+        const auto head = hubHead(conn(hubTxn));
+        if (head == *expectedHead) report.publishedPosition = head;
+        else { report.headMismatch = true; report.hubHead = head; }
+        return report;
+    }
     {
         // Lets a retry recognize this push on the hub if its outcome is lost.
         auto mark = replica.write();
@@ -467,6 +477,25 @@ HubSyncReport hubPush(ObjectStore& replica)
         pool(txn).actingHolder = self;
         auto* hubDb = conn(txn);
         const auto now = nowMicros();
+        const auto head = hubHead(hubDb);
+        std::optional<int64_t> recovered;
+        if (expectedHead) {
+            bool onHub = true;
+            int64_t latest = 0;
+            for (const auto& [id, change] : changes) {
+                if (syncRecord(hub, txn, id) != change.record) { onHub = false; break; }
+                latest = std::max(latest, hubVersion(hubDb, id));
+            }
+            // Every change is on the hub already: a retry of this replica's
+            // publication on top of the expected head recovers its position.
+            if (const auto mine = onHub ? hubPublicationOf(hubDb, latest) : std::nullopt;
+                mine && mine->replica == self && mine->previous == *expectedHead)
+                recovered = mine->position;
+            else if (head != *expectedHead) {
+                report.headMismatch = true; report.hubHead = head;
+                return report;
+            }
+        }
         auto before = Json::object(), merged = Json::object();
         std::set<std::string> apply;
         std::vector<std::string> unleased;
@@ -545,6 +574,8 @@ HubSyncReport hubPush(ObjectStore& replica)
             created.push_back({id, self, replica.author(), replica.hostname(), now, now + kDefaultLeaseSeconds * 1000000});
         }
         writeLeases(hubDb, created);
+        if (recovered) report.publishedPosition = *recovered;
+        else if (!apply.empty() || expectedHead) report.publishedPosition = hubHead(hubDb);
         txn.commit();
         report.pushed = int64_t(apply.size());
     }
@@ -569,6 +600,7 @@ HubSyncReport hubSync(ObjectStore& replica)
     if (!report.conflicts.empty()) return report;
     auto pushed = hubPush(replica);
     report.pushed = pushed.pushed;
+    report.publishedPosition = pushed.publishedPosition;
     report.conflicts = std::move(pushed.conflicts);
     return report;
 }
@@ -610,12 +642,42 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
     mirror.commit();
 }
 
+void readHubPosition(ObjectStore& replica, int64_t position,
+                     const std::function<void(ObjectStore&, const ReadTxn&, const RevisionSelection&)>& read)
+{
+    std::shared_ptr<ObjectStore> hub;
+    {
+        auto local = replica.read();
+        hub = openHub(replica, local, upstream(conn(local)));
+    }
+    auto txn = hub->read();
+    const auto publication = hubPublicationAt(conn(txn), position);
+    const auto selection = hub->revisionSelectionAt(txn, publication.publishedAtUs, true);
+    {
+        auto local = replica.read();
+        Statement geometry(conn(txn), "SELECT geometry_uuid FROM object_revisions WHERE uuid=? AND geometry_uuid IS NOT NULL");
+        Statement present(conn(local), "SELECT 1 FROM geometry_revisions WHERE uuid=?");
+        for (const auto& [object, revision] : selection) {
+            geometry.reset(); geometry.bind(1, *revision);
+            if (!geometry.row()) continue;
+            present.reset(); present.bind(1, geometry.blob16(0));
+            if (!present.row())
+                throw std::runtime_error("hub: this replica lacks geometry of " + object + " at position " +
+                                         std::to_string(position) + "; pull first");
+        }
+    }
+    read(*hub, txn, selection);
+}
+
 std::optional<HubStatus> hubStatus(ObjectStore& store)
 {
     auto txn = store.read();
     if (detectHubRole(conn(txn)) != HubRole::Replica) return std::nullopt;
     HubStatus status;
-    status.hub = upstream(conn(txn)).hub;
+    const auto up = upstream(conn(txn));
+    status.hub = up.hub;
+    status.hubReplica = up.hubReplica;
+    status.position = up.cursor.journal;
     status.replica = replicaIdentity(conn(txn));
     Statement pending(conn(txn), "SELECT record_uuid FROM hub_pending ORDER BY record_uuid");
     while (pending.row()) status.pending.push_back(pending.text(0));

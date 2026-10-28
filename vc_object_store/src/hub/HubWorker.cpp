@@ -20,6 +20,26 @@ LeaseHold& LeaseHold::operator=(LeaseHold&& other) noexcept
     return *this;
 }
 
+PushHold::PushHold(PushHold&& other) noexcept : holds_(std::move(other.holds_)) {}
+
+PushHold& PushHold::operator=(PushHold&& other) noexcept
+{
+    if (this != &other) {
+        reset();
+        holds_ = std::move(other.holds_);
+    }
+    return *this;
+}
+
+void PushHold::reset()
+{
+    if (const auto holds = holds_.lock()) {
+        std::lock_guard lock(holds->mutex);
+        if (--holds->count == 0 && holds->worker) holds->worker->requestSync(false);
+    }
+    holds_.reset();
+}
+
 void LeaseHold::reset()
 {
     if (const auto counts = counts_.lock()) {
@@ -56,11 +76,16 @@ HubWorker::HubWorker(ObjectStore& replica, const HubSessionOptions& options, std
 {
     status_ = localStatus();
     due_ = std::chrono::steady_clock::now();
+    pushHolds_->worker = this;
     thread_ = std::thread([this] { run(); });
 }
 
 HubWorker::~HubWorker()
 {
+    {
+        std::lock_guard lock(pushHolds_->mutex);
+        pushHolds_->worker = nullptr;
+    }
     {
         std::lock_guard lock(mutex_);
         stopping_ = true;
@@ -83,6 +108,7 @@ HubSessionStatus HubWorker::syncAndWait(std::chrono::milliseconds timeout)
     std::unique_lock lock(mutex_);
     const auto target = started_ + 1;
     due_ = std::chrono::steady_clock::now();
+    pushRequested_ = true;
     wake_.notify_all();
     if (!synced_.wait_for(lock, timeout, [&] { return finished_ >= target; }))
         throw std::runtime_error("hub: no sync finished within " + std::to_string(timeout.count()) + " ms" +
@@ -103,7 +129,17 @@ void HubWorker::requestResolve(const std::string& keep)
 HubSessionStatus HubWorker::status() const
 {
     std::lock_guard lock(mutex_);
-    return status_;
+    auto result = status_;
+    result.pushesHeld = pushHolds_->count > 0;
+    return result;
+}
+
+PushHold HubWorker::holdPushes()
+{
+    PushHold result;
+    ++pushHolds_->count;
+    result.holds_ = pushHolds_;
+    return result;
 }
 
 LeaseHold HubWorker::hold(const std::vector<std::string>& objects)
@@ -151,7 +187,7 @@ HubSessionStatus HubWorker::localStatus()
     return result;
 }
 
-HubSessionStatus HubWorker::syncOnce(const std::optional<std::string>& resolve)
+HubSessionStatus HubWorker::syncOnce(const std::optional<std::string>& resolve, bool push)
 {
     std::lock_guard hub(hub_);
     if (resolve)
@@ -160,9 +196,13 @@ HubSessionStatus HubWorker::syncOnce(const std::optional<std::string>& resolve)
             if (*resolve == "local" && object) renewLeases(replica_, {conflict.uuid});
             resolveHubConflict(replica_, conflict.uuid, *resolve);
         }
-    hubPull(replica_);
+    const auto pulled = hubPull(replica_);
     auto status = *hubStatus(replica_);
-    if (!status.conflicts.empty()) return localStatus();
+    if (!status.conflicts.empty()) {
+        auto result = localStatus();
+        result.position = pulled.pulledPosition;
+        return result;
+    }
     const auto held = leases_->held();
     const std::set<std::string> pending(status.pending.begin(), status.pending.end());
     // Edits made while offline outlive their leases; pushing needs them again.
@@ -172,16 +212,20 @@ HubSessionStatus HubWorker::syncOnce(const std::optional<std::string>& resolve)
             lease.expiresUs - nowMicros() < kRenewMarginUs)
             renew.push_back(lease.objectUuid);
     if (!renew.empty()) renewLeases(replica_, renew);
-    hubPush(replica_);
-    // Release what nobody holds once pushed, including objects this push created.
-    status = *hubStatus(replica_);
-    for (const auto& lease : status.leases)
-        if (lease.holder == status.replica && !held.contains(lease.objectUuid) &&
-            std::find(status.pending.begin(), status.pending.end(), lease.objectUuid) == status.pending.end())
-            release.push_back(lease.objectUuid);
-    if (!release.empty()) releaseLeases(replica_, release);
+    int64_t position = pulled.pulledPosition;
+    if (push) {
+        if (const auto pushed = hubPush(replica_); pushed.publishedPosition) position = pushed.publishedPosition;
+        // Release what nobody holds once pushed, including objects this push created.
+        status = *hubStatus(replica_);
+        for (const auto& lease : status.leases)
+            if (lease.holder == status.replica && !held.contains(lease.objectUuid) &&
+                std::find(status.pending.begin(), status.pending.end(), lease.objectUuid) == status.pending.end())
+                release.push_back(lease.objectUuid);
+        if (!release.empty()) releaseLeases(replica_, release);
+    }
     auto result = localStatus();
     result.syncedAtUs = nowMicros();
+    result.position = position;
     return result;
 }
 
@@ -194,15 +238,17 @@ void HubWorker::run()
         due_ = std::chrono::steady_clock::now() + options_.syncInterval;
         ++started_;
         const auto resolve = std::exchange(resolve_, std::nullopt);
+        const bool push = std::exchange(pushRequested_, false) || pushHolds_->count == 0;
         const auto previous = status_;
         lock.unlock();
         HubSessionStatus next;
         try {
-            next = syncOnce(resolve);
+            next = syncOnce(resolve, push);
             if (!next.syncedAtUs) next.syncedAtUs = previous.syncedAtUs;
         } catch (const std::exception& error) {
             try { next = localStatus(); } catch (...) { next = previous; }
             next.syncedAtUs = previous.syncedAtUs;
+            next.position = previous.position;
             next.error = firstLine(error.what());
         }
         lock.lock();

@@ -777,6 +777,15 @@ LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, con
     return hold;
 }
 
+PushHold ObjectStoreSession::holdPushes(const AttachmentIdentity& identity)
+{
+    auto attachment = acquire(identity, false);
+    PushHold hold;
+    if (attachment->hub) hold = attachment->hub->holdPushes();
+    release(*attachment, false);
+    return hold;
+}
+
 std::optional<HubSessionStatus> ObjectStoreSession::hubStatus(const AttachmentIdentity& identity) const
 {
     std::lock_guard lock(mutex_);

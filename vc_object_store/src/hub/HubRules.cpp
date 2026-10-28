@@ -37,6 +37,39 @@ std::string describe(const Lease& lease)
 {
     return lease.author + "@" + lease.host + " until " + isoFromMicros(lease.expiresUs);
 }
+
+int64_t latestPublicationUs(sqlite3* db)
+{
+    Statement row(db, "SELECT coalesce(max(published_at_us),0) FROM object_revisions");
+    (void)row.row();
+    return row.i64(0);
+}
+
+bool hasPublications(sqlite3* db)
+{
+    Statement table(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hub_publications'");
+    return table.row();
+}
+
+// Positions name hub states by journal sequence; each hub write that journals
+// records the publication time its history reads at. Hubs made before the
+// index start it, with the state they had, at their next write.
+void createPublications(sqlite3* db, int64_t head, int64_t publishedAtUs)
+{
+    exec(db, R"SQL(
+CREATE TABLE hub_publications(
+  position INTEGER PRIMARY KEY,
+  previous INTEGER NOT NULL,
+  published_at_us INTEGER NOT NULL,
+  replica TEXT NOT NULL
+);)SQL");
+    execute(db, "INSERT INTO hub_publications VALUES(?,0,?,'')", head, publishedAtUs);
+}
+
+HubPublication publication(Statement& row)
+{
+    return {row.i64(0), row.i64(1), row.i64(2), row.text(3)};
+}
 }
 
 HubRole detectHubRole(sqlite3* db)
@@ -56,6 +89,45 @@ CREATE TABLE hub_leases(
   holder TEXT NOT NULL, author TEXT NOT NULL, host TEXT NOT NULL,
   acquired_us INTEGER NOT NULL, expires_us INTEGER NOT NULL
 );)SQL");
+    createPublications(db, hubHead(db), latestPublicationUs(db));
+}
+
+int64_t hubHead(sqlite3* hub)
+{
+    Statement row(hub, "SELECT coalesce(max(seq),0) FROM journal");
+    (void)row.row();
+    return row.i64(0);
+}
+
+HubPublication hubPublicationAt(sqlite3* hub, int64_t position)
+{
+    const auto head = hubHead(hub);
+    if (position < 0 || position > head)
+        throw std::runtime_error("hub: position " + std::to_string(position) + " is not a hub state (head " +
+                                 std::to_string(head) + ")");
+    if (!hasPublications(hub)) {
+        if (position != head)
+            throw std::runtime_error("hub: position " + std::to_string(position) + " predates the hub's publication index");
+        return {head, 0, latestPublicationUs(hub), ""};
+    }
+    Statement row(hub, "SELECT position,previous,published_at_us,replica FROM hub_publications "
+                       "WHERE position<=? ORDER BY position DESC LIMIT 1", position);
+    if (!row.row())
+        throw std::runtime_error("hub: position " + std::to_string(position) + " predates the hub's publication index");
+    auto result = publication(row);
+    Statement between(hub, "SELECT 1 FROM journal WHERE seq>? AND seq<=? LIMIT 1", result.position, position);
+    if (between.row())
+        throw std::runtime_error("hub: position " + std::to_string(position) + " falls inside a hub write");
+    return result;
+}
+
+std::optional<HubPublication> hubPublicationOf(sqlite3* hub, int64_t version)
+{
+    if (!hasPublications(hub)) return std::nullopt;
+    Statement row(hub, "SELECT position,previous,published_at_us,replica FROM hub_publications "
+                       "WHERE position>=?1 AND previous<?1 ORDER BY position LIMIT 1", version);
+    if (!row.row()) return std::nullopt;
+    return publication(row);
 }
 
 void createReplicaTables(sqlite3* db)
@@ -124,9 +196,10 @@ void beginHubWrite(sqlite3* db, StatementPool& pool)
     pool.hubApply = false;
     pool.actingHolder.reset();
     Statement cursors(db, "SELECT coalesce((SELECT max(seq) FROM journal),0),"
-                          "coalesce((SELECT max(rowid) FROM geometry_revisions),0)");
+                          "coalesce((SELECT max(rowid) FROM geometry_revisions),0),"
+                          "coalesce((SELECT max(published_at_us) FROM object_revisions),0)");
     (void)cursors.row();
-    pool.startJournal = cursors.i64(0); pool.startGeometry = cursors.i64(1);
+    pool.startJournal = cursors.i64(0); pool.startGeometry = cursors.i64(1); pool.startPublishedUs = cursors.i64(2);
 }
 
 void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
@@ -139,6 +212,10 @@ void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
         for (const auto& object : changedObjects(db, changed))
             if (const auto held = lease(db, object); held && held->expiresUs > now && held->holder != acting)
                 throw std::runtime_error("object store: " + object + " is leased to " + describe(*held));
+        if (const auto head = hubHead(db); head > pool.startJournal) {
+            if (!hasPublications(db)) createPublications(db, pool.startJournal, pool.startPublishedUs);
+            execute(db, "INSERT INTO hub_publications VALUES(?,?,?,?)", head, pool.startJournal, latestPublicationUs(db), acting);
+        }
         return;
     }
     const auto self = replicaIdentity(db);

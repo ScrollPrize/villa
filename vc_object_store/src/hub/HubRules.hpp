@@ -14,6 +14,14 @@ std::string replicaIdentity(sqlite3*);
 int64_t hubVersion(sqlite3* hub, const std::string& record);
 // The hub version this replica last installed or pushed for a record.
 int64_t knownHubVersion(sqlite3* replica, const std::string& record);
+// The hub publication a position (journal sequence) names: the last hub write
+// at or before it. Throws unless nothing was journaled between that write and
+// the position and the position is not beyond the hub's head.
+struct HubPublication { int64_t position = 0, previous = 0, publishedAtUs = 0; std::string replica; };
+HubPublication hubPublicationAt(sqlite3* hub, int64_t position);
+// The publication that journaled a record version (a hubVersion), if recorded.
+std::optional<HubPublication> hubPublicationOf(sqlite3* hub, int64_t version);
+int64_t hubHead(sqlite3* hub);
 // Capture the cursors that delimit this write's changes; call after BEGIN.
 void beginHubWrite(sqlite3*, StatementPool&);
 // Before COMMIT: lease checks (hub and replica) and pending-change bookkeeping

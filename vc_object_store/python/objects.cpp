@@ -710,15 +710,70 @@ NB_MODULE(_native, m)
             if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
             return self.require().forkReplica();
         })
-        .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
+        .def("hub_sync", [](PyObjectStore& self, bool pull, bool push, std::optional<int64_t> expectedHead) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");
+            if (expectedHead && (pull || !push))
+                throw std::invalid_argument("hub_sync: expected_head applies to a push alone (pull=False)");
             vo::HubSyncReport report;
             { nb::gil_scoped_release release;
-              report = pull && push ? vo::hubSync(db) : pull ? vo::hubPull(db) : vo::hubPush(db); }
+              report = pull && push ? vo::hubSync(db) : pull ? vo::hubPull(db) : vo::hubPush(db, expectedHead); }
             return hubReport(report);
-        }, nb::arg("pull") = true, nb::arg("push") = true,
-           "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases.")
+        }, nb::arg("pull") = true, nb::arg("push") = true, nb::arg("expected_head") = std::nullopt,
+           "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases. "
+           "With expected_head (push only), publish only while the hub is still at that position; "
+           "the report's head_mismatch says it was not.")
+        .def("hub_selection_at", [](PyObjectStore& self, int64_t position, bool includeRetired) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_selection_at requires an idle store");
+            vo::RevisionSelection result;
+            nb::gil_scoped_release release;
+            vo::readHubPosition(db, position, [&](vo::ObjectStore& hub, const vo::ReadTxn& txn, const vo::RevisionSelection& selection) {
+                for (const auto& [object, revision] : selection)
+                    if (includeRetired || !hub.objectRevision(txn, *revision)->record.retired) result.emplace(object, revision);
+            });
+            return result;
+        }, nb::arg("position"), nb::arg("include_retired") = false,
+           "The hub's object revisions at a hub position (hub revision UUIDs).")
+        .def("hub_read_view_at", [](PyObjectStore& self, int64_t position, const std::optional<std::vector<std::string>>& objects,
+                                    bool includeRetired) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_read_view_at requires an idle store");
+            vo::RevisionSelection selected;
+            std::vector<vo::ObjectRevision> revisions;
+            std::vector<vo::SelectedRelationship> relationships;
+            {
+                nb::gil_scoped_release release;
+                vo::readHubPosition(db, position, [&](vo::ObjectStore& hub, const vo::ReadTxn& txn, const vo::RevisionSelection& selection) {
+                    std::set<std::string> wanted;
+                    if (objects) for (const auto& uuid : *objects) wanted.insert(vo::util::canonicalUuid(uuid));
+                    for (const auto& [object, revision] : selection) {
+                        if (objects && !wanted.contains(object)) continue;
+                        auto value = hub.objectRevision(txn, *revision);
+                        if (!includeRetired && value->record.retired) continue;
+                        selected.emplace(object, revision);
+                        revisions.push_back(std::move(*value));
+                    }
+                    relationships = hub.relationshipsAt(txn, selected);
+                });
+            }
+            nb::dict result, resolved;
+            nb::list items, edges;
+            for (const auto& revision : revisions) {
+                items.append(objectRevisionToPy(revision));
+                resolved[pyStr(revision.objectUuid)] = revision.uuid;
+            }
+            for (const auto& relationship : relationships) {
+                auto edge = relationshipRevisionToPy(relationship.relationship);
+                edge["applicable"] = relationship.applicable; edges.append(edge);
+            }
+            result["objects"] = items; result["relationships"] = edges; result["selection"] = resolved;
+            result["position"] = position;
+            return result;
+        }, nb::arg("position"), nb::arg("object_uuids") = std::nullopt, nb::arg("include_retired") = false,
+           "revision_read_view of the hub's state at a hub position: objects present then (or those of object_uuids "
+           "present then), their records and relationship applicability, read from the hub's history. Geometry "
+           "revisions it names are read from this replica.")
         .def("acquire_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
             auto& db = self.require();
             std::vector<vo::HubLease> leases;
@@ -740,6 +795,7 @@ NB_MODULE(_native, m)
             const auto status = vo::hubStatus(self.require());
             if (!status) return nb::none();
             nb::dict result; result["hub"] = status->hub.string(); result["replica"] = status->replica;
+            result["hub_replica"] = status->hubReplica; result["position"] = status->position;
             result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
             result["leases"] = hubLeases(status->leases);
             return result;

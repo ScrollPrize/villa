@@ -561,13 +561,74 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
         assert lease['author'] == 'script'
         script.set_meta(fiber, 'review', 'done')
         assert script.hub_status()['pending'] == [fiber]
-        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
+        report = script.hub_sync()
+        assert (report['pulled'], report['pushed'], report['conflicts']) == (0, 1, [])
+        assert report['published_position'] > report['pulled_position'] == script.hub_status()['position']
         assert viewer.hub_sync()['pulled'] == 1
         assert viewer.object(fiber)['meta']['review'] == 'done'
         with pytest.raises(RuntimeError, match='leased to script'):
             viewer.acquire_leases([fiber])
         script.release_leases([fiber])
         assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
+
+
+def test_a_service_links_and_pins_a_hub_position(tmp_path):
+    """Positions name hub states: a conditional push publishes only on the
+    expected head, and any replica reads a position from the hub's history."""
+    import vc_object_store as vos
+    hub = tmp_path / 'hub.vcobj'
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        first, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        second, _ = put(origin, Fiber([[1, 2, 4], [4, 5, 7]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    for name in ('service', 'editor'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    session = vos.ObjectStoreSession()
+    editor = session.attach(str(tmp_path / 'editor.vcobj'), 'editor', sync_interval_ms=100, push_delay_ms=20)
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        status = service.hub_status()
+        assert status['hub_replica'] and status['position'] > 0
+        with session.hold_leases(editor, [first]):
+            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+                db.set_meta(first, 'review', 'edited')
+            with session.hold_pushes(editor):
+                assert session.hub_status(editor)['pushes_held']
+                reached = session.sync_hub_and_wait(editor, timeout_s=20)
+        assert not reached['pending'] and reached['position'] > status['position']
+        # Link at the head, then publish only on it.
+        head = service.hub_sync(pull=True, push=False)['pulled_position']
+        assert head == reached['position']
+        anchor = dict(points=[dict(array='control_points', index=[0])])
+        edge = service.add_edge(dict(a=first, b=second, kind='fiber_branch', a_anchor=anchor, b_anchor=anchor))
+        with session.hold_leases(editor, [second]):
+            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+                db.set_meta(second, 'note', 'unrelated')  # an unrelated foreign commit after H
+            foreign = session.sync_hub_and_wait(editor, timeout_s=20)['position']
+        refused = service.hub_sync(pull=False, push=True, expected_head=head)
+        assert refused['head_mismatch'] and refused['hub_head'] == foreign and refused['pushed'] == 0
+        assert service.hub_status()['pending'] == [edge]
+        head = service.hub_sync(pull=True, push=False)['pulled_position']
+        pinned = service.hub_sync(pull=False, push=True, expected_head=head)
+        assert not pinned['head_mismatch'] and pinned['published_position'] > head
+        position = pinned['published_position']
+        # Later commits do not change the position.
+        with session.hold_leases(editor, [first]):
+            with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+                db.set_meta(first, 'review', 'later')
+            session.sync_hub_and_wait(editor, timeout_s=20)
+        service.hub_sync(pull=True, push=False)
+        view = service.hub_read_view_at(position)
+        records = {revision['object_uuid']: revision['record'] for revision in view['objects']}
+        assert records[first]['meta']['review'] == 'edited' and records[second]['meta']['note'] == 'unrelated'
+        [relationship] = view['relationships']
+        assert relationship['record']['uuid'] == edge and relationship['applicable']
+        assert service.hub_selection_at(position) == view['selection']
+        assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
+        assert service.object(first)['meta']['review'] == 'later'
+    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+        assert db.hub_read_view_at(position)['selection'] == view['selection']
+    session.detach(editor)
 
 
 def test_service_edits_a_hosted_surface_through_a_session(tmp_path):

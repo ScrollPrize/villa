@@ -88,9 +88,32 @@ struct HubSessionStatus {
     std::string error;                  // last failed sync; empty once one succeeds
     std::optional<int64_t> syncedAtUs;  // last successful sync, UTC Unix microseconds
     std::vector<HubLease> leases;       // as of the last hub contact
+    // The hub position (objects/Hub.hpp) the last successful sync reached: its
+    // push's publication when it published, else the state it pulled.
+    int64_t position = 0;
+    bool pushesHeld = false;            // a PushHold is keeping background pushes back
 };
 
-namespace detail { struct HubLeaseCounts; class HubWorker; struct SurfaceDraft; }
+namespace detail { struct HubLeaseCounts; struct HubPushHolds; class HubWorker; struct SurfaceDraft; }
+
+// Keeps a hosted replica's background sync from pushing while it lives, e.g.
+// while a service links and pins a hub position this replica reached. Local
+// edits still commit and pull still runs; they push once no hold remains.
+// syncHubAndWait pushes regardless.
+class PushHold {
+public:
+    PushHold() = default;
+    PushHold(PushHold&&) noexcept;
+    PushHold& operator=(PushHold&&) noexcept;
+    PushHold(const PushHold&) = delete;
+    PushHold& operator=(const PushHold&) = delete;
+    ~PushHold() { reset(); }
+    void reset();
+
+private:
+    friend class detail::HubWorker;
+    std::weak_ptr<detail::HubPushHolds> holds_;
+};
 
 // Keeps objects leased while it lives. Leases are renewed in the background;
 // once no hold remains and the object's changes are pushed, the lease is released.
@@ -258,13 +281,16 @@ public:
     // pull the hub's newer record), then check that the pin is still its current
     // revision. Throws when it is not.
     LeaseHold holdForEditing(const PinnedObject&);
+    // Hold this replica's background pushes; an empty hold for other stores.
+    PushHold holdPushes(const AttachmentIdentity&);
     // nullopt unless the attachment is a writable hosted replica.
     std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
     // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.
     void syncHub(const AttachmentIdentity&);
     // Sync now and block until that sync has finished: everything committed
-    // before the call is pushed and the hub's changes are pulled, unless the
-    // returned status reports an error or conflicts. nullopt when the attachment
+    // before the call is pushed (even under a PushHold) and the hub's changes
+    // are pulled, unless the returned status reports an error or conflicts;
+    // its position is the hub state that includes them. nullopt when the attachment
     // is not a writable hosted replica. Throws when no sync finishes in time.
     std::optional<HubSessionStatus> syncHubAndWait(const AttachmentIdentity&, std::chrono::milliseconds timeout);
     void resolveHubConflicts(const AttachmentIdentity&, const std::string& keep);

@@ -362,6 +362,27 @@ journal sequence) of each record it installed, and its own unpushed changes.
   relationship dependencies, and verifies the result.
 - A retry after a push whose outcome was lost recognizes its own records.
 
+**Positions.** A hub position names one immutable hub state: the hub's journal
+sequence after a hub write, the same on every replica (pair it with
+`HubStatus::hubReplica`, the hub's identity). `HubSyncReport::pulledPosition` is
+the state a pull installed, `publishedPosition` the state holding a push, and
+`HubStatus::position` the state this replica last pulled. Each hub write that
+journals records its position and publication time in `hub_publications`, so
+`readHubPosition(replica, position, read)` reads that state through the hub's
+own history: records, tags, approvals, deletions and relationship membership as
+they were, whatever this replica pulled since. Geometry revisions are shared and
+are read locally; the replica must have pulled to the position, or published
+it. A hub made before the index reads only its head until its next write.
+- `hubPush(replica, expectedHead)` publishes only while the hub is still at
+  that position, checked in the publishing hub transaction. Otherwise it
+  publishes nothing and reports `headMismatch` with the hub's head, even when the
+  newer commits touch unrelated records. With nothing to publish it validates
+  the head the same way and reports it as the position. A retry whose earlier
+  publication on top of the same head succeeded, but whose response was lost,
+  reports that publication's position again rather than a mismatch. This is
+  how a service links on top of a head and pins the result: per-record version
+  checks alone let a push land on top of foreign commits.
+
 **Applications** do not drive sync themselves. When an `ObjectStoreSession`
 attaches a writable hosted replica, it starts a background worker. The worker
 pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
@@ -372,8 +393,12 @@ renewed while it lives. Once no hold remains and the changes are pushed, the
 worker releases the lease. A hold pulls once first if the hub is ahead, and it
 is a no-op for ordinary stores, so callers need not check what they attached.
 `hubStatus(attachment)` reports pending records, conflicts, the last error and
-sync time for that replica, and a `StoreSessionEvent::Kind::Hub` event tagged with
-the attachment announces each change. `syncHub(attachment)` and
+sync time for that replica, and the hub position the last sync reached (its
+push's, when it pushed); a `StoreSessionEvent::Kind::Hub` event tagged with
+the attachment announces each change. `holdPushes(attachment)` returns a
+`PushHold` that keeps background syncs from pushing while it lives (local edits
+still commit, and push once no hold remains); `syncHubAndWait` pushes regardless
+and reports the position that includes everything committed before it. `syncHub(attachment)` and
 `resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
 do not use a session call `hub_sync` and the lease functions directly.
 
