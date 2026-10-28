@@ -230,6 +230,7 @@ private:
     };
     QHash<QString, SavedObject> _brushPatches;
     QHash<QString, SavedObject> _savedCollections;
+    int _savesInFlight = 0;  // submitReadyDrafts writing on a worker thread
     QStringList _savedDraftIds;
     QStringList _savedPatchIds;
     // Those saved when the input update in flight began.
