@@ -663,7 +663,10 @@ struct SurfaceCache::State {
     std::size_t bytes = 0;
     std::size_t capacity = 0;
     std::size_t incomplete = 0;
-    std::unordered_set<TileKey, TileKeyHash> outstanding;
+    // Admitted fills, with the epoch each was admitted under. A full
+    // invalidation forgets them: a fill it discards must not hold its key out
+    // of requestView, or the tile stays blank until the view next moves.
+    std::unordered_map<TileKey, std::uint64_t, TileKeyHash> outstanding;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     // Fills that stored an incomplete tile, per tile. A tile can be incomplete
     // because a chunk was evicted mid-fill or is genuinely missing; re-queueing
@@ -712,6 +715,17 @@ struct SurfaceCache::State {
             lru.erase(pos->second);
             lruPos.erase(pos);
         }
+    }
+
+    // Ends the fill admitted for `key` under `epoch`, unless an invalidation
+    // already forgot it. Returns whether an edit reached the tile mid-fill.
+    bool releaseLocked(const TileKey& key, std::uint64_t epoch)
+    {
+        auto it = outstanding.find(key);
+        if (it == outstanding.end() || it->second != epoch)
+            return false;
+        outstanding.erase(it);
+        return editedDuringFill.erase(key) > 0;
     }
 
     void enforceCapacityLocked()
@@ -970,16 +984,14 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
     {
         std::lock_guard lock(self->mutex);
         if (self->shuttingDown || epoch != self->epoch || !self->viewTiles.count(key)) {
-            self->outstanding.erase(key);
-            self->editedDuringFill.erase(key);
+            self->releaseLocked(key, epoch);
             return;
         }
     }
 
     auto release = [&]() {
         std::lock_guard lock(self->mutex);
-        self->outstanding.erase(key);
-        self->editedDuringFill.erase(key);
+        self->releaseLocked(key, epoch);
     };
 
     std::shared_ptr<const SurfaceGeometryTileCache::Tile> geometry;
@@ -1141,8 +1153,7 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
 
     {
         std::lock_guard lock(self->mutex);
-        self->outstanding.erase(key);
-        const bool editedSinceStart = self->editedDuringFill.erase(key) > 0;
+        const bool editedSinceStart = self->releaseLocked(key, epoch);
         if (epoch == self->epoch) {
             // Never discard computed work: an incomplete tile is stored and
             // used anyway, and requestView re-queues it. So is a tile an edit
@@ -1290,6 +1301,7 @@ void SurfaceCache::invalidateAll()
         _state->incomplete = 0;
         _state->failedAttempts.clear();
         _state->stale.clear();
+        _state->outstanding.clear();
         _state->editedDuringFill.clear();
         _state->viewTiles.clear();
     }
@@ -1322,9 +1334,9 @@ void SurfaceCache::invalidateSurfaceRegion(const cv::Rect& gridCells)
             _state->failedAttempts.erase(key);
         }
     }
-    for (const TileKey& key : _state->outstanding) {
-        if (touched(key))
-            _state->editedDuringFill.insert(key);
+    for (const auto& fill : _state->outstanding) {
+        if (touched(fill.first))
+            _state->editedDuringFill.insert(fill.first);
     }
 }
 
@@ -1433,9 +1445,9 @@ void SurfaceCache::requestView(int startLevel,
                 return;
             if (_state->outstanding.size() >= _state->maxOutstandingFills)
                 break;
-            if (!_state->outstanding.insert(candidate.key).second)
-                continue;
             epoch = _state->epoch;
+            if (!_state->outstanding.emplace(candidate.key, epoch).second)
+                continue;
         }
         ++admitted;
         auto state = _state;

@@ -945,21 +945,10 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         return;
     }
 
-    auto surface = _editManager->previewSurface();
-    if (!surface) {
+    if (!_editManager->previewSurface()) {
         return;
     }
-
-    if (const auto touched = _editManager->recentTouchedBounds()) {
-        const cv::Rect changedCells(touched->x - 1,
-                                    touched->y - 1,
-                                    touched->width + 2,
-                                    touched->height + 2);
-        viewer->invalidateVisRegion("segmentation", changedCells);
-    } else {
-        viewer->invalidateVis();
-    }
-    viewer->requestRender("push/pull active viewer refresh");
+    _module.refreshEditedRegion(viewer);
 }
 
 void SegmentationPushPullTool::applyAlphaResult()

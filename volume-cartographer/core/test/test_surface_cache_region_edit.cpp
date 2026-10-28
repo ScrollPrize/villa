@@ -1,7 +1,8 @@
 // An edit tool (push/pull, drag) moves vertices of the displayed surface and
 // invalidates the edited grid region on every tick. The flattened view must
 // keep drawing the region while it refills -- never a blank square -- and the
-// refills must land while the edit is still running.
+// refills must land while the edit is still running. A full invalidation, as
+// an edit without a known region ends in, must refill without the view moving.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -14,8 +15,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -208,5 +211,48 @@ TEST_CASE("refills land while an edit keeps invalidating the region")
     CHECK(sawMoved);
 
     array->prefetchDelayMs = 0;
+    cache.shutdown();
+}
+
+TEST_CASE("a full invalidation during a fill refills without the view moving")
+{
+    auto array = std::make_shared<LayeredArray>();
+    auto surface = std::make_shared<QuadSurface>(sheetAt(2000.0f), cv::Vec2f(1.0f, 1.0f));
+    SurfaceCache::Options options;
+    options.byteCapacity = 256ULL << 20;
+    SurfaceCache cache(array, surface, options);
+
+    // The viewer redraws only when a tile is published (or the view moves,
+    // which it does not here).
+    std::mutex mutex;
+    std::condition_variable cv;
+    int notifications = 0;
+    const auto id = cache.addTileReadyListener([&] {
+        std::lock_guard lock(mutex);
+        ++notifications;
+        cv.notify_all();
+    });
+
+    array->prefetchDelayMs = 200;
+    renderFrame(cache);  // admits the fill, which is now waiting on chunks
+    moveSheet(*surface, 3000.0f);
+    cache.invalidateAll();
+    renderFrame(cache);  // the redraw the edit's surface update submits
+    array->prefetchDelayMs = 0;
+
+    bool moved = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!moved) {
+        std::unique_lock lock(mutex);
+        const int seen = notifications;
+        if (!cv.wait_until(lock, deadline, [&] { return notifications != seen; }))
+            break;
+        lock.unlock();
+        const Frame frame = renderFrame(cache);
+        moved = frame.covered == kViewEdge * kViewEdge && frame.value == kAtZ3000;
+    }
+    CHECK(moved);
+
+    cache.removeTileReadyListener(id);
     cache.shutdown();
 }

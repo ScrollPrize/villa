@@ -144,6 +144,7 @@
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
@@ -1006,7 +1007,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _lineAnnotationLengthLabel->hide();
     statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
 
-    _sharedCacheStatsLabel = new QLabel(this);
+    _sharedCacheStatsLabel = new GrowOnlyLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setToolTip(
         tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
@@ -4163,12 +4164,7 @@ void CWindow::updateSharedStatusLabel()
         items << tr("Z sens: %1")
             .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
     }
-    const QString text = items.join(QStringLiteral("  "));
-    _sharedCacheStatsLabel->setText(text);
-    const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
-    _sharedCacheStatsLabel->setMinimumWidth(
-        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
-        margins.left() + margins.right());
+    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
 }
 
 // Open volume package

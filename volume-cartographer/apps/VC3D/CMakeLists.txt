@@ -101,6 +101,7 @@ set(srcs
     elements/ViewerStatsBar.hpp
     elements/DownloadQueueStats.cpp
     elements/DownloadQueueStats.hpp
+    elements/GrowOnlyLabel.hpp
     elements/DownloadQueueDebugOverlay.cpp
     elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp

@@ -11,6 +11,7 @@
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -393,7 +394,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         settings.setValue(QStringLiteral("spiral/split_y"), _grid->splitY());
     };
 
-    auto* cacheStatsLabel = new QLabel(this);
+    auto* cacheStatsLabel = new GrowOnlyLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
