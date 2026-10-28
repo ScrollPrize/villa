@@ -236,6 +236,7 @@ class StoredRelationship:
     meta: dict
     a_geometry_revision: str = None
     b_geometry_revision: str = None
+    stored_order: tuple = None  # (a, b) as the record stores them
 
     def provenance(self):
         """Identity by content: the shared record, its endpoints' geometry
@@ -448,7 +449,8 @@ def filter_relationships(view_relationships, objects, approved_links_only):
             family=family, approval_state=state,
             generation=record['generation'], a=a, b=b, a_anchor=a_anchor,
             b_anchor=b_anchor, meta=record['meta'] or {},
-            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry))
+            a_geometry_revision=a_geometry, b_geometry_revision=b_geometry,
+            stored_order=(record['a'], record['b'])))
     consumed.sort(key=lambda rel: (rel.family, rel.a, rel.b, rel.uuid))
     return consumed, exclusions
 
@@ -1037,8 +1039,23 @@ def materialize_patch_overlaps(store, snapshot, patches, *, pair_spacing,
     collections, counts, problems = {}, Counter(), []
     if not edges:
         return collections, counts
-    results = store.overlap_correspondences(
-        list(edges), snapshot.volume_uuid, float(pair_spacing), int(max_pairs))
+    # From the snapshot's records (the edge's pose, its endpoints' frames and
+    # geometry revisions), not the store's current state: a replica pulled
+    # past the snapshot's position must materialize what the digest names.
+    def pinned(rel):
+        a, b = rel.stored_order or (rel.a, rel.b)
+        anchors = {rel.a: rel.a_anchor, rel.b: rel.b_anchor}
+        return {'uuid': rel.uuid, 'a': a, 'b': b,
+                'whole_geometry': all(bool((anchors[end] or {}).get('whole_geometry'))
+                                      for end in (a, b)),
+                'meta': json.dumps(rel.meta),
+                'a_object_meta': json.dumps(snapshot.objects[a].meta),
+                'b_object_meta': json.dumps(snapshot.objects[b].meta),
+                'a_geometry_revision': snapshot.objects[a].geometry_revision,
+                'b_geometry_revision': snapshot.objects[b].geometry_revision}
+    results = store.overlap_correspondences_at(
+        [pinned(rel) for rel in edges.values()], snapshot.volume_uuid,
+        float(pair_spacing), int(max_pairs))
     cid = first_id
     for result in results:
         rel = edges.pop(result['edge_uuid'], None)

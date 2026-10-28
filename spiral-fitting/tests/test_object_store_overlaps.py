@@ -173,16 +173,44 @@ def test_materialization_errors_and_stale_geometry_are_reported(db):
         osi.materialize(db, snapshot, z_begin=0, z_end=64, z_margin=0,
                         erode_cells_default=1)
     assert error.value.problems == [f'patch overlap {plain}: edge has no overlap pose']
-    # Pairs computed from geometry the snapshot did not freeze are refused.
+    # The pairs are computed from the geometry the snapshot froze: one this
+    # store does not hold is that edge's error.
     snapshot = osi.read_snapshot(db, osi.InputRequest())
     snapshot.relationships = [rel for rel in snapshot.relationships
                               if rel.uuid == edge['uuid']]
     patches, _ = osi.materialize_patches(
         db, snapshot, z_begin=0, z_end=64, z_margin=0, erode_cells_default=1)
     snapshot.objects[b].geometry_revision = '00000000-0000-4000-8000-0000000000aa'
-    with pytest.raises(osi.ObjectStoreInputError, match="other than the snapshot's"):
+    with pytest.raises(osi.ObjectStoreInputError, match='has no geometry revision'):
         osi.materialize_patch_overlaps(db, snapshot, patches, pair_spacing=8.0,
                                        max_pairs=16)
+
+
+def test_overlaps_are_materialized_as_the_snapshot_read_them(db):
+    # A replica pulled past the snapshot's position (a checkpoint resume, a
+    # rebuild at an older position) must not read the edge as it is now.
+    _put(db, _plane())
+    _put(db, _plane(10.0))
+    [edge] = _detect(db)
+    snapshot = osi.read_snapshot(db, osi.InputRequest())
+    patches, _ = osi.materialize_patches(
+        db, snapshot, z_begin=0, z_end=64, z_margin=0, erode_cells_default=1)
+
+    def pairs():
+        collections, _ = osi.materialize_patch_overlaps(
+            db, snapshot, patches, pair_spacing=8.0, max_pairs=16)
+        return {cid: [(point['p'], point['on_patch']) for point in pcl['points'].values()]
+                for cid, pcl in collections.items()}
+    before = pairs()
+    assert before
+    # Re-detected with another pose: the snapshot's pose is used.
+    fit = dict(edge['meta']['fit'])
+    fit['pose'] = [*fit['pose'][:2], fit['pose'][2] + 3.0, *fit['pose'][3:]]
+    db.set_meta(edge['uuid'], 'fit', fit)
+    assert pairs() == before
+    # Removed since: still the snapshot's edge.
+    db.remove_edge(edge['uuid'])
+    assert pairs() == before
 
 
 def test_edges_weigh_the_same_whatever_their_pair_count(db, tmp_path):
