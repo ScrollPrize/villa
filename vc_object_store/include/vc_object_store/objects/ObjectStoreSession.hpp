@@ -286,6 +286,9 @@ public:
     LeaseHold holdForEditing(const PinnedObject&);
     // Hold this replica's background pushes; an empty hold for other stores.
     PushHold holdPushes(const AttachmentIdentity&);
+    // The hub's journal between two of its positions (objects/Hub.hpp
+    // hubJournal); empty for other stores. Blocks on the hub.
+    std::vector<JournalEntry> hubJournal(const AttachmentIdentity&, int64_t after, int64_t upTo);
     // nullopt unless the attachment is a writable hosted replica.
     std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
     // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.

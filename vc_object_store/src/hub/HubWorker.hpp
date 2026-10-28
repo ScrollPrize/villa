@@ -35,6 +35,7 @@ public:
     void requestResolve(const std::string& keep);
     LeaseHold hold(const std::vector<std::string>& objects);
     PushHold holdPushes();
+    std::vector<JournalEntry> journal(int64_t after, int64_t upTo);
     HubSessionStatus status() const;
 
 private:

@@ -256,6 +256,9 @@ int main() try
         hubPull(bob);
         require(synced->position == hubStatus(bob)->position, "the waited sync reports the hub position it reached");
         require(state(bob, synced->position)["relationships"][ab]["meta"]["note"] == "held", "that position holds the edit");
+        const auto journal = session.hubJournal(attachment, synced->position - 1, synced->position);
+        require(!journal.empty() && journal.back().recordUuid == ab && journal.back().author == "alice",
+                "the hub journal names the records a position changed");
         session.act(attachment, endpoints(), [&](auto& store, auto& txn) { store.setMeta(txn, ab, "note", "\"released\""); });
         hold.reset();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);

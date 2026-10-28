@@ -113,6 +113,10 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
 void readHubPosition(ObjectStore& replica, int64_t position,
                      const std::function<void(ObjectStore& hub, const ReadTxn&, const RevisionSelection&)>& read);
 
+// The hub's journal entries after one position up to another: which
+// records the hub states between them changed, by whom.
+std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_t upTo);
+
 // Local state only; no hub contact.
 std::optional<HubStatus> hubStatus(ObjectStore& store);
 // keep = "hub": install the hub record here. keep = "local": push this

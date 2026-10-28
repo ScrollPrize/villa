@@ -134,6 +134,12 @@ HubSessionStatus HubWorker::status() const
     return result;
 }
 
+std::vector<JournalEntry> HubWorker::journal(int64_t after, int64_t upTo)
+{
+    std::lock_guard hub(hub_);
+    return hubJournal(replica_, after, upTo);
+}
+
 PushHold HubWorker::holdPushes()
 {
     PushHold result;

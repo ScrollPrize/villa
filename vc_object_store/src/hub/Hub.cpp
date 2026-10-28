@@ -675,6 +675,19 @@ void readHubPosition(ObjectStore& replica, int64_t position,
     read(*hub, txn, selection);
 }
 
+std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_t upTo)
+{
+    std::shared_ptr<ObjectStore> hub;
+    {
+        auto local = replica.read();
+        hub = openHub(replica, local, upstream(conn(local)));
+    }
+    auto txn = hub->read();
+    auto entries = hub->journalSince(txn, after);
+    std::erase_if(entries, [&](const JournalEntry& entry) { return entry.seq > upTo; });
+    return entries;
+}
+
 std::optional<HubStatus> hubStatus(ObjectStore& store)
 {
     auto txn = store.read();

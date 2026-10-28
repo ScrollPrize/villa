@@ -723,6 +723,22 @@ NB_MODULE(_native, m)
            "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases. "
            "With expected_head (push only), publish only while the hub is still at that position; "
            "the report's head_mismatch says it was not.")
+        .def("hub_journal", [](PyObjectStore& self, int64_t after, int64_t upTo) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_journal requires an idle store");
+            std::vector<vo::JournalEntry> entries;
+            { nb::gil_scoped_release release; entries = vo::hubJournal(db, after, upTo); }
+            nb::list out;
+            for (const auto& e : entries) {
+                nb::dict d;
+                d["seq"] = e.seq; d["record_uuid"] = e.recordUuid; d["kind"] = e.kind;
+                d["author"] = e.author; d["hostname"] = e.hostname; d["timestamp"] = e.timestamp;
+                d["change_kind"] = e.changeKind;
+                out.append(d);
+            }
+            return out;
+        }, nb::arg("after"), nb::arg("up_to"),
+           "The hub's journal entries after one hub position up to another.")
         .def("hub_selection_at", [](PyObjectStore& self, int64_t position, bool includeRetired) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_selection_at requires an idle store");
