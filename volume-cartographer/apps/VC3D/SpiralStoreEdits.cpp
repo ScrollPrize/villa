@@ -27,14 +27,31 @@ std::string changedSince(const std::string& what, const std::string& uuid)
            "it); nothing was overwritten: reload it and redo the edit";
 }
 
-std::string currentRevision(vc::objects::ObjectStoreSession& session,
-                            const vc::objects::AttachmentIdentity& attachment, const std::string& uuid)
+// The revision a save just committed, read after it (revisions are made at
+// commit). Empty when it cannot be read (the store was detached meanwhile):
+// the save stands, and the next save of the object, naming no revision, is
+// refused with the current one, from which it can save again.
+std::string committedRevision(vc::objects::ObjectStoreSession& session,
+                              const vc::objects::AttachmentIdentity& attachment, const std::string& uuid)
 {
     std::string revision;
-    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-        if (const auto head = db.currentObjectRevision(txn, uuid)) revision = head->uuid;
-    });
+    try {
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto head = db.currentObjectRevision(txn, uuid)) revision = head->uuid;
+        });
+    } catch (const std::exception&) {
+        return {};
+    }
     return revision;
+}
+
+// The current revision of `uuid`; throws when it is gone.
+template <typename Db, typename Txn>
+std::string headRevision(const Db& db, const Txn& txn, const std::string& what, const std::string& uuid)
+{
+    const auto head = db.currentObjectRevision(txn, uuid);
+    if (!head) throw std::runtime_error(what + " " + uuid + " is no longer in the object store");
+    return head->uuid;
 }
 }
 
@@ -55,20 +72,27 @@ std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession& s
                 create_quad_in_store(db, txn, uuid, *patch.surface, patch.name, {kBrushPatchTag}, coordinates, provenance);
             });
             // Nobody else knows the new object yet: its head is this save.
-            saved.push_back({uuid, currentRevision(session, attachment, uuid)});
+            saved.push_back({uuid, committedRevision(session, attachment, uuid)});
             continue;
         }
         const auto uuid = vc::objects::util::canonicalUuid(patch.uuid);
-        if (patch.revision.empty()) throw std::invalid_argument("brush patch " + uuid + " names no revision");
         // Leased (on a hosted replica: taking it pulls), then pinned at the
         // revision this edit started from; its relationships are kept as
-        // recorded.
+        // recorded. An unknown revision (its last save could not read it
+        // back) is refused like a changed one: the user saves again knowingly.
         auto hold = session.holdLeases(attachment, {uuid});
         const vc::objects::RevisionSelection pins{{uuid, patch.revision}};
         session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto head = db.currentObjectRevision(txn, uuid);
-            if (!head) throw std::runtime_error("brush patch " + uuid + " is no longer in the object store");
-            if (head->uuid != patch.revision) throw std::runtime_error(changedSince("brush patch", uuid));
+            const auto head = headRevision(db, txn, "brush patch", uuid);
+            if (head != patch.revision)
+                throw StoreObjectChanged(
+                    "brush patch " + uuid + (patch.revision.empty()
+                        ? std::string(" was saved, but its saved revision could not be read back; nothing was "
+                                      "overwritten. Save again to replace the stored version with this drawing")
+                        : std::string(" was saved by another editor after this drawing's last save; nothing was "
+                                      "overwritten. Save again to replace their version with this drawing, or "
+                                      "remove the drawing to keep theirs")),
+                    uuid, head);
         });
         if (patch.remove) {
             session.act(attachment, pins, [&](auto& db, auto& txn) {
@@ -84,7 +108,7 @@ std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession& s
                                keep(db.affectedGeometryEdges(txn, uuid, geometry)));
             });
             // Read under the lease: still this save's revision.
-            saved.push_back({uuid, currentRevision(session, attachment, uuid)});
+            saved.push_back({uuid, committedRevision(session, attachment, uuid)});
         }
     }
     return saved;
@@ -149,9 +173,7 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
         if (object) {
             const std::string revision = drafts[i].sourceCollection.value(QStringLiteral("metadata")).toObject()
                                              .value(QLatin1String(kLocalObjectRevisionKey)).toString().toStdString();
-            if (revision.empty())
-                throw std::invalid_argument("point collection " + *object + " names no revision to edit from");
-            expected[*object] = revision;
+            expected[*object] = revision;  // empty: unknown, refused below
         }
         if (drafts[i].deleted) {
             if (object) removed.push_back(*object);
@@ -168,8 +190,12 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
     // refused unless that is still current.
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         for (const auto& [uuid, revision] : expected) {
-            const auto head = db.currentObjectRevision(txn, uuid);
-            if (!head || head->uuid != *revision) throw std::runtime_error(changedSince("point collection", uuid));
+            const auto head = headRevision(db, txn, "point collection", uuid);
+            if (head != *revision)
+                throw StoreObjectChanged(revision->empty()
+                    ? "point collection " + uuid + " was saved, but its saved revision could not be read back; "
+                      "nothing was overwritten. Save again to replace the stored version"
+                    : changedSince("point collection", uuid), uuid, head);
         }
         for (const auto& [index, uuid] : replacements) {
             const auto object = db.objectByUuid(txn, uuid);
@@ -182,7 +208,7 @@ std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreS
     // Each written head is this commit's: the objects are leased on a hosted
     // replica, and a new one is known to no one else yet.
     for (std::size_t i = 0; i < drafts.size(); ++i)
-        if (!drafts[i].deleted) saved[i].revision = currentRevision(session, attachment, saved[i].uuid);
+        if (!drafts[i].deleted) saved[i].revision = committedRevision(session, attachment, saved[i].uuid);
     return saved;
 }
 

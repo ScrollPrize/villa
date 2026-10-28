@@ -97,6 +97,9 @@ public:
     void finalizationSucceeded(const QString& id);
     void finalizationFailed(const QString& id, const QString& error = {});
     QJsonArray patchDrafts() const;
+    // The patch or point collection `id` is as its last successful save
+    // left it: finalized, and not edited or being saved since.
+    bool savedUnchanged(const QString& id) const;
     bool removePatchDraft(const QString& id);
     std::shared_ptr<QuadSurface> setPatchRemoved(const QString& id, bool removed);
     // Where volume points lie on patches (the store: patches are drafts).

@@ -233,9 +233,10 @@ private:
     int _savesInFlight = 0;  // submitReadyDrafts writing on a worker thread
     QStringList _savedDraftIds;
     QStringList _savedPatchIds;
-    // Those saved when the input update in flight began.
-    QStringList _updatingDraftIds;
-    QStringList _updatingPatchIds;
+    // Those saved when the input update in flight began, with the revision
+    // saved: one saved again or edited since stays a local drawing.
+    QHash<QString, std::string> _updatingDrafts;
+    QHash<QString, std::string> _updatingPatches;
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();

@@ -2336,6 +2336,15 @@ QJsonArray SpiralBrushController::patchDrafts() const
     return rows;
 }
 
+bool SpiralBrushController::savedUnchanged(const QString& id) const
+{
+    for (const auto& gesture : _gestures)
+        if (gesture.id == id) return gesture.state == GestureState::Finalized && !gesture.uploadInFlight;
+    for (const auto& line : _polylines)
+        if (line.id == id) return line.state == GestureState::Finalized;
+    return false;
+}
+
 bool SpiralBrushController::removePatchDraft(const QString& id)
 {
     for (auto it = _gestures.begin(); it != _gestures.end(); ++it) {

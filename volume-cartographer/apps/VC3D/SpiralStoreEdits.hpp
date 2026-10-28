@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,15 @@ struct SavedBrushPatch {
     std::string uuid, revision;
 };
 
+// A save refused because another editor saved the object after the
+// revision the edit started from; `current` is their revision. Nothing was
+// written: saving again from `current` replaces theirs.
+struct StoreObjectChanged : std::runtime_error {
+    StoreObjectChanged(const std::string& message, std::string uuid, std::string current)
+        : std::runtime_error(message), uuid(std::move(uuid)), current(std::move(current)) {}
+    std::string uuid, current;
+};
+
 // Save brush patches in one checked commit each: a new one becomes a surface
 // object (tag kBrushPatchTag, with the surface's meta, which for a painted
 // patch carries meta.source.spiral_patch_erode_cells 0), a replaced one gets a new
@@ -48,9 +58,9 @@ struct SavedBrushPatch {
 // refresh revisits them), a removed one is retired. A replaced or removed
 // patch is pinned at the revision its edit started from: when another
 // editor saved it since (pulled with the lease, held on a hosted replica)
-// the save is refused instead of overwriting theirs. Returns each patch's
-// saved state, in order; throws on the first failure (earlier patches stay
-// saved).
+// the save is refused (StoreObjectChanged) instead of overwriting theirs.
+// Returns each patch's saved state, its revision read in the commit that
+// wrote it; throws on the first failure (earlier patches stay saved).
 std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&,
                                               const std::string& volume, double previewScale,
                                               const std::vector<BrushPatchSave>& patches);

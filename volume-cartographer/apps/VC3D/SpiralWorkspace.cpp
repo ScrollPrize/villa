@@ -472,22 +472,36 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_panel, &SpiralPanel::cloneHubRequested, this, &SpiralWorkspace::hubReplicaRequested);
     connect(_service, &SpiralServiceManager::inputUpdateProgress, this, [this](const QString& phase, const QString&) {
         if (phase != QStringLiteral("pushing")) return;
-        _updatingDraftIds = _savedDraftIds;
-        _updatingPatchIds = _savedPatchIds;
+        _updatingDrafts.clear();
+        _updatingPatches.clear();
+        for (const auto& id : _savedDraftIds) _updatingDrafts[id] = _savedCollections.value(id).revision;
+        for (const auto& id : _savedPatchIds) _updatingPatches[id] = _brushPatches.value(id).revision;
     });
     connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
             [this](const SpiralServiceManager::InputUpdate& update) {
-                const auto drafts = std::exchange(_updatingDraftIds, {});
-                const auto patches = std::exchange(_updatingPatchIds, {});
+                const auto drafts = std::exchange(_updatingDrafts, {});
+                const auto patches = std::exchange(_updatingPatches, {});
                 if (!update.error.isEmpty() || !_brush) return;
                 // The fit holds what was saved before the update began: those
-                // drafts are shown as its inputs from now on.
-                _brush->commitSucceeded(drafts);
-                for (const auto& id : drafts) {
+                // drafts are shown as its inputs from now on, unless one was
+                // edited or saved again meanwhile (then it stays a drawing
+                // whose next save replaces its object).
+                auto included = [this](const QHash<QString, std::string>& saved,
+                                       const QHash<QString, SavedObject>& objects) {
+                    QStringList ids;
+                    for (auto it = saved.cbegin(); it != saved.cend(); ++it)
+                        if (objects.value(it.key()).revision == it.value() && _brush->savedUnchanged(it.key()))
+                            ids << it.key();
+                    return ids;
+                };
+                const QStringList fittedDrafts = included(drafts, _savedCollections);
+                const QStringList fittedPatches = included(patches, _brushPatches);
+                _brush->commitSucceeded(fittedDrafts);
+                for (const auto& id : fittedDrafts) {
                     _savedDraftIds.removeAll(id);
                     _savedCollections.remove(id);
                 }
-                for (const auto& id : patches) {
+                for (const auto& id : fittedPatches) {
                     _brush->removePatchDraft(id);
                     _brushPatches.remove(id);
                     _savedPatchIds.removeAll(id);
@@ -1332,6 +1346,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         vc3d::spiral::BrushPatchSave save;
         std::optional<vc3d::spiral::SavedBrushPatch> written;
         QString error;
+        std::string theirs;  // refused: the revision another editor saved
     };
     struct Result {
         std::vector<PatchJob> patches;
@@ -1339,6 +1354,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         QStringList ids, fitted, savedIds;  // savedIds: the collection of each draft
         std::vector<vc3d::spiral::SavedPointCollection> collections;
         QString collectionError;
+        std::string changedUuid, changedTo;  // refused: the object and its revision now
     };
     auto result = std::make_shared<Result>();
     for (const auto& patch : patches) {
@@ -1389,6 +1405,10 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         QStringList errors, saved;
         for (const auto& job : result->patches) {
             if (!job.written) {
+                // Saving again replaces their version knowingly: it starts
+                // from the revision the refusal named.
+                if (!job.theirs.empty() && _brushPatches.contains(job.id))
+                    _brushPatches[job.id].revision = job.theirs;
                 _brush->finalizationFailed(job.id, job.error);
                 errors << tr("%1: %2").arg(job.id, job.error);
                 continue;
@@ -1401,6 +1421,11 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         }
         if (!result->ids.isEmpty()) {
             if (!result->collectionError.isEmpty()) {
+                // A new collection saved before: saving again starts from the
+                // revision the refusal named.
+                for (auto& saved : _savedCollections)
+                    if (!result->changedUuid.empty() && saved.uuid == result->changedUuid)
+                        saved.revision = result->changedTo;
                 for (const auto& id : result->ids) _brush->finalizationFailed(id, result->collectionError);
                 errors << tr("point collections: %1").arg(result->collectionError);
             } else {
@@ -1432,6 +1457,9 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             try {
                 job.written = vc3d::spiral::saveBrushPatches(*session, attachment, volume, previewScale,
                                                              {job.save}).front();
+            } catch (const vc3d::spiral::StoreObjectChanged& changed) {
+                job.error = QString::fromUtf8(changed.what());
+                job.theirs = changed.current;
             } catch (const std::exception& error) {
                 job.error = QString::fromUtf8(error.what());
             }
@@ -1439,6 +1467,10 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
         if (result->drafts.empty()) return;
         try {
             result->collections = vc3d::spiral::savePointCollections(*session, attachment, volume, result->drafts);
+        } catch (const vc3d::spiral::StoreObjectChanged& changed) {
+            result->collectionError = QString::fromUtf8(changed.what());
+            result->changedUuid = changed.uuid;
+            result->changedTo = changed.current;
         } catch (const std::exception& error) {
             result->collectionError = QString::fromUtf8(error.what());
         }

@@ -101,6 +101,15 @@ private slots:
         const auto again = vc3d::spiral::savePointCollections(session, attachment, kVolume, fresh);
         QVERIFY(again.front().uuid == uuid && again.front().revision != created.front().revision);
         QVERIFY(read(uuid)["ids"] == Json({10, 20, 30, 31}));
+        // A save whose revision could not be read back (the store detached
+        // after its commit) is refused with the current one, not duplicated.
+        vc3d::spiral::setPointCollectionObject(fresh.front(), uuid, {});
+        try {
+            vc3d::spiral::savePointCollections(session, attachment, kVolume, fresh);
+            QFAIL("a save from an unknown revision was not refused");
+        } catch (const vc3d::spiral::StoreObjectChanged& changed) {
+            QVERIFY(changed.uuid == uuid && changed.current == again.front().revision);
+        }
         std::size_t collections = 0;
         session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
             collections = db.objectsByKind(txn, "point_collection").size();
@@ -237,26 +246,29 @@ private slots:
             theirs.detach(mine);
         }
         const auto last = session.attach(replica, options);
+        std::string theirs;
         for (const bool remove : {false, true}) {
-            bool refused = false;
             try {
                 vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0,
                                                {{uuid, replaced.revision, "brush_1", grid(13.0f), remove}});
-            } catch (const std::runtime_error& error) {
-                refused = std::string(error.what()).find("after this edit began") != std::string::npos;
+                QFAIL("a save over another editor's was not refused");
+            } catch (const vc3d::spiral::StoreObjectChanged& changed) {
+                QVERIFY(std::string(changed.what()).find("Save again to replace") != std::string::npos);
+                QVERIFY(changed.uuid == uuid && changed.current != replaced.revision);
+                theirs = changed.current;
             }
-            QVERIFY(refused);
         }
         session.read(last, [&](const auto& db, const auto& txn, const auto&) {
             QVERIFY(!db.objectByUuid(txn, uuid)->retired);
             QVERIFY(db.currentGeometry(txn, uuid)->uuid != replacedGeometry);  // theirs
         });
-        // From the revision now current, it saves.
-        std::string current;
+        // From the revision the refusal named (theirs), saving again replaces it.
+        const auto mine = vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0,
+                                                         {{uuid, theirs, "brush_1", grid(13.0f), false}}).front();
         session.read(last, [&](const auto& db, const auto& txn, const auto&) {
-            current = db.currentObjectRevision(txn, uuid)->uuid;
+            QVERIFY(db.currentObjectRevision(txn, uuid)->uuid == mine.revision);
         });
-        vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0, {{uuid, current, "brush_1", nullptr, true}});
+        vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0, {{uuid, mine.revision, "brush_1", nullptr, true}});
         session.read(last, [&](const auto& db, const auto& txn, const auto&) {
             QVERIFY(db.objectByUuid(txn, uuid)->retired);
         });
