@@ -875,7 +875,7 @@ def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray
     with tifffile.TiffFile(path) as tif:
         series = tif.series[0] if tif.series else None
         axes = str(series.axes) if series is not None else ""
-        image = np.asarray(tif.asarray())
+        image = np.asarray(series.asarray() if series is not None else tif.asarray())
     if image.ndim == len(axes) and image.ndim >= 3:
         image = np.squeeze(
             image,
