@@ -51,7 +51,7 @@ That is what the spiral fit does. It takes the whole pile of partial evidence �
 
 <div className="mb-4 max-w-[720px] mx-auto">
   <img src="/img/tutorials/spiral-fit-paris4.webp" className="w-[100%]"/>
-  <figcaption className="mt-[-6px]">The result of fitting a spiral to PHerc. Paris 4 (Scroll 1): the 130 fitted windings, overlaid on a horizontal slice through the scan.</figcaption>
+  <figcaption className="mt-[-6px]">The result of fitting a spiral to PHerc. Paris. 4 (Scroll 1): the 130 fitted windings, overlaid on a horizontal slice through the scan.</figcaption>
 </div>
 
 The core idea: we know the scroll was originally one long rectangular sheet, rolled up into a neat spiral. The eruption of Vesuvius deformed that spiral into the crushed shape we see in the CT scan. Instead of reconstructing the surface piece by piece, we search for the combination of *ideal scroll shape* and *smooth deformation* that best explains everything we observe. Once we have those, virtual unrolling comes almost for free: any point in the scan can be mapped back onto the original flat sheet.
@@ -125,7 +125,7 @@ rclone copy :http: ./spiral_datasets/phercparis4 \
     --transfers 32 -P
 ```
 
-Note that re-running rclone resumes interrupted downloads. For PHerc Paris 4, the dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
+Note that re-running rclone resumes interrupted downloads. For PHerc. Paris. 4, the dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
 
 #### Generating missing inputs
 
@@ -540,7 +540,7 @@ The script `get_ink_metrics.py` computes some metrics based on the amount of let
 
 :::warning
 
-The ink-coverage model was only trained on PHerc. Paris 4, so it may not give accurate results for other scrolls with significantly different writing styles.
+The ink-coverage model was only trained on PHerc. Paris. 4, so it may not give accurate results for other scrolls with significantly different writing styles.
 
 :::
 

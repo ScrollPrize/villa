@@ -302,9 +302,9 @@ class EpisodeSampler:
         if not d.fiber_pool:
             return episode
         margin = self.pad+d.point_spacing
-        key = run['fiber'] if isinstance(run['fiber'], str) else f"afv:{run['fiber']}"
+        # The run's fiber key (fiber:<UUID> or json:<file stem>) is the pool's key of the same fiber.
         episode['fibers'] = episode_fibers(fiber_pool(d.fiber_pool), episode['reach_lo']-margin,
-                                           episode['reach_hi']+margin, key, seed_keep, d.fiber_max_instances,
+                                           episode['reach_hi']+margin, run['fiber'], seed_keep, d.fiber_max_instances,
                                            d.fiber_max_points)
         return episode
 

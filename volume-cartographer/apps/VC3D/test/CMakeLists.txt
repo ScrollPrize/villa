@@ -1,5 +1,32 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_surface_transform_name test_surface_transform_name.cpp)
+target_include_directories(test_surface_transform_name PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_surface_transform_name PRIVATE Qt6::Core)
+add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
+vc_register_test_target(test_surface_transform_name)
+vc_register_ctest(surface_transform_name test_surface_transform_name)
+
+add_executable(test_volume_path_labels test_volume_path_labels.cpp
+    ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
+set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_volume_path_labels PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_volume_path_labels PRIVATE Qt6::Widgets Qt6::Test)
+add_test(NAME volume_path_labels COMMAND test_volume_path_labels)
+set_tests_properties(volume_path_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_volume_path_labels)
+vc_register_ctest(volume_path_labels test_volume_path_labels)
+
+add_executable(test_surface_render_policy test_surface_render_policy.cpp)
+set_target_properties(test_surface_render_policy PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_surface_render_policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_surface_render_policy PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME surface_render_policy COMMAND test_surface_render_policy)
+vc_register_test_target(test_surface_render_policy)
+vc_register_ctest(surface_render_policy test_surface_render_policy)
+
 add_executable(test_catalog_project_dialog
     test_catalog_project_dialog.cpp
     ../OpenDataCatalogWindow.cpp
@@ -18,16 +45,6 @@ vc_register_test_target(test_catalog_project_dialog)
 vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
 set_tests_properties(catalog_project_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
-
-add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
-set_target_properties(test_line_annotation_adjacent_links PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_line_annotation_adjacent_links PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_line_annotation_adjacent_links PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME line_annotation_adjacent_links COMMAND test_line_annotation_adjacent_links)
-vc_register_test_target(test_line_annotation_adjacent_links)
-vc_register_ctest(line_annotation_adjacent_links test_line_annotation_adjacent_links)
 
 add_executable(test_intersection_layer_item
     test_intersection_layer_item.cpp
@@ -152,22 +169,7 @@ add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
 vc_register_test_target(test_spiral_reload_comparison)
 vc_register_ctest(spiral_reload_comparison test_spiral_reload_comparison)
 
-add_executable(test_fiber_source_dedupe
-    test_fiber_source_dedupe.cpp)
 
-set_target_properties(test_fiber_source_dedupe PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_fiber_source_dedupe PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_fiber_source_dedupe PRIVATE
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME fiber_source_dedupe COMMAND test_fiber_source_dedupe)
-vc_register_test_target(test_fiber_source_dedupe)
-vc_register_ctest(fiber_source_dedupe test_fiber_source_dedupe)
 
 add_executable(test_spiral_artifact_pins
     test_spiral_artifact_pins.cpp)
@@ -313,8 +315,7 @@ vc_register_test_target(test_seeding_batch_tracker)
 vc_register_ctest(seeding_batch_tracker test_seeding_batch_tracker)
 
 add_executable(test_fiber_save_batch_tracker
-    test_fiber_save_batch_tracker.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp)
+    test_fiber_save_batch_tracker.cpp)
 
 set_target_properties(test_fiber_save_batch_tracker PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -330,23 +331,7 @@ add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
 vc_register_test_target(test_fiber_save_batch_tracker)
 vc_register_ctest(fiber_save_batch_tracker test_fiber_save_batch_tracker)
 
-add_executable(test_fiber_runtime_ids
-    test_fiber_runtime_ids.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberRuntimeIds.hpp)
 
-set_target_properties(test_fiber_runtime_ids PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_fiber_runtime_ids PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_fiber_runtime_ids PRIVATE
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME fiber_runtime_ids COMMAND test_fiber_runtime_ids)
-vc_register_test_target(test_fiber_runtime_ids)
-vc_register_ctest(fiber_runtime_ids test_fiber_runtime_ids)
 
 add_executable(test_fiber_network_layout
     test_fiber_network_layout.cpp
@@ -360,10 +345,12 @@ set_target_properties(test_fiber_network_layout PROPERTIES
 
 target_include_directories(test_fiber_network_layout PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include
     ${OpenCV_INCLUDE_DIRS})
 
 target_link_libraries(test_fiber_network_layout PRIVATE
     Qt6::Core
+    Qt6::Gui
     Qt6::Test)
 
 add_test(NAME fiber_network_layout COMMAND test_fiber_network_layout)
@@ -499,6 +486,31 @@ target_link_libraries(test_fiber_global_layout PRIVATE
 add_test(NAME fiber_global_layout COMMAND test_fiber_global_layout)
 vc_register_test_target(test_fiber_global_layout)
 vc_register_ctest(fiber_global_layout test_fiber_global_layout)
+
+add_executable(test_fiber_map_auto_link
+    test_fiber_map_auto_link.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapAutoLink.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapAutoLink.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_map_auto_link PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_auto_link PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_map_auto_link PRIVATE
+    Qt6::Core
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME fiber_map_auto_link COMMAND test_fiber_map_auto_link)
+vc_register_test_target(test_fiber_map_auto_link)
+vc_register_ctest(fiber_map_auto_link test_fiber_map_auto_link)
 
 add_executable(test_fiber_map_gap_field
     test_fiber_map_gap_field.cpp
@@ -660,3 +672,14 @@ add_test(NAME spiral_brush_patch COMMAND test_spiral_brush_patch)
 vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# Exercise the production controller publication paths after Qt/state cleanup.
+# The VC3D app target only exists with VC_BUILD_APPS; CI runs this test from
+# the VC3D compile-and-smoke job.
+if(TARGET VC3D)
+    add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
+    set_tests_properties(object_store_vc3d_controller PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+    vc_register_test_target(VC3D)
+    vc_register_ctest(object_store_vc3d_controller VC3D)
+endif()

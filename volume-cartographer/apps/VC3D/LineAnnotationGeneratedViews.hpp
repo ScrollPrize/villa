@@ -84,6 +84,8 @@ struct GeneratedOverlay {
             bool pending = false;
             // Adjacent-winding link (FiberBranchRef::adjacent).
             bool adjacent = false;
+            // Unreviewed automatic link (FiberBranchRef::autoLink).
+            bool autoLink = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
@@ -103,6 +105,9 @@ struct GeneratedOverlay {
         bool hasDamagedToNext = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
+        // Every pending link on this point is an unreviewed automatic link
+        // (autoPendingMarker): the pending marker draws with a dashed outline.
+        bool hasAutoPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
         // palette; H-V links keep the default blue/purple. Set by the
         // controller, which owns the fiber HV state.
@@ -195,6 +200,9 @@ struct GeneratedOverlay {
         // Set with projectedBranchLink when the local and linked fibers share
         // an H/V classification (the orange warning palette).
         bool sameHvBranchLink = false;
+        // Set with pendingBranchLink when that pending link is automatic
+        // (the connector and the X take the automatic palette).
+        bool autoPendingBranchLink = false;
         bool isLinkCandidateFiber = false;
         std::optional<cv::Vec3f> connectorStart;
     };
@@ -281,11 +289,11 @@ struct GeneratedSpanAlignmentMetric {
 // Positions cross from the stored fiber grid to the viewer grid together;
 // directions and line indices are independent of that uniform scale.
 inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
-                                          double scale)
+                                          double localScale, double linkedScale)
 {
-    marker.localControlPoint *= static_cast<float>(scale);
-    marker.linkedControlPoint *= static_cast<float>(scale);
-    marker.planePoint *= static_cast<float>(scale);
+    marker.localControlPoint *= static_cast<float>(localScale);
+    marker.linkedControlPoint *= static_cast<float>(linkedScale);
+    marker.planePoint *= static_cast<float>(linkedScale);
 }
 
 inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,
@@ -1622,6 +1630,88 @@ inline bool generatedLineSegmentIsTail(
     return midpoint < controlRange->first || midpoint > controlRange->second;
 }
 
+// The vertices of an overlay line the renderer DRAWS, in order: every index
+// whose line point and whose projection are both finite. The drawn segments
+// join consecutive entries of this list, so a blanked (NaN) vertex does not
+// break the polyline - the segment bridges it, exactly as the renderer's
+// polyline runs do. One enumeration, shared by the renderer and the anchor
+// rule below so the two can never disagree about what is on screen.
+inline std::vector<std::size_t> generatedDrawnLineVertices(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<QPointF>& scenePoints)
+{
+    std::vector<std::size_t> drawn;
+    const std::size_t count = std::min(linePoints.size(), scenePoints.size());
+    drawn.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& point = linePoints[i];
+        const QPointF& scene = scenePoints[i];
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2]) ||
+            !std::isfinite(scene.x()) || !std::isfinite(scene.y())) {
+            continue;
+        }
+        drawn.push_back(i);
+    }
+    return drawn;
+}
+
+// The control range the renderer classifies tails against: the overlay's
+// own lineTailControlRange when a builder set one (a windowed side cut), else
+// the range of the overlay's controls. The renderer's rule, in one place.
+inline std::optional<std::pair<double, double>> effectiveLineTailControlRange(
+    const GeneratedOverlay& overlay)
+{
+    return overlay.lineTailControlRange.has_value()
+        ? overlay.lineTailControlRange
+        : generatedControlLinePositionRange(overlay.controlPoints);
+}
+
+// The position on the DRAWN line nearest to a scene point: the foot of the
+// target on the nearest drawn, non-tail segment (generatedDrawnLineVertices,
+// generatedLineSegmentIsTail), as the fractional line position i + t (j - i)
+// of that foot with t clamped to [0, 1]. Exact ties take the lower position.
+// Nothing drawn -> nullopt. Pure: no viewer, the caller projects.
+inline std::optional<double> nearestDrawnLinePosition(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<QPointF>& scenePoints,
+    const std::optional<std::pair<double, double>>& tailControlRange,
+    const QPointF& target)
+{
+    if (!std::isfinite(target.x()) || !std::isfinite(target.y())) {
+        return std::nullopt;
+    }
+    const std::vector<std::size_t> drawn = generatedDrawnLineVertices(linePoints, scenePoints);
+    std::optional<double> best;
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 1; k < drawn.size(); ++k) {
+        const std::size_t i = drawn[k - 1];
+        const std::size_t j = drawn[k];
+        if (generatedLineSegmentIsTail(static_cast<double>(i), static_cast<double>(j),
+                                       tailControlRange)) {
+            continue;
+        }
+        const QPointF a = scenePoints[i];
+        const QPointF b = scenePoints[j];
+        const double dx = b.x() - a.x();
+        const double dy = b.y() - a.y();
+        const double lengthSq = dx * dx + dy * dy;
+        double t = 0.0;
+        if (lengthSq > 0.0) {
+            t = ((target.x() - a.x()) * dx + (target.y() - a.y()) * dy) / lengthSq;
+            t = std::clamp(t, 0.0, 1.0);
+        }
+        const double fx = a.x() + t * dx - target.x();
+        const double fy = a.y() + t * dy - target.y();
+        const double distanceSq = fx * fx + fy * fy;
+        const double position = static_cast<double>(i) + t * static_cast<double>(j - i);
+        if (distanceSq < bestDistanceSq || (distanceSq == bestDistanceSq && best && position < *best)) {
+            bestDistanceSq = distanceSq;
+            best = position;
+        }
+    }
+    return best;
+}
+
 // Defined further down (with the other tagged-end helpers); declared here for
 // the overlay builders' blocked-marker state.
 inline bool generatedLinePositionBeyondKollesisTermination(
@@ -1871,9 +1961,42 @@ struct GeneratedLinkCandidateMenuState {
 
 // The link-state palette shared by linked control points, their connector
 // lines and the linked fiber's projected X marker: purple approved, blue
-// pending, orange same-H/V approved, light orange same-H/V pending.
-// Defined in the .cpp: this header is also compiled into QtCore-only tests.
-[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
+// pending, orange same-H/V approved, light orange same-H/V pending; an
+// AUTOMATIC pending link (automatic = true, pending = true) is bright cyan,
+// or light pink when same-H/V - hues of their own, so an unreviewed
+// automatic link reads apart from a human-made pending one at a glance and
+// from the Fiber Map's teal H fibers.
+// The hue itself is a QtCore-free inline rule (linkStateRgb) so every
+// renderer, the slice overlay's QtGui-only test target included, builds its
+// colours from the one table; generatedLinkStateColor (defined in the .cpp,
+// this header is also compiled into QtCore-only tests) is its QColor form.
+struct LinkStateRgb {
+    int r = 0;
+    int g = 0;
+    int b = 0;
+};
+[[nodiscard]] inline LinkStateRgb linkStateRgb(bool pending, bool sameHv, bool automatic = false)
+{
+    if (pending && automatic) {
+        return sameHv ? LinkStateRgb{255, 168, 216} : LinkStateRgb{32, 240, 255};
+    }
+    if (sameHv) {
+        return pending ? LinkStateRgb{255, 190, 120} : LinkStateRgb{255, 140, 0};
+    }
+    return pending ? LinkStateRgb{80, 150, 255} : LinkStateRgb{210, 95, 255};
+}
+[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha,
+                                             bool automatic = false);
+
+// Marker palette rule shared by every renderer (generated views, the fast
+// current-cut path, the overview bar, the slice overlay, the Fiber Map): the
+// automatic palette iff the point draws in a pending colour AND is an
+// automatic pending point (ControlPointMarker::hasAutoPendingLinks,
+// autoPendingMarker: every pending link on it is automatic).
+inline bool automaticLinkMarker(bool drawsPending, bool autoPending)
+{
+    return drawsPending && autoPending;
+}
 
 // The kollesis-termination ring colour: the ordinary control-point yellow.
 // The tag is told apart by form, not hue: a tagged point draws as a hollow
@@ -3211,6 +3334,15 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    // "Link <current> and <other>" on a fiber-intersection X (the automatic
+    // link made from inside the annotation): the current fiber's id (0 for a
+    // never-saved session: no entry), the dialog's anchor rule (the position
+    // of the open fiber's DRAWN line nearest a scene point, with the line
+    // revision it was computed on; nullopt = no visible pass, entry
+    // disabled) and the request (fiber, X point, anchor, revision).
+    uint64_t currentFiberId = 0;
+    std::function<std::optional<std::pair<double, uint64_t>>(const QPointF&)> nearestVisibleLinePosition;
+    std::function<void(uint64_t, cv::Vec3f, double, uint64_t)> linkNearbyFiber;
     // --- Span menu (strip viewers only: a Ctrl+right-click on the centre
     // line away from every control point). Each takes the two controls of
     // the span, in line-position order. The interpolation goal lives here

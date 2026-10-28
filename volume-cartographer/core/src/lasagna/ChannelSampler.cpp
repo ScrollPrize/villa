@@ -1,10 +1,10 @@
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/core/util/PortableTensor.hpp"
 
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 
-#include "utils/thread_pool.hpp"
 #include "utils/zarr.hpp"
 
 #include <algorithm>
@@ -18,11 +18,39 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 
 #include <opencv2/core.hpp>
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 
 namespace vc::lasagna {
+std::vector<vc::render::ChunkKey> lasagnaRegionChunkKeys(
+    const LasagnaChannelBinding& b, const cv::Vec3d& lo, const cv::Vec3d& hi)
+{
+    std::array<int,3> first{}, last{};
+    for (int a=0; a<3; ++a) {
+        if (!b.shapeZYX[a] || !b.chunksZYX[a] || !(b.spacing>0))
+            throw std::invalid_argument("invalid pinned sampling grid");
+        const double low=std::floor(lo[2-a]/b.spacing)-1;
+        const double high=std::floor(hi[2-a]/b.spacing)+2;
+        if (high<0 || low>=double(b.shapeZYX[a])) return {};
+        first[a]=int(std::max(0.,low)/b.chunksZYX[a]);
+        last[a]=int(std::min(double(b.shapeZYX[a]-1),high)/b.chunksZYX[a]);
+    }
+    std::vector<vc::render::ChunkKey> keys;
+    for(int z=first[0];z<=last[0];++z)
+        for(int y=first[1];y<=last[1];++y)
+            for(int x=first[2];x<=last[2];++x) keys.push_back({0,z,y,x});
+    return keys;
+}
+void pinLasagnaRegion(vc::render::PinnedChunkRegion& region,
+    const LasagnaChannelBinding& b,const cv::Vec3d& lo,const cv::Vec3d& hi)
+{
+    region.pin(b.chunkSource,lasagnaRegionChunkKeys(b,lo,hi));
+}
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
@@ -42,27 +70,12 @@ constexpr float kFloatEpsilon = 1.0e-6f;
     return v / len;
 }
 
-[[nodiscard]] utils::ThreadPool& lasagnaReadPool()
-{
-    // Keep workers alive so repeated short sampler calls can reuse HTTP/S3
-    // connections through the underlying read-through store.
-    static auto* pool = new utils::ThreadPool(lasagnaReadWorkersPerChannel() * 3);
-    return *pool;
-}
-
 [[nodiscard]] uint32_t checkedChunkIndex(size_t value)
 {
     if (value > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("Lasagna chunk index exceeds compact cache key range");
     }
     return static_cast<uint32_t>(value);
-}
-
-[[nodiscard]] std::vector<size_t> chunkPathIndicesForKey(
-    const LasagnaChannelBinding& binding,
-    const LasagnaChannelChunkKey& key)
-{
-    return {key.z, key.y, key.x};
 }
 
 [[nodiscard]] LasagnaChannelChunkKey chunkKeyForVoxel(
@@ -98,43 +111,53 @@ constexpr float kFloatEpsilon = 1.0e-6f;
     return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
 }
 
-[[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> readSourceChunk(
-    const LasagnaChannelBinding& binding,
-    const utils::ZarrArray& array,
-    const LasagnaChannelChunkKey& key)
+void validateChunk(const vc::render::ChunkResult& result)
 {
-    const size_t originZ = static_cast<size_t>(key.z) * binding.chunksZYX[0];
-    const size_t originY = static_cast<size_t>(key.y) * binding.chunksZYX[1];
-    const size_t originX = static_cast<size_t>(key.x) * binding.chunksZYX[2];
-    if (originZ >= binding.shapeZYX[0] ||
-        originY >= binding.shapeZYX[1] ||
-        originX >= binding.shapeZYX[2]) {
-        return nullptr;
-    }
+    using vc::render::ChunkStatus;
+    if (result.status == ChunkStatus::Error)
+        throw std::runtime_error(result.error.empty() ? "Lasagna chunk read failed" : result.error);
+    if (result.status == ChunkStatus::MissQueued)
+        throw std::runtime_error("Lasagna blocking read returned an unresolved chunk");
+}
 
-    const auto source = array.read_chunk(chunkPathIndicesForKey(binding, key));
-    auto cached = std::make_shared<LasagnaCachedChunk>();
-    cached->dimsZYX = binding.chunksZYX;
-    if (source.has_value()) {
-        cached->values.resize(source->size());
-        std::memcpy(cached->values.data(), source->data(), source->size());
-    } else {
-        const auto fillValue = array.metadata().fill_value;
-        if (!fillValue.has_value()) {
-            return nullptr;
-        }
-        if (!std::isfinite(*fillValue) ||
-            *fillValue < 0.0 ||
-            *fillValue > 255.0 ||
-            std::trunc(*fillValue) != *fillValue) {
-            throw std::runtime_error(
-                "Lasagna uint8 Zarr has an invalid fill_value: " + binding.path.string());
-        }
-        cached->values.assign(
-            array.metadata().chunk_byte_size(), static_cast<uint8_t>(*fillValue));
-    }
+[[nodiscard]] vc::render::ChunkResult checkedChunk(vc::render::ChunkResult result)
+{
+    validateChunk(result);
+    return result;
+}
 
-    return cached;
+[[nodiscard]] std::optional<uint8_t> chunkByte(
+    const LasagnaChannelBinding& binding, const vc::render::ChunkResult& chunk, size_t offset)
+{
+    using vc::render::ChunkStatus;
+    if (chunk.status == ChunkStatus::Error || chunk.status == ChunkStatus::MissQueued) {
+        // Default unresolved entries in a prepared cube have no data yet.
+        if (chunk.status == ChunkStatus::Error)
+            throw std::runtime_error(chunk.error);
+        return std::nullopt;
+    }
+    if (chunk.status == ChunkStatus::Missing || chunk.status == ChunkStatus::AllFill) {
+        const auto fill = binding.array->metadata().fill_value;
+        if (!fill.has_value())
+            return std::nullopt;
+        if (!std::isfinite(*fill) || *fill < 0 || *fill > 255 || std::trunc(*fill) != *fill)
+            throw std::runtime_error("Lasagna uint8 Zarr has an invalid fill_value: " + binding.path.string());
+        return static_cast<uint8_t>(*fill);
+    }
+    if (chunk.dtype == vc::render::ChunkDtype::Float32 && chunk.bytes) {
+        const auto at = chunk.byteOffset + offset * sizeof(float);
+        if (at + sizeof(float) > chunk.bytes->size())
+            throw std::runtime_error("packed float channel payload too small");
+        float value;
+        std::memcpy(&value, chunk.bytes->data() + at, sizeof(value));
+        if (!std::isfinite(value) || value < 0 || value > 255)
+            throw std::runtime_error("invalid packed encoded byte value");
+        return static_cast<uint8_t>(std::lround(value));
+    }
+    offset += chunk.byteOffset;
+    if (chunk.dtype != vc::render::ChunkDtype::UInt8 || !chunk.bytes || offset >= chunk.bytes->size())
+        throw std::runtime_error("Lasagna decoded chunk has invalid dtype/size: " + binding.path.string());
+    return std::to_integer<uint8_t>((*chunk.bytes)[offset]);
 }
 
 [[nodiscard]] uint32_t arrayIdForPath(const std::filesystem::path& path)
@@ -155,24 +178,29 @@ constexpr float kFloatEpsilon = 1.0e-6f;
 [[nodiscard]] std::optional<double> readSourceVoxel(
     const LasagnaChannelBinding& binding,
     const LasagnaChannelChunkKey& key,
-    const std::shared_ptr<const LasagnaCachedChunk>& chunk,
+    const vc::render::ChunkResult& chunk,
     size_t z,
     size_t y,
     size_t x)
 {
-    if (chunk == nullptr) {
-        return std::nullopt;
-    }
     const size_t offset = originalChunkOffset(
         binding,
         z % binding.chunksZYX[0],
         y % binding.chunksZYX[1],
         x % binding.chunksZYX[2]);
-    if (offset >= chunk->values.size()) {
-        throw std::runtime_error("Lasagna cached source chunk is smaller than expected at chunk " +
-                                 chunkKeyToString(key));
+    if (binding.array->metadata().dtype == utils::ZarrDtype::float32) {
+        validateChunk(chunk);
+        if (chunk.status == vc::render::ChunkStatus::Missing || chunk.status == vc::render::ChunkStatus::AllFill)
+            return binding.array->metadata().fill_value;
+        if (chunk.dtype != vc::render::ChunkDtype::Float32 || !chunk.bytes ||
+            chunk.byteOffset + (offset + 1) * sizeof(float) > chunk.bytes->size())
+            throw std::runtime_error("invalid float32 Lasagna chunk: " + binding.path.string());
+        float value;
+        std::memcpy(&value, chunk.bytes->data() + chunk.byteOffset + offset * sizeof(float), sizeof(value));
+        return value;
     }
-    return static_cast<double>(chunk->values[offset]);
+    const auto value = chunkByte(binding, chunk, offset);
+    return value ? std::optional<double>(*value) : std::nullopt;
 }
 
 [[nodiscard]] std::optional<LasagnaCubeValues> readInterpolationCube(
@@ -195,7 +223,7 @@ constexpr float kFloatEpsilon = 1.0e-6f;
                 const auto value = readSourceVoxel(
                     binding,
                     request.keys[chunkIndex],
-                    request.chunks[chunkIndex],
+                    request.chunk(chunkIndex),
                     z,
                     y,
                     x);
@@ -210,15 +238,44 @@ constexpr float kFloatEpsilon = 1.0e-6f;
                              values[4], values[5], values[6], values[7]};
 }
 
+// A same-chunk cube has fixed strides. Hoist dtype, modulo, size and chunk
+// checks out of the eight-corner loop. Missing/fill/error/boundary cases keep
+// using the shared general reader below.
+template<class Output>
+bool readSingleChunkCube(const LasagnaChannelBinding& binding,
+    const LasagnaCubeRequest& request,std::array<Output,8>& values)
+{
+    if(!request.valid || !request.singleChunk) return false;
+    const auto& chunk=request.chunk(0);
+    if(!chunk.bytes || chunk.status==vc::render::ChunkStatus::Missing || chunk.status==vc::render::ChunkStatus::AllFill)
+        return false;
+    validateChunk(chunk);
+    const bool floats=binding.array->metadata().dtype==utils::ZarrDtype::float32;
+    if constexpr(std::is_same_v<Output,uint8_t>) {if(floats)return false;}
+    if(chunk.dtype!=(floats?vc::render::ChunkDtype::Float32:vc::render::ChunkDtype::UInt8)) return false;
+    const size_t offset=chunk.byteOffset/(floats?sizeof(float):1)+originalChunkOffset(binding,request.z0%binding.chunksZYX[0],request.y0%binding.chunksZYX[1],request.x0%binding.chunksZYX[2]);
+    const size_t sx=request.x0+1<binding.shapeZYX[2]?1:0;
+    const size_t sy=request.y0+1<binding.shapeZYX[1]?binding.chunksZYX[2]:0;
+    const size_t sz=request.z0+1<binding.shapeZYX[0]?binding.chunksZYX[1]*binding.chunksZYX[2]:0;
+    if((offset+sx+sy+sz+1)*(floats?sizeof(float):1)>chunk.bytes->size()) return false;
+    for(size_t k=0;k<8;++k) {
+        const size_t at=offset+((k&1)?sx:0)+((k&2)?sy:0)+((k&4)?sz:0);
+        if(floats){float v;std::memcpy(&v,chunk.bytes->data()+at*sizeof(float),sizeof(v));values[k]=static_cast<Output>(v);}
+        else values[k]=std::to_integer<uint8_t>((*chunk.bytes)[at]);
+    }
+    return true;
+}
+
 [[nodiscard]] bool readInterpolationCubeValues(
     const LasagnaChannelBinding& binding,
     const LasagnaCubeRequest& request,
-    std::array<double, 8>& values)
+    std::array<double, 8>& values,bool fast=false)
 {
     if (!request.valid) {
         return false;
     }
 
+    if(fast && readSingleChunkCube(binding,request,values)) return true;
     size_t cubeIndex = 0;
     for (size_t dz = 0; dz <= 1; ++dz) {
         const size_t z = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
@@ -227,21 +284,10 @@ constexpr float kFloatEpsilon = 1.0e-6f;
             for (size_t dx = 0; dx <= 1; ++dx) {
                 const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
                 const size_t chunkIndex = request.singleChunk ? size_t{0} : cubeIndex;
-                const auto& chunk = request.chunks[chunkIndex];
-                if (chunk == nullptr) {
-                    return false;
-                }
-                const size_t offset = originalChunkOffset(
-                    binding,
-                    z % binding.chunksZYX[0],
-                    y % binding.chunksZYX[1],
-                    x % binding.chunksZYX[2]);
-                if (offset >= chunk->values.size()) {
-                    throw std::runtime_error(
-                        "Lasagna cached source chunk is smaller than expected at chunk " +
-                        chunkKeyToString(request.keys[chunkIndex]));
-                }
-                values[cubeIndex++] = static_cast<double>(chunk->values[offset]);
+                const auto& chunk = request.chunk(chunkIndex);
+                const auto value = readSourceVoxel(binding, request.keys[chunkIndex], chunk, z, y, x);
+                if (!value) return false;
+                values[cubeIndex++] = *value;
             }
         }
     }
@@ -251,12 +297,13 @@ constexpr float kFloatEpsilon = 1.0e-6f;
 [[nodiscard]] bool readInterpolationCubeBytes(
     const LasagnaChannelBinding& binding,
     const LasagnaCubeRequest& request,
-    std::array<uint8_t, 8>& values)
+    std::array<uint8_t, 8>& values,bool fast=false)
 {
     if (!request.valid) {
         return false;
     }
 
+    if(fast && readSingleChunkCube(binding,request,values)) return true;
     size_t cubeIndex = 0;
     for (size_t dz = 0; dz <= 1; ++dz) {
         const size_t z = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
@@ -265,36 +312,23 @@ constexpr float kFloatEpsilon = 1.0e-6f;
             for (size_t dx = 0; dx <= 1; ++dx) {
                 const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
                 const size_t chunkIndex = request.singleChunk ? size_t{0} : cubeIndex;
-                const auto& chunk = request.chunks[chunkIndex];
-                if (chunk == nullptr) {
-                    return false;
-                }
+                const auto& chunk = request.chunk(chunkIndex);
                 const size_t offset = originalChunkOffset(
                     binding,
                     z % binding.chunksZYX[0],
                     y % binding.chunksZYX[1],
                     x % binding.chunksZYX[2]);
-                if (offset >= chunk->values.size()) {
-                    throw std::runtime_error(
-                        "Lasagna cached source chunk is smaller than expected at chunk " +
-                        chunkKeyToString(request.keys[chunkIndex]));
-                }
-                values[cubeIndex++] = chunk->values[offset];
+                const auto value = chunkByte(binding, chunk, offset);
+                if (!value) return false;
+                values[cubeIndex++] = *value;
             }
         }
     }
     return true;
 }
 
-[[nodiscard]] std::optional<double> sampleLasagnaChannelValues(
-    const LasagnaChannelBinding& binding,
-    const LasagnaCubeRequest& request)
+[[nodiscard]] double interpolateChannelValues(const std::array<double,8>& values,const LasagnaCubeRequest& request)
 {
-    std::array<double, 8> values{};
-    if (!readInterpolationCubeValues(binding, request, values)) {
-        return std::nullopt;
-    }
-
     const double c00 = values[0] * (1.0 - request.fx) + values[1] * request.fx;
     const double c01 = values[2] * (1.0 - request.fx) + values[3] * request.fx;
     const double c10 = values[4] * (1.0 - request.fx) + values[5] * request.fx;
@@ -302,6 +336,14 @@ constexpr float kFloatEpsilon = 1.0e-6f;
     const double c0 = c00 * (1.0 - request.fy) + c01 * request.fy;
     const double c1 = c10 * (1.0 - request.fy) + c11 * request.fy;
     return c0 * (1.0 - request.fz) + c1 * request.fz;
+}
+
+[[nodiscard]] std::optional<double> sampleLasagnaChannelValues(
+    const LasagnaChannelBinding& binding,const LasagnaCubeRequest& request)
+{
+    std::array<double,8> values{};
+    if(!readInterpolationCubeValues(binding,request,values))return std::nullopt;
+    return interpolateChannelValues(values,request);
 }
 
 struct DecodedCompactNormal {
@@ -441,7 +483,6 @@ decodedCompactNormalTable()
 
 [[nodiscard]] std::optional<LasagnaCubeValues> readInterpolationCube(
     const LasagnaChannelBinding& binding,
-    const LasagnaChannelChunkCache& cache,
     size_t z0,
     size_t y0,
     size_t x0)
@@ -451,6 +492,7 @@ decodedCompactNormalTable()
     request.z0 = z0;
     request.y0 = y0;
     request.x0 = x0;
+    LasagnaLocalChunkResolver resolver(binding);
     size_t cubeIndex = 0;
     for (size_t dz = 0; dz <= 1; ++dz) {
         const size_t z = std::min(z0 + dz, binding.shapeZYX[0] - 1);
@@ -459,12 +501,12 @@ decodedCompactNormalTable()
             for (size_t dx = 0; dx <= 1; ++dx) {
                 const size_t x = std::min(x0 + dx, binding.shapeZYX[2] - 1);
                 request.keys[cubeIndex] = chunkKeyForVoxel(binding, z, y, x);
-                request.chunks[cubeIndex] = cache.get(
-                    binding, *binding.array, request.keys[cubeIndex]);
+
                 ++cubeIndex;
             }
         }
     }
+    resolver.resolve(request);
     return readInterpolationCube(binding, request);
 }
 
@@ -511,27 +553,7 @@ public:
     {
         if (!binding.array)
             throw std::runtime_error("VC3D corner-batch sampling requires an open Zarr array");
-        std::error_code ec;
-        auto sourcePath = std::filesystem::weakly_canonical(binding.path, ec);
-        if (ec)
-            sourcePath = std::filesystem::absolute(binding.path, ec);
-        if (ec)
-            sourcePath = binding.path;
-        vc::render::ChunkCacheOptions cacheOptions;
-        // A line solve streams whole-line chunk batches per iteration; those
-        // must never displace the viewer tiles the user is panning over in
-        // the shared decoded budget. Trade-off: while lasagna data occupies
-        // budget, lasagna is also the preferred victim - if a solve's
-        // working set ever exceeded the whole budget it would re-fetch its
-        // own evictions each iteration. A line's per-iteration footprint is
-        // orders of magnitude below typical budgets, so protecting the
-        // interactive tiles wins.
-        cacheOptions.decodedEvictionPreferSelf = true;
-        cache_ = vc::render::acquireProcessChunkCache(
-            "lasagna-channel|" + sourcePath.lexically_normal().string() +
-                "|channel=" + std::to_string(binding.channelIndex),
-            binding.array,
-            std::move(cacheOptions));
+        cache_ = binding.chunkSource;
     }
 
     [[nodiscard]] NormalPrefetchReport sampleBatch(
@@ -592,6 +614,7 @@ public:
         cv::Mat_<uint8_t> coverage = cv::Mat_<uint8_t>::zeros(rows, 8);
         vc::render::ChunkedPlaneSampler::Options options(
             vc::Sampling::Nearest, 32);
+        options.request.foreground = true;
         const auto stats =
             vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
                 *cache_, 0, coords, values, coverage, options);
@@ -617,7 +640,7 @@ public:
 private:
     float spacing_ = 1.0f;
     std::array<int, 3> shapeZYX_{};
-    std::shared_ptr<vc::render::ChunkCache> cache_;
+    std::shared_ptr<vc::render::IChunkedArray> cache_;
 };
 
 LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
@@ -632,6 +655,12 @@ LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
 LasagnaChannelCornerSampler& LasagnaChannelCornerSampler::operator=(
     LasagnaChannelCornerSampler&&) noexcept = default;
 
+bool LasagnaChannelCornerSampler::sharesSamplingGrid(const LasagnaChannelCornerSampler& other) const noexcept
+{
+    return impl_ && other.impl_ && impl_->spacing() == other.impl_->spacing() &&
+        impl_->shapeZYX() == other.impl_->shapeZYX();
+}
+
 NormalPrefetchReport LasagnaChannelCornerSampler::sampleBatch(
     const std::vector<cv::Vec3f>& volumePoints,
     std::vector<LasagnaCornerSample>& samples) const
@@ -645,7 +674,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
     int parallelThreads,
-    bool collectLocalityStats)
+    bool collectLocalityStats,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     if (samplers.empty() || volumePoints.empty())
         return {};
@@ -653,13 +683,10 @@ NormalPrefetchReport visitLasagnaChannelCorners(
         throw std::invalid_argument("corner batch contains a null channel sampler");
 
     const float spacing = samplers.front()->impl_->spacing();
-    const auto shape = samplers.front()->impl_->shapeZYX();
     std::vector<vc::render::IChunkedArray*> arrays;
     arrays.reserve(samplers.size());
     for (const auto* sampler : samplers) {
-        if (sampler == nullptr || !sampler->impl_ ||
-            sampler->impl_->spacing() != spacing ||
-            sampler->impl_->shapeZYX() != shape) {
+        if (sampler == nullptr || !samplers.front()->sharesSamplingGrid(*sampler)) {
             throw std::invalid_argument(
                 "grouped corner samplers must share one spatial grid");
         }
@@ -678,7 +705,9 @@ NormalPrefetchReport visitLasagnaChannelCorners(
             visitorContext,
             visitor,
             parallelThreads,
-            collectLocalityStats);
+            collectLocalityStats,
+            vc::render::ChunkRequestContext{.foreground = true},
+            pinnedRegion);
     return {
         static_cast<uint64_t>(stats.requestedChunks),
         static_cast<uint64_t>(stats.requestedChunks),
@@ -757,275 +786,85 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     return report;
 }
 
-struct LasagnaChannelChunkCache::InFlightLoad {
-    std::mutex mutex;
-    std::condition_variable finished;
-    bool done = false;
-    std::shared_ptr<const LasagnaCachedChunk> bytes;
-    std::exception_ptr error;
-};
-
-LasagnaChannelChunkCache::LasagnaChannelChunkCache(size_t capacityBytes)
-    : capacityBytes_(std::max<size_t>(1, capacityBytes))
-{
-}
-
-std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::get(
+NormalPrefetchReport resolveLasagnaChunks(
     const LasagnaChannelBinding& binding,
-    const utils::ZarrArray& array,
-    const LasagnaChannelChunkKey& key) const
-{
-    return load(binding, array, key);
-}
-
-NormalPrefetchReport LasagnaChannelChunkCache::prefetchResolved(
-    const LasagnaChannelBinding& binding,
-    const utils::ZarrArray& array,
-    const std::vector<LasagnaChannelChunkKey>& keys,
-    size_t maxWorkers,
-    ResolvedChunkMap& resolved) const
+    const std::vector<LasagnaChannelChunkKey>& keys, LasagnaResolvedChunks& resolved)
 {
     NormalPrefetchReport report;
     resolved.clear();
-    std::vector<LasagnaChannelChunkKey> missing;
-    missing.reserve(keys.size());
+    std::vector<vc::render::ChunkKey> pending;
     std::unordered_set<LasagnaChannelChunkKey, LasagnaChannelChunkKeyHash> seen;
-    seen.reserve(keys.size());
-    {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& key : keys) {
-            if (!seen.insert(key).second) {
-                continue;
-            }
-            ++report.requestedChunks;
-            if (auto it = entries_.find(key); it != entries_.end()) {
-                resolved.emplace(key, it->second.bytes);
-            } else {
-                missing.push_back(key);
-            }
+    for (const auto& key : keys) {
+        if (!seen.insert(key).second) continue;
+        ++report.requestedChunks;
+        auto result = binding.chunkSource->getChunkIfCached(0, key.z, key.y, key.x);
+        if (result.status == vc::render::ChunkStatus::MissQueued) {
+            ++report.chunksRead;
+            pending.push_back({0, static_cast<int>(key.z), static_cast<int>(key.y), static_cast<int>(key.x)});
+        } else {
+            resolved.emplace(key, checkedChunk(std::move(result)));
         }
     }
-    report.chunksRead = missing.size();
-    if (!missing.empty()) {
-        maxWorkers = std::clamp<size_t>(maxWorkers, 1, missing.size());
-        std::vector<std::future<void>> futures;
-        futures.reserve(maxWorkers);
-        std::atomic<size_t> next{0};
-        for (size_t worker = 0; worker < maxWorkers; ++worker) {
-            futures.push_back(lasagnaReadPool().submit(
-                [this, &binding, &array, &missing, &next]() {
-                    while (true) {
-                        const size_t index = next.fetch_add(1);
-                        if (index >= missing.size()) {
-                            return;
-                        }
-                        const LasagnaChannelChunkKey key = missing[index];
-                        (void)load(binding, array, key);
-                    }
-                }));
-        }
-        for (auto& future : futures) {
-            future.get();
-        }
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& key : missing) {
-            if (auto it = entries_.find(key); it != entries_.end()) {
-                resolved.emplace(key, it->second.bytes);
-            }
-        }
+    if(!pending.empty()) binding.chunkSource->prefetchChunks(pending, false);
+    for (const auto& key : keys) {
+        if (resolved.contains(key)) continue;
+        resolved.emplace(key, checkedChunk(binding.chunkSource->getChunkBlocking(0, key.z, key.y, key.x)));
     }
     return report;
 }
 
-NormalPrefetchReport LasagnaChannelChunkCache::prefetchInterleaved(
-    const std::vector<PrefetchRequest>& requests) const
+NormalPrefetchReport prefetchLasagnaChunks(const std::vector<LasagnaPrefetchRequest>& requests)
 {
     NormalPrefetchReport report;
-    std::vector<PrefetchRequest> missing;
-    missing.reserve(requests.size());
     std::unordered_set<LasagnaChannelChunkKey, LasagnaChannelChunkKeyHash> seen;
-    seen.reserve(requests.size());
-    {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        for (const auto& request : requests) {
-            if (!seen.insert(request.second).second) {
-                continue;
-            }
-            ++report.requestedChunks;
-            if (entries_.find(request.second) == entries_.end()) {
-                missing.push_back(request);
-            }
+    // Queue all distinct dependencies first; only the regular service owns workers.
+    std::vector<LasagnaPrefetchRequest> pending;
+    for (const auto& request : requests) {
+        if (!seen.insert(request.second).second) continue;
+        ++report.requestedChunks;
+        const auto& key = request.second;
+        auto& source = *request.first->chunkSource;
+        auto result = source.getChunkIfCached(0, key.z, key.y, key.x);
+        if (result.status == vc::render::ChunkStatus::MissQueued) {
+            ++report.chunksRead;
+            source.prefetchChunks({{0, static_cast<int>(key.z), static_cast<int>(key.y), static_cast<int>(key.x)}}, false);
+            pending.push_back(request);
+        } else {
+            (void)checkedChunk(std::move(result));
         }
     }
-    report.chunksRead = missing.size();
-
-    const size_t maxWorkers = std::min(lasagnaReadPool().worker_count(), missing.size());
-    std::vector<std::future<void>> futures;
-    futures.reserve(maxWorkers);
-    std::atomic<size_t> next{0};
-    for (size_t worker = 0; worker < maxWorkers; ++worker) {
-        futures.push_back(lasagnaReadPool().submit([this, &missing, &next]() {
-            while (true) {
-                const size_t index = next.fetch_add(1);
-                if (index >= missing.size()) {
-                    return;
-                }
-                const auto& request = missing[index];
-                (void)load(*request.first, *request.first->array, request.second);
-            }
-        }));
-    }
-    for (auto& future : futures) {
-        future.get();
-    }
+    for (const auto& [binding, key] : pending)
+        (void)checkedChunk(binding->chunkSource->getChunkBlocking(0, key.z, key.y, key.x));
     return report;
 }
 
-std::shared_ptr<const LasagnaCachedChunk> LasagnaChannelChunkCache::load(
-    const LasagnaChannelBinding& binding,
-    const utils::ZarrArray& array,
-    const LasagnaChannelChunkKey& key) const
+LasagnaLocalChunkResolver::LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
+    : local_(*binding.chunkSource, 8)
 {
-    std::shared_ptr<InFlightLoad> request;
-    bool ownsRequest = false;
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (auto it = entries_.find(key); it != entries_.end()) {
-            lru_.splice(lru_.begin(), lru_, it->second.lruIt);
-            return it->second.bytes;
-        }
-        if (auto it = inFlight_.find(key); it != inFlight_.end()) {
-            request = it->second;
-        } else {
-            request = std::make_shared<InFlightLoad>();
-            inFlight_.emplace(key, request);
-            ownsRequest = true;
-        }
-    }
-
-    if (!ownsRequest) {
-        // Wait on the shared in-flight load without a deadline: a timed-out
-        // duplicate read fans out extra source fetches without actually
-        // bounding anything (the duplicate itself has no timeout). The
-        // owner's read carries the source layer's own deadlines, and its
-        // error is stored and rethrown here, so followers share its fate
-        // exactly once.
-        std::unique_lock<std::mutex> lock(request->mutex);
-        request->finished.wait(lock, [&]() { return request->done; });
-        if (request->error) {
-            std::rethrow_exception(request->error);
-        }
-        return request->bytes;
-    }
-
-    std::shared_ptr<const LasagnaCachedChunk> bytes;
-    std::exception_ptr error;
-    try {
-        bytes = readSourceChunk(binding, array, key);
-        store(key, bytes);
-    } catch (...) {
-        error = std::current_exception();
-    }
-    {
-        std::lock_guard<std::mutex> lock(request->mutex);
-        request->bytes = bytes;
-        request->error = error;
-        request->done = true;
-    }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (auto it = inFlight_.find(key);
-            it != inFlight_.end() && it->second == request) {
-            inFlight_.erase(it);
-        }
-    }
-    request->finished.notify_all();
-    if (error) {
-        std::rethrow_exception(error);
-    }
-    return bytes;
+    if (pinnedRegion)
+        pinned_.emplace(*pinnedRegion, binding.chunkSource.get());
 }
 
-void LasagnaChannelChunkCache::store(
-    LasagnaChannelChunkKey key,
-    std::shared_ptr<const LasagnaCachedChunk> bytes) const
+vc::render::ChunkResult LasagnaLocalChunkResolver::resolveKey(const LasagnaChannelChunkKey& key)
 {
-    const size_t byteSize = bytes ? bytes->values.size() : 0;
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (auto it = entries_.find(key); it != entries_.end()) {
-        lru_.splice(lru_.begin(), lru_, it->second.lruIt);
-        if (it->second.bytes) {
-            cachedBytes_ -= it->second.bytes->values.size();
-        }
-        it->second.bytes = std::move(bytes);
-        cachedBytes_ += byteSize;
-        trim();
-        return;
-    }
-
-    lru_.push_front(key);
-    entries_.emplace(std::move(key), Entry{std::move(bytes), lru_.begin()});
-    cachedBytes_ += byteSize;
-    trim();
-}
-
-void LasagnaChannelChunkCache::trim() const
-{
-    while (cachedBytes_ > capacityBytes_ && !lru_.empty()) {
-        const LasagnaChannelChunkKey evicted = lru_.back();
-        lru_.pop_back();
-        auto it = entries_.find(evicted);
-        if (it != entries_.end()) {
-            if (it->second.bytes) {
-                cachedBytes_ -= it->second.bytes->values.size();
-            }
-            entries_.erase(it);
-        }
-    }
-}
-
-LasagnaLocalChunkResolver::LasagnaLocalChunkResolver(
-    const LasagnaChannelBinding& binding,
-    const LasagnaChannelChunkCache& cache)
-    : binding_(&binding)
-    , cache_(&cache)
-{
-}
-
-std::shared_ptr<const LasagnaCachedChunk> LasagnaLocalChunkResolver::resolveKey(
-    const LasagnaChannelChunkKey& key)
-{
-    if (hasLast_ && lastKey_ == key) {
-        return lastChunk_;
-    }
-    for (size_t index = 0; index < size_; ++index) {
-        if (keys_[index] == key) {
-            lastKey_ = key;
-            lastChunk_ = chunks_[index];
-            hasLast_ = true;
-            return chunks_[index];
-        }
-    }
-    auto chunk = cache_->get(*binding_, *binding_->array, key);
-    if (size_ < keys_.size()) {
-        keys_[size_] = key;
-        chunks_[size_] = chunk;
-        ++size_;
-    } else {
-        keys_[next_] = key;
-        chunks_[next_] = chunk;
-        next_ = (next_ + 1) % keys_.size();
-    }
-    lastKey_ = key;
-    lastChunk_ = chunk;
-    hasLast_ = true;
-    return chunk;
+    // Copy the shared ownership before the next lookup can recycle the window.
+    return checkedChunk(local_.get({0, static_cast<int>(key.z), static_cast<int>(key.y), static_cast<int>(key.x)}, requested_, errors_));
 }
 
 void LasagnaLocalChunkResolver::resolve(LasagnaCubeRequest& request)
 {
     if (!request.valid)
         return;
+    if (pinned_) {
+        for(size_t i=0;i<(request.singleChunk?1u:8u);++i) {
+            const auto& k=request.keys[i];
+            request.borrowed[i] = &pinned_->get(
+                {0, static_cast<int>(k.z), static_cast<int>(k.y), static_cast<int>(k.x)});
+            validateChunk(*request.borrowed[i]);
+        }
+        return;
+    }
     if (request.singleChunk) {
         request.chunks[0] = resolveKey(request.keys[0]);
         return;
@@ -1051,27 +890,9 @@ size_t lasagnaReadWorkersPerChannel()
         hardwareThreads == 0 ? 4 : static_cast<size_t>(hardwareThreads), 1, 8);
 }
 
-std::shared_ptr<LasagnaChannelChunkCache>
-sharedLasagnaChannelChunkCache(size_t capacityBytes)
-{
-    static std::mutex mutex;
-    static std::shared_ptr<LasagnaChannelChunkCache> cache;
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!cache) {
-        cache = std::make_shared<LasagnaChannelChunkCache>(capacityBytes);
-    }
-    return cache;
-}
-
 namespace {
 
-[[nodiscard]] cv::Vec3f normalizedFloatOrZero(const cv::Vec3f& value)
-{
-    const float norm2 = value.dot(value);
-    if (!(norm2 > kFloatEpsilon * kFloatEpsilon) || !std::isfinite(norm2))
-        return {0.0f, 0.0f, 0.0f};
-    return value * (1.0f / std::sqrt(norm2));
-}
+using vc::core::portable::normalizedFloatOrZero;
 
 [[nodiscard]] std::array<float, 8> cornerWeights(const cv::Vec3f& fractionXYZ)
 {
@@ -1087,7 +908,8 @@ namespace {
 }
 
 struct DecodedCompactNormalFloat {
-    std::array<float, 6> tensor{};
+    // Two padding lanes permit one vector load, no overread into the next entry.
+    std::array<float, 8> tensor{};
     bool valid = false;
 };
 
@@ -1105,7 +927,7 @@ decodedCompactNormalFloatTable()
                 const float z = std::sqrt(std::max(
                     0.0f, 1.0f - x * x - y * y));
                 auto& decoded = out[(rawNx << 8) | rawNy];
-                const cv::Vec3f axis = normalizedFloatOrZero({x, y, z});
+                const cv::Vec3f axis = normalizedFloatOrZero(cv::Vec3f{x, y, z});
                 decoded.valid = axis.dot(axis) >
                     kFloatEpsilon * kFloatEpsilon;
                 if (decoded.valid) {
@@ -1124,85 +946,7 @@ decodedCompactNormalFloatTable()
     return table;
 }
 
-[[nodiscard]] cv::Vec3f principalFloatTensorAxis(
-    float a00,
-    float a01,
-    float a02,
-    float a11,
-    float a12,
-    float a22,
-    const cv::Vec3f& hint)
-{
-    if (!std::isfinite(a00) || !std::isfinite(a01) || !std::isfinite(a02) ||
-        !std::isfinite(a11) || !std::isfinite(a12) || !std::isfinite(a22)) {
-        return {0.0f, 0.0f, 0.0f};
-    }
-    auto fallback = [&]() {
-        cv::Vec3f result{1.0f, 0.0f, 0.0f};
-        if (a11 > a00 && a11 >= a22)
-            result = {0.0f, 1.0f, 0.0f};
-        else if (a22 > a00 && a22 > a11)
-            result = {0.0f, 0.0f, 1.0f};
-        return result;
-    };
-
-    cv::Vec3f axis{};
-    const float offDiagonal = a01 * a01 + a02 * a02 + a12 * a12;
-    if (offDiagonal <= kFloatEpsilon * kFloatEpsilon) {
-        axis = fallback();
-    } else {
-        const float q = (a00 + a11 + a22) / 3.0f;
-        const float b00 = a00 - q;
-        const float b11 = a11 - q;
-        const float b22 = a22 - q;
-        const float p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0f * offDiagonal;
-        const float p = std::sqrt(std::max(0.0f, p2 / 6.0f));
-        if (!(p > kFloatEpsilon)) {
-            axis = fallback();
-        } else {
-            const float invP = 1.0f / p;
-            const float c00 = b00 * invP;
-            const float c01 = a01 * invP;
-            const float c02 = a02 * invP;
-            const float c11 = b11 * invP;
-            const float c12 = a12 * invP;
-            const float c22 = b22 * invP;
-            const float detC =
-                c00 * (c11 * c22 - c12 * c12) -
-                c01 * (c01 * c22 - c12 * c02) +
-                c02 * (c01 * c12 - c11 * c02);
-            const float phi = std::acos(std::clamp(0.5f * detC, -1.0f, 1.0f)) / 3.0f;
-            const float lambda = q + 2.0f * p * std::cos(phi);
-            const cv::Vec3f row0{a00 - lambda, a01, a02};
-            const cv::Vec3f row1{a01, a11 - lambda, a12};
-            const cv::Vec3f row2{a02, a12, a22 - lambda};
-            const std::array<cv::Vec3f, 3> candidates{
-                row0.cross(row1), row0.cross(row2), row1.cross(row2)};
-            float bestNorm2 = -1.0f;
-            for (const auto& candidate : candidates) {
-                const float norm2 = candidate.dot(candidate);
-                if (norm2 > bestNorm2) {
-                    bestNorm2 = norm2;
-                    axis = candidate;
-                }
-            }
-            if (!(bestNorm2 > kFloatEpsilon * kFloatEpsilon))
-                axis = fallback();
-        }
-    }
-
-    axis = normalizedFloatOrZero(axis);
-    if (axis.dot(axis) <= kFloatEpsilon * kFloatEpsilon)
-        return {0.0f, 0.0f, 0.0f};
-    const cv::Vec3f normalizedHint = normalizedFloatOrZero(hint);
-    if (normalizedHint.dot(normalizedHint) > kFloatEpsilon * kFloatEpsilon) {
-        if (axis.dot(normalizedHint) < 0.0f)
-            axis *= -1.0f;
-    } else if (axis[2] < 0.0f) {
-        axis *= -1.0f;
-    }
-    return axis;
-}
+using vc::core::portable::principalFloatTensorAxis;
 
 } // namespace
 
@@ -1229,6 +973,14 @@ float interpolateLasagnaCorners(
     return value;
 }
 
+std::array<float, 8> validLasagnaCornerWeights(
+    const std::array<float, 8>& weights, const std::array<uint8_t, 8>& validity)
+{
+    auto result=weights;
+    for (size_t i=0;i<8;++i) if (!validity[i]) result[i]=0;
+    return result; // Tensor eigenvector is scale invariant; do not perturb all-valid weights.
+}
+
 cv::Vec3f interpolateLasagnaCompactAxisCorners(
     const LasagnaCornerSample& nx,
     const LasagnaCornerSample& ny,
@@ -1244,7 +996,7 @@ cv::Vec3f interpolateLasagnaCompactAxisCorners(
     const std::array<uint8_t, 8>& nx,
     const std::array<uint8_t, 8>& ny,
     const std::array<float, 8>& weights,
-    const cv::Vec3f& hint)
+    const cv::Vec3f& hint, bool vectorized)
 {
     float a00 = 0.0f;
     float a01 = 0.0f;
@@ -1253,6 +1005,22 @@ cv::Vec3f interpolateLasagnaCompactAxisCorners(
     float a12 = 0.0f;
     float a22 = 0.0f;
     const auto& normalTable = decodedCompactNormalFloatTable();
+#if defined(__AVX2__) && defined(__FMA__)
+    if (vectorized) {
+        // Each lane retains the scalar corner order and fused rounding exactly.
+        __m256 tensor=_mm256_setzero_ps();
+        for(size_t corner=0;corner<weights.size();++corner) {
+            const auto& decoded=normalTable[(size_t(nx[corner])<<8)|size_t(ny[corner])];
+            if(decoded.valid)
+                tensor=_mm256_fmadd_ps(_mm256_set1_ps(weights[corner]),_mm256_loadu_ps(decoded.tensor.data()),tensor);
+        }
+        alignas(32) float values[8];_mm256_store_ps(values,tensor);
+        if(!(values[0]+values[3]+values[5]>0.f)) return {0.f,0.f,0.f};
+        return principalFloatTensorAxis(values[0],values[1],values[2],values[3],values[4],values[5],hint);
+    }
+#else
+    (void)vectorized; // Portable scalar reference on builds without AVX2/FMA.
+#endif
     for (size_t corner = 0; corner < weights.size(); ++corner) {
         const auto& decoded = normalTable[
             (static_cast<size_t>(nx[corner]) << 8) |
@@ -1267,6 +1035,8 @@ cv::Vec3f interpolateLasagnaCompactAxisCorners(
         a12 = std::fma(weight, decoded.tensor[4], a12);
         a22 = std::fma(weight, decoded.tensor[5], a22);
     }
+    if (!(a00 + a11 + a22 > 0.0f))
+        return {0.0f, 0.0f, 0.0f};
     return principalFloatTensorAxis(a00, a01, a02, a11, a12, a22, hint);
 }
 
@@ -1281,6 +1051,25 @@ cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy)
     const double ny = decodeCompactNormalComponent(rawNy);
     const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
     return normalizedOrZero({nx, ny, std::sqrt(nzSq)});
+}
+
+std::optional<std::array<uint8_t, 2>>
+encodeCompactNormalToRaw(const cv::Vec3d& input)
+{
+    cv::Vec3d normal = normalizedOrZero(input);
+    const double norm2 = normal.dot(normal);
+    if (!(norm2 > kEpsilon * kEpsilon) ||
+        !std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2])) {
+        return std::nullopt;
+    }
+    if (normal[2] < 0.0)
+        normal *= -1.0;
+    const auto encode = [](double component) {
+        const long raw = std::lround(component * 127.0 + 128.0);
+        return static_cast<uint8_t>(std::clamp(raw, 0L, 255L));
+    };
+    return std::array<uint8_t, 2>{encode(normal[0]), encode(normal[1])};
 }
 
 cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d& hint)
@@ -1386,7 +1175,7 @@ cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d&
 
 LasagnaChannelBinding bindLasagnaChannel(
     const LasagnaDatasetManifest& manifest,
-    std::string_view channel)
+    std::string_view channel, bool allowFloat32)
 {
     const LasagnaChannelGroup* group = manifest.groupForChannel(channel);
     if (group == nullptr) {
@@ -1407,16 +1196,22 @@ LasagnaChannelBinding bindLasagnaChannel(
     binding.spacing = static_cast<double>(group->scaleFactor()) *
                       manifest.sourceToBase / manifest.workingToBaseScale;
 
-    const auto& meta = binding.array->metadata();
-    if (meta.dtype != utils::ZarrDtype::uint8) {
+    const auto meta = binding.array->metadata();
+    if ((allowFloat32 || meta.shape.size() == 4) && meta.dtype == utils::ZarrDtype::float32) {
+        binding.array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, *group, 4));
+    } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' must be uint8");
     }
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
+    const bool packed = meta.shape.size() == 4 && meta.chunks.size() == 4;
+    if ((packed && manifest.version != 3 && !manifest.raw.value("packed_channel_view", false)) ||
+        (!packed && (meta.shape.size() != 3 || meta.chunks.size() != 3)) ||
+        (packed && (meta.shape[0] != group->channels.size() || meta.chunks[0] != meta.shape[0]))) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
                                  "' must reference a 3D (Z,Y,X) zarr");
     }
-    binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
-    binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
+    const size_t first = packed ? 1 : 0;
+    binding.shapeZYX = {meta.shape[first], meta.shape[first+1], meta.shape[first+2]};
+    binding.chunksZYX = {meta.chunks[first], meta.chunks[first+1], meta.chunks[first+2]};
 
     if (binding.spacing <= 0.0 || !std::isfinite(binding.spacing)) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has invalid spacing");
@@ -1425,6 +1220,29 @@ LasagnaChannelBinding bindLasagnaChannel(
         binding.chunksZYX[0] == 0 || binding.chunksZYX[1] == 0 || binding.chunksZYX[2] == 0) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has empty zarr shape/chunks");
     }
+    std::error_code ec;
+    auto sourcePath = std::filesystem::weakly_canonical(binding.path, ec);
+    if (ec)
+        sourcePath = std::filesystem::absolute(binding.path, ec);
+    if (ec)
+        sourcePath = binding.path;
+    vc::render::ChunkCacheOptions cacheOptions;
+    // A line solve streams whole-line chunk batches per iteration; those
+    // must never displace the viewer tiles the user is panning over in
+    // the shared decoded budget. Trade-off: while lasagna data occupies
+    // budget, lasagna is also the preferred victim - if a solve's
+    // working set ever exceeded the whole budget it would re-fetch its
+    // own evictions each iteration. A line's per-iteration footprint is
+    // orders of magnitude below typical budgets, so protecting the
+    // interactive tiles wins.
+    cacheOptions.decodedEvictionPreferSelf = true;
+    // Without an explicit fill, a stored all-zero chunk is still valid data.
+    cacheOptions.detectAllFillChunks = binding.array->metadata().fill_value.has_value();
+    binding.chunkSource = vc::render::acquireProcessZarrChannel(
+        "lasagna-channel|" + sourcePath.lexically_normal().string(),
+        binding.array,
+        binding.channelIndex,
+        std::move(cacheOptions));
     return binding;
 }
 
@@ -1497,6 +1315,7 @@ LasagnaCubeRequest cloneLasagnaCubeRequestForBinding(
 {
     LasagnaCubeRequest out = source;
     out.chunks = {};
+    out.borrowed = {};
     if (out.singleChunk) {
         out.keys[0].arrayId = binding.arrayId;
         out.keys[0].channelIndex = static_cast<uint32_t>(binding.channelIndex);
@@ -1511,8 +1330,9 @@ LasagnaCubeRequest cloneLasagnaCubeRequestForBinding(
 
 void assignResolvedLasagnaCubeRequestChunks(
     LasagnaCubeRequest& request,
-    const LasagnaChannelChunkCache::ResolvedChunkMap& resolved)
+    const LasagnaResolvedChunks& resolved)
 {
+    request.borrowed = {};
     if (!request.valid) {
         return;
     }
@@ -1596,12 +1416,11 @@ void appendLasagnaInterpolationChunkKeys(
     if (!request.valid) {
         return;
     }
-    keys.insert(keys.end(), request.keys.begin(), request.keys.end());
+    appendUniqueLasagnaCubeRequestChunkKeys(request, keys);
 }
 
 std::optional<double> sampleLasagnaChannel(
     const LasagnaChannelBinding& binding,
-    const LasagnaChannelChunkCache& cache,
     const cv::Vec3d& volumePoint)
 {
     const double x = volumePoint[0] / binding.spacing;
@@ -1624,7 +1443,7 @@ std::optional<double> sampleLasagnaChannel(
     const double fy = y - static_cast<double>(y0);
     const double fz = z - static_cast<double>(z0);
 
-    const auto cube = readInterpolationCube(binding, cache, z0, y0, x0);
+    const auto cube = readInterpolationCube(binding, z0, y0, x0);
     if (!cube.has_value()) {
         return std::nullopt;
     }
@@ -1648,8 +1467,7 @@ std::optional<double> sampleLasagnaChannel(
 std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     const LasagnaChannelBinding& nxBinding,
     const LasagnaChannelBinding& nyBinding,
-    const LasagnaChannelChunkCache& cache,
-    const cv::Vec3d& volumePoint)
+    const cv::Vec3d& volumePoint, const LasagnaChannelBinding* validity)
 {
     const LasagnaCubeRequest nxRequest = prepareLasagnaCubeRequest(nxBinding, volumePoint);
     const LasagnaCubeRequest nyRequest = prepareLasagnaCubeRequest(nyBinding, volumePoint);
@@ -1658,9 +1476,14 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     }
     LasagnaCubeRequest resolvedNx = nxRequest;
     LasagnaCubeRequest resolvedNy = nyRequest;
-    for (size_t i = 0; i < resolvedNx.keys.size(); ++i) {
-        resolvedNx.chunks[i] = cache.get(nxBinding, *nxBinding.array, resolvedNx.keys[i]);
-        resolvedNy.chunks[i] = cache.get(nyBinding, *nyBinding.array, resolvedNy.keys[i]);
+    LasagnaLocalChunkResolver nxResolver(nxBinding), nyResolver(nyBinding);
+    nxResolver.resolve(resolvedNx);
+    nyResolver.resolve(resolvedNy);
+    if (validity) {
+        auto maskRequest=prepareLasagnaCubeRequest(*validity,volumePoint);
+        LasagnaLocalChunkResolver resolver(*validity);
+        resolver.resolve(maskRequest);
+        return sampleLasagnaCompactAxisTensor(nxBinding,nyBinding,resolvedNx,resolvedNy,validity,&maskRequest);
     }
     return sampleLasagnaCompactAxisTensor(nxBinding, nyBinding, resolvedNx, resolvedNy);
 }
@@ -1669,13 +1492,21 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     const LasagnaChannelBinding& nxBinding,
     const LasagnaChannelBinding& nyBinding,
     const LasagnaCubeRequest& nxRequest,
-    const LasagnaCubeRequest& nyRequest)
+    const LasagnaCubeRequest& nyRequest, const LasagnaChannelBinding* validity,
+    const LasagnaCubeRequest* validityRequest)
 {
     if (!nxRequest.valid || !nyRequest.valid) {
         return std::nullopt;
     }
     std::array<uint8_t, 8> nxValues{};
     std::array<uint8_t, 8> nyValues{};
+    std::array<uint8_t, 8> mask{};
+    mask.fill(255);
+    if (validity) {
+        if (!sameLasagnaSamplingGrid(nxBinding,*validity) || !sameLasagnaSamplingGrid(nyBinding,*validity))
+            throw std::invalid_argument("validity must share axis sampling grid");
+        if (!validityRequest || !validityRequest->valid || !readInterpolationCubeBytes(*validity,*validityRequest,mask)) return std::nullopt;
+    }
     if (!readInterpolationCubeBytes(nxBinding, nxRequest, nxValues) ||
         !readInterpolationCubeBytes(nyBinding, nyRequest, nyValues)) {
         return std::nullopt;
@@ -1698,7 +1529,7 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
             for (int dx = 0; dx <= 1; ++dx) {
                 const double wx = dx == 0 ? (1.0 - nxRequest.fx) : nxRequest.fx;
                 const double weight = wx * wy * wz;
-                if (weight <= 0.0) {
+                if (weight <= 0.0 || !mask[cubeIndex]) {
                     ++cubeIndex;
                     continue;
                 }
@@ -1734,6 +1565,90 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
         return std::nullopt;
     }
     return normal;
+}
+
+std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
+    const LasagnaDatasetManifest& manifest, const LasagnaChannelBinding& lattice)
+{
+    size_t count = 0;
+    for (const auto& group : manifest.groups)
+        for (const auto& channel : group.channels)
+            if (channel.starts_with("embedding_")) ++count;
+    if (count == 0 || count > 256)
+        throw std::runtime_error("embedding tracing requires 1..256 contiguous embedding_NNN channels");
+    std::vector<LasagnaChannelBinding> bindings;
+    for (size_t i = 0; i < count; ++i) {
+        const auto digits = std::to_string(i);
+        auto binding = bindLasagnaChannel(manifest, "embedding_" + std::string(3-digits.size(), '0') + digits, true);
+        if (binding.array->metadata().dtype != utils::ZarrDtype::float32 ||
+            binding.spacing != lattice.spacing || binding.shapeZYX != lattice.shapeZYX)
+            throw std::runtime_error("embedding channels must be float32 on the prediction lattice");
+        bindings.push_back(std::move(binding));
+    }
+    return bindings;
+}
+
+void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
+    const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors, bool normalize,
+    const LasagnaChannelBinding* validity, const vc::render::PinnedChunkRegion* pinnedRegion)
+{
+    if (channels.empty()) throw std::invalid_argument("vector sampling requires channels");
+    std::vector<LasagnaPrefetchRequest> requests;
+    const bool pinned = pinnedRegion != nullptr;
+    if (validity) {
+        std::vector<LasagnaChannelChunkKey> keys;
+        for (const auto& c:channels) if (c.spacing!=validity->spacing || c.shapeZYX!=validity->shapeZYX)
+            throw std::invalid_argument("validity must share scalar sampling lattice");
+        if(!pinned) for (const auto& p:points) appendLasagnaInterpolationChunkKeys(*validity,cv::Vec3d(p),keys);
+        deduplicateLasagnaChunkKeysInPlace(keys);
+        for (const auto& k:keys) requests.emplace_back(validity,k);
+    }
+    if(!pinned) for (const auto& channel : channels) {
+        std::vector<LasagnaChannelChunkKey> keys;
+        for (const auto& p : points) appendLasagnaInterpolationChunkKeys(channel, cv::Vec3d(p), keys);
+        deduplicateLasagnaChunkKeysInPlace(keys);
+        for (const auto& key : keys) requests.emplace_back(&channel, key);
+    }
+    (void)prefetchLasagnaChunks(requests);
+    std::vector<LasagnaLocalChunkResolver> resolvers;
+    for (const auto& channel : channels) resolvers.emplace_back(channel, pinnedRegion);
+    vectors.assign(points.size(), {});
+    std::unique_ptr<LasagnaLocalChunkResolver> maskResolver;
+    if (validity) maskResolver=std::make_unique<LasagnaLocalChunkResolver>(*validity, pinnedRegion);
+    for (size_t i = 0; i < points.size(); ++i) {
+        auto& vector = vectors[i];
+        double norm2 = 0;
+        std::array<uint8_t,8> mask{};
+        if (validity) {
+            auto request=prepareLasagnaCubeRequest(*validity,cv::Vec3d(points[i]));
+            maskResolver->resolve(request);
+            if (!request.valid || !readInterpolationCubeBytes(*validity,request,mask,pinned)) continue;
+        }
+        for (size_t c = 0; c < channels.size(); ++c) {
+            auto request = prepareLasagnaCubeRequest(channels[c], cv::Vec3d(points[i]));
+            resolvers[c].resolve(request);
+            std::array<double,8> samples{};
+            const bool haveSamples=pinned && readInterpolationCubeValues(channels[c],request,samples,true);
+            auto value = pinned ? (haveSamples?std::optional<double>(interpolateChannelValues(samples,request)):std::nullopt) : sampleLasagnaChannel(channels[c], request);
+            if (validity && std::any_of(mask.begin(),mask.end(),[](uint8_t v){return !v;})) {
+                const bool available=pinned?haveSamples:readInterpolationCubeValues(channels[c],request,samples);
+                value=std::nullopt;
+                if (available) {
+                    double sum=0,denom=0;
+                    for (size_t k=0;k<8;++k) if (mask[k]) {
+                        const double w=((k&1)?request.fx:1-request.fx)*((k&2)?request.fy:1-request.fy)*((k&4)?request.fz:1-request.fz);
+                        if (w>0) { sum+=w*samples[k]; denom+=w; }
+                    }
+                    if (denom>0) value=sum/denom;
+                }
+            }
+            if (!value || !std::isfinite(*value)) { vector.clear(); break; }
+            vector.push_back(static_cast<float>(*value));
+            norm2 += *value * *value;
+        }
+        if (vector.size() != channels.size() || !std::isfinite(norm2) || (normalize && norm2 <= 1e-16)) vector.clear();
+        else if (normalize) for (auto& v : vector) v /= static_cast<float>(std::sqrt(norm2));
+    }
 }
 
 } // namespace vc::lasagna

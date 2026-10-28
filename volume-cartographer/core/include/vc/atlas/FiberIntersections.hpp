@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,6 +30,9 @@ struct FiberPolyline {
     uint64_t generation = 1;
     std::vector<FiberPoint> points;
     std::vector<cv::Vec3d> controlPoints;
+    std::optional<vc::objects::PinnedObject> storePin;
+    double storeToQueryScale = 1.0;
+    bool coordinateKnown = true;
 };
 
 struct FiberSegmentEntry {
@@ -178,6 +182,11 @@ using FiberIntersectionCancelCallback = std::function<bool()>;
 using FiberSideStripProgressCallback =
     std::function<void(FiberSideStripProgressPhase phase, size_t completed, size_t total)>;
 
+[[nodiscard]] std::vector<FiberSideStripIntersection> fiberSideStripIntersections(
+    const FiberSideStripQueryOptions& options,
+    FiberSideStripProgressCallback progressCallback = {},
+    FiberIntersectionCancelCallback cancelCallback = {});
+
 class FiberSpatialIndex {
 public:
     void clear();
@@ -292,6 +301,7 @@ private:
     const FiberIntersectionCeresOptions& ceres,
     const vc::lasagna::LasagnaNormalSampler* windingSampler = nullptr,
     FiberIntersectionProgressCallback progressCallback = {},
-    FiberIntersectionCancelCallback cancelCallback = {});
+    FiberIntersectionCancelCallback cancelCallback = {},
+    std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 
 } // namespace vc::atlas

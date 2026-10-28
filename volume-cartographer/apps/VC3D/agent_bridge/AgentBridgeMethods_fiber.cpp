@@ -20,15 +20,6 @@ AgentBridgeParam nonNegativeIndex(const QString& name)
     return param;
 }
 
-AgentBridgeParam positiveScale()
-{
-    AgentBridgeParam param =
-        Params::optionalNumber(QStringLiteral("scale"), 1.0);
-    param.minimum = 0.0;
-    param.exclusiveMinimum = true;
-    return param;
-}
-
 }  // namespace
 
 
@@ -83,6 +74,7 @@ void AgentBridgeServer::registerFiberHandlers()
                 Params::optionalArray(
                     QStringLiteral("span"),
                     nonNegativeIndex(QString())),
+                Params::optionalBoolean(QStringLiteral("editable"), false),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open")),
@@ -150,7 +142,6 @@ void AgentBridgeServer::registerFiberHandlers()
             .name = QStringLiteral("fiber.export"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),
-                positiveScale(),
             },
             .errors = {-32602, -32000, -32010, -32005},
             .mcp = Mcp::exact(QStringLiteral("vc3d_fiber_export")),
@@ -162,7 +153,6 @@ void AgentBridgeServer::registerFiberHandlers()
             .name = QStringLiteral("fiber.import"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),
-                positiveScale(),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
             .mcp = Mcp::exact(QStringLiteral("vc3d_fiber_import")),

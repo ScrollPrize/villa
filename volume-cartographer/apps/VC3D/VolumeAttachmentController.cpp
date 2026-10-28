@@ -197,7 +197,9 @@ bool VolumeAttachmentController::start(
                         vc::project::volumeMetadataFromEntryTags(request.tags),
                         !anonymous);
                 } else {
-                    result.volume = Volume::New(std::filesystem::path(location));
+                    result.volume = Volume::New(
+                        std::filesystem::path(location),
+                        vc::project::volumeMetadataFromEntryTags(request.tags));
                 }
             } catch (const std::exception& error) {
                 result.error = QString::fromUtf8(error.what());

@@ -16,23 +16,129 @@ import logging
 logger = logging.getLogger("dinov2")
 
 
-try:
-    from xformers.ops import cross_entropy
+def _soft_target_log_likelihood(t, s, temp: float):
+    return torch.sum(t.float() * F.log_softmax(s.float() / temp, dim=-1), dim=-1)
 
-    def lossfunc(t, s, temp):
-        s = s.float()
-        t = t.float()
-        if s.ndim == 2:
-            return -cross_entropy(s.unsqueeze(0), t.unsqueeze(0), temp, bw_inplace=True).squeeze(0)
-        elif s.ndim == 3:
-            return -cross_entropy(s, t, temp, bw_inplace=True)
 
-except ImportError:
+def _soft_target_log_likelihood_grad(t, s, grad_rows, temp: float):
+    # d/ds sum_j t_j log_softmax(s / temp)_j = (t - softmax(s / temp) * sum(t)) / temp
+    t = t.float()
+    probabilities = F.softmax(s.float() / temp, dim=-1)
+    grad = (t - probabilities * t.sum(dim=-1, keepdim=True)) * (grad_rows.unsqueeze(-1) / temp)
+    return grad.to(s.dtype)
 
-    def lossfunc(t, s, temp):
-        teacher_targets = t.float()
-        student_logits = s.float()
-        return torch.sum(teacher_targets * F.log_softmax(student_logits / temp, dim=-1), dim=-1)
+
+class _SoftTargetLogLikelihood(torch.autograd.Function):
+    """Row-wise sum(t * log_softmax(s / temp)) evaluated in float32 chunks.
+
+    Autograd would keep a float32 log-softmax of every row for backward. This
+    function saves only its inputs and recomputes the softmax one chunk at a time.
+    """
+
+    @staticmethod
+    def forward(ctx, t, s, temp, chunk_size, forward_fn, backward_fn):
+        rows = s.new_empty(s.shape[0], dtype=torch.float32)
+        for start in range(0, s.shape[0], chunk_size):
+            end = min(start + chunk_size, s.shape[0])
+            rows[start:end] = forward_fn(t[start:end], s[start:end], temp)
+        ctx.save_for_backward(t, s)
+        ctx.temp, ctx.chunk_size, ctx.backward_fn = temp, chunk_size, backward_fn
+        return rows
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        t, s = ctx.saved_tensors
+        grad_s = torch.empty_like(s)
+        for start in range(0, s.shape[0], ctx.chunk_size):
+            end = min(start + ctx.chunk_size, s.shape[0])
+            grad_s[start:end] = ctx.backward_fn(t[start:end], s[start:end], grad_rows[start:end], ctx.temp)
+        return None, grad_s, None, None, None, None
+
+
+# Fused last layer, Sinkhorn-Knopp targets, and masked cross-entropy.
+#
+# Sinkhorn-Knopp on E = exp(L / T) alternates prototype (column) and sample (row)
+# normalizations. After the final row normalization each target row is
+#     t_i = softmax(L_i / T + log b),
+# where b holds the accumulated per-prototype scales. b needs one pass over E
+# per iteration, so the [n_masked, K] logits, targets, and gradients are only
+# formed one chunk of rows at a time from the bottleneck features.
+
+def _logits(features, weight):
+    return torch.mm(features, weight.t()).float()
+
+
+def _prototype_sums(teacher_features, teacher_weight, teacher_temp: float):
+    return torch.exp(_logits(teacher_features, teacher_weight) / teacher_temp).sum(dim=0)
+
+
+def _row_normalized_prototype_sums(teacher_features, teacher_weight, teacher_temp: float, prototype_scales, n_samples):
+    weights = torch.exp(_logits(teacher_features, teacher_weight) / teacher_temp)
+    sample_scales = 1.0 / (torch.sum(weights * prototype_scales, dim=1, keepdim=True) * n_samples)
+    return torch.sum(weights * sample_scales, dim=0)
+
+
+def _fused_targets(teacher_features, teacher_weight, teacher_temp: float, log_prototype_scales):
+    return torch.softmax(_logits(teacher_features, teacher_weight) / teacher_temp + log_prototype_scales, dim=-1)
+
+
+def _fused_log_likelihood(student_features, student_weight, teacher_features, teacher_weight,
+                          student_temp: float, teacher_temp: float, log_prototype_scales):
+    targets = _fused_targets(teacher_features, teacher_weight, teacher_temp, log_prototype_scales)
+    log_probabilities = F.log_softmax(_logits(student_features, student_weight) / student_temp, dim=-1)
+    return torch.sum(targets * log_probabilities, dim=-1)
+
+
+def _fused_log_likelihood_grad(student_features, student_weight, teacher_features, teacher_weight,
+                               student_temp: float, teacher_temp: float, log_prototype_scales, grad_rows):
+    targets = _fused_targets(teacher_features, teacher_weight, teacher_temp, log_prototype_scales)
+    probabilities = F.softmax(_logits(student_features, student_weight) / student_temp, dim=-1)
+    grad_logits = (targets - probabilities * targets.sum(dim=-1, keepdim=True)) * (grad_rows.unsqueeze(-1) / student_temp)
+    grad_logits = grad_logits.to(student_features.dtype)
+    grad_features = torch.mm(grad_logits, student_weight)
+    grad_weight = torch.mm(grad_logits.t(), student_features).float()
+    return grad_features, grad_weight
+
+
+_FUSED_KERNELS = {
+    "prototype_sums": _prototype_sums,
+    "row_normalized_prototype_sums": _row_normalized_prototype_sums,
+    "log_likelihood": _fused_log_likelihood,
+    "log_likelihood_grad": _fused_log_likelihood_grad,
+}
+
+
+class _FusedProjectionLogLikelihood(torch.autograd.Function):
+    """Row-wise sum(t * log_softmax(z_s W_s^T / T_s)) with targets recomputed per chunk."""
+
+    @staticmethod
+    def forward(ctx, student_features, student_weight, teacher_features, teacher_weight,
+                log_prototype_scales, student_temp, teacher_temp, chunk_size, kernels):
+        rows = student_features.new_empty(student_features.shape[0], dtype=torch.float32)
+        for start in range(0, student_features.shape[0], chunk_size):
+            end = min(start + chunk_size, student_features.shape[0])
+            rows[start:end] = kernels["log_likelihood"](
+                student_features[start:end], student_weight, teacher_features[start:end], teacher_weight,
+                student_temp, teacher_temp, log_prototype_scales,
+            )
+        ctx.save_for_backward(student_features, student_weight, teacher_features, teacher_weight, log_prototype_scales)
+        ctx.student_temp, ctx.teacher_temp, ctx.chunk_size, ctx.kernels = student_temp, teacher_temp, chunk_size, kernels
+        return rows
+
+    @staticmethod
+    def backward(ctx, grad_rows):
+        student_features, student_weight, teacher_features, teacher_weight, log_prototype_scales = ctx.saved_tensors
+        grad_features = torch.empty_like(student_features)
+        grad_weight = torch.zeros(student_weight.shape, dtype=torch.float32, device=student_weight.device)
+        for start in range(0, student_features.shape[0], ctx.chunk_size):
+            end = min(start + ctx.chunk_size, student_features.shape[0])
+            chunk_features, chunk_weight = ctx.kernels["log_likelihood_grad"](
+                student_features[start:end], student_weight, teacher_features[start:end], teacher_weight,
+                ctx.student_temp, ctx.teacher_temp, log_prototype_scales, grad_rows[start:end],
+            )
+            grad_features[start:end] = chunk_features
+            grad_weight += chunk_weight
+        return grad_features, grad_weight.to(student_weight.dtype), None, None, None, None, None, None, None
 
 
 class iBOTPatchLoss(nn.Module):
@@ -49,6 +155,9 @@ class iBOTPatchLoss(nn.Module):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.masked_loss_chunk_size = masked_loss_chunk_size
+        self._log_likelihood_fn = _soft_target_log_likelihood
+        self._log_likelihood_grad_fn = _soft_target_log_likelihood_grad
+        self._fused_kernels = dict(_FUSED_KERNELS)
         self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
         self.updated = True
         self.reduce_handle = None
@@ -73,14 +182,16 @@ class iBOTPatchLoss(nn.Module):
 
     @torch.no_grad()
     def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_masked_patches_tensor, n_iterations=3):
-        teacher_output = teacher_output.float()
+        # Q is B-by-K (samples by prototypes), the transpose of the paper's notation, so
+        # the returned targets are contiguous. One float32 copy is exponentiated in place.
+        Q = teacher_output.to(torch.float32, copy=True)
+        Q.div_(teacher_temp).exp_()
         # world_size = dist.get_world_size() if dist.is_initialized() else 1
-        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
-        # B = Q.shape[1] * world_size # number of samples to assign
+        # B = Q.shape[0] * world_size # number of samples to assign
         B = n_masked_patches_tensor
         if dist.is_initialized():
             dist.all_reduce(B)
-        K = Q.shape[0]  # how many prototypes
+        K = Q.shape[1]  # how many prototypes
 
         # make the matrix sums to 1
         sum_Q = torch.sum(Q)
@@ -89,19 +200,19 @@ class iBOTPatchLoss(nn.Module):
         Q /= sum_Q
 
         for it in range(n_iterations):
-            # normalize each row: total weight per prototype must be 1/K
-            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            # normalize each prototype: total weight per prototype must be 1/K
+            sum_of_rows = torch.sum(Q, dim=0, keepdim=True)
             if dist.is_initialized():
                 dist.all_reduce(sum_of_rows)
             Q /= sum_of_rows
             Q /= K
 
-            # normalize each column: total weight per sample must be 1/B
-            Q /= torch.sum(Q, dim=0, keepdim=True)
+            # normalize each sample: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=1, keepdim=True)
             Q /= B
 
-        Q *= B  # the columns must sum to 1 so that Q is an assignment
-        return Q.t()
+        Q *= B  # each sample's weights must sum to 1 so that Q is an assignment
+        return Q
 
     def forward(self, student_patch_tokens, teacher_patch_tokens, student_masks_flat):
         """
@@ -136,17 +247,78 @@ class iBOTPatchLoss(nn.Module):
             t = t[:n_masked_patches]
             s = s[:n_masked_patches]
             masks_weight = masks_weight[:n_masked_patches]
-        chunk_size = self.masked_loss_chunk_size
-        if chunk_size is None or s.shape[0] <= chunk_size:
-            loss = lossfunc(t, s, self.student_temp)
-            return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
+        chunk_size = self.masked_loss_chunk_size or max(1, s.shape[0])
+        loss = _SoftTargetLogLikelihood.apply(
+            t, s, self.student_temp, chunk_size, self._log_likelihood_fn, self._log_likelihood_grad_fn
+        )
+        return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
 
-        total_loss = s.new_zeros((), dtype=torch.float32)
-        for start in range(0, s.shape[0], chunk_size):
-            end = min(start + chunk_size, s.shape[0])
-            chunk_loss = lossfunc(t[start:end], s[start:end], self.student_temp)
-            total_loss = total_loss + (chunk_loss * masks_weight[start:end]).sum()
-        return -total_loss / student_masks_flat.shape[0]
+    @torch.no_grad()
+    def sinkhorn_knopp_prototype_scales(self, teacher_features, teacher_weight, teacher_temp,
+                                        n_masked_patches_tensor, n_iterations=3):
+        """Log prototype scales b such that softmax(z_t W_t^T / T + log b) equals the
+        Sinkhorn-Knopp targets of sinkhorn_knopp_teacher on the teacher logits."""
+        chunk_size = self.masked_loss_chunk_size or max(1, teacher_features.shape[0])
+        n_samples = n_masked_patches_tensor.to(device=teacher_features.device, dtype=torch.float32)
+        if dist.is_initialized():
+            dist.all_reduce(n_samples)
+        n_prototypes = teacher_weight.shape[0]
+        chunks = [
+            (start, min(start + chunk_size, teacher_features.shape[0]))
+            for start in range(0, teacher_features.shape[0], chunk_size)
+        ]
+
+        def all_reduced(sums):
+            if dist.is_initialized():
+                dist.all_reduce(sums)
+            return sums
+
+        # The first normalization by the total sum cancels in the prototype normalization.
+        prototype_sums = all_reduced(sum(
+            self._fused_kernels["prototype_sums"](teacher_features[start:end], teacher_weight, teacher_temp)
+            for start, end in chunks
+        ))
+        prototype_scales = 1.0 / (prototype_sums * n_prototypes)
+        for _ in range(n_iterations - 1):
+            prototype_sums = all_reduced(sum(
+                self._fused_kernels["row_normalized_prototype_sums"](
+                    teacher_features[start:end], teacher_weight, teacher_temp, prototype_scales, n_samples,
+                )
+                for start, end in chunks
+            ))
+            prototype_scales = prototype_scales / (prototype_sums * prototype_scales * n_prototypes)
+        # The last sample normalization is the softmax applied when targets are formed.
+        return torch.log(prototype_scales)
+
+    def forward_masked_from_features(
+        self,
+        student_features,
+        student_weight,
+        teacher_features,
+        teacher_weight,
+        log_prototype_scales,
+        teacher_temp,
+        student_masks_flat,
+        masks_weight,
+    ):
+        """forward_masked for logits z W^T and Sinkhorn-Knopp targets, without materializing them.
+
+        Features and weights should already be in the logit compute dtype (the autocast
+        dtype under mixed precision), matching what the head's last linear layer would use.
+        """
+        chunk_size = self.masked_loss_chunk_size or max(1, student_features.shape[0])
+        loss = _FusedProjectionLogLikelihood.apply(
+            student_features, student_weight, teacher_features, teacher_weight, log_prototype_scales,
+            self.student_temp, teacher_temp, chunk_size, self._fused_kernels,
+        )
+        return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
+
+    def compile_kernels(self, **options) -> None:
+        """Compile the per-chunk masked-loss kernels into fused reductions."""
+        options = {**options, "dynamic": True}
+        self._log_likelihood_fn = torch.compile(_soft_target_log_likelihood, **options)
+        self._log_likelihood_grad_fn = torch.compile(_soft_target_log_likelihood_grad, **options)
+        self._fused_kernels = {name: torch.compile(kernel, **options) for name, kernel in _FUSED_KERNELS.items()}
 
     @torch.no_grad()
     def update_center(self, teacher_patch_tokens, token_weights=None):

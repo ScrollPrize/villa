@@ -1,7 +1,10 @@
 #pragma once
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "VolumePathLabels.hpp"
 #include <QString>
+#include <QHash>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -20,11 +23,37 @@ inline QString volumeDisplayAlias(const std::vector<std::string>& tags)
     return {};
 }
 
-inline QString volumeDisplayLabel(const VolumePkg& pkg, const std::string& id,
-                                  const QString& original)
+inline QString volumeDisplayPath(const VolumePkg& pkg, const std::string& id)
 {
+    const auto volume = pkg.volume(id);
+    return volumePathForDisplay(QString::fromStdString(volume->isRemote()
+        ? volume->remoteLocator() : volume->path().string()));
+}
+
+// One snapshot per dropdown refresh, shared by all labels in that refresh.
+inline QHash<QString, QString> volumeDisplaySuffixes(const VolumePkg& pkg)
+{
+    const auto ids = pkg.volumeIDs();
+    QStringList paths;
+    for (const auto& candidate : ids) {
+        paths.push_back(volumeDisplayPath(pkg, candidate));
+    }
+    const auto suffixes = distinguishingVolumePaths(paths);
+    QHash<QString, QString> result;
+    qsizetype index = 0;
+    for (const auto& id : ids)
+        result.insert(QString::fromStdString(id), suffixes[index++]);
+    return result;
+}
+
+inline QString volumeDisplayLabel(const VolumePkg& pkg, const std::string& id,
+                                  const QString& original, const QString& suffix)
+{
+    QString label = original;
+    if (suffix.contains('/'))
+        label += QStringLiteral(" [%1]").arg(suffix);
     const auto alias = volumeDisplayAlias(pkg.volumeTags(id));
-    return alias.isEmpty() ? original : alias + QStringLiteral(" - ") + original;
+    return alias.isEmpty() ? label : alias + QStringLiteral(" - ") + label;
 }
 
 inline auto orderedDisplayVolumeIds(const VolumePkg& pkg)

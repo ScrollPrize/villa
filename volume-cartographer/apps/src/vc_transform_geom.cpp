@@ -210,8 +210,20 @@ static int run_tifxyz(const std::filesystem::path& inDir,
                       const AffineTransform* A,
                       bool invert,
                       double scale_before_affine,
-                      double scale_after_affine)
+                      double scale_after_affine,
+                      bool noResample = false,
+                      std::optional<std::array<int, 3>> targetShape = std::nullopt)
 {
+    if (noResample) {
+        try {
+            vc::core::util::scaleTifxyzWithoutResampling(inDir, outDir,
+                scale_before_affine * scale_after_affine, targetShape);
+            return 0;
+        } catch (const std::exception& e) {
+            std::cerr << "failed to scale tifxyz: " << e.what() << std::endl;
+            return 4;
+        }
+    }
     std::unique_ptr<AffineTransform> AA;
     if (A) {
         AA = std::make_unique<AffineTransform>(*A);
@@ -271,7 +283,9 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
                             const AffineTransform* A,
                             bool invert,
                             double scale_before_affine,
-                            double scale_after_affine)
+                            double scale_after_affine,
+                            bool noResample = false,
+                            std::optional<std::array<int, 3>> targetShape = std::nullopt)
 {
     if (std::filesystem::exists(outRoot)) {
         std::cerr << "output directory already exists: " << outRoot << std::endl;
@@ -294,7 +308,7 @@ static int run_tifxyz_batch(const std::filesystem::path& inRoot,
 
         found++;
         const auto out = outRoot / sub.filename();
-        const int rc = run_tifxyz(sub, out, A, invert, scale_before_affine, scale_after_affine);
+        const int rc = run_tifxyz(sub, out, A, invert, scale_before_affine, scale_after_affine, noResample, targetShape);
         if (rc == 0) {
             ok++;
             std::cout << "[ok] " << sub.filename() << std::endl;
@@ -408,6 +422,8 @@ int main(int argc, char** argv) {
             ("scale-before-affine", po::value<double>()->default_value(1.0), "Uniform scale applied before affine")
             ("scale-after-affine", po::value<double>()->default_value(1.0), "Uniform scale applied after affine")
             ("scale-segmentation", po::value<double>(), "[Deprecated] Alias for --scale-before-affine")
+            ("no-resample", po::bool_switch(), "TIFXYZ scale only: stream XYZ without changing grid dimensions; scale the grid spacing too")
+            ("target-shape-zyx", po::value<std::vector<int>>()->multitoken(), "Actual destination volume shape Z Y X for --no-resample (required if input records base_shape_zyx)")
         ;
 
         po::variables_map vm;
@@ -424,6 +440,16 @@ int main(int argc, char** argv) {
         double scale_before_affine = vm["scale-before-affine"].as<double>();
         const double scale_after_affine = vm["scale-after-affine"].as<double>();
         const bool invert = vm["invert"].as<bool>();
+        const bool noResample = vm["no-resample"].as<bool>();
+        std::optional<std::array<int, 3>> targetShape;
+        if (vm.count("target-shape-zyx")) {
+            const auto shape = vm["target-shape-zyx"].as<std::vector<int>>();
+            if (!noResample || shape.size() != 3 || std::any_of(shape.begin(), shape.end(), [](int n) { return n <= 0; }))
+                throw std::invalid_argument("--target-shape-zyx requires --no-resample and three positive sizes");
+            targetShape = std::array<int, 3>{shape[0], shape[1], shape[2]};
+        }
+        if (noResample && (vm.count("affine") || invert || !std::filesystem::is_directory(inPath)))
+            throw std::invalid_argument("--no-resample supports TIFXYZ uniform scaling only, without --affine/--invert");
 
         if (vm.count("scale-segmentation")) {
             const double legacy_scale = vm["scale-segmentation"].as<double>();
@@ -446,11 +472,11 @@ int main(int argc, char** argv) {
             if (std::filesystem::exists(outPath)) {
                 std::cerr << "output directory already exists: " << outPath << std::endl; return 1;
             }
-            return run_tifxyz(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine);
+            return run_tifxyz(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine, noResample, targetShape);
         }
 
         if (std::filesystem::is_directory(inPath)) {
-            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine);
+            return run_tifxyz_batch(inPath, outPath, A.get(), invert, scale_before_affine, scale_after_affine, noResample, targetShape);
         }
 
         if (inPath.extension() == ".obj") {

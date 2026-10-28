@@ -37,7 +37,7 @@ from vesuvius.neural_tracing.tracers.fibers.train.step import (
     initialize_training_optimizer, optimizer_update, prepare_training)
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.plots import plot_run_curves
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery import monitor_fixture, evaluate_monitor
-from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.rollouts import monitor_afv_sources, training_diagnostics
+from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.rollouts import monitor_store_sources, training_diagnostics
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import (
     bind_frame_checkpoint, configured_frame_policy, frame_predictor, prediction_window)
 from vesuvius.neural_tracing.tracers.fibers.train.training_log import (
@@ -283,7 +283,7 @@ def main(argv=None):
         cache_bytes=int(args.worker_cache_gb*(1 << 30)), onpolicy=caches,
         replay_index=str(collector.index), batch_builder=builder, budget=budget)
     from vesuvius.neural_tracing.tracers.fibers.data.datasets import build_mixed_dataset
-    progress('Checking mixed-source datasets and AFV checksums')
+    progress('Checking mixed-source datasets and fiber stores')
     dataset, dataset_provenance = build_mixed_dataset(dataset, dataset_document, cfg, sample,
         identity_sampling, args, seed=args.seed+done+rank_seed, out=out, resume=resume is not None,
         normalization=ct_normalization, budget=budget)
@@ -296,15 +296,15 @@ def main(argv=None):
             continue
         if main_rank:
             (out/f'validation_{source["name"]}.json').write_text(json.dumps(source_dataset.validation_manifest,indent=2)+'\n')
-        afv_collection = dict(collection, length_power=args.afv_length_power,
-                              fibers_per_collection=args.afv_dagger_fibers or args.dagger_fibers)
+        store_collection = dict(collection, length_power=args.store_length_power,
+                                fibers_per_collection=args.store_dagger_fibers or args.dagger_fibers)
         collectors.append((source['name'],OnlineCollector(out/'dagger'/source['name'],
             source['path'], (0,1), args.device,
-            initial=[c._dir for c in source_dataset.onpolicy], **afv_collection,
+            initial=[c._dir for c in source_dataset.onpolicy], **store_collection,
             extra_args=('--dataset-name',source['name'],*bank_args))))
     collector = MultiSourceCollector(collectors)
     progress('Dataset sampling: '+', '.join(f'{name}={weight:.1%}' for name,weight in zip(dataset.names,dataset.weights))
-             +f'; AFV training draws and AFV collection order proportional to length**{args.afv_length_power:g}')
+             +f'; fiber-store training draws and collection order proportional to length**{args.store_length_power:g}')
     progress('Task budget per source: '+', '.join(f'{k} {v:.0%}' for k, v in budget.to_dict()['shares'].items())
              +f'; replay age ceiling {budget.replay_max_age}, event cap {budget.replay_event_cap}, '
              f'synthetic terminal fallback cap {budget.terminal_fallback_cap:.0%}')
@@ -527,7 +527,7 @@ def main(argv=None):
                 began = time.monotonic()
                 training_diagnostics(ema, diagnostic['cpu_batch'], tracer, val_f, manifest['monitor'], out, step, log,
                                      device=args.device,dataset_name=primary_source['name'])
-                monitor_afv_sources(ema, dataset_document['sources'], dataset.datasets, cfg, policy, step, log,
+                monitor_store_sources(ema, dataset_document['sources'], dataset.datasets, cfg, policy, step, log,
                                     max_len=args.diag_max_len, device=args.device)
                 plot_run_curves(out, model.cfg.model_type)
                 periodic['diagnostics_seconds'] = time.monotonic()-began
