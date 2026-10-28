@@ -294,4 +294,101 @@ StitchResult stitchSheets(const std::vector<Mesh>& sheets, const StitchParams& p
     return r;
 }
 
+StitchResult interpolateGaps(const StitchResult& in, const InterpParams& params)
+{
+    StitchResult r = in;
+    const int R = r.rows, C = r.cols;
+    const size_t N = size_t(R) * C;
+    if (N == 0 || r.filledCells == 0)
+        return r;
+
+    const std::vector<uint8_t> orig = r.valid;  // pinned boundary (true sheet data)
+    auto lerp = [](const Point& a, const Point& b, double t) {
+        return Point{a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t};
+    };
+
+    // Phase 1: scan-line interpolation. For each hole, find the nearest ORIGINAL sheet
+    // cells bounding it along its row and along its column and linearly interpolate
+    // across. A hole fills only when bounded on BOTH sides (row or column), so gaps of
+    // any width bridge but the outer boundary (data on one side only) is never
+    // extrapolated. Row and column interpolants are averaged where both exist.
+    std::vector<int> left(N, -1), right(N, -1), up(N, -1), down(N, -1);
+    for (int y = 0; y < R; ++y) {           // nearest original-valid to the left / right in each row
+        int last = -1;
+        for (int x = 0; x < C; ++x) { const size_t k = size_t(y) * C + x; left[k] = last; if (orig[k]) last = x; }
+        last = -1;
+        for (int x = C - 1; x >= 0; --x) { const size_t k = size_t(y) * C + x; right[k] = last; if (orig[k]) last = x; }
+    }
+    for (int x = 0; x < C; ++x) {            // nearest original-valid above / below in each column
+        int last = -1;
+        for (int y = 0; y < R; ++y) { const size_t k = size_t(y) * C + x; up[k] = last; if (orig[k]) last = y; }
+        last = -1;
+        for (int y = R - 1; y >= 0; --y) { const size_t k = size_t(y) * C + x; down[k] = last; if (orig[k]) last = y; }
+    }
+    for (int y = 0; y < R; ++y)
+        for (int x = 0; x < C; ++x) {
+            const size_t k = size_t(y) * C + x;
+            if (orig[k])
+                continue;
+            Point acc{0, 0, 0};
+            int w = 0;
+            if (left[k] >= 0 && right[k] >= 0) {  // bounded along the row
+                const double t = double(x - left[k]) / double(right[k] - left[k]);
+                const Point p = lerp(r.grid[size_t(y) * C + left[k]], r.grid[size_t(y) * C + right[k]], t);
+                acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; ++w;
+            }
+            if (up[k] >= 0 && down[k] >= 0) {     // bounded along the column
+                const double t = double(y - up[k]) / double(down[k] - up[k]);
+                const Point p = lerp(r.grid[size_t(up[k]) * C + x], r.grid[size_t(down[k]) * C + x], t);
+                acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; ++w;
+            }
+            if (w) {
+                r.grid[k] = {acc[0] / w, acc[1] / w, acc[2] / w};
+                r.valid[k] = 1;
+            }
+        }
+
+    auto at = [&](int y, int x) -> const Point* {
+        if (y < 0 || x < 0 || y >= R || x >= C)
+            return nullptr;
+        const size_t k = size_t(y) * C + x;
+        return r.valid[k] ? &r.grid[k] : nullptr;
+    };
+
+    // Phase 2: Laplace-smooth the filled cells (original sheet cells stay pinned) so the
+    // bridge is a seam-free membrane rather than a blend of two inward fronts.
+    for (int iter = 0; iter < params.maxIters; ++iter) {
+        std::vector<std::pair<size_t, Point>> upd;
+        double maxMove = 0.0;
+        for (int y = 0; y < R; ++y)
+            for (int x = 0; x < C; ++x) {
+                const size_t k = size_t(y) * C + x;
+                if (!r.valid[k] || orig[k])
+                    continue;  // only relax newly filled cells
+                Point s{0, 0, 0};
+                int n = 0;
+                for (const Point* p : {at(y, x - 1), at(y, x + 1), at(y - 1, x), at(y + 1, x)})
+                    if (p) { s[0] += (*p)[0]; s[1] += (*p)[1]; s[2] += (*p)[2]; ++n; }
+                if (!n)
+                    continue;
+                const Point np{s[0] / n, s[1] / n, s[2] / n};
+                const double d = std::sqrt((np[0] - r.grid[k][0]) * (np[0] - r.grid[k][0]) +
+                                           (np[1] - r.grid[k][1]) * (np[1] - r.grid[k][1]) +
+                                           (np[2] - r.grid[k][2]) * (np[2] - r.grid[k][2]));
+                maxMove = std::max(maxMove, d);
+                upd.push_back({k, np});
+            }
+        for (const auto& [k, pt] : upd)
+            r.grid[k] = pt;
+        if (upd.empty() || maxMove < params.tol * r.cell)
+            break;
+    }
+
+    r.filledCells = 0;
+    for (size_t k = 0; k < N; ++k)
+        if (r.valid[k])
+            ++r.filledCells;
+    return r;
+}
+
 }  // namespace vc::sheets

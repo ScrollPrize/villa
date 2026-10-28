@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -124,6 +126,66 @@ std::string writeFixture()
     sqlite3_close(db);
     return path;
 }
+
+// Like writeFixture but the sheets table carries the (nullable) quality columns, with
+// three co-located sheets whose `confidence` is 0.9, 0.2 and NULL. Used to test the
+// quality filter: thresholds drop low sheets, NULL always passes.
+std::string writeQualityFixture()
+{
+    const auto path = (std::filesystem::temp_directory_path() /
+                       ("asv_q_" + std::to_string(::getpid()) + ".asv")).string();
+    std::filesystem::remove(path);
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+    exec(db,
+         "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+         "CREATE TABLE sheets(id INTEGER PRIMARY KEY, name TEXT NOT NULL, window TEXT NOT NULL DEFAULT '',"
+         " family TEXT NOT NULL DEFAULT '', nu INTEGER NOT NULL, nv INTEGER NOT NULL,"
+         " vert_count INTEGER NOT NULL CHECK(vert_count >= 3),"
+         " area_mm2 REAL, n_voxels INTEGER, self_mass REAL, confidence REAL, mass_frac REAL,"
+         " fit_rms_um REAL, coverage REAL,"
+         " min_x REAL,max_x REAL,min_y REAL,max_y REAL, min_z REAL,max_z REAL,"
+         " payload BLOB NOT NULL, annotation TEXT NOT NULL DEFAULT '{}');"
+         "CREATE VIRTUAL TABLE sheet_bounds USING rtree(id,min_x,max_x,min_y,max_y,min_z,max_z);");
+    setMeta(db, "format_version", "1");
+    setMeta(db, "complete", "true");
+    setMeta(db, "codec", "zlib");
+    setMeta(db, "grid_step_um", "30.0");
+
+    const int nu = 4, nv = 4;
+    std::vector<std::array<float, 3>> verts;
+    for (int i = 0; i < nu; ++i)
+        for (int j = 0; j < nv; ++j)
+            verts.push_back({10.0f + i * 10.0f, 40.0f, 10.0f + j * 10.0f});
+    const auto blob = buildSheetBlob(nu, nv, verts);
+
+    // id, confidence (NaN sentinel -> bind NULL)
+    const double kNull = std::nan("");
+    const std::array<std::pair<int, double>, 3> rows = {{{1, 0.9}, {2, 0.2}, {3, kNull}}};
+    for (const auto& [id, conf] : rows) {
+        sqlite3_stmt* s = nullptr;
+        REQUIRE(sqlite3_prepare_v2(
+                    db,
+                    "INSERT INTO sheets(id,name,window,family,nu,nv,vert_count,confidence,coverage,mass_frac,"
+                    "fit_rms_um,min_x,max_x,min_y,max_y,min_z,max_z,payload,annotation) "
+                    "VALUES(?,'s','','',?,?,?,?,1.0,1.0,10.0,10,40,40,40,10,40,?,'{}')",
+                    -1, &s, nullptr) == SQLITE_OK);
+        sqlite3_bind_int(s, 1, id);
+        sqlite3_bind_int(s, 2, nu);
+        sqlite3_bind_int(s, 3, nv);
+        sqlite3_bind_int(s, 4, nu * nv);
+        if (std::isnan(conf)) sqlite3_bind_null(s, 5);
+        else sqlite3_bind_double(s, 5, conf);
+        sqlite3_bind_blob(s, 6, blob.data(), int(blob.size()), SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(s) == SQLITE_DONE);
+        sqlite3_finalize(s);
+        const std::string ins =
+            "INSERT INTO sheet_bounds VALUES(" + std::to_string(id) + ",10,40,40,40,10,40)";
+        exec(db, ins.c_str());
+    }
+    sqlite3_close(db);
+    return path;
+}
 }  // namespace
 
 TEST_CASE("sheet collection: open, metadata, decode")
@@ -193,4 +255,56 @@ TEST_CASE("sheet collection: region query and plane intersection")
     Bounds empty{{0, 0, 200}, {100, 100, 300}};
     CHECK(sc.region(empty, 0, 0, FamilyFilter::All).empty());
     std::filesystem::remove(path);
+}
+
+TEST_CASE("sheet collection: quality filter")
+{
+    using namespace vc::sheets;
+    const Bounds box{{0, 0, 0}, {100, 100, 100}};
+
+    // Quality columns present: confidence 0.9 (id 1), 0.2 (id 2), NULL (id 3).
+    {
+        const auto path = writeQualityFixture();
+        SheetCollection sc(path);
+        const auto all = sc.region(box, 0, 0, FamilyFilter::All);  // no filter -> all three
+        REQUIRE(all.size() == 3);
+        // Metric values are read onto SheetMesh (the colour-by-metric data path).
+        std::map<int64_t, const SheetMesh*> byId;
+        for (const auto& m : all) byId[m.id] = &m;
+        CHECK(byId[1]->confidence == doctest::Approx(0.9));
+        CHECK(byId[2]->confidence == doctest::Approx(0.2));
+        CHECK(std::isnan(byId[3]->confidence));          // NULL -> NaN
+        CHECK(byId[1]->coverage == doctest::Approx(1.0));
+        CHECK(byId[1]->fitRmsUm == doctest::Approx(10.0));
+
+        QualityFilter q;
+        q.minConfidence = 0.5;
+        const auto kept = sc.region(box, 0, 0, FamilyFilter::All, nullptr, 64u << 20, q);
+        // Drops the 0.2 sheet; keeps 0.9 and the NULL one (NULL always passes).
+        REQUIRE(kept.size() == 2);
+        std::set<int64_t> ids;
+        for (const auto& m : kept) ids.insert(m.id);
+        CHECK(ids.count(1) == 1);
+        CHECK(ids.count(2) == 0);
+        CHECK(ids.count(3) == 1);
+
+        // fit_rms_um is 10 for all; a 5 µm cap drops them all, a 20 µm cap keeps them.
+        QualityFilter qr;
+        qr.maxFitRmsUm = 5.0;
+        CHECK(sc.region(box, 0, 0, FamilyFilter::All, nullptr, 64u << 20, qr).empty());
+        qr.maxFitRmsUm = 20.0;
+        CHECK(sc.region(box, 0, 0, FamilyFilter::All, nullptr, 64u << 20, qr).size() == 3);
+        std::filesystem::remove(path);
+    }
+
+    // Columns absent (older schema): a quality filter must be ignored, not error.
+    {
+        const auto path = writeFixture();
+        SheetCollection sc(path);
+        QualityFilter q;
+        q.minConfidence = 0.99;
+        q.maxFitRmsUm = 1.0;
+        CHECK(sc.region(box, 0, 0, FamilyFilter::All, nullptr, 64u << 20, q).size() == 1);
+        std::filesystem::remove(path);
+    }
 }

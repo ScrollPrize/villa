@@ -58,4 +58,18 @@ struct StitchResult {
 // yields a result with ok() == false. Never throws for ordinary input.
 StitchResult stitchSheets(const std::vector<Mesh>& sheets, const StitchParams& params = {});
 
+struct InterpParams {
+    int maxIters = 400;    // cap on the grow / smooth passes
+    double tol = 1e-3;     // smoothing stops when the max move < tol * cell
+};
+
+// Fill the GAPS of a stitched grid so sparse sheet selections become a continuous
+// surface, working purely on the grid geometry (never the sheet meshes). A cell is
+// filled only when it is "sandwiched" -- it has filled/valid cells on opposite sides
+// along a row or a column -- so the fill bridges gaps BETWEEN sheets and grows inward
+// to meet, but never extrapolates past the outer boundary. The bridged cells are then
+// Laplace-smoothed (original cells pinned) for a seam-free membrane. Returns a new
+// result with the extra cells marked valid.
+StitchResult interpolateGaps(const StitchResult& in, const InterpParams& params = {});
+
 }  // namespace vc::sheets

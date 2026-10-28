@@ -96,6 +96,29 @@ TEST_CASE("two sheets stacked along the normal are flagged as a fold")
     CHECK(r.maxSpreadVox > 20.0);
 }
 
+TEST_CASE("interpolateGaps bridges a gap between two coplanar sheets")
+{
+    const Point X{1, 0, 0}, Y{0, 1, 0}, Z{0, 0, 1};
+    // Two patches on z = 100 separated by a ~60-voxel gap in x.
+    Mesh a = planarPatch(8, 8, {0, 0, 100}, X, Y, Z, 10.0, [](int64_t, int64_t) { return 0.0; });
+    Mesh b = planarPatch(8, 8, {130, 0, 100}, X, Y, Z, 10.0, [](int64_t, int64_t) { return 0.0; });
+
+    vc::sheets::StitchResult r = stitchSheets({a, b});
+    REQUIRE(r.ok());
+    vc::sheets::StitchResult r2 = vc::sheets::interpolateGaps(r);
+    CHECK(r2.filledCells > r.filledCells);  // the gap got bridged
+    CHECK(r2.cols == r.cols);               // same grid, only gaps filled
+    // Every filled cell (sheet or bridge) lies on the shared plane -> seam-free.
+    double worst = 0.0;
+    for (int rr = 0; rr < r2.rows; ++rr)
+        for (int cc = 0; cc < r2.cols; ++cc)
+            if (r2.validAt(rr, cc))
+                worst = std::max(worst, distToZ(r2.at(rr, cc), 100.0));
+    CHECK(worst < 1e-2);
+    // The outer margin is never extrapolated: not every cell becomes valid.
+    CHECK(r2.filledCells < r2.cols * r2.rows);
+}
+
 TEST_CASE("empty input is handled")
 {
     CHECK_FALSE(stitchSheets({}).ok());

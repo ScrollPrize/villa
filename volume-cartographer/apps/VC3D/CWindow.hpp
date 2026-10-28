@@ -443,6 +443,8 @@ private:
     QLabel* _sheetStitchBannerText{nullptr};
     bool _sheetStitchInLayout{false};
     std::array<bool, 4> _sheetStitchPrevHidden{{false, false, false, false}};
+    std::shared_ptr<Surface> _sheetStitchPrevSeg;  // segmentation slot before the preview took it
+    bool _sheetStitchPrevAxisAligned{false};       // axis-aligned-slices state before stitching
     QTimer* _statusMessageTimer{nullptr};
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};

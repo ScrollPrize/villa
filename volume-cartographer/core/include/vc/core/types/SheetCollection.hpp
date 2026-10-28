@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,6 +23,21 @@ using Point = std::array<double, 3>;
 // 'R' recto, 'V' verso, empty = unclassified. Mirrors the fibre H/V family filter;
 // our sheets are currently written unclassified, so None keeps unclassified sheets.
 enum class FamilyFilter { All, Recto, Verso, None };
+
+// Optional per-sheet quality thresholds, applied on the .asv's (nullable) quality
+// columns. A field at its disabled default imposes no constraint, and a sheet whose
+// column is NULL -- or a file that predates the column entirely -- always passes, so
+// a filter never empties an older .asv. See hercunet/meshes/asv.py for the columns.
+struct QualityFilter {
+    double minConfidence{0.0};  // confidence >= this  (mean own-membership, 0..1)
+    double minCoverage{0.0};    // coverage   >= this  (mask voxels within a grid step, 0..1)
+    double minMassFrac{0.0};    // mass_frac  >= this  (self_mass / window max, 0..1)
+    double maxFitRmsUm{0.0};    // fit_rms_um <= this  (mesh-vs-mask RMS, um); <= 0 disables
+    bool active() const
+    {
+        return minConfidence > 0.0 || minCoverage > 0.0 || minMassFrac > 0.0 || maxFitRmsUm > 0.0;
+    }
+};
 
 struct Bounds {
     Point lower{}, upper{};
@@ -85,6 +101,12 @@ struct SheetMesh {
     std::string family;
     Bounds bounds;
     Mesh mesh;
+    // Per-sheet quality values from the .asv (see hercunet/meshes/asv.py), for
+    // colour-by-metric. NaN when the column is NULL or the file predates it.
+    double confidence{std::numeric_limits<double>::quiet_NaN()};
+    double coverage{std::numeric_limits<double>::quiet_NaN()};
+    double massFrac{std::numeric_limits<double>::quiet_NaN()};
+    double fitRmsUm{std::numeric_limits<double>::quiet_NaN()};
 };
 
 class SheetCollection
@@ -114,7 +136,8 @@ public:
     RegionPage viewRegion(
         const ViewRegion& view, size_t maximum = 0, int64_t selected = 0,
         size_t byteBudget = 8 * 1024 * 1024, const std::atomic_bool* cancelled = nullptr,
-        int64_t minVerts = 0, FamilyFilter family = FamilyFilter::All) const;
+        int64_t minVerts = 0, FamilyFilter family = FamilyFilter::All,
+        const QualityFilter& quality = {}) const;
 
     // Decoded meshes for the sheets whose bounding box intersects `box`, largest
     // first, up to `maxSheets` (0 = all) and `byteBudget` of decoded payload. This is
@@ -124,7 +147,7 @@ public:
     std::vector<SheetMesh> region(
         const Bounds& box, size_t maxSheets = 0, int64_t minVerts = 0,
         FamilyFilter family = FamilyFilter::All, const std::atomic_bool* cancelled = nullptr,
-        size_t byteBudget = 64 * 1024 * 1024) const;
+        size_t byteBudget = 64 * 1024 * 1024, const QualityFilter& quality = {}) const;
 
     Mesh mesh(int64_t sheetId) const;
     std::string annotation(int64_t sheetId) const;

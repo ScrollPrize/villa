@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 #include <sqlite3.h>
@@ -234,6 +237,7 @@ Point ViewRegion::project(const Point& p) const
 
 struct SheetCollection::Impl {
     sqlite3* db{};
+    std::set<std::string, std::less<>> sheetCols;  // columns present in `sheets` (schema may predate quality cols)
     ~Impl()
     {
         if (db) sqlite3_close(db);
@@ -271,6 +275,27 @@ std::string familyClause(FamilyFilter f)
         case FamilyFilter::All: default: return "";
     }
 }
+
+// SQL for the active quality thresholds, over the `prefix`-qualified sheets columns
+// (e.g. "s."). Each predicate passes NULLs so a sheet missing the value is kept, and a
+// threshold is skipped entirely when its column is absent from `cols` (older schema).
+// The threshold values are appended to `binds` in clause order for positional binding.
+std::string qualityClause(const QualityFilter& q, const std::set<std::string, std::less<>>& cols,
+                          std::vector<double>& binds, const std::string& prefix)
+{
+    std::string c;
+    auto add = [&](double v, const char* col, const char* op) {
+        if (cols.find(col) == cols.end())
+            return;  // column predates this .asv schema -> no constraint
+        c += " AND (" + prefix + col + " IS NULL OR " + prefix + col + op + "?)";
+        binds.push_back(v);
+    };
+    if (q.minConfidence > 0.0) add(q.minConfidence, "confidence", ">=");
+    if (q.minCoverage > 0.0)   add(q.minCoverage, "coverage", ">=");
+    if (q.minMassFrac > 0.0)   add(q.minMassFrac, "mass_frac", ">=");
+    if (q.maxFitRmsUm > 0.0)   add(q.maxFitRmsUm, "fit_rms_um", "<=");
+    return c;
+}
 }  // namespace
 
 SheetCollection::SheetCollection(const std::filesystem::path& path)
@@ -296,6 +321,11 @@ SheetCollection::SheetCollection(const std::filesystem::path& path)
         throw std::runtime_error(".asv file is incomplete");
     Statement probe(impl_->db, "SELECT id FROM sheet_bounds LIMIT 0");
     probe.row();
+    // Record which columns the `sheets` table actually has, so a quality filter never
+    // references a column that an older .asv predates (that would error, not return NULL).
+    Statement cols(impl_->db, "PRAGMA table_info(sheets)");
+    while (cols.row())
+        impl_->sheetCols.insert(columnText(cols.value, 1));  // col 1 = name
 }
 
 SheetCollection::~SheetCollection() = default;
@@ -363,16 +393,29 @@ std::string SheetCollection::annotation(int64_t sheetId) const
 
 std::vector<SheetMesh> SheetCollection::region(
     const Bounds& box, size_t maxSheets, int64_t minVerts, FamilyFilter family,
-    const std::atomic_bool* cancelled, size_t byteBudget) const
+    const std::atomic_bool* cancelled, size_t byteBudget, const QualityFilter& quality) const
 {
     std::vector<SheetMesh> out;
     // Candidates: bbox intersects the query box, largest first so a cap keeps the most
     // visible sheets deterministically.
+    std::vector<double> qbinds;
+    const std::string qual = qualityClause(quality, impl_->sheetCols, qbinds, "s.");
+    // Append whichever quality columns this .asv has (for colour-by-metric), after the
+    // fixed 9 columns (0..8). An absent column simply gets no slot -> stays NaN.
+    const char* kQcols[4] = {"confidence", "coverage", "mass_frac", "fit_rms_um"};
+    int qslot[4] = {-1, -1, -1, -1};
+    std::string qsel;
+    int nextSlot = 9;
+    for (int i = 0; i < 4; ++i)
+        if (impl_->sheetCols.find(kQcols[i]) != impl_->sheetCols.end()) {
+            qsel += std::string(",s.") + kQcols[i];
+            qslot[i] = nextSlot++;
+        }
     const std::string sql =
-        "SELECT s.id,s.family,s.payload,s.min_x,s.max_x,s.min_y,s.max_y,s.min_z,s.max_z "
-        "FROM sheet_bounds b JOIN sheets s ON s.id=b.id WHERE "
+        "SELECT s.id,s.family,s.payload,s.min_x,s.max_x,s.min_y,s.max_y,s.min_z,s.max_z" + qsel +
+        " FROM sheet_bounds b JOIN sheets s ON s.id=b.id WHERE "
         "b.max_x>=? AND b.min_x<=? AND b.max_y>=? AND b.min_y<=? AND b.max_z>=? AND b.min_z<=? "
-        "AND s.vert_count>=?" + familyClause(family) + " ORDER BY s.vert_count DESC, s.id ASC";
+        "AND s.vert_count>=?" + familyClause(family) + qual + " ORDER BY s.vert_count DESC, s.id ASC";
     Statement s(impl_->db, sql.c_str());
     sqlite3_bind_double(s.value, 1, box.lower[0]);
     sqlite3_bind_double(s.value, 2, box.upper[0]);
@@ -381,17 +424,27 @@ std::vector<SheetMesh> SheetCollection::region(
     sqlite3_bind_double(s.value, 5, box.lower[2]);
     sqlite3_bind_double(s.value, 6, box.upper[2]);
     s.bind(7, minVerts);
+    for (size_t i = 0; i < qbinds.size(); ++i)  // quality thresholds follow the fixed binds (8..)
+        sqlite3_bind_double(s.value, int(8 + i), qbinds[i]);
 
+    // byteBudget caps the RESIDENT (decoded) mesh memory this query may hold, not the
+    // compressed payload read from SQLite: the blobs compress heavily, so budgeting on
+    // the stored size would let one query decode several GB (and OOM with several panels
+    // each holding a region). We therefore account for the decoded footprint.
+    auto meshBytes = [](const Mesh& m) {
+        return m.verts.size() * sizeof(Point) + m.tris.size() * sizeof(std::array<int64_t, 3>) +
+               m.foot.size();
+    };
     size_t decoded = 0;
     while (s.row()) {
         if (cancelled && cancelled->load())
             break;
         if (maxSheets != 0 && out.size() >= maxSheets)
             break;
+        if (decoded >= byteBudget && !out.empty())
+            break;
         const auto* blob = static_cast<const unsigned char*>(sqlite3_column_blob(s.value, 2));
         const int n = sqlite3_column_bytes(s.value, 2);
-        if (decoded + size_t(n) > byteBudget && !out.empty())
-            break;
         SheetMesh sm;
         sm.id = sqlite3_column_int64(s.value, 0);
         sm.family = columnText(s.value, 1);
@@ -399,12 +452,21 @@ std::vector<SheetMesh> SheetCollection::region(
             sm.bounds.lower[i] = sqlite3_column_double(s.value, 3 + 2 * i);
             sm.bounds.upper[i] = sqlite3_column_double(s.value, 4 + 2 * i);
         }
+        auto readQ = [&](int slot) {
+            return (slot < 0 || sqlite3_column_type(s.value, slot) == SQLITE_NULL)
+                       ? std::numeric_limits<double>::quiet_NaN()
+                       : sqlite3_column_double(s.value, slot);
+        };
+        sm.confidence = readQ(qslot[0]);
+        sm.coverage = readQ(qslot[1]);
+        sm.massFrac = readQ(qslot[2]);
+        sm.fitRmsUm = readQ(qslot[3]);
         try {
             sm.mesh = decodeSheetBlob(blob, size_t(n));
         } catch (const std::exception&) {
             continue;  // skip a corrupt sheet rather than fail the whole region
         }
-        decoded += size_t(n);
+        decoded += meshBytes(sm.mesh);
         out.push_back(std::move(sm));
     }
     return out;
@@ -412,12 +474,13 @@ std::vector<SheetMesh> SheetCollection::region(
 
 RegionPage SheetCollection::viewRegion(
     const ViewRegion& view, size_t maximum, int64_t /*selected*/, size_t byteBudget,
-    const std::atomic_bool* cancelled, int64_t minVerts, FamilyFilter family) const
+    const std::atomic_bool* cancelled, int64_t minVerts, FamilyFilter family,
+    const QualityFilter& quality) const
 {
     // Convenience: fetch the region, then intersect each mesh with the slice plane.
     // The interactive overlay instead caches region() and intersects per frame.
     RegionPage page;
-    const auto meshes = region(view.box, maximum, minVerts, family, cancelled, byteBudget);
+    const auto meshes = region(view.box, maximum, minVerts, family, cancelled, byteBudget, quality);
     std::array<Point, 2> seg;
     for (const auto& sm : meshes) {
         SheetRuns runs;

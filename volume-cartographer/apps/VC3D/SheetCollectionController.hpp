@@ -2,10 +2,12 @@
 
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/SheetCollection.hpp"
+#include "vc/core/types/SheetStitch.hpp"
 
 #include <QPolygonF>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -16,6 +18,7 @@
 class QDockWidget;
 class QLabel;
 class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QSpinBox;
 class QTimer;
@@ -68,6 +71,11 @@ private:
     using Slice = vc::sheets::ViewRegion;
     struct View;  // per-viewport cache + in-flight query (defined in the .cpp)
 
+    // How sheet curves are coloured. Solid = one colour; Rainbow = a per-sheet hue (id
+    // hash); the rest map a per-sheet quality metric through a red->green ramp.
+    enum class ColourMode { Solid, Rainbow, Confidence, Coverage, MassFrac, FitRms };
+    ColourMode colourMode() const;
+
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
     // Start an async region query (margin-expanded) if the cache cannot serve `s`.
     void ensureRegion(VolumeViewerBase* viewer, const Slice& s);
@@ -81,6 +89,9 @@ private:
     void scheduleControlsApply(bool needQuery);
     // Minimum vertex count equivalent to the mm^2 size filter (area ~ verts*grid^2).
     int64_t minVertsThreshold() const;
+    // Per-sheet quality thresholds from the dock spinboxes (empty when all at default).
+    vc::sheets::QualityFilter qualityFilter() const;
+    void showQualityHelp();  // popup explaining the .asv per-sheet quality columns
 
     // --- manual sheet stitching ---------------------------------------------
     // One drawn sheet's slice crossing in scene coords, kept so a click can be
@@ -100,17 +111,34 @@ private:
     void toggleSheet(int64_t id);
     void rebuildStitchPreview();   // re-blend the selected sheets -> pane-0 preview
     void saveStitch();             // write the blended surface as a VC3D segment
-    std::shared_ptr<QuadSurface> blendSelected() const;  // nullptr if nothing usable
+    // Blend the consolidated base (if any) + selected sheets into one grid; ok()==false
+    // when there is nothing usable.
+    vc::sheets::StitchResult blendResult() const;
+    std::shared_ptr<QuadSurface> blendSelected() const;             // grid -> QuadSurface, or nullptr
+    std::shared_ptr<QuadSurface> toQuadSurface(const vc::sheets::StitchResult& r) const;
+    // Interpolate the gaps of the current blend and bake it as the consolidated base,
+    // then clear the sheet selection so stitching can continue onto it.
+    void consolidateInterpolate();
+    void reclaimCaches();          // free decoded-sheet caches (on stitch exit)
+    size_t cachedMeshBytes() const;
+    void refreshSelectionMeshes();  // keep selMeshes_ in sync with stitched_
+    // Outline each selected sheet in the flattened segment (pane-0) view: anchor red,
+    // members magenta, both white-outlined -- mirrors the cross-section highlight.
+    void drawSegmentPaneOutlines(VolumeViewerBase* viewer, OverlayBuilder& builder);
 
     ViewerManager* manager_{};
     QDockWidget* dock_{};
     QLabel* status_{};
     QCheckBox* visible_{};
-    QCheckBox* rainbow_{};
+    QComboBox* colourBy_{};         // Solid / Rainbow / colour-by a quality metric
     QDoubleSpinBox* distance_{};    // slice half-thickness in native L0 voxels
     QDoubleSpinBox* lineWidth_{};
     QSpinBox* maxDisplayed_{};
-    QDoubleSpinBox* minArea_{};     // hide sheets smaller than this (mm^2)
+    QDoubleSpinBox* minArea_{};        // hide sheets smaller than this (mm^2)
+    QDoubleSpinBox* minConfidence_{};  // hide sheets below this mean own-membership (0..1)
+    QDoubleSpinBox* minCoverage_{};    // hide sheets below this mask coverage (0..1)
+    QDoubleSpinBox* minMassFrac_{};    // hide sheets below this normalised mass fraction (0..1)
+    QDoubleSpinBox* maxFitRms_{};      // hide sheets with worse mesh-vs-mask RMS (um); 0 = off
 
     std::unique_ptr<vc::sheets::SheetCollection> reader_;  // UI-thread: metadata/count only
     QString path_;
@@ -136,8 +164,11 @@ private:
     // Stitch mode state.
     CWindow* cwin_{};                 // for banner / 4-panel layout / save, if available
     bool stitchMode_{false};
-    int64_t seedId_{0};               // the sheet that started the stitch
+    int64_t seedId_{0};               // the sheet that started the stitch (anchor, red)
+    int64_t lastAdded_{0};            // most recently appended sheet (magenta); 0 = none
     std::unordered_set<int64_t> stitched_;  // sheets currently in the stitch
     std::set<VolumeViewerBase*> wired_;     // viewers whose mouse/menu are connected
     std::unordered_map<VolumeViewerBase*, std::vector<SheetHit>> hits_;  // per-viewer hit geometry
+    std::map<int64_t, vc::sheets::Mesh> selMeshes_;  // decoded meshes of the selected sheets
+    vc::sheets::Mesh consolidatedBase_;  // baked interpolated base (pseudo-sheet); empty = none
 };

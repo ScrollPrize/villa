@@ -11462,6 +11462,14 @@ void CWindow::sheetStitchEnterLayout()
     if (!_sheetStitchInLayout) {
         for (int i = 0; i < 4; ++i)
             _sheetStitchPrevHidden[i] = grid->paneHidden(i);
+        _sheetStitchPrevSeg = _state ? _state->surface("segmentation") : nullptr;  // restore on exit
+        // Force axis-aligned XZ/YZ slices while stitching: otherwise the flat preview
+        // segment makes the segment-relative planes collapse to the XY view
+        // (AxisAlignedSliceController.cpp useCanonical = _enabled || !segment). Restore on exit.
+        _sheetStitchPrevAxisAligned =
+            _axisAlignedSliceController && _axisAlignedSliceController->isEnabled();
+        if (_axisAlignedSliceController && !_sheetStitchPrevAxisAligned)
+            _axisAlignedSliceController->setEnabled(true, ui.chkAxisOverlays, nullptr, /*persist=*/false);
         _sheetStitchInLayout = true;
     }
     grid->exitFullSize();
@@ -11474,6 +11482,16 @@ void CWindow::sheetStitchExitLayout()
     if (auto* grid = mainViewerSplitGrid(ui.tabSegment); grid && _sheetStitchInLayout)
         for (int i = 0; i < 4; ++i)
             grid->setPaneHidden(i, _sheetStitchPrevHidden[i]);
+    // Release the preview surface (and its flattened-view SurfaceCache) by restoring
+    // whatever was in the segmentation slot before stitching.
+    if (_sheetStitchInLayout && _state)
+        _state->setSurface("segmentation", _sheetStitchPrevSeg, false, false);
+    // Restore the axis-aligned-slices state we changed on entry.
+    if (_sheetStitchInLayout && _axisAlignedSliceController &&
+        _axisAlignedSliceController->isEnabled() != _sheetStitchPrevAxisAligned)
+        _axisAlignedSliceController->setEnabled(_sheetStitchPrevAxisAligned, ui.chkAxisOverlays, nullptr,
+                                                /*persist=*/false);
+    _sheetStitchPrevSeg.reset();
     _sheetStitchInLayout = false;
 }
 
