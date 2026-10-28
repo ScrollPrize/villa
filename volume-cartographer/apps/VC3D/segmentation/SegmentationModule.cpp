@@ -32,6 +32,7 @@
 #include <QPointer>
 #include <QString>
 #include <QTimer>
+#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <array>
