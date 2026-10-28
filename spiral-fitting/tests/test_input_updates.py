@@ -210,3 +210,82 @@ def test_two_ranks_install_the_same_inputs(state, hub, device_stubs, tmp_path):
     assert outcome[0]['after'] == outcome[1]['after'] != outcome[0]['before']
     assert outcome[0]['patches'] == outcome[1]['patches']
     assert outcome[0]['iteration'] and outcome[1]['iteration']
+
+
+# ---------------------------------------------------------------------------
+# The service's update route (step 17)
+# ---------------------------------------------------------------------------
+
+def _settled_update(state, timeout=60):
+    deadline = time.monotonic() + timeout
+    while state.status()['input_update'] is not None:
+        assert time.monotonic() < deadline, state.status()['input_update']
+        time.sleep(0.05)
+    return state.status()
+
+
+def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_stubs,
+                                                             no_theta_topology):
+    import spiral_service
+    state.initialize(REQUEST)
+    before = settle(state)
+    assert state.dataset()['capabilities']['input_updates'] is True
+    assert state.dataset()['capabilities']['inputs_frozen'] is False
+    session_id = state.session_id
+    with ObjectStore.open(hub['editor'], author='editor') as db:
+        db.hub_sync(pull=True, push=False)
+    _add_patch(hub['editor'])()
+    with ObjectStore.open(hub['editor'], read_only=True) as db:
+        reached = db.hub_status()['position']
+    with pytest.raises(spiral_service.ApiError, match='input generation 3'):
+        state.update_inputs({'inputs_position': reached, 'expected_input_generation': 3})
+    response = state.update_inputs({'inputs_position': reached, 'expected_input_generation': 0})
+    assert response['updating_inputs'] and response['build_id']
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and state.session_id == session_id
+    assert status['input_generation'] == 1
+    assert status['input_digest'] != before['input_digest']
+    assert status['current_iteration'] == before['current_iteration']
+    position = status['input_position']
+    assert position['source'] == 'update' and position['requested'] == reached
+    assert position['sequence'] >= reached and position['input_generation'] == 1
+    assert status['input_preparation_error'] is None
+
+
+def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
+                                                 monkeypatch):
+    import fit_spiral
+    state.initialize(REQUEST)
+    before = settle(state)
+
+    def refuse(self, inputs):
+        raise fit_spiral.InputReplacementRefused('the inputs cannot replace this fit\'s')
+    monkeypatch.setattr(fit_spiral.FitContext, 'prepare_input_replacement', refuse)
+    response = state.update_inputs({})
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and status['input_digest'] == before['input_digest']
+    assert status['input_position'] == before['input_position']
+    failure = status['input_preparation_error']
+    assert failure['build_id'] == response['build_id'] and failure['phase'] == 'preparing'
+    assert failure['recovery_required'] is False
+    # The lease's lifecycle answers the command with the refusal, and a
+    # repeat of the same command replays it instead of updating again.
+    import spiral_service
+    state.lease().claim('client-token', 'claim-1')
+    for _ in range(2):
+        with pytest.raises(spiral_service.ApiError, match='could not be prepared'):
+            state.lease_lifecycle('client-token', 'session_update_inputs',
+                                  {'command_id': 'update-1'}, state.update_inputs)
+    assert state.status()['input_generation'] == 0
+
+
+def test_a_plain_store_has_no_input_updates(store_path, tmp_path):
+    import spiral_service
+    from test_service_hub_positions import _service_state
+    state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
+    try:
+        assert state.dataset()['capabilities']['input_updates'] is False
+        with pytest.raises(spiral_service.ApiError, match='not a hub replica'):
+            state.update_inputs({})
+    finally:
+        state.close()

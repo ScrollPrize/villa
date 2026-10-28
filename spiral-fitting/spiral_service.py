@@ -262,6 +262,9 @@ SERVICE_CAPABILITIES = {
     # Initialize and full-input rebuilds link and pin a hub position,
     # including at least the request's ``inputs_position`` (hosted bindings).
     "input_positions": False,
+    # POST /session/update-inputs replaces a resident fit's inputs with a
+    # hub position's, keeping its model and optimiser (hosted bindings).
+    "input_updates": False,
 }
 
 
@@ -622,6 +625,9 @@ class ServiceState:
         self._input_preparation = None
         self._input_preparation_error = None
         self._input_position = None
+        self._session_scroll = None
+        # An input update of the resident session in flight (its build ID).
+        self._input_update = None
         self.startup_run = dict(startup_run or {})
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
@@ -780,7 +786,8 @@ class ServiceState:
         lease.require(token)
         def perform(captured):
             lease.require(token)
-            rebuilding = operation in {"session_initialize", "session_rebuild"}
+            rebuilding = operation in {"session_initialize", "session_rebuild",
+                                       "session_update_inputs"}
             command_id = captured.get("command_id")
             if rebuilding and command_id in lease.lifecycle_started:
                 response = lease.lifecycle_started[command_id]
@@ -792,8 +799,9 @@ class ServiceState:
                 while True:
                     with self.lock:
                         building, session = self._building, self.session
+                        updating = self._input_update is not None
                         state = self._session_state if session is None else session.status()["state"]
-                    if not building and state != SessionState.Loading:
+                    if not building and not updating and state != SessionState.Loading:
                         break
                     time.sleep(0.05)
                 if state == SessionState.Error:
@@ -882,6 +890,7 @@ class ServiceState:
             response["input_preparation"] = copy.deepcopy(self._input_preparation)
             response["input_preparation_error"] = copy.deepcopy(
                 self._input_preparation_error)
+            response["input_update"] = copy.deepcopy(self._input_update)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -963,8 +972,11 @@ class ServiceState:
 
     def dataset(self):
         capabilities = dict(SERVICE_CAPABILITIES)
-        capabilities["input_positions"] = bool(
-            self.object_store is not None and self.object_store.hosted)
+        hosted = bool(self.object_store is not None and self.object_store.hosted)
+        capabilities["input_positions"] = hosted
+        # A hub-bound service updates a resident fit's inputs in place.
+        capabilities["inputs_frozen"] = not hosted
+        capabilities["input_updates"] = hosted
         response = {**self._base(), **self.dataset_resolution.to_dict(),
                     "session_checkpoints": self.session_checkpoints(),
                     "capabilities": capabilities}
@@ -1336,6 +1348,132 @@ class ServiceState:
                 "stage": stage, "inputs": "reload" if stage == "all" else "keep",
                 "build_id": build_id}
 
+    def update_inputs(self, request):
+        """Update the resident fit's inputs to a hub position, keeping its
+        model and optimiser state (stage 2b).
+
+        ``inputs_position`` (M) is the position the inputs must include,
+        e.g. where a client's pushed edits reached; the service links and
+        pins N at the hub head (at least M), then every rank replaces its
+        inputs with N's at an iteration boundary. ``expected_input_generation``
+        refuses an update computed against another generation than the
+        session's. The response returns at once; the work runs off the HTTP
+        thread, and a lease-holding client's command is answered when it
+        settles. A refusal leaves the fit as it was (input_preparation_error);
+        a failure past the release fails the session, which then needs a
+        rebuild or a checkpoint load.
+        """
+        request = dict(request or {})
+        request.pop("command_id", None)
+        minimum = self._inputs_position(request.pop("inputs_position", None))
+        expected = request.pop("expected_input_generation", None)
+        if request:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Unknown input update fields: {', '.join(sorted(request))}")
+        if not self._hosted():
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This service's object store is not a hub replica; rebuild "
+                           "the fit with current inputs instead")
+        with self.lock:
+            session = self.session
+            if session is None or self._building or self._input_update is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The fit session is being built, or its inputs updated")
+            status = session.status()
+            if status["state"] != SessionState.Idle:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"An input update requires an idle session (state is "
+                    f"{SessionState(status['state']).name})")
+            generation = int(status.get("input_generation") or 0)
+            if expected is not None and expected != generation:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    f"The update was computed against input generation {expected}; "
+                    f"the session is at {generation}")
+            config = dict(status.get("applied_config") or {})
+            paths, scroll = self.session_paths, self._session_scroll
+            self._build_serial += 1
+            update_id = self._build_serial
+            self._input_update = {"build_id": update_id, "requested_position": minimum,
+                                  "from_generation": generation}
+            self._input_preparation = {"build_id": update_id, "requested_position": minimum}
+            self._input_preparation_error = None
+            self.status_generation += 1
+            session_id = self.session_id
+        try:
+            self._start_background(
+                target=self._update_inputs_job,
+                args=(update_id, session_id, session, config, paths, scroll, minimum),
+                name="spiral-input-update", daemon=True)
+        except BaseException:
+            with self.lock:
+                self._input_update = self._input_preparation = None
+            raise
+        return {**self.status(), "accepted": True, "updating_inputs": True,
+                "build_id": update_id}
+
+    def _update_inputs_job(self, update_id, session_id, session, config, paths, scroll,
+                           minimum):
+        from spiral_runtime import InputUpdateFailed, InputUpdateRefused
+
+        def refused(exc, phase):
+            cause = _cause(exc)
+            with self.lock:
+                self._input_update = None
+                self._input_preparation = None
+                self._input_preparation_error = {
+                    "build_id": update_id, "requested_position": minimum,
+                    "phase": phase, "recovery_required": False, "message": cause,
+                    "problems": list(getattr(exc, "problems", None) or [cause])}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The inputs could not be updated; the fit is unchanged: {cause}",
+                severity="error", source="service", operation="updating_inputs")
+        try:
+            prepared = self._prepare_position(config, paths, scroll, minimum)
+        except BaseException as exc:
+            refused(exc, "linking")
+            return
+        for line in prepared.lines:
+            self.events.append("log", line, source="service", operation="updating_inputs")
+        with self.lock:
+            self._input_preparation = None
+            self._input_update = {**self._input_update, "position": prepared.position.sequence}
+            self.status_generation += 1
+        try:
+            result = session.update_inputs(prepared.position.sequence)
+        except InputUpdateRefused as exc:
+            refused(exc, "preparing")
+            return
+        except BaseException as exc:
+            cause = _cause(exc)
+            with self.lock:
+                self._input_update = None
+                self._input_preparation_error = {
+                    "build_id": update_id, "requested_position": minimum,
+                    "phase": "installing", "recovery_required": True, "message": cause,
+                    "problems": [cause]}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The input update failed after the fit released its inputs; "
+                f"rebuild the fit or load a checkpoint: {cause}", severity="error",
+                source="service", operation="updating_inputs")
+            return
+        with self.lock:
+            if self.session_id == session_id:
+                self._input_position = {
+                    **prepared.position.provenance(), "requested": minimum,
+                    "head": prepared.head, "attempts": prepared.attempts,
+                    "source": "update",
+                    "input_generation": result.get("input_generation")}
+            self._input_update = None
+            self.status_generation += 1
+        self.events.append(
+            "log", f"Inputs updated to hub position {prepared.position.sequence} "
+            f"(input generation {result.get('input_generation')})",
+            source="service", operation="updating_inputs")
+
     def _rebuild_stage_locked(self, paths, run, preview, state):
         """How much of the resident session this request has to replace.
 
@@ -1448,7 +1586,7 @@ class ServiceState:
                                "A session build is already in progress")
             self._building = True
             build_id, session_id, previous = self._publish_build_locked(
-                paths, run, preview, record)
+                paths, run, preview, record, scroll)
         self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run, preview, scroll),
@@ -1497,13 +1635,17 @@ class ServiceState:
     def _prepare_inputs(self, paths, run, scroll, minimum):
         """object_store_inputs.prepare_position on the bound replica, with the
         configuration and lasagna normals the build will apply."""
-        from vc_object_store import ObjectStore
-        from fit_session import lasagna_normal_inputs
-        from object_store_inputs import prepare_position, request_from_config
         from spiral_runtime import merge_session_config
         config, _, overrides = merge_session_config(
             paths.checkpoint, run, warn=lambda warning: None)
         config.update(overrides)
+        return self._prepare_position(config, paths, scroll, minimum)
+
+    def _prepare_position(self, config, paths, scroll, minimum):
+        """Link and pin a hub position for ``config`` on the bound replica."""
+        from vc_object_store import ObjectStore
+        from fit_session import lasagna_normal_inputs
+        from object_store_inputs import prepare_position, request_from_config
         lasagna = lasagna_normal_inputs(
             paths.normal_x, paths.normal_y, scroll.normal_zarr_group,
             int(scroll.lasagna_scale))
@@ -1547,10 +1689,10 @@ class ServiceState:
         with self.lock:
             self._input_preparation = None
             _, session_id, previous = self._publish_build_locked(
-                paths, run, preview, record, build_id=build_id)
+                paths, run, preview, record, scroll, build_id=build_id)
         self._build(session_id, previous, paths, run, preview, scroll)
 
-    def _publish_build_locked(self, paths, run, preview, input_position, *,
+    def _publish_build_locked(self, paths, run, preview, input_position, scroll, *,
                               build_id=None):
         """Retire the resident session and publish ``Loading`` for a new one.
         Call with the lock held and ``_building`` claimed."""
@@ -1572,6 +1714,7 @@ class ServiceState:
         self.session_revision += 1
         self._reset_session_scope()
         self._input_position = input_position
+        self._session_scroll = scroll
         self._session_state = SessionState.Loading
         self._session_phase = "Building the fit session"
         self._session_error = None
@@ -3051,6 +3194,9 @@ ROUTES = (
           reads_body=True),
     Route("POST", "/session/rebuild", "session_rebuild",
           lambda ctx: ctx.state.rebuild(ctx.body), Idempotency.COMMAND_ID,
+          reads_body=True),
+    Route("POST", "/session/update-inputs", "session_update_inputs",
+          lambda ctx: ctx.state.update_inputs(ctx.body), Idempotency.COMMAND_ID,
           reads_body=True),
     Route("POST", "/session/run", "session_run",
           lambda ctx: ctx.state.run(ctx.body), Idempotency.COMMAND_ID,

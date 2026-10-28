@@ -436,7 +436,7 @@ def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store)
         'author': 'spiral-test', 'hub': None}
     assert advertised['capabilities'] == {
         'input_source': 'object_store', 'inputs_frozen': True,
-        'input_reload_rebuild': True, 'input_positions': False}
+        'input_reload_rebuild': True, 'input_positions': False, 'input_updates': False}
     # The dataset no longer resolves or advertises patch, fiber or PCL files.
     assert 'pcl_inputs' not in advertised
     assert not {'verified_patches', 'fibers'} & set(advertised['resolved'])

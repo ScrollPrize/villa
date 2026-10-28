@@ -142,7 +142,15 @@ from surface_orientation import spiral_outward_sense_for
 # sequence, requested, head, attempts, source) and "input_preparation";
 # lifecycle responses carry "build_id". A checkpoint resumes at the position
 # it recorded. object_store_input_position is service-owned.
-API_VERSION = 37
+# 38: input updates. POST /session/update-inputs {"inputs_position",
+# "expected_input_generation"} links and pins a hub position and replaces
+# the resident fit's inputs with it at an iteration boundary, keeping the
+# model, optimiser, scheduler and iteration (capabilities.input_updates;
+# inputs_frozen is false for a hub-bound service). Status carries
+# "input_update" while one runs and "input_generation"; a failed update's
+# "input_preparation_error" says its "phase" and whether the fit needs
+# recovery ("recovery_required").
+API_VERSION = 38
 
 
 class SessionState(str, Enum):
