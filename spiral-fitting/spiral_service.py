@@ -1871,6 +1871,7 @@ class ServiceState:
             model_state = (published.raw_manifest or {}).get(
                 "model_state_sha256")
             input_digest = (published.raw_manifest or {}).get("input_digest")
+            input_position = (published.raw_manifest or {}).get("input_position")
             with self.lock:
                 if self.session_id == session_id:
                     self._preview.artifact = ref
@@ -1890,7 +1891,7 @@ class ServiceState:
                         manifest_path=published.manifest_path,
                         session_id=session_id, generation=preview_generation,
                         source_fit_iteration=published.source_fit_iteration,
-                        input_digest=input_digest)
+                        input_digest=input_digest, input_position=input_position)
                 except Exception as exc:
                     self.events.append(
                         "log", "Could not index the published preview by "

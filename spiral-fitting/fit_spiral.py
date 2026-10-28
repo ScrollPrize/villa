@@ -3155,6 +3155,9 @@ class FitContext:
             manifest['model_state_sha256'] = self.model_state_digest()
             inputs = getattr(self, 'object_store_inputs', None)
             manifest['input_digest'] = inputs.digest if inputs is not None else None
+            # The hub position they were read at, when they were.
+            manifest['input_position'] = ((inputs.manifest or {}).get('position')
+                                          if inputs is not None else None)
             if not diagnostics:
                 return manifest
             diagnostic_weights = {

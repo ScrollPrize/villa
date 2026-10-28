@@ -569,6 +569,7 @@ class InteractiveFitSession:
         # their digest, the manifest file the run directory records (rank
         # zero) and a summary small enough for every status snapshot.
         self._input_digest = None
+        self._input_position = None
         self._input_manifest_path = None
         self._input_summary = None
         self.requested_config = dict(run.config)
@@ -976,6 +977,7 @@ class InteractiveFitSession:
             if inputs is not None and inputs.manifest is not None:
                 from object_store_inputs import input_summary
                 self._input_digest = inputs.digest
+                self._input_position = inputs.manifest.get("position")
                 self._input_summary = input_summary(inputs)
                 self.input_manifest["object_store_digest"] = inputs.digest
                 if manifest_path.is_file():
@@ -1662,7 +1664,8 @@ class InteractiveFitSession:
             dataset_root=self.paths.dataset_root,
             completed_iterations=self._completed,
             model_state_sha256=(checkpoint_state or {}).get("model_state_sha256"),
-            input_digest=getattr(self, "_input_digest", None))
+            input_digest=getattr(self, "_input_digest", None),
+            input_position=getattr(self, "_input_position", None))
         return autosave
 
     def _publish_preview(self, diagnostics=False):

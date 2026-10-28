@@ -131,6 +131,19 @@ def test_initialize_links_and_pins_the_requested_position(state, hub, device_stu
     assert entry['metadata']['sampling_group'] == 'reviewed'
     # The fit read the pinned position once; it did not link again.
     assert len(device_stubs) == 1
+    # Autosaves name the position as well as the digest. (The stubbed device
+    # stages leave no model to save, so the archive itself is a stand-in.)
+    session = state.session
+
+    def save_checkpoint(path, completed):
+        Path(path).write_bytes(b'PK\x03\x04')
+        return path
+    session._context.save_checkpoint = save_checkpoint
+    autosave = Path(session._write_autosave())
+    import json
+    metadata = json.loads(autosave.with_name('checkpoint_autosave.json').read_text())
+    assert metadata['input_position'] == manifest['position']
+    assert metadata['input_digest'] == state.session._context.object_store_inputs.digest
     # The editor reaches N by pulling, links included.
     with ObjectStore.open(hub['editor'], author='editor') as db:
         assert db.hub_sync(pull=True, push=False)['pulled_position'] == position['sequence']
@@ -225,3 +238,12 @@ def test_positions_need_a_hub_replica(store_path, tmp_path):
                 **RUN, 'object_store_input_position': 3}}})
     finally:
         state.close()
+
+
+def test_the_preview_index_records_the_position(tmp_path):
+    from preview_index import PublishedPreviewIndex
+    index = PublishedPreviewIndex(tmp_path)
+    position = {'hub': 'hub-identity', 'sequence': 12}
+    index.record('state', manifest_path=tmp_path / 'preview.json', session_id='s',
+                 generation=1, input_digest='digest', input_position=position)
+    assert index._load()['previews']['state']['input_position'] == position

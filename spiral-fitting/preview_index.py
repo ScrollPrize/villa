@@ -102,9 +102,10 @@ class PublishedPreviewIndex:
     # -- operations ------------------------------------------------------
 
     def record(self, digest, *, manifest_path, session_id, generation,
-               source_fit_iteration=None, input_digest=None):
+               source_fit_iteration=None, input_digest=None, input_position=None):
         """Remember that ``manifest_path`` is the published surface of ``digest``,
-        fitted to the inputs of ``input_digest``."""
+        fitted to the inputs of ``input_digest``, read at the hub position
+        ``input_position`` (when they were)."""
         if not digest:
             return
         with self._lock:
@@ -116,6 +117,7 @@ class PublishedPreviewIndex:
                 "generation": int(generation),
                 "source_fit_iteration": source_fit_iteration,
                 "input_digest": input_digest,
+                "input_position": input_position,
             }
             self._store(document)
 

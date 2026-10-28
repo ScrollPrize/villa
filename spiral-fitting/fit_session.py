@@ -870,6 +870,7 @@ def write_autosave_metadata(
     completed_iterations: int,
     model_state_sha256: str | None = None,
     input_digest: str | None = None,
+    input_position: Mapping[str, Any] | None = None,
 ) -> str:
     """Record what an autosave is, next to it, atomically.
 
@@ -899,6 +900,9 @@ def write_autosave_metadata(
         # The object-store inputs it was fitted to (the checkpoint's
         # input_manifest.object_store_digest), likewise.
         document["input_digest"] = str(input_digest)
+    if input_position:
+        # The hub position they were read at ({hub, sequence}).
+        document["input_position"] = dict(input_position)
     temporary = metadata_path.with_name(f".{metadata_path.name}.incoming")
     with temporary.open("w", encoding="utf-8") as stream:
         json.dump(document, stream, indent=2)
