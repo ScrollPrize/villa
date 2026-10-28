@@ -280,7 +280,7 @@ Commits (push them together; the adapter is broken between 1 and 3):
   do not use dataset-root path substitution as an object identity mechanism.
 - Retain read-only patch/fiber/PCL overlays and fit previews. The overlays
   follow the store: they show the fitted objects as the store holds them now
-  and reload when a commit touches them or their links. The resident fit does
+  and update the inputs a commit touches, not the whole set. The resident fit does
   not follow; the freshness notes say what differs and a rebuild reads it.
   Showing old revisions of an evolving store is not a goal: the main VC3D
   views show the store's current state, and the Spiral overlays must agree
@@ -527,8 +527,10 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
     editors for stage 2. Show service connection, store binding, selection
     counts, manifest digest, resolved volume, and input freshness: store
     events touching the fitted objects or links (`StoreSessionEvent::touches`)
-    reload the overlays and their freshness notes, coalesced; other inputs a
-    rebuild's selection may include are counted. Previews show their
+    re-read only the records they name (and a changed object's links) and
+    replace only those overlays, coalesced; a full read happens only for a
+    new manifest or store binding. Other inputs a rebuild's selection may
+    include are counted. Previews show their
     digest; a preview from another digest is labelled as such. Stage 0 moves
     VC3D point collections into the store (`PointCollectionSync`); check
     whether the Spiral point editors already write through it, and if so
@@ -683,7 +685,9 @@ checkpoint, exported a preview and released the lease.
   the attached store holds them now and reload on store commits touching
   them; freshness compares geometry revisions, the manifest's new adapter
   metadata values and relationship generation/approval/endpoint geometry,
-  with no client-side hashing. Fibers are drawn by a read-only overlay
+  with no client-side hashing. A commit re-reads only the objects and links
+  it names (`readFitInputChanges`): on the acceptance store a full read
+  takes 0.58 s and one surface plus one link 0.018 s. Fibers are drawn by a read-only overlay
   (`SpiralFiberOverlayController`). The display comparisons above ran on an
   unchanged store, where current and pinned reads coincide; rerun on the
   acceptance store, the reader finds all 954 objects and 1,103 links as

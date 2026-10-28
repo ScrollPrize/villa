@@ -794,9 +794,9 @@ attach a replica of the store the service was started with. The panel's
 *Object store* row compares the store UUIDs: when they differ, or no store is
 attached, the fit's inputs are not displayed. When they match, VC3D downloads
 the session's input manifest and shows each fitted surface, collection and
-fiber as the attached store holds it now: the store is edited live, and the
-overlays reload when a commit touches the fitted inputs or their links, so
-they agree with the rest of VC3D. The resident fit does not follow. *Fit
+fiber as the attached store holds it now: the store is edited live, and a
+commit that touches a fitted input or link updates just that input's overlay
+and the notes, so they agree with the rest of VC3D. The resident fit does not follow. *Fit
 inputs* lists the digest, the counts per kind and the links, and notes what
 differs from what the fit read: inputs no longer in the store, inputs edited
 or with other metadata, fitted links that changed or would no longer be
