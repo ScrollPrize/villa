@@ -1489,6 +1489,59 @@ class FitContext:
         else:
             tracks = None
 
+        using_tracks = (
+            (self.config['loss_weight_track_radius'] > 0 or self.config['loss_weight_track_dt'] > 0)
+            and bool(tracks)
+        )
+        patch_inputs = self._prepare_patch_inputs(
+            verified_patches, unattached_pcl_strips, using_tracks=using_tracks)
+
+        # Loaded host inputs, kept as inspectable attributes (ownership
+        # class (b): host-prepared inputs and caches). cross_patch_pcls,
+        # unattached_pcl_strips, unattached_strip_sampling_groups, and
+        # pcl_sampling_strata were assigned above, before the strata build.
+        self.umbilicus = umbilicus
+        self.scroll_zarr = scroll_zarr
+        self.fiber_direction_samples = fiber_direction_samples
+        self.filter_tracks_by_shell = filter_tracks_by_shell
+        self.shell_patch = shell_patch
+        self.shell_envelope = shell_envelope
+        self.verified_patches = verified_patches
+        self.dense_spacing_mode = dense_spacing_mode
+        self.winding_model_mode = winding_model_mode
+        self.dense_normals_enabled = input_source_enabled(
+            self.config, 'normals')
+        self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
+        self.track_sampling_config = track_sampling_config
+        self.tracks = tracks
+        self.track_families = track_families
+        self.track_source_ids = track_source_ids
+        self.track_crossing_cache = track_crossing_cache
+        self.track_graph = track_graph
+        self.track_reload_source = track_reload_source
+        self.track_reload_families = track_reload_families
+        self.track_reload_source_ids = track_reload_source_ids
+        self.using_tracks = using_tracks
+        for name, value in patch_inputs.items():
+            setattr(self, name, value)
+
+        # ==========================================================================
+        # Whole-object DT target caches (see dt_targets.py)
+        # ==========================================================================
+
+        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
+            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
+        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
+        self._prepare_dt_target_samples(self.verified_patches_list)
+
+    def _prepare_patch_inputs(self, verified_patches, unattached_pcl_strips, *, using_tracks):
+        """The patch-derived host inputs: the patch list and its sampling
+        probabilities, the host patch atlas (geometry stays on the host until
+        materialize()), and the trusted-geometry tree over the patches'
+        vertices and the unattached strips, which only track exclusion reads.
+        Returns them by attribute name; allocates no device memory."""
+        progress = progress_or_null(self.progress)
+
         # ==========================================================================
         # patch cache / atlas construction
         # ==========================================================================
@@ -1516,25 +1569,47 @@ class FitContext:
         # trusted geometry (verified patches and pcls) kdtree / tracks masking
         # ==========================================================================================
 
-        # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
-        # on CPU instead of storing it in the atlas on CUDA, concatenating it again on
-        # CUDA, and immediately copying it back here.
+        # The trusted anchor cloud (verified patch vertices + pcl strips) drives
+        # the DBM-track exclusion in tracks.py, and nothing else: it is built
+        # only when tracks are used. The cloud is consumed only by a CPU
+        # cKDTree, so it is built directly on the CPU.
+        trusted_geometry_tree = None
+        if using_tracks:
+            verified_patches_and_pcls_np = np.ascontiguousarray(
+                self._trusted_geometry_cloud(verified_patches_list, unattached_pcl_strips).numpy(),
+                dtype=np.float32)
+            if verified_patches_and_pcls_np.shape[0] > 0:
+                progress.begin(
+                    'loading', 'Building trusted-geometry index',
+                    detail=f'{len(verified_patches_and_pcls_np):,} points')
+                trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
+        return {
+            'verified_patches_list': verified_patches_list,
+            'patch_sampling_probabilities': patch_sampling_probabilities,
+            'num_verified_patches': num_verified_patches,
+            'patch_atlas': patch_atlas,
+            'trusted_geometry_tree': trusted_geometry_tree,
+        }
+
+    def _trusted_geometry_cloud(self, patches, strips):
+        """The trusted anchor points (CPU float32, (N, 3)): every valid patch
+        vertex and every strip point in the z window, in patch then strip
+        order."""
         trusted_counts = []
-        for patch in verified_patches_list:
+        for patch in patches:
             z_flat = patch.zyxs.reshape(-1, 3).to(dtype=torch.float32)
             valid_flat = patch.valid_vertex_mask.reshape(-1)
             z_in_roi = (z_flat[:, 0] >= self.z_begin) & (z_flat[:, 0] < self.z_end)
             trusted_counts.append(int((valid_flat & z_in_roi).sum()))
-        for strip in unattached_pcl_strips:
+        for strip in strips:
             zyxs_np = np.asarray(strip['zyxs'])
             trusted_counts.append(int((
                 (zyxs_np[..., 0] >= self.z_begin)
                 & (zyxs_np[..., 0] < self.z_end)).sum()))
-        verified_patches_and_pcls_cpu = torch.empty(
-            (sum(trusted_counts), 3), dtype=torch.float32)
+        cloud = torch.empty((sum(trusted_counts), 3), dtype=torch.float32)
         trusted_offset = 0
         count_index = 0
-        for patch in verified_patches_list:
+        for patch in patches:
             count = trusted_counts[count_index]
             count_index += 1
             if count:
@@ -1542,96 +1617,32 @@ class FitContext:
                 valid_flat = patch.valid_vertex_mask.reshape(-1)
                 selected = valid_flat & (z_flat[:, 0] >= self.z_begin) \
                     & (z_flat[:, 0] < self.z_end)
-                verified_patches_and_pcls_cpu[
-                    trusted_offset:trusted_offset + count].copy_(z_flat[selected])
+                cloud[trusted_offset:trusted_offset + count].copy_(z_flat[selected])
                 trusted_offset += count
-        for strip in unattached_pcl_strips:
+        for strip in strips:
             count = trusted_counts[count_index]
             count_index += 1
             if count:
                 zyxs = torch.from_numpy(strip['zyxs']).to(dtype=torch.float32)
                 selected = (zyxs[..., 0] >= self.z_begin) \
                     & (zyxs[..., 0] < self.z_end)
-                verified_patches_and_pcls_cpu[
-                    trusted_offset:trusted_offset + count].copy_(zyxs[selected])
+                cloud[trusted_offset:trusted_offset + count].copy_(zyxs[selected])
                 trusted_offset += count
+        return cloud
 
-        using_tracks = (
-            (self.config['loss_weight_track_radius'] > 0 or self.config['loss_weight_track_dt'] > 0)
-            and bool(tracks)
+    def _prepare_dt_target_samples(self, patches):
+        """Deterministic sparse samples over each patch's own grid for the
+        whole-object DT targets: host work on host inputs, so it belongs here
+        rather than beside the model that eventually reads the caches these
+        seed."""
+        if not self.dt_target_whole_object:
+            return
+        progress_or_null(self.progress).begin(
+            'loading', 'Preparing distance-target samples',
+            detail=f'{len(patches):,} patches')
+        prepare_patch_dt_target_samples(
+            patches, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
         )
-        trusted_geometry_tree = None
-        verified_patches_and_pcls_np = None
-
-        # The trusted anchor cloud (verified patch vertices + pcl strips) drives
-        # the DBM-track exclusion in tracks.py.
-        if using_tracks:
-            # Build a cKDTree over the scroll-space anchor points (CPU) for fixed-radius
-            # nearest-neighbour queries.
-            verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
-            verified_patches_and_pcls_np = np.ascontiguousarray(verified_patches_and_pcls_np, dtype=np.float32)
-            if verified_patches_and_pcls_np.shape[0] > 0:
-                progress.begin(
-                    'loading', 'Building trusted-geometry index',
-                    detail=f'{len(verified_patches_and_pcls_np):,} points')
-                trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
-
-
-        # Loaded host inputs, kept as inspectable attributes (ownership
-        # class (b): host-prepared inputs and caches). cross_patch_pcls,
-        # unattached_pcl_strips, unattached_strip_sampling_groups, and
-        # pcl_sampling_strata were assigned above, before the strata build.
-        self.umbilicus = umbilicus
-        self.scroll_zarr = scroll_zarr
-        self.fiber_direction_samples = fiber_direction_samples
-        self.filter_tracks_by_shell = filter_tracks_by_shell
-        self.shell_patch = shell_patch
-        self.shell_envelope = shell_envelope
-        self.verified_patches = verified_patches
-        self.dense_spacing_mode = dense_spacing_mode
-        self.winding_model_mode = winding_model_mode
-        self.dense_normals_enabled = input_source_enabled(
-            self.config, 'normals')
-        self.grad_mag_spacing_enabled = grad_mag_spacing_enabled
-        self.track_sampling_config = track_sampling_config
-        self.tracks = tracks
-        self.track_families = track_families
-        self.track_source_ids = track_source_ids
-        self.track_crossing_cache = track_crossing_cache
-        self.track_graph = track_graph
-        self.track_reload_source = track_reload_source
-        self.track_reload_families = track_reload_families
-        self.track_reload_source_ids = track_reload_source_ids
-        self.verified_patches_list = verified_patches_list
-        self.patch_sampling_probabilities = patch_sampling_probabilities
-        self.num_verified_patches = num_verified_patches
-        self.patch_atlas = patch_atlas
-        self.using_tracks = using_tracks
-        self.trusted_geometry_tree = trusted_geometry_tree
-
-        # The trusted cloud itself stays local: the cKDTree above is all
-        # anything downstream reads it for, and consuming it here rather
-        # than in build_device_state() is what leaves the device stages
-        # with nothing of the host's to release.
-        del verified_patches_and_pcls_cpu, verified_patches_and_pcls_np
-
-        # ==========================================================================
-        # Whole-object DT target caches (see dt_targets.py)
-        # ==========================================================================
-
-        # Deterministic sparse samples over each patch's own grid: host work on
-        # host inputs, so it belongs here rather than beside the model that
-        # eventually reads the caches these seed.
-        if self.config['dt_target_mode'] not in ('strip_median', 'whole_object_quantile'):
-            raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {self.config['dt_target_mode']!r}")
-        self.dt_target_whole_object = self.config['dt_target_mode'] == 'whole_object_quantile'
-        if self.dt_target_whole_object:
-            progress.begin(
-                'loading', 'Preparing distance-target samples',
-                detail=f'{len(self.verified_patches_list):,} patches')
-            prepare_patch_dt_target_samples(
-                self.verified_patches_list, self.config['sample_count_patch_dt_target_points'], self.config['dt_target_max_stride'],
-            )
 
     def _object_store_track_scale(self):
         """The declared track_scale_factor of an object-store fit attaching a
