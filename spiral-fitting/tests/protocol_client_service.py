@@ -2,15 +2,18 @@
 """A Spiral service for VC3D's protocol tests: the real HTTP service bound to
 an object store, with the resident runtime faked.
 
-    python protocol_client_service.py --store STORE.vcobj --root DIR --port-file FILE
+    python protocol_client_service.py --store STORE.vcobj [--hub HUB] --root DIR --port-file FILE
 
+With --hub the store is the service's replica of that hub (cloned when
+absent), and builds link and pin hub positions as a real service's do.
 The faked session freezes inputs the way a real one does: it reads the
-store's default selection read-only, writes the run directory's
+store's default selection (at the pinned position) read-only, writes the run directory's
 object_store_inputs.json and reports its digest, summary and manifest path,
 so the service publishes the input manifest artifact a client resolves pins
 from. Bearer credential: "key".
 """
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 import sys
@@ -35,7 +38,11 @@ class FrozenInputsRuntime(FakeRuntime):
         from vc_object_store import ObjectStore
         config = Config(dict(run.config)).as_dict()
         with ObjectStore.open(config['object_store_path'], read_only=True) as store:
-            snapshot = osi.read_snapshot(store, osi.request_from_config(config))
+            request = osi.request_from_config(config)
+            if config['object_store_input_position'] is not None:
+                request = dataclasses.replace(request, position=osi.InputPosition(
+                    store.hub_status()['hub_replica'], config['object_store_input_position']))
+            snapshot = osi.read_snapshot(store, request)
         manifest = snapshot.manifest()
         manifest['link_refresh'] = {'enabled': False}
         self.digest = osi.manifest_digest(manifest)
@@ -67,6 +74,7 @@ class FrozenInputsRuntime(FakeRuntime):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--store', required=True)
+    parser.add_argument('--hub', default=None)
     parser.add_argument('--root', required=True)
     parser.add_argument('--port-file', required=True)
     args = parser.parse_args(argv)
@@ -83,7 +91,7 @@ def main(argv=None):
     spiral_runtime.create_session = FrozenInputsRuntime
     state = spiral_service.ServiceState(
         dataset_root=str(dataset), dataset_resolution=resolution,
-        object_store=spiral_service.bind_object_store(args.store, 'protocol-test'),
+        object_store=spiral_service.bind_object_store(args.store, 'protocol-test', args.hub),
         startup_run={'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)})
     server = spiral_service.SpiralServer(('127.0.0.1', 0), ['key'], state)
     # Written whole, then renamed, so a reader never sees it half written.
