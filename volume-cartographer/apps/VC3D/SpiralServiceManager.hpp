@@ -312,8 +312,13 @@ private:
     QString _sessionState;
     qint64 _inputGeneration = 0;
     std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
-    void finishInputUpdate(InputUpdate update);
-    void sendInputUpdate(QJsonObject request, qint64 requested);
+    // Each update's callbacks carry its serial; abandoning one (the
+    // connection changed under it) bumps the serial, so the late callbacks
+    // of the abandoned update are ignored.
+    quint64 _inputUpdateSerial = 0;
+    void finishInputUpdate(InputUpdate update, quint64 serial);
+    void sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial);
+    void abandonInputUpdate();
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);

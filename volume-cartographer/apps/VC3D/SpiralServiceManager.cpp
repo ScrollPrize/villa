@@ -591,8 +591,24 @@ void SpiralServiceManager::updateStoreBinding()
     emit storeBindingChanged();
 }
 
+void SpiralServiceManager::abandonInputUpdate()
+{
+    // The replies of the old connection are dropped, so an update waiting on
+    // one would never finish: end it here. Its outcome on the service is
+    // unknown until the next status names the fit's position.
+    if (!_inputUpdateActive) return;
+    ++_inputUpdateSerial;
+    _inputUpdateHold.reset();
+    _inputUpdateActive = false;
+    InputUpdate abandoned;
+    abandoned.error = tr("The connection to the Spiral service changed during the update; its outcome "
+                         "is unknown: check the fit's input position");
+    emit inputUpdateFinished(abandoned);
+}
+
 void SpiralServiceManager::disconnectFromService()
 {
+    abandonInputUpdate();
     ++_connectionGeneration;
     _leaseOwner = false;
     _poll->stop();
@@ -617,6 +633,7 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     if (ownsProcess()) {
+        abandonInputUpdate();
         ++_connectionGeneration;
         _leaseOwner = false;
         _statusInFlight = false;
@@ -757,6 +774,7 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
         return;
     }
     _inputUpdateActive = true;
+    const quint64 serial = ++_inputUpdateSerial;
     const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
     // Held before pushing: the waited sync below still pushes everything
     // saved so far, and nothing pushed meanwhile can slip in between it and
@@ -772,9 +790,10 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
     emit inputUpdateProgress(QStringLiteral("pushing"), tr("Pushing saved edits to the hub…"));
     using Pushed = std::pair<std::optional<vc::objects::HubSessionStatus>, QString>;
     auto* watcher = new QFutureWatcher<Pushed>(this);
-    connect(watcher, &QFutureWatcher<Pushed>::finished, this, [this, watcher, request]() {
+    connect(watcher, &QFutureWatcher<Pushed>::finished, this, [this, watcher, request, serial]() {
         const auto [status, exception] = watcher->result();
         watcher->deleteLater();
+        if (serial != _inputUpdateSerial) return;  // abandoned
         InputUpdate update;
         if (!exception.isEmpty() || !status) {
             update.error = tr("The hub could not be reached: %1").arg(exception.isEmpty() ? tr("no hub") : exception);
@@ -790,10 +809,10 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
             update.error = tr("%n saved edit(s) were not pushed", nullptr, int(status->pending.size()));
         }
         if (!update.error.isEmpty()) {
-            finishInputUpdate(update);
+            finishInputUpdate(update, serial);
             return;
         }
-        sendInputUpdate(request, status->position);
+        sendInputUpdate(request, status->position, serial);
     });
     watcher->setFuture(QtConcurrent::run([session, attachment]() -> Pushed {
         try {
@@ -804,7 +823,7 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
     }));
 }
 
-void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested)
+void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial)
 {
     emit inputUpdateProgress(QStringLiteral("linking"),
                              tr("Linking and pinning a hub position including %1…").arg(requested));
@@ -820,7 +839,16 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
     if (!tracks.isEmpty()) body[QStringLiteral("paths")] = QJsonObject{{QStringLiteral("tracks_dbm"), tracks}};
     const bool initialize = !_hasActiveSession;
     // An idle fit keeps training across the update; a failed one is rebuilt.
+    // Any other state (a run, a build) is the user's to stop first: a
+    // rebuild would discard the model the update means to keep.
     const bool update = !initialize && _sessionState == QStringLiteral("Idle");
+    if (!initialize && !update && _sessionState != QStringLiteral("Error")) {
+        InputUpdate busy;
+        busy.requested = requested;
+        busy.error = tr("The fit is %1: stop it, then update its inputs").arg(_sessionState);
+        finishInputUpdate(busy, serial);
+        return;
+    }
     QString route = QStringLiteral("/session/initialize");
     if (update) {
         route = QStringLiteral("/session/update-inputs");
@@ -831,7 +859,7 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
         route = QStringLiteral("/session/rebuild");
         body[QStringLiteral("inputs")] = QStringLiteral("reload");
     }
-    auto failed = [this, requested](const QString& message, const QJsonObject& body) {
+    auto failed = [this, requested, serial](const QString& message, const QJsonObject& body) {
         InputUpdate update;
         update.requested = requested;
         update.error = message;
@@ -839,10 +867,10 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
         for (const QJsonValue& problem : failure.value(QStringLiteral("problems")).toArray())
             update.problems << problem.toString();
         if (!body.isEmpty()) handleStatus(body);
-        finishInputUpdate(update);
+        finishInputUpdate(update, serial);
     };
     postWithRetry(route, body, Timeout::Load, kMutationRetries,
-                  [this, requested](const QJsonObject& response) {
+                  [this, requested, serial](const QJsonObject& response) {
                       handleStatus(response);
                       const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
                       InputUpdate update;
@@ -850,13 +878,14 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
                       update.head = position.value(QStringLiteral("head")).toInteger(-1);
                       update.fitted = position.value(QStringLiteral("sequence")).toInteger(-1);
                       if (update.fitted < 0) update.error = tr("The service reported no fitted position");
-                      finishInputUpdate(update);
+                      finishInputUpdate(update, serial);
                   },
                   {}, failed);
 }
 
-void SpiralServiceManager::finishInputUpdate(InputUpdate update)
+void SpiralServiceManager::finishInputUpdate(InputUpdate update, quint64 serial)
 {
+    if (serial != _inputUpdateSerial) return;  // abandoned
     // Pushes resume; then pull to (at least) the fitted position, so the
     // service's links and any edits it included are here.
     _inputUpdateHold.reset();
@@ -869,9 +898,10 @@ void SpiralServiceManager::finishInputUpdate(InputUpdate update)
     emit inputUpdateProgress(QStringLiteral("pulling"), tr("Pulling the fitted position %1…").arg(update.fitted));
     const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
     auto* watcher = new QFutureWatcher<InputUpdate>(this);
-    connect(watcher, &QFutureWatcher<InputUpdate>::finished, this, [this, watcher]() {
+    connect(watcher, &QFutureWatcher<InputUpdate>::finished, this, [this, watcher, serial]() {
         const InputUpdate result = watcher->result();
         watcher->deleteLater();
+        if (serial != _inputUpdateSerial) return;  // abandoned
         _inputUpdateActive = false;
         refreshLocalHub();
         emit inputUpdateFinished(result);

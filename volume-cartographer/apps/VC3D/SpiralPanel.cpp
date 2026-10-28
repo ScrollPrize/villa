@@ -2426,7 +2426,12 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const bool preparingInputs =
         progress.value(QStringLiteral("operation")).toString()
         == QStringLiteral("loading");
-    const bool runnable = idle && !preparingInputs;
+    // An input update in flight (pushing here, or linking and installing on
+    // the service) holds the fit too: the service refuses Run and rebuilds
+    // until it settles.
+    const bool updatingInputs = _service->inputUpdateActive()
+        || !status.value(QStringLiteral("input_update")).isNull();
+    const bool runnable = idle && !preparingInputs && !updatingInputs;
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
@@ -2436,7 +2441,6 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     const auto& binding = _service->storeBinding();
     _updateInputs->setVisible(binding.hosted());
     _updateInputs->setEnabled(_load->isEnabled() && binding.matches()
-                              && !_service->inputUpdateActive()
                               && status.value(QStringLiteral("input_preparation")).isNull());
     if (!binding.matches() && binding.hosted())
         setToolTipNote(_updateInputs, tr("Attach a replica of the service's hub first"));

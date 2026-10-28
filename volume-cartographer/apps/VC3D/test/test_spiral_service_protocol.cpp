@@ -319,6 +319,25 @@ private:
         QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
         QVERIFY(update.fitted > fittedBefore);
 
+        // A connection change during an update ends it here (its replies
+        // are dropped) and resumes this replica's pushes.
+        QSignalSpy progress(&manager, &SpiralServiceManager::inputUpdateProgress);
+        edit(4);
+        manager.updateFitInputs(request);
+        QTRY_VERIFY_WITH_TIMEOUT(!progress.isEmpty() && progress.last().at(0).toString() == QStringLiteral("linking"),
+                                 60000);
+        manager.disconnectFromService();
+        QCOMPARE(updates.count(), 5);
+        update = updates.at(4).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY(update.error.contains(QStringLiteral("outcome is unknown")));
+        QVERIFY(!manager.inputUpdateActive());
+        edit(5);
+        QTRY_VERIFY_WITH_TIMEOUT(session->hubStatus(attachment)->pending.empty(), 30000);
+        manager.connectToService(protocolProfile(service.port));
+        QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
+        QTest::qWait(500);
+        QCOMPARE(updates.count(), 5);  // the abandoned update's late replies are ignored
+
         bool released = false;
         manager.releaseSessionLease([&]() { released = true; });
         QTRY_VERIFY_WITH_TIMEOUT(released, 30000);
