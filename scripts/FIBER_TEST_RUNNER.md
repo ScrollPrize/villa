@@ -1,5 +1,13 @@
 # Reusable fiber test and experiment runner
 
+`cache-pressure-build`, `cache-pressure-tests`, and `cache-pressure-pilots`
+use the local `test_cache_pressure.py` harness. They build/run cache, persistence,
+queue and tracer regressions, then exercise the same 32 Paris4 seed tiles with
+64-GiB, 4-GiB and deliberately undersized 512-MiB decoded budgets. `cache-pressure-stop`
+interrupts only the identified pilot, not production. These optional real-data
+fixtures live under `evaluations/cache_pressure_20261028_v1`. Portable bitmap,
+scheduler-lock and anticipatory-eviction regressions live in `test_chunk_cache`.
+
 `stream-volume-build`, `stream-volume-policy`, `stream-volume-native`,
 `stream-volume-pilot`, `stream-volume-resume`, `stream-volume-comparison`,
 `stream-volume-stop`, `stream-volume-status`, `stream-volume-restart`, and `stream-volume-full` use

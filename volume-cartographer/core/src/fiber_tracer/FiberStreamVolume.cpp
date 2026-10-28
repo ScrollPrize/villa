@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -94,7 +95,10 @@ class CTChecks {
             {
                 std::lock_guard lock(mutex);wakeQueued=false;
                 for(auto i=waiting.begin();i!=waiting.end();) {
-                    const auto& k=i->first;auto r=cache->getChunkIfCached(k.level,k.iz,k.iy,k.ix);
+                    // A notification is not a lease: pressure can evict the
+                    // chunk before this queued wake runs. Re-request it rather
+                    // than waiting forever on a fetch that already completed.
+                    const auto& k=i->first;auto r=cache->tryGetChunk(k.level,k.iz,k.iy,k.ix);
                     if(r.status==vc::render::ChunkStatus::MissQueued){++i;continue;}
                     for(auto& f:i->second)ready.push_back(std::move(f));i=waiting.erase(i);
                 }
@@ -443,6 +447,11 @@ public:
         {std::lock_guard lock(admission);r["active_fibers"]=active.size();r["open_tiles"]=open.size();}
         {std::lock_guard lock(reasonMutex);for(const auto&[reason,count]:reasons)r["stop_"+reason]=count;}
         for(size_t i=0;i<4;++i){r["worker_tier_seconds"].push_back(pool.workSeconds[i].load());r["worker_tier_jobs"].push_back(pool.jobs[i].load());}
+        const auto budget=vc::render::processChunkCacheService()->decodedByteBudget()->stats();
+        r["decoded_cache"]={{"bytes",budget.decodedBytes},{"capacity",budget.maximumBytes},
+            {"recycled_bytes",budget.recycledBytes},{"reserve_bytes",budget.reserveBytes},
+            {"pending_requests",budget.pendingRequests},{"background_passes",budget.backgroundPasses},
+            {"background_evicted_bytes",budget.backgroundEvictedBytes},{"hard_limit_passes",budget.hardLimitPasses}};
         auto path=output/(complete?"summary.json":"progress.json"),tmp=path;tmp+=".partial";
         {std::ofstream f(tmp);f<<r.dump(2)<<'\n';}std::filesystem::rename(tmp,path);std::cout<<r.dump()<<std::endl;return r;
     }

@@ -8,6 +8,10 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "local/fiber_tests.json"
 SUITES = {
+    "cache-pressure-build": ("local/test_cache_pressure.py::test_build",),
+    "cache-pressure-tests": ("local/test_cache_pressure.py::test_regressions",),
+    "cache-pressure-pilots": ("local/test_cache_pressure.py::test_pilots",),
+    "cache-pressure-stop": ("local/test_cache_pressure.py::test_stop_pressure",),
     "stream-volume-build": ("local/test_stream_volume.py::test_build",),
     "stream-volume-policy": ("local/test_stream_volume.py::test_policy",),
     "stream-volume-native": ("local/test_stream_volume.py::test_native",),

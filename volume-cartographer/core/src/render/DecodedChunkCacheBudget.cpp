@@ -4,12 +4,24 @@
 #include <limits>
 #include <utility>
 #include <vector>
+#include <utils/thread_pool.hpp>
 
 namespace vc::render {
+
+namespace {
+utils::ThreadPool& evictionPool()
+{
+    static utils::ThreadPool pool(2);
+    return pool;
+}
+}
 
 DecodedChunkCacheBudget::DecodedChunkCacheBudget(std::size_t maximumBytes)
     : maximumBytes_(maximumBytes)
 {
+    // Construct before any owning static cache service so housekeeping is
+    // destroyed after those services have drained their cache operations.
+    (void)evictionPool();
 }
 
 DecodedChunkCacheBudget::~DecodedChunkCacheBudget() = default;
@@ -26,6 +38,11 @@ DecodedChunkCacheBudget::Stats DecodedChunkCacheBudget::stats() const
     result.trimmedBuffers = trimmedBuffers_.load(std::memory_order_relaxed);
     result.trimmedBytes = trimmedBytes_.load(std::memory_order_relaxed);
     result.reuseEnforcementBusy = reuseEnforcementBusy_.load(std::memory_order_relaxed);
+    result.pendingRequests = pendingRequests_.load(std::memory_order_relaxed);
+    result.reserveBytes = reserveBytes();
+    result.backgroundPasses = backgroundPasses_.load(std::memory_order_relaxed);
+    result.backgroundEvictedBytes = backgroundEvictedBytes_.load(std::memory_order_relaxed);
+    result.hardLimitPasses = hardLimitPasses_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(participantsMutex_);
         result.cacheCount = participants_.size();
@@ -67,11 +84,11 @@ DecodedChunkCacheBudget::Buffer DecodedChunkCacheBudget::takeBuffer(std::size_t 
     const auto maximum = maximumBytes_.load(std::memory_order_acquire);
     if (!size || size > maximum ||
         decodedBytes_.load(std::memory_order_acquire) <= maximum-size) return {};
-    // Make room using the same global LRU/reader protections as publication.
-    // This moves a necessary eviction before allocating its replacement, so
-    // streaming through a full cache can reuse the retired allocation. No
-    // source/pool locks are held here; don't queue behind another enforcer.
-    enforce(size, true);
+    // Ask housekeeping for headroom without waiting for eviction. A buffer
+    // retired concurrently can already be reused; publication enforces the
+    // hard limit after dropping its source lock.
+    trimRecycled();
+    requestCleanup();
     return pop();
 }
 
@@ -164,6 +181,58 @@ std::uint64_t DecodedChunkCacheBudget::nextTouch() noexcept
 void DecodedChunkCacheBudget::addBytes(std::size_t bytes) noexcept
 {
     decodedBytes_.fetch_add(bytes, std::memory_order_acq_rel);
+    if (bytes) {
+        auto old = meanChunkBytes_.load(std::memory_order_relaxed);
+        while (!meanChunkBytes_.compare_exchange_weak(old,
+            old ? old - old / 16 + bytes / 16 : bytes, std::memory_order_relaxed)) {}
+    }
+}
+
+void DecodedChunkCacheBudget::beginRequest() noexcept
+{
+    pendingRequests_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DecodedChunkCacheBudget::endRequests(std::size_t count) noexcept
+{
+    pendingRequests_.fetch_sub(count, std::memory_order_relaxed);
+}
+
+std::size_t DecodedChunkCacheBudget::reserveBytes() const noexcept
+{
+    const auto mean = meanChunkBytes_.load(std::memory_order_relaxed);
+    const auto capacity = maximumBytes_.load(std::memory_order_relaxed);
+    const auto pending = pendingRequests_.load(std::memory_order_relaxed);
+    // Leave two mean chunks or one completion wave free, bounded to 12.5%.
+    // Integer division first prevents overflow for a huge prefetch backlog.
+    const auto ceiling = capacity / 8;
+    if (!mean || mean > ceiling / 2) return 0;
+    const auto count = std::max(std::size_t(2), std::min(pending, ceiling / mean));
+    return count * mean;
+}
+
+void DecodedChunkCacheBudget::requestCleanup()
+{
+    const auto reserve = reserveBytes();
+    if (!reserve || decodedBytes_.load(std::memory_order_acquire) <= maximumBytes() - reserve / 2)
+        return;
+    if (cleanupQueued_.exchange(true)) return;
+    try {
+        // Shared bounded housekeeping pool; one queued/running pass per budget.
+        // The job holds its own lease, so releasing the last source during
+        // cleanup cannot destroy a budget underneath a worker or self-join.
+        evictionPool().enqueue([weak = weak_from_this()] {
+            if (auto budget = weak.lock()) {
+                try {
+                    ++budget->backgroundPasses_;
+                    budget->enforceTarget(budget->reserveBytes(), true);
+                } catch (...) { /* A later cache operation retries cleanup. */ }
+                budget->cleanupQueued_ = false;
+            }
+        });
+    } catch (...) {
+        cleanupQueued_ = false;
+    }
 }
 
 void DecodedChunkCacheBudget::removeBytes(std::size_t bytes) noexcept
@@ -178,7 +247,19 @@ void DecodedChunkCacheBudget::removeBytes(std::size_t bytes) noexcept
     }
 }
 
-void DecodedChunkCacheBudget::enforce(std::size_t reserveBytes, bool tryOnly)
+void DecodedChunkCacheBudget::enforce()
+{
+    trimRecycled();
+    requestCleanup();
+    // No caller waits on eviction below the hard decoded-cache ceiling.
+    // Buffer acquisition is opportunistic even at the ceiling; publication
+    // performs hard-limit enforcement after dropping all source locks.
+    if (decodedBytes_.load(std::memory_order_acquire) <= maximumBytes()) return;
+    ++hardLimitPasses_;
+    enforceTarget(0, false);
+}
+
+void DecodedChunkCacheBudget::enforceTarget(std::size_t reserveBytes, bool background)
 {
     trimRecycled();
     const auto target = [&] {
@@ -187,7 +268,7 @@ void DecodedChunkCacheBudget::enforce(std::size_t reserveBytes, bool tryOnly)
     };
     if (decodedBytes_.load(std::memory_order_acquire) <= target()) return;
     std::unique_lock enforcementLock(enforcementMutex_,std::defer_lock);
-    if (tryOnly) { if (!enforcementLock.try_lock()) {
+    if (background) { if (!enforcementLock.try_lock()) {
         reuseEnforcementBusy_.fetch_add(1, std::memory_order_relaxed);
         return;
     } }
@@ -212,7 +293,7 @@ void DecodedChunkCacheBudget::enforce(std::size_t reserveBytes, bool tryOnly)
         for (const auto& [id, participant] : snapshot) {
             if (!participant.oldestDecodedTouch)
                 continue;
-            const auto touch = participant.oldestDecodedTouch();
+            const auto touch = participant.oldestDecodedTouch(background);
             if (!touch)
                 continue;
             const bool preferOverCurrent =
@@ -231,13 +312,16 @@ void DecodedChunkCacheBudget::enforce(std::size_t reserveBytes, bool tryOnly)
         auto victim = std::find_if(
             snapshot.begin(), snapshot.end(),
             [victimId](const auto& item) { return item.first == victimId; });
-        if (victim == snapshot.end() || !victim->second.evictOldestDecoded ||
-            victim->second.evictOldestDecoded() == 0) {
+        const auto freed = victim != snapshot.end() && victim->second.evictOldestDecoded
+            ? victim->second.evictOldestDecoded(background) : 0;
+        if (freed == 0) {
+            if (background) break; // A busy source must not spin housekeeping.
             // The candidate changed between inspection and eviction. Retry
             // against a fresh snapshot; concurrent invalidation may already
             // have brought the aggregate below its ceiling.
             continue;
         }
+        if (background) backgroundEvictedBytes_.fetch_add(freed, std::memory_order_relaxed);
     }
 }
 

@@ -45,6 +45,27 @@ void ChunkRequestSelectionGate::publish(const std::function<void()>& update)
     update();
 }
 
+void ChunkRequestSelectionGate::publish(std::mutex& prerequisite,
+                                       const std::function<void()>& update)
+{
+    std::lock_guard sourceLock(prerequisite);
+    publish(update);
+}
+
+void ChunkRequestSelectionGate::publish(std::span<std::mutex* const> prerequisites,
+                                       const std::function<void()>& update)
+{
+    // Stable order for multi-source operations (e.g. closing a viewport).
+    // Source registration is snapshotted before entering this operation.
+    std::vector<std::mutex*> ordered(prerequisites.begin(), prerequisites.end());
+    std::sort(ordered.begin(), ordered.end(), std::less<std::mutex*>{});
+    ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(ordered.size());
+    for (auto* mutex : ordered) locks.emplace_back(*mutex);
+    publish(update);
+}
+
 struct ChunkRequestScheduler::Impl {
     using Clock = std::chrono::steady_clock;
 

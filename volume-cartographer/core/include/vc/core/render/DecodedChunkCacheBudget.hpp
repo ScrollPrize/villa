@@ -30,6 +30,11 @@ public:
         std::uint64_t trimmedBuffers = 0;
         std::uint64_t trimmedBytes = 0;
         std::uint64_t reuseEnforcementBusy = 0;
+        std::size_t pendingRequests = 0;
+        std::size_t reserveBytes = 0;
+        std::uint64_t backgroundPasses = 0;
+        std::uint64_t backgroundEvictedBytes = 0;
+        std::uint64_t hardLimitPasses = 0;
     };
 
     explicit DecodedChunkCacheBudget(std::size_t maximumBytes);
@@ -48,8 +53,8 @@ private:
     friend class ChunkCache;
 
     struct Participant {
-        std::function<std::optional<std::uint64_t>()> oldestDecodedTouch;
-        std::function<std::size_t()> evictOldestDecoded;
+        std::function<std::optional<std::uint64_t>(bool)> oldestDecodedTouch;
+        std::function<std::size_t(bool)> evictOldestDecoded;
         // Preferred eviction victim (see
         // ChunkCacheOptions::decodedEvictionPreferSelf): while any flagged
         // participant still holds decoded data, enforcement evicts among the
@@ -62,7 +67,12 @@ private:
     std::uint64_t nextTouch() noexcept;
     void addBytes(std::size_t bytes) noexcept;
     void removeBytes(std::size_t bytes) noexcept;
-    void enforce(std::size_t reserveBytes = 0, bool tryOnly = false);
+    void enforce();
+    void enforceTarget(std::size_t reserveBytes, bool background);
+    void requestCleanup();
+    std::size_t reserveBytes() const noexcept;
+    void beginRequest() noexcept;
+    void endRequests(std::size_t count = 1) noexcept;
     using Buffer = std::vector<std::byte>;
     Buffer takeBuffer(std::size_t size);
     std::shared_ptr<const Buffer> shareBuffer(Buffer bytes);
@@ -87,6 +97,12 @@ private:
     std::atomic_uint64_t trimmedBuffers_{0};
     std::atomic_uint64_t trimmedBytes_{0};
     std::atomic_uint64_t reuseEnforcementBusy_{0};
+    std::atomic_size_t pendingRequests_{0};
+    std::atomic_size_t meanChunkBytes_{0};
+    std::atomic_bool cleanupQueued_{false};
+    std::atomic_uint64_t backgroundPasses_{0};
+    std::atomic_uint64_t backgroundEvictedBytes_{0};
+    std::atomic_uint64_t hardLimitPasses_{0};
 };
 
 } // namespace vc::render

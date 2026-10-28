@@ -2,6 +2,7 @@
 #include "vc/core/render/ChunkLoadQueue.hpp"
 
 #include "vc/core/render/DecodedChunkCacheBudget.hpp"
+#include "vc/core/render/EmptyChunkMap.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 
 #include <atomic>
@@ -54,7 +55,8 @@ struct PersistentCacheMetadataObject {
 };
 
 struct ChunkCacheOptions {
-    // Bound resolved non-data entries for sparse volumes.
+    // Bound heavyweight entries. Known missing/all-fill chunks live in a
+    // separate paged bitmap until explicit source invalidation.
     std::size_t metadataEntryCapacity = 1ULL << 20;
     bool detectAllFillChunks = true;
     std::optional<std::filesystem::path> persistentCachePath;
@@ -206,6 +208,10 @@ public:
     };
 
     struct Stats {
+        std::size_t knownEmptyChunks = 0;
+        std::size_t emptyBitmapBytes = 0;
+        std::size_t metadataEntries = 0;
+        std::uint64_t evictionEntriesExamined = 0;
         // Bytes retained by this source, before aggregation into the shared
         // service budget.
         std::size_t localDecodedBytes = 0;
@@ -404,6 +410,7 @@ private:
         bool persistentWriteQueued = false;
         bool unresolvedCounted = false;
         bool inLru = false;
+        bool inDecodedLru = false;
         int basePriority = 0;
         std::uint64_t fetchSerial = 0;
         std::uint64_t probeTaskId = 0;
@@ -414,6 +421,7 @@ private:
         bool foregroundDemand = false;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
+        std::list<ChunkKey>::iterator decodedLruIt;
     };
 
     struct FetchContext {
@@ -624,6 +632,10 @@ private:
                            StorageObjectTransfer,
                            StorageObjectKeyHash> storageObjectTransfers_;
         std::list<ChunkKey> lru_;
+        // Data only: empty/error metadata must never be scanned to free RAM.
+        std::list<ChunkKey> decodedLru_;
+        EmptyChunkMap emptyChunks_;
+        std::uint64_t evictionEntriesExamined_ = 0;
         // Readers currently parked inside getChunkBlocking, counted per key
         // and owned by the readers themselves (registered on entry, released
         // exactly once on every exit). The count - not the entry - carries
@@ -893,10 +905,13 @@ private:
     static std::optional<std::size_t> regularFileSize(const std::filesystem::path& path);
     static void addPersistentCacheBytesDelta(State& state, std::int64_t delta);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
+    static void unlinkLruLocked(State& state, Entry& entry);
+    static std::optional<ChunkResult> emptyResultLocked(const State& state, const ChunkKey& key);
+    static bool compactEmptyLocked(State& state, const ChunkKey& key, const Entry& entry);
     static void enforceCapacityLocked(const std::shared_ptr<State>& state);
     static std::optional<std::uint64_t> oldestDecodedTouch(
-        const std::shared_ptr<State>& state);
-    static std::size_t evictOldestDecoded(const std::shared_ptr<State>& state);
+        const std::shared_ptr<State>& state, bool tryOnly = false);
+    static std::size_t evictOldestDecoded(const std::shared_ptr<State>& state, bool tryOnly = false);
     static std::size_t evictOldestDecodedLocked(const std::shared_ptr<State>& state);
     static void addDecodedBytesLocked(State& state, std::size_t bytes);
     static void removeDecodedBytesLocked(State& state, std::size_t bytes);

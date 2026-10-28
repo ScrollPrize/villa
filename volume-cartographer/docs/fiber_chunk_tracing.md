@@ -1807,6 +1807,42 @@ not establish sustained full-volume throughput. The run was stopped for cache
 integration and pressure testing; this limitation must be verified under a
 filled cache before resuming production.
 
+The cache pressure redesign removes that lock chain:
+
+- Publishers acquire source prerequisites **before** the global scheduling gate;
+  waiting for a busy source no longer freezes unrelated queue selection.
+- Decoded payloads have a separate eviction LRU. Missing/all-fill chunks use a
+  sparse, source-local two-bit bitmap (16-cubed chunk pages), not heavy LRU entries.
+  Negative knowledge survives metadata eviction, but `invalidate()` clears it.
+  Completed volumes need no refresh; live publishers still must invalidate when
+  previously absent data becomes available. This does not change source mutability.
+- A bounded two-thread housekeeping pool runs at most one eviction job per shared
+  budget. It uses try-locks on busy sources. Headroom is two average decoded chunks
+  or one outstanding-request wave, capped at one eighth of the budget. Average
+  chunk bytes use an EMA; cleanup starts halfway into that reserve. Tiny caches
+  holding fewer than sixteen average chunks use hard-limit enforcement only.
+  Callers join eviction only after exceeding the hard decoded-byte ceiling.
+- Byte accounting covers cache-owned payloads and recycled buffers, not caller-held
+  sampling leases, in-flight decode buffers or total process RSS. Parked blocking
+  readers retain their existing protection. Background eviction is serialized per
+  shared budget to preserve victim selection; it is not one worker per source.
+
+`progress.json.decoded_cache` reports decoded/recycled bytes, capacity, requested
+reserve, pending requests, background passes/bytes evicted and hard-limit passes.
+Use pressure tests, not just an initially empty-cache timing, to validate liveness.
+The 512-MiB pilot also exposed a CT readiness race: a published chunk could be
+evicted before its queued waiter observed it. CT wake checks now re-request missing
+chunks instead of waiting indefinitely for an already-completed fetch.
+
+On the matched 32-tile Paris4 pilot (224 workers, 2240 active pairs, 4096-base
+maximum half-trace, GCC 13 RelWithDebInfo/LTO), three 64-GiB runs averaged
+34.80 s versus the previous 34.54 s: no meaningful no-pressure speedup. A 4-GiB
+run completed in 35.44 s while evicting 13.6 GiB in the background; a 512-MiB
+stress run completed in 100.37 s with 1.5 TiB cumulative decoded eviction.
+Both finished without stranded work. These are bounded pressure checks, not a
+new full-volume ETA. Configs, individual timings and the initially stranded CT
+pilot are retained in `evaluations/cache_pressure_20261028_v1/README.md`.
+
 Output `tiles/X_Y_Z.msgpack.zst` pages belong to seed tiles, not clipping regions:
 their paths can extend far beyond the tile. Each piece includes base coordinates,
 seed provenance, width history/mean, per-half cumulative cost from the seed,
