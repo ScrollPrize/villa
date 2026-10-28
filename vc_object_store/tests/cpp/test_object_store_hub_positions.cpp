@@ -37,6 +37,7 @@ nlohmann::json state(ObjectStore& replica, int64_t position)
 {
     auto result = nlohmann::json::object();
     readHubPosition(replica, position, [&](ObjectStore& hub, const ReadTxn& txn, const RevisionSelection& selection) {
+        requireHubGeometry(replica, txn, position, selection);  // it names every object's geometry
         RevisionSelection active;
         for (const auto& [object, revision] : selection) {
             const auto value = hub.objectRevision(txn, *revision);
