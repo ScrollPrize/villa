@@ -1833,28 +1833,32 @@ class ServiceState:
     def _note_input_manifest(self, status):
         """Publish the session's input manifest once its inputs are frozen.
 
-        Runs on the fitter thread: it claims the digest and leaves copying
-        and hashing to a background thread.
+        Runs on the fitter thread: it claims the inputs (their digest and
+        input generation: an update to another position with identical
+        inputs still names that position) and leaves copying and hashing to
+        a background thread.
         """
         digest = status.get("input_digest")
         path = status.get("input_manifest_path")
         if not digest or not path:
             return
+        key = (digest, int(status.get("input_generation") or 0))
         with self.lock:
             if self.session_id is None or (
-                    self._input_manifest and self._input_manifest[0] == digest):
+                    self._input_manifest and self._input_manifest[0] == key):
                 return
-            self._input_manifest = (digest, None)
+            self._input_manifest = (key, None)
             session_id = self.session_id
             generation = self.session_generation
             output = self._output_root()
         threading.Thread(
             target=self._publish_input_manifest,
-            args=(session_id, generation, digest, Path(path), output),
+            args=(session_id, generation, key, Path(path), output),
             name="spiral-input-manifest-publish", daemon=True).start()
 
-    def _publish_input_manifest(self, session_id, generation, digest, source,
+    def _publish_input_manifest(self, session_id, generation, key, source,
                                 output):
+        digest = key[0]
         root = (Path(output) / ".spiral-artifacts" /
                 f"inputs-{digest[:12]}-{secrets.token_hex(6)}")
         try:
@@ -1873,9 +1877,9 @@ class ServiceState:
             return
         with self.lock:
             current = (self.session_id == session_id and self._input_manifest
-                       and self._input_manifest[0] == digest)
+                       and self._input_manifest[0] == key)
             if current:
-                self._input_manifest = (digest, ref)
+                self._input_manifest = (key, ref)
                 self.status_generation += 1
         if not current:
             # The session was replaced meanwhile: withdraw only this copy.

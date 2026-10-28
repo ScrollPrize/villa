@@ -314,6 +314,36 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     assert state.session._context.config['object_store_input_position'] == position['sequence']
 
 
+def test_an_update_with_identical_inputs_republishes_the_manifest(state, hub, device_stubs,
+                                                                  no_theta_topology):
+    # A commit the adapter does not read moves the position, not the digest:
+    # the published manifest must still name the fitted position.
+    from test_service_hub_positions import _edit, _names
+    state.initialize(REQUEST)
+    before = settle(state)
+
+    def published():
+        deadline = time.monotonic() + 30
+        while True:
+            artifact = state.status()['input_manifest_artifact']
+            if artifact is not None:
+                _, path, _ = state.artifacts.acquire_file(artifact['id'], 'object_store_inputs.json')
+                with open(path) as stream:
+                    manifest = json.load(stream)['manifest']
+                if manifest['position']['sequence'] == state.status()['input_position']['sequence']:
+                    return manifest
+            assert time.monotonic() < deadline, state.status()['input_manifest_artifact']
+            time.sleep(0.02)
+    first = published()
+    walk = _names(hub['editor'])['walk']
+    reached = _edit(hub['editor'], walk, 'review_note', 'not an input')
+    state.update_inputs({'inputs_position': reached})
+    status = _settled_update(state)
+    assert status['input_generation'] == 1 and status['input_digest'] == before['input_digest']
+    assert published()['position']['sequence'] == status['input_position']['sequence'] \
+        > first['position']['sequence']
+
+
 def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
                                                  monkeypatch):
     import fit_spiral
