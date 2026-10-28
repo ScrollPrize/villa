@@ -8,6 +8,7 @@
 #include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralStoreInputs.hpp"
+#include "SpiralStoreEdits.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
@@ -456,7 +457,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         }
         _brush->markDraftsReady();
         statusBar()->showMessage(
-            tr("Drawing draft is ready; use Add to current fit to submit it"), 5000);
+            tr("Drawing draft is ready; use Save Drafts to Store to save it"), 5000);
     });
     connect(_brush.get(), &SpiralBrushController::brushDiameterChanged,
             this, [this](int diameter) {
@@ -469,6 +470,26 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     _panel = new SpiralPanel(_service, this);
     connect(_panel, &SpiralPanel::cloneHubRequested, this, &SpiralWorkspace::hubReplicaRequested);
+    connect(_service, &SpiralServiceManager::inputUpdateProgress, this, [this](const QString& phase, const QString&) {
+        if (phase != QStringLiteral("pushing")) return;
+        _updatingDraftIds = _savedDraftIds;
+        _updatingPatchIds = _savedPatchIds;
+    });
+    connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
+            [this](const SpiralServiceManager::InputUpdate& update) {
+                const auto drafts = std::exchange(_updatingDraftIds, {});
+                const auto patches = std::exchange(_updatingPatchIds, {});
+                if (!update.error.isEmpty() || !_brush) return;
+                // The fit holds what was saved before the update began: those
+                // drafts are shown as its inputs from now on.
+                _brush->commitSucceeded(drafts);
+                for (const auto& id : drafts) _savedDraftIds.removeAll(id);
+                for (const auto& id : patches) {
+                    _brush->removePatchDraft(id);
+                    _brushPatchUuids.remove(id);
+                    _savedPatchIds.removeAll(id);
+                }
+            });
     connect(_panel, &SpiralPanel::removeLocalPatchRequested, this,
             [this](const QString& id) { _brush->removePatchDraft(id); });
     connect(_panel, &SpiralPanel::addDraftsRequested,
@@ -1254,29 +1275,117 @@ void SpiralWorkspace::addPatchToCurrentFit(
     Q_UNUSED(tifxyzDirectory);
     Q_UNUSED(surface);
     QMessageBox::information(this, tr("Add patch to the Spiral fit"),
-                             SpiralServiceManager::inputsFrozenMessage());
+                             tr("Surfaces in the object store are fit inputs when the fit's selection "
+                                "includes them (by default, every active surface). %1")
+                                 .arg(SpiralServiceManager::inputsFrozenMessage()));
 }
 
 void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
 {
     Q_UNUSED(fiberIds);
     QMessageBox::information(this, tr("Add fibers to the Spiral fit"),
-                             SpiralServiceManager::inputsFrozenMessage());
+                             tr("Fibers in the object store are fit inputs when the fit's selection "
+                                "includes them (by default, every active fiber). %1")
+                                 .arg(SpiralServiceManager::inputsFrozenMessage()));
 }
 
 void SpiralWorkspace::finalizeBrushPaint()
 {
-    // Painted patches and drawn collections stay in memory: they cannot join
-    // a fit whose inputs are frozen, and are kept for store-backed editing.
-    statusBar()->showMessage(SpiralServiceManager::inputsFrozenMessage(), 15000);
+    submitReadyDrafts(false);
 }
 
-void SpiralWorkspace::submitReadyDrafts(bool commitAfterAdd)
+void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
 {
-    // Drafts stay local, ready for store-backed editing; a frozen fit takes
-    // none of them.
-    Q_UNUSED(commitAfterAdd);
-    statusBar()->showMessage(SpiralServiceManager::inputsFrozenMessage(), 15000);
+    // A saved edit is a checked revision of the attached store, pushed to its
+    // hub by the session's worker. The fit sees it at its next input update.
+    const auto session = _state->objectStoreSession();
+    const auto attachment = _state->objectStoreAttachment();
+    QString problem;
+    std::optional<double> scale;
+    if (!attachment || !session->writable(*attachment))
+        problem = tr("Attach a writable object store to save Spiral drawings");
+    else if (!_fitInputs || _fitInputs->volumeUuid.empty())
+        problem = tr("Spiral drawings are saved in the fit's volume: wait until the fit's inputs are shown");
+    else
+        scale = fitInputScale(&problem);
+    if (!scale) {
+        statusBar()->showMessage(problem, 15000);
+        return;
+    }
+    _brush->markDraftsReady();
+    QStringList warnings;
+    auto patches = _brush->preparePatches(warnings);
+    auto collections = _brush->preparePointCollections(warnings);
+    if (!warnings.isEmpty()) {
+        for (const auto& patch : patches) _brush->finalizationFailed(patch.id);
+        for (const auto& collection : collections) _brush->finalizationFailed(collection.id);
+        statusBar()->showMessage(warnings.join(QStringLiteral("; ")), 15000);
+        return;
+    }
+    const std::string volume = _fitInputs->volumeUuid;
+    QStringList errors, saved;
+    for (const auto& patch : patches) {
+        const auto known = _brushPatchUuids.constFind(patch.id);
+        const bool remove = patch.operation == QStringLiteral("delete");
+        if (remove && known == _brushPatchUuids.cend()) {
+            // Never saved: there is nothing in the store to retire.
+            _brush->finalizationSucceeded(patch.id);
+            continue;
+        }
+        try {
+            const auto uuids = vc3d::spiral::saveBrushPatches(
+                *session, *attachment, volume, *scale,
+                {{known == _brushPatchUuids.cend() ? std::string() : *known, patch.id.toStdString(),
+                  patch.surface, remove}});
+            if (remove) _brushPatchUuids.remove(patch.id);
+            else _brushPatchUuids[patch.id] = uuids.front();
+            _brush->finalizationSucceeded(patch.id);
+            if (!_savedPatchIds.contains(patch.id)) _savedPatchIds << patch.id;
+            saved << patch.id;
+        } catch (const std::exception& error) {
+            _brush->finalizationFailed(patch.id, QString::fromUtf8(error.what()));
+            errors << tr("%1: %2").arg(patch.id, QString::fromUtf8(error.what()));
+        }
+    }
+    if (!collections.empty()) {
+        std::vector<vc3d::spiral::EditablePclDraft> drafts;
+        QStringList fitted;
+        for (const auto& collection : collections) {
+            if (collection.draft) {
+                drafts.push_back(*collection.draft);
+            } else {
+                // A drawn control-point line: one same-winding collection.
+                auto imported = vc3d::spiral::importEditablePcls(collection.document, 1.0, {}, true,
+                                                                 vc3d::spiral::PclRole::SameWinding);
+                if (imported.empty()) continue;
+                drafts.push_back(std::move(imported.front()));
+            }
+            if (vc3d::spiral::pointCollectionObject(drafts.back())) fitted << collection.id;
+        }
+        QStringList ids;
+        for (const auto& collection : collections) ids << collection.id;
+        try {
+            vc3d::spiral::savePointCollections(*session, *attachment, volume, drafts);
+            for (const auto& id : ids) _brush->finalizationSucceeded(id);
+            // Edits of fitted collections are shown from the store now; new
+            // ones stay drawn until an update brings them into the fit.
+            _brush->commitSucceeded(fitted);
+            for (const auto& id : ids)
+                if (!fitted.contains(id) && !_savedDraftIds.contains(id)) _savedDraftIds << id;
+            saved << ids;
+        } catch (const std::exception& error) {
+            for (const auto& id : ids) _brush->finalizationFailed(id, QString::fromUtf8(error.what()));
+            errors << tr("point collections: %1").arg(QString::fromUtf8(error.what()));
+        }
+    }
+    if (!errors.isEmpty()) {
+        QMessageBox::warning(this, tr("Cannot save Spiral drawings"), errors.join(QStringLiteral("\n")));
+        return;
+    }
+    statusBar()->showMessage(saved.isEmpty() ? tr("No Spiral drawings to save")
+                                             : tr("Saved %n drawing(s) to the object store", nullptr, int(saved.size())),
+                             10000);
+    if (updateAfter) _panel->requestInputUpdate();
 }
 
 bool SpiralWorkspace::hasPendingBrushWork() const

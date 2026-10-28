@@ -812,14 +812,15 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runLayout->addWidget(_fitInputs);
     describe(QStringLiteral("fit_inputs"), {_fitInputs});
 
-    auto* ephemeralLabel = new QLabel(tr("Local drafts (not part of the fit):"), runContents);
+    auto* ephemeralLabel = new QLabel(tr("Local drafts (saved to the object store, then part of the fit "
+                                         "at its next input update):"), runContents);
     _inputList = new QListWidget(runContents);
     _inputList->setObjectName(QStringLiteral("spiralInputList"));
     _inputList->setMaximumHeight(80);
     _inputList->setSelectionMode(QAbstractItemView::SingleSelection);
-    _commitInputs = new QPushButton(tr("Commit"), runContents);
+    _commitInputs = new QPushButton(tr("Save and Update Fit Inputs"), runContents);
     _commitInputs->setEnabled(false);
-    _addInputs = new QPushButton(tr("Add/Apply changes"), runContents);
+    _addInputs = new QPushButton(tr("Save Drafts to Store"), runContents);
     _removeInput = new QPushButton(tr("Remove"), runContents);
     _removeInput->setEnabled(false);
     _commitHint = new QLabel(runContents);
@@ -1159,28 +1160,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         else
             _service->rebuildSession(sessionRequest(), reloadInputs);
     });
-    connect(_updateInputs, &QPushButton::clicked, this, [this]() {
-        QJsonParseError error;
-        const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
-        if (error.error != QJsonParseError::NoError || !advanced.isObject()) {
-            QMessageBox::warning(this, tr("Invalid advanced configuration"),
-                                 tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
-            return;
-        }
-        if (_sessionState != QStringLiteral("Uninitialized") && _sessionState != QStringLiteral("Error")) {
-            const auto answer = QMessageBox::question(
-                this, tr("Update Fit Inputs"),
-                tr("Updating the inputs rebuilds the fit from a hub position including your saved "
-                   "edits, discarding what this session has trained. Continue?"));
-            if (answer != QMessageBox::Yes) return;
-        }
-        persist();
-        QJsonObject request = sessionRequest();
-        QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
-        paths.remove(QStringLiteral("checkpoint"));
-        request[QStringLiteral("paths")] = paths;
-        _service->updateFitInputs(request);
-    });
+    connect(_updateInputs, &QPushButton::clicked, this, [this]() { startInputUpdate(true); });
     connect(_service, &SpiralServiceManager::inputUpdateProgress, this,
             [this](const QString&, const QString& text) {
                 _inputUpdateText = text;
@@ -1689,9 +1669,23 @@ void SpiralPanel::setLossMapLegend(const QString& text)
 void SpiralPanel::setLocalDraftsReady(bool ready)
 {
     _localDraftsReady = ready;
-    // Drafts are kept for store-backed editing; none reaches a frozen fit.
-    if (_addInputs) _addInputs->setEnabled(false);
-    if (_commitInputs) _commitInputs->setEnabled(false);
+    updateDraftActions();
+    updatePositionSummary();
+}
+
+void SpiralPanel::updateDraftActions()
+{
+    // Saving needs only a writable store; the update needs the hub-bound
+    // service as well (the workspace and manager say why when not).
+    if (_addInputs) _addInputs->setEnabled(_localDraftsReady);
+    if (_commitInputs)
+        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().matches()
+                                  && _service->storeBinding().hosted() && _updateInputs
+                                  && _updateInputs->isEnabled());
+    if (_commitHint)
+        _commitHint->setText(_service->storeBinding().hosted()
+            ? tr("Saved drafts reach the fit at its next input update.")
+            : tr("Saved drafts reach the fit when it is rebuilt with current inputs."));
 }
 
 void SpiralPanel::setInputFreshness(const QString& text)
@@ -1860,6 +1854,35 @@ void SpiralPanel::updateObjectStoreSummary()
     _objectStoreSummary->setText(text);
 }
 
+void SpiralPanel::startInputUpdate(bool confirm)
+{
+    if (!_service->storeBinding().hosted()) {
+        _warnings->setText(tr("The Spiral service is not bound to a hub: saved edits reach the fit "
+                              "when it is rebuilt with current inputs"));
+        return;
+    }
+    QJsonParseError error;
+    const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
+    if (error.error != QJsonParseError::NoError || !advanced.isObject()) {
+        QMessageBox::warning(this, tr("Invalid advanced configuration"),
+                             tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
+        return;
+    }
+    if (confirm && _sessionState != QStringLiteral("Uninitialized") && _sessionState != QStringLiteral("Error")) {
+        const auto answer = QMessageBox::question(
+            this, tr("Update Fit Inputs"),
+            tr("Updating the inputs rebuilds the fit from a hub position including your saved "
+               "edits, discarding what this session has trained. Continue?"));
+        if (answer != QMessageBox::Yes) return;
+    }
+    persist();
+    QJsonObject request = sessionRequest();
+    QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
+    paths.remove(QStringLiteral("checkpoint"));
+    request[QStringLiteral("paths")] = paths;
+    _service->updateFitInputs(request);
+}
+
 void SpiralPanel::updatePositionSummary()
 {
     const auto& binding = _service->storeBinding();
@@ -1900,6 +1923,8 @@ void SpiralPanel::updatePositionSummary()
                             : QString())
                      + (binding.localPosition >= 0 ? tr("; synced to position %1").arg(binding.localPosition)
                                                    : QString());
+    if (_localDraftsReady)
+        lines << tr("Unsaved drawings in this workspace: save them to the store to include them");
     if (!_inputUpdateText.isEmpty()) lines << _inputUpdateText;
     _positionSummary->setText(lines.join(QStringLiteral("\n")));
     _positionSummary->setVisible(!lines.isEmpty());
@@ -2476,12 +2501,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             if (!present.contains(id)) delete _inputItems.take(id);
         refreshInputVisibility();
     }
-    const bool commitAvailable = status.value(QStringLiteral("commit_available")).toBool();
-    // A resident fit's inputs are frozen: nothing here changes them.
-    Q_UNUSED(commitAvailable);
-    _commitInputs->setEnabled(false);
-    _addInputs->setEnabled(false);
-    _commitHint->setText(_service->inputsFrozenMessage());
+    updateDraftActions();
 }
 
 void SpiralPanel::setSessionCheckpoint(const QString& hostPath)

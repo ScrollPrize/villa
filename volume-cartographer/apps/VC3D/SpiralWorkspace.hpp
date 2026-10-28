@@ -214,11 +214,21 @@ private:
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveFiberBaseShape(QString* errorMessage) const;
     void updatePreviewCoordinateScale();
-    void submitReadyDrafts(bool commitAfterAdd);
+    // Save the brush's ready drafts into the attached store (store-backed
+    // edits); ``updateAfter`` then runs Update Fit Inputs.
+    void submitReadyDrafts(bool updateAfter);
     void discardBrushWork();
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void pruneBrushPreviewSurfaces();
     QSet<QString> _retainedBrushPreviewIds;
+    // Brush patches saved to the store, by gesture id, and drafts saved but
+    // not yet part of the fit (dropped once an input update includes them).
+    QHash<QString, std::string> _brushPatchUuids;
+    QStringList _savedDraftIds;
+    QStringList _savedPatchIds;
+    // Those saved when the input update in flight began.
+    QStringList _updatingDraftIds;
+    QStringList _updatingPatchIds;
     void updateSurfaceIntersections();
     void ensureInitialFocus();
     void initializePreviewFocus();

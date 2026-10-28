@@ -64,6 +64,9 @@ public:
         QString operation;
         QString targetCollectionId;
         QString sourceIdentity;
+        // The edited collection itself (its points' source ids included),
+        // when it came from the point-collection editor.
+        std::optional<vc3d::spiral::EditablePclDraft> draft;
     };
 
     explicit SpiralBrushController(QObject* parent = nullptr);

@@ -2,10 +2,9 @@
 
 QString SpiralServiceManager::inputsFrozenMessage()
 {
-    return tr("Fit inputs come from the service's object store and are frozen for this "
-              "fit. Edit patches, point collections and fibers in the store, then use "
-              "Rebuild Fit to read them; editing them from this workspace arrives with "
-              "store-backed editing.");
+    return tr("Fit inputs come from the object store, and a resident fit keeps the inputs it "
+              "read. Save edits to the store, then use Update Fit Inputs (or, for a service "
+              "without a hub, Rebuild Fit with current inputs) to fit them.");
 }
 
 void SpiralServiceManager::claimSessionLease()

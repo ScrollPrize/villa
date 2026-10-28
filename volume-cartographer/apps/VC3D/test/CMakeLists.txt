@@ -210,6 +210,17 @@ add_test(NAME spiral_store_inputs COMMAND test_spiral_store_inputs)
 vc_register_test_target(test_spiral_store_inputs)
 vc_register_ctest(spiral_store_inputs test_spiral_store_inputs)
 
+add_executable(test_spiral_store_edits
+    test_spiral_store_edits.cpp
+    ../SpiralStoreEdits.cpp ../SpiralStoreEdits.hpp
+    ../SpiralPointCollectionEdit.cpp ../SpiralPointCollectionEdit.hpp)
+target_include_directories(test_spiral_store_edits PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_spiral_store_edits PRIVATE vc_core Qt6::Core Qt6::Gui Qt6::Test opencv_core)
+add_test(NAME spiral_store_edits COMMAND test_spiral_store_edits)
+vc_register_test_target(test_spiral_store_edits)
+vc_register_ctest(spiral_store_edits test_spiral_store_edits)
+
 add_executable(test_spiral_preview_provenance
     test_spiral_preview_provenance.cpp)
 

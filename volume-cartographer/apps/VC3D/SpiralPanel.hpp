@@ -48,6 +48,8 @@ public:
     void setLossMapLegend(const QString& text);
     void setLocalPatchDrafts(const QJsonArray& drafts);
     void setLocalDraftsReady(bool ready);
+    // Update Fit Inputs, as its button does (after saving drafts).
+    void requestInputUpdate() { startInputUpdate(true); }
     // Whether the store still holds the fitted inputs as fitted, and what
     // changed since; shown with the session's input summary.
     void setInputFreshness(const QString& text);
@@ -177,6 +179,8 @@ private:
     QLabel* _positionSummary = nullptr;
     QString _inputUpdateText;
     void updatePositionSummary();
+    void startInputUpdate(bool confirm);
+    void updateDraftActions();
     QPushButton* _run = nullptr;
     QCheckBox* _dtLossScheduleEnabled = nullptr;
     QSpinBox* _dtLossLastPct = nullptr;
