@@ -372,6 +372,16 @@ class SpiralInputPaths:
         return asdict(self)
 
 
+def lasagna_normal_inputs(normal_x, normal_y, group, scale):
+    """A fit's lasagna normals as object_store_inputs.fiber_normal_source
+    takes them, or None when it loads none: the normal stores, their group
+    and its downsampling relative to the fit volume."""
+    if not (normal_x and normal_y):
+        return None
+    return {'normal_x': normal_x, 'normal_y': normal_y,
+            'group': group, 'scale': scale}
+
+
 # Run-block keys the scroll specification owns, mapped to the ScrollSpec field
 # each one used to shadow. A request that carries one is rejected rather than
 # ignored: silently dropping it would let a client believe it had renamed a

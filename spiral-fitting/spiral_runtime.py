@@ -489,6 +489,59 @@ class DiscardCheckpointCommand(SessionCommand):
     kind: ClassVar[str] = "discard_checkpoint"
 
 
+def merge_session_config(checkpoint, run_config, warn):
+    """The configuration a session build resolves before count scaling.
+
+    The Python defaults, then the resume ``checkpoint``'s stored ``cfg``
+    (tolerated, with ``warn`` naming dropped and defaulted keys), the run
+    window, then the request's known advanced overrides (``warn`` names
+    unknown ones). Returns ``(config, checkpoint profile config or None,
+    advanced overrides)``. Shared by the build and by the service's input
+    preparation, which must refresh links with the configuration the build
+    will apply.
+    """
+    config = Config().as_dict()
+    checkpoint_profile_config = None
+    if checkpoint:
+        from checkpoint_io import load_checkpoint_cpu
+        checkpoint_config = load_checkpoint_cpu(checkpoint)
+        try:
+            if not isinstance(checkpoint_config, dict) or not isinstance(
+                    checkpoint_config.get('cfg'), Mapping):
+                raise ValueError("Checkpoint has no current Spiral configuration")
+            # Dropped and defaulted keys are tolerated and reported;
+            # only an invalid stored value refuses.
+            durable, notes = tolerate_config(
+                checkpoint_config['cfg'], defaults=config)
+            for note in notes:
+                warn(f"Checkpoint {checkpoint} {note}")
+            durable = Config(durable).as_dict()
+            # Keep the durable configuration aligned with the canonical
+            # run window. The service restores a newly loaded checkpoint's
+            # range into this run block; later dock edits remain free to
+            # choose a narrower or otherwise compatible window.
+            durable["z_begin"] = int(run_config.z_begin)
+            durable["z_end"] = int(run_config.z_end)
+            config.update(durable)
+            # The session-scoped profile initially reproduces the
+            # checkpoint without applying scaling twice.
+            checkpoint_profile_config = copy.deepcopy(durable)
+        finally:
+            # This first load exists only to resolve configuration.  Do
+            # not retain a complete model + optimiser checkpoint.
+            del checkpoint_config
+    # The canonical run window (the request normally, or the restored
+    # checkpoint window above) owns the applied configuration and Default
+    # profile.
+    config["z_begin"] = int(run_config.z_begin)
+    config["z_end"] = int(run_config.z_end)
+    # Saved workspace overrides may outlive any setting in the schema.
+    # Report and remove unknown keys before applying overrides or counts.
+    advanced_config = filter_known_config_keys(
+        run_config.config, config, label="advanced config", warn=warn)
+    return config, checkpoint_profile_config, advanced_config
+
+
 class InteractiveFitSession:
     def __init__(self, paths: SpiralInputPaths, run: SpiralRunConfig,
                  preview: SpiralPreviewConfig, scroll: ScrollSpec,
@@ -849,57 +902,17 @@ class InteractiveFitSession:
         """
         from spiral_helpers import scale_and_split_counts
 
-        config = Config().as_dict()
-        checkpoint_profile_config = None
-        if self.paths.checkpoint:
-            self._progress_reporter().begin(
-                "loading", "Reading checkpoint configuration",
-                detail=Path(self.paths.checkpoint).name)
-            from checkpoint_io import load_checkpoint_cpu
-            checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
-            try:
-                if not isinstance(checkpoint_config, dict) or not isinstance(
-                        checkpoint_config.get('cfg'), Mapping):
-                    raise ValueError("Checkpoint has no current Spiral configuration")
-                # Dropped and defaulted keys are tolerated and reported;
-                # only an invalid stored value refuses.
-                durable, notes = tolerate_config(
-                    checkpoint_config['cfg'], defaults=config)
-                for note in notes:
-                    warning = f"Checkpoint {self.paths.checkpoint} {note}"
-                    print(warning)
-                    with self._condition:
-                        self._warnings.append(warning)
-                durable = Config(durable).as_dict()
-                # Keep the durable configuration aligned with the canonical
-                # run window. The service restores a newly loaded checkpoint's
-                # range into this run block; later dock edits remain free to
-                # choose a narrower or otherwise compatible window.
-                durable["z_begin"] = int(self.run_config.z_begin)
-                durable["z_end"] = int(self.run_config.z_end)
-                config.update(durable)
-                # The session-scoped profile initially reproduces the
-                # checkpoint without applying scaling twice.
-                checkpoint_profile_config = copy.deepcopy(durable)
-            finally:
-                # This first load exists only to resolve configuration.  Do
-                # not retain a complete model + optimiser checkpoint for the
-                # lifetime of the resident fitter thread.
-                del checkpoint_config
-        # The canonical run window (the request normally, or the restored
-        # checkpoint window above) owns the applied configuration and Default
-        # profile.
-        config["z_begin"] = int(self.run_config.z_begin)
-        config["z_end"] = int(self.run_config.z_end)
-        # Saved workspace overrides may outlive any setting in the schema.
-        # Report and remove unknown keys before applying overrides or counts.
         def warn(warning):
             print(warning)
             with self._condition:
                 if warning not in self._warnings:
                     self._warnings.append(warning)
-        advanced_config = filter_known_config_keys(
-            self.run_config.config, config, label="advanced config", warn=warn)
+        if self.paths.checkpoint:
+            self._progress_reporter().begin(
+                "loading", "Reading checkpoint configuration",
+                detail=Path(self.paths.checkpoint).name)
+        config, checkpoint_profile_config, advanced_config = merge_session_config(
+            self.paths.checkpoint, self.run_config, warn)
         if checkpoint_profile_config is not None:
             default_advanced_config = checkpoint_profile_config
         else:

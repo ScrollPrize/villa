@@ -46,7 +46,7 @@ from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
 from devices import fit_device
 from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS,
-                         fit_input, input_source_enabled,
+                         fit_input, input_source_enabled, lasagna_normal_inputs,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
 
@@ -1664,11 +1664,9 @@ class FitContext:
     def _lasagna_normal_inputs(self):
         """The fit's lasagna normals as object_store_inputs.fiber_normal_source
         takes them, or None when the fit loads none."""
-        if not (self.normal_nx_zarr_path and self.normal_ny_zarr_path):
-            return None
-        return {'normal_x': self.normal_nx_zarr_path,
-                'normal_y': self.normal_ny_zarr_path,
-                'group': self.normal_zarr_group, 'scale': self.lasagna_scale}
+        return lasagna_normal_inputs(
+            self.normal_nx_zarr_path, self.normal_ny_zarr_path,
+            self.normal_zarr_group, self.lasagna_scale)
 
     def _external_input_frames(self):
         """Frames of the inputs read outside the object store, for the input
