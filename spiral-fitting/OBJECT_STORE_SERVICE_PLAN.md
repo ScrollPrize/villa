@@ -10,7 +10,9 @@ sources are then addressed by array path rather than multiscales index
 on 2026-10-27 (`0ed53d4ce`, `6221efeba`, `0061bc9b8`); step 4's re-ingest and
 CPU startup smoke are recorded in the CLI acceptance notes. Stage 1 is now
 implemented; its steps 13–14 record below includes the real-data 1,000-step
-service fit, checkpoint and preview acceptance. Stage 2 remains planned.
+service fit, checkpoint and preview acceptance. Stage 2 is implemented except
+step 4 (hub crash recovery, owned by `vc_object_store` separately); see its
+record at the end.
 
 The CLI acceptance notes record a real-data, single-GPU 1,000-step fit with no
 patch/fiber/PCL files, finite losses, complete provenance and matching no-refresh
@@ -1097,6 +1099,89 @@ Stage 2b:
 
 Later work: diff-based incremental materialization; automatic Update fit
 inputs; storing Spiral results as store objects.
+
+### Stage 2 implementation record (2026-10-28)
+
+Commits on `spiral-object-store` (not pushed), in order:
+
+- Store (steps 1–3, 5): `b5ed834b2` hub positions in sync reports and
+  statuses, `hub_publications` (position → publication time) written by
+  every journaling hub write, `readHubPosition`, `PushHold`, conditional
+  `hubPush(expectedHead)` with lost-response recovery; `32f8b0c42` read-only
+  replicas read positions, a no-op retry recovers its own publication;
+  `6504d0f9e` session status names its hub; `f379073e9` `hubJournal`;
+  `43d67591e` fixes a use-after-free in the session worker's conflict
+  resolution (found by the conflict acceptance test); `c5c3f0fb5` docs.
+- Step 2 investigation outcome: a position is read through the hub's own
+  history (`revisionSelectionAt` at the publication's time, then
+  `relationshipsAt`/`objectRevision` on the hub), not by importing history
+  into the replica. Records are small and the reader has just contacted the
+  hub; geometry revisions are shared and read locally, and a read refuses a
+  position whose geometry the replica has not pulled. A replica-local import
+  would duplicate history with conflicting revision identities. Resuming at a
+  position therefore needs the hub to be reachable.
+- Adapter (steps 6–7): `6b17a8984` `InputPosition` in requests and manifests
+  (outside the digest), link parameters and normal source recorded,
+  `stale_link_reasons`, `prepare_position`.
+- 2a service (8–9): `c04bb94c3` shared config merge and lasagna inputs,
+  `cd8526db9` `--object-store-hub`, builds at linked, pinned positions before
+  teardown, checkpoint resume at its position (API 37).
+- 2a VC3D (10–12): `d3fea3432` hub profiles, separate local service replica,
+  Host Object Store Locally, Clone the Service's Hub, Update Fit Inputs;
+  `d10969011` store-backed brush/PCL saves (`SpiralStoreEdits`) and the four
+  states; `f83f7ec27` conflict-blocking protocol test.
+- 2a provenance (13): `d3b31f39b`, `633f1fd8f`.
+- 2b (15–18): `7a64c111f` mechanical split of `load_host_inputs`;
+  `50b2cb952` `FitContext.prepare_input_replacement`/`replace_inputs`;
+  `5603117da` prepare/install/publish runtime commands and coordinators;
+  `d004b35ba` `POST /session/update-inputs` (API 38); `cd03c8615` VC3D in
+  place (kApiVersion 38).
+- 19: `2fe7681db` upload refusal no longer cites frozen inputs (code
+  `inputs_in_object_store`), README; `ac3be576f` VC3D message and docs.
+  `inputs_frozen` remains a capability, true for a service without a hub.
+
+Deviations: track exclusion masks with `track_exclusion_radius > 0` depend on
+the inputs' trusted geometry and are refused for in-place updates (rebuild
+instead). A failed session after an update is recovered through the existing
+rebuild/checkpoint paths. A plain (non-hub) store keeps stage 1's frozen
+semantics rather than being removed.
+
+Acceptance (Linux, RTX 3090 shared with another job; stage 0 acceptance store
+copied as a hub; dataset dir with spiral-scroll.json, umbilicus.json,
+lasagna_inputs, outer_shell, fiber_directions.npz; z 8900–9300):
+
+- 2a over a real SSH hub (`sftp://wari/...`, scratch driver `real_2a.py`):
+  VC3D-role replica and service replica both cloned over SFTP; initialize at
+  head 2881 linked 553 PCL-patch, 6 fiber-patch and 444 overlap links and
+  pinned 3884; 300 iterations and a preview; a surface's erosion and a
+  collection's sampling group edited, pushed to M = 3886; an update request
+  for a position the hub never reached was refused with the fit Idle and
+  unchanged; rebuild at M pinned N = 3886 (no new links), the fitted manifest
+  carried both edits, the client pulled to 3886; 300 more iterations and a
+  preview. VC3D's `SpiralStoreInputs` (SPIRAL_STORE_INPUTS_DUMP) resolved all
+  954 objects and 1,103 links as fitted in the client replica.
+- 2b on GPU (`tests/input_update_driver.py`, in-process ServiceState): after
+  300 iterations an editor retired a fitted surface (keeping its links as
+  recorded) and edited a collection, pushed to 3886; the in-place update
+  (9.2 s) relinked and pinned 4534; patches 181 → 180; model parameters,
+  optimiser state, scheduler state and iteration bitwise unchanged, same
+  objects; device memory 737.4 MB before, peak +48.9 MB (theta topology and
+  staging; atlases 11.5 MB each), 737.4 MB after. 300 more iterations, loss
+  49.8, finite; previews indexed at positions 3884 and 4534; checkpoint
+  records 4534; a refused update (linking) left the fit Idle, digest unchanged,
+  training on; a simulated allocation failure after release put the session
+  in Error with `recovery_required`, and a rebuild from the checkpoint resumed
+  at 4534 with the same digest and iteration 600.
+- Suites: store ctest 16/16 (with `object_store_hub_positions`), store Python
+  136; spiral-fitting position/update/service/runtime suites; VC3D `ctest -R
+  spiral` 10/10 (with `spiral_store_edits` and the hub protocol test),
+  `VC3D --test-object-store`.
+
+Not run: two-rank GPU updates (one GPU; two gloo ranks and the coordinator's
+decisions are tested on the CPU); step 4's crash recovery and an interrupted
+hub transaction; a hub on a different host from the service; interactive VC3D
+GUI inspection (the VC3D client code ran in the protocol tests, against the
+fixture service).
 
 ## Implementation and validation workflow
 
