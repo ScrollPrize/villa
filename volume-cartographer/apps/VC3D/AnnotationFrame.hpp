@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include <optional>
+#include "vc/core/util/Rect3D.hpp"
 
 namespace vc3d::annotation {
 
@@ -25,6 +26,33 @@ struct AnnotationFrame {
     // not counts in this frame.
     std::array<double, 3> extentXyz{0.0, 0.0, 0.0};
 };
+
+inline bool hasCoordinateFrame(const AnnotationFrame& frame)
+{
+    return std::isfinite(frame.factor) && frame.factor > 0.0 &&
+        std::all_of(frame.extentXyz.begin(), frame.extentXyz.end(),
+                    [](double extent) { return std::isfinite(extent) && extent > 0.0; });
+}
+
+// Persist in the source annotation grid, but keep viewer APIs in volume voxels.
+// No volume (or an unresolved frame) means no usable mask, not a guessed scale.
+inline std::optional<Rect3D> focusBoundsInAnnotationFrame(
+    const std::optional<Rect3D>& bounds, const AnnotationFrame& frame)
+{
+    if (!bounds || !hasCoordinateFrame(frame))
+        return std::nullopt;
+    return Rect3D{bounds->low * static_cast<float>(frame.factor),
+                  bounds->high * static_cast<float>(frame.factor)};
+}
+
+inline std::optional<Rect3D> focusBoundsInVolume(
+    const std::optional<Rect3D>& bounds, const AnnotationFrame& frame)
+{
+    if (!bounds || !hasCoordinateFrame(frame))
+        return std::nullopt;
+    return Rect3D{bounds->low / static_cast<float>(frame.factor),
+                  bounds->high / static_cast<float>(frame.factor)};
+}
 
 // Resolves that frame from what a volume can report about itself:
 // `volumeVoxelSizeUm` and `volumeDimsXyz` are the store's own,

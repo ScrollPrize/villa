@@ -2,6 +2,7 @@
 
 #include "vc/lasagna/Manifest.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -11,6 +12,20 @@
 #include <vector>
 
 namespace vc3d::line_annotation {
+
+// A viewer-created fiber uses the viewer's volume grid, not an inferred
+// level-0 grid (whose dimensions cannot be recovered exactly by scaling).
+inline std::array<std::size_t, 3> fiberCoordinateShapeFromVolume(
+    const std::array<int, 3>& shapeZYX)
+{
+    std::array<std::size_t, 3> result{};
+    for (std::size_t axis = 0; axis < result.size(); ++axis) {
+        if (shapeZYX[axis] <= 0)
+            throw std::runtime_error("Fiber creation requires a positive volume shape");
+        result[axis] = static_cast<std::size_t>(shapeZYX[axis]);
+    }
+    return result;
+}
 
 struct FiberNormalCoordinateScales {
     double fiberBaseToNormalBase = 1.0;
@@ -67,26 +82,6 @@ inline FiberNormalCoordinateScales resolveFiberNormalCoordinateScales(
         fiberBaseToNormalBase,
         traceToNormalBase,
     };
-}
-
-// Manifest locations to consult, in order, for a fiber that does not store
-// its own coordinate base shape: the manifest its trace spans recorded, then
-// the package's selected fiber-inference dataset. Older fibers recorded
-// absolute manifest paths that may since have moved, so the package selection
-// (which is what traces them today) is the fallback.
-inline std::vector<std::string> fiberBaseShapeManifestCandidates(
-    const std::string& fiberManifestLocation,
-    const std::string& selectedFiberInferenceDataset)
-{
-    std::vector<std::string> candidates;
-    if (!fiberManifestLocation.empty()) {
-        candidates.push_back(fiberManifestLocation);
-    }
-    if (!selectedFiberInferenceDataset.empty() &&
-        selectedFiberInferenceDataset != fiberManifestLocation) {
-        candidates.push_back(selectedFiberInferenceDataset);
-    }
-    return candidates;
 }
 
 } // namespace vc3d::line_annotation

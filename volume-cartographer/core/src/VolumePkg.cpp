@@ -522,6 +522,13 @@ utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags)
     const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
     if (!nameTag.empty())
         metadata["name"] = nameTag;
+    // Only the native source scan owns the catalog ID. Predictions and
+    // rebased source views also carry this tag, but have distinct identities
+    // and coordinate frames. Apply this on every open, including saved projects.
+    const auto catalogId = tagValueWithPrefix(tags, "vc-open-data-volume-id:");
+    if (!catalogId.empty() &&
+        std::find(tags.begin(), tags.end(), "vc-open-data-preferred-source") != tags.end())
+        metadata["uuid"] = catalogId;
     return metadata;
 }
 
@@ -1595,7 +1602,7 @@ bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
         const auto candidate = base / volumeDirName;
         if (!isSingleZarrVolumeDir(candidate)) continue;
         try {
-            auto v = Volume::New(candidate);
+            auto v = Volume::New(candidate, vc::project::volumeMetadataFromEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) return false;
             loadedVolumes_.emplace(id, v);
@@ -1631,11 +1638,15 @@ bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
     auto it = loadedVolumes_.find(volumeId);
     if (it == loadedVolumes_.end() || !it->second) return false;
     const auto vp = it->second->path();
+    std::vector<std::string> tags;
+    if (const auto t = volumeTagsByID_.find(volumeId); t != volumeTagsByID_.end()) tags = t->second;
     loadedVolumes_.erase(it);
     volumeTagsByID_.erase(volumeId);
     try {
-        auto v = Volume::New(vp);
-        loadedVolumes_.emplace(v->id(), v);
+        auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(tags));
+        const auto id = v->id();
+        loadedVolumes_.emplace(id, v);
+        if (!tags.empty()) volumeTagsByID_[id] = tags;
         return true;
     } catch (const std::exception& ex) {
         Logger()->warn("reloadSingleVolume('{}'): {}", volumeId, ex.what());
@@ -2033,7 +2044,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     }
     auto loadOne = [&](const fs::path& vp) {
         try {
-            auto v = Volume::New(vp);
+            auto v = Volume::New(vp, vc::project::volumeMetadataFromEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());
@@ -2232,6 +2243,21 @@ void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
     }
 }
 
+void VolumePkg::setFocusBounds(std::optional<Rect3D> bounds, bool enabled)
+{
+    if (bounds) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(bounds->low[axis]) || !std::isfinite(bounds->high[axis]))
+                throw std::invalid_argument("Project focus bounds must be finite");
+            if (bounds->low[axis] > bounds->high[axis])
+                std::swap(bounds->low[axis], bounds->high[axis]);
+        }
+    }
+    focusBounds_ = bounds;
+    focusBoundsEnabled_ = enabled && bounds.has_value();
+    persistProjectState();
+}
+
 utils::Json VolumePkg::toJson() const
 {
     auto j = utils::Json::object();
@@ -2245,6 +2271,17 @@ utils::Json VolumePkg::toJson() const
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
     if (umbilicus_) j["umbilicus"] = *umbilicus_;
+    if (focusBounds_) {
+        auto low = utils::Json::array();
+        auto high = utils::Json::array();
+        for (int axis = 0; axis < 3; ++axis) {
+            low.push_back(double(focusBounds_->low[axis]));
+            high.push_back(double(focusBounds_->high[axis]));
+        }
+        j["focus_bounds"] = {{"enabled", focusBoundsEnabled_},
+                             {"coordinate_frame", "annotation"},
+                             {"low_xyz", low}, {"high_xyz", high}};
+    }
     return j;
 }
 
@@ -2252,6 +2289,26 @@ void VolumePkg::fromJson(const utils::Json& j)
 {
     name_ = j.value("name", std::string("Untitled"));
     version_ = j.value("version", 1);
+    focusBounds_.reset();
+    focusBoundsEnabled_ = false;
+    if (j.contains("focus_bounds")) {
+        const auto saved = j.at("focus_bounds");
+        if (saved.value("coordinate_frame", std::string{}) != "annotation")
+            throw std::invalid_argument("Project focus bounds must declare coordinate_frame 'annotation'");
+        const auto low = saved.at("low_xyz").get_double_array();
+        const auto high = saved.at("high_xyz").get_double_array();
+        if (low.size() != 3 || high.size() != 3)
+            throw std::invalid_argument("Project focus bounds must contain three XYZ coordinates");
+        Rect3D bounds;
+        for (int axis = 0; axis < 3; ++axis) {
+            bounds.low[axis] = std::min(low[axis], high[axis]);
+            bounds.high[axis] = std::max(low[axis], high[axis]);
+            if (!std::isfinite(bounds.low[axis]) || !std::isfinite(bounds.high[axis]))
+                throw std::invalid_argument("Project focus bounds must be finite");
+        }
+        focusBounds_ = bounds;
+        focusBoundsEnabled_ = saved.value("enabled", false);
+    }
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
     if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));

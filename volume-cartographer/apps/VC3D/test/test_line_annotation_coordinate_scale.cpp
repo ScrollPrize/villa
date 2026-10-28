@@ -6,44 +6,23 @@ class TestLineAnnotationCoordinateScale : public QObject {
     Q_OBJECT
 
 private slots:
+    void stampsExactViewerGrid();
     void acceptsSameLevelOffByOneDomains();
     void acceptsDyadicNormalAndFiberDomains();
     void mapsFiberBaseCoordinatesIntoDownsampledVolume();
     void preservesLegacyUnspecifiedDomains();
     void rejectsIncompatibleDomains();
-    void ordersManifestCandidatesFiberFirstThenSelection();
-    void omitsEmptyAndDuplicateManifestCandidates();
 };
 
-void TestLineAnnotationCoordinateScale::ordersManifestCandidatesFiberFirstThenSelection()
+void TestLineAnnotationCoordinateScale::stampsExactViewerGrid()
 {
-    // A fiber without a stored base shape names the manifest its trace spans
-    // used; that path may have moved, so the package's selected
-    // fiber-inference dataset follows it as the fallback.
-    const auto candidates =
-        vc3d::line_annotation::fiberBaseShapeManifestCandidates(
-            "/old/volpkg/fibers/a.lasagna.json",
-            "fiber_zarrs/a.lasagna.json");
-
-    QCOMPARE(candidates.size(), std::size_t{2});
-    QCOMPARE(candidates[0], std::string{"/old/volpkg/fibers/a.lasagna.json"});
-    QCOMPARE(candidates[1], std::string{"fiber_zarrs/a.lasagna.json"});
-}
-
-void TestLineAnnotationCoordinateScale::omitsEmptyAndDuplicateManifestCandidates()
-{
-    QVERIFY(vc3d::line_annotation::fiberBaseShapeManifestCandidates("", "").empty());
-
-    const auto selectionOnly =
-        vc3d::line_annotation::fiberBaseShapeManifestCandidates(
-            "", "fiber_zarrs/a.lasagna.json");
-    QCOMPARE(selectionOnly.size(), std::size_t{1});
-    QCOMPARE(selectionOnly[0], std::string{"fiber_zarrs/a.lasagna.json"});
-
-    const auto same =
-        vc3d::line_annotation::fiberBaseShapeManifestCandidates(
-            "fiber_zarrs/a.lasagna.json", "fiber_zarrs/a.lasagna.json");
-    QCOMPARE(same.size(), std::size_t{1});
+    using vc3d::line_annotation::fiberCoordinateShapeFromVolume;
+    const std::array<std::size_t, 3> expected{18946, 8174, 8174};
+    QVERIFY(fiberCoordinateShapeFromVolume({18946, 8174, 8174}) == expected);
+    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({0, 8174, 8174}),
+                             std::runtime_error);
+    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({18946, -1, 8174}),
+                             std::runtime_error);
 }
 
 void TestLineAnnotationCoordinateScale::mapsFiberBaseCoordinatesIntoDownsampledVolume()

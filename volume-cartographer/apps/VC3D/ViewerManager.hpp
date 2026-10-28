@@ -122,8 +122,8 @@ public:
     const std::string& overlayColormap() const { return _overlayColormapId; }
     void setOverlaySamplingMethod(vc::Sampling method);
     vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
-    void setOverlayThreshold(float threshold);
-    float overlayThreshold() const { return _overlayWindowLow; }
+    void setOverlayIntensityAsAlpha(bool enabled);
+    bool overlayIntensityAsAlpha() const { return _overlayIntensityAsAlpha; }
 
     void setOverlayWindow(float low, float high);
     float overlayWindowLow() const { return _overlayWindowLow; }
@@ -335,6 +335,7 @@ private:
     vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    bool _overlayIntensityAsAlpha{false};
     int _overlayMaxDisplayedResolution{0};
     OverlayCompositeSettings _overlayComposite;
     float _volumeWindowLow{0.0f};

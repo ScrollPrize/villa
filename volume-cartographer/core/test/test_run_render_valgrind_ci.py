@@ -18,6 +18,49 @@ SPEC.loader.exec_module(DRIVER)
 
 
 class RenderValgrindCiTest(unittest.TestCase):
+    def test_reference_failure_retries_fresh_capture_at_most_twice(self):
+        for passes_on in (1, 2, 3, None):
+            with self.subTest(passes_on=passes_on), tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
+                args = SimpleNamespace(case_dir=Path(root), valgrind="valgrind",
+                                       benchmark="benchmark", replay="replay", model=Path("model.json"),
+                                       fixture="parallel", scenario="mixed_shuffled",
+                                       reference=Path("reference.json"), reuse_capture=True)
+                capture = args.case_dir / "callgrind"
+                capture.mkdir()
+                (capture / "collected.stamp").touch()
+                (args.case_dir / "evaluation.json").write_text("{}")
+                captures = gates = 0
+
+                def run(command, **kwargs):
+                    nonlocal captures, gates
+                    if command[0] == "valgrind":
+                        captures += 1
+                        self.assertFalse((capture / "collected.stamp").exists())
+                        self.assertFalse((args.case_dir / "evaluation.json").exists())
+                        return SimpleNamespace(returncode=0)
+                    output = Path(command[command.index("--output") + 1])
+                    if "--reference" in command:
+                        gates += 1
+                        if gates != passes_on:
+                            output.with_name("checked.failed.json").write_text('{"status":"failed"}')
+                            return SimpleNamespace(returncode=1)
+                    output.write_text("{}")
+                    return SimpleNamespace(returncode=0)
+
+                with patch.object(DRIVER.subprocess, "run", side_effect=run):
+                    if passes_on is None:
+                        with self.assertRaisesRegex(RuntimeError, "after 3 attempts"):
+                            DRIVER.collect_evaluate(args)
+                    else:
+                        DRIVER.collect_evaluate(args)
+                self.assertEqual(gates, passes_on or 3)
+                self.assertEqual(captures, (passes_on or 3) - 1)
+                self.assertEqual((args.case_dir / "checked.json").exists(), passes_on is not None)
+                for attempt in range(1, (passes_on or 4)):
+                    failed = args.case_dir / f"failed-gate-attempt-{attempt}"
+                    self.assertTrue((failed / "checked.failed.json").is_file())
+                    self.assertTrue((failed / "evaluation.json").is_file())
+
     def test_capture_retries_start_fresh_and_stop_at_first_valid_evaluation(self):
         for failure in ("collect", "evaluate"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=Path.cwd()) as root:

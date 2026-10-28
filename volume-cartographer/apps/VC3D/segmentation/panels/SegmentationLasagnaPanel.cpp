@@ -468,14 +468,15 @@ struct AtlasRequestArtifacts
 bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
                                 const std::filesystem::path& volpkgRootIn,
                                 AtlasRequestArtifacts* out,
-                                QString* error)
+                                QString* error,
+                                std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     if (!out) {
         return false;
     }
     vc::atlas::LasagnaAtlasExport atlasExport;
     try {
-        atlasExport = vc::atlas::loadLasagnaAtlasExport(atlasDir, volpkgRootIn);
+        atlasExport = vc::atlas::loadLasagnaAtlasExport(atlasDir, volpkgRootIn, store);
     } catch (const std::exception& ex) {
         if (error) {
             *error = QString::fromStdString(ex.what());
@@ -2299,7 +2300,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
     AtlasRequestArtifacts artifacts;
     QString error;
     const std::filesystem::path atlasDir(_atlasDirPath.toStdString());
-    if (!buildAtlasRequestArtifacts(atlasDir, volpkgRootForState(state), &artifacts, &error)) {
+    if (!buildAtlasRequestArtifacts(atlasDir, volpkgRootForState(state), &artifacts, &error, state->objectStoreSession())) {
         showLasagnaConfigError(error, statusBar, 7000, presentation);
         return SubmissionResult::failure(error);
     }
@@ -2865,7 +2866,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
                     std::filesystem::path(_atlasDirPath.toStdString()),
                     volpkgRootForState(state),
                     &atlasArtifacts,
-                    &atlasError)) {
+                    &atlasError, state->objectStoreSession())) {
                 for (const QJsonValue& value : atlasArtifacts.uploads) {
                     const QJsonObject upload = value.toObject();
                     const QJsonObject ref = upload[QStringLiteral("object")].toObject();

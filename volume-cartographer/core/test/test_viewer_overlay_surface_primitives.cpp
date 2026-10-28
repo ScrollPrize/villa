@@ -10,7 +10,6 @@
 #include "ViewerManager.hpp"
 #include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/AtlasOverlayController.hpp"
-#include "overlays/FiberOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -155,7 +154,7 @@ public:
     void setOverlayOpacity(float) override {}
     void setOverlayColormap(const std::string&) override {}
     void setOverlaySamplingMethod(vc::Sampling) override {}
-    void setOverlayThreshold(float) override {}
+    void setOverlayIntensityAsAlpha(bool) override {}
     void setOverlayWindow(float, float) override {}
     void setOverlayMaxDisplayedResolution(int) override {}
     void setOverlayComposite(const OverlayCompositeSettings&) override {}
@@ -649,133 +648,6 @@ private slots:
         QCOMPARE(normal, 1);
         QCOMPARE(selected, 1);
         QCOMPARE(selectedPosition, viewer.surfaceCoordsToScene(10.0f, 20.0f));
-    }
-
-    void fiberStylesUseDistinctMatchingColors()
-    {
-        const QColor first = FiberOverlayController::fiberColor(1);
-        const QColor second = FiberOverlayController::fiberColor(2);
-        QVERIFY(first.isValid());
-        QVERIFY(second.isValid());
-        QVERIFY(first != second);
-
-        const auto style = FiberOverlayController::fiberStyle(first, 25.0f);
-        QCOMPARE(style.color, first);
-        QCOMPARE(style.pointBorderColor, first);
-        QCOMPARE(style.distanceTolerance, 25.0f);
-    }
-
-    void fiberOverlayRetainsGraphicsItemsAcrossRefreshes()
-    {
-        FakeViewer viewer;
-        viewer.graphicsView()->resize(800, 600);
-        viewer.setSurfaceSceneTransform(1.0, QPointF{});
-        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
-            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
-
-        FiberOverlayController controller;
-        controller.attachViewer(&viewer);
-        controller.setChains({
-            FiberOverlayController::Chain{1, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}},
-            FiberOverlayController::Chain{2, {{0, 2, 0}, {1, 2, 0}, {2, 2, 0}}},
-        });
-        controller.setVisible(true);
-
-        const auto initialItems = viewer.scene().items();
-        QCOMPARE(initialItems.size(), 2);
-        const std::set<QGraphicsItem*> initialSet(initialItems.begin(), initialItems.end());
-        const QRectF initialBounds = viewer.scene().itemsBoundingRect();
-
-        controller.refreshViewer(&viewer);
-        const auto refreshedItems = viewer.scene().items();
-        const std::set<QGraphicsItem*> refreshedSet(refreshedItems.begin(), refreshedItems.end());
-        QCOMPARE(refreshedItems.size(), 2);
-        QVERIFY(refreshedSet == initialSet);
-
-        // Camera changes update the retained batches in place rather than
-        // replacing their QGraphicsItems.
-        viewer.setSurfaceSceneTransform(2.0, QPointF(20.0, 30.0));
-        controller.refreshViewer(&viewer);
-        const auto movedItems = viewer.scene().items();
-        const std::set<QGraphicsItem*> movedSet(movedItems.begin(), movedItems.end());
-        QCOMPARE(movedItems.size(), 2);
-        QVERIFY(movedSet == initialSet);
-        QVERIFY(viewer.scene().itemsBoundingRect() != initialBounds);
-
-        controller.setVisible(false);
-        QCOMPARE(viewer.scene().items().size(), 0);
-    }
-
-    void fiberOverlayUsesTheSameViewerScaleForDrawingAndHitTesting()
-    {
-        FakeViewer viewer;
-        viewer.graphicsView()->resize(800, 600);
-        viewer.setSurfaceSceneTransform(10.0, QPointF{1.0, 2.0});
-        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
-            cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
-
-        FiberOverlayController controller;
-        controller.attachViewer(&viewer);
-        controller.setViewerBaseToViewerFactor(&viewer, 0.25);
-        controller.setChains({
-            FiberOverlayController::Chain{7, {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}},
-        });
-        controller.setVisible(true);
-
-        QCOMPARE(controller.viewerBaseToViewerFactor(&viewer), 0.25);
-        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 11.0) < 0.75);
-        const auto hit = controller.hitTestControlPoint(
-            &viewer, QPointF{11.0, 2.0}, 1.0);
-        QVERIFY(hit.has_value());
-        QCOMPARE(hit->fiberId, uint64_t{7});
-        QCOMPARE(hit->controlPointIndex, 1);
-
-        controller.setViewerBaseToViewerFactor(&viewer, 0.5);
-        QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 21.0) < 0.75);
-        const auto movedHit = controller.hitTestControlPoint(
-            &viewer, QPointF{21.0, 2.0}, 1.0);
-        QVERIFY(movedHit.has_value());
-        QCOMPARE(movedHit->controlPointIndex, 1);
-    }
-
-    void fiberOverlayUsesTheOwningWorkspacePatchIndex()
-    {
-        cv::Mat_<cv::Vec3f> grid(30, 30);
-        for (int row = 0; row < grid.rows; ++row) {
-            for (int col = 0; col < grid.cols; ++col) {
-                grid(row, col) = cv::Vec3f(static_cast<float>(col),
-                                           static_cast<float>(row), 0.0f);
-            }
-        }
-        auto spiralSurface = std::make_shared<QuadSurface>(
-            grid, cv::Vec2f(1.0f, 1.0f));
-
-        ViewerManager mainManager(nullptr, nullptr);
-        ViewerManager spiralManager(nullptr, nullptr);
-        spiralManager.surfacePatchIndex()->rebuild({spiralSurface}, 0.0f, false);
-        QVERIFY(mainManager.surfacePatchIndex()->empty());
-        QVERIFY(spiralManager.surfacePatchIndex()->containsSurface(spiralSurface));
-
-        FakeViewer viewer;
-        viewer.graphicsView()->resize(800, 600);
-        viewer.setSurfaceSceneTransform(1.0, QPointF{});
-        viewer.setCurrentSurface(spiralSurface);
-
-        FiberOverlayController controller;
-        controller.bindToViewerManager(&mainManager);
-        controller.attachViewer(&viewer, &spiralManager);
-        controller.setChains({
-            FiberOverlayController::Chain{
-                42, {{5, 10, 0}, {10, 10, 0}, {15, 10, 0}}},
-        });
-        controller.setVisible(true);
-
-        QCOMPARE(viewer.scene().items().size(), 2);
-        const auto hit = controller.hitTestControlPoint(
-            &viewer, QPointF{-4.5, -4.5}, 1.0);
-        QVERIFY(hit.has_value());
-        QCOMPARE(hit->fiberId, uint64_t{42});
-        QCOMPARE(hit->controlPointIndex, 1);
     }
 
     void depthBandDistanceIsZeroInsideTheBand()

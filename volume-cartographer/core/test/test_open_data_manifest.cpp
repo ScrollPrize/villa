@@ -6,7 +6,6 @@
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataSegmentCache.hpp"
@@ -1205,17 +1204,6 @@ TEST_CASE("Project creation defaults to the shared autosave directory")
     std::filesystem::remove_all(root);
 }
 
-TEST_CASE("Project fiber paths share annotation filename sanitization")
-{
-    CHECK(vc3d::projectFiberDirectory("projects/My Project.volpkg.json") ==
-          std::filesystem::path("projects/fibers/My_Project.volpkg.json"));
-    CHECK(vc3d::projectFiberDirectory("local.volpkg.json") ==
-          std::filesystem::path("fibers/local.volpkg.json"));
-    CHECK(vc3d::projectFiberDirectory({}, "legacy") ==
-          std::filesystem::path("legacy/fibers/legacy"));
-    CHECK(vc3d::projectFiberDirectory({}).empty());
-}
-
 TEST_CASE("Catalog source selection is independent of derived representations")
 {
     OpenDataSample sample;
@@ -1251,6 +1239,48 @@ TEST_CASE("Catalog source selection is independent of derived representations")
     attachOpenDataSampleVolumes(*raw, sample, &selection);
     REQUIRE(raw->volumeEntries().size() == 1);
     CHECK(raw->volumeEntries().front().location == source.resolvedUrl);
+}
+
+TEST_CASE("Single catalog prediction attachment retains identity and validates its source level")
+{
+    OpenDataSample sample;
+    sample.id = "sample";
+    OpenDataVolume volume;
+    volume.id = "scan";
+    volume.pixelSizeUm = 2.4;
+    OpenDataArtifact source, prediction;
+    source.type = "ome-zarr";
+    source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
+    prediction.type = "surface-prediction-zarr";
+    prediction.resolvedUrl = "http://127.0.0.1:9/prediction.zarr";
+    prediction.levelParameterPresent = true;
+    prediction.sourceCoordinateLevel = 2;
+    volume.artifacts = {source, prediction};
+    sample.volumes = {volume};
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations = std::vector<OpenDataRepresentationRef>{
+        {0, 1, OpenDataRepresentationKind::Prediction}};
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto pkg = VolumePkg::newDetached(options);
+    const auto result = attachOpenDataSampleVolumes(*pkg, sample, &selection);
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    const auto& entry = pkg->volumeEntries().front();
+    CHECK(entry.location == prediction.resolvedUrl);
+    for (const auto* tag : {"surface-prediction", "vc-open-data-sample-id:sample",
+                           "vc-open-data-volume-id:scan"})
+        CHECK(std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end());
+    CHECK(vc::project::usesAnonymousRemoteAuth(entry));
+    // The source need not be attached, but its descriptor must be checked before
+    // assigning a coordinate frame. A failed check is reported, not silently L0.
+    CHECK(result.failedVolumes == 1);
+    CHECK(std::any_of(result.messages.begin(), result.messages.end(), [](const auto& message) {
+        return message.find("against source L2:") != std::string::npos;
+    }));
+    CHECK(std::none_of(entry.tags.begin(), entry.tags.end(), [](const auto& tag) {
+        return tag.starts_with("vc-open-data-coordinate-space:");
+    }));
 }
 
 TEST_CASE("Selective catalog projects isolate cached projects and individual segments")
@@ -1295,13 +1325,7 @@ TEST_CASE("Selective catalog projects isolate cached projects and individual seg
     CHECK(empty->selectedLasagnaDataset().empty());
     CHECK(empty->name() == destination.name);
     CHECK(empty->path() == destination.path);
-    const auto fiberDir = vc3d::projectFiberDirectory(destination.path);
-    CHECK(fiberDir == root / "fibers" / "empty.volpkg.json");
-    CHECK(std::filesystem::is_directory(fiberDir));
-    CHECK(std::filesystem::is_empty(fiberDir));
-    writeFile(fiberDir / "existing.json", "{}");
-    const auto recreated = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
-    CHECK(std::filesystem::is_regular_file(fiberDir / "existing.json"));
+    CHECK_FALSE(std::filesystem::exists(root / "fibers"));
 
     selection.segmentIds->push_back(sample.segments.front().id);
     destination = {root / "selected.volpkg.json", "Only selected"};

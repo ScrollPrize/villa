@@ -87,6 +87,10 @@ Enabling transparency to check clearances etc.:
 
 <img width="1000" alt="image" src="https://github.com/user-attachments/assets/495dcffd-c353-496e-b086-b02d5a0bc729" />
 
+### Flat fragments
+
+The halves part across the S-shaped divider, which `build_lining` lays along the scroll's wide direction. For a flat fragment, `scripts/stl_generator.py` then turns the lining, divider and split together about the axis, relative to the square caps, so the fragment is narrowest along y (its long side along x, as the divider runs before the rotation search turns it): `mesh.narrowest_in_y` gives the turn, and `ScrollCaseConfig.split_rotation_deg` takes it. The caps keep their outline, base bolt holes, mount and alignment arrow; their bolt protrusions (and the top cap's labels) move to the pair of sides nearest the turned divider, and past the lining the split runs straight to the middle of those sides. By default (`--narrow-y auto`) a fragment is turned when its footprint's length is at least `--narrow-y-min-aspect` (1.5) times its least width; `--narrow-y on`/`off` always or never turns it. A turn the split cannot make within the caps (a lining too wide for a divider nearly 45 degrees from the caps' sides) is skipped under `auto` and an error under `on`. `scroll_summary.csv` records the turn as `Split rotation (deg)`.
+
 ### Customizing the case
 
 The case is customized using the ScrollCase class:
