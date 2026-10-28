@@ -276,6 +276,15 @@ TEST_CASE("sheet collection: quality filter")
         CHECK(std::isnan(byId[3]->confidence));          // NULL -> NaN
         CHECK(byId[1]->coverage == doctest::Approx(1.0));
         CHECK(byId[1]->fitRmsUm == doctest::Approx(10.0));
+        // columnRange: all three fit_rms_um are 10.0 -> [10,10]; confidence spans [0.2,0.9] (NULL ignored).
+        auto fr = sc.columnRange("fit_rms_um");
+        REQUIRE(fr.has_value());
+        CHECK(fr->first == doctest::Approx(10.0));
+        CHECK(fr->second == doctest::Approx(10.0));
+        auto cr = sc.columnRange("confidence");
+        REQUIRE(cr.has_value());
+        CHECK(cr->first == doctest::Approx(0.2));
+        CHECK(cr->second == doctest::Approx(0.9));
 
         QualityFilter q;
         q.minConfidence = 0.5;
@@ -305,6 +314,7 @@ TEST_CASE("sheet collection: quality filter")
         q.minConfidence = 0.99;
         q.maxFitRmsUm = 1.0;
         CHECK(sc.region(box, 0, 0, FamilyFilter::All, nullptr, 64u << 20, q).size() == 1);
+        CHECK(!sc.columnRange("fit_rms_um").has_value());   // column absent -> no range
         std::filesystem::remove(path);
     }
 }

@@ -343,6 +343,19 @@ int64_t SheetCollection::sheetCount() const
     return s.row() ? sqlite3_column_int64(s.value, 0) : 0;
 }
 
+std::optional<std::pair<double, double>> SheetCollection::columnRange(const std::string& col) const
+{
+    // Guard: only a column the file actually has (and a known quality column), so the name is never
+    // attacker-controlled SQL — it is one of our own fixed identifiers, validated against the schema.
+    if (impl_->sheetCols.find(col) == impl_->sheetCols.end())
+        return std::nullopt;
+    const std::string sql = "SELECT MIN(" + col + "), MAX(" + col + ") FROM sheets WHERE " + col + " IS NOT NULL";
+    Statement s(impl_->db, sql.c_str());
+    if (!s.row() || sqlite3_column_type(s.value, 0) == SQLITE_NULL)
+        return std::nullopt;                         // no non-NULL rows
+    return std::make_pair(sqlite3_column_double(s.value, 0), sqlite3_column_double(s.value, 1));
+}
+
 Summary SheetCollection::summary(int64_t sheetId) const
 {
     const std::string sql = std::string("SELECT ") + kSummaryColumns + " FROM sheets WHERE id=?";

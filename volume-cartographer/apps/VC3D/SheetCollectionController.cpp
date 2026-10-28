@@ -36,6 +36,7 @@
 #include <QPushButton>
 #include <QtMath>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTimer>
 #include <QToolButton>
@@ -392,7 +393,9 @@ SheetCollectionController::SheetCollectionController(ViewerManager* manager, QMa
     maxFitRms_->setSuffix(tr(" µm"));
     maxFitRms_->setSpecialValueText(tr("Off"));  // shown at 0
     maxFitRms_->setValue(settings.value("sheetCollections/maxFitRmsUm", 0.0).toDouble());
-    maxFitRms_->setToolTip(tr("Hide sheets whose mesh-vs-mask fit RMS is worse than this. 0 = off."));
+    maxFitRms_->setToolTip(tr("Hide sheets whose mesh-vs-mask fit RMS is larger than this — a SMALLER number keeps "
+                              "only the better-fitted sheets. On load this is scaled to the file's range and starts "
+                              "at the max (nothing hidden); pull it down to cull the worst fits."));
 
     // Section header for the quality filters, with a help button explaining the columns.
     auto* qualHeader = new QWidget(body);
@@ -484,6 +487,21 @@ void SheetCollectionController::openCollection(const QString& path)
                 gridStepUm_ = g;
             const int64_t n = reader_->sheetCount();
             status_->setText(tr("%1 sheets · %2").arg(n).arg(QFileInfo(path).fileName()));
+            // Scale the fit-RMS filter to THIS file: floor to the data min, cap to the data max, and default to
+            // the max so nothing is hidden on load (smaller = better-fitted; pull it down to cull the worst fits).
+            // There is a hard fit-RMS floor (~1.5 voxels), so a fixed 0-based range would sit entirely below it.
+            if (maxFitRms_) {
+                QSignalBlocker block(maxFitRms_);
+                if (auto rng = reader_->columnRange("fit_rms_um")) {
+                    maxFitRms_->setSpecialValueText(QString());          // no "Off" at min; the max is the keep-all end
+                    maxFitRms_->setRange(std::floor(rng->first), std::ceil(rng->second));
+                    maxFitRms_->setValue(maxFitRms_->maximum());         // default = max = nothing hidden
+                } else {                                                 // older .asv w/o the column: 0 = Off
+                    maxFitRms_->setSpecialValueText(tr("Off"));
+                    maxFitRms_->setRange(0.0, 100000.0);
+                    maxFitRms_->setValue(0.0);
+                }
+            }
         } catch (const std::exception& e) {
             status_->setText(tr("Could not open %1: %2").arg(path, QString::fromUtf8(e.what())));
         }
@@ -548,7 +566,10 @@ vc::sheets::QualityFilter SheetCollectionController::qualityFilter() const
     if (minConfidence_) q.minConfidence = minConfidence_->value();
     if (minCoverage_)   q.minCoverage = minCoverage_->value();
     if (minMassFrac_)   q.minMassFrac = minMassFrac_->value();
-    if (maxFitRms_)     q.maxFitRmsUm = maxFitRms_->value();
+    // At the cap (the file's max, the load default) the fit-RMS filter is OFF — keep every sheet, including the
+    // one exactly at the max, with no rounding-boundary exclusion. Below the cap it culls the worse fits.
+    if (maxFitRms_ && maxFitRms_->value() < maxFitRms_->maximum())
+        q.maxFitRmsUm = maxFitRms_->value();
     return q;
 }
 

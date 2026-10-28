@@ -6,7 +6,9 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Read-only reader for an Automated Sheet Volume (.asv): the sheet-mesh sibling of
@@ -120,6 +122,10 @@ public:
     std::string metadata(const std::string& key) const;
     int64_t sheetCount() const;
     Summary summary(int64_t sheetId) const;
+
+    // [min, max] of a quality column (e.g. "fit_rms_um") over all sheets, or nullopt if the
+    // column is absent (older .asv) or entirely NULL. Lets a UI scale a filter to the data.
+    std::optional<std::pair<double, double>> columnRange(const std::string& col) const;
 
     // Descending vert_count (a size proxy), then ascending id. Start with
     // beforeVerts = INT64_MAX / afterId = 0 and continue from the last returned row.
