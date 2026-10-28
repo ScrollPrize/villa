@@ -1,5 +1,15 @@
 # Reusable fiber test and experiment runner
 
+`stream-attributes-pilot` builds on the native stream tests with a fresh 32-tile
+Paris4 run, checking point/segment cardinalities, unit normals, local widths and
+piece aggregates, then verifying an unchanged attributed-output resume.
+`stream-attributes-audit` inspects a bounded sample of fresh production pages.
+`stream-attributes-fresh` is **destructive**: the local authorized harness stops
+the named old production job, locks its output directory, validates and deletes
+only its old traced-fiber pages/metadata, and starts from zero. It refuses to
+erase a new-format run and never modifies CT or prediction caches. These suites
+require `local/test_stream_attributes.py`; they are not default tests.
+
 `cache-pressure-build`, `cache-pressure-tests`, and `cache-pressure-pilots`
 use the local `test_cache_pressure.py` harness. They build/run cache, persistence,
 queue and tracer regressions, then exercise the same 32 Paris4 seed tiles with
