@@ -51,9 +51,12 @@ def test_an_update_replaces_the_inputs_and_keeps_the_iteration(state, hub, devic
     session = state.session
     patches = session._context.num_verified_patches
     position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
+    # A patch the old inputs' theta gate excluded is judged afresh.
+    session._context.non_liftable_patch_ids.add('excluded-before')
     result = session.update_inputs(position)
     status = session.status()
     assert status['state'] == 'Idle'
+    assert session._context.non_liftable_patch_ids == set()
     assert status['input_generation'] == 1 and result['input_generation'] == 1
     assert status['input_digest'] == result['digest'] != before['input_digest']
     assert status['current_iteration'] == before['current_iteration']
@@ -315,8 +318,9 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     _add_patch(hub['editor'])()
     with ObjectStore.open(hub['editor'], read_only=True) as db:
         reached = db.hub_status()['position']
-    with pytest.raises(spiral_service.ApiError, match='input generation 3'):
+    with pytest.raises(spiral_service.ApiError, match='input generation 3') as stale:
         state.update_inputs({'inputs_position': reached, 'expected_input_generation': 3})
+    assert stale.value.payload['code'] == spiral_service.INPUT_GENERATION_STALE
     response = state.update_inputs({'inputs_position': reached, 'expected_input_generation': 0})
     assert response['updating_inputs'] and response['build_id']
     status = _settled_update(state)
@@ -415,8 +419,12 @@ def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_s
         for verb in (lambda: state.run({'iterations': 1}),
                      lambda: state.rebuild({'inputs': 'reload'}),
                      lambda: state.load_checkpoint({'path': 'absent.ckpt'})):
-            with pytest.raises(spiral_service.ApiError, match='input update in progress'):
+            with pytest.raises(spiral_service.ApiError, match='input update in progress') as busy:
                 verb()
+            assert busy.value.payload['code'] == spiral_service.INPUT_UPDATE_IN_PROGRESS
+        with pytest.raises(spiral_service.ApiError) as busy:
+            state.update_inputs({})
+        assert busy.value.payload['code'] == spiral_service.INPUT_UPDATE_BUSY
     finally:
         release.set()
     status = _settled_update(state)
@@ -430,7 +438,8 @@ def test_a_plain_store_has_no_input_updates(store_path, tmp_path):
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
         assert state.dataset()['capabilities']['input_updates'] is False
-        with pytest.raises(spiral_service.ApiError, match='not a hub replica'):
+        with pytest.raises(spiral_service.ApiError, match='not a hub replica') as refused:
             state.update_inputs({})
+        assert refused.value.payload['code'] == spiral_service.INPUT_UPDATE_UNAVAILABLE
     finally:
         state.close()

@@ -17,8 +17,12 @@ creates the first resident session, and ``POST /session/rebuild`` replaces an
 existing one.
 
 Patch, PCL and fiber inputs come from the object store bound at launch
-(``--object-store``) and are frozen for a resident session: changing them is
-an edit in the store followed by a full-input rebuild, never an upload. One
+(``--object-store``), never from an upload. With ``--object-store-hub`` that
+store is the service's replica of a hub: a fit reads the inputs of a linked,
+pinned hub position, and ``POST /session/update-inputs`` replaces a resident
+fit's inputs with a newer position's in place, keeping its model and
+optimiser. Without a hub the inputs are frozen for a resident session, and
+changing them is an edit in the store followed by a full-input rebuild. One
 client owns the mutation surface through the session lease
 (``POST /session/lease/claim``).
 
@@ -129,6 +133,12 @@ _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # The stable code of a refused input upload: patches, PCLs and fibers come
 # from the object store, so an upload is never how inputs change.
 INPUTS_IN_OBJECT_STORE = "inputs_in_object_store"
+# Stable codes of refused input updates (POST /session/update-inputs), and
+# of verbs refused while one is in flight.
+INPUT_UPDATE_UNAVAILABLE = "input_update_unavailable"  # no hub, or no session
+INPUT_UPDATE_BUSY = "input_update_busy"                # not an idle session
+INPUT_GENERATION_STALE = "input_generation_stale"      # expected_input_generation
+INPUT_UPDATE_IN_PROGRESS = "input_update_in_progress"  # another verb waits for one
 LEASE_TOKEN_HEADER = "X-Spiral-Session-Token"
 
 
@@ -348,11 +358,21 @@ def bind_object_store(path, author=None, hub=None):
     remote = "://" in status["hub"]
     try:
         with ObjectStore.open(str(resolved), author=author) as store:
-            store.hub_sync(pull=True, push=False)
+            # The service replica writes only links, and every update links
+            # afresh: unpublished ones (an interrupted update's) are dropped.
+            store.hub_revert()
+            pulled = store.hub_sync(pull=True, push=False)
+            conflicts = pulled["conflicts"]
+            pending = store.hub_status()["pending"]
     except Exception as exc:
         raise ObjectStoreBindingError(
             f"cannot reach the hub {status['hub']} of {resolved}: {exc}"
             + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
+    if conflicts or pending:
+        raise ObjectStoreBindingError(
+            f"{resolved} holds unpublished edits the service did not make "
+            f"({len(pending)} pending, {len(conflicts)} in conflict with the hub); "
+            "a service replica must hold none: resolve them, or name a new replica path")
     return ObjectStoreBinding(str(resolved), str(uuid), author,
                               status["hub"], status["hub_replica"])
 
@@ -1259,7 +1279,8 @@ class ServiceState:
         with self.lock:
             if self._input_update is not None:
                 raise ApiError(HTTPStatus.CONFLICT,
-                               f"{verb} waits for the input update in progress")
+                               f"{verb} waits for the input update in progress",
+                               payload={"code": INPUT_UPDATE_IN_PROGRESS})
 
     def _hosted(self):
         return self.object_store is not None and self.object_store.hosted
@@ -1336,7 +1357,8 @@ class ServiceState:
                                "A session build is already in progress")
             if self._input_update is not None:  # began after the check above
                 raise ApiError(HTTPStatus.CONFLICT,
-                               "A rebuild waits for the input update in progress")
+                               "A rebuild waits for the input update in progress",
+                               payload={"code": INPUT_UPDATE_IN_PROGRESS})
             state = self.session.status()["state"] if self.session else None
             if state in SESSION_BUSY_STATES:
                 raise ApiError(
@@ -1388,24 +1410,32 @@ class ServiceState:
         if not self._hosted():
             raise ApiError(HTTPStatus.CONFLICT,
                            "This service's object store is not a hub replica; rebuild "
-                           "the fit with current inputs instead")
+                           "the fit with current inputs instead",
+                           payload={"code": INPUT_UPDATE_UNAVAILABLE})
         with self.lock:
             session = self.session
-            if session is None or self._building or self._input_update is not None:
+            if session is None:
                 raise ApiError(HTTPStatus.CONFLICT,
-                               "The fit session is being built, or its inputs updated")
+                               "There is no fit session to update; initialize it first",
+                               payload={"code": INPUT_UPDATE_UNAVAILABLE})
+            if self._building or self._input_update is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "The fit session is being built, or its inputs updated",
+                               payload={"code": INPUT_UPDATE_BUSY})
             status = session.status()
             if status["state"] != SessionState.Idle:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     f"An input update requires an idle session (state is "
-                    f"{SessionState(status['state']).name})")
+                    f"{SessionState(status['state']).name})",
+                    payload={"code": INPUT_UPDATE_BUSY})
             generation = int(status.get("input_generation") or 0)
             if expected is not None and expected != generation:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     f"The update was computed against input generation {expected}; "
-                    f"the session is at {generation}")
+                    f"the session is at {generation}",
+                    payload={"code": INPUT_GENERATION_STALE})
             config = dict(status.get("applied_config") or {})
             paths, scroll = self.session_paths, self._session_scroll
             self._build_serial += 1

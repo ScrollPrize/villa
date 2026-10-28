@@ -115,6 +115,26 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
                                          str(tmp_path / 'absent-hub.vcobj'))
 
 
+def test_startup_drops_unpublished_links_and_refuses_other_edits(hub):
+    binding = spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
+    names = _names(hub['service'])
+    # An interrupted update's links are dropped at the next start.
+    with ObjectStore.open(hub['service'], author='svc') as db:
+        db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
+                     'a_anchor': {'whole_geometry': True}, 'b_anchor': {'whole_geometry': True}})
+        assert len(db.hub_status()['pending']) == 1
+    assert spiral_service.bind_object_store(hub['service'], 'svc', hub['hub']) == binding
+    with ObjectStore.open(hub['service'], read_only=True) as db:
+        assert db.hub_status()['pending'] == []
+        assert db.edges_by_kind('related') == []
+    # Any other edit is not the service's: startup refuses it.
+    with ObjectStore.open(hub['service'], author='svc') as db:
+        db.acquire_leases([names['walk']])
+        db.set_meta(names['walk'], 'sampling_group', 'not the service')
+    with pytest.raises(spiral_service.ObjectStoreBindingError, match='unpublished edits'):
+        spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
+
+
 def test_hub_addresses_compare_as_the_store_records_them(tmp_path):
     # The store records a remote hub in canonical sftp:// form: an ssh://
     # address, or an unencoded path, must compare equal to it on restart.

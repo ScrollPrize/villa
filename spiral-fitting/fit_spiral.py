@@ -4057,7 +4057,11 @@ class FitContext:
             position = (self.object_store_inputs.manifest.get('position') or {}).get('sequence')
             self.config.update({'object_store_input_position': position})
             self.patch_atlas.materialize(self.device)
+            # Exclusions are judged afresh for these inputs (the report
+            # lists those of the inputs installed now).
+            self.non_liftable_patch_ids = set()
             warnings = self._build_theta_crossing_map()
+            self._write_non_liftable_patch_report()
             if getattr(self, 'dt_target_cache_manager', None) is not None:
                 self.dt_target_cache_manager.reset()
             if hasattr(self, 'out_path'):
