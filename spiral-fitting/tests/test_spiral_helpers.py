@@ -21,6 +21,7 @@ from fit_spiral import (
     _UnattachedPclStripList,
     get_dt_loss_eligibility,
     get_unattached_pcl_dt_start,
+    get_unattached_pcl_weight_scale,
     get_run_dt_resume_iteration,
     materialize_fiber_fit_inputs,
 )
@@ -74,6 +75,25 @@ class RunDtLossScheduleTests(unittest.TestCase):
         self.assertEqual(get_unattached_pcl_dt_start(decoupled), 0)
         self.assertTrue(get_dt_loss_eligibility(decoupled, 1)['unattached_pcl'])
         self.assertFalse(get_dt_loss_eligibility(decoupled, 1)['verified_patch'])
+
+
+class UnattachedPclWeightScaleTests(unittest.TestCase):
+    def test_default_leaves_the_weights_unchanged(self):
+        cfg = Config().as_dict()
+        for iteration in (0, 1, 15_000, 10**9):
+            self.assertEqual(get_unattached_pcl_weight_scale(cfg, iteration), 1.0)
+
+    def test_linear_ramp_to_the_final_scale(self):
+        cfg = Config({
+            'loss_weight_unattached_pcl_scale_final': 0.1,
+            'loss_weight_unattached_pcl_ramp_start_step': 15_000,
+            'loss_weight_unattached_pcl_ramp_steps': 7_500,
+        }).as_dict()
+        self.assertEqual(get_unattached_pcl_weight_scale(cfg, 0), 1.0)
+        self.assertEqual(get_unattached_pcl_weight_scale(cfg, 15_000), 1.0)
+        self.assertAlmostEqual(get_unattached_pcl_weight_scale(cfg, 18_750), 0.55)
+        self.assertEqual(get_unattached_pcl_weight_scale(cfg, 22_500), 0.1)
+        self.assertEqual(get_unattached_pcl_weight_scale(cfg, 30_000), 0.1)
 
 
 class FiberPointCollectionTests(unittest.TestCase):
