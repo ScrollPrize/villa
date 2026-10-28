@@ -1583,6 +1583,17 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
     refresh = bool(config['object_store_refresh_links'])
     author = config['object_store_author']
     path = config['object_store_path']
+    pinned = config['object_store_input_position']
+    if pinned is not None:
+        # Prepared already (the service linked and pinned it): read it exactly.
+        status = _hosted(path)
+        if status is None:
+            raise ObjectStoreInputError([
+                f'object store {path} is not a hosted replica; it has no position {pinned}'])
+        position = InputPosition(status['hub_replica'], int(pinned))
+        with ObjectStore.open(path, read_only=True) as store:
+            uuids = resolve_selection(store, dataclasses.replace(request, position=position))
+        return uuids, [f'reading pinned hub position {pinned}'], position
     if _hosted(path) is not None:
         if not author:
             raise ObjectStoreInputError([
@@ -1924,7 +1935,8 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     the one refresh phase unless object_store_refresh_links is off; the
     other ranks wait for its result, and every rank fails when it fails.
     On a hosted replica that phase links and pins a hub position, including
-    at least ``minimum_position`` (prepare_position). Every rank then reads
+    at least ``minimum_position`` (prepare_position), unless
+    object_store_input_position names the position to read. Every rank then reads
     the now-immutable store (or position) read-only, materializes the same
     frozen snapshot and closes the store; their manifests must agree before
     anyone trains. Returns FitInputs carrying ``manifest`` and ``digest``.

@@ -196,29 +196,57 @@ class ObjectStoreBinding:
     """The object store this service reads fit inputs from.
 
     Bound once at launch (``--object-store``) and never chosen by a client:
-    patch, PCL and fiber inputs, and the links the startup refresh writes,
+    patch, PCL and fiber inputs, and the links the service's refresh writes,
     live in this one store. ``path`` is meaningful on the service host only;
     clients identify the store by ``uuid``, which every replica of it shares.
     ``author`` names the service in the store when it refreshes links.
+
+    A hosted binding (``hub`` set) is the service's own replica of a hub:
+    it writes only detector links, pushes them only with a conditional
+    push, and fits hub positions (object_store_inputs.prepare_position).
+    ``hub_identity`` names the hub positions belong to.
     """
 
     path: str
     uuid: str
     author: str
+    hub: str = None
+    hub_identity: str = None
+
+    @property
+    def hosted(self):
+        return self.hub is not None
 
     def config(self):
         """The service-owned configuration a session request receives."""
         return {"object_store_path": self.path,
-                "object_store_author": self.author}
+                "object_store_author": self.author,
+                "object_store_input_position": None}
+
+    def hub_position(self):
+        """The hub position this replica last pulled, read now."""
+        from vc_object_store import ObjectStore
+        try:
+            with ObjectStore.open(self.path, read_only=True) as store:
+                return (store.hub_status() or {}).get("position")
+        except Exception:
+            return None
 
     def advertisement(self):
-        return {"uuid": self.uuid, "path": self.path, "author": self.author}
+        result = {"uuid": self.uuid, "path": self.path, "author": self.author,
+                  "hub": None}
+        if self.hosted:
+            result["hub"] = {"address": self.hub, "identity": self.hub_identity,
+                             "position": self.hub_position()}
+        return result
 
 
 # Configuration keys the launch binding owns. A session request or --config
 # naming one is refused, as the scroll-specification keys are, rather than
-# quietly overruled: a client cannot repoint the inputs a service reads.
-SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author")
+# quietly overruled: a client cannot repoint the inputs a service reads, or
+# choose the hub position a build pins (it asks with ``inputs_position``).
+SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
+                             "object_store_input_position")
 
 
 # What /dataset tells a client this service supports, so it can enable or
@@ -231,6 +259,9 @@ SERVICE_CAPABILITIES = {
     "inputs_frozen": True,
     # POST /session/rebuild {"inputs": "reload"} rereads the store.
     "input_reload_rebuild": True,
+    # Initialize and full-input rebuilds link and pin a hub position,
+    # including at least the request's ``inputs_position`` (hosted bindings).
+    "input_positions": False,
 }
 
 
@@ -245,30 +276,79 @@ def default_object_store_author():
     return f"spiral-service@{socket.gethostname()}"
 
 
-def bind_object_store(path, author=None):
+def _canonical_hub(address):
+    """A hub address as the store records it: an sftp:// or ssh:// URL as
+    given, a path made absolute."""
+    if "://" in str(address):
+        return str(address)
+    return str(Path(address).expanduser().resolve(strict=False))
+
+
+_REMOTE_HUB_HINT = (
+    "a remote hub is reached with ssh in batch mode: the service account needs "
+    "a key (or agent) with access to the hub file and its directory, and a "
+    "known_hosts entry for the host")
+
+
+def bind_object_store(path, author=None, hub=None):
     """Resolve and open the launch object store once; return its binding.
+
+    With ``hub`` the store is this service's replica of that hub: cloned
+    when absent, otherwise checked to replicate that hub. A store that is
+    already a replica binds its own hub. A hosted binding pulls once now, so
+    an unreachable hub (or, for an sftp:// hub, missing ssh credentials or
+    host key) fails startup instead of the first update.
 
     Raises ObjectStoreBindingError when the vc_object_store module is not
     importable or the store cannot be opened, so startup fails with the
     cause instead of the first fit failing later.
     """
     resolved = Path(path).expanduser().resolve(strict=False)
+    author = author or default_object_store_author()
     try:
+        import vc_object_store as vos
         from vc_object_store import ObjectStore
     except ImportError as exc:
         raise ObjectStoreBindingError(
             f"the vc_object_store Python module is unavailable ({exc}); put "
             "its build's python directory on PYTHONPATH") from exc
+    remote = hub is not None and "://" in str(hub)
+    if hub is not None and not resolved.exists():
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            vos.hub_clone(_canonical_hub(hub), str(resolved), author)
+        except Exception as exc:
+            raise ObjectStoreBindingError(
+                f"cannot clone the hub {hub} to {resolved}: {exc}"
+                + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
     if not resolved.is_file():
         raise ObjectStoreBindingError(f"no object store at {resolved}")
     try:
         with ObjectStore.open(str(resolved), read_only=True) as store:
             uuid = store.uuid
+            status = store.hub_status()
     except Exception as exc:
         raise ObjectStoreBindingError(
             f"cannot open the object store {resolved}: {exc}") from exc
-    return ObjectStoreBinding(str(resolved), str(uuid),
-                              author or default_object_store_author())
+    if status is None:
+        if hub is not None:
+            raise ObjectStoreBindingError(
+                f"{resolved} exists and is not a replica of the hub {hub}; "
+                "name a new replica path, or omit --object-store-hub")
+        return ObjectStoreBinding(str(resolved), str(uuid), author)
+    if hub is not None and _canonical_hub(hub) != status["hub"]:
+        raise ObjectStoreBindingError(
+            f"{resolved} replicates the hub {status['hub']}, not {hub}")
+    remote = "://" in status["hub"]
+    try:
+        with ObjectStore.open(str(resolved), author=author) as store:
+            store.hub_sync(pull=True, push=False)
+    except Exception as exc:
+        raise ObjectStoreBindingError(
+            f"cannot reach the hub {status['hub']} of {resolved}: {exc}"
+            + (f"; {_REMOTE_HUB_HINT}" if remote else "")) from exc
+    return ObjectStoreBinding(str(resolved), str(uuid), author,
+                              status["hub"], status["hub_replica"])
 
 
 def bind_service_paths(resolution, output_directory, cache_directory):
@@ -535,6 +615,13 @@ class ServiceState:
         self._session_phase = "Waiting for fit initialization"
         self._session_error = None
         self._building = False
+        self._build_serial = 0
+        # Hub positions (hosted bindings): the one being linked and pinned
+        # before a build, the last preparation that failed (the resident fit
+        # is then unchanged), and the position the session reads.
+        self._input_preparation = None
+        self._input_preparation_error = None
+        self._input_position = None
         self.startup_run = dict(startup_run or {})
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
@@ -711,7 +798,13 @@ class ServiceState:
                     time.sleep(0.05)
                 if state == SessionState.Error:
                     raise ApiError(409, "Resident construction failed", payload=self.status())
-                response = {**self.status(), "accepted": True}
+                with self.lock:
+                    failed = self._input_preparation_error
+                if failed and failed.get("build_id") == response.get("build_id"):
+                    raise ApiError(409, "The inputs could not be prepared; the "
+                                   "resident fit is unchanged", payload=self.status())
+                response = {**self.status(), "accepted": True,
+                            "build_id": response.get("build_id")}
             return response
         return lease.coordinator.execute(request.get("command_id"), operation,
             request, perform, recoverable=lambda exc: isinstance(exc, TimeoutError))
@@ -785,6 +878,10 @@ class ServiceState:
                 self._preview.diagnostics_artifact)
             response["input_manifest_artifact"] = (
                 self._input_manifest[1] if self._input_manifest else None)
+            response["input_position"] = copy.deepcopy(self._input_position)
+            response["input_preparation"] = copy.deepcopy(self._input_preparation)
+            response["input_preparation_error"] = copy.deepcopy(
+                self._input_preparation_error)
             response["preview_publish"] = (
                 dict(self._preview.progress)
                 if self._preview.progress else None)
@@ -865,9 +962,12 @@ class ServiceState:
         return catalog
 
     def dataset(self):
+        capabilities = dict(SERVICE_CAPABILITIES)
+        capabilities["input_positions"] = bool(
+            self.object_store is not None and self.object_store.hosted)
         response = {**self._base(), **self.dataset_resolution.to_dict(),
                     "session_checkpoints": self.session_checkpoints(),
-                    "capabilities": dict(SERVICE_CAPABILITIES)}
+                    "capabilities": capabilities}
         if self.object_store is not None:
             response["object_store"] = self.object_store.advertisement()
             response["inputs"] = self.startup_inputs()
@@ -1122,6 +1222,7 @@ class ServiceState:
         """Create the first resident fit session on explicit client request."""
         request = dict(request or {})
         request.pop("command_id", None)
+        minimum = self._inputs_position(request.pop("inputs_position", None))
         with self.lock:
             if self._building or self.session_id is not None \
                     or self._session_state != SessionState.Uninitialized:
@@ -1133,8 +1234,26 @@ class ServiceState:
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
                 paths.checkpoint, run.config)
-        self._begin_build(paths, run, preview, scroll)
-        return {**self.status(), "accepted": True, "initializing": True}
+        build_id = self._begin_build(paths, run, preview, scroll, minimum=minimum)
+        return {**self.status(), "accepted": True, "initializing": True,
+                "build_id": build_id}
+
+    def _hosted(self):
+        return self.object_store is not None and self.object_store.hosted
+
+    def _inputs_position(self, value):
+        """A request's ``inputs_position``: the hub position (M) the build's
+        inputs must include, e.g. where a client's pushed edits reached."""
+        if value is None:
+            return None
+        if type(value) is not int or value < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "inputs_position must be a non-negative integer")
+        if not self._hosted():
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "This service's object store is not a hub replica; "
+                           "it has no input positions")
+        return value
 
     def rebuild(self, request):
         """Rebuild the resident session, from the model stage or from nothing.
@@ -1166,6 +1285,10 @@ class ServiceState:
         if inputs not in ("keep", "reload"):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            'inputs must be "keep" or "reload"')
+        minimum = self._inputs_position(request.pop("inputs_position", None))
+        if minimum is not None:
+            # A position to include is a reread of the inputs.
+            inputs = "reload"
         defaults = request.pop("defaults", False)
         if not isinstance(defaults, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -1197,12 +1320,21 @@ class ServiceState:
             # keeps the frozen inputs it loaded.
             stage = ("all" if defaults or inputs == "reload"
                      else self._rebuild_stage_locked(paths, run, preview, state))
+            live_position = ((self.session_request or {}).get("run") or {}).get(
+                "config", {}).get("object_store_input_position")
+        build_id = None
         if stage == "model":
+            # The model stage keeps the frozen inputs, at their position.
+            run = dataclasses.replace(run, config={
+                **run.config, "object_store_input_position": live_position})
             self._begin_model_rebuild(paths, run, preview)
         else:
-            self._begin_build(paths, run, preview, scroll)
+            build_id = self._begin_build(paths, run, preview, scroll,
+                                         minimum=minimum,
+                                         reload_inputs=inputs == "reload")
         return {**self.status(), "accepted": True, "rebuilding": True,
-                "stage": stage, "inputs": "reload" if stage == "all" else "keep"}
+                "stage": stage, "inputs": "reload" if stage == "all" else "keep",
+                "build_id": build_id}
 
     def _rebuild_stage_locked(self, paths, run, preview, state):
         """How much of the resident session this request has to replace.
@@ -1239,6 +1371,8 @@ class ServiceState:
             key for key in set(live_config) | set(new_config)
             if live_config.get(key) != new_config.get(key)
         }
+        # The service pins the position; a request never carries the live one.
+        changed.discard("object_store_input_position")
         # _prepare_session_request already blanked either path when its
         # input toggle is off, so both being named means the resident
         # session filtered its tracks against the shell at load: the fitter
@@ -1285,36 +1419,164 @@ class ServiceState:
             self._building = False
             self.status_generation += 1
 
-    def _begin_build(self, paths, run, preview, scroll):
-        """Publish ``Loading`` and construct the runtime off the HTTP thread."""
+    def _begin_build(self, paths, run, preview, scroll, *, minimum=None,
+                     reload_inputs=False):
+        """Publish ``Loading`` and construct the runtime off the HTTP thread.
+
+        On a hosted binding the build reads a hub position. A checkpoint
+        resume reads the position the checkpoint recorded on this hub,
+        unless the request reloads the inputs or names a position to
+        include; otherwise the inputs are linked and pinned first
+        (``_prepare_then_build``), while the resident session, if any, is
+        left alone. Returns the build's ID.
+        """
+        record = None
+        if self._hosted():
+            position = None
+            if paths.checkpoint and minimum is None and not reload_inputs:
+                position = self._checkpoint_position(paths.checkpoint)
+            if position is None:
+                return self._begin_prepared_build(paths, run, preview, scroll,
+                                                  minimum)
+            run = self._pin_run(run, position)
+            record = {"hub": self.object_store.hub_identity,
+                      "sequence": position, "requested": None, "head": None,
+                      "attempts": 0, "source": "checkpoint"}
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
-            previous = self.session
-            if previous is not None:
-                self._retiring_sessions.append(previous)
-            self.session = None
             self._building = True
-            self.session_generation += 1
-            self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
-            self.session_paths = paths
-            self.session_request = {
-                "paths": paths.manifest(),
-                "run": run.manifest(),
-                "preview": preview.manifest(),
-            }
-            self.session_revision += 1
-            self._reset_session_scope()
-            self._session_state = SessionState.Loading
-            self._session_phase = "Building the fit session"
-            self._session_error = None
-            self.status_generation += 1
-            session_id = self.session_id
+            build_id, session_id, previous = self._publish_build_locked(
+                paths, run, preview, record)
         self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run, preview, scroll),
             name="spiral-session-build", daemon=True)
+        return build_id
+
+    @staticmethod
+    def _pin_run(run, position):
+        return dataclasses.replace(run, config={
+            **run.config, "object_store_input_position": int(position)})
+
+    def _checkpoint_position(self, path):
+        """The position on this service's hub a checkpoint's inputs were
+        read at, or None."""
+        *_, manifest = self._checkpoint_durable_cfg(path)
+        position = ((manifest or {}).get("object_store") or {}).get("position")
+        if not position or position.get("hub") != self.object_store.hub_identity:
+            return None
+        return int(position["sequence"])
+
+    def _begin_prepared_build(self, paths, run, preview, scroll, minimum):
+        """Link and pin a hub position off the HTTP thread, then build at it."""
+        with self.lock:
+            if self._building:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A session build is already in progress")
+            self._building = True
+            self._build_serial += 1
+            build_id = self._build_serial
+            self._input_preparation = {"build_id": build_id,
+                                       "requested_position": minimum}
+            self._input_preparation_error = None
+            self.status_generation += 1
+        try:
+            self._start_background(
+                target=self._prepare_then_build,
+                args=(build_id, paths, run, preview, scroll, minimum),
+                name="spiral-input-position", daemon=True)
+        except BaseException:
+            with self.lock:
+                self._building = False
+                self._input_preparation = None
+            raise
+        return build_id
+
+    def _prepare_inputs(self, paths, run, scroll, minimum):
+        """object_store_inputs.prepare_position on the bound replica, with the
+        configuration and lasagna normals the build will apply."""
+        from vc_object_store import ObjectStore
+        from fit_session import lasagna_normal_inputs
+        from object_store_inputs import prepare_position, request_from_config
+        from spiral_runtime import merge_session_config
+        config, _, overrides = merge_session_config(
+            paths.checkpoint, run, warn=lambda warning: None)
+        config.update(overrides)
+        lasagna = lasagna_normal_inputs(
+            paths.normal_x, paths.normal_y, scroll.normal_zarr_group,
+            int(scroll.lasagna_scale))
+        cache = (os.path.join(paths.cache_directory, "object_store_strips")
+                 if paths.cache_directory else None)
+
+        def log(line):
+            self.events.append("log", line, source="service",
+                               operation="preparing_inputs")
+        with ObjectStore.open(self.object_store.path,
+                              author=self.object_store.author) as store:
+            return prepare_position(
+                store, config, request_from_config(config), lasagna=lasagna,
+                minimum=minimum, cache_directory=cache, log=log)
+
+    def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum):
+        try:
+            prepared = self._prepare_inputs(paths, run, scroll, minimum)
+        except BaseException as exc:
+            cause = _cause(exc)
+            with self.lock:
+                self._building = False
+                self._input_preparation = None
+                self._input_preparation_error = {
+                    "build_id": build_id, "requested_position": minimum,
+                    "message": cause,
+                    "problems": list(getattr(exc, "problems", None) or [cause])}
+                self.status_generation += 1
+            self.events.append(
+                "error", f"The inputs could not be prepared; the resident fit "
+                f"is unchanged: {cause}", severity="error", source="service",
+                operation="preparing_inputs")
+            return
+        for line in prepared.lines:
+            self.events.append("log", line, source="service",
+                               operation="preparing_inputs")
+        record = {**prepared.position.provenance(), "requested": minimum,
+                  "head": prepared.head, "attempts": prepared.attempts,
+                  "source": "prepared"}
+        run = self._pin_run(run, prepared.position.sequence)
+        with self.lock:
+            self._input_preparation = None
+            _, session_id, previous = self._publish_build_locked(
+                paths, run, preview, record, build_id=build_id)
+        self._build(session_id, previous, paths, run, preview, scroll)
+
+    def _publish_build_locked(self, paths, run, preview, input_position, *,
+                              build_id=None):
+        """Retire the resident session and publish ``Loading`` for a new one.
+        Call with the lock held and ``_building`` claimed."""
+        if build_id is None:
+            self._build_serial += 1
+            build_id = self._build_serial
+        previous = self.session
+        if previous is not None:
+            self._retiring_sessions.append(previous)
+        self.session = None
+        self.session_generation += 1
+        self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
+        self.session_paths = paths
+        self.session_request = {
+            "paths": paths.manifest(),
+            "run": run.manifest(),
+            "preview": preview.manifest(),
+        }
+        self.session_revision += 1
+        self._reset_session_scope()
+        self._input_position = input_position
+        self._session_state = SessionState.Loading
+        self._session_phase = "Building the fit session"
+        self._session_error = None
+        self.status_generation += 1
+        return build_id, self.session_id, previous
 
     def _build(self, session_id, previous, paths, run, preview, scroll):
         """Close the old resident session, then construct the new one.
@@ -3098,6 +3360,12 @@ def main(argv=None):
                              "PCL and fiber inputs from, and writes startup "
                              "link refreshes to. Opened once at startup; "
                              "clients cannot repoint it.")
+    parser.add_argument("--object-store-hub", default=None, metavar="HUB",
+                        help="Hub (a path, or an sftp://[user@]host/path "
+                             "address) whose replica --object-store is: cloned "
+                             "there when absent. Updates then link and pin hub "
+                             "positions. A store that already is a replica binds "
+                             "its own hub without this flag.")
     parser.add_argument("--object-store-author", default=None, metavar="NAME",
                         help="Author of the links this service's refresh "
                              "writes (default: spiral-service@<host>)")
@@ -3187,7 +3455,8 @@ def main(argv=None):
 
     try:
         object_store = bind_object_store(args.object_store,
-                                         args.object_store_author)
+                                         args.object_store_author,
+                                         args.object_store_hub)
     except ObjectStoreBindingError as exc:
         print(f"Refusing to start: {exc}", file=sys.stderr, flush=True)
         return 2
@@ -3276,6 +3545,9 @@ def main(argv=None):
     print(f"Spiral dataset root: {dataset_root}", flush=True)
     print(f"Spiral object store: {object_store.path} ({object_store.uuid})",
           flush=True)
+    if object_store.hosted:
+        print(f"Spiral object-store hub: {object_store.hub} "
+              f"({object_store.hub_identity})", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
     if args.session_name:

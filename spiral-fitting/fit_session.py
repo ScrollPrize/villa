@@ -133,7 +133,16 @@ from surface_orientation import spiral_outward_sense_for
 # model-only rebuild). A checkpoint refused for its inputs says so in the 409's
 # "inputs" (legacy, problems, the reload rebuild and
 # object_store_allow_changed_inputs).
-API_VERSION = 36
+# 37: hub positions. /dataset's object_store carries "hub" (address,
+# identity, position) for a service bound to a hub replica, and
+# capabilities.input_positions. Initialize and full-input rebuilds link and
+# pin a hub position first, including at least the request's
+# "inputs_position"; the resident fit is unchanged when that fails
+# ("input_preparation_error"). Status carries "input_position" (hub,
+# sequence, requested, head, attempts, source) and "input_preparation";
+# lifecycle responses carry "build_id". A checkpoint resumes at the position
+# it recorded. object_store_input_position is service-owned.
+API_VERSION = 37
 
 
 class SessionState(str, Enum):

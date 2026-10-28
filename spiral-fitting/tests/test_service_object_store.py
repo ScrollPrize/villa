@@ -70,7 +70,9 @@ def test_binding_resolves_the_store_once_and_records_its_uuid(store, tmp_path,
         assert binding.uuid == db.uuid
     assert binding.path == str(Path(store).resolve())
     assert binding.config() == {'object_store_path': binding.path,
-                                'object_store_author': 'svc'}
+                                'object_store_author': 'svc',
+                                'object_store_input_position': None}
+    assert not binding.hosted
     assert spiral_service.bind_object_store(store).author.startswith(
         'spiral-service@')
 
@@ -431,10 +433,10 @@ def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store)
     advertised = state.dataset()
     assert advertised['object_store'] == {
         'uuid': state.object_store.uuid, 'path': state.object_store.path,
-        'author': 'spiral-test'}
+        'author': 'spiral-test', 'hub': None}
     assert advertised['capabilities'] == {
         'input_source': 'object_store', 'inputs_frozen': True,
-        'input_reload_rebuild': True}
+        'input_reload_rebuild': True, 'input_positions': False}
     # The dataset no longer resolves or advertises patch, fiber or PCL files.
     assert 'pcl_inputs' not in advertised
     assert not {'verified_patches', 'fibers'} & set(advertised['resolved'])

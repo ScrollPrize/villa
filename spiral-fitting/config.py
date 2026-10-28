@@ -34,6 +34,7 @@ _NULL_TYPES = {
     "loss_start_unattached_pcl_dt": "integer",
     "object_store_path": "string",
     "object_store_author": "string",
+    "object_store_input_position": "integer",
     "object_store_patch_uuids": "strings",
     "object_store_patch_tags": "strings",
     "object_store_pcl_uuids": "strings",
@@ -272,6 +273,7 @@ _RUN_MUTABLE_PCL_KEYS = frozenset({
 OBJECT_STORE_INPUT_KEYS = frozenset({
     "object_store_path",
     "object_store_author",
+    "object_store_input_position",
     "object_store_refresh_links",
     "object_store_approved_links_only",
     "object_store_allow_changed_inputs",
@@ -649,6 +651,12 @@ class Config:
         # against identical inputs and frames unless allow_changed_inputs.
         self.object_store_path = None
         self.object_store_author = None
+        # On a hosted replica the inputs are a hub position (a journal
+        # sequence on the store's hub). None links and pins the hub head at
+        # load (object_store_inputs.prepare_position); a position is read
+        # exactly as pinned, without linking. The service sets it from the
+        # position it prepared; a client never does.
+        self.object_store_input_position = None
         self.object_store_refresh_links = True
         self.object_store_approved_links_only = False
         self.object_store_allow_changed_inputs = False
