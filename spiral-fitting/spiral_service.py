@@ -356,6 +356,19 @@ def bind_object_store(path, author=None, hub=None):
         raise ObjectStoreBindingError(
             f"{resolved} replicates the hub {status['hub']}, not {hub}")
     remote = "://" in status["hub"]
+    # Checked before anything is changed: a replica someone else writes
+    # (a VC3D user's, named by mistake) holds their unpushed edits.
+    try:
+        with ObjectStore.open(str(resolved), read_only=True) as store:
+            others = [writer for writer in store.hub_writers() if writer != author]
+    except Exception as exc:
+        raise ObjectStoreBindingError(
+            f"cannot open the object store {resolved}: {exc}") from exc
+    if others:
+        raise ObjectStoreBindingError(
+            f"{resolved} is not this service's replica: {', '.join(others)} "
+            f"wrote to it, not only {author}; name a new replica path (the "
+            "service clones one), or start the service as its author")
     try:
         with ObjectStore.open(str(resolved), author=author) as store:
             # The service replica writes only links, and every update links

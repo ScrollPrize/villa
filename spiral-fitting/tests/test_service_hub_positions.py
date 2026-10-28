@@ -135,6 +135,21 @@ def test_startup_drops_unpublished_links_and_refuses_other_edits(hub):
         spiral_service.bind_object_store(hub['service'], 'svc', hub['hub'])
 
 
+def test_startup_leaves_a_replica_others_write_untouched(hub):
+    # The editor's replica named by mistake: its unpushed approval survives.
+    names = _names(hub['editor'])
+    with ObjectStore.open(hub['editor'], author='editor') as db:
+        db.hub_sync(pull=True, push=False)
+        edge = db.add_edge({'kind': 'related', 'a': names['near'], 'b': names['far'],
+                            'a_anchor': {'whole_geometry': True},
+                            'b_anchor': {'whole_geometry': True}})
+    with pytest.raises(spiral_service.ObjectStoreBindingError,
+                       match="not this service's replica: editor"):
+        spiral_service.bind_object_store(hub['editor'], 'svc', hub['hub'])
+    with ObjectStore.open(hub['editor'], read_only=True) as db:
+        assert db.hub_status()['pending'] == [edge]
+
+
 def test_hub_addresses_compare_as_the_store_records_them(tmp_path):
     # The store records a remote hub in canonical sftp:// form: an ssh://
     # address, or an unencoded path, must compare equal to it on restart.
