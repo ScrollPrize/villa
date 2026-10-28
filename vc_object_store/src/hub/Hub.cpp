@@ -704,20 +704,24 @@ void readHubPosition(ObjectStore& replica, int64_t position,
     auto txn = hub->read();
     const auto publication = hubPublicationAt(conn(txn), position);
     const auto selection = hub->revisionSelectionAt(txn, publication.publishedAtUs, true);
-    {
-        auto local = replica.read();
-        Statement geometry(conn(txn), "SELECT geometry_uuid FROM object_revisions WHERE uuid=? AND geometry_uuid IS NOT NULL");
-        Statement present(conn(local), "SELECT 1 FROM geometry_revisions WHERE uuid=?");
-        for (const auto& [object, revision] : selection) {
-            geometry.reset(); geometry.bind(1, *revision);
-            if (!geometry.row()) continue;
-            present.reset(); present.bind(1, geometry.blob16(0));
-            if (!present.row())
-                throw std::runtime_error("hub: this replica lacks geometry of " + object + " at position " +
-                                         std::to_string(position) + "; pull first");
-        }
-    }
     read(*hub, txn, selection);
+}
+
+void requireHubGeometry(ObjectStore& replica, const ReadTxn& hubTxn, int64_t position,
+                        const RevisionSelection& objects)
+{
+    auto local = replica.read();
+    Statement geometry(conn(hubTxn), "SELECT geometry_uuid FROM object_revisions WHERE uuid=? AND geometry_uuid IS NOT NULL");
+    Statement present(conn(local), "SELECT 1 FROM geometry_revisions WHERE uuid=?");
+    for (const auto& [object, revision] : objects) {
+        if (!revision) continue;
+        geometry.reset(); geometry.bind(1, *revision);
+        if (!geometry.row()) continue;
+        present.reset(); present.bind(1, geometry.blob16(0));
+        if (!present.row())
+            throw std::runtime_error("hub: this replica lacks geometry of " + object + " at position " +
+                                     std::to_string(position) + "; pull first");
+    }
 }
 
 std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_t upTo)

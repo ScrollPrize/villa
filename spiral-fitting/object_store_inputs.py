@@ -473,7 +473,7 @@ def _position_records(store, position):
     """{UUID: record} of every object at a position, retired ones included."""
     check_position(store, position)
     view = store.hub_read_view_at(position.sequence, include_retired=True,
-                                  relationships=False)
+                                  relationships=False, geometry=False)
     return {revision['object_uuid']: revision['record'] for revision in view['objects']}
 
 

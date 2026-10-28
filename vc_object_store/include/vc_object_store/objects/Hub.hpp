@@ -117,11 +117,16 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
 // gets the hub, a read transaction and the hub's revision of every object
 // present at that position, retired ones included. Records, tags, deletions
 // and relationship membership/approval come from the hub; geometry revisions
-// are shared, and every one the position references must already be in this
-// replica (pull to the position, or publish it, first). Throws for a position
-// that is not a hub state.
+// are shared and read from this replica, so a reader checks the objects whose
+// geometry it reads with requireHubGeometry. Throws for a position that is
+// not a hub state.
 void readHubPosition(ObjectStore& replica, int64_t position,
                      const std::function<void(ObjectStore& hub, const ReadTxn&, const RevisionSelection&)>& read);
+// Inside readHubPosition's `read`: throws unless this replica holds the
+// geometry of every one of `objects` (hub revisions) at `position` (pull to
+// the position, or publish it, first).
+void requireHubGeometry(ObjectStore& replica, const ReadTxn& hubTxn, int64_t position,
+                        const RevisionSelection& objects);
 
 // The hub's journal entries after one position up to another: which
 // records the hub states between them changed, by whom.

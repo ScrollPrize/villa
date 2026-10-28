@@ -631,6 +631,29 @@ def test_a_service_links_and_pins_a_hub_position(tmp_path):
     session.detach(editor)
 
 
+def test_a_position_needs_only_the_geometry_it_reads(tmp_path):
+    """A replica that has not pulled an object's geometry still reads the
+    other objects of a position; only a read naming that object needs it."""
+    import vc_object_store as vos
+    hub = tmp_path / 'hub.vcobj'
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        first, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    for name in ('service', 'editor'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as db:
+        added, _ = put(db, Fiber([[7, 8, 9], [1, 1, 1]], []), kind='fiber')
+        position = db.hub_sync(pull=True, push=True)['published_position']
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        assert service.hub_read_view_at(position, [first])['selection'].keys() == {first}
+        assert service.hub_read_view_at(position, geometry=False)['selection'].keys() == {first, added}
+        with pytest.raises(RuntimeError, match='lacks geometry of ' + added):
+            service.hub_read_view_at(position)
+        service.hub_sync(pull=True, push=False)
+        assert service.hub_read_view_at(position)['selection'].keys() == {first, added}
+
+
 def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
     """Regression: the session worker's resolve loop read its conflicts
     from a destroyed temporary."""
