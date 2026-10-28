@@ -631,6 +631,28 @@ def test_a_service_links_and_pins_a_hub_position(tmp_path):
     session.detach(editor)
 
 
+def test_an_indexed_hub_and_its_replicas_gate_older_binaries(tmp_path):
+    """A hub with a publication index has its own schema version, which
+    binaries from before the index refuse; ordinary stores keep theirs."""
+    import sqlite3
+    import vc_object_store as vos
+
+    def version(path):
+        with sqlite3.connect(path) as sql:
+            return sql.execute('PRAGMA user_version').fetchone()[0]
+    hub = str(tmp_path / 'hub.vcobj')
+    ObjectStore.create(hub, author='curator').close()
+    plain = version(hub)
+    vos.hub_init(hub, 'curator')
+    replica = str(tmp_path / 'replica.vcobj')
+    vos.hub_clone(hub, replica, 'editor')
+    assert version(hub) == version(replica) == plain + 1
+    with ObjectStore.open(replica, author='editor') as db:
+        put(db, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        assert db.hub_sync(pull=True, push=True)['published_position'] > 0
+    assert version(hub) == plain + 1
+
+
 def test_a_position_needs_only_the_geometry_it_reads(tmp_path):
     """A replica that has not pulled an object's geometry still reads the
     other objects of a position; only a read naming that object needs it."""

@@ -36,7 +36,8 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     auto validate = [&](sqlite3* db) {
         if (pragmaInt(db, "application_id") != kApplicationId)
             throw std::runtime_error("object store: unsupported database format: " + path.string());
-        if (pragmaInt(db, "user_version") != kSchemaVersion)
+        if (const int version = pragmaInt(db, "user_version");
+            version != kSchemaVersion && version != kIndexedHubSchemaVersion)
             throw std::runtime_error("object store: unsupported database schema: " + path.string());
         // A hub must keep its rollback journal: opening it with WAL from a
         // network mount would break locking for every other client.

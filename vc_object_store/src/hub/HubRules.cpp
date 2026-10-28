@@ -64,6 +64,7 @@ CREATE TABLE hub_publications(
   replica TEXT NOT NULL
 );)SQL");
     execute(db, "INSERT INTO hub_publications VALUES(?,0,?,'')", head, publishedAtUs);
+    exec(db, ("PRAGMA user_version=" + std::to_string(kIndexedHubSchemaVersion) + ";").c_str());
 }
 
 HubPublication publication(Statement& row)
@@ -223,6 +224,9 @@ void enforceHubRules(sqlite3* db, const StatementPool& pool, HubRole role)
                 throw std::runtime_error("object store: " + object + " is leased to " + describe(*held));
         if (const auto head = hubHead(db); head > pool.startJournal) {
             if (!hasPublications(db)) createPublications(db, pool.startJournal, pool.startPublishedUs);
+            else if (pragmaInt(db, "user_version") != kIndexedHubSchemaVersion)
+                // Indexed before the version gate existed.
+                exec(db, ("PRAGMA user_version=" + std::to_string(kIndexedHubSchemaVersion) + ";").c_str());
             execute(db, "INSERT INTO hub_publications VALUES(?,?,?,?)", head, pool.startJournal, latestPublicationUs(db), acting);
         }
         return;

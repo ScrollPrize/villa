@@ -4,6 +4,12 @@
 // Hosted-store invariants shared by every write on a hub or a replica.
 // Stores without hub_* tables (HubRole::None) never reach this code.
 namespace vc::objects::detail {
+// The schema of a hub with a publication index, and of the replicas cloned
+// from it: the ordinary schema plus hub_publications. Binaries from before
+// the index accept only the ordinary version, so they cannot write to an
+// indexed hub (their writes would journal without a publication, leaving
+// every later position unreadable until the next indexed write).
+constexpr int kIndexedHubSchemaVersion = 18;
 HubRole detectHubRole(sqlite3*);
 void createHubTables(sqlite3*);
 void createReplicaTables(sqlite3*);
