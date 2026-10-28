@@ -4,6 +4,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/objects/CatalogStore.hpp"
+#include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/objects/GeometryRegion.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
@@ -174,13 +175,15 @@ int main() try
             "namespaced UUIDv5");
 
     ObjectStoreSession session;
-    const auto cache = directory.path / "cache";
-    CatalogStoreReport report;
-    const auto catalog = attachCatalog(session, sample, cache, {}, std::nullopt, &report);
+    session.setGeometryFetcher(kCatalogMetaKey, fetchCatalogSurface);
+    OpenOptions user;
+    user.author = "catalog-test";
+    const auto projectPath = directory.path / "sample.vcobj";
+    createProject(projectPath, "sample", {{"open_data", {{"sample", "sample"}}}}, user);
+    const auto catalog = session.attach(projectPath, user);
+    const auto report = addCatalogSample(session, catalog, sample);
     require(report.added == 2 && report.surfaces == 2, "placeholders for every catalog surface");
-    require(session.path(catalog) == catalogSampleStorePath(cache, "sample"), "store path");
-    require(session.writable(catalog), "the sample store accepts local edits without another store");
-    require(attachCatalog(session, sample, cache) == catalog, "an attached sample store is reused");
+    require(addCatalogSample(session, catalog, sample).added == 0, "adding the sample again adds nothing");
 
     // Placeholder metadata comes from the catalog, never the published meta.json.
     std::optional<ObjectRecord> record;
@@ -243,33 +246,23 @@ int main() try
     require(fs::is_regular_file(ink) && ink.parent_path() == session.artifactDirectory(catalog, uuid, false),
             "published image fetched");
 
-    // Importing makes the same object in the user's store, which then hides the catalog's.
-    OpenOptions user;
-    user.author = "catalog-test";
+    // Editing a fetched surface edits it in place; resetting restores the fetched version.
+    std::string firstRevision;
+    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) { firstRevision = db.currentObjectRevision(txn, uuid)->uuid; });
+    session.act(catalog, {{uuid, firstRevision}}, [&](auto& db, auto& txn) { db.setMeta(txn, uuid, "review", "\"edited\""); });
+    restoreCatalogVersion(session, catalog, uuid);
+    session.read(catalog, [&](const auto& db, const auto& txn, const auto&) {
+        require(!nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta).contains("review"), "reset to the catalog version");
+    });
+    // Other objects have no catalog version.
+    mustFail([&] { restoreCatalogVersion(session, catalog, util::newUuid()); });
+
+    // Importing brings the same object into another store, which then hides it in queries.
     { auto created = ObjectStore::create(directory.path / "user.vcobj", user); }
     const auto mine = session.attach(directory.path / "user.vcobj", user);
     session.importObject(catalog, mine, uuid);
     const auto both = session.selectObjects({mine, catalog}, near);
-    require(both.size() == 1 && both.front().attachment == mine, "imported copy shadows the catalog surface");
-    const auto regions = session.geometryRegion({mine, catalog}, [] {
-        RegionSlice slice;
-        slice.origin = {12, 12, 30};
-        slice.localBounds = {-20, -20, -1, 20, 20, 1};
-        return slice;
-    }(), [] {
-        RegionOptions options;
-        options.kind = "surface";
-        options.volume = "vol";
-        return options;
-    }());
-    require(!regions[0].result.runs.empty() && regions[1].result.runs.empty(), "region shadowing");
-    std::string firstRevision;
-    session.read(mine, [&](const auto& db, const auto& txn, const auto&) { firstRevision = db.currentObjectRevision(txn, uuid)->uuid; });
-    session.act(mine, {{uuid, firstRevision}}, [&](auto& db, auto& txn) { db.setMeta(txn, uuid, "review", "\"edited\""); });
-    session.restoreImported(mine, uuid);
-    session.read(mine, [&](const auto& db, const auto& txn, const auto&) {
-        require(!nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta).contains("review"), "reset to the imported version");
-    });
+    require(both.size() == 1 && both.front().attachment == mine, "imported copy shadows the original");
 
     // Refresh follows the catalog only when asked; a changed tifxyz is fetched again.
     writeSurface(served / "seg-a-v2.tifxyz", 31);
@@ -288,9 +281,9 @@ int main() try
     }, "new revision");
     session.read(mine, [&](const auto& db, const auto& txn, const auto&) {
         require(nlohmann::json::parse(db.currentGeometry(txn, uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
-                "user store untouched by refresh");
+                "other stores untouched by refresh");
     });
-    // Editing the fetched sample itself survives refresh and reopening.
+    // Local edits survive refresh and reopening.
     session.editCurrent(catalog, {uuid}, [&](auto& db, auto& txn, const auto& id) {
         auto geometry = db.currentGeometry(txn, id);
         const auto view = GeometrySnapshot(db, txn).viewStored(id);
@@ -302,19 +295,39 @@ int main() try
     });
     const auto kept = refreshCatalog(session, catalog, sample);
     require(kept.preserved == 1 && kept.stale == 0, "refresh preserves locally edited geometry");
+    // A geometry edit, then a reset, returns the fetched geometry.
+    const auto edited = editedGeometry;
     session.detach(catalog);
-    const auto reopened = attachCatalog(session, sample, cache);
+    const auto reopened = session.attach(projectPath, user);
     session.read(reopened, [&](const auto& db, const auto& txn, const auto&) {
-        require(db.currentGeometry(txn, uuid)->uuid == editedGeometry, "edits survive reopening the sample");
+        require(db.currentGeometry(txn, uuid)->uuid == edited, "edits survive reopening the project");
         require(GeometrySnapshot(db, txn).surface(uuid).vertex(0, 0) == vc::geometry::SurfacePoint{42, 43, 44},
                 "saved coordinates survive refresh and reopening");
     });
+    restoreCatalogVersion(session, reopened, uuid);
+    session.read(reopened, [&](const auto& db, const auto& txn, const auto&) {
+        const auto record = db.objectByUuid(txn, uuid);
+        require(nlohmann::json(db.currentGeometry(txn, uuid)->uuid) == nlohmann::json::parse(record->meta).at("catalog_geometry_revision"),
+                "reset restores the fetched geometry");
+    });
     session.detach(reopened);
+    // Read-only attachments read local geometry but never fetch.
     OpenOptions readOnly;
     readOnly.readOnly = true;
-    const auto viewed = attachCatalog(session, sample, cache, readOnly);
-    require(!session.writable(viewed), "explicit read-only sample attachments remain read-only");
+    const auto viewed = session.attach(projectPath, readOnly);
+    require(!session.writable(viewed), "explicit read-only attachments remain read-only");
     mustFail([&] { session.editRecords(viewed, {uuid}, [](auto& r) { r.name = "forbidden"; }); });
+    const auto unfetchedPath = directory.path / "unfetched.vcobj";
+    createProject(unfetchedPath, "unfetched", nlohmann::json::object(), user);
+    const auto unfetched = session.attach(unfetchedPath, user);
+    addCatalogSample(session, unfetched, sample);
+    mustFail([&] { restoreCatalogVersion(session, unfetched, uuid); });  // never fetched
+    session.detach(unfetched);
+    const auto requests = server.requests("seg-a.tifxyz/x.tif");
+    const auto viewedUnfetched = session.attach(unfetchedPath, readOnly);
+    mustFail([&] { session.ensureGeometry(viewedUnfetched, uuid); });
+    (void)regionAt(session, viewedUnfetched, 30);
+    require(server.requests("seg-a.tifxyz/x.tif") == requests, "read-only attachments do not fetch");
     std::cout << "ok\n";
     return 0;
 } catch (const std::exception& error) {

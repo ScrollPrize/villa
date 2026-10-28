@@ -42,6 +42,7 @@ PointCollectionSync::PointCollectionSync(CState* state) : QObject(state), state_
     });
     connect(state_, &CState::volumeChanged, this, [this] { reload(); });
     connect(state_, &CState::objectStoreChanged, this, &PointCollectionSync::onStoreEvent);
+    connect(state_, &CState::storeRoutesChanged, this, &PointCollectionSync::reload);
 }
 
 bool PointCollectionSync::anchored(uint64_t collectionId) const
@@ -136,7 +137,7 @@ void PointCollectionSync::unload()
 void PointCollectionSync::reload()
 {
     flush();
-    const auto attachment = state_->objectStoreAttachment();
+    const auto attachment = state_->storeFor("point_collection");
     const auto volume = state_->currentVolume();
     std::vector<vc::objects::AttachedCollection> stored;
     if (attachment && volume) {

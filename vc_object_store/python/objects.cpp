@@ -9,6 +9,7 @@
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/objects/Project.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
@@ -316,6 +317,14 @@ NB_MODULE(_native, m)
         return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(meta)), volume);
     }, nb::arg("meta"), nb::arg("volume"),
        "Volume voxels per stored unit for an object whose meta binds it to volume; None when it is not.");
+    m.def("create_project", [](const std::filesystem::path& path, const std::string& name, const nb::object& meta,
+                               const std::string& author) {
+        vo::OpenOptions options;
+        options.author = author;
+        vo::createProject(path, name, meta.is_none() ? nlohmann::json::object() : nlohmann::json::parse(jsonDumps(meta)), options);
+    }, nb::arg("path"), nb::arg("name"), nb::arg("meta") = nb::none(), nb::arg("author"),
+       "Create a store at path holding a project named name.");
+    m.def("project_resource_uuid", &vo::projectResourceUuid, nb::arg("kind"), nb::arg("location"), nb::arg("owner") = "");
     m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
           "Turn a local store with no other connections into a hub for a network share.");
     m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
@@ -871,6 +880,29 @@ NB_MODULE(_native, m)
     },nb::arg("object_uuid"));
     store.def("geometry_length_in_volume",readMethod<&vo::ObjectStore::geometryLengthInVolume>(),
         nb::arg("object_uuid"),nb::arg("target_volume"),nb::arg("target_scale")=1.0);
+    // A store as a project (objects/Project.hpp).
+    store.def("project_record",[](PyObjectStore& self)->nb::object{
+        const auto record=self.withRead([&](auto& db,auto& txn){return vo::projectRecord(db,txn);});
+        return record?nb::object(objectToPy(*record)):nb::none();
+    },"The store's project record, or None.");
+    store.def("project_resources",[](PyObjectStore& self,const std::string& kind,const std::optional<std::string>& viewer){
+        nb::list resources;
+        for(const auto& resource:self.withRead([&](auto& db,auto& txn){return vo::projectResources(db,txn,kind,viewer);})){
+            nb::dict d;
+            d["uuid"]=resource.uuid;d["kind"]=resource.kind;d["location"]=resource.location;d["owner"]=resource.owner;
+            d["tags"]=resource.tags;d["meta"]=jsonLoads(resource.meta.dump());
+            resources.append(d);
+        }
+        return resources;
+    },nb::arg("kind"),nb::arg("viewer")=std::nullopt,
+      "The live resources of kind (volume, normal_grid, lasagna_dataset) viewer sees (all when None), in the order added.");
+    store.def("add_project_resource",[](PyObjectStore& self,const std::string& kind,const std::string& location,
+                                        const std::vector<std::string>& tags,const nb::object& meta,const std::string& owner){
+        const auto record=vo::projectResourceRecord(kind,location,tags,
+            meta.is_none()?nlohmann::json::object():nlohmann::json::parse(jsonDumps(meta)),owner);
+        return self.withWrite([&](auto& db,auto& txn){return db.upsertObject(txn,record);});
+    },nb::arg("kind"),nb::arg("location"),nb::arg("tags")=std::vector<std::string>{},nb::arg("meta")=nb::none(),
+      nb::arg("owner")="","Add (or update) a project resource, shared or owner's alone; returns its uuid.");
     store.def("register_volume_transform",[](PyObjectStore& self,const std::string& source,const std::string& target,const nb::object& rows,const std::string& name){
         const auto matrix=vo::VolumeAffine::fromJson(nlohmann::json::parse(jsonDumps(rows)));
         return self.withWrite([&](auto& db,auto& txn){return db.registerVolumeTransform(txn,source,target,matrix,name);});

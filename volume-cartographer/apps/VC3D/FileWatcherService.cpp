@@ -54,7 +54,7 @@ void FileWatcherService::startWatching()
 
     // Watch the volumes directory for live updates
     {
-        std::filesystem::path volumesDir = std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) / "volumes";
+        std::filesystem::path volumesDir = std::filesystem::path(_state->vpkg()->directory().string()) / "volumes";
         if (std::filesystem::exists(volumesDir)) {
             int wd = inotify_add_watch(_inotifyFd, volumesDir.c_str(),
                                       IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ONLYDIR);

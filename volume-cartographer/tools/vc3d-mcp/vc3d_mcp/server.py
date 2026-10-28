@@ -98,10 +98,10 @@ def resolve_launch_binary(explicit: str | None) -> str | None:
     return installed or default_vc3d_binary()
 
 
-def _launch_command(binary: str, volpkg: str | None) -> list[str]:
+def _launch_command(binary: str, project: str | None) -> list[str]:
     command = [binary, "--agent-bridge"]
-    if volpkg:
-        command += ["--volpkg", volpkg]
+    if project:
+        command += ["--project", project]
     return command
 
 
@@ -140,7 +140,7 @@ async def verify_bridge_protocol(
 
 def launch_vc3d(
     binary: str,
-    volpkg: str | None = None,
+    project: str | None = None,
     timeout: float = LAUNCH_HANDSHAKE_TIMEOUT_S,
 ) -> str:
     """Spawn VC3D with the agent bridge enabled and return its local endpoint.
@@ -163,7 +163,7 @@ def launch_vc3d(
     global _launched_process
 
     proc = subprocess.Popen(
-        _launch_command(binary, volpkg),
+        _launch_command(binary, project),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,  # keep diagnostics; drained below
         text=True,
@@ -292,7 +292,7 @@ async def resolve_connection(args: argparse.Namespace) -> tuple[str | None, str]
             f"vc3d-mcp: no running bridge found; launching VC3D at {binary!r}...",
             file=sys.stderr,
         )
-        path = launch_vc3d(binary, volpkg=args.volpkg)
+        path = launch_vc3d(binary, project=args.project)
         await verify_bridge_protocol(path, args.request_timeout)
         return path, f"auto-launched VC3D ({binary})"
 
@@ -336,12 +336,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--volpkg",
+        "--project",
         default=None,
         help=(
-            "Optional volume-package path forwarded to an auto-launched VC3D as "
-            "--volpkg, so the agent's first action need not be opening a "
-            "volume. Only used on the auto-launch path."
+            "Optional project (.vcobj) forwarded to an auto-launched VC3D as "
+            "--project, so the agent's first action need not be opening a "
+            "project. Only used on the auto-launch path."
         ),
     )
     parser.add_argument(

@@ -378,13 +378,13 @@ auto main(int argc, char* argv[]) -> int
     parser.addOption(cacheSizeOption);
 
     QCommandLineOption volumePackageOption(
-        "volpkg",
-        "Open a volume package at startup.",
+        "project",
+        "Open a project (.vcobj) at startup.",
         "path");
     parser.addOption(volumePackageOption);
-    QCommandLineOption fiberCollectionOption(
-        "object-store", "Attach an existing writable object store (.vcobj) for this session.", "path");
-    parser.addOption(fiberCollectionOption);
+    QCommandLineOption attachStoreOption(
+        "attach-store", "Attach an existing writable object store (.vcobj) beside the project.", "path");
+    parser.addOption(attachStoreOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -515,8 +515,8 @@ auto main(int argc, char* argv[]) -> int
             }
         }
 
-        if (parser.isSet(fiberCollectionOption)) {
-            aWin.attachObjectStore(parser.value(fiberCollectionOption).trimmed());
+        if (parser.isSet(attachStoreOption)) {
+            aWin.attachStore(parser.value(attachStoreOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

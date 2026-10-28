@@ -8,6 +8,7 @@
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "support/TestProject.hpp"
 #include "vc/core/util/MemMap.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -26,28 +27,6 @@ using namespace vc3d::opendata;
 
 namespace {
 
-struct TestAutosaveRoot {
-    TestAutosaveRoot()
-        : previous(VolumePkg::autosaveRoot())
-        , root(std::filesystem::temp_directory_path() /
-               ("vc_open_data_manifest_autosave_" +
-                std::to_string(vc::memmap::pid())))
-    {
-        std::filesystem::remove_all(root);
-        VolumePkg::setAutosaveRoot(root);
-    }
-
-    ~TestAutosaveRoot()
-    {
-        VolumePkg::setAutosaveRoot(previous);
-        std::filesystem::remove_all(root);
-    }
-
-    std::filesystem::path previous;
-    std::filesystem::path root;
-};
-
-TestAutosaveRoot testAutosaveRoot;
 
 constexpr const char* kFixture = R"({
   "samples": {
@@ -449,7 +428,7 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
     REQUIRE(preparation.messages.size() == 1);
     CHECK(preparation.messages.front().find("coordinate level L3") != std::string::npos);
     CHECK(preparation.messages.front().find("ambiguous") == std::string::npos);
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     CHECK(attachOpenDataLasagna(*pkg, preparation) == 0);
 }
 
@@ -463,7 +442,7 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
         R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") + ", " +
         publishedArtifact("lasagna", "vol-a", 3) + R"(]}, "vol-b": {"id": "vol-b", "data": [)" +
         publishedArtifact("zarr", "vol-b.zarr") + ", " + publishedArtifact("lasagna", "vol-b", 0) + "]}}");
-    auto pkg = VolumePkg::newEmpty(options);
+    auto pkg = vc::test::emptyProject(options);
     REQUIRE(pkg->addLasagnaDatasetEntry(cachedLasagna(root / "vol-a", "https://example.test/vol-a").string()));
     const auto& catalog = *options.catalog;
 
@@ -514,7 +493,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
         QString::fromStdString(root.string()));
     settings.sync();
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     REQUIRE(pkg->addLasagnaDatasetEntry(location));
     pkg->setSelectedLasagnaDataset(location);
     const auto resolved = resolveLasagnaForView(*pkg, std::nullopt);
@@ -546,7 +525,7 @@ TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume s
     vc::project::LoadOptions options;
     options.catalog = lasagnaCatalog(R"({"vol-a": {"id": "vol-a", "data": [)" + publishedArtifact("zarr", "vol-a.zarr") +
                                      ", " + publishedArtifact("lasagna", "vol-a", 3) + "]}}");
-    auto pkg = VolumePkg::newEmpty(options);
+    auto pkg = vc::test::emptyProject(options);
     REQUIRE(pkg->addLasagnaDatasetEntry(cachedLasagna(root, "https://example.test/vol-a", R"({
       "version":2,
       "source_to_base":1,
@@ -588,7 +567,7 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
 
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto pkg = VolumePkg::newEmpty(options);
+    auto pkg = vc::test::emptyProject(options);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.attachedVolumeEntries == 2);
@@ -628,12 +607,12 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     selection.representations = vcr::catalog::derivedRepresentations(sample);
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto pkg = VolumePkg::newDetached(options);
+    auto pkg = vc::test::emptyProject(options);
     attachOpenDataSampleVolumes(*pkg, sample, &selection);
     CHECK(pkg->volumeEntries().empty());
 
     selection.rawVolumeIds->push_back(volume.id);
-    auto withScan = VolumePkg::newDetached(options);
+    auto withScan = vc::test::emptyProject(options);
     attachOpenDataSampleVolumes(*withScan, sample, &selection);
     REQUIRE(withScan->volumeEntries().size() == 1);
     CHECK(withScan->volumeEntries().front().location == source.resolvedUrl);
@@ -644,7 +623,7 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     auto catalog = std::make_shared<vcr::catalog::OpenDataManifest>();
     catalog->samples = {sample};
     options.catalog = catalog;
-    auto cataloged = VolumePkg::newDetached(options);
+    auto cataloged = vc::test::emptyProject(options);
     const auto manifest = cachedLasagna(root, lasagna.resolvedUrl);
     REQUIRE(cataloged->addLasagnaDatasetEntry(manifest.string()));
     const auto resolved = resolveLasagnaForView(*cataloged, catalog->volumeAt(source.resolvedUrl, 0));
@@ -735,7 +714,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     const auto root = std::filesystem::temp_directory_path() /
         ("vc_open_data_normal_grids_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     CHECK(attachOpenDataNormalGrids(*pkg, sample, root) == 2);
     const auto entries = pkg->normalGridEntries();
     REQUIRE(entries.size() == 2);
@@ -819,7 +798,7 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     REQUIRE(volumeFromScan->pixelSizeUm.has_value());
     CHECK(*volumeFromScan->pixelSizeUm == doctest::Approx(2.403));
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     const auto result = attachOpenDataSampleVolumes(*pkg, *sample);
     CHECK(result.supportedVolumes == 2);
     REQUIRE(pkg->volumeEntries().size() == 2);
@@ -862,7 +841,7 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
 
     vc::project::LoadOptions loadOptions;
     loadOptions.deferResolution = true;
-    auto pkg = VolumePkg::newEmpty(loadOptions);
+    auto pkg = vc::test::emptyProject(loadOptions);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
@@ -895,19 +874,17 @@ TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a cat
         }));
 }
 
-TEST_CASE("Project creation defaults to the shared autosave directory")
+TEST_CASE("Project creation defaults to the chosen directory, else VC3D's projects")
 {
     const auto root = std::filesystem::current_path() /
         ("project_defaults_test_" + std::to_string(vc::memmap::pid()));
-    const auto previous = VolumePkg::autosaveRoot();
-    VolumePkg::setAutosaveRoot(root / "vc3d");
     {
         QSettings settings(QString::fromStdString((root / "settings.ini").string()), QSettings::IniFormat);
-        settings.setValue(vc3d::settings::project::DEFAULT_PATH, "different-directory");
-        CHECK(vc3d::defaultNewProjectDirectory(settings).toStdString() == (root / "vc3d").string());
-        CHECK(std::filesystem::is_directory(root / "vc3d"));
+        CHECK(vc3d::defaultNewProjectDirectory(settings) == vc3d::projectsDirectory());
+        CHECK(std::filesystem::is_directory(vc3d::projectsDirectory().toStdString()));
+        settings.setValue(vc3d::settings::project::DEFAULT_PATH, "chosen-directory");
+        CHECK(vc3d::defaultNewProjectDirectory(settings) == QStringLiteral("chosen-directory"));
     }
-    VolumePkg::setAutosaveRoot(previous);
     std::filesystem::remove_all(root);
 }
 
@@ -930,19 +907,19 @@ TEST_CASE("Catalog source selection is independent of derived representations")
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
     selection.representations.emplace();
-    auto empty = VolumePkg::newEmpty(options);
+    auto empty = vc::test::emptyProject(options);
     attachOpenDataSampleVolumes(*empty, sample, &selection);
     CHECK(empty->volumeEntries().empty());
 
     selection.representations = vcr::catalog::derivedRepresentations(sample);
-    auto derived = VolumePkg::newEmpty(options);
+    auto derived = vc::test::emptyProject(options);
     attachOpenDataSampleVolumes(*derived, sample, &selection);
     REQUIRE(derived->volumeEntries().size() == 1);
     CHECK(derived->volumeEntries().front().location == prediction.resolvedUrl);
 
     selection.rawVolumeIds = std::vector<std::string>{"v"};
     selection.representations->clear();
-    auto raw = VolumePkg::newEmpty(options);
+    auto raw = vc::test::emptyProject(options);
     attachOpenDataSampleVolumes(*raw, sample, &selection);
     REQUIRE(raw->volumeEntries().size() == 1);
     CHECK(raw->volumeEntries().front().location == source.resolvedUrl);
@@ -970,7 +947,7 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
         {0, 1, vcr::catalog::OpenDataRepresentationKind::Prediction}};
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto pkg = VolumePkg::newDetached(options);
+    auto pkg = vc::test::emptyProject(options);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample, &selection);
     REQUIRE(pkg->volumeEntries().size() == 1);
     const auto& entry = pkg->volumeEntries().front();
@@ -992,48 +969,36 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
     }));
 }
 
-TEST_CASE("Selective catalog projects isolate cached projects")
+TEST_CASE("A sample's project is a store that names its sample")
 {
     auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto sample = *manifest.findSample("PHerc0139");
     const auto root = std::filesystem::current_path() /
         ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
     std::filesystem::remove_all(root);
-    const auto oldAutosave = VolumePkg::autosaveRoot();
-    VolumePkg::setAutosaveRoot(root / "autosave");
-    // Prepare the full catalog cache first.
-    vc::project::LoadOptions options;
-    options.deferResolution = true;
-    auto full = VolumePkg::newEmpty(options);
-    full->setSelectedLasagnaDataset("full-project-marker");
-    const auto cachedPath = root / "open_data/projects/PHerc0139.volpkg.json";
-    full->save(cachedPath);
-    const auto autosaveBefore = [&]() {
-        std::ifstream stream(VolumePkg::autosaveRoot() / "current_project.json");
-        return nlohmann::json::parse(stream);
-    }();
+    vc::objects::OpenOptions options;
+    options.author = "vc-test";
 
+    const auto path = root / "empty.vcobj";
+    createSampleProjectStore(path, sample, "Empty chosen project", options);
+    CHECK_THROWS(createSampleProjectStore(path, sample, "again", options));
+    auto session = std::make_shared<vc::objects::ObjectStoreSession>();
+    const auto project = session->attach(path, options);
+    CHECK(openDataProjectSample(*session, project) == std::optional<std::string>("PHerc0139"));
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
     selection.representations.emplace();
-    OpenDataNewProject destination{root / "empty.volpkg.json", "Empty chosen project"};
-    auto empty = createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &destination);
+    selection.segmentIds.emplace();
+    auto empty = createOpenDataSampleProject(session, project, "vc-test", sample, root, nullptr, {}, &selection);
     CHECK(empty->volumeEntries().empty());
     CHECK(empty->selectedLasagnaDataset().empty());
-    CHECK(empty->name() == destination.name);
-    CHECK(empty->path() == destination.path);
+    CHECK(empty->name() == "Empty chosen project");
+    CHECK(empty->path() == path);
     CHECK_FALSE(std::filesystem::exists(root / "fibers"));
 
-    auto reloaded = VolumePkg::load(destination.path, options);
-    CHECK(reloaded->name() == destination.name);
-    auto cached = VolumePkg::load(cachedPath, options);
-    CHECK(cached->selectedLasagnaDataset() == "full-project-marker");
-    OpenDataNewProject invalid{root, "Cannot save onto directory"};
-    CHECK_THROWS(createOpenDataSampleProject(sample, root, nullptr, {}, &selection, &invalid));
-    std::ifstream autosaveStream(VolumePkg::autosaveRoot() / "current_project.json");
-    CHECK(nlohmann::json::parse(autosaveStream) == autosaveBefore);
-    autosaveStream.close();
-    VolumePkg::setAutosaveRoot(oldAutosave);
+    // Any other store is not a sample's project.
+    const auto plain = vc::test::createTestProject();
+    CHECK_FALSE(openDataProjectSample(*plain.session, plain.attachment));
     std::filesystem::remove_all(root);
 }
 
@@ -1069,7 +1034,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     sample.segments.push_back(segment("vol-b"));
     sample.segments.push_back(segment("vol-c"));
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
     CHECK(result.supportedVolumes == 3);
@@ -1079,38 +1044,35 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
     for (auto& derived : sample.segments)
         if (derived.originalVolumeId == "vol-b")
             derived.creation.derivedFrom = vcr::catalog::OpenDataReference{"volume", "vol-c"};
-    auto derivedPkg = VolumePkg::newEmpty();
+    auto derivedPkg = vc::test::emptyProject();
     CHECK(attachOpenDataSampleVolumes(*derivedPkg, sample).preferredVolumeId == "vol-c");
 }
 
 
-TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
+TEST_CASE("Reopening a sample's project keeps what the user changed")
 {
     vcr::catalog::OpenDataSample sample;
     sample.id = "Sample With Spaces";
 
-    const auto cacheRoot = std::filesystem::temp_directory_path() /
-                           ("vc_open_data_cached_project_test_" + std::to_string(vc::memmap::pid()));
-    std::filesystem::remove_all(cacheRoot);
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("vc_open_data_sample_project_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(root);
+    const auto path = sampleProjectPath(root, sample);
+    CHECK(path == root / "open_data" / "Sample_With_Spaces.vcobj");
+    vc::objects::OpenOptions options;
+    options.author = "vc-test";
+    createSampleProjectStore(path, sample, sample.id, options);
+    auto session = std::make_shared<vc::objects::ObjectStoreSession>();
+    const auto project = session->attach(path, options);
 
-    OpenDataSampleProjectResult firstResult;
-    auto first = createOpenDataSampleProject(sample, cacheRoot, &firstResult);
-    const auto projectPath = cacheRoot / "open_data" / "projects" /
-                             "Sample_With_Spaces.volpkg.json";
-    CHECK(std::filesystem::is_regular_file(projectPath));
-    CHECK(first->path() == projectPath);
+    auto first = createOpenDataSampleProject(session, project, "vc-test", sample, root);
+    CHECK(first->path() == path);
+    first->setSelectedLasagnaDataset("user-marker");
+    REQUIRE(first->addVolumeEntry("/user/volume.zarr"));
 
-    first->setSelectedLasagnaDataset("cached-marker");
-
-    OpenDataSampleProjectResult secondResult;
-    auto second = createOpenDataSampleProject(sample, cacheRoot, &secondResult);
-    CHECK(second->path() == projectPath);
-    CHECK(second->selectedLasagnaDataset() == "cached-marker");
-    CHECK(std::any_of(secondResult.messages.begin(),
-                      secondResult.messages.end(),
-                      [](const std::string& message) {
-                          return message.find("Loaded cached sample project") != std::string::npos;
-                      }));
-
-    std::filesystem::remove_all(cacheRoot);
+    auto second = createOpenDataSampleProject(session, project, "vc-test", sample, root);
+    CHECK(second->selectedLasagnaDataset() == "user-marker");
+    CHECK(std::any_of(second->volumeEntries().begin(), second->volumeEntries().end(),
+                      [](const auto& entry) { return entry.location == "/user/volume.zarr"; }));
+    std::filesystem::remove_all(root);
 }

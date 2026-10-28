@@ -7,6 +7,10 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
+#include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/objects/Project.hpp>
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -97,64 +101,58 @@ std::string segmentSourcePreferredVolumeId(
     return preferredCount == 0 ? std::string{} : preferredId;
 }
 
-std::filesystem::path sampleProjectCachePath(
-    const std::filesystem::path& remoteCacheRoot,
-    const vcr::catalog::OpenDataSample& sample)
-{
-    return remoteCacheRoot / "open_data" / "projects" /
-           (vcr::catalog::safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".volpkg.json");
-}
-
-bool isNonEmptyFile(const std::filesystem::path& path)
-{
-    std::error_code ec;
-    return std::filesystem::is_regular_file(path, ec) &&
-           std::filesystem::file_size(path, ec) > 0 &&
-           !ec;
-}
-
 } // namespace
 
+std::filesystem::path sampleProjectPath(const std::filesystem::path& projectsDirectory,
+                                        const vcr::catalog::OpenDataSample& sample)
+{
+    return projectsDirectory / "open_data" /
+           (vcr::catalog::safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".vcobj");
+}
+
+void createSampleProjectStore(const std::filesystem::path& path, const vcr::catalog::OpenDataSample& sample,
+                              const std::string& name, const vc::objects::OpenOptions& options)
+{
+    std::filesystem::create_directories(path.parent_path());
+    vc::objects::createProject(path, name, {{"open_data", {{"sample", sample.id}}}}, options);
+}
+
+std::optional<std::string> openDataProjectSample(vc::objects::ObjectStoreSession& session,
+                                                 const vc::objects::AttachmentIdentity& project)
+{
+    std::optional<std::string> sample;
+    session.read(project, [&](const auto& store, const auto& txn, const auto&) {
+        const auto record = vc::objects::projectRecord(store, txn);
+        if (!record) return;
+        const auto meta = nlohmann::json::parse(record->meta);
+        if (const auto openData = meta.find("open_data"); openData != meta.end() && openData->is_object())
+            if (const auto id = openData->value("sample", std::string{}); !id.empty()) sample = id;
+    });
+    return sample;
+}
+
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const vc::objects::AttachmentIdentity& project,
+    const std::string& author,
     const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut,
     const OpenDataSampleProgressCallback& progressCallback,
-    const OpenDataResourceSelection* selection,
-    const OpenDataNewProject* newProject)
+    const OpenDataResourceSelection* selection)
 {
     auto result = OpenDataSampleProjectResult{};
-    std::shared_ptr<VolumePkg> pkg;
-    if (newProject && (newProject->path.empty() || newProject->name.empty()))
-        throw std::invalid_argument("New project requires a name and destination.");
-    const auto cachedProjectPath = (remoteCacheRoot.empty() || newProject)
-        ? std::filesystem::path{}
-        : sampleProjectCachePath(remoteCacheRoot, sample);
     // Catalog loads remain unresolved until normal-grid paths have been
     // reconciled.
     vc::project::LoadOptions loadOptions;
     loadOptions.catalog = vc3d::opendata::cachedCatalog();
     loadOptions.deferResolution = true;
+    auto pkg = VolumePkg::open(session, project, author, loadOptions);
 
-    if (!cachedProjectPath.empty() && isNonEmptyFile(cachedProjectPath)) {
-        try {
-            pkg = VolumePkg::load(cachedProjectPath, loadOptions);
-            result.messages.push_back("Loaded cached sample project: " +
-                                      cachedProjectPath.string());
-        } catch (const std::exception& e) {
-            result.messages.push_back("Ignored cached sample project " +
-                                      cachedProjectPath.string() + ": " + e.what());
-        } catch (...) {
-            result.messages.push_back("Ignored cached sample project " +
-                                      cachedProjectPath.string() + ": unknown error.");
-        }
-    }
-
-    if (!pkg) {
-        pkg = newProject ? VolumePkg::newDetached(loadOptions) : VolumePkg::newEmpty(loadOptions);
-    }
-    pkg->setName(newProject ? newProject->name :
-                 (sample.id.empty() ? "Open Data Sample" : sample.id));
+    const auto surfaces = vc::objects::addCatalogSample(*session, project, sample,
+                                                        selection ? selection->segmentIds : std::nullopt);
+    if (surfaces.added > 0)
+        result.messages.push_back("Added " + std::to_string(surfaces.added) + " catalog surface(s).");
     auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
@@ -181,44 +179,22 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                 " manifest-backed Lasagna dataset(s).");
         }
     }
-    if (newProject) {
-        // Detached preparation must not overwrite the active project's autosave.
-        // Reload the saved JSON to activate ordinary persistence and exercise
-        // exactly the same entry resolution as reopening it later.
-
-        pkg->save(newProject->path);
-        pkg = VolumePkg::load(newProject->path, loadOptions);
+    if (progressCallback) {
+        try { progressCallback({"resolving-volumes"}); } catch (...) {}
     }
-    if (pkg->entryResolutionDeferred()) {
-        if (progressCallback) {
-            try { progressCallback({"resolving-volumes"}); } catch (...) {}
-        }
-        pkg->resolveDeferredEntries();
-        if (progressCallback) {
-            try { progressCallback({"project-ready"}); } catch (...) {}
-        }
-        for (const auto& entry : pkg->volumeEntries()) {
-            const auto view = vc::project::catalogVolumeView(pkg->catalog().get(), entry.location);
-            if (!view || view->sampleId != sample.id || pkg->hasLoadedVolumeEntry(entry.location)) {
-                continue;
-            }
-            ++result.failedVolumes;
-            result.messages.push_back(
-                "Catalog volume failed remote open/base-level validation: " +
-                entry.location + ".");
-        }
+    pkg->resolveDeferredEntries();
+    if (progressCallback) {
+        try { progressCallback({"project-ready"}); } catch (...) {}
     }
-
-    if (!cachedProjectPath.empty()) {
-        try {
-            pkg->save(cachedProjectPath);
-        } catch (const std::exception& e) {
-            result.messages.push_back("Failed to save cached sample project " +
-                                      cachedProjectPath.string() + ": " + e.what());
-        } catch (...) {
-            result.messages.push_back("Failed to save cached sample project " +
-                                      cachedProjectPath.string() + ": unknown error.");
+    for (const auto& entry : pkg->volumeEntries()) {
+        const auto view = vc::project::catalogVolumeView(pkg->catalog().get(), entry.location);
+        if (!view || view->sampleId != sample.id || pkg->hasLoadedVolumeEntry(entry.location)) {
+            continue;
         }
+        ++result.failedVolumes;
+        result.messages.push_back(
+            "Catalog volume failed remote open/base-level validation: " +
+            entry.location + ".");
     }
 
     if (resultOut) {

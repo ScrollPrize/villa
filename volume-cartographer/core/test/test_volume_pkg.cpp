@@ -1,6 +1,5 @@
-// Coverage for core/src/VolumePkg.cpp — focuses on the JSON project file
-// lifecycle (newEmpty/save/load), entry add/remove, validators, and the
-// free vc::project helpers.
+// Coverage for core/src/VolumePkg.cpp — a project kept in its object store
+// (open/reopen), entry add/remove, validators, and the free vc::project helpers.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -8,6 +7,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
+#include "support/TestProject.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -33,26 +33,6 @@ fs::path tmpDir(const std::string& tag)
     fs::create_directories(p);
     return p;
 }
-
-struct TestAutosaveRoot {
-    TestAutosaveRoot()
-        : previous(VolumePkg::autosaveRoot())
-        , root(tmpDir("autosave_root"))
-    {
-        VolumePkg::setAutosaveRoot(root);
-    }
-
-    ~TestAutosaveRoot()
-    {
-        VolumePkg::setAutosaveRoot(previous);
-        fs::remove_all(root);
-    }
-
-    fs::path previous;
-    fs::path root;
-};
-
-TestAutosaveRoot testAutosaveRoot;
 
 } // namespace
 
@@ -157,64 +137,27 @@ TEST_CASE("validateLocation: a normalgrid-shaped dir validates for NormalGrids")
 
 // --- VolumePkg lifecycle ---
 
-TEST_CASE("VolumePkg::newEmpty produces an empty package")
+TEST_CASE("A new project is empty")
 {
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     REQUIRE(p);
     CHECK(p->volumeEntries().empty());
     CHECK(p->normalGridEntries().empty());
+    CHECK(p->name() == "test");
 }
 
-TEST_CASE("VolumePkg: setName persists in memory")
+TEST_CASE("VolumePkg: setName is the project's name in its store")
 {
-    auto p = VolumePkg::newEmpty();
+    const auto store = vc::test::createTestProject();
+    auto p = store.open();
     p->setName("My Project");
     CHECK(p->name() == "My Project");
-}
-
-TEST_CASE("VolumePkg::newDetached writes only when explicitly saved")
-{
-    const auto autosave = VolumePkg::autosaveFile();
-    fs::create_directories(autosave.parent_path());
-    {
-        std::ofstream out(autosave);
-        out << "current session";
-    }
-
-    auto d = tmpDir("detached");
-    auto target = d / "created.volpkg.json";
-    vc::project::LoadOptions opts;
-    opts.deferResolution = true;
-    auto p = VolumePkg::newDetached(opts);
-    p->setName("Created");
-    CHECK(p->addVolumeEntry("/volume", {"source:test"}));
-
-    std::ifstream beforeSave(autosave);
-    CHECK(std::string(
-              std::istreambuf_iterator<char>(beforeSave),
-              std::istreambuf_iterator<char>()) == "current session");
-    CHECK_FALSE(fs::exists(target));
-
-    p->save(target);
-    REQUIRE(fs::exists(target));
-    auto loaded = VolumePkg::load(target, opts);
-    CHECK(loaded->name() == "Created");
-    REQUIRE(loaded->volumeEntries().size() == 1);
-    CHECK(loaded->volumeEntries().front().location == "/volume");
-
-    p->setName("Changed later");
-    CHECK(VolumePkg::load(target, opts)->name() == "Created");
-
-    std::ifstream afterSave(autosave);
-    CHECK(std::string(
-              std::istreambuf_iterator<char>(afterSave),
-              std::istreambuf_iterator<char>()) == "current session");
-    fs::remove_all(d);
+    CHECK(store.open()->name() == "My Project");
 }
 
 TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
 {
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     CHECK(p->addVolumeEntry("/vol1", {"tag-a"}));
     CHECK(p->volumeEntries().size() == 1);
     CHECK(p->volumeEntries()[0].location == "/vol1");
@@ -232,117 +175,95 @@ TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
 
 TEST_CASE("VolumePkg: addNormalGridEntry")
 {
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     CHECK(p->addNormalGridEntry("/grids"));
     CHECK(p->normalGridEntries().size() == 1);
     CHECK_FALSE(p->addNormalGridEntry(""));
     CHECK_FALSE(p->addNormalGridEntry("/grids")); // duplicate
 }
 
-TEST_CASE("VolumePkg: save then load round-trips entries")
+TEST_CASE("VolumePkg: reopening the project returns its entries")
 {
-    auto d = tmpDir("save_load");
-    auto jsonPath = d / "project.json";
-
+    const auto store = vc::test::createTestProject();
     {
-        auto p = VolumePkg::newEmpty();
+        auto p = store.open();
         p->setName("Roundtrip");
         p->addVolumeEntry("/vol-x");
         p->addNormalGridEntry("/ng-x");
-        p->save(jsonPath);
     }
-    REQUIRE(fs::exists(jsonPath));
-
-    auto loaded = VolumePkg::load(jsonPath);
+    auto loaded = store.open();
     REQUIRE(loaded);
     CHECK(loaded->name() == "Roundtrip");
     CHECK(loaded->volumeEntries().size() == 1);
     CHECK(loaded->volumeEntries()[0].location == "/vol-x");
     CHECK(loaded->normalGridEntries().size() == 1);
-    fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg: saving over an existing project replaces it")
+TEST_CASE("VolumePkg: the selected Lasagna dataset is the author's, kept in the store")
 {
-    auto d = tmpDir("save_overwrite");
-    auto jsonPath = d / "project.json";
-
-    auto p = VolumePkg::newEmpty();
-    p->setName("First");
-    p->save(jsonPath);
-    REQUIRE(fs::exists(jsonPath));
-
-    p->setName("Second");
-    p->save(jsonPath);
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->name() == "Second");
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: missing selected_lasagna_dataset loads as empty")
-{
-    auto d = tmpDir("lasagna_missing");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->selectedLasagnaDataset().empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: selected_lasagna_dataset round-trips through save/load")
-{
-    auto d = tmpDir("lasagna_roundtrip");
-    auto jsonPath = d / "project.json";
-    const std::string manifest = (d / "dataset.lasagna.json").string();
-    {
-        auto p = VolumePkg::newEmpty();
-        p->setSelectedLasagnaDataset(manifest);
-        CHECK(p->selectedLasagnaDataset() == manifest);
-        p->save(jsonPath);
-    }
-
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
+    const auto store = vc::test::createTestProject();
+    CHECK(store.open()->selectedLasagnaDataset().empty());
+    const std::string manifest = "/data/dataset.lasagna.json";
+    store.open()->setSelectedLasagnaDataset(manifest);
+    auto loaded = store.open();
     CHECK(loaded->selectedLasagnaDataset() == manifest);
-
+    // Another author has a view of their own.
+    CHECK(VolumePkg::open(store.session, store.attachment, "someone-else")->selectedLasagnaDataset().empty());
     loaded->clearSelectedLasagnaDataset();
-    CHECK(loaded->selectedLasagnaDataset().empty());
-    fs::remove_all(d);
+    CHECK(store.open()->selectedLasagnaDataset().empty());
 }
 
-TEST_CASE("VolumePkg: autosave file path is settable")
+TEST_CASE("VolumePkg shares remote volumes and keeps local paths to their author")
 {
-    auto saved = VolumePkg::autosaveRoot();
-    auto d = tmpDir("autosave");
-    VolumePkg::setAutosaveRoot(d);
-    CHECK(VolumePkg::autosaveRoot() == d);
-    // Restore so other tests aren't affected.
-    VolumePkg::setAutosaveRoot(saved);
-    fs::remove_all(d);
+    const auto store = vc::test::createTestProject();
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto alice = VolumePkg::open(store.session, store.attachment, "alice", options);
+    auto bob = VolumePkg::open(store.session, store.attachment, "bob", options);
+    REQUIRE(alice->addVolumeEntry("s3://bucket/shared.zarr"));
+    REQUIRE(alice->addVolumeEntry("/home/alice/predictions.zarr"));
+    REQUIRE(bob->addVolumeEntry("/home/alice/predictions.zarr"));  // the same path on his disk is his own
+    CHECK(bob->reload());
+    std::vector<std::string> seen;
+    for (const auto& entry : bob->volumeEntries()) seen.push_back(entry.location);
+    CHECK(seen == std::vector<std::string>{"s3://bucket/shared.zarr", "/home/alice/predictions.zarr"});
+    // Removing his own leaves hers.
+    REQUIRE(bob->removeEntry("/home/alice/predictions.zarr"));
+    CHECK(VolumePkg::open(store.session, store.attachment, "alice", options)->volumeEntries().size() == 2);
+    CHECK(VolumePkg::open(store.session, store.attachment, "bob", options)->volumeEntries().size() == 1);
+}
+
+TEST_CASE("VolumePkg follows entries another session adds or removes")
+{
+    const auto store = vc::test::createTestProject();
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto mine = store.open(options);
+    auto theirs = store.open(options);
+    CHECK_FALSE(mine->reload());
+    REQUIRE(theirs->addVolumeEntry("/their-volume"));
+    CHECK(mine->reload());
+    REQUIRE(mine->volumeEntries().size() == 1);
+    CHECK(mine->volumeEntries().front().location == "/their-volume");
+    REQUIRE(theirs->removeEntry("/their-volume"));
+    CHECK(mine->reload());
+    CHECK(mine->volumeEntries().empty());
 }
 
 TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of normal grids")
 {
     auto d = tmpDir("lasagna_entries");
-    const auto project = d / "project.json";
+    const auto store = vc::test::createTestProject();
     const auto lasagna = (d / "cache" / "data.lasagna.json").string();
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = store.open();
     REQUIRE(pkg->addLasagnaDatasetEntry(
         lasagna,
         {"vc-open-data-lasagna", "vc-open-data-volume-id:vol-a"}));
     CHECK(pkg->normalGridEntries().empty());
-    pkg->save(project);
 
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    auto loaded = VolumePkg::load(project, options);
+    auto loaded = store.open(options);
     REQUIRE(loaded);
     REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
     CHECK(loaded->lasagnaDatasetEntries().front().location == lasagna);
@@ -350,31 +271,27 @@ TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of n
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical array")
+TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one resource kind")
 {
-    auto d = tmpDir("canonical_lasagna_roles");
-    const auto project = d / "project.json";
-    auto pkg = VolumePkg::newEmpty();
+    const auto store = vc::test::createTestProject();
+    auto pkg = store.open();
     REQUIRE(pkg->addLasagnaDatasetEntry("regular.lasagna.json", {"user-tag"}));
     REQUIRE(pkg->addLasagnaDatasetEntry("fiber.lasagna.json", {"model:v1", std::string(vc::project::kFiberLasagnaTag)}));
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
-    pkg->save(project);
-
-    const auto json = utils::Json::parse_file(project);
-    REQUIRE(json.contains("lasagna_datasets"));
-    REQUIRE(json.at("lasagna_datasets").size() == 2);
+    store.session->read(store.attachment, [](const auto& db, const auto& txn, const auto&) {
+        CHECK(vc::objects::projectResources(db, txn, vc::objects::kLasagnaDatasetResource).size() == 2);
+    });
 
     vc::project::LoadOptions options;
     options.deferResolution = true;
-    const auto loaded = VolumePkg::load(project, options);
+    const auto loaded = store.open(options);
     REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
     REQUIRE(loaded->fiberInferenceDatasetEntries().size() == 1);
     CHECK(loaded->fiberInferenceDatasetEntries().front().location == "fiber.lasagna.json");
     CHECK(vc::project::isFiberLasagnaEntry(loaded->fiberInferenceDatasetEntries().front()));
     CHECK(loaded->selectedLasagnaDataset() == "regular.lasagna.json");
     CHECK(loaded->selectedFiberInferenceDataset() == "fiber.lasagna.json");
-    fs::remove_all(d);
 }
 
 TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries")
@@ -393,7 +310,7 @@ TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries
         {"vc-lasagna-manifest:fiber.lasagna.json", "vc-lasagna-group:presence"},
         volume,
     };
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     CHECK(pkg->attachPreparedLasagnaDataset("fiber.lasagna.json", {"user-tag"}, true, {derived}) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(pkg->fiberInferenceDatasetEntries().size() == 1);
     REQUIRE(pkg->volumeEntries().size() == 1);
@@ -411,7 +328,7 @@ TEST_CASE("VolumePkg attaches Lasagna manifest volumes as regular volume entries
 
 TEST_CASE("VolumePkg Lasagna attach fills but does not replace selected datasets")
 {
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
 
     REQUIRE(pkg->attachPreparedLasagnaDataset(
                 "first.lasagna.json", {}, false, {}) ==
@@ -459,7 +376,7 @@ TEST_CASE("VolumePkg Lasagna reattachment updates manifest role without owning v
         newVolume,
     }};
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     REQUIRE(pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:old"}, true, oldAttachments) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(
         pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments) ==
@@ -498,7 +415,7 @@ TEST_CASE("VolumePkg merges Lasagna manifest breadcrumbs onto shared regular vol
         {"vc-lasagna-manifest:second.lasagna.json", "vc-lasagna-group:second"},
         volume,
     };
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     REQUIRE(pkg->attachPreparedLasagnaDataset("first.lasagna.json", {}, false, {first}) == VolumePkg::AttachLasagnaResult::Attached);
     REQUIRE(pkg->attachPreparedLasagnaDataset("second.lasagna.json", {}, false, {second}) == VolumePkg::AttachLasagnaResult::Attached);
 
@@ -524,7 +441,7 @@ TEST_CASE("VolumePkg Lasagna attach can tag an independently attached source vol
     const auto location = (d / "source.zarr").string();
     auto volume = vc::test::createZarrVolume(location, create);
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
             VolumePkg::AttachVolumeResult::Attached);
     const VolumePkg::PreparedVolumeAttachment derived{
@@ -560,7 +477,7 @@ TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations"
     const auto location = (d / "source.zarr").string();
     auto prepared = vc::test::createZarrVolume(d / "other.zarr", create);
 
-    auto pkg = VolumePkg::newEmpty();
+    auto pkg = vc::test::emptyProject();
     const VolumePkg::PreparedVolumeAttachment derived{
         location,
         {"vc-lasagna-manifest:data.lasagna.json", "vc-lasagna-group:source"},
@@ -580,16 +497,10 @@ TEST_CASE("VolumePkg rejects Lasagna prepared volumes with mismatched locations"
 
 TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit base zero")
 {
-    auto d = tmpDir("remote_selector_identity");
-    const auto jsonPath = d / "project.json";
-    {
-        std::ofstream out(jsonPath);
-        out << R"({"name":"selectors","version":1,"volumes":[{"location":"s3://bucket/source.zarr","tags":[]}]})";
-    }
     vc::project::LoadOptions opts;
     opts.deferResolution = true;
-    auto pkg = VolumePkg::load(jsonPath, opts);
-    REQUIRE(pkg);
+    auto pkg = vc::test::emptyProject(opts);
+    REQUIRE(pkg->addVolumeEntry("s3://bucket/source.zarr"));
     CHECK_FALSE(pkg->addVolumeEntry(
         "s3://bucket/source.zarr#vc-base-scale=0"));
     CHECK(pkg->addVolumeEntry(
@@ -600,6 +511,5 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     CHECK(pkg->volumeEntries()[0].location == "s3://bucket/source.zarr");
     CHECK(pkg->volumeEntries()[1].location ==
           "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
-    fs::remove_all(d);
 }
 

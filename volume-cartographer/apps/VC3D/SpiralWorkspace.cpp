@@ -288,6 +288,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _trackedFiberPaths.clear();
         }
     });
+    connect(_state,&CState::storeRoutesChanged,this,[this]() {
+        cancelLineAnnotationDraft();
+        _trackedFiberPaths.clear();
+    });
     // Drafts are synced before anything else hears of a surface change.
     connect(_state, &CState::surfaceChanged, this,
             [this](std::string, std::shared_ptr<Surface> surface, bool edit) {
@@ -1144,8 +1148,8 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
 void SpiralWorkspace::startLineAnnotationDraft()
 {
     QString reason = lineAnnotationDraftUnavailableReason();
-    if (reason.isEmpty() && !_state->objectStoreAttachment())
-        reason = tr("Attach an object store before creating fibers");
+    if (reason.isEmpty() && !_state->storeFor("fiber"))
+        reason = tr("Open a project before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
         return;

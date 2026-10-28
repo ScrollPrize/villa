@@ -46,14 +46,14 @@ AGENTS_AGENT_MODE=1 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest \
 ```
 
 The bridge smoke creates a disposable current-format fiber database and isolated
-settings. It checks that `fiber.list` returns spans before any edit, VC3D's
-collection export imports through the store, edits persist before Save, external
-journal updates are observed, and edits survive a fresh VC3D process. For
-surfaces it lists a user surface beside a read-only catalog store surface;
-activation, tags, rename and review commit to the store; cropping commits a child
-geometry revision; the catalog surface refuses rename and tags, and enabling
-editing on it imports it into the user's store as the same surface. Two hosted
-replicas exchange fiber and surface edits through a hub, and a lease held
+settings, and opens it as the project (`--project`). It checks that `fiber.list`
+returns spans before any edit, VC3D's collection export imports through the
+store, edits persist before Save, external journal updates are observed, and
+edits survive a fresh VC3D process. For surfaces it lists a project surface
+beside an Open Data catalog surface; activation, tags, rename and review commit
+to the store; cropping commits a child geometry revision; the catalog surface is
+edited, renamed and tagged in place. Two hosted replicas, each opened as the
+project, exchange fiber and surface edits through a hub, and a lease held
 elsewhere blocks editing. Supplying `--database PATH` instead runs against a
 disposable backup of a current database.
 

@@ -137,22 +137,24 @@ public:
     AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&,
                                const HubSessionOptions& = {});
     void detach(const AttachmentIdentity&);
-    // Writes on a fetched attachment, by the code that owns its records.
+    // Writes by a geometry fetcher (setGeometryFetcher) on a writable attachment.
     using FetchWrite = std::function<RevisionSelection(const RevisionSelection& expected, const Action&)>;
     // Fetches one object's geometry and writes it with `write`; throws when it
     // cannot. Runs on the attachment's fetch thread; must only read `store`.
     using GeometryFetcher = std::function<void(ObjectStore& store, const std::string& objectUuid, const FetchWrite& write)>;
-    // A store whose objects without geometry are published elsewhere (e.g. an
-    // Open Data sample, objects/CatalogStore.hpp). Local edits are allowed
-    // unless options.readOnly is set; fetching remains available in either mode.
-    // Geometry regions and nearest-surface queries that reach such an object
-    // queue its fetch (then the Committed write).
-    AttachmentIdentity attachFetched(const std::filesystem::path&, const OpenOptions&, GeometryFetcher);
+    // Objects whose record meta has `metaKey` publish their geometry elsewhere
+    // (e.g. Open Data catalog surfaces, objects/CatalogStore.hpp): `fetch`
+    // gives them their geometry, in any writable attachment. Geometry regions
+    // and nearest-surface queries that reach such an object without local
+    // geometry queue its fetch (then the Committed write); refetch fetches it
+    // again. An empty `fetch` removes the fetcher. Read-only attachments never fetch.
+    void setGeometryFetcher(const std::string& metaKey, GeometryFetcher fetch);
     RevisionSelection fetchWrite(const AttachmentIdentity&, const RevisionSelection& expected, const Action&);
     // Fetch these again (their published geometry changed), read or not.
     void refetch(const AttachmentIdentity&, const std::vector<std::string>& objectUuids);
-    // Block until the object's geometry is local, fetching it now on a fetched
-    // attachment. Throws GeometryUnavailable when the fetch fails or `cancel` returns true.
+    // Block until the object's geometry is local, fetching it now when it has
+    // a fetcher. Throws GeometryUnavailable when the fetch
+    // fails or `cancel` returns true.
     void ensureGeometry(const AttachmentIdentity&, const std::string& objectUuid, const std::function<bool()>& cancel = {});
     std::vector<AttachmentIdentity> attachments() const;
     bool writable(const AttachmentIdentity&) const;
@@ -191,15 +193,10 @@ public:
     std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid,
                            const std::string& name = {});
     // Bring an object into another attachment as the same object (same UUID):
-    // its current record and geometry become its first revision there, so
-    // restoring that revision returns to the source's version. Throws when the
-    // destination already has the object.
-    // An object of a fetched attachment is fetched first.
+    // its current record and geometry become its first revision there. Throws
+    // when the destination already has the object. An object without local
+    // geometry is fetched first.
     void importObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
-    // Restore an imported object to the version it was imported at (its first
-    // revision here), e.g. "Reset to Open Data Version"; its relationships are
-    // kept as recorded.
-    void restoreImported(const AttachmentIdentity&, const std::string& objectUuid);
     // A long job on a writable attachment, e.g. ingestion (objects/GeometryIngest.hpp),
     // run on the caller's thread. It reads the store outside any transaction and
     // writes only through `commit`: each call is one transaction, serialized with
@@ -286,6 +283,7 @@ private:
     void retire(const std::shared_ptr<Attachment>&);
     void observe(Attachment&);
     void hubChanged(const Attachment*);
+    void startFetching(Attachment&);
 
     // transition_ serializes lifecycle operations and is never held by read
     // callbacks. mutex_ protects the attachment list, admission and events.
@@ -299,6 +297,8 @@ private:
     // Guarded by mutex_; queries take a snapshot.
     Drafts drafts_;
     uint64_t draftRevision_ = 0;
+    // Guarded by mutex_.
+    std::map<std::string, GeometryFetcher> fetchers_;
     Drafts drafts() const;
     void draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>&);
 };

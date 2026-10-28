@@ -1,5 +1,6 @@
 // More VolumePkg coverage:
-// - getVolpkgDirectory
+// - focus bounds (the author's view)
+// - directory
 // - volumeTags
 // - normalGridPaths
 
@@ -9,6 +10,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
+#include "support/TestProject.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -27,67 +29,38 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-struct TestAutosaveRoot {
-    TestAutosaveRoot()
-        : previous(VolumePkg::autosaveRoot())
-        , root(tmpDir("autosave_root"))
-    {
-        VolumePkg::setAutosaveRoot(root);
-    }
-
-    ~TestAutosaveRoot()
-    {
-        VolumePkg::setAutosaveRoot(previous);
-        fs::remove_all(root);
-    }
-
-    fs::path previous;
-    fs::path root;
-};
-
-TestAutosaveRoot testAutosaveRoot;
-
 TEST_CASE("Project focus bounds persist independently of enabled state")
 {
-    const auto path = testAutosaveRoot.root / "focus.volpkg.json";
-    auto project = VolumePkg::newDetached();
+    const auto store = vc::test::createTestProject();
+    auto project = store.open();
     CHECK_FALSE(project->focusBounds().has_value());
     CHECK_FALSE(project->focusBoundsEnabled());
     project->setFocusBounds(Rect3D{{30, 20, 10}, {1, 2, 3}}, true);
-    project->save(path);
-    CHECK(utils::Json::parse_file(path).at("focus_bounds")
-              .at("coordinate_frame").get_string() == "annotation");
-    auto loaded = VolumePkg::load(path);
+    auto loaded = store.open();
     REQUIRE(loaded->focusBounds().has_value());
     CHECK(loaded->focusBounds()->low == cv::Vec3f(1, 2, 3));
     CHECK(loaded->focusBounds()->high == cv::Vec3f(30, 20, 10));
     CHECK(loaded->focusBoundsEnabled());
 
     loaded->setFocusBounds(loaded->focusBounds(), false);
-    auto disabled = VolumePkg::load(path);
+    auto disabled = store.open();
     REQUIRE(disabled->focusBounds().has_value());
     CHECK_FALSE(disabled->focusBoundsEnabled());
     CHECK(disabled->focusBounds()->high == cv::Vec3f(30, 20, 10));
     disabled->setFocusBounds(std::nullopt, false);
-    auto cleared = VolumePkg::load(path);
+    auto cleared = store.open();
     CHECK_FALSE(cleared->focusBounds().has_value());
     CHECK_FALSE(cleared->focusBoundsEnabled());
-    CHECK_FALSE(VolumePkg::newDetached()->focusBounds().has_value());
+    CHECK_FALSE(vc::test::emptyProject()->focusBounds().has_value());
 }
 
-TEST_CASE("Project focus bounds reject an unspecified coordinate frame")
+TEST_CASE("The volume an author last viewed is kept with the project")
 {
-    const auto path = testAutosaveRoot.root / "ambiguous-focus.volpkg.json";
-    auto project = VolumePkg::newDetached();
-    project->save(path);
-    auto json = utils::Json::parse_file(path);
-    json["focus_bounds"] = utils::Json::parse(
-        R"({"enabled":true,"low_xyz":[0,0,0],"high_xyz":[10,20,30]})");
-    {
-        std::ofstream output(path);
-        output << json.dump();
-    }
-    CHECK_THROWS_AS(VolumePkg::load(path), std::invalid_argument);
+    const auto store = vc::test::createTestProject();
+    CHECK(store.open()->currentVolumeId().empty());
+    store.open()->setCurrentVolumeId("scan-a");
+    CHECK(store.open()->currentVolumeId() == "scan-a");
+    CHECK(VolumePkg::open(store.session, store.attachment, "someone-else")->currentVolumeId().empty());
 }
 
 fs::path makeLocalVolume(const fs::path& root, const std::string& id = "vol1")
@@ -106,23 +79,12 @@ fs::path makeLocalVolume(const fs::path& root, const std::string& id = "vol1")
 
 } // namespace
 
-TEST_CASE("getVolpkgDirectory: empty when no save path is set")
-{
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->getVolpkgDirectory().empty());
-}
-
-TEST_CASE("save + load: getVolpkgDirectory returns the parent")
+TEST_CASE("directory is the project store's directory")
 {
     auto d = tmpDir("vpkg_dir");
-    auto jsonPath = d / "project.json";
-    {
-        auto p = VolumePkg::newEmpty();
-        p->save(jsonPath);
-    }
-    auto loaded = VolumePkg::load(jsonPath);
-    REQUIRE(loaded);
-    CHECK(loaded->getVolpkgDirectory() == d.string());
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
+    CHECK(store.open()->directory() == d);
+    CHECK(store.open()->path() == d / "project.vcobj");
     fs::remove_all(d);
 }
 
@@ -130,7 +92,7 @@ TEST_CASE("volumeTags return tags by id")
 {
     auto d = tmpDir("tags");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string(), {"voltag1", "voltag2"});
     // Volume ID is the uuid from meta.json
     auto v = p->volume("vol1");
@@ -144,33 +106,15 @@ TEST_CASE("isRemote is false for purely-local projects")
 {
     auto d = tmpDir("isremote");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
     CHECK_FALSE(p->isRemote());
     fs::remove_all(d);
 }
 
-TEST_CASE("runtime remote cache root is not persisted in projects")
-{
-    auto d = tmpDir("runtime_cache_root");
-    const auto project = d / "project.volpkg.json";
-    vc::project::LoadOptions options;
-    auto pkg = VolumePkg::newEmpty(options);
-    pkg->save(project);
-
-    std::ifstream input(project);
-    REQUIRE(input.good());
-    const std::string json(
-        (std::istreambuf_iterator<char>(input)),
-        std::istreambuf_iterator<char>());
-    CHECK(json.find("remote_cache_root") == std::string::npos);
-
-    fs::remove_all(d);
-}
-
 TEST_CASE("normalGridPaths: empty without entries")
 {
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     CHECK(p->normalGridPaths().empty());
 }
 
@@ -178,16 +122,10 @@ TEST_CASE("volumeIDs returns loaded volume ids")
 {
     auto d = tmpDir("vol_ids");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
     auto ids = p->volumeIDs();
     CHECK_FALSE(ids.empty());
     CHECK(ids[0] == "vol1");
     fs::remove_all(d);
-}
-
-TEST_CASE("version() returns a positive int")
-{
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->version() >= 0);
 }

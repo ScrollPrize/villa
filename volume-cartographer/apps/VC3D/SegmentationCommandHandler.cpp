@@ -845,11 +845,17 @@ SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchEr
                CommandLaunchError::SegmentNotFound);
         return std::nullopt;
     }
-    if (row->catalog) {
-        setErr(tr("%1 is a read-only catalog surface; copy it to your store first.")
-                   .arg(QString::fromStdString(row->record.name.empty() ? id : row->record.name)),
-               CommandLaunchError::InvalidState);
-        return std::nullopt;
+    if (row->fromCatalog()) {
+        // Tools read the store file: the catalog geometry must be there.
+        try {
+            _surfacePanel->catalog()->session()->ensureGeometry(row->source, id);
+        } catch (const std::exception& fetchError) {
+            setErr(tr("%1 could not be fetched from Open Data: %2")
+                       .arg(QString::fromStdString(row->record.name.empty() ? id : row->record.name),
+                            QString::fromUtf8(fetchError.what())),
+                   CommandLaunchError::InvalidState);
+            return std::nullopt;
+        }
     }
     if (throughView ? !row->bound() : !row->toolInput()) {
         setErr((throughView ? tr("Surface %1 does not open in the current volume.")
@@ -1064,7 +1070,7 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
     }
 
     const std::filesystem::path jsonParamsPath =
-        std::filesystem::path(_state->vpkgPath().toStdString()) / "trace_params.json";
+        std::filesystem::path(_state->projectDirectory().toStdString()) / "trace_params.json";
     if (!std::filesystem::exists(jsonParamsPath)) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("trace_params.json not found in the volpkg"));
         return;
@@ -1138,7 +1144,7 @@ bool SegmentationCommandHandler::startRunTraceImpl(
     }
 
     const std::filesystem::path jsonParamsPath =
-        std::filesystem::path(_state->vpkgPath().toStdString()) / "trace_params.json";
+        std::filesystem::path(_state->projectDirectory().toStdString()) / "trace_params.json";
     if (!std::filesystem::exists(jsonParamsPath)) {
         setErr(tr("trace_params.json not found in the volpkg"),
                CommandLaunchError::InputNotFound);
@@ -1254,7 +1260,7 @@ bool SegmentationCommandHandler::startRenderImpl(const std::string& segmentId,
     // package, or the surface's artifacts), created if needed.
     QString outputPattern = params.outputPattern;
     if (outputPattern.isEmpty()) {
-        const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
+        const std::filesystem::path volpkgPath(_state->projectDirectory().toStdString());
         std::filesystem::path baseDir;
         try {
             if (params.outputDir.isEmpty()) {
@@ -1807,9 +1813,9 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         return fail(tr("GrowPatch needs an output tag."));
     }
 
-    QString volpkgRoot = _state->vpkgPath();
+    QString volpkgRoot = _state->projectDirectory();
     if (volpkgRoot.isEmpty()) {
-        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+        volpkgRoot = QString::fromStdString(_state->vpkg()->directory().string());
     }
 
     const int iterations = std::clamp(params.iterations, 1, 100000);
@@ -2453,7 +2459,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const auto baseOutputName = QStringLiteral("labels_%1.zarr").arg(timestamp);
 
     std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
+    const std::filesystem::path volpkgDir(_state->vpkg()->directory().string());
     const std::filesystem::path volumesDir = volpkgDir / "volumes";
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
@@ -2548,7 +2554,7 @@ std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces
     std::vector<const SurfaceCatalog::Row*> rows;
     if (auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr) {
         for (const auto& [uuid, row] : catalog->rows())
-            if (throughView ? !row.catalog && row.bound() : row.toolInput()) rows.push_back(&row);
+            if (throughView ? row.bound() : row.toolInput()) rows.push_back(&row);
     }
     return rows;
 }
@@ -2886,7 +2892,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
     }
 
     std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
+    const std::filesystem::path volpkgDir(_state->vpkg()->directory().string());
     const std::filesystem::path volumesDir = volpkgDir / "volumes";
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {

@@ -1,5 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include <vc_object_store/objects/Project.hpp>
 
 #include <QBuffer>
 #include <QByteArray>
@@ -58,8 +59,9 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 
     if (!state) {
         // Degenerate case: report an empty snapshot rather than erroring.
-        result["vpkg"] = QJsonValue::Null;
-        result["objectStore"] = QJsonValue::Null;
+        result["project"] = QJsonValue::Null;
+        result["stores"] = QJsonArray();
+        result["routes"] = QJsonObject();
         result["volume"] = QJsonValue::Null;
         result["activeSurface"] = QJsonValue::Null;
         result["segmentationGrowthVolumeId"] = QString();
@@ -77,25 +79,31 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         return result;
     }
 
-    // vpkg
-    if (state->hasVpkg()) {
-        QJsonObject vpkg;
-        vpkg["path"] = state->vpkgPath();
-        result["vpkg"] = vpkg;
-    } else {
-        result["vpkg"] = QJsonValue::Null;
-    }
-
-    // The user's object store: where surfaces are listed from and saved to.
-    if (const auto attachment = state->objectStoreAttachment()) {
+    // The project: its store, the stores beside it and the store each routable kind uses.
+    const auto session = state->objectStoreSession();
+    const auto describeStore = [&](const vc::objects::AttachmentIdentity& attachment) {
         QJsonObject store;
-        store["storeUuid"] = QString::fromStdString(attachment->storeUuid);
-        store["writable"] = state->objectStoreSession()->writable(*attachment);
-        store["hosted"] = state->objectStoreSession()->hubStatus(*attachment).has_value();
-        result["objectStore"] = store;
+        store["path"] = QString::fromStdString(session->path(attachment).string());
+        store["storeUuid"] = QString::fromStdString(attachment.storeUuid);
+        store["writable"] = session->writable(attachment);
+        store["hosted"] = session->hubStatus(attachment).has_value();
+        return store;
+    };
+    if (const auto project = state->projectAttachment()) {
+        auto described = describeStore(*project);
+        if (state->hasVpkg()) described["name"] = QString::fromStdString(state->vpkg()->name());
+        result["project"] = described;
     } else {
-        result["objectStore"] = QJsonValue::Null;
+        result["project"] = QJsonValue::Null;
     }
+    QJsonArray stores;
+    for (const auto& attachment : state->attachedStores()) stores.append(describeStore(attachment));
+    result["stores"] = stores;
+    QJsonObject routes;
+    for (const auto& kind : CState::routableKinds())
+        if (const auto store = state->storeFor(kind))
+            routes[QString::fromStdString(kind)] = QString::fromStdString(store->storeUuid);
+    result["routes"] = routes;
 
     // volume
     if (auto vol = state->currentVolume()) {
@@ -487,8 +495,8 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
         QJsonObject data{{"param", "volume"}};
         throw AgentBridgeError{-32602, "volume must not be blank", data};
     }
-    if (!output.endsWith(QStringLiteral(".volpkg.json"), Qt::CaseInsensitive))
-        output += QStringLiteral(".volpkg.json");
+    if (!output.endsWith(QStringLiteral(".vcobj"), Qt::CaseInsensitive))
+        output += QStringLiteral(".vcobj");
 
     fs::path outputPath = fs::path(output.toStdString()).lexically_normal();
     if (!outputPath.is_absolute()) {
@@ -532,8 +540,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     if (p.contains("name")) {
         projectName = p.value("name").toString();
     } else {
-        projectName = QString::fromStdString(outputPath.filename().string());
-        projectName.chop(QStringLiteral(".volpkg.json").size());
+        projectName = QString::fromStdString(outputPath.stem().string());
         if (projectName.isEmpty())
             projectName = QStringLiteral("Untitled");
     }
@@ -544,16 +551,33 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     for (const QJsonValue& tag : tagValues)
         tags.push_back(tag.toString().toStdString());
 
-    vc::project::LoadOptions options;
-    options.deferResolution = true;
-    options.catalog = vc3d::opendata::cachedCatalog();
-    auto package = VolumePkg::newDetached(options);
-    package->setName(projectName.toStdString());
-    if (!package->addVolumeEntry(volumeLocation, std::move(tags)))
-        throw AgentBridgeError{-32010, "Could not add volume to project", {}};
-
+    std::string recordedLocation;
     try {
-        package->save(outputPath);
+        if (outputExists) {
+            const auto open = _window && _window->_state ? _window->_state->projectAttachment() : std::nullopt;
+            std::error_code same;
+            if (open && fs::equivalent(_window->_state->objectStoreSession()->path(*open), outputPath, same))
+                throw std::runtime_error("the output is the open project");
+            for (const auto& file : {outputPath, fs::path(outputPath.string() + "-wal"), fs::path(outputPath.string() + "-shm")})
+                fs::remove(file);
+            fs::remove_all(fs::path(outputPath.string() + ".artifacts"));
+        }
+        const auto author = CState::storeAuthor();
+        const auto storeOptions = CState::storeOpenOptions(author, false);
+        fs::create_directories(outputPath.parent_path());
+        vc::objects::createProject(outputPath, projectName.toStdString(), nlohmann::json::object(), storeOptions);
+        // Recorded as VC3D records volumes, without opening it.
+        auto session = std::make_shared<vc::objects::ObjectStoreSession>();
+        const auto attachment = session->attach(outputPath, storeOptions);
+        vc::project::LoadOptions options;
+        options.deferResolution = true;
+        options.catalog = vc3d::opendata::cachedCatalog();
+        auto package = VolumePkg::open(session, attachment, author.toStdString(), options);
+        if (!package->addVolumeEntry(volumeLocation, std::move(tags)))
+            throw AgentBridgeError{-32010, "Could not add volume to project", {}};
+        recordedLocation = package->volumeEntries().front().location;
+    } catch (const AgentBridgeError&) {
+        throw;
     } catch (const std::exception& error) {
         QJsonObject data{{"detail", QString::fromUtf8(error.what())}};
         throw AgentBridgeError{-32005, "Project write failed", data};
@@ -562,8 +586,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     QJsonObject result;
     result["path"] = QString::fromStdString(outputPath.string());
     result["name"] = projectName;
-    result["volume"] =
-        QString::fromStdString(package->volumeEntries().front().location);
+    result["volume"] = QString::fromStdString(recordedLocation);
     return result;
 }
 
@@ -726,7 +749,7 @@ QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
     const auto ids = state->vpkg()->volumeIDs();
     QJsonObject result;
     result["opened"] = true;
-    result["vpkgPath"] = state->vpkgPath();
+    result["vpkgPath"] = state->projectDirectory();
     result["volumeId"] = QString::fromStdString(state->currentVolumeId());
     QJsonArray idArr;
     for (const auto& id : ids)

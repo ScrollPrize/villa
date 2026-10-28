@@ -75,7 +75,7 @@ session.act(attachment, observed, [&](auto& store, auto& txn) {
 
 Keep all work using a snapshot inside its callback and do not reenter the
 session from a callback. A session holds any number of attachments (for example a
-writable store beside read-only catalog stores), each with its own access mode,
+project store beside a hosted team store), each with its own access mode,
 writer, events and hub sync; a store is attached at most once. `attach()` adds one,
 `replace(attachment, ...)` swaps one for another store, `detach(attachment)` removes
 one, and `attachments()` lists them in attach order. Replacement validates the new
@@ -83,7 +83,12 @@ database first, drains the old attachment's accepted writes, cancels/waits for
 its readers and delivers its last commits; events report `Detached` for the old
 attachment before `Attached` for the new one. Include the attachment generation in
 asynchronous requests and caches: even reattaching the same store invalidates old
-requests. `takeEvents()` polls local and external commits of
+requests. Objects whose geometry is published elsewhere (Open Data catalog
+surfaces, `objects/CatalogStore.hpp`) are fetched by the fetcher registered for
+their meta key (`setGeometryFetcher`), in any writable attachment, when a read
+reaches them. A store is also a project (`objects/Project.hpp`): resource
+records reference the volumes, normal grids and Lasagna datasets it uses, and
+each author keeps a `project_view` record of their own. `takeEvents()` polls local and external commits of
 every attachment for all object kinds, tagged by attachment; call it from the
 application's event loop. Each change carries
 its record's object or edge `kind` (kept for deletions too), so a consumer

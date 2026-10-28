@@ -58,7 +58,7 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
         return QString();
     }
 
-    const QString base = QString::fromStdString(pkg->getVolpkgDirectory());
+    const QString base = QString::fromStdString(pkg->directory().string());
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
@@ -876,7 +876,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
     const auto* row = catalog->row(segmentationSurface->id);
-    if (!pin || !pin->geometryRevision || !row || row->catalog || !row->bound()) {
+    if (!pin || !pin->geometryRevision || !row || !row->bound()) {
         showStatus(tr("Copy with NT needs a surface of the writable object store that opens in the current volume."),
                    kStatusLong);
         return false;

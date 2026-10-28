@@ -1,12 +1,12 @@
 #pragma once
-// The surfaces of the current volume in the user's object store and in
-// catalog stores (Open Data samples): one row per surface record,
+// The surfaces of the current volume in the store surfaces are kept in (the
+// project's, or the one chosen for surfaces): one row per surface record,
 // bound to the volume or not (like the fiber catalog), kept current from the
 // store's commit events, and the materialization of the one surface being
 // viewed or edited. Surfaces are identified by their store UUID and read in the
-// open volume's voxels, through the stores' registrations (an Open Data level
-// is a registered volume). A catalog surface is edited in the user's store as
-// the same surface (importCatalogSurface); the session then reads it from there.
+// open volume's voxels, through the store's registrations (an Open Data level
+// is a registered volume). Open Data catalog surfaces are ordinary surfaces of
+// the store whose geometry is fetched on first use.
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -45,17 +45,16 @@ public:
         // Stored coordinates to the open volume's voxels; nullopt when the store
         // cannot map the surface into the volume.
         std::optional<vc::objects::VolumeAffine> mapping;
-        // The store it is in; catalog rows retain their sample store.
+        // The store it is in.
         vc::objects::AttachmentIdentity source;
-        bool catalog = false;
-        // A catalog surface imported into the user's store: its first revision
-        // there is the catalog version (ObjectStoreSession::restoreImported).
-        bool imported() const;
+        // An Open Data catalog surface: fetched on first use, and reset to its
+        // catalog version by vc::objects::restoreCatalogVersion.
+        bool fromCatalog() const;
         // Shown and opened in the open volume (through `mapping`).
         bool bound() const { return mapping.has_value(); }
         // Input for external tools, which read stored coordinates: a user
         // surface stored in the open volume's voxels.
-        bool toolInput() const { return !catalog && mapping == vc::objects::VolumeAffine::identity(); }
+        bool toolInput() const { return mapping == vc::objects::VolumeAffine::identity(); }
     };
     // A materialized surface: points in the volume's voxels, pinned at the
     // revisions it was read from.
@@ -75,10 +74,8 @@ public:
 
     // List the surfaces of `volume` in `attachment` (nothing without both).
     void setSource(const std::optional<vc::objects::AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume);
-    // Also list these catalog stores (while a volume is open).
-    void setCatalogSources(std::vector<vc::objects::AttachmentIdentity> sources);
-    // The user's store (when attached) then the catalog stores: the order in
-    // which the session reads a surface held by several (imported ones).
+    // The attachment listed, while a volume is open (none or one), for
+    // session queries across attachments.
     std::vector<vc::objects::AttachmentIdentity> sources() const;
     // Session events (CState::objectStoreChanged); other attachments are ignored.
     void handle(const vc::objects::StoreSessionEvent& event);
@@ -134,12 +131,6 @@ public:
     };
     ToolStore toolStore() const;
 
-    // Edit a catalog surface in the user's store: imports it there as the same
-    // surface (fetching it first), its catalog version the first revision, and
-    // reads its row from there. `opened` (its current version, as on screen)
-    // continues as the user's: same surface object, pinned and reading
-    // channels there. Throws when the user's store places it differently.
-    Opened importCatalogSurface(const Opened& opened);
     // A new surface holding `surface` (in the volume's voxels), bound to the
     // volume; `provenance` records how it was made. Sets surface.id and returns
     // the UUID.
@@ -166,7 +157,6 @@ private:
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     std::optional<vc::objects::AttachmentIdentity> attachment_;
     std::shared_ptr<Volume> volume_;
-    std::vector<vc::objects::AttachmentIdentity> catalogSources_;
     std::map<std::string, Row> rows_;
     // Bumped by setSource(): reads of an earlier source are dropped.
     uint64_t generation_ = 0;

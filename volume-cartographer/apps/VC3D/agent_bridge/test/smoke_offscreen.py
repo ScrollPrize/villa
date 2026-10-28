@@ -28,6 +28,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import sys
 import tempfile
 import time
@@ -72,12 +73,12 @@ def unique_name(tag: str) -> str:
 def launch(
     binary: str,
     name: str,
-    volpkg: str | None = None,
+    project: str | None = None,
     config_home: str | None = None,
 ) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
-    if volpkg is not None:
-        args.extend(["--volpkg", volpkg])
+    if project is not None:
+        args.extend(["--project", project])
     env = dict(OFFSCREEN_ENV)
     if config_home is not None:
         env["XDG_CONFIG_HOME"] = config_home
@@ -156,16 +157,34 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
     return volume
 
 
-def create_test_project(root: Path) -> Path:
-    create_test_volume(root / "volumes" / "vol1", "vol1")
+def project_volumes(project: Path) -> list[dict]:
+    """The volume entries a project store records ({location, tags}), read
+    directly from its database as VC3D wrote them."""
+    with sqlite3.connect(project.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        rows = db.execute(
+            "SELECT o.id, o.storage_ref FROM objects o "
+            "LEFT JOIN object_lifecycle l ON l.object_id=o.id "
+            "WHERE o.kind='volume' AND COALESCE(l.retired,0)=0 ORDER BY o.id").fetchall()
+        return [{"location": location,
+                 "tags": [tag for (tag,) in db.execute(
+                     "SELECT tag FROM object_tags WHERE object_id=? ORDER BY tag", (object_id,))]}
+                for object_id, location in rows]
 
-    volpkg = root / "smoke.volpkg.json"
-    volpkg.write_text(json.dumps({
-        "name": "smoke",
-        "version": 1,
-        "volumes": ["volumes"],
-    }))
-    return volpkg
+
+def project_name(project: Path) -> str | None:
+    with sqlite3.connect(project.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        row = db.execute("SELECT name FROM objects WHERE kind='project'").fetchone()
+        return row[0] if row else None
+
+
+def create_test_project(client: BridgeClient, root: Path) -> Path:
+    """The smoke project: one local volume, made and opened through the bridge."""
+    volume = root / "volumes" / "vol1"
+    create_test_volume(volume, "vol1")
+    project = root / "smoke.vcobj"
+    client.call("project.create", {"path": str(project), "volume": str(volume)}, timeout=RPC_TIMEOUT)
+    client.call("volume.open", {"path": str(project)}, timeout=RPC_TIMEOUT)
+    return project
 
 
 def wait_for_job(
@@ -442,7 +461,7 @@ def check_project_create(
 ) -> None:
     volume = root / "volumes" / "vol1"
     requested = root / "created" / "agent-project"
-    created = requested.with_suffix(".volpkg.json")
+    created = requested.with_suffix(".vcobj")
 
     try:
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -456,30 +475,24 @@ def check_project_create(
             timeout=RPC_TIMEOUT,
         )
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        document = json.loads(created.read_text())
-        volume_entry = document.get("volumes", [{}])[0]
         valid = (
             result == {
                 "path": str(created),
                 "name": "agent-project",
                 "volume": str(volume),
             }
-            and document.get("name") == "agent-project"
-            and document.get("version") == 1
-            and volume_entry == {
+            and project_name(created) == "agent-project"
+            and project_volumes(created) == [{
                 "location": str(volume),
                 "tags": ["source:smoke"],
-            }
-            and "segments" not in document
-            and document.get("normal_grids") == []
-            and document.get("lasagna_datasets") == []
-            and after.get("vpkg") == before.get("vpkg")
+            }]
+            and after.get("project") == before.get("project")
         )
         results.record(
             "project_create",
             valid,
             f"path={result.get('path')} session_unchanged="
-            f"{after.get('vpkg') == before.get('vpkg')}",
+            f"{after.get('project') == before.get('project')}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(
@@ -533,7 +546,7 @@ def check_project_create(
                 error.code == -32007
                 and error.data.get("kind") == "volume"
                 and expected_detail in detail
-                and not output.with_suffix(".volpkg.json").exists(),
+                and not output.with_suffix(".vcobj").exists(),
                 f"returned code={error.code} detail={detail!r}",
             )
         except Exception as error:  # noqa: BLE001
@@ -596,7 +609,7 @@ def check_volume_attach(
     client: BridgeClient,
     results: Results,
     root: Path,
-    volpkg: Path,
+    project: Path,
 ) -> None:
     overlay = create_test_volume(root / "overlays" / "vol2", "vol2")
     conflict = create_test_volume(root / "conflicts" / "vol2", "vol2")
@@ -608,19 +621,18 @@ def check_volume_attach(
             timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
-        document = json.loads(volpkg.read_text())
         result = terminal.get("result") or {}
         results.record(
-            "volume_attach_existing_relative_entry",
+            "volume_attach_existing_entry",
             terminal.get("state") == "succeeded"
             and result.get("attached") is False
             and result.get("alreadyAttached") is True
-            and document.get("volumes") == ["volumes"],
+            and project_volumes(project) == [{"location": str(root / "volumes" / "vol1"), "tags": []}],
             f"state={terminal.get('state')} result={result}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(
-            "volume_attach_existing_relative_entry",
+            "volume_attach_existing_entry",
             False,
             f"{type(error).__name__}: {error}",
         )
@@ -667,8 +679,7 @@ def check_volume_attach(
             f"render_opacity={render_result.get('overlayOpacity')} "
             f"overlay_opacity={overlay_after_render.get('opacity')}",
         )
-        document = json.loads(volpkg.read_text())
-        entries = document.get("volumes", [])
+        entries = project_volumes(project)
         attached_entry = next(
             (
                 entry
@@ -723,7 +734,7 @@ def check_volume_attach(
         )
         client.call(
             "volume.open",
-            {"path": str(volpkg)},
+            {"path": str(project)},
             timeout=RPC_TIMEOUT,
         )
         restored_overlay, _ = client.call(
@@ -747,10 +758,9 @@ def check_volume_attach(
             timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
-        document = json.loads(volpkg.read_text())
         matching = [
             entry
-            for entry in document.get("volumes", [])
+            for entry in project_volumes(project)
             if isinstance(entry, dict) and entry.get("location") == str(overlay)
         ]
         result = terminal.get("result") or {}
@@ -780,10 +790,9 @@ def check_volume_attach(
         )
         terminal = wait_for_job(client, started["jobId"])
         volumes, _ = client.call("volume.list", {}, timeout=RPC_TIMEOUT)
-        document = json.loads(volpkg.read_text())
         persisted = [
             entry
-            for entry in document.get("volumes", [])
+            for entry in project_volumes(project)
             if isinstance(entry, dict) and entry.get("location") == str(conflict)
         ]
         results.record(
@@ -836,8 +845,7 @@ def check_volume_attach(
     results.record("volume_attach_absolute_path", ok, detail)
 
 
-def check_c4(client: BridgeClient, results: Results, volpkg: str,
-             broken_fiber_volpkg: str) -> None:
+def check_c4(client: BridgeClient, results: Results, project: str) -> None:
     # Liveness / dispatch sanity.
     try:
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -931,7 +939,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         client.call(
             "volume.open",
-            {"path": "/vc3d-smoke/does-not-exist.volpkg.json"},
+            {"path": "/vc3d-smoke/does-not-exist.vcobj"},
             timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_failure_is_headless", False,
@@ -945,9 +953,9 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
 
     try:
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        preserved = before is not None and after.get("project") == before.get("project")
         results.record("volume_open_failure_preserves_project", preserved,
-                       f"vpkg unchanged={preserved}")
+                       f"project unchanged={preserved}")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_failure_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
@@ -955,56 +963,20 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     try:
         client.call(
             "volume.open",
-            {"path": volpkg, "volumeId": "missing-volume"},
+            {"path": project, "volumeId": "missing-volume"},
             timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_unknown_id_preserves_project", False,
                        "expected a bridge error, got a result")
     except BridgeError as e:
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        preserved = before is not None and after.get("project") == before.get("project")
         results.record("volume_open_unknown_id_preserves_project",
                        e.code == -32007 and preserved,
-                       f"code={e.code} vpkg unchanged={preserved}")
+                       f"code={e.code} project unchanged={preserved}")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_unknown_id_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
-
-    try:
-        opened, _ = client.call(
-            "volume.open", {"path": broken_fiber_volpkg}, timeout=RPC_TIMEOUT)
-        results.record(
-            "volume_open_broken_fibers_is_headless",
-            opened.get("opened") is True,
-            "project fiber files are not loaded or repaired",
-        )
-    except Exception as e:  # noqa: BLE001
-        results.record("volume_open_broken_fibers_is_headless", False,
-                       f"unexpected {type(e).__name__}: {e}")
-
-    try:
-        client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        results.record("fiber_save_requires_attachment", False, "unexpected success without a store")
-    except BridgeError as error:
-        results.record("fiber_save_requires_attachment", error.code == -32000, str(error))
-
-
-def check_project_fiber_files_untouched(client: BridgeClient, results: Results,
-                                       fiber_volpkg: str, fiber_file: Path) -> None:
-    """Opening a project must neither load nor rewrite former fiber sources."""
-    try:
-        original = fiber_file.read_bytes()
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        try:
-            client.call("fiber.list", {}, timeout=RPC_TIMEOUT)
-            results.record("fiber_list_requires_attachment", False, "unexpected success without a store")
-        except BridgeError as error:
-            results.record("fiber_list_requires_attachment", error.code == -32000, str(error))
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        results.record("project_fiber_files_untouched", fiber_file.read_bytes() == original,
-                       "project open/reopen preserves native source bytes")
-    except Exception as error:
-        results.record("project_fiber_files_untouched", False, str(error))
 
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
@@ -1209,55 +1181,15 @@ def main() -> int:
     results = Results()
     with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
         tmp_path = Path(tmp_dir)
-        volpkg = create_test_project(tmp_path)
-        broken_volpkg = tmp_path / "broken.volpkg.json"
-        broken_volpkg.write_text(json.dumps({"name": "broken", "version": 1}))
-        fiber_dir = Path(tmp_dir) / "fibers" / broken_volpkg.name
-        fiber_dir.mkdir(parents=True)
-        (fiber_dir / "fiber_smoke.json").write_text(json.dumps({
-            "type": "vc3d_fiber",
-            "version": 1,
-            "username": "smoke",
-            "started_at": "2026-01-01T00:00:00Z",
-            "sequence": 1,
-            "generation": 1,
-            "control_points": [[0.0, 0.0, 0.0]],
-            "line_points": [],
-            "branches": [{}],
-        }))
-        # Use a separate clean project: broken-link fixtures deliberately
-        # defer all load-time repair writes, including UUID backfills.
-        legacy_fiber_volpkg = tmp_path / "legacy-fiber.volpkg.json"
-        legacy_fiber_volpkg.write_text(json.dumps({
-            "name": "legacy-fiber",
-            "version": 1,
-            "volumes": ["volumes"],
-        }))
-        legacy_fiber_dir = tmp_path / "fibers" / legacy_fiber_volpkg.name
-        legacy_fiber_dir.mkdir(parents=True)
-        legacy_fiber = legacy_fiber_dir / "fiber_legacy.json"
-        # Both fields are intentionally absent: package fibers load before
-        # volume activation, which must complete the deferred metadata save.
-        legacy_fiber.write_text(json.dumps({
-            "type": "vc3d_fiber",
-            "version": 1,
-            "username": "smoke",
-            "started_at": "2026-01-01T00:00:00Z",
-            "sequence": 2,
-            "generation": 1,
-            "control_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 20.0]],
-            "line_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 15.0],
-                            [10.0, 10.0, 20.0]],
-            "branches": [],
-        }))
         name = unique_name("main")
         config_home = tmp_path / "config-main"
-        proc = launch(binary, name, str(volpkg), str(config_home))
+        proc = launch(binary, name, None, str(config_home))
         client = None
         try:
             sock_path = proc.wait_for_handshake(timeout=60.0)
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+            project = create_test_project(client, tmp_path)
 
             check_rpc_describe(
                 client,
@@ -1268,10 +1200,8 @@ def main() -> int:
             require_running(proc, results, "viewer normalization")
             check_canvas_normalization(client, results)
 
-            check_volume_attach(client, results, tmp_path, volpkg)
-            check_c4(client, results, str(volpkg), str(broken_volpkg))
-            check_project_fiber_files_untouched(client, results, str(legacy_fiber_volpkg),
-                                    legacy_fiber)
+            check_volume_attach(client, results, tmp_path, project)
+            check_c4(client, results, str(project))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)

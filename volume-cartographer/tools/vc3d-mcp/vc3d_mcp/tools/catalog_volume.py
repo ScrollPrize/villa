@@ -24,7 +24,7 @@ async def vc3d_create_project(
     tags: Optional[list[str]] = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create a .volpkg.json project that references one local zarr volume or
+    """Create a .vcobj project that references one local zarr volume or
     remote .zarr URL.
     This writes the project but does not open it; call vc3d_open_volume with the
     returned path when it should become the active project. Remote availability
@@ -34,7 +34,7 @@ async def vc3d_create_project(
     volume must be an absolute local zarr path on that same filesystem, or a
     remote zarr URL. In the containerized development setup, use paths visible
     inside the container (typically /work/...), not host-only paths. Missing
-    parent directories and the .volpkg.json suffix are added automatically.
+    parent directories and the .vcobj suffix are added automatically.
     name and tags customize the project entry; overwrite must be true to
     replace an existing output file.
     """
@@ -54,8 +54,7 @@ async def vc3d_create_project(
 
 @mcp.tool()
 async def vc3d_open_volume(path: str, volume_id: Optional[str] = None) -> dict[str, Any]:
-    """Open a volume package (.volpkg / .volpkg.json / zarr project) and
-    optionally select a volume id."""
+    """Open a project (.vcobj) and optionally select a volume id."""
     return await _call("volume.open", _strip_none({"path": path, "volumeId": volume_id}))
 
 

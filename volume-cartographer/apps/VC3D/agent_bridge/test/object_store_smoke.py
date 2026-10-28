@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Exercise VC3D attachment, transfer and immediate edits on a disposable database.
+"""Exercise a VC3D project store: transfer and immediate edits on a disposable database.
 
 Requires the vc_object_store Python extension in PYTHONPATH. The input database
 must contain at least one fiber; neither it nor the user's settings are modified.
 Without --database, create a current-format fixture and check lazy span details.
-VC3D opens a one-volume project; the database gets a surface bound to that
-volume and an Open Data sample store a read-only catalog surface, so the bridge's
-surface workflow (list, activate, rename, tags, review, catalog guards, editing a
-catalog surface) runs against real stores.
+The database is the project VC3D opens: it references one volume and holds a
+surface bound to it and an Open Data catalog surface, so the bridge's surface
+workflow (list, activate, rename, tags, review, editing a catalog surface in
+place) runs against a real store. Hosted replicas of it open as projects too.
 """
 import argparse
 import json
@@ -61,21 +61,20 @@ def main():
         with ObjectStore.open(str(database), read_only=True) as store:
             count = len(store.objects_by_kind('fiber'))
         assert count > 0, 'The smoke fixture must contain fibers'
-        # The project's volume is the Open Data sample volume "catvol" at L0.
+        # The database is the project: it references the volume, relative to itself.
         create_test_volume(root / 'volumes' / 'vol1', 'vol1')
-        project = root / 'smoke.volpkg.json'
-        project.write_text(json.dumps(dict(name='smoke', version=1, volumes=[dict(location='volumes', tags=[
-            'vc-open-data-sample-id:smp', 'vc-open-data-volume-id:catvol',
-            'vc-open-data-coordinate-space:smp/catvol@L0'])])))
         with ObjectStore.open(str(database), author='bridge-fixture') as store:
+            store.add_project_resource('volume', 'volumes')
             user_surface = add_surface(store, 'smoke surface', 'vol1', invalid_rows=2)
             # A surface of another scan, registered to vol1 by a shift.
             registered_surface = add_surface(store, 'registered surface', 'scanb')
             store.register_volume_transform('scanb', 'vol1', [[1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 0]], 'smoke registration')
-        catalog_store = root / 'remote-cache' / 'open_data' / 'stores' / 'smp.vcobj'
-        catalog_store.parent.mkdir(parents=True)
-        with ObjectStore.create(str(catalog_store), author='vc3d-open-data') as store:
+            # An Open Data catalog surface of the sample volume "catvol" (vol1 shows it at L0), as fetched.
             catalog_surface = add_surface(store, 'catalog surface', 'catvol')
+            store.set_meta(catalog_surface, 'catalog', dict(sample='smp', segment='seg', url='https://example.invalid/seg'))
+            store.set_meta(catalog_surface, 'catalog_geometry_revision', store.current_geometry(catalog_surface)['uuid'])
+            store.set_meta(catalog_surface, 'catalog_write', 'fetched')
+            store.register_volume_transform('catvol', 'vol1', [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], 'catalog level 0')
         config = root / 'config'
         config.mkdir()
         (config / 'VC3D.ini').write_text(
@@ -86,7 +85,7 @@ def main():
         def launch(index, store=database):
             process = VC3DProcess(args.vc3d,
                 ['--agent-bridge', '--agent-bridge-name', f'vc3d-store-{os.getpid()}-{index}',
-                 '--object-store', str(store), '--volpkg', str(project)],
+                 '--project', str(store)],
                 env_overrides={'QT_QPA_PLATFORM': 'offscreen',
                                'XDG_CONFIG_HOME': str(config), 'VC3D_CONFIG_DIR': str(config)})
             client = None
@@ -178,8 +177,8 @@ def expect_error(client, method, params, code):
 
 
 def surfaces(client, database, user_surface, catalog_surface):
-    """Surfaces of the user's store are edited through the bridge; catalog surfaces
-    are read-only until copied into the user's store."""
+    """Surfaces of the project are edited through the bridge, Open Data catalog
+    surfaces among them, in place."""
     rows = listed_surfaces(client, {user_surface, catalog_surface})
     assert not rows[user_surface]['catalog'] and rows[user_surface]['bound'], rows[user_surface]
     assert rows[catalog_surface]['catalog'] and rows[catalog_surface]['bound'], rows[catalog_surface]
@@ -207,22 +206,21 @@ def surfaces(client, database, user_surface, catalog_surface):
     assert after['parent_uuid'] == before['uuid'], (before, after)
     assert [array['shape'] for array in after['arrays'] if array['name'] == 'points'] == [[3, 3, 3]], after
 
+    # A catalog surface is the project's like any other: tagged, renamed and edited in place.
     client.call('segments.activate', {'segmentId': catalog_surface}, timeout=120)
-    expect_error(client, 'segments.rename', {'segmentId': catalog_surface, 'newName': 'x'}, -32009)
-    expect_error(client, 'tags.set', {'segmentId': catalog_surface, 'tag': 'approved', 'enabled': True}, -32009)
-
-    # Editing a catalog surface edits it in the user's store, as the same surface
-    # whose first revision is the catalog version as stored.
     enabled, _ = client.call('segmentation.enable_editing', {'enabled': True}, timeout=120)
     assert enabled['enabled'], enabled
     client.call('segmentation.enable_editing', {'enabled': False}, timeout=120)
+    client.call('tags.set', {'segmentId': catalog_surface, 'tag': 'approved', 'enabled': True}, timeout=120)
+    client.call('segments.rename', {'segmentId': catalog_surface, 'newName': 'renamed catalog surface'}, timeout=120)
     with ObjectStore.open(str(database), read_only=True) as store:
         record = store.object(catalog_surface)
         assert record['meta']['coordinates']['volume_uuid'] == 'catvol', record['meta']
+        assert 'approved' in record['tags'] and record['name'] == 'renamed catalog surface', record
     rows = listed_surfaces(client, {catalog_surface})
-    assert not rows[catalog_surface]['catalog'], rows[catalog_surface]
-    print('Surfaces: list, activate, tags, rename, review and crop edit the store; a catalog surface '
-          'is edited in the user\'s store as the same surface', flush=True)
+    assert rows[catalog_surface]['catalog'], rows[catalog_surface]
+    print('Surfaces: list, activate, tags, rename, review and crop edit the project; a catalog surface '
+          'is edited in place', flush=True)
 
 
 def render(client, root, *surface_ids):

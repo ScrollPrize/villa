@@ -335,11 +335,11 @@ class FakeAgentBridgeServer:
                     },
                 )
             else:
-                if not path.lower().endswith(".volpkg.json"):
-                    path += ".volpkg.json"
+                if not path.lower().endswith(".vcobj"):
+                    path += ".vcobj"
                 name = params.get(
                     "name",
-                    Path(path).name[:-len(".volpkg.json")] or "Untitled",
+                    Path(path).name[:-len(".vcobj")] or "Untitled",
                 )
                 await self._reply(
                     writer,
@@ -365,7 +365,7 @@ class FakeAgentBridgeServer:
                 "alreadyAttached": False,
                 "volumeId": "vol-c",
                 "location": params.get("location"),
-                "projectPath": "/tmp/project.volpkg.json",
+                "projectPath": "/tmp/project.vcobj",
             }
         elif method == "volume.list":
             await self._reply(

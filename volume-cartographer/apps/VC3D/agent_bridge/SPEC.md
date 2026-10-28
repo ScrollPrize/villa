@@ -262,11 +262,17 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
-- `project.create` writes a new `.volpkg.json` referencing one local zarr
+- A project is an object store (`.vcobj`): it references its volumes, normal
+  grids and Lasagna datasets and holds the surfaces, fibers and point
+  collections. Remote locations are shared with everyone using the project; a
+  local path is its author's alone. Other stores (e.g. a hosted team store) can
+  be attached beside it, and surfaces, fibers and point collections each come
+  from one chosen store (`state.get`: `project`, `stores`, `routes`).
+- `project.create` writes a new `.vcobj` project referencing one local zarr
   volume or remote `.zarr` URL. It does not change the current session;
   remote availability is checked by `volume.open` when the new project is
   opened.
-- `volume.open` opens a local project and may select a volume. Failed opens do
+- `volume.open` opens a project and may select a volume. Failed opens do
   not discard the current project.
 - `volume.attach` loads one local zarr or remote `.zarr` URL asynchronously,
   then persists it in the project only if the same project is still open. It
@@ -285,22 +291,19 @@ dialog.
 
 ### Segments and review state
 
-Segments are surfaces in the object stores the surface panel lists: the user's
-store (attached with `--object-store`) and, for an open Open Data volume, its
-sample's read-only catalog store. A segment id is the surface's store UUID.
-Methods on segments need an attached store and an open volume (-32000).
+Segments are surfaces of the store surfaces are kept in: the project's, or the
+store chosen for surfaces. An Open Data sample is opened as a project of its
+own whose catalog surfaces are ordinary surfaces of it. A segment id is the
+surface's store UUID. Methods on segments need an open project and volume (-32000).
 
 - `segments.list` reports the listed surfaces: `id`, `name`, record `tags`,
-  `catalog` (read-only catalog store), `bound` (bound to the open volume) and
-  `active`; `loading` is true while a listing is still being read.
+  `catalog` (an Open Data catalog surface), `bound` (bound to the open volume)
+  and `active`; `loading` is true while a listing is still being read.
 - `segments.activate` validates before changing selection. Activating the
   current segment is a no-op success. A catalog surface whose geometry is still
   remote is fetched first (the call blocks while it downloads).
-- Enabling editing on a catalog surface imports it into the user's store as
-  the same surface (its catalog version, as stored, is its first revision
-  there); from then on it is listed from the user's store. Delete (retire),
-  rename and `tags.set` change the user's store and fail with -32009 on a
-  catalog surface that was not edited yet.
+- Catalog surfaces are edited, renamed, tagged and deleted in place like any
+  other; delete, rename and `tags.set` fail with -32009 only on a read-only store.
 - `segments.review` derives review status from the record tags, with optional
   tag filters, without changing the current selection.
 
@@ -417,9 +420,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one local zarr volume or remote `.zarr` URL without opening it. |
+| `vc3d_create_project` | `project.create` | Create a `.vcobj` project that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
-| `vc3d_delete_segment` | `segments.delete` | Retire a surface in your object store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on catalog surfaces. |
+| `vc3d_delete_segment` | `segments.delete` | Retire a surface in its store (it leaves the listing; store history keeps it). Requires `confirm=true`. Fails while segmentation editing is enabled and on read-only stores. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
 | `vc3d_drag` | `canvas.drag` |
 | `vc3d_enable_editing` | `segmentation.enable_editing` | Turn segmentation editing mode on/off for the active segment. |
@@ -437,7 +440,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
 | `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, highlighted surfaces). |
-| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
+| `vc3d_get_state` | `state.get` | Snapshot of VC3D: open project and its stores, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_surface_from_seed` | `segmentation.grow_surface_from_seed` | Create a new surface by growing it from a 3D seed point (headless GrowPatch). Async: returns a jobId; the new surface's UUID is the finished job's output. |
 | `vc3d_grow_segment` | `segmentation.grow` | Grow the active segmentation surface (method: tracer/corrections; direction; steps). Async: returns a jobId. |
 | `vc3d_job_status` | `job.status` | Poll a job by id (or the latest job): state, message, console tail. |
@@ -460,7 +463,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
 | `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
-| `vc3d_open_volume` | `volume.open` | Open a volume package (.volpkg / .volpkg.json / zarr project) and optionally select a volume id. |
+| `vc3d_open_volume` | `volume.open` | Open a project (.vcobj) and optionally select a volume id. |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
 | `vc3d_push_pull_start` | `segmentation.push_pull.start` |
@@ -469,7 +472,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_remove_point_collection_tag` | `points.remove_collection_tag` |
 | `vc3d_remove_point` | `points.remove_point` |
 | `vc3d_rename_point_collection` | `points.rename_collection` |
-| `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails on catalog surfaces. |
+| `vc3d_rename_segment` | `segments.rename` | Rename a surface (its UUID stays). `new_name` must differ from the current name. Fails in a read-only store. |
 | `vc3d_render_tifxyz` | `render.tifxyz` |
 | `vc3d_reoptimize_segment` | `segment.reoptimize` | Resume-opt local reoptimization of a segment. Asynchronous (`source:"tool"`); supports `wait: bool = false` (30-minute cap). |
 | `vc3d_reset_windings` | `points.reset_windings` |

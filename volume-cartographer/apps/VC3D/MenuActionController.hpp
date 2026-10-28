@@ -35,7 +35,6 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
-    static constexpr size_t kMaxRecentObjectStores = 10;
 
     explicit MenuActionController(CWindow* window);
     ~MenuActionController() override;
@@ -48,21 +47,22 @@ public:
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
-    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved) and attaches it.
-    bool attachObjectStore();
-    // Prompts for a new .vcobj location, creates an empty store there and attaches it.
-    bool createObjectStore();
-    // With no store attached, explains that `purpose` needs one and offers to
-    // create or attach one. True once a store is attached.
-    bool requireObjectStore(const QString& purpose);
+    // Prompts for a .vcobj (and a username unless a non-"anon" one is saved)
+    // and attaches it beside the project; with `kind`, objects of that kind are
+    // then kept in it. True once attached.
+    bool attachStore(bool readOnly = false, const std::string& kind = {});
+    // With no project open, explains that `purpose` needs one and offers to
+    // create or open one. True once a project is open.
+    bool requireProject(const QString& purpose);
     // Author recorded on edits: the saved username, asked for until it is not "anon".
     // Empty means cancelled.
     QString objectStoreAuthor();
-    void cloneHostedStore();
+    // Clones a hosted store to a local replica, then opens it as the project
+    // or attaches it beside the project.
+    void cloneHostedStore(bool asProject);
     // Collects a kind, a source folder and an optional volume binding, then ingests
-    // it into the attached store in the background (vc::objects::ingestGeometrySource).
+    // it into the kind's store in the background (vc::objects::ingestGeometrySource).
     void importIntoObjectStore();
-    void detachObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
         bool success{false};
@@ -126,14 +126,10 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
-    // Attaches, reporting failure in a message box; success moves the store to the top of the recent list.
-    bool attachObjectStoreAt(const QString& path, const QString& author, bool readOnly);
-    // remote: a replica of a hosted store.
-    struct RecentObjectStore { QString path; bool readOnly{false}; bool remote{false}; };
-    std::vector<RecentObjectStore> loadRecentObjectStores() const;
-    void saveRecentObjectStores(const std::vector<RecentObjectStore>& stores);
-    void refreshRecentObjectStoreMenu();
-    void openRecentObjectStore(const RecentObjectStore& store);
+    // The Stores menu: the stores beside the project and the store each kind uses.
+    void refreshStoresMenu();
+    // Open Data: the sample's project store, made or refreshed from the catalog.
+    void resetOpenDataProject();
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
@@ -187,8 +183,7 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
-    QMenu* _objectStoreMenu{nullptr};
-    QMenu* _recentObjectStoreMenu{nullptr};
+    QMenu* _storesMenu{nullptr};
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};

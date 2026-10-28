@@ -271,11 +271,12 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
         // Committed events; status-only events must preserve warm views/selection.
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
-            event.attachment != state_->objectStoreAttachment()) return;
+            event.attachment != state_->storeFor("fiber")) return;
         if (!event.touches({"fiber", "fiber_branch", "volume_transform", "volume_transform_choice"})) return;
         projectChanged(event.kind == vc::objects::StoreSessionEvent::Kind::Committed);
     });
     connect(state_, &CState::volumeChanged, this, [this]() { projectChanged(); });
+    connect(state_, &CState::storeRoutesChanged, this, [this]() { projectChanged(); });
     connect(state_, &CState::volumeClosing, this, [this]() { clear(); });
     bindToViewerManager(manager);
 }
@@ -315,7 +316,7 @@ void FiberCollectionController::setLineAnnotationActive(bool active)
 }
 void FiberCollectionController::publishStatus(const QString& text)
 {
-    emit statusChanged(state_->objectStoreAttachment().has_value(), text);
+    emit statusChanged(state_->storeFor("fiber").has_value(), text);
 }
 void FiberCollectionController::publishSelection(Selection selection)
 {
@@ -365,7 +366,7 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
     if (!preserveSelection) clear();
     else ++revision_;
     const auto connection = state_->objectStoreSession();
-    const auto attachment = state_->objectStoreAttachment();
+    const auto attachment = state_->storeFor("fiber");
     const auto volume = state_->currentVolume();
     if (!attachment || !annotations_) return;
     catalogCursor_.reset();
@@ -477,7 +478,7 @@ void FiberCollectionController::listPage(bool reset)
     const auto filters = std::tuple{options_.minLengthMm, options_.horizontal, options_.vertical};
     catalogBusy_ = true;
     background<std::vector<CatalogRow>>(this,
-        [connection=state_->objectStoreSession(), attachment=*state_->objectStoreAttachment(),
+        [connection=state_->objectStoreSession(), attachment=*state_->storeFor("fiber"),
          selection, none=noFamilies()]() {
             std::vector<CatalogRow> rows;
             if (none) return rows;
@@ -558,7 +559,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
     const auto volumeId = volume ? volume->id() : std::string{};
     background<SelectedFiber>(
         this,
-        [connection=state_->objectStoreSession(),attachment=*state_->objectStoreAttachment(),uuid,volumeId]() {
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),uuid,volumeId]() {
             SelectedFiber selected;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
                 const auto revision=db.currentObjectRevision(txn,uuid);
@@ -688,7 +689,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             const auto found = views_.find(viewer);
             return found == views_.end() ? nullptr : found->second.get();
         },
-        [connection=state_->objectStoreSession(),attachment=*state_->objectStoreAttachment(),
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
          volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{},
          selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
          none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
@@ -994,7 +995,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
     const auto rev = revision_;
     background<ChainResult>(
         this,
-        [connection=state_->objectStoreSession(),attachment=*state_->objectStoreAttachment(),
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
          volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{}, box, cancel,
          min=options_.minLengthMm / nativeVoxelMm_, family=familyFilter(), maximum=options_.maxDisplayed,
          linked=options_.showLinked, none=noFamilies()]() {

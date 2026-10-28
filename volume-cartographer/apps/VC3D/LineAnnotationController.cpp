@@ -1601,7 +1601,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 onVolumePackageChanged({});
                 return;
             }
-            if (event.attachment != _state->objectStoreAttachment() ||
+            if (event.attachment != _state->storeFor("fiber") ||
                 !event.touches({"fiber", "fiber_branch", vc::objects::kAttachmentEdgeKind, "volume_transform", "volume_transform_choice"})) return;
             ++_fiberDataGeneration;
             _sideStripStoredSnapshotCache.clear();
@@ -1617,6 +1617,7 @@ LineAnnotationController::LineAnnotationController(CState* state,
                 &CState::vpkgChanged,
                 this,
                 &LineAnnotationController::onVolumePackageChanged);
+        connect(_state, &CState::storeRoutesChanged, this, [this]() { onVolumePackageChanged({}); });
         // Both handlers only bump counters and queue one coalesced refresh; the
         // actual reload happens at the cache choke point when a stale view is
         // rebuilt, so neither handler touches the filesystem itself.
@@ -1768,7 +1769,7 @@ void LineAnnotationController::setSurfacePanel(SurfacePanelController* panel)
 
 bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const
 {
-    return _state && _state->objectStoreAttachment() && viewerSupportsLaunch(viewer);
+    return _state && _state->storeFor("fiber") && viewerSupportsLaunch(viewer);
 }
 
 bool LineAnnotationController::viewerSupportsLaunch(const CChunkedVolumeViewer* viewer) const
@@ -4227,7 +4228,7 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
 
 void LineAnnotationController::importFibers()
 {
-    if (!_state || !_state->objectStoreAttachment()) {
+    if (!_state || !_state->storeFor("fiber")) {
         showError(tr("Attach an object store before importing fibers."));
         return;
     }
@@ -4270,13 +4271,13 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         }
         return false;
     }
-    if (!_state || !_state->objectStoreAttachment()) {
+    if (!_state || !_state->storeFor("fiber")) {
         if(errorMessage) *errorMessage=tr("Attach an object store before importing fibers.");
         return false;
     }
     try {
         const auto report = vc::objects::ingestGeometrySource(*_state->objectStoreSession(),
-                                                              *_state->objectStoreAttachment(), "fiber", importPath);
+                                                              *_state->storeFor("fiber"), "fiber", importPath);
         if (!report.problems.empty()) {
             if (errorMessage) *errorMessage = tr("Could not import fibers: %1").arg(QString::fromStdString(report.problems.front()));
             return false;
@@ -4325,7 +4326,7 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
 
     try {
         const auto connection = _state->objectStoreSession();
-        const auto attachment = _state->objectStoreAttachment();
+        const auto attachment = _state->storeFor("fiber");
         if (!attachment) throw std::runtime_error("Attach an object store before exporting fibers");
         nlohmann::json root{{"type", "vc3d_fiber_collection"}, {"version", 1},
                             {"point_collections", nlohmann::json::array()}};
@@ -5442,7 +5443,7 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
 const LineAnnotationController::StoredUmbilicus&
 LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
 {
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
     const auto key = (attachment ? attachment->storeUuid : std::string{}) + "/" + volumeId;
     const auto [found, inserted] = _storedUmbilici.try_emplace(key);
     if (!inserted) return found->second;
@@ -5463,7 +5464,7 @@ LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
 QString LineAnnotationController::umbilicusFingerprint() const
 {
     // Changes whenever the answer does: uuid@revision, else why there is none.
-    if (!_state || !_state->objectStoreAttachment() || _state->currentVolumeId().empty()) {
+    if (!_state || !_state->projectAttachment() || _state->currentVolumeId().empty()) {
         return {};
     }
     const auto& stored = storedUmbilicus(_state->currentVolumeId());
@@ -5625,7 +5626,7 @@ std::string LineAnnotationController::storedFiberFileName(uint64_t fiberId) cons
 {
     const auto uuid = fiberUuidForId(fiberId);
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     std::string fileName;
     if (!uuid.empty() && attachment) {
         connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -5648,7 +5649,7 @@ std::vector<std::string> LineAnnotationController::knownFiberTags() const
     const std::string reviewedTag{vc3d::line_annotation::kReviewedTag};
     std::vector<std::string> tags{reviewedTag};
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment) return tags;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         for (auto& tag : db.objectTags(txn, std::string{"fiber"}))
@@ -5674,7 +5675,7 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 void LineAnnotationController::refreshChangedStoreFibers()
 {
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment) return;
     std::vector<uint64_t> changed;
     struct Reopen {
@@ -6966,8 +6967,8 @@ std::optional<QString> LineAnnotationController::linkSessionControlToStoredContr
 
 bool LineAnnotationController::objectStoreEditingAvailable(std::string* error) const
 {
-    if (_state && _state->objectStoreAttachment()) return true;
-    if (error) *error = "Attach an object store before editing fibers";
+    if (_state && _state->storeFor("fiber")) return true;
+    if (error) *error = "Open a project (or choose a fiber store) before editing fibers";
     return false;
 }
 
@@ -11208,7 +11209,7 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
     // Built once per volume (points in its voxels, centres sized to it) from
     // the stored umbilicus; an umbilicus change drops it.
     const auto volume = _state ? _state->currentVolume() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->projectAttachment() : std::nullopt;
     if (!volume || !attachment) {
         _scrollUmbilicusVolumeId.clear();
         _scrollUmbilicus.reset();
@@ -12070,7 +12071,7 @@ uint64_t LineAnnotationController::fiberIdForFilePath(const fs::path& path) cons
     } catch(...) { return 0; }
     // Only a fiber the attached store holds has a runtime id.
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment) return 0;
     bool active = false;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -12085,7 +12086,7 @@ bool LineAnnotationController::storedFiberHasFileName(uint64_t fiberId, const st
 {
     const auto uuid = fiberUuidForId(fiberId);
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (uuid.empty() || !attachment) return false;
     bool matches = false;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -12117,7 +12118,7 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
 {
     if (fiberIds.empty()) return {};
     const auto connection = _state->objectStoreSession();
-    const auto attachment = _state->objectStoreAttachment();
+    const auto attachment = _state->storeFor("fiber");
     if (!attachment) throw std::runtime_error("Attach an object store before exporting fibers");
     std::vector<std::string> roots;
     for (const auto id : fiberIds) {
@@ -12283,7 +12284,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
             vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
             vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT).toDouble();
     }
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment) { fail(tr("Attach an object store before creating fibers.")); return; }
     auto shouldSave = std::move(request.shouldSave);
     const auto baseShapeZYX = request.inputs.fiberDataset
@@ -12475,7 +12476,7 @@ fs::path LineAnnotationController::currentVolpkgRoot() const
     if (!projectPath.empty()) {
         return projectPath.parent_path();
     }
-    return fs::path(vpkg->getVolpkgDirectory());
+    return fs::path(vpkg->directory().string());
 }
 
 uint64_t LineAnnotationController::nextFiberId() const
@@ -12488,7 +12489,7 @@ uint64_t LineAnnotationController::nextFiberSequenceForUsername(const std::strin
     const std::string normalized = vc3d::line_annotation::normalizedFiberUsername(username);
     uint64_t sequence = 1;
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (attachment) {
         // Retired fibers keep their sequence: a label is never reissued.
         connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -12531,8 +12532,8 @@ std::string LineAnnotationController::currentFiberDateTimeString()
 void LineAnnotationController::ensureSessionFiberIdentity(LineAnnotationSession& session)
 {
     if (!session.storePin && _state) {
-        const auto attachment = _state->objectStoreAttachment();
-        if (!attachment) throw std::runtime_error("Attach an object store before editing fibers");
+        const auto attachment = _state->storeFor("fiber");
+        if (!attachment) throw std::runtime_error("Open a project (or choose a fiber store) before editing fibers");
         session.storePin = vc::objects::PinnedObject{*attachment, {attachment->storeUuid, session.fiberUuid}, "", {}};
     }
     if (!session.fiberFileName.empty()) {
@@ -12939,7 +12940,7 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     // acceptance, segment/triangle tests and ordering remain in the shared core.
     try {
     const auto connection=_state->objectStoreSession();
-    const auto attachment=_state->objectStoreAttachment();
+    const auto attachment=_state->storeFor("fiber");
     const auto volume=_state->currentVolume();
     if(!attachment || !volume) return;
     // Strip points and candidates are in the volume's voxels.
@@ -14619,8 +14620,8 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
             break;
         }
     }
-    if (!_state || !_state->objectStoreAttachment())
-        throw std::runtime_error("Attach an object store before editing fibers");
+    if (!_state || !_state->storeFor("fiber"))
+        throw std::runtime_error("Open a project (or choose a fiber store) before editing fibers");
     return snapshot;
 }
 
@@ -14743,7 +14744,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     using namespace vc::objects;
     std::vector<StoredFiber> result;
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment || (uuids && uuids->empty())) return result;
     const bool readOnly = !connection->writable(*attachment);
     const auto volume = _state->currentVolume();
@@ -14902,7 +14903,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     const std::vector<std::string>& uuids, bool lines) const
 {
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment || uuids.empty()) return readStoredFibers(uuids, lines);
     // Bound fibers decode in the open volume's voxels.
     const auto volume = _state->currentVolume();
@@ -14977,8 +14978,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             QTimer::singleShot(0, this, [this] { refreshChangedStoreFibers(); });
     });
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
-    if (!attachment) throw std::runtime_error("Attach an object store before editing fibers");
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
+    if (!attachment) throw std::runtime_error("Open a project (or choose a fiber store) before editing fibers");
     // Working copies receive allocated IDs only after the database commits.
     auto edits = snapshots;
     vc3d::line_annotation::canonicalizeFiberSaveSnapshots(edits);
@@ -15231,7 +15232,7 @@ bool LineAnnotationController::fiberBoundToVolume(uint64_t id, const std::shared
 {
     const auto uuid = fiberUuidForId(id);
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!volume || uuid.empty() || !attachment) return false;
     bool bound = false;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -15251,7 +15252,7 @@ bool LineAnnotationController::fiberInVolume(const StoredFiber& fiber) const
 uint64_t LineAnnotationController::fiberIdForUuid(const std::string& uuid) const
 {
     if (uuid.empty()) return 0;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment) return 0;
     auto [found, inserted] = _fiberIdsByUuid.try_emplace(attachment->storeUuid + "/" + uuid, 0);
     if (inserted) {
@@ -15269,7 +15270,7 @@ std::string LineAnnotationController::fiberUuidForId(uint64_t id) const
 
 void LineAnnotationController::registerFiberId(const std::string& uuid, uint64_t id) const
 {
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment || uuid.empty() || id == 0) return;
     _fiberIdsByUuid[attachment->storeUuid + "/" + uuid] = id;
     _fiberUuidsById[id] = uuid;
@@ -15279,7 +15280,7 @@ std::optional<vc::objects::PinnedObject> LineAnnotationController::fiberPin(uint
 {
     const auto uuid = fiberUuidForId(id);
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
-    const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
+    const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (uuid.empty() || !attachment) return std::nullopt;
     std::optional<vc::objects::PinnedObject> pin;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {

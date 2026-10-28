@@ -7,6 +7,7 @@
 #include "vc_object_store/sftp/Sftp.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 
 namespace vc::objects {
@@ -24,7 +25,8 @@ struct ObjectStoreSession::Attachment {
     int64_t journalPosition = 0;
     // Hosted replicas only; declared after store so it stops first.
     std::unique_ptr<detail::HubWorker> hub;
-    // Fetched attachments only (attachFetched): fetches published geometry.
+    // Writable attachments: fetches the geometry of objects published elsewhere
+    // (setGeometryFetcher).
     std::unique_ptr<detail::FetchQueue> fetches;
 };
 
@@ -50,7 +52,17 @@ ObjectStoreSession::~ObjectStoreSession()
 std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const std::filesystem::path& path,
     const OpenOptions& options, const HubSessionOptions& hubOptions)
 {
-    auto next = std::make_shared<Attachment>(ObjectStore::open(path, options));
+    // Reads that reach objects without local geometry queue their fetch.
+    std::unique_ptr<detail::FetchQueue> fetches;
+    auto opened = options;
+    if (!options.readOnly) {
+        fetches = std::make_unique<detail::FetchQueue>();
+        opened.remoteGeometryReached = [requests = fetches.get()](const std::vector<std::string>& uuids) {
+            requests->request(uuids);
+        };
+    }
+    auto next = std::make_shared<Attachment>(ObjectStore::open(path, opened));
+    next->fetches = std::move(fetches);
     // Exercise write access without changing records. Opening a read connection
     // successfully is not sufficient validation for an editing session.
     next->writable = !options.readOnly;
@@ -75,6 +87,7 @@ AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path,
         attached_.push_back(next);
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
+    startFetching(*next);
     if (next->writable && vc::objects::hubStatus(next->store))
         next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
             [this, owner = next.get()] { hubChanged(owner); });
@@ -101,6 +114,7 @@ AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identit
         attached_.push_back(next);
         events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
+    startFetching(*next);
     if (next->writable && vc::objects::hubStatus(next->store))
         next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
             [this, owner = next.get()] { hubChanged(owner); });
@@ -237,15 +251,6 @@ void ObjectStoreSession::importObject(const AttachmentIdentity& from, const Atta
     act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
 }
 
-void ObjectStoreSession::restoreImported(const AttachmentIdentity& identity, const std::string& objectUuid)
-{
-    const auto uuid = util::canonicalUuid(objectUuid);
-    std::vector<ObjectRevision> history;
-    read(identity, [&](const auto& store, const auto& txn, const auto&) { history = store.objectHistory(txn, uuid); });
-    if (history.empty()) throw std::runtime_error("object has no history: " + uuid);
-    editCurrent(identity, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, history.front().uuid); });
-}
-
 void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job& job)
 {
     auto attachment = acquire(identity, true);
@@ -308,43 +313,39 @@ void ObjectStoreSession::tagObjects(const AttachmentIdentity& identity, const st
     });
 }
 
-AttachmentIdentity ObjectStoreSession::attachFetched(const std::filesystem::path& path, const OpenOptions& options,
-                                                     GeometryFetcher fetch)
+void ObjectStoreSession::setGeometryFetcher(const std::string& metaKey, GeometryFetcher fetch)
 {
-    std::lock_guard transition(transition_);
-    auto opened = options;
-    opened.readOnly = false;
-    auto queue = std::make_unique<detail::FetchQueue>();
-    auto* requests = queue.get();
-    opened.remoteGeometryReached = [requests](const std::vector<std::string>& uuids) { requests->request(uuids); };
-    auto next = std::make_shared<Attachment>(ObjectStore::open(path, opened));
-    next->writable = !options.readOnly;  // fetching and local edits share the writer lock
-    {
-        auto txn = next->store.read();
-        next->identity.storeUuid = next->store.uuid(txn);
-        next->journalPosition = next->store.journalPosition(txn);
-    }
-    {
-        std::lock_guard lock(mutex_);
-        if (std::any_of(attached_.begin(), attached_.end(),
-                        [&](const auto& a) { return a->identity.storeUuid == next->identity.storeUuid; }))
-            throw std::runtime_error("object store is already attached to this session");
-        next->identity.generation = ++generation_;
-        attached_.push_back(next);
-        events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
-    }
-    const auto identity = next->identity;
-    requests->start([this, identity, fetch = std::move(fetch)](const std::string& uuid) {
-        auto attachment = acquire(identity, false);
+    std::lock_guard lock(mutex_);
+    if (fetch) fetchers_[metaKey] = std::move(fetch);
+    else fetchers_.erase(metaKey);
+}
+
+void ObjectStoreSession::startFetching(Attachment& attachment)
+{
+    if (!attachment.fetches) return;
+    attachment.fetches->start([this, identity = attachment.identity](const std::string& uuid) {
+        auto held = acquire(identity, false);
         try {
-            fetch(attachment->store, uuid, [&](const RevisionSelection& expected, const Action& action) {
+            nlohmann::json meta = nlohmann::json::object();
+            {
+                auto txn = held->store.read();
+                if (const auto record = held->store.objectByUuid(txn, uuid)) meta = nlohmann::json::parse(record->meta);
+            }
+            GeometryFetcher fetch;
+            {
+                std::lock_guard lock(mutex_);
+                for (const auto& [key, fetcher] : fetchers_)
+                    if (!fetch && meta.is_object() && meta.contains(key)) fetch = fetcher;
+            }
+            if (!fetch) throw std::runtime_error("no geometry fetcher for " + uuid);
+            // A placeholder another replica pushed is edited by fetching it.
+            const auto lease = holdLeases(identity, {uuid});
+            fetch(held->store, uuid, [&](const RevisionSelection& expected, const Action& action) {
                 return fetchWrite(identity, expected, action);
             });
-        } catch (...) { release(*attachment, false); throw; }
-        release(*attachment, false);
+        } catch (...) { release(*held, false); throw; }
+        release(*held, false);
     });
-    next->fetches = std::move(queue);
-    return identity;
 }
 
 RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& identity, const RevisionSelection& expected,
@@ -353,12 +354,13 @@ RevisionSelection ObjectStoreSession::fetchWrite(const AttachmentIdentity& ident
     RevisionSelection committed;
     auto attachment = acquire(identity, false);
     try {
-        if (!attachment->fetches) throw std::runtime_error("not a fetched attachment");
+        if (!attachment->fetches) throw std::runtime_error("Object store is attached read-only");
         std::lock_guard writer(attachment->writer);
         auto txn = attachment->store.write(expected);
         callback(attachment->store, txn);
         txn.commit();
         committed = txn.committedRevisions();
+        if (attachment->hub) attachment->hub->requestSync(true);
     } catch (...) { release(*attachment, false); throw; }
     release(*attachment, false);
     return committed;
@@ -383,7 +385,7 @@ void ObjectStoreSession::ensureGeometry(const AttachmentIdentity& identity, cons
             local = attachment->store.currentGeometry(txn, uuid).has_value();
         }
         if (!local) {
-            if (!attachment->fetches) throw GeometryUnavailable("object has no geometry: " + uuid);
+            if (!attachment->fetches) throw GeometryUnavailable("object has no geometry and its store is attached read-only: " + uuid);
             std::string error;
             if (!attachment->fetches->fetchNow(uuid, [&] { return attachment->cancelled.load() || (cancel && cancel()); },
                                                &error))

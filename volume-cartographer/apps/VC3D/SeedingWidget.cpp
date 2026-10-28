@@ -431,7 +431,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         setError(storeError);
         return false;
     }
-    const std::filesystem::path projectDir(fVpkg->getVolpkgDirectory());
+    const std::filesystem::path projectDir(fVpkg->directory().string());
     const std::filesystem::path seedJsonPath = projectDir / "seed.json";
 
     if (!std::filesystem::exists(seedJsonPath)) {
@@ -1331,7 +1331,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
         setError(storeError);
         return false;
     }
-    const std::filesystem::path projectDir(fVpkg->getVolpkgDirectory());
+    const std::filesystem::path projectDir(fVpkg->directory().string());
     const std::filesystem::path expandJsonPath = projectDir / "expand.json";
 
     if (!std::filesystem::exists(expandJsonPath)) {

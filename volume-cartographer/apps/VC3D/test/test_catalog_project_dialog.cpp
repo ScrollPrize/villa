@@ -1,5 +1,6 @@
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "support/TestProject.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 
@@ -94,8 +95,6 @@ private slots:
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.setValue(vc3d::settings::viewer::REMOTE_CACHE_DIR, temp.filePath("cache"));
         settings.sync();
-        const auto oldRoot = VolumePkg::autosaveRoot();
-        VolumePkg::setAutosaveRoot(temp.path().toStdString());
         vcr::catalog::OpenDataManifest manifest;
         vcr::catalog::OpenDataSample sample;
         sample.id = "PHercParis4";
@@ -187,10 +186,10 @@ private slots:
                 QVERIFY(selection.representations.has_value());
                 QVERIFY(selection.representations->empty());
                 QCOMPARE(project.name, std::string("my-selection"));
-                QCOMPARE(project.path.string(), temp.filePath("my-selection.VOLPKG.JSON").toStdString());
+                QCOMPARE(project.path.string(), temp.filePath("my-selection.VCOBJ").toStdString());
                 vc::project::LoadOptions options;
                 options.deferResolution = true;
-                auto pkg = VolumePkg::newDetached(options);
+                auto pkg = vc::test::emptyProject(options);
                 attachOpenDataSampleVolumes(*pkg, selectedSample, &selection);
                 QCOMPARE(pkg->volumeEntries().size(), std::size_t{1});
                 QCOMPARE(pkg->volumeEntries().front().location, raw.resolvedUrl);
@@ -203,7 +202,7 @@ private slots:
                 QVERIFY(dialog);
                 auto* path = dialog->findChild<QLineEdit*>("catalogProjectPath");
                 QVERIFY(path);
-                path->setText(temp.filePath("my-selection.VOLPKG.JSON"));
+                path->setText(temp.filePath("my-selection.VCOBJ"));
                 auto trees = dialog->findChildren<QTreeWidget*>();
                 for (auto* tree : trees) {
                     if (tree->topLevelItem(0)->text(0) == "Source volumes")
@@ -214,7 +213,6 @@ private slots:
             QVERIFY(QMetaObject::invokeMethod(&catalog, "createSelectedProject", Qt::DirectConnection));
             QVERIFY(created);
         }
-        VolumePkg::setAutosaveRoot(oldRoot);
         if (oldConfig.isNull()) qunsetenv("VC3D_CONFIG_DIR");
         else qputenv("VC3D_CONFIG_DIR", oldConfig);
     }

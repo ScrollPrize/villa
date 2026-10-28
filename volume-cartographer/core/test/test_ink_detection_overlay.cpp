@@ -6,6 +6,7 @@
 #include "overlays/InkDetectionOverlayController.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
+#include "support/TestProject.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -108,14 +109,14 @@ struct CatalogFixture {
             db.upsertObject(txn, record);
             txn.commit();
         }
-        const auto attachment = state.objectStoreSession()->attachFetched(storePath, storeOptions,
+        state.objectStoreSession()->setGeometryFetcher("catalog",
             [](vo::ObjectStore&, const std::string&, const vo::ObjectStoreSession::FetchWrite&) {
                 throw std::runtime_error("offline");
             });
+        const auto attachment = state.objectStoreSession()->attach(storePath, storeOptions);
         inkFile = state.objectStoreSession()->artifactDirectory(attachment, surfaceUuid) / inkName;
         catalog = std::make_unique<SurfaceCatalog>(state.objectStoreSession());
-        catalog->setSource(std::nullopt, volume);
-        catalog->setCatalogSources({attachment});
+        catalog->setSource(attachment, volume);
         QElapsedTimer timer;
         timer.start();
         while ((catalog->loading() || catalog->rows().empty()) && timer.elapsed() < 10000) {
@@ -185,7 +186,11 @@ TEST_CASE("CState::closeAll clears the project's surfaces and keeps the view pla
 {
     for (const bool withProject : {false, true}) {
         CState state;
-        if (withProject) state.setVpkg(VolumePkg::newEmpty());
+        if (withProject) {
+            const auto store = vc::test::createTestProject();
+            state.setVpkg(VolumePkg::open(state.objectStoreSession(),
+                                          state.attachProjectStore(store.path, "vc-test"), "vc-test"));
+        }
         state.setSurface("segmentation", makeSurface("segmentation"));
         state.setSurface("other", makeSurface("other"));
         const auto xy = state.surface("xy plane");

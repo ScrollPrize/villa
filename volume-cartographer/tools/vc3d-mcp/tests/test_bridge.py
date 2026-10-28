@@ -361,7 +361,7 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result,
             {
-                "path": "/tmp/new-project.volpkg.json",
+                "path": "/tmp/new-project.vcobj",
                 "name": "new-project",
                 "volume": "/tmp/volume",
             },
@@ -377,7 +377,7 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_vc3d_create_project_forwards_optional_values(self) -> None:
         await vc3d_create_project(
-            "/tmp/new-project.volpkg.json",
+            "/tmp/new-project.vcobj",
             "https://example.test/volume.zarr",
             name="Example",
             tags=["source:test"],
@@ -386,7 +386,7 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.fake_server.received_requests[-1]["params"],
             {
-                "path": "/tmp/new-project.volpkg.json",
+                "path": "/tmp/new-project.vcobj",
                 "volume": "https://example.test/volume.zarr",
                 "name": "Example",
                 "tags": ["source:test"],

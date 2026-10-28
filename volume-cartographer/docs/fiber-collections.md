@@ -1,19 +1,23 @@
 # Fibers in an object store
 
-VC3D uses one writable `.vcobj` for fiber geometry, annotations, stable control
-point identities, revisions, and shared branch relationships. Choose **File →
-Object Store → Attach Object Store**, or launch `VC3D --object-store /data/fibers.vcobj`.
-Stores attached from that menu are listed under **File → Object Store → Open Recent
-Object Store**; replicas of hosted stores are tagged *(remote)*.
-Attachment lasts for the session. A failed replacement leaves the current store
-attached. Detaching or replacing it cancels old background reads and closes the
+Fiber geometry, annotations, stable control point identities, revisions, and
+shared branch relationships live in an object store (`.vcobj`): by default the
+open project's. Another store can be attached beside the project (**File →
+Stores → Attach Store...**, or launch `VC3D --project p.vcobj --attach-store
+/data/fibers.vcobj`) and chosen for fibers with **File → Stores → Show Fibers
+From**, or with the fiber pane's store buttons. Stores attached beside a project
+and the store chosen for each kind are remembered with the project on this
+machine. Changing the fiber store cancels old background reads and closes the
 fiber panes after accepted writes finish.
 
 To share fibers with other people, keep the store as a hosted hub on a network
-share. Choose **File → Object Store → Clone Hosted Object Store...** to copy the
-hub into a local replica and attach it. VC3D then syncs the replica in the background: every 15 s,
-and shortly after each local edit. The status bar shows the sync state. **File → Object
-Store → Sync Hosted Object Store Now** syncs immediately.
+share. **File → Stores → Clone Hosted Store...** copies the hub into a local
+replica and attaches it beside the project; **File → Clone Hosted Project...**
+opens it as the project itself, so the team also shares its volumes. VC3D syncs
+replicas in the background: every 15 s, and shortly after each local edit. The
+status bar shows the sync state. **File → Stores → Sync Hosted Stores Now** syncs
+immediately. Remote volumes (URLs) of a shared project are everyone's; a volume
+at a local path is listed only for the person who attached it.
 
 Enabling editing of a fiber, and any edit, tag or retire action, first leases
 that fiber from the hub. If someone else holds the lease, VC3D reports who and

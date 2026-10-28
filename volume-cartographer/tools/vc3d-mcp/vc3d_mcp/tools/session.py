@@ -20,7 +20,7 @@ async def vc3d_ping() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_get_state() -> dict[str, Any]:
-    """Snapshot of VC3D: open volume package, current volume, active segment,
+    """Snapshot of VC3D: open project and its stores, current volume, active segment,
     viewers (ids/names), editing mode, running job. Call this first."""
     return await _call("state.get")
 

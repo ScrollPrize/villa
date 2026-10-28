@@ -92,7 +92,7 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
     const QString tagStr = p.value("tag").toString();
     const bool enabled = p.value("enabled").toBool();
 
-    // Review tags are record tags of the surface in the user's store.
+    // Review tags are record tags of the surface in its store.
     const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
     const std::vector<std::string> tag{tagStr.toStdString()};
     try {
