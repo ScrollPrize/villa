@@ -2,7 +2,6 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -64,9 +63,10 @@ public:
     bool hasActiveSpiralSession() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
-    void addFiberToCurrentFit(const QString& fiberJsonPath);
-    void noteTrackedFiberSaved(uint64_t generation, const QString& fiberJsonPath);
-    void noteFiberRemoved(const QString& path);
+    void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
+    bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
+    void refreshTrackedFibers();
+    void noteFiberRetired(const QString& objectUuid);
     bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);
     bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
     void noteManagedPatchSaved(const QString& path);
@@ -74,15 +74,13 @@ public:
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
     [[nodiscard]] bool isFlattenedViewer(const VolumeViewerBase* viewer) const;
+    // Why a draft cannot start now, ignoring the object store, which the caller
+    // offers to create or attach.
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
-    [[nodiscard]] std::optional<double> fiberBaseToPreviewFactor() const {
-        return _fiberBaseToPreviewFactor;
-    }
     void startLineAnnotationDraft();
 
 signals:
     void spiralSessionActiveChanged(bool active);
-    void fiberBaseToPreviewFactorChanged(double factor, bool valid);
     void patchEditorRequested(const QString& id, const QString& path);
 
 protected:
@@ -234,8 +232,7 @@ private:
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
     QJsonObject _sessionRunConfig;
-    QString _externalFiberSource;
-    QSet<QString> _managedFiberDirectories;
+    QHash<QString, QString> _trackedFiberPaths;
     struct LineAnnotationDraft {
         std::shared_ptr<QuadSurface> surface;
         std::vector<QPointF> surfacePoints;
@@ -257,7 +254,6 @@ private:
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;
     std::optional<std::array<std::size_t, 3>> _fiberBaseShapeZYX;
     std::optional<double> _previewToFiberBaseScale;
-    std::optional<double> _fiberBaseToPreviewFactor;
     QString _previewCoordinateError;
     std::vector<PreviewComponent> _previewComponents;
     cv::Mat_<int32_t> _previewWindingIds;
@@ -301,10 +297,8 @@ private:
     std::function<void()> _pendingExitAction;
     bool _commitAfterBrushUploads = false;
     QHash<QString, QString> _managedPatchCopies;
-    QHash<QString, QString> _inputFiberDirectories;
     int _draftPreparationRemaining = 0;
     bool _draftPreparationFailed = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime
     // fiber id: runtime ids are reassigned whenever the fiber list reloads.
-    using TrackedFiber = vc3d::SpiralTrackedFiber;
 };

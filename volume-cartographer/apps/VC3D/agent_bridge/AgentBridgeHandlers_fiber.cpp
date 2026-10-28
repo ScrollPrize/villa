@@ -121,8 +121,8 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
 LineAnnotationController* AgentBridgeServer::fiberController() const
 {
     CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+    if (!state || !state->objectStoreSession()->attachment())
+        throw AgentBridgeError{-32000, "Attach an object store before using fibers", {}};
     LineAnnotationController* ctrl =
         _window->_lineAnnotationController ? _window->_lineAnnotationController.get() : nullptr;
     if (!ctrl)
@@ -131,13 +131,11 @@ LineAnnotationController* AgentBridgeServer::fiberController() const
 }
 
 
-// Throws -32007 kind:"fiber" unless `fiberId` is a currently-loaded fiber.
+// Throws -32007 kind:"fiber" unless `fiberId` is an active fiber of the attached store.
 void AgentBridgeServer::requireKnownFiber(LineAnnotationController* ctrl, quint64 fiberId) const
 {
-    for (const auto& summary : ctrl->fiberSummaries()) {
-        if (summary.id == fiberId)
-            return;
-    }
+    if (ctrl->fiberPin(fiberId))
+        return;
     QJsonObject data;
     data["kind"] = "fiber";
     data["id"] = QString::number(fiberId);
@@ -216,7 +214,7 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
     LineAnnotationController* ctrl = fiberController();
 
     QJsonArray fibers;
-    for (const auto& s : ctrl->fiberSummaries()) {
+    for (const auto& s : ctrl->fiberSummaries(std::nullopt)) {
         QJsonObject f;
         f["fiberId"] = QString::number(s.id);
         f["name"] = QString::fromStdString(s.name);
@@ -312,6 +310,9 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         } else {
             ctrl->openFiber(fiberId);
         }
+        // Stored fibers open read-only; editing is an explicit request.
+        if (p.value("editable").toBool(false))
+            ctrl->enableFiberEditing(fiberId);
     });
     if (!err.isEmpty()) {
         QJsonObject data;
@@ -395,10 +396,7 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     vc3d::line_annotation::FiberDeleteOutcome outcome;
     const QString err = captureFiberError(ctrl, [&] { outcome = ctrl->deleteFibers(ids); });
 
-    // What was removed (or found already absent), in terms of the file names
-    // captured before the controller's save drain: the package can change during that drain,
-    // so "is the requested id still listed" is not the question. deleteFibers
-    // continues past per-file failures.
+    // Report the UUIDs retired by the checked action using the requested handles.
     QJsonArray deleted;
     bool allDeleted = !outcome.aborted;
     for (uint64_t id : ids) {
@@ -502,12 +500,14 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    const double scale = p.value("scale").toDouble(1.0);
+    if (p.contains("scale"))
+        throw AgentBridgeError{-32602,
+            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     QString err;
     int exported = 0;
     if (!ctrl->exportFibersToPath(std::filesystem::path(pathStr.toStdString()),
-                                  scale, &err, &exported)) {
+                                  &err, &exported)) {
         QJsonObject data;
         data["detail"] = err;
         throw AgentBridgeError{-32005, "fiber.export failed", data};
@@ -531,7 +531,9 @@ QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
         data["param"] = "path";
         throw AgentBridgeError{-32602, "path is required", data};
     }
-    const double scale = p.value("scale").toDouble(1.0);
+    if (p.contains("scale"))
+        throw AgentBridgeError{-32602,
+            "Fiber import/export preserves coordinates; scale is not supported", {}};
 
     const std::filesystem::path importPath(pathStr.toStdString());
     std::error_code ec;
@@ -545,7 +547,7 @@ QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
     QString err;
     int imported = 0;
     int skipped = 0;
-    if (!ctrl->importFibersFromPath(importPath, scale, &err, &imported, &skipped)) {
+    if (!ctrl->importFibersFromPath(importPath, &err, &imported, &skipped)) {
         QJsonObject data;
         data["detail"] = err;
         data["skipped"] = skipped;

@@ -1,4 +1,5 @@
 #include "SurfaceAffineTransformController.hpp"
+#include "SurfaceTransformName.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
@@ -415,6 +416,10 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
     auto* transformPanel = transformsPanel();
     const int scale = transformPanel ? transformPanel->scaleValue() : 1;
     const bool scaleOnly = transformPanel && transformPanel->scaleOnlyChecked();
+    if (transformPanel && transformPanel->noResampleChecked() &&
+        !sourceSurface->path.empty() && std::filesystem::exists(sourceSurface->path / "corrections.json")) {
+        throw std::runtime_error("No-resample scaling does not yet transform corrections.json");
+    }
     std::optional<cv::Matx44d> matrix;
     if (!scaleOnly) {
         matrix = currentTransformMatrix(allowRemoteFetch);
@@ -436,7 +441,13 @@ bool SurfaceAffineTransformController::applyTransformPreview(bool allowRemoteFet
 
     previewSurface->path.clear();
 
-    transformSurfacePoints(previewSurface.get(), scale, matrix);
+    if (transformPanel && transformPanel->noResampleChecked()) {
+        const auto volume = _state->currentVolume();
+        vc::core::util::scaleSurfaceWithoutResampling(previewSurface.get(), scale,
+            volume ? std::optional(volume->shape()) : std::nullopt);
+    } else {
+        transformSurfacePoints(previewSurface.get(), scale, matrix);
+    }
     refreshTransformedSurfaceState(previewSurface.get());
     if (_viewerManager) {
         _viewerManager->refreshSurfacePatchIndex(previewSurface);
@@ -650,9 +661,9 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
         return;
     }
 
-    const QString defaultName = QString::fromStdString(sourceSurface->id.empty()
-        ? sourceSurface->path.filename().string() + "_transformed"
-        : sourceSurface->id + "_transformed");
+    const QString defaultName = suggestedTransformedSurfaceName(
+        QString::fromStdString(sourceSurface->id.empty()
+            ? sourceSurface->path.filename().string() : sourceSurface->id));
     bool ok = false;
     QString newName = QInputDialog::getText(_dialogParent,
                                             tr("Save Transformed"),
@@ -699,7 +710,15 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
             throw std::runtime_error("failed to clone source surface");
         }
 
-        transformSurfacePoints(transformedSurface.get(), scale, matrix);
+        if (transformPanel && transformPanel->noResampleChecked()) {
+            if (std::filesystem::exists(sourcePath / "corrections.json"))
+                throw std::runtime_error("No-resample scaling does not yet transform corrections.json");
+            const auto volume = _state->currentVolume();
+            vc::core::util::scaleSurfaceWithoutResampling(transformedSurface.get(), scale,
+                volume ? std::optional(volume->shape()) : std::nullopt);
+        } else {
+            transformSurfacePoints(transformedSurface.get(), scale, matrix);
+        }
         refreshTransformedSurfaceState(transformedSurface.get());
 
         const std::filesystem::path stagingPath =

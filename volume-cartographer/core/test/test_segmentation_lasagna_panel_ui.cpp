@@ -23,6 +23,11 @@
 #include "LasagnaServiceManager.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <filesystem>
@@ -530,15 +535,52 @@ int main(int argc, char** argv)
             "Failed to create atlas mappings directory");
     require(QDir().mkpath(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/attachments/pred_snap_points")),
             "Failed to create atlas pred-snap attachments directory");
-    require(QDir().mkpath(volpkgRoot + QStringLiteral("/fibers")),
-            "Failed to create atlas fibers directory");
     writeWrappedTifxyz(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/base_mesh/base.tifxyz"));
-    writeFile(volpkgRoot + QStringLiteral("/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_fiber","version":1,"line_points":[[10,20,30]],"control_points":[]})"));
+
+    // Atlas mappings pin store revisions; publish the fiber into a store the
+    // state is attached to.
+    const QString storePath = volpkgRoot + QStringLiteral("/objects.vcobj");
+    {
+        vc::objects::OpenOptions options;
+        options.author = "lasagna-panel-test";
+        (void)vc::objects::ObjectStore::create(storePath.toStdString(), options);
+    }
+    state.attachObjectStore(storePath, QStringLiteral("lasagna-panel-test"));
+    auto store = state.objectStoreSession();
+    const auto attachment = *store->attachment();
+    auto fiberDocument = vc::objects::decodeFiberJson(
+        R"({"type":"vc3d_fiber","version":4,"line_points":[[10,20,30]],"control_points":[],"uuid":"2ee9de94-f66f-5984-abff-0d1fa40106ba"})");
+    std::string fiberGeometry;
+    const auto receipt = store->act(attachment, {{fiberDocument.object.uuid, {}}}, [&](auto& db, auto& txn) {
+        auto object = fiberDocument.object;
+        object.meta = nlohmann::json{{"source", fiberDocument.source}}.dump();
+        db.upsertObject(txn, object);
+        fiberGeometry = db.putGeometry(txn, object.uuid, fiberDocument.geometry);
+    });
+    const std::string fiberUuid = fiberDocument.object.uuid;
+    const nlohmann::json fiberPin = {
+        {"store_uuid", attachment.storeUuid},
+        {"object_uuid", fiberUuid},
+        {"object_revision", *receipt.at(fiberUuid)},
+        {"geometry_revision", fiberGeometry}};
+    auto pinnedMapping = [&](const nlohmann::json& pin, int windingOffset, nlohmann::json lineAnchors) {
+        return QByteArray::fromStdString(nlohmann::json{
+            {"type", "vc3d_atlas_fiber_mapping"},
+            {"version", 4},
+            {"object", pin},
+            {"winding_offset", windingOffset},
+            {"line_anchors", std::move(lineAnchors)}}.dump());
+    };
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}]})"));
-    writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/attachments/pred_snap_points/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_pred_snap_points","version":1,"fiber_path":"fibers/fiber.json","entries":{}})"));
+              pinnedMapping(fiberPin, 2, nlohmann::json::array({
+                  {{"source_index", 0}, {"world", {1, 1, 0}}, {"atlas", {1, 1}}, {"distance", 0}}})));
+    writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/attachments/pred_snap_points/") +
+                  QString::fromStdString(fiberUuid) + QStringLiteral(".json"),
+              QByteArray::fromStdString(nlohmann::json{
+                  {"type", "vc3d_atlas_pred_snap_points"},
+                  {"version", 1},
+                  {"fiber_path", attachment.storeUuid + "/" + fiberUuid},
+                  {"entries", nlohmann::json::object()}}.dump()));
     writeFile(volpkgRoot + QStringLiteral("/atlases/fiber_atlas/metadata.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"fiber_atlas","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})"));
 
@@ -685,7 +727,7 @@ int main(int argc, char** argv)
     writeFile(missingBaseAtlas + QStringLiteral("/metadata.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"missing_base","base_mesh_path":"base_mesh/missing.tifxyz","zero_winding_column":0})"));
     writeFile(missingBaseAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})"));
+              pinnedMapping(fiberPin, 0, nlohmann::json::array()));
     panel._atlasDirPath = missingBaseAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
     require(statusBar.currentMessage().contains(QStringLiteral("base mesh does not exist")),
@@ -699,12 +741,14 @@ int main(int argc, char** argv)
     writeWrappedTifxyz(missingFiberAtlas + QStringLiteral("/base_mesh/base.tifxyz"));
     writeFile(missingFiberAtlas + QStringLiteral("/metadata.json"),
               QByteArrayLiteral(R"({"type":"vc3d_atlas","version":5,"name":"missing_fiber","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":0})"));
+    nlohmann::json missingFiberPin = fiberPin;
+    missingFiberPin["object_uuid"] = "6f1c0a8e-3d2b-4c5a-9e7f-112233445566";
     writeFile(missingFiberAtlas + QStringLiteral("/mappings/fibers/fiber.json"),
-              QByteArrayLiteral(R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/does_not_exist.json","winding_offset":0,"line_anchors":[]})"));
+              pinnedMapping(missingFiberPin, 0, nlohmann::json::array()));
     panel._atlasDirPath = missingFiberAtlas;
     panel.startAtlasOptimization(&state, &statusBar);
-    require(statusBar.currentMessage().contains(QStringLiteral("references missing fiber path")),
-            "Atlas launch should fail clearly for a missing fiber JSON");
+    require(statusBar.currentMessage().contains(QStringLiteral("fiber revision is unavailable")),
+            "Atlas launch should fail clearly for a pinned fiber missing from the store");
 
     const QString missingMapAtlas = volpkgRoot + QStringLiteral("/atlases/missing_map");
     require(QDir().mkpath(missingMapAtlas + QStringLiteral("/base_mesh/base.tifxyz")),

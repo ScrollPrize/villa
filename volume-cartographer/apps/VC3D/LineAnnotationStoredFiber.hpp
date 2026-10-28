@@ -7,7 +7,9 @@
 // without the controller or Qt Widgets. The controller keeps `using` aliases
 // under its former nested names.
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <array>
+#include <nlohmann/json.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -30,6 +32,7 @@ namespace vc3d::line_annotation {
 // branches must go through the private session paths that call
 // syncLinkedBranchMetadataAfterFiberModification().
 struct FiberBranchRef {
+    std::string edgeUuid;
     int controlPointIndex = -1;
     uint64_t branchFiberId = 0;
     int branchControlPointIndex = -1;
@@ -51,9 +54,17 @@ struct FiberBranchRef {
     // for a link (delete and re-link to change), mirrored on both
     // reciprocal refs.
     bool adjacent = false;
+    // Created by the Fiber Map's automatic link ("Link A and B") and not yet
+    // reviewed: drawn with a dashed marker in the pending colours. Invariant
+    // `autoLink => pending && !adjacent`, enforced wherever a ref is read,
+    // merged or written; approving the link clears it with `pending`.
+    // Mirrored on both reciprocal refs like `pending` (JSON key "auto").
+    bool autoLink = false;
 };
 
 struct StoredFiber {
+    std::optional<vc::objects::PinnedObject> storePin;
+    nlohmann::json coordinateIdentity = nlohmann::json::object();
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
@@ -62,10 +73,11 @@ struct StoredFiber {
     std::string startedAt;
     uint64_t sequence = 0;
     std::string fileName;
-    std::filesystem::path sourceRoot;
     uint64_t generation = 1;
     std::vector<StoredControlPoint> controlPoints;
-    std::vector<cv::Vec3d> linePoints;
+    mutable std::vector<cv::Vec3d> linePoints;
+    mutable bool linePointsLoaded = true;
+    std::optional<vc::objects::FiberDetail> catalogDetail;
     // Stored snapshots only. Live-session branch metadata must be converted
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.
@@ -79,31 +91,9 @@ struct StoredFiber {
     // stored. New Spiral-created fibers record the fiber manifest's L0
     // shape so a downsampled active volume can display them correctly.
     std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
-    bool needsSave = false;
-    // The file's write time as of the READ that produced this record
-    // (loadFiberFile), so a save decided from that read - the adjacent
-    // link heal - can tell a file the sync replaced in the meantime and
-    // leave it alone (the next load heals again). Unset for fibers not
-    // read from disk.
-    std::optional<std::filesystem::file_time_type> loadedWriteTime;
-    // Presence at read time, including an explicitly empty array. Only
-    // a missing array permits restoring adjacent refs from peers.
-    bool adjacentBranchesPresent = true;
-    // healOneSidedAdjacentLinks marked this record for saving.
-    bool adjacentHealed = false;
-    // Load put the gap span tags in step with the break point tags (a
-    // version-3 file, or one edited by hand); saved back under the same
-    // stale-file guard as the adjacent heal.
-    bool gapHealed = false;
-    // The load dropped one or more of this record's link entries in memory
-    // only (the user kept the files unchanged): the file on disk still
-    // holds them. Structural edits consult this before trusting the record
-    // as the on-disk truth.
-    bool linkEntriesDroppedAtLoad = false;
-    // Shown read-only from an Automated Fiber Volume: held in memory only for
-    // its view (never written, listed, linked or optimized) and dropped when
-    // that view closes.
+    // Inspection of a read-only object-store attachment.
     bool readOnly = false;
+    std::string editorError;
 };
 
 }  // namespace vc3d::line_annotation

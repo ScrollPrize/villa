@@ -18,7 +18,7 @@ Each mapped fiber stores an integer `winding_offset`, derived from atlas links a
 
 Stored anchor U/V values remain immutable base-relative coordinates.
 
-`zero_winding_column` records the column that should be treated as winding zero for interpretation. It replaces the old `idx_rotation_columns` metadata from V1 atlases; old atlas metadata and old fiber mapping versions are rejected by normal loads and require an explicit rebuild from source fiber JSON.
+`zero_winding_column` records the column that should be treated as winding zero for interpretation. It replaces the old `idx_rotation_columns` metadata from V1 atlases; old atlas metadata and old fiber mapping versions are rejected by normal loads and require an explicit rebuild from pinned object-store fibers.
 
 ## Atlas Links And Layout
 

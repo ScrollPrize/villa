@@ -5,8 +5,8 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataLasagna.hpp"
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
@@ -22,11 +22,13 @@
 #include "Keybinds.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationFiberNaming.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Umbilicus.hpp"
@@ -73,6 +75,8 @@
 #include <QTreeWidgetItem>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QPushButton>
 
 #include "utils/Json.hpp"
 
@@ -229,12 +233,38 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
-        // macOS hides the native file-type selector when there is only one filter.
-        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
-                                                     {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
-        if (!path.isEmpty()) qWindow->openFiberCollection(path);
+    _objectStoreMenu = new QMenu(QObject::tr("Object &Store"), _fileMenu);
+    _fileMenu->addMenu(_objectStoreMenu);
+    _objectStoreMenu->addAction(QObject::tr("New Object Store..."), this, &MenuActionController::createObjectStore);
+    _objectStoreMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
+    _objectStoreMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [this]() {
+        const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Read-only Object Store"),
+            {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+        if (!path.isEmpty()) attachObjectStoreAt(path, {}, true);
     });
+    _objectStoreMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
+    _recentObjectStoreMenu = new QMenu(QObject::tr("Open &Recent Object Store"), _objectStoreMenu);
+    _objectStoreMenu->addMenu(_recentObjectStoreMenu);
+    refreshRecentObjectStoreMenu();
+    _objectStoreMenu->addSeparator();
+    auto* syncHub = _objectStoreMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
+        qWindow->_state->objectStoreSession()->syncHub();
+        qWindow->promptHubConflicts();
+    });
+    syncHub->setEnabled(false);
+    connect(qWindow->_state, &CState::objectStoreChanged, syncHub, [qWindow, syncHub](const vc::objects::StoreSessionEvent&) {
+        syncHub->setEnabled(qWindow->_state->objectStoreSession()->hubStatus().has_value());
+    });
+    auto* detachStore = _objectStoreMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
+    detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+    connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
+        [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
+            detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+        });
+    connect(qWindow->_state, &CState::objectStoreObservationFailed, this,
+        [qWindow](const QString& error) {
+            QMessageBox::warning(qWindow, QObject::tr("Object store observation failed"), error);
+        });
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_detachUmbilicusAct);
@@ -518,6 +548,46 @@ void MenuActionController::showOpenDataCatalog()
             this, &MenuActionController::showAttachRemoteZarrDialog);
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
             this, &MenuActionController::attachCatalogLasagna);
+    dialog->setAttachPredictionHandler([this](const vc3d::opendata::OpenDataSample& sample,
+            const vc3d::opendata::OpenDataResourceSelection& selection) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
+                *_window->_state->vpkg(), sample, &selection);
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+            if (result.failedVolumes) {
+                QStringList messages;
+                for (const auto& message : result.messages)
+                    messages.push_back(QString::fromStdString(message));
+                QMessageBox::warning(_window, tr("Attach incomplete"), messages.join('\n'));
+            }
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
+            this, [this](const QString& sample, const QString& volume, const QString& url,
+                         int level, bool explicitLevel) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const vc3d::opendata::OpenDataNormalGridsInfo info{
+                sample.toStdString(), volume.toStdString(), url.toStdString(), level, explicitLevel};
+            if (!vc3d::opendata::attachStreamingNormalGridsEntry(
+                    *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
+                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
+                return;
+            }
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
@@ -1716,7 +1786,7 @@ void MenuActionController::newProject()
     // autosave, and save() then writes the full JSON including the name.
     pkg->setName(base.toStdString());
     try {
-        std::filesystem::create_directories(vc3d::projectFiberDirectory(file.toStdString()));
+
         pkg->save(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("New Project failed"), QString::fromUtf8(e.what()));
@@ -2273,4 +2343,256 @@ void MenuActionController::convertLegacyVolpkg()
     auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
         QObject::tr("Wrote %1 — open it now?").arg(out));
     if (reply == QMessageBox::Yes) openVolpkgAt(out);
+}
+
+QString MenuActionController::objectStoreAuthor()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString name = settings.value(vc3d::settings::viewer::USERNAME,
+                                  vc3d::settings::viewer::USERNAME_DEFAULT).toString().trimmed();
+    if (!vc3d::line_annotation::isAnonymousFiberUsername(name.toStdString())) return name;
+    name = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME"));
+    QString prompt = QObject::tr("Username recorded on your object store edits and fiber names:");
+    for (;;) {
+        bool ok = false;
+        name = QInputDialog::getText(_window, QObject::tr("Object Store Username"), prompt,
+                                     QLineEdit::Normal, name, &ok).trimmed();
+        if (!ok) return {};
+        if (!vc3d::line_annotation::isAnonymousFiberUsername(name.toStdString())) break;
+        prompt = QObject::tr("Enter a username other than \"anon\":");
+    }
+    settings.setValue(vc3d::settings::viewer::USERNAME, name);
+    return name;
+}
+
+bool MenuActionController::attachObjectStore()
+{
+    const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Object Store"),
+        {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+    if (path.isEmpty()) return false;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return false;
+    return attachObjectStoreAt(path, author, false);
+}
+
+bool MenuActionController::createObjectStore()
+{
+    QString path = QFileDialog::getSaveFileName(_window, QObject::tr("New Object Store"),
+        QDir::home().filePath(QStringLiteral("objects.vcobj")), QObject::tr("Object store (*.vcobj)"),
+        nullptr, QFileDialog::DontConfirmOverwrite);
+    if (path.isEmpty()) return false;
+    if (QFileInfo(path).suffix().isEmpty()) path += QStringLiteral(".vcobj");
+    if (QFileInfo::exists(path)) {
+        QMessageBox::critical(_window, QObject::tr("Cannot create object store"),
+            QObject::tr("%1 already exists. Choose a new file name, or use Attach Object Store to open it.").arg(path));
+        return false;
+    }
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return false;
+    try {
+        vc::objects::OpenOptions options;
+        options.author = author.toStdString();
+        // Closed again at once: the session attaches it like any existing store.
+        vc::objects::ObjectStore::create(path.toStdString(), options);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot create object store"),
+            QString::fromUtf8(error.what()));
+        return false;
+    }
+    return attachObjectStoreAt(path, author, false);
+}
+
+bool MenuActionController::requireObjectStore(const QString& purpose)
+{
+    if (_window->_state->objectStoreSession()->attachment()) return true;
+    QMessageBox box(QMessageBox::Information, QObject::tr("Object Store Required"),
+        QObject::tr("%1 requires an object store, and none is attached.\n\n"
+                    "Create a new empty store (.vcobj), or attach an existing one.").arg(purpose),
+        QMessageBox::Cancel, _window);
+    auto* create = box.addButton(QObject::tr("Create New Store..."), QMessageBox::AcceptRole);
+    auto* attach = box.addButton(QObject::tr("Attach Existing..."), QMessageBox::AcceptRole);
+    box.setDefaultButton(create);
+    box.exec();
+    if (box.clickedButton() == create) return createObjectStore();
+    if (box.clickedButton() == attach) return attachObjectStore();
+    return false;
+}
+
+bool MenuActionController::attachObjectStoreAt(const QString& path, const QString& author, bool readOnly)
+{
+    try {
+        _window->_state->attachObjectStore(path, author, readOnly);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot attach object store"),
+            QString::fromUtf8(error.what()));
+        return false;
+    }
+    // Only writable attachments reveal a hosted replica; a read-only reopen keeps the earlier tag.
+    const QString absolute = QFileInfo(path).absoluteFilePath();
+    auto stores = loadRecentObjectStores();
+    bool remote = _window->_state->objectStoreSession()->hubStatus().has_value();
+    for (auto it = stores.begin(); it != stores.end();) {
+        if (it->path != absolute) { ++it; continue; }
+        if (readOnly) remote = remote || it->remote;
+        it = stores.erase(it);
+    }
+    stores.insert(stores.begin(), {absolute, readOnly, remote});
+    if (stores.size() > kMaxRecentObjectStores) stores.resize(kMaxRecentObjectStores);
+    saveRecentObjectStores(stores);
+    refreshRecentObjectStoreMenu();
+    return true;
+}
+
+std::vector<MenuActionController::RecentObjectStore> MenuActionController::loadRecentObjectStores() const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    std::vector<RecentObjectStore> stores;
+    const int count = settings.beginReadArray(vc3d::settings::object_store::RECENT);
+    for (int i = 0; i < count; ++i) {
+        settings.setArrayIndex(i);
+        RecentObjectStore store{settings.value("path").toString(), settings.value("read_only").toBool(),
+                                settings.value("remote").toBool()};
+        if (!store.path.isEmpty()) stores.push_back(std::move(store));
+    }
+    settings.endArray();
+    return stores;
+}
+
+void MenuActionController::saveRecentObjectStores(const std::vector<RecentObjectStore>& stores)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.remove(vc3d::settings::object_store::RECENT);
+    settings.beginWriteArray(vc3d::settings::object_store::RECENT, int(stores.size()));
+    for (int i = 0; i < int(stores.size()); ++i) {
+        settings.setArrayIndex(i);
+        settings.setValue("path", stores[i].path);
+        settings.setValue("read_only", stores[i].readOnly);
+        settings.setValue("remote", stores[i].remote);
+    }
+    settings.endArray();
+}
+
+void MenuActionController::refreshRecentObjectStoreMenu()
+{
+    if (!_recentObjectStoreMenu) return;
+    _recentObjectStoreMenu->clear();
+    const auto stores = loadRecentObjectStores();
+    for (size_t i = 0; i < stores.size(); ++i) {
+        const auto& store = stores[i];
+        QStringList tags;
+        if (store.remote) tags << QObject::tr("remote");
+        if (store.readOnly) tags << QObject::tr("read-only");
+        QString name = QFileInfo(store.path).fileName();
+        name.replace("&", "&&");
+        QString dir = QFileInfo(store.path).absolutePath();
+        dir.replace("&", "&&");
+        auto text = QObject::tr("&%1 | %2").arg(i + 1).arg(name);
+        if (!tags.isEmpty()) text += QStringLiteral(" (%1)").arg(tags.join(QStringLiteral(", ")));
+        text += QStringLiteral(" - %1").arg(dir);
+        auto* action = _recentObjectStoreMenu->addAction(text, this, [this, store]() { openRecentObjectStore(store); });
+        action->setToolTip(store.path);
+    }
+    _recentObjectStoreMenu->setEnabled(!stores.empty());
+}
+
+void MenuActionController::openRecentObjectStore(const RecentObjectStore& store)
+{
+    if (!QFileInfo::exists(store.path)) {
+        const auto reply = QMessageBox::question(_window, QObject::tr("Object store not found"),
+            QObject::tr("%1 no longer exists. Remove it from the recent list?").arg(store.path));
+        if (reply == QMessageBox::Yes) {
+            auto stores = loadRecentObjectStores();
+            std::erase_if(stores, [&](const RecentObjectStore& entry) { return entry.path == store.path; });
+            saveRecentObjectStores(stores);
+            refreshRecentObjectStoreMenu();
+        }
+        return;
+    }
+    QString author;
+    if (!store.readOnly) {
+        author = objectStoreAuthor();
+        if (author.isEmpty()) return;
+    }
+    attachObjectStoreAt(store.path, author, store.readOnly);
+}
+
+void MenuActionController::cloneHostedStore()
+{
+    const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
+    QDialog chooser(_window);
+    chooser.setWindowTitle(QObject::tr("Clone Hosted Object Store"));
+    auto* layout = new QVBoxLayout(&chooser);
+    layout->addWidget(new QLabel(QObject::tr("Hub on a network share, or an sftp:// or ssh:// address "
+                                             "(sftp://user@host/path/hub.vcobj):"), &chooser));
+    auto* row = new QHBoxLayout;
+    auto* location = new QLineEdit(&chooser);
+    location->setMinimumWidth(480);
+    location->setPlaceholderText(QStringLiteral("sftp://user@host/path/hub.vcobj"));
+    auto* browse = new QPushButton(QObject::tr("Browse..."), &chooser);
+    QObject::connect(browse, &QPushButton::clicked, &chooser, [&] {
+        const auto file = QFileDialog::getOpenFileName(&chooser,
+            QObject::tr("Choose the hub on the network share"), {}, filter);
+        if (!file.isEmpty()) location->setText(file);
+    });
+    row->addWidget(location);
+    row->addWidget(browse);
+    layout->addLayout(row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &chooser);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &chooser, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &chooser, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (chooser.exec() != QDialog::Accepted) return;
+    const auto hub = location->text().trimmed();
+    if (hub.isEmpty()) return;
+    // The last path component names the replica, for addresses and files alike.
+    const auto hubName = QFileInfo(hub.section(QLatin1Char('/'), -1)).completeBaseName();
+    const auto replica = QFileDialog::getSaveFileName(_window, QObject::tr("Local Replica"),
+        QDir::home().filePath(hubName + QStringLiteral("-replica.vcobj")), filter);
+    if (replica.isEmpty()) return;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return;
+
+    auto* progressDialog = new QProgressDialog(QObject::tr("Copying the hosted store..."), {}, 0, 1000, _window);
+    progressDialog->setWindowModality(Qt::WindowModal);
+    progressDialog->setMinimumDuration(0);
+    progressDialog->setValue(0);
+    QPointer<QProgressDialog> guardedDialog(progressDialog);
+    auto progress = [guardedDialog](const vc::objects::util::ProgressUpdate& event) {
+        if (!event.total) return;
+        const int value = int(1000 * event.completed / event.total);
+        QMetaObject::invokeMethod(guardedDialog, [guardedDialog, value] {
+            if (guardedDialog) guardedDialog->setValue(value);
+        }, Qt::QueuedConnection);
+    };
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, progressDialog, replica, author] {
+        const auto error = watcher->result();
+        watcher->deleteLater();
+        progressDialog->close();
+        progressDialog->deleteLater();
+        if (!error.isEmpty()) {
+            QMessageBox::critical(_window, QObject::tr("Cannot clone hosted object store"), error);
+            return;
+        }
+        attachObjectStoreAt(replica, author, false);
+    });
+    watcher->setFuture(QtConcurrent::run([hub, replica, author, progress]() {
+        try {
+            vc::objects::OpenOptions options;
+            options.author = author.toStdString();
+            vc::objects::cloneHub(hub.toStdString(), replica.toStdString(), options, progress);
+            return QString();
+        } catch (const std::exception& error) {
+            return QString::fromUtf8(error.what());
+        }
+    }));
+}
+
+void MenuActionController::detachObjectStore()
+{
+    try { _window->_state->detachObjectStore(); }
+    catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot detach object store"),
+            QString::fromUtf8(error.what()));
+    }
 }

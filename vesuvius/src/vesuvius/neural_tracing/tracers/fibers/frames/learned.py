@@ -42,17 +42,27 @@ def prediction_window(cfg):
     return float(cfg.gate_horizon*cfg.future_step)
 
 
+@lru_cache(maxsize=8)
+def _cone_coefficients(max_angle, step):
+    """Invariant ring coefficients, with the original ring order and arithmetic."""
+    ca, sa, cb, sb = [], [], [], []
+    for a in np.radians(np.arange(step, max_angle+1e-9, step)):
+        n = max(6, int(np.ceil(360*np.sin(a)/step)))
+        b = np.linspace(0., 2*np.pi, n, endpoint=False)
+        ca.append(np.full((n, 1), np.cos(a)))
+        sa.append(np.full((n, 1), np.sin(a)))
+        cb.append(np.cos(b)[:, None])
+        sb.append(np.sin(b)[:, None])
+    return tuple(np.concatenate(v) if v else np.empty((0, 1)) for v in (ca, sa, cb, sb))
+
+
 def _cone(centre, max_angle, step):
     """Unit directions within max_angle (deg) of centre on rings step (deg) apart, centre first."""
     e1 = np.cross(centre, np.eye(3)[np.argmin(np.abs(centre))])
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(centre, e1)
-    out = [centre]
-    for a in np.radians(np.arange(step, max_angle+1e-9, step)):
-        n = max(6, int(np.ceil(360*np.sin(a)/step)))
-        b = np.linspace(0., 2*np.pi, n, endpoint=False)
-        out.append(np.cos(a)*centre+np.sin(a)*(np.cos(b)[:, None]*e1+np.sin(b)[:, None]*e2))
-    return np.vstack([np.atleast_2d(o) for o in out])
+    ca, sa, cb, sb = _cone_coefficients(max_angle, step)
+    return np.vstack([centre[None], ca*centre+sa*(cb*e1+sb*e2)])
 
 
 def predicted_axis(future, head, window):
@@ -132,6 +142,9 @@ def trace_family_kwargs(tracer, families):
 
 
 def predict_frames(predictor, vol, positions, priors, paths, families, previous=None, *, pool=None):
+    if (hasattr(predictor, 'predict_frames_batched')
+            and getattr(getattr(predictor, 'device', None), 'type', None) == 'cuda'):
+        return predictor.predict_frames_batched(vol, positions, priors, paths, families, previous, pool)
     results = []
     previous = previous if previous is not None else [None]*len(positions)
     for start in range(0, len(positions), 64):

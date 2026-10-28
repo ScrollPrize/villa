@@ -27,6 +27,12 @@ struct OverlayColormapSpec {
     int opencvCode;
     cv::Vec3f tint; // R, G, B in [0,1]
     const uint32_t* discreteLut;
+    // Black at the low end, so the colours read as already scaled by
+    // intensity (fire, tints). Intensity-as-alpha then blends them as
+    // premultiplied colour with alpha = brightest channel; other maps
+    // (viridis) are blended as straight colour with alpha = intensity.
+    // Ignored for DiscreteLut, whose values are labels.
+    bool premultiplied;
 };
 
 struct OverlayColormapEntry {

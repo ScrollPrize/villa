@@ -7,6 +7,8 @@ on:
       - 'lasagna/**'
       # Local source dependencies installed by uv sync --extra all.
       - 'volume-cartographer/**'
+      - 'vc_object_store/**'
+      - 'vc_reader/**'
       - 'segmentation/models/batchgeneratorsv2/**'
       - 'segmentation/models/arch/nnunet/**'
       - '.github/workflows/test-vesuvius.yml'
@@ -34,8 +36,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # Native dependency closure for volume-cartographer's Python-only
-          # scikit-build configuration (apps, UI tracer, flatboi, tests: OFF).
+          # Native dependency closure for the Python-only scikit-build
+          # configurations of volume-cartographer (apps, UI tracer, flatboi,
+          # tests: OFF) and vc_object_store (tools: OFF).
           # qt6-base-dev: utils links Qt6::Core (SFTP remote access, #1941).
           sudo apt-get install -y --no-install-recommends \
             build-essential \

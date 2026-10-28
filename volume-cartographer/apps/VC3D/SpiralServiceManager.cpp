@@ -2,7 +2,6 @@
 
 #include "SpiralArtifactCache.hpp"
 #include "SpiralArtifactPins.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralPreviewProvenance.hpp"
 #include "SpiralSessionSync.hpp"
 #include "SpiralSshTunnel.hpp"

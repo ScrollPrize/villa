@@ -65,8 +65,15 @@ function(vc_add_test)
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
+vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
+vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_store::vc_object_geometry)
 
-vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
+vc_add_test(NAME test_sampling_wait_profile)
+add_test(NAME test_sampling_wait_profile_enabled
+    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
+        $<TARGET_FILE:test_sampling_wait_profile>)
+vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
+
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
@@ -121,18 +128,16 @@ vc_add_test(NAME test_ink_detection_overlay
             ${viewer_manager_overlay_test_moc}
             ${cstate_ink_detection_moc}
             ${vccollection_ink_detection_moc}
-    LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TESTING)
 
 qt6_wrap_cpp(viewer_overlay_base_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
-qt6_wrap_cpp(fiber_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.hpp)
 qt6_wrap_cpp(points_overlay_surface_primitives_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.hpp)
 qt6_wrap_cpp(vccollection_surface_primitives_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 vc_add_test(NAME test_viewer_overlay_surface_primitives
     SOURCES test_viewer_overlay_surface_primitives.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/FiberOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/PointsOverlayController.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/OverlayBatchItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/AtlasOverlayController.cpp
@@ -143,7 +148,6 @@ vc_add_test(NAME test_viewer_overlay_surface_primitives
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             test_viewer_manager_stub.cpp
             ${viewer_overlay_base_surface_primitives_moc}
-            ${fiber_overlay_surface_primitives_moc}
             ${points_overlay_surface_primitives_moc}
             ${vccollection_surface_primitives_moc}
             ${viewer_manager_overlay_test_moc}
@@ -215,7 +219,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${collapsible_settings_group_moc}
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
+    LIBS vc_object_store::vc_objects Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
@@ -256,8 +260,6 @@ vc_add_test(NAME test_line_annotation_structural_edits
 
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
@@ -267,7 +269,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
+    LIBS vc_object_store::vc_objects doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry
@@ -281,6 +283,33 @@ vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
+vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_json LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_trace_winding_bp LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_lasagna_normal_alignment LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reference_replay_benchmark LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
+set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
+vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_crop_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_visualization LIBS doctest::doctest vc_fiber_tracer)
+target_compile_definitions(test_fiber_replay_visualization PRIVATE VC_TESTING)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # The inline optimized/reference kernels assert bitwise operation-order
+    # equality. Do not let the compiler contract just one expression into FMA.
+    # This affects the comparison harness only, not production code.
+    target_compile_options(test_fiberlet_paths PRIVATE -ffp-contract=off)
+endif()
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -679,19 +708,17 @@ if(VC_RUN_RENDER_BENCHMARKS)
 
                 set(_gate "${_case_dir}/checked.json")
                 set(_gate_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
+                    ${Python3_EXECUTABLE}
+                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                    collect-evaluate --reuse-capture
+                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                    --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    --replay $<TARGET_FILE:bench_thread_sync_replay>
                     --fixture ${_fixture}
                     --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
+                    --case-dir "${_case_dir}"
                     --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}"
-                    --output "${_gate}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _gate_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
+                    --reference "${_render_valgrind_ci_reference}")
                 add_custom_command(
                     OUTPUT "${_gate}"
                     BYPRODUCTS "${_case_dir}/checked.failed.json"
@@ -700,6 +727,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         "${_evaluation}"
                         "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
                     VERBATIM)
@@ -788,8 +816,9 @@ vc_add_test(NAME test_tiff)
 
 vc_add_test(NAME test_normalgridtools)
 
-# Live S3: opens the PHerc 0172 volume and reads small chunks.
-vc_add_test(NAME test_volume_live_s3)
+# Live S3: PHerc 0172 sampling and PHerc 0139 catalog/object-store identity.
+vc_add_test(NAME test_volume_live_s3
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
@@ -799,6 +828,7 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_global_cache_root)
 vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
 if(VC_BUILD_PYTHON)
     find_package(Python REQUIRED COMPONENTS Interpreter)
@@ -858,7 +888,7 @@ vc_add_test(NAME test_open_data_manifest
     LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_line_optimizer LIBS doctest::doctest vc_lasagna Ceres::ceres)
 
 vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagna)
 

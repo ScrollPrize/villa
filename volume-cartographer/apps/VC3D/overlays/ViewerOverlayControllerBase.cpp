@@ -980,7 +980,7 @@ ViewerOverlayControllerBase::projectPointChainForHitTest(
     return result;
 }
 
-void ViewerOverlayControllerBase::clearPointChainProjectionCache()
+void ViewerOverlayControllerBase::clearPointChainProjectionCache() const
 {
     _pointChainProjectionCache.clear();
 }
