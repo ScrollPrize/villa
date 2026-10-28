@@ -894,6 +894,9 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace, &SpiralWorkspace::hubReplicaRequested, this, [this](const QString& hub) {
+            if (_menuController) _menuController->cloneHostedStore(hub);
+        });
         connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
                 [this](const QString& id, const QString& path) {
                     try {

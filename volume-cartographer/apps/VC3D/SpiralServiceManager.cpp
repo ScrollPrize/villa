@@ -329,8 +329,15 @@ void SpiralServiceManager::startLocalProcess()
         return;
     }
     QStringList binding{QStringLiteral("--dataset"), _profile.datasetRoot.trimmed(),
-                        QStringLiteral("--output"), outputRoot,
-                        QStringLiteral("--object-store"), _localStorePath};
+                        QStringLiteral("--output"), outputRoot};
+    // A hosted replica's service works on its own replica of the same hub
+    // (cloned at first launch, reattached later), never on this one.
+    if (_storeBinding.localHosted())
+        binding << QStringLiteral("--object-store")
+                << localServiceReplica(outputRoot, _storeBinding.localHubIdentity)
+                << QStringLiteral("--object-store-hub") << _storeBinding.localHub;
+    else
+        binding << QStringLiteral("--object-store") << _localStorePath;
     if (!_profile.cacheRoot.trimmed().isEmpty())
         binding << QStringLiteral("--cache") << _profile.cacheRoot.trimmed();
 
@@ -509,23 +516,54 @@ void SpiralServiceManager::setObjectStore(
     std::optional<vc::objects::AttachmentIdentity> attachment)
 {
     _storeSession = session;
+    _storeAttachment = attachment ? std::make_unique<vc::objects::AttachmentIdentity>(*attachment) : nullptr;
     QString path;
     QString uuid;
     if (session && attachment) {
         path = QString::fromStdString(session->path(*attachment).string());
         uuid = QString::fromStdString(attachment->storeUuid);
     }
+    const QString hub = _storeBinding.localHub;
     const bool changed = path != _localStorePath;
     _localStorePath = path;
     _storeBinding.localPath = path;
     _storeBinding.localUuid = uuid;
-    emit storeBindingChanged();
+    refreshLocalHub();
     // A local service is bound to the store at launch: follow the attachment.
-    if (changed && ownsProcess() && _profile.autoLaunch
+    if ((changed || hub != _storeBinding.localHub) && ownsProcess() && _profile.autoLaunch
         && _connectionState != ConnectionState::Disconnected) {
         emit logMessage(tr("The attached object store changed; restarting the local Spiral service"));
         connectToService(_profile);
     }
+}
+
+void SpiralServiceManager::refreshLocalHub()
+{
+    const auto session = _storeSession.lock();
+    std::optional<vc::objects::HubSessionStatus> status;
+    if (session && _storeAttachment) status = session->hubStatus(*_storeAttachment);
+    _storeBinding.localHub = status ? QString::fromStdString(status->hub) : QString();
+    _storeBinding.localHubIdentity = status ? QString::fromStdString(status->hubReplica) : QString();
+    _storeBinding.localPosition = status && status->syncedAtUs ? status->position : -1;
+    _storeBinding.localPending = status ? int(status->pending.size()) : 0;
+    _storeBinding.localConflicts = status ? int(status->conflicts.size()) : 0;
+    emit storeBindingChanged();
+}
+
+QString SpiralServiceManager::localServiceReplica(const QString& outputRoot,
+                                                  const QString& hubIdentity)
+{
+    return QDir(outputRoot).filePath(QStringLiteral("object-store-replicas/%1.vcobj").arg(hubIdentity));
+}
+
+QString SpiralServiceManager::serviceHubAddress() const
+{
+    if (!_profile.hubAddress.trimmed().isEmpty()) return _profile.hubAddress.trimmed();
+    const QString advertised = _storeBinding.serviceHub;
+    if (advertised.isEmpty() || advertised.contains(QStringLiteral("://"))) return advertised;
+    if (_profile.transport == SpiralServiceProfile::Transport::SshTunnel && !_profile.sshDestination.isEmpty())
+        return QStringLiteral("sftp://%1%2").arg(_profile.sshDestination, advertised);
+    return advertised;
 }
 
 void SpiralServiceManager::updateStoreBinding()
@@ -533,12 +571,20 @@ void SpiralServiceManager::updateStoreBinding()
     const QJsonObject store = _advertisedDataset.value(QStringLiteral("object_store")).toObject();
     _storeBinding.serviceUuid = store.value(QStringLiteral("uuid")).toString();
     _storeBinding.servicePath = store.value(QStringLiteral("path")).toString();
+    const QJsonObject hub = store.value(QStringLiteral("hub")).toObject();
+    _storeBinding.serviceHub = hub.value(QStringLiteral("address")).toString();
+    _storeBinding.serviceHubIdentity = hub.value(QStringLiteral("identity")).toString();
+    _storeBinding.servicePosition = hub.value(QStringLiteral("position")).toInteger(-1);
     if (_storeBinding.advertised() && !_storeBinding.matches())
         emit logMessage(
             _storeBinding.localUuid.isEmpty()
                 ? tr("The Spiral service reads object store %1, and none is attached here: "
                      "its fit inputs cannot be displayed")
                       .arg(_storeBinding.serviceUuid)
+            : _storeBinding.serviceUuid == _storeBinding.localUuid
+                ? tr("The Spiral service fits positions of hub %1 (%2); the attached store is "
+                     "not a replica of it: clone that hub to edit and update the fit's inputs")
+                      .arg(_storeBinding.serviceHubIdentity, serviceHubAddress())
                 : tr("The Spiral service reads object store %1, not the attached store %2: "
                      "its fit inputs are not displayed as fitted")
                       .arg(_storeBinding.serviceUuid, _storeBinding.localUuid));
@@ -691,6 +737,154 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
                                           : tr("Checkpoint uploaded to service path %1").arg(hostPath));
                                   finish(hostPath);
                               });
+}
+
+void SpiralServiceManager::updateFitInputs(QJsonObject request)
+{
+    InputUpdate refused;
+    const auto session = _storeSession.lock();
+    if (_inputUpdateActive)
+        refused.error = tr("An input update is already in progress");
+    else if (!isReady() || !_leaseOwner)
+        refused.error = tr("Connect to the Spiral service and own its session lease first");
+    else if (!_storeBinding.hosted())
+        refused.error = tr("The Spiral service is not bound to a hub: rebuild with current inputs instead");
+    else if (!_storeBinding.matches() || !session || !_storeAttachment)
+        refused.error = tr("Attach a replica of the service's hub (%1) to update the fit's inputs")
+                            .arg(_storeBinding.serviceHubIdentity);
+    if (!refused.error.isEmpty()) {
+        emit inputUpdateFinished(refused);
+        return;
+    }
+    _inputUpdateActive = true;
+    const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
+    // Held before pushing: the waited sync below still pushes everything
+    // saved so far, and nothing pushed meanwhile can slip in between it and
+    // the service's link-then-pin loop (which would only make it relink).
+    try {
+        _inputUpdateHold = std::make_shared<vc::objects::PushHold>(session->holdPushes(attachment));
+    } catch (const std::exception& error) {
+        _inputUpdateActive = false;
+        refused.error = QString::fromUtf8(error.what());
+        emit inputUpdateFinished(refused);
+        return;
+    }
+    emit inputUpdateProgress(QStringLiteral("pushing"), tr("Pushing saved edits to the hub…"));
+    using Pushed = std::pair<std::optional<vc::objects::HubSessionStatus>, QString>;
+    auto* watcher = new QFutureWatcher<Pushed>(this);
+    connect(watcher, &QFutureWatcher<Pushed>::finished, this, [this, watcher, request]() {
+        const auto [status, exception] = watcher->result();
+        watcher->deleteLater();
+        InputUpdate update;
+        if (!exception.isEmpty() || !status) {
+            update.error = tr("The hub could not be reached: %1").arg(exception.isEmpty() ? tr("no hub") : exception);
+        } else if (!status->conflicts.empty()) {
+            update.conflicts = true;
+            update.error = tr("Hub conflicts block the update: resolve them (File > Object store > "
+                              "Sync Hosted Object Store Now), then update again");
+            for (const auto& conflict : status->conflicts)
+                update.problems << QString::fromStdString(conflict.uuid);
+        } else if (!status->error.empty()) {
+            update.error = tr("Saved edits could not be pushed: %1").arg(QString::fromStdString(status->error));
+        } else if (!status->pending.empty()) {
+            update.error = tr("%n saved edit(s) were not pushed", nullptr, int(status->pending.size()));
+        }
+        if (!update.error.isEmpty()) {
+            finishInputUpdate(update);
+            return;
+        }
+        sendInputUpdate(request, status->position);
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment]() -> Pushed {
+        try {
+            return {session->syncHubAndWait(attachment, std::chrono::seconds(120)), QString()};
+        } catch (const std::exception& error) {
+            return {std::nullopt, QString::fromUtf8(error.what())};
+        }
+    }));
+}
+
+void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested)
+{
+    emit inputUpdateProgress(QStringLiteral("linking"),
+                             tr("Linking and pinning a hub position including %1…").arg(requested));
+    const QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
+    QJsonObject run = request.value(QStringLiteral("run")).toObject();
+    QJsonObject config = run.value(QStringLiteral("config")).toObject();
+    for (const QString& key : _serviceOwnedKeys) config.remove(key);
+    run[QStringLiteral("config")] = config;
+    QJsonObject body{{QStringLiteral("run"), run},
+                     {QStringLiteral("inputs_position"), requested},
+                     {QStringLiteral("command_id"), commandId()}};
+    const QString tracks = paths.value(QStringLiteral("tracks_dbm")).toString().trimmed();
+    if (!tracks.isEmpty()) body[QStringLiteral("paths")] = QJsonObject{{QStringLiteral("tracks_dbm"), tracks}};
+    const bool initialize = !_hasActiveSession;
+    if (!initialize) body[QStringLiteral("inputs")] = QStringLiteral("reload");
+    auto failed = [this, requested](const QString& message, const QJsonObject& body) {
+        InputUpdate update;
+        update.requested = requested;
+        update.error = message;
+        const QJsonObject failure = body.value(QStringLiteral("input_preparation_error")).toObject();
+        for (const QJsonValue& problem : failure.value(QStringLiteral("problems")).toArray())
+            update.problems << problem.toString();
+        if (!body.isEmpty()) handleStatus(body);
+        finishInputUpdate(update);
+    };
+    postWithRetry(initialize ? QStringLiteral("/session/initialize") : QStringLiteral("/session/rebuild"),
+                  body, Timeout::Load, kMutationRetries,
+                  [this, requested](const QJsonObject& response) {
+                      handleStatus(response);
+                      const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
+                      InputUpdate update;
+                      update.requested = requested;
+                      update.head = position.value(QStringLiteral("head")).toInteger(-1);
+                      update.fitted = position.value(QStringLiteral("sequence")).toInteger(-1);
+                      if (update.fitted < 0) update.error = tr("The service reported no fitted position");
+                      finishInputUpdate(update);
+                  },
+                  {}, failed);
+}
+
+void SpiralServiceManager::finishInputUpdate(InputUpdate update)
+{
+    // Pushes resume; then pull to (at least) the fitted position, so the
+    // service's links and any edits it included are here.
+    _inputUpdateHold.reset();
+    const auto session = _storeSession.lock();
+    if (!update.error.isEmpty() || !session || !_storeAttachment) {
+        _inputUpdateActive = false;
+        emit inputUpdateFinished(update);
+        return;
+    }
+    emit inputUpdateProgress(QStringLiteral("pulling"), tr("Pulling the fitted position %1…").arg(update.fitted));
+    const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
+    auto* watcher = new QFutureWatcher<InputUpdate>(this);
+    connect(watcher, &QFutureWatcher<InputUpdate>::finished, this, [this, watcher]() {
+        const InputUpdate result = watcher->result();
+        watcher->deleteLater();
+        _inputUpdateActive = false;
+        refreshLocalHub();
+        emit inputUpdateFinished(result);
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment, update]() mutable {
+        auto describe = [](const vc::objects::JournalEntry& entry) {
+            return QStringLiteral("%1 %2 %3 (%4)").arg(QString::fromStdString(entry.changeKind),
+                QString::fromStdString(entry.kind), QString::fromStdString(entry.recordUuid),
+                QString::fromStdString(entry.author));
+        };
+        try {
+            const auto status = session->syncHubAndWait(attachment, std::chrono::seconds(120));
+            if (update.head > update.requested)
+                for (const auto& entry : session->hubJournal(attachment, update.requested, update.head))
+                    update.includedBeyondRequested << describe(entry);
+            if (status && status->position > update.fitted)
+                for (const auto& entry : session->hubJournal(attachment, update.fitted, status->position))
+                    update.afterFitted << describe(entry);
+        } catch (const std::exception& error) {
+            update.problems << QObject::tr("Pulling the fitted position failed: %1").arg(QString::fromUtf8(error.what()));
+        }
+        return update;
+    }));
 }
 
 void SpiralServiceManager::rebuildWithDefaults()

@@ -10,7 +10,9 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <vc_object_store/objects/Hub.hpp>
 
+#include <QElapsedTimer>
 #include <QFile>
 #include <QProcess>
 #include <QSignalSpy>
@@ -22,11 +24,152 @@
 using namespace vc::objects;
 using Json = nlohmann::json;
 
+namespace {
+// One 2x2 surface in volume "vol", written through the session.
+std::string addSurface(ObjectStoreSession& session, const AttachmentIdentity& attachment)
+{
+    const auto surface = util::newUuid();
+    session.act(attachment, {{surface, std::nullopt}}, [&](auto& db, auto& txn) {
+        ObjectRecord record; record.uuid = surface; record.kind = "surface"; record.name = "near";
+        record.meta = Json{{"coordinates", volumeCoordinates("vol", 1)}}.dump();
+        db.upsertObject(txn, record);
+        std::vector<float> points;
+        for (int row = 0; row < 2; ++row)
+            for (int col = 0; col < 2; ++col) points.insert(points.end(), {float(col), float(row), 5.f});
+        GeometryArray array{"points", "<f4", {2, 2, 3}, std::vector<uint8_t>(points.size() * 4)};
+        std::memcpy(array.bytes.data(), points.data(), array.bytes.size());
+        db.putGeometry(txn, surface, GeometryData{"surface", 1, "source_xyz", R"({"scale":[1.0,1.0]})", {array}});
+    });
+    return surface;
+}
+
+struct ServiceProcess {
+    QProcess process;
+    int port = 0;
+    ~ServiceProcess() { process.kill(); process.waitForFinished(5000); }
+};
+
+bool startService(ServiceProcess& service, const QString& python, const QTemporaryDir& directory,
+                  const QString& store, const QString& hub = {})
+{
+    service.process.setProcessChannelMode(QProcess::ForwardedChannels);
+    const QString portFile = directory.filePath(QStringLiteral("port"));
+    QStringList arguments{QStringLiteral(SPIRAL_PROTOCOL_SERVICE_FIXTURE), QStringLiteral("--store"), store,
+                          QStringLiteral("--root"), directory.filePath(QStringLiteral("service")),
+                          QStringLiteral("--port-file"), portFile};
+    if (!hub.isEmpty()) arguments << QStringLiteral("--hub") << hub;
+    service.process.start(python, arguments);
+    if (!service.process.waitForStarted()) return false;
+    QElapsedTimer timer; timer.start();
+    while (!QFile::exists(portFile) && timer.elapsed() < 60000) QTest::qWait(50);
+    QFile port(portFile);
+    if (!port.open(QIODevice::ReadOnly)) return false;
+    service.port = port.readAll().trimmed().toInt();
+    return service.port > 0;
+}
+
+SpiralServiceProfile protocolProfile(int port)
+{
+    SpiralServiceProfile profile;
+    profile.id = QStringLiteral("protocol");
+    profile.baseUrl = QUrl(QStringLiteral("http://127.0.0.1:%1").arg(port));
+    profile.apiKey = QStringLiteral("key");
+    return profile;
+}
+}
+
 class SpiralServiceProtocolTest : public QObject
 {
     Q_OBJECT
 
 private slots:
+    // Stage 2a: VC3D edits its replica of the service's hub; Update Fit
+    // Inputs pushes them, the service links and pins a position including
+    // them, and VC3D pulls to it.
+    void updateFitInputsAtAHubPosition()
+    {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to a Spiral Python environment with vc_object_store");
+        qRegisterMetaType<SpiralServiceManager::InputUpdate>();
+        QTemporaryDir directory;
+        const auto hubPath = std::filesystem::path(directory.filePath(QStringLiteral("hub.vcobj")).toStdString());
+        const auto replicaPath = std::filesystem::path(directory.filePath(QStringLiteral("vc3d.vcobj")).toStdString());
+        OpenOptions options; options.author = "vc3d-test";
+        std::string surface;
+        {
+            auto origin = std::make_shared<ObjectStoreSession>();
+            { auto created = ObjectStore::create(hubPath, options); }
+            const auto attachment = origin->attach(hubPath, options);
+            surface = addSurface(*origin, attachment);
+            origin->detach(attachment);
+        }
+        initHub(hubPath, "curator");
+        cloneHub(hubPath, replicaPath, options);
+        auto session = std::make_shared<ObjectStoreSession>();
+        HubSessionOptions fast; fast.syncInterval = std::chrono::milliseconds(200); fast.pushDelay = std::chrono::milliseconds(20);
+        const auto attachment = session->attach(replicaPath, options, fast);
+
+        ServiceProcess service;
+        QVERIFY(startService(service, python, directory, directory.filePath(QStringLiteral("service-replica.vcobj")),
+                             QString::fromStdString(hubPath.string())));
+        SpiralServiceManager manager;
+        manager.setObjectStore(session, attachment);
+        QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
+        QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
+        manager.connectToService(protocolProfile(service.port));
+        QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().hosted() && manager.storeBinding().matches(), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.serviceOwnedKeys().contains(QStringLiteral("object_store_input_position")), 10000);
+
+        auto edit = [&](int cells) {
+            auto hold = session->holdLeases(attachment, {surface});
+            RevisionSelection pins;
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                pins[surface] = db.currentObjectRevision(txn, surface)->uuid;
+            });
+            session->act(attachment, pins, [&](auto& db, auto& txn) {
+                db.setMeta(txn, surface, "source", Json{{"spiral_patch_erode_cells", cells}}.dump());
+            });
+        };
+        auto fittedMetadata = [&](int index) {
+            QFile file(manifests.at(index).at(0).toString());
+            if (!file.open(QIODevice::ReadOnly)) return Json();
+            return Json::parse(file.readAll().toStdString());
+        };
+        const QJsonObject config{{"dense_spacing_mode", "grad_mag"}, {"loss_weight_dense_spacing", 0},
+                                 {"loss_weight_dense_normals", 0}, {"loss_weight_shell_outer", 0}};
+        const QJsonObject request{{"run", QJsonObject{{"z_begin", 0}, {"z_end", 10}, {"config", config}}}};
+
+        // The first update initializes the fit at a position including the edit.
+        edit(2);
+        manager.updateFitInputs(request);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 1, 60000);
+        auto update = updates.at(0).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
+        QVERIFY(update.requested > 0 && update.head >= update.requested && update.fitted >= update.head);
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 1, 30000);
+        auto fitted = fittedMetadata(0);
+        QCOMPARE(fitted.at("manifest").at("position").at("sequence").get<qint64>(), update.fitted);
+        QCOMPARE(fitted.at("manifest").at("objects").at(0).at("metadata").at("spiral_patch_erode_cells").get<int>(), 2);
+        QVERIFY(session->hubStatus(attachment)->position >= update.fitted);
+
+        // The next one rebuilds it; an edit saved after it is not part of it.
+        edit(3);
+        manager.updateFitInputs(request);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 2, 60000);
+        update = updates.at(1).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 2, 30000);
+        fitted = fittedMetadata(1);
+        QCOMPARE(fitted.at("manifest").at("position").at("sequence").get<qint64>(), update.fitted);
+        QCOMPARE(fitted.at("manifest").at("objects").at(0).at("metadata").at("spiral_patch_erode_cells").get<int>(), 3);
+
+        bool released = false;
+        manager.releaseSessionLease([&]() { released = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(released, 30000);
+        session->detach(attachment);
+    }
+
     void storeBackedSessionLifecycle()
     {
         const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");

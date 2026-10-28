@@ -76,6 +76,9 @@ signals:
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
     void removeLocalPatchRequested(const QString& id);
+    // Clone the service's hub to a local replica (prefilled with its address
+    // as this machine reaches it) and attach that.
+    void cloneHubRequested(const QString& hubAddress);
     void addDraftsRequested(bool commitAfterAdd);
 
 private:
@@ -157,6 +160,7 @@ private:
     QComboBox* _checkpointChoice = nullptr;
     QLineEdit* _runTag = nullptr;
     QLabel* _objectStoreSummary = nullptr;
+    QPushButton* _cloneHub = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QCheckBox* _verticalFiberOffsetEnabled = nullptr;
@@ -169,6 +173,10 @@ private:
     QPlainTextEdit* _advanced = nullptr;
     VolumeSelector* _volumeSelector = nullptr;
     QPushButton* _load = nullptr;
+    QPushButton* _updateInputs = nullptr;
+    QLabel* _positionSummary = nullptr;
+    QString _inputUpdateText;
+    void updatePositionSummary();
     QPushButton* _run = nullptr;
     QCheckBox* _dtLossScheduleEnabled = nullptr;
     QSpinBox* _dtLossLastPct = nullptr;

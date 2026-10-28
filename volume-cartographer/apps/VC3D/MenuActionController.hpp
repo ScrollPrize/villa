@@ -58,7 +58,12 @@ public:
     // Author recorded on edits: the saved username, asked for until it is not "anon".
     // Empty means cancelled.
     QString objectStoreAuthor();
-    void cloneHostedStore();
+    // ``hub`` prefills the hub address (e.g. a Spiral service's hub).
+    void cloneHostedStore(const QString& hub = {});
+    // Make the attached ordinary store a hosted one on this machine: it
+    // becomes the hub <name>.hub.vcobj beside it and its own path a replica,
+    // so services can fit hub positions of it.
+    void hostObjectStoreLocally();
     void detachObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {

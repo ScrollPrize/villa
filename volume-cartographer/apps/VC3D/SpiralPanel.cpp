@@ -267,6 +267,14 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _objectStoreSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
     pathsForm->addRow(tr("Object store"), _objectStoreSummary);
     describe(QStringLiteral("object_store"), {_objectStoreSummary});
+    _cloneHub = new QPushButton(tr("Clone the Service's Hub…"), pathsContents);
+    _cloneHub->setObjectName(QStringLiteral("spiralCloneHub"));
+    _cloneHub->setToolTip(tr("Edits reach a hub-bound fit through a replica of its hub: "
+                             "clone the hub to a local replica and attach it."));
+    _cloneHub->setVisible(false);
+    pathsForm->addRow(QString(), _cloneHub);
+    connect(_cloneHub, &QPushButton::clicked, this,
+            [this] { emit cloneHubRequested(_service->serviceHubAddress()); });
 
     // Vertical fibers lie on the back face of the papyrus sheet; the fitter can
     // expect them a few voxels radially outside the winding it fits to the
@@ -733,8 +741,19 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     controls->addWidget(_run);
     controls->addWidget(_stop);
     controls->addStretch(1);
+    _updateInputs = new QPushButton(tr("Update Fit Inputs"), runContents);
+    _updateInputs->setObjectName(QStringLiteral("spiralUpdateInputs"));
+    _updateInputs->setEnabled(false);
+    controls->addWidget(_updateInputs);
     controls->addWidget(_load);
     runLayout->addLayout(controls);
+    _positionSummary = new QLabel(runContents);
+    _positionSummary->setObjectName(QStringLiteral("spiralInputPosition"));
+    _positionSummary->setWordWrap(true);
+    _positionSummary->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    runLayout->addWidget(_positionSummary);
+    describe(QStringLiteral("run_update_inputs"), {_updateInputs});
+    describe(QStringLiteral("run_input_position"), {_positionSummary});
     auto* previewScheduleRow = new QHBoxLayout;
     previewScheduleRow->addWidget(_backgroundPreview);
     previewScheduleRow->addWidget(_previewCadence);
@@ -1140,6 +1159,59 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         else
             _service->rebuildSession(sessionRequest(), reloadInputs);
     });
+    connect(_updateInputs, &QPushButton::clicked, this, [this]() {
+        QJsonParseError error;
+        const QJsonDocument advanced = QJsonDocument::fromJson(_advanced->toPlainText().toUtf8(), &error);
+        if (error.error != QJsonParseError::NoError || !advanced.isObject()) {
+            QMessageBox::warning(this, tr("Invalid advanced configuration"),
+                                 tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
+            return;
+        }
+        if (_sessionState != QStringLiteral("Uninitialized") && _sessionState != QStringLiteral("Error")) {
+            const auto answer = QMessageBox::question(
+                this, tr("Update Fit Inputs"),
+                tr("Updating the inputs rebuilds the fit from a hub position including your saved "
+                   "edits, discarding what this session has trained. Continue?"));
+            if (answer != QMessageBox::Yes) return;
+        }
+        persist();
+        QJsonObject request = sessionRequest();
+        QJsonObject paths = request.value(QStringLiteral("paths")).toObject();
+        paths.remove(QStringLiteral("checkpoint"));
+        request[QStringLiteral("paths")] = paths;
+        _service->updateFitInputs(request);
+    });
+    connect(_service, &SpiralServiceManager::inputUpdateProgress, this,
+            [this](const QString&, const QString& text) {
+                _inputUpdateText = text;
+                updatePositionSummary();
+                _updateInputs->setEnabled(false);
+            });
+    connect(_service, &SpiralServiceManager::inputUpdateFinished, this,
+            [this](const SpiralServiceManager::InputUpdate& update) {
+                QStringList lines;
+                if (!update.error.isEmpty()) {
+                    lines << tr("Update failed: %1").arg(update.error);
+                    for (const QString& problem : update.problems) lines << QStringLiteral("  ") + problem;
+                    _warnings->setText(lines.join(QStringLiteral("\n")));
+                } else {
+                    lines << tr("Updated: the fit reads hub position %1 (your edits reached %2; linked at %3)")
+                                 .arg(update.fitted).arg(update.requested).arg(update.head);
+                    if (!update.includedBeyondRequested.isEmpty())
+                        lines << tr("It includes %n later hub commit(s) by others:", nullptr,
+                                    int(update.includedBeyondRequested.size()))
+                              << update.includedBeyondRequested.mid(0, 5);
+                    if (!update.afterFitted.isEmpty())
+                        lines << tr("%n commit(s) after it are not part of the fit:", nullptr,
+                                    int(update.afterFitted.size()))
+                              << update.afterFitted.mid(0, 5);
+                    lines << update.problems;
+                }
+                _inputUpdateText = lines.join(QStringLiteral("\n"));
+                updatePositionSummary();
+            });
+    connect(_service, &SpiralServiceManager::storeBindingChanged,
+            this, &SpiralPanel::updatePositionSummary);
     connect(_run, &QPushButton::clicked, this, [this]() {
         QJsonParseError error;
         const QJsonDocument advanced =
@@ -1750,22 +1822,87 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
 void SpiralPanel::updateObjectStoreSummary()
 {
     const auto& binding = _service->storeBinding();
+    _cloneHub->setVisible(binding.hosted() && !binding.matches());
+    auto position = [](qint64 value) {
+        return value < 0 ? tr("not synced yet") : tr("position %1").arg(value);
+    };
+    QString local = binding.localUuid.isEmpty()
+        ? QString()
+        : binding.localHosted()
+            ? tr("%1, a replica of hub %2 (%3), synced to %4")
+                  .arg(binding.localPath, binding.localHub, binding.localHubIdentity,
+                       position(binding.localPosition))
+            : binding.localPath;
     if (!binding.advertised()) {
         _objectStoreSummary->setText(binding.localUuid.isEmpty()
             ? tr("No object store attached in VC3D")
-            : tr("Attached here: %1 (%2)").arg(binding.localUuid, binding.localPath));
+            : tr("Attached here: %1 (%2)").arg(binding.localUuid, local));
         return;
     }
     QString text = tr("Service reads %1 (%2 on the service host)")
                        .arg(binding.serviceUuid, binding.servicePath);
+    if (binding.hosted())
+        text += tr("\nIt fits positions of hub %1 (%2); its replica is at %3")
+                    .arg(binding.serviceHubIdentity, binding.serviceHub,
+                         position(binding.servicePosition));
     if (binding.matches())
-        text += tr("\nThe same store is attached here");
+        text += binding.hosted()
+            ? tr("\nAttached here: %1").arg(local)
+            : tr("\nThe same store is attached here");
     else if (binding.localUuid.isEmpty())
         text += tr("\nNo store is attached here: fit inputs cannot be displayed");
+    else if (binding.serviceUuid == binding.localUuid)
+        text += tr("\nThe attached copy of this store (%1) is not a replica of the service's hub: "
+                   "edits cannot reach the fit until you clone the hub").arg(local);
     else
         text += tr("\nAnother store is attached here (%1): fit inputs are not displayed as fitted")
                     .arg(binding.localUuid);
     _objectStoreSummary->setText(text);
+}
+
+void SpiralPanel::updatePositionSummary()
+{
+    const auto& binding = _service->storeBinding();
+    if (!binding.hosted()) {
+        _positionSummary->setVisible(false);
+        return;
+    }
+    QStringList lines;
+    const QJsonObject position = _lastInputStatus.value(QStringLiteral("input_position")).toObject();
+    if (!position.isEmpty()) {
+        const qint64 sequence = position.value(QStringLiteral("sequence")).toInteger();
+        const QJsonValue requested = position.value(QStringLiteral("requested"));
+        lines << (position.value(QStringLiteral("source")).toString() == QStringLiteral("checkpoint")
+                      ? tr("The fit reads hub position %1, recorded by its checkpoint").arg(sequence)
+                  : requested.isNull()
+                      ? tr("The fit reads hub position %1 (linked at %2)")
+                            .arg(sequence).arg(position.value(QStringLiteral("head")).toInteger())
+                      : tr("The fit reads hub position %1 (requested %2, linked at %3)")
+                            .arg(sequence).arg(requested.toInteger())
+                            .arg(position.value(QStringLiteral("head")).toInteger()));
+    }
+    const QJsonObject preparing = _lastInputStatus.value(QStringLiteral("input_preparation")).toObject();
+    if (!preparing.isEmpty())
+        lines << tr("The service is linking and pinning a position%1…")
+                     .arg(preparing.value(QStringLiteral("requested_position")).isNull()
+                              ? QString()
+                              : tr(" including %1").arg(preparing.value(QStringLiteral("requested_position")).toInteger()));
+    const QJsonObject failed = _lastInputStatus.value(QStringLiteral("input_preparation_error")).toObject();
+    if (!failed.isEmpty() && _inputUpdateText.isEmpty())
+        lines << tr("The last input update failed; the fit is unchanged: %1")
+                     .arg(failed.value(QStringLiteral("message")).toString());
+    if (binding.matches())
+        lines << (binding.localPending > 0
+                      ? tr("This replica: %n saved edit(s) not yet pushed", nullptr, binding.localPending)
+                      : tr("This replica: every saved edit is pushed"))
+                     + (binding.localConflicts > 0
+                            ? tr("; %n hub conflict(s) to resolve", nullptr, binding.localConflicts)
+                            : QString())
+                     + (binding.localPosition >= 0 ? tr("; synced to position %1").arg(binding.localPosition)
+                                                   : QString());
+    if (!_inputUpdateText.isEmpty()) lines << _inputUpdateText;
+    _positionSummary->setText(lines.join(QStringLiteral("\n")));
+    _positionSummary->setVisible(!lines.isEmpty());
 }
 
 void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
@@ -2270,6 +2407,16 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _load->setEnabled(_connected && _service->ownsSessionLease()
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
+    const auto& binding = _service->storeBinding();
+    _updateInputs->setVisible(binding.hosted());
+    _updateInputs->setEnabled(_load->isEnabled() && binding.matches()
+                              && !_service->inputUpdateActive()
+                              && status.value(QStringLiteral("input_preparation")).isNull());
+    if (!binding.matches() && binding.hosted())
+        setToolTipNote(_updateInputs, tr("Attach a replica of the service's hub first"));
+    else
+        setToolTipNote(_updateInputs, {});
+    updatePositionSummary();
     _run->setEnabled(_connected && _service->ownsSessionLease() && runnable && !_reloadRequired);
     _stop->setEnabled(_service->ownsSessionLease() && state == "Running");
     _save->setEnabled(_connected && _service->ownsSessionLease() && runnable);

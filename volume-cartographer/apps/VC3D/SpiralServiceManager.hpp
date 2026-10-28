@@ -20,6 +20,7 @@
 
 namespace vc::objects {
 class ObjectStoreSession;
+class PushHold;
 struct AttachmentIdentity;
 }
 
@@ -50,18 +51,34 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 36;
+    static constexpr int kApiVersion = 37;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted only when both
-    // are the same store (the same UUID: a hub replica shares it).
+    // are the same store (the same UUID: a hub replica shares it). A service
+    // bound to a hub replica fits hub positions; it matches only a replica
+    // of the same hub (the hub identity), whose positions are comparable.
     struct StoreBinding {
         QString serviceUuid;   // /dataset object_store.uuid
         QString servicePath;   // where the service host opened it
+        QString serviceHub;    // the hub address on the service host
+        QString serviceHubIdentity;
+        qint64 servicePosition = -1;  // the service replica's last pull
         QString localUuid;     // the attachment's store UUID
         QString localPath;
+        QString localHub;      // the attachment's hub, when it is a replica
+        QString localHubIdentity;
+        qint64 localPosition = -1;    // the hub position the last sync reached
+        int localPending = 0;         // saved edits not yet pushed
+        int localConflicts = 0;
         bool advertised() const { return !serviceUuid.isEmpty(); }
-        bool matches() const { return advertised() && serviceUuid == localUuid; }
+        bool hosted() const { return !serviceHubIdentity.isEmpty(); }
+        bool localHosted() const { return !localHubIdentity.isEmpty(); }
+        bool matches() const
+        {
+            return advertised() && serviceUuid == localUuid
+                && (!hosted() || serviceHubIdentity == localHubIdentity);
+        }
     };
 
     explicit SpiralServiceManager(QObject* parent = nullptr);
@@ -99,6 +116,28 @@ public:
     // Rebuild from the service's own launch defaults, ignoring any autosave.
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
+
+    // One "Update fit inputs" (stage 2a: a full-input rebuild at a hub
+    // position). Needs a service bound to a hub and a replica of that hub
+    // attached here (storeBinding().matches()).
+    struct InputUpdate {
+        qint64 requested = -1;  // M: where this replica's pushed edits reached
+        qint64 head = -1;       // H: the hub head the service linked at
+        qint64 fitted = -1;     // N: H plus the service's links; the fit's inputs
+        QString error;          // empty on success
+        QStringList problems;   // the service's reasons, or the hub conflicts
+        bool conflicts = false; // hub conflicts blocked the push
+        // Hub commits the position includes beyond M by other writers, and
+        // commits after N (excluded: they show as stale).
+        QStringList includedBeyondRequested;
+        QStringList afterFitted;
+    };
+    // Hold this replica's background pushes, push its saved edits and wait
+    // (stopping on hub conflicts), then initialize or rebuild the fit from a
+    // hub position including them; finally release the hold and pull to the
+    // position the service fitted. ``request`` is the panel's session request.
+    void updateFitInputs(QJsonObject request);
+    bool inputUpdateActive() const { return _inputUpdateActive; }
     void runIterations(int iterations, const QJsonObject& runConfig,
                        const QJsonObject& dtLossSchedule,
                        const QJsonObject& previewSchedule = {});
@@ -116,6 +155,16 @@ public:
     void setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
                         std::optional<vc::objects::AttachmentIdentity> attachment);
     const StoreBinding& storeBinding() const { return _storeBinding; }
+    // Re-read the attachment's hub state (its sync position), e.g. after a
+    // hub session event.
+    void refreshLocalHub();
+    // Where this machine reaches the service's hub: the profile's hub
+    // address, else for an SSH profile the advertised path on its host
+    // (sftp://destination/path), else the advertised address itself.
+    QString serviceHubAddress() const;
+    // The local service's own replica of the attachment's hub (under the
+    // output root, by hub identity): client and service never share one.
+    static QString localServiceReplica(const QString& outputRoot, const QString& hubIdentity);
     // Configuration keys the service's launch binding owns
     // (schema.fields[*].service_owned): requests never choose them.
     const QSet<QString>& serviceOwnedKeys() const { return _serviceOwnedKeys; }
@@ -192,6 +241,10 @@ signals:
                                const QString& message);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
+    // Update fit inputs: a phase ("pushing", "linking", "pulling") as it
+    // starts, then the outcome.
+    void inputUpdateProgress(const QString& phase, const QString& text);
+    void inputUpdateFinished(const SpiralServiceManager::InputUpdate& update);
 
 private:
     // Per-operation-class request timeouts: a single global timeout is wrong.
@@ -248,6 +301,11 @@ private:
     void updateStoreBinding();
     QString _sessionLeaseId;
     bool _leaseOwner = false;
+    // Update fit inputs in flight: its push hold, released when it finishes.
+    bool _inputUpdateActive = false;
+    std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
+    void finishInputUpdate(InputUpdate update);
+    void sendInputUpdate(QJsonObject request, qint64 requested);
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);
@@ -264,6 +322,7 @@ private:
     QProcess* _process = nullptr;       // owned local service process, if any
     QStringList _ownedLaunchBinding;    // --dataset/--output/--cache/--object-store of _process
     std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
+    std::unique_ptr<vc::objects::AttachmentIdentity> _storeAttachment;
     QString _localStorePath;
     StoreBinding _storeBinding;
     QSet<QString> _serviceOwnedKeys;
@@ -312,3 +371,5 @@ private:
 
     QStringList artifactCachePins() const;
 };
+
+Q_DECLARE_METATYPE(SpiralServiceManager::InputUpdate)

@@ -33,6 +33,11 @@ struct SpiralServiceProfile
     QString datasetRoot;
     QString outputRoot;
     QString cacheRoot;
+    // The hub of the service's object store as this machine reaches it (a
+    // mount path, or sftp://[user@]host/path), for cloning a local replica
+    // when the attached store is not one; empty uses the advertised address
+    // (through the SSH destination for an SSH profile).
+    QString hubAddress;
 
     bool isLocalhost() const { return autoLaunch; }
     bool isRemote() const { return !autoLaunch; }
@@ -70,6 +75,7 @@ struct SpiralServiceProfile
         settings.setValue(QStringLiteral("dataset_root"), datasetRoot);
         settings.setValue(QStringLiteral("output_root"), outputRoot);
         settings.setValue(QStringLiteral("cache_root"), cacheRoot);
+        settings.setValue(QStringLiteral("hub_address"), hubAddress);
         settings.endGroup();
     }
 
@@ -90,6 +96,7 @@ struct SpiralServiceProfile
         profile.datasetRoot = settings.value(QStringLiteral("dataset_root")).toString();
         profile.outputRoot = settings.value(QStringLiteral("output_root")).toString();
         profile.cacheRoot = settings.value(QStringLiteral("cache_root")).toString();
+        profile.hubAddress = settings.value(QStringLiteral("hub_address")).toString();
         settings.endGroup();
         return profile;
     }

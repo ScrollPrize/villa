@@ -289,6 +289,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             if (_service)
                 _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
         } else {
+            if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub && _service)
+                _service->refreshLocalHub();
             noteStoreChanges(event);
         }
     });
@@ -466,6 +468,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
 
     _panel = new SpiralPanel(_service, this);
+    connect(_panel, &SpiralPanel::cloneHubRequested, this, &SpiralWorkspace::hubReplicaRequested);
     connect(_panel, &SpiralPanel::removeLocalPatchRequested, this,
             [this](const QString& id) { _brush->removePatchDraft(id); });
     connect(_panel, &SpiralPanel::addDraftsRequested,

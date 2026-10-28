@@ -238,7 +238,17 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
             {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
         if (!path.isEmpty()) attachObjectStoreAt(path, {}, true);
     });
-    _objectStoreMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
+    _objectStoreMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, [this] { cloneHostedStore(); });
+    auto* hostStore = _objectStoreMenu->addAction(QObject::tr("Host Object Store Locally..."), this,
+                                                  &MenuActionController::hostObjectStoreLocally);
+    auto hostable = [qWindow] {
+        const auto attachment = qWindow->_state->objectStoreAttachment();
+        const auto session = qWindow->_state->objectStoreSession();
+        return attachment && session->writable(*attachment) && !session->hubStatus(*attachment);
+    };
+    hostStore->setEnabled(hostable());
+    connect(qWindow->_state, &CState::objectStoreChanged, hostStore,
+            [hostStore, hostable](const vc::objects::StoreSessionEvent&) { hostStore->setEnabled(hostable()); });
     _recentObjectStoreMenu = new QMenu(QObject::tr("Open &Recent Object Store"), _objectStoreMenu);
     _objectStoreMenu->addMenu(_recentObjectStoreMenu);
     refreshRecentObjectStoreMenu();
@@ -2212,7 +2222,7 @@ void MenuActionController::openRecentObjectStore(const RecentObjectStore& store)
     attachObjectStoreAt(store.path, author, store.readOnly);
 }
 
-void MenuActionController::cloneHostedStore()
+void MenuActionController::cloneHostedStore(const QString& prefilledHub)
 {
     const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
     QDialog chooser(_window);
@@ -2224,6 +2234,7 @@ void MenuActionController::cloneHostedStore()
     auto* location = new QLineEdit(&chooser);
     location->setMinimumWidth(480);
     location->setPlaceholderText(QStringLiteral("sftp://user@host/path/hub.vcobj"));
+    location->setText(prefilledHub);
     auto* browse = new QPushButton(QObject::tr("Browse..."), &chooser);
     QObject::connect(browse, &QPushButton::clicked, &chooser, [&] {
         const auto file = QFileDialog::getOpenFileName(&chooser,
@@ -2281,6 +2292,67 @@ void MenuActionController::cloneHostedStore()
         } catch (const std::exception& error) {
             return QString::fromUtf8(error.what());
         }
+    }));
+}
+
+void MenuActionController::hostObjectStoreLocally()
+{
+    const auto attachment = _window->_state->objectStoreAttachment();
+    const auto session = _window->_state->objectStoreSession();
+    if (!attachment || !session->writable(*attachment) || session->hubStatus(*attachment)) return;
+    const QString path = QString::fromStdString(session->path(*attachment).string());
+    const QFileInfo info(path);
+    const QString hub = info.dir().filePath(info.completeBaseName() + QStringLiteral(".hub.vcobj"));
+    if (QFileInfo::exists(hub)) {
+        QMessageBox::critical(_window, QObject::tr("Cannot host object store"),
+            QObject::tr("%1 already exists. Clone that hub instead, or move it away.").arg(hub));
+        return;
+    }
+    const auto reply = QMessageBox::question(_window, QObject::tr("Host Object Store Locally"),
+        QObject::tr("The store moves to the hub %1, and %2 becomes this computer's replica of it, "
+                    "holding the same objects. Spiral services then fit hub positions: edits are "
+                    "saved here, pushed to the hub, and reach a fit when you update its inputs.\n\n"
+                    "Close every other program using %2 first. Continue?").arg(hub, path));
+    if (reply != QMessageBox::Yes) return;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return;
+    try {
+        _window->_state->detachObjectStore();
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot detach object store"), QString::fromUtf8(error.what()));
+        return;
+    }
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, path, author] {
+        const auto error = watcher->result();
+        watcher->deleteLater();
+        if (!error.isEmpty())
+            QMessageBox::critical(_window, QObject::tr("Cannot host object store"), error);
+        // The replica on success; the untouched store when hosting never began.
+        if (QFileInfo::exists(path)) attachObjectStoreAt(path, author, false);
+    });
+    watcher->setFuture(QtConcurrent::run([path, hub, author]() {
+        for (const auto* suffix : {"-wal", "-shm", "-journal"})
+            if (QFileInfo::exists(path + QLatin1String(suffix)))
+                return QObject::tr("%1 is still open elsewhere (%2 exists); close it and try again")
+                    .arg(path, path + QLatin1String(suffix));
+        if (!QFile::rename(path, hub)) return QObject::tr("Cannot move %1 to %2").arg(path, hub);
+        try {
+            vc::objects::initHub(hub.toStdString(), author.toStdString());
+        } catch (const std::exception& error) {
+            QFile::rename(hub, path);
+            return QString::fromUtf8(error.what());
+        }
+        try {
+            vc::objects::OpenOptions options;
+            options.author = author.toStdString();
+            vc::objects::cloneHub(hub.toStdString(), path.toStdString(), options);
+        } catch (const std::exception& error) {
+            return QObject::tr("The hub %1 was created, but cloning it to %2 failed: %3. "
+                               "Clone it with File > Object store > Clone Hosted Object Store.")
+                .arg(hub, path, QString::fromUtf8(error.what()));
+        }
+        return QString();
     }));
 }
 

@@ -88,6 +88,8 @@ public:
 signals:
     void spiralSessionActiveChanged(bool active);
     void patchEditorRequested(const QString& id, const QString& path);
+    // Clone a hub (the Spiral service's) to a local replica and attach it.
+    void hubReplicaRequested(const QString& hubAddress);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
