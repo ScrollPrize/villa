@@ -48,7 +48,40 @@ jobs:
 
           echo "PROMOTION_SHA=$requested_sha" >> "$GITHUB_ENV"
 
+      # A repeated promotion of the already released SHA must not rebuild
+      # three expensive platform packages simply to discover a no-op.
+      # This probe is read-only and fails closed if the archive receipt is bad.
+      - name: Preflight previously published stable (read-only)
+        id: stable_preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          skip_packages=false
+          # Distinguish a missing tag from a genuine read/auth/network error.
+          # Never launch rebuilds after a failed remote preflight.
+          stable_ref="$(git ls-remote --refs origin refs/tags/stable)"
+          if [[ -n "$stable_ref" ]]; then
+            git fetch --no-tags origin refs/tags/stable
+            current_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            if [[ "$current_sha" == "$PROMOTION_SHA" ]]; then
+              receipt="$(python3 .github/scripts/vc3d_archive_zero_copy.py stable "$PROMOTION_SHA")"
+              printf '%s\n' "$receipt"
+              status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$receipt")"
+              case "$status" in
+                ALREADY_PUBLISHED|BOOTSTRAPPED_UNCHANGED)
+                  skip_packages=true ;;
+                REPAIR_RELEASE_ONLY)
+                  # An incomplete release must still have its package inputs.
+                  ;;
+                *) echo "::error::invalid stable preflight status: $status" >&2; exit 1 ;;
+              esac
+            fi
+          fi
+          # Single authoritative output; failures never grant skip.
+          echo "skip_packages=$skip_packages" >> "$GITHUB_OUTPUT"
+
       - name: Find or rebuild package artifacts
+        if: steps.stable_preflight.outputs.skip_packages != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -169,6 +202,7 @@ jobs:
           echo "LINUX_RUN_ID=$linux_run" >> "$GITHUB_ENV"
 
       - name: Download packages from selected commit
+        if: steps.stable_preflight.outputs.skip_packages != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -203,23 +237,57 @@ jobs:
             exit 1
           fi
 
+      - name: Archive previous stable release (preserves six asset IDs)
+        id: archive_previous
+        env:
+          PREFLIGHT_SKIP_PACKAGES: ${{ steps.stable_preflight.outputs.skip_packages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_arg=()
+          if [[ "$PREFLIGHT_SKIP_PACKAGES" == true ]]; then
+            # Do not permit the helper's PATCH path after downloads were skipped:
+            # the tag or release may have changed since the first probe.
+            probe_arg+=(--probe-only)
+          fi
+          receipt="$(python3 .github/scripts/vc3d_archive_zero_copy.py stable "$PROMOTION_SHA" "${probe_arg[@]}")"
+          printf '%s\n' "$receipt"
+          status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$receipt")"
+          # After omitting downloads on an initial no-op, a race must NOT
+          # turn this into a mutating publication with empty asset inputs.
+          if [[ "$PREFLIGHT_SKIP_PACKAGES" == true ]]; then
+            case "$status" in
+              ALREADY_PUBLISHED|BOOTSTRAPPED_UNCHANGED) ;;
+              *) echo "::error::stable changed after no-op preflight; stop safely" >&2; exit 1 ;;
+            esac
+          fi
+          # Only validated helper-controlled values enter the workflow outputs.
+          echo "status=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "archive_ref=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("archive", ""))' <<< "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "old_oid=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("old_tag_object", ""))' <<< "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "archived_release_id=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("release_id", ""))' <<< "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "archived_asset_ids=$(python3 -c 'import json,sys; print(",".join(map(str,json.load(sys.stdin).get("asset_ids", []))))' <<< "$receipt")" >> "$GITHUB_OUTPUT"
+
       - name: Move stable tag
+        if: steps.archive_previous.outputs.status != 'REPAIR_RELEASE_ONLY' && steps.archive_previous.outputs.status != 'ALREADY_PUBLISHED' && steps.archive_previous.outputs.status != 'BOOTSTRAPPED_UNCHANGED'
+        env:
+          ARCHIVE_REF: ${{ steps.archive_previous.outputs.archive_ref }}
+          EXPECTED_OLD_TAG_OID: ${{ steps.archive_previous.outputs.old_oid }}
+          ARCHIVED_RELEASE_ID: ${{ steps.archive_previous.outputs.archived_release_id }}
+          ARCHIVED_ASSET_IDS: ${{ steps.archive_previous.outputs.archived_asset_ids }}
         shell: bash
         run: |
           set -euo pipefail
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git tag --force --annotate stable "$PROMOTION_SHA" \
-            --message "VC3D stable release at $PROMOTION_SHA"
-          git push --force origin refs/tags/stable
+          # Archive alias is atomically PRE-STAGED with stable while this
+          # source commit is eligible; no future push to an old commit.
+          bash .github/scripts/vc3d_atomic_prestage.sh \
+            stable "$PROMOTION_SHA" "$EXPECTED_OLD_TAG_OID" \
+            "$ARCHIVE_REF" "$ARCHIVED_RELEASE_ID" "$ARCHIVED_ASSET_IDS"
 
-          # The stable channel changes only through this manual workflow.
-          if gh release view stable >/dev/null 2>&1; then
-            gh release delete stable --yes
-          fi
 
       - name: Publish stable release
+        if: steps.archive_previous.outputs.status != 'ALREADY_PUBLISHED' && steps.archive_previous.outputs.status != 'BOOTSTRAPPED_UNCHANGED'
         shell: bash
         run: |
           set -euo pipefail
