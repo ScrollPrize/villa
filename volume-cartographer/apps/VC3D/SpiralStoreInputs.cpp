@@ -206,6 +206,7 @@ void readObject(const ObjectStore& db, const Txn& txn, const StoreInputPin& pin,
     FitPointCollection collection;
     collection.pin = pin;
     collection.state = state;
+    if (present) collection.revision = current->uuid;
     FitFiber fiber{pin, state, {}, {}, {}, {}};
     try {
         std::optional<vc::objects::GeometryRevision> geometry;
@@ -259,7 +260,7 @@ void readObject(const ObjectStore& db, const Txn& txn, const StoreInputPin& pin,
         // Nothing of an unreadable input is shown.
         problem = pin.kind + " " + pin.uuid + ": " + error.what();
         surface.surface.reset();
-        collection = FitPointCollection{pin, state, false, {}, {}, {}, {}};
+        collection = FitPointCollection{pin, state, false, {}, {}, {}, {}, {}};
         fiber = FitFiber{pin, state, {}, {}, {}, {}};
     }
     if (pin.kind == "surface") {

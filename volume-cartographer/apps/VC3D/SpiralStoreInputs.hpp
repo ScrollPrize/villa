@@ -60,6 +60,7 @@ struct FitPointCollection {
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
     std::string problem;
+    std::string revision;  // the object revision read (of this replica): what an edit starts from
 };
 
 struct FitFiber {

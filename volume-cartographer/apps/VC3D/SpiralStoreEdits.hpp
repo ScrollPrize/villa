@@ -25,24 +25,35 @@ inline constexpr const char* kBrushPatchTag = "spiral-brush";
 
 // One brush patch: its geometry in the preview's frame, which is declared
 // as `previewScale` stored units per voxel of the fit volume `volume`.
-// `uuid` is the store object once saved; `remove` retires it.
+// `uuid` is the store object once saved, and `revision` the object revision
+// that save wrote: the one this edit started from. `remove` retires it.
 struct BrushPatchSave {
     std::string uuid;  // empty: create a new surface
+    std::string revision;  // required with `uuid`
     std::string name;
     std::shared_ptr<QuadSurface> surface;
     bool remove = false;
+};
+
+// A saved patch: its object and the revision the save wrote (empty when it
+// was retired), which the next edit of it starts from.
+struct SavedBrushPatch {
+    std::string uuid, revision;
 };
 
 // Save brush patches in one checked commit each: a new one becomes a surface
 // object (tag kBrushPatchTag, with the surface's meta, which for a painted
 // patch carries meta.source.spiral_patch_erode_cells 0), a replaced one gets a new
 // geometry revision keeping its relationships as recorded (the next link
-// refresh revisits them), a removed one is retired. Leases are held on a
-// hosted replica. Returns each patch's UUID, in order; throws on the first
-// failure (earlier patches stay saved).
-std::vector<std::string> saveBrushPatches(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&,
-                                          const std::string& volume, double previewScale,
-                                          const std::vector<BrushPatchSave>& patches);
+// refresh revisits them), a removed one is retired. A replaced or removed
+// patch is pinned at the revision its edit started from: when another
+// editor saved it since (pulled with the lease, held on a hosted replica)
+// the save is refused instead of overwriting theirs. Returns each patch's
+// saved state, in order; throws on the first failure (earlier patches stay
+// saved).
+std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&,
+                                              const std::string& volume, double previewScale,
+                                              const std::vector<BrushPatchSave>& patches);
 
 // A point-collection draft as the store keeps it, in reference-volume voxels:
 // every point at its source position ("p" of its payload), kept points with
@@ -59,10 +70,18 @@ vc::objects::AttachedCollection storedPointCollection(const EditablePclDraft& dr
 // (metadata.object_uuid of the fit's point-collection documents), if any.
 std::optional<std::string> pointCollectionObject(const EditablePclDraft& draft);
 
+// The key of the object revision (of the attached replica) a fit
+// point-collection document was read at: what an edit of it starts from.
+// Not the manifest's object_revision, which names the service replica's.
+inline constexpr const char* kLocalObjectRevisionKey = "local_object_revision";
+
 // Save point-collection drafts and deletions in one checked commit (the
 // store's writeVolumeCollections in the fit volume's voxels): replaced
 // collections keep their identity and their points' ids, new ones are
-// created, deleted ones retired. Returns the UUIDs written, in order.
+// created, deleted ones retired. A replaced or deleted collection is pinned
+// at the revision its draft was read at (metadata.local_object_revision):
+// when another editor changed or retired it since, the commit is refused
+// instead of overwriting their edit. Returns the UUIDs written, in order.
 std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&,
                                               const std::string& volume,
                                               const std::vector<EditablePclDraft>& drafts);

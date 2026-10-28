@@ -11,7 +11,9 @@ including its links.
 
 The input list holds local drawings: brush patches and drawn point
 collections. *Save Drafts to Store* (Shift+E) saves the ready ones into the
-attached store as checked revisions; with a hub-bound service, *Update Fit
+attached store as checked revisions, each pinned at the revision its edit
+started from: a save is refused, overwriting nothing, when another editor
+changed or retired that object since. With a hub-bound service, *Update Fit
 Inputs* (or *Save and Update Fit Inputs*) pushes them and updates the
 resident fit's inputs in place at a hub position including them, keeping its
 model and optimiser. Without a hub, saved edits reach the fit when it is

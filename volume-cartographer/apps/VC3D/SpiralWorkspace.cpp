@@ -486,7 +486,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 for (const auto& id : drafts) _savedDraftIds.removeAll(id);
                 for (const auto& id : patches) {
                     _brush->removePatchDraft(id);
-                    _brushPatchUuids.remove(id);
+                    _brushPatches.remove(id);
                     _savedPatchIds.removeAll(id);
                 }
             });
@@ -1325,20 +1325,20 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
     const std::string volume = _fitInputs->volumeUuid;
     QStringList errors, saved;
     for (const auto& patch : patches) {
-        const auto known = _brushPatchUuids.constFind(patch.id);
+        const auto known = _brushPatches.constFind(patch.id);
         const bool remove = patch.operation == QStringLiteral("delete");
-        if (remove && known == _brushPatchUuids.cend()) {
+        if (remove && known == _brushPatches.cend()) {
             // Never saved: there is nothing in the store to retire.
             _brush->finalizationSucceeded(patch.id);
             continue;
         }
         try {
-            const auto uuids = vc3d::spiral::saveBrushPatches(
+            const SavedPatch previous = known == _brushPatches.cend() ? SavedPatch{} : *known;
+            const auto written = vc3d::spiral::saveBrushPatches(
                 *session, *attachment, volume, *scale,
-                {{known == _brushPatchUuids.cend() ? std::string() : *known, patch.id.toStdString(),
-                  patch.surface, remove}});
-            if (remove) _brushPatchUuids.remove(patch.id);
-            else _brushPatchUuids[patch.id] = uuids.front();
+                {{previous.uuid, previous.revision, patch.id.toStdString(), patch.surface, remove}}).front();
+            if (remove) _brushPatches.remove(patch.id);
+            else _brushPatches[patch.id] = {written.uuid, written.revision};
             _brush->finalizationSucceeded(patch.id);
             if (!_savedPatchIds.contains(patch.id)) _savedPatchIds << patch.id;
             saved << patch.id;
@@ -2134,6 +2134,7 @@ void SpiralWorkspace::rebuildFitPclDocuments()
             {QStringLiteral("points"), points},
             {QStringLiteral("metadata"), QJsonObject{
                 {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
+                {QLatin1String(vc3d::spiral::kLocalObjectRevisionKey), QString::fromStdString(entry.revision)},
                 {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
     }
     const QString digest = QString::fromStdString(_fitInputs->digest).left(12);

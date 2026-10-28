@@ -20,12 +20,30 @@ nlohmann::json toJson(const QJsonValue& value)
 }
 }
 
-std::vector<std::string> saveBrushPatches(vc::objects::ObjectStoreSession& session,
-                                          const vc::objects::AttachmentIdentity& attachment,
-                                          const std::string& volume, double previewScale,
-                                          const std::vector<BrushPatchSave>& patches)
+namespace {
+std::string changedSince(const std::string& what, const std::string& uuid)
 {
-    std::vector<std::string> saved;
+    return what + " " + uuid + " was changed in the object store after this edit began (another editor saved "
+           "it); nothing was overwritten: reload it and redo the edit";
+}
+
+std::string currentRevision(vc::objects::ObjectStoreSession& session,
+                            const vc::objects::AttachmentIdentity& attachment, const std::string& uuid)
+{
+    std::string revision;
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        if (const auto head = db.currentObjectRevision(txn, uuid)) revision = head->uuid;
+    });
+    return revision;
+}
+}
+
+std::vector<SavedBrushPatch> saveBrushPatches(vc::objects::ObjectStoreSession& session,
+                                              const vc::objects::AttachmentIdentity& attachment,
+                                              const std::string& volume, double previewScale,
+                                              const std::vector<BrushPatchSave>& patches)
+{
+    std::vector<SavedBrushPatch> saved;
     const auto coordinates = vc::objects::volumeCoordinates(volume, previewScale);
     for (const auto& patch : patches) {
         if (patch.uuid.empty()) {
@@ -36,23 +54,27 @@ std::vector<std::string> saveBrushPatches(vc::objects::ObjectStoreSession& sessi
             session.act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
                 create_quad_in_store(db, txn, uuid, *patch.surface, patch.name, {kBrushPatchTag}, coordinates, provenance);
             });
-            saved.push_back(uuid);
+            // Nobody else knows the new object yet: its head is this save.
+            saved.push_back({uuid, currentRevision(session, attachment, uuid)});
             continue;
         }
         const auto uuid = vc::objects::util::canonicalUuid(patch.uuid);
-        // Leased (on a hosted replica) and pinned at its current revision;
-        // its relationships are kept as recorded.
+        if (patch.revision.empty()) throw std::invalid_argument("brush patch " + uuid + " names no revision");
+        // Leased (on a hosted replica: taking it pulls), then pinned at the
+        // revision this edit started from; its relationships are kept as
+        // recorded.
         auto hold = session.holdLeases(attachment, {uuid});
-        vc::objects::RevisionSelection pins;
+        const vc::objects::RevisionSelection pins{{uuid, patch.revision}};
         session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
             const auto head = db.currentObjectRevision(txn, uuid);
             if (!head) throw std::runtime_error("brush patch " + uuid + " is no longer in the object store");
-            pins[uuid] = head->uuid;
+            if (head->uuid != patch.revision) throw std::runtime_error(changedSince("brush patch", uuid));
         });
         if (patch.remove) {
             session.act(attachment, pins, [&](auto& db, auto& txn) {
                 if (const auto object = db.objectByUuid(txn, uuid); object && !object->retired) db.retireObject(txn, uuid);
             });
+            saved.push_back({uuid, {}});
         } else {
             if (!patch.surface) throw std::invalid_argument("a replaced brush patch needs a surface");
             const auto geometry = quad_surface_geometry(*patch.surface);
@@ -61,8 +83,9 @@ std::vector<std::string> saveBrushPatches(vc::objects::ObjectStoreSession& sessi
                 db.putGeometry(txn, uuid, geometry, current ? std::optional(current->uuid) : std::nullopt,
                                keep(db.affectedGeometryEdges(txn, uuid, geometry)));
             });
+            // Read under the lease: still this save's revision.
+            saved.push_back({uuid, currentRevision(session, attachment, uuid)});
         }
-        saved.push_back(uuid);
     }
     return saved;
 }
@@ -110,8 +133,16 @@ std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& s
     std::vector<vc::objects::AttachedCollection> changed;
     std::vector<std::string> removed, saved;
     std::vector<std::pair<std::size_t, std::string>> replacements;
+    vc::objects::RevisionSelection expected;
     for (std::size_t i = 0; i < drafts.size(); ++i) {
         const auto object = pointCollectionObject(drafts[i]);
+        if (object) {
+            const std::string revision = drafts[i].sourceCollection.value(QStringLiteral("metadata")).toObject()
+                                             .value(QLatin1String(kLocalObjectRevisionKey)).toString().toStdString();
+            if (revision.empty())
+                throw std::invalid_argument("point collection " + *object + " names no revision to edit from");
+            expected[*object] = revision;
+        }
         if (drafts[i].deleted) {
             if (object) removed.push_back(*object);
             continue;
@@ -119,7 +150,13 @@ std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& s
         if (object) replacements.emplace_back(i, *object);
         else changed.push_back(storedPointCollection(drafts[i], vc::objects::util::newUuid(), {}));
     }
+    // The meta.source kept is read at the expected revision: the commit is
+    // refused unless that is still current.
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        for (const auto& [uuid, revision] : expected) {
+            const auto head = db.currentObjectRevision(txn, uuid);
+            if (!head || head->uuid != *revision) throw std::runtime_error(changedSince("point collection", uuid));
+        }
         for (const auto& [index, uuid] : replacements) {
             const auto object = db.objectByUuid(txn, uuid);
             if (!object) throw std::runtime_error("point collection " + uuid + " is no longer in the object store");
@@ -127,7 +164,7 @@ std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& s
             changed.push_back(storedPointCollection(drafts[index], uuid, meta.value("source", nlohmann::json::object())));
         }
     });
-    vc::objects::writeVolumeCollections(session, attachment, volume, changed, removed);
+    vc::objects::writeVolumeCollections(session, attachment, volume, changed, removed, expected);
     for (const auto& collection : changed) saved.push_back(collection.uuid);
     saved.insert(saved.end(), removed.begin(), removed.end());
     return saved;

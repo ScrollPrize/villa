@@ -21,7 +21,7 @@ using Json = nlohmann::json;
 namespace {
 constexpr const char* kVolume = "fit-volume";
 
-QJsonDocument fitDocument(const QString& objectUuid, bool absolute)
+QJsonDocument fitDocument(const QString& objectUuid, bool absolute, const std::string& revision = {})
 {
     // A fit point-collection document as the workspace builds it from the
     // store: stable ids as keys, reference-volume positions.
@@ -32,6 +32,8 @@ QJsonDocument fitDocument(const QString& objectUuid, bool absolute)
                                                   {QStringLiteral("creation_time"), 0}};
     QJsonObject metadata{{QStringLiteral("winding_is_absolute"), absolute}};
     if (!objectUuid.isEmpty()) metadata[QStringLiteral("object_uuid")] = objectUuid;
+    if (!revision.empty())
+        metadata[QLatin1String(vc3d::spiral::kLocalObjectRevisionKey)] = QString::fromStdString(revision);
     return QJsonDocument(QJsonObject{
         {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
         {QStringLiteral("collections"), QJsonObject{{QStringLiteral("1"), QJsonObject{
@@ -92,19 +94,49 @@ private slots:
         QVERIFY(stored["annotations"][1]["wind_a"] == Json(1.0));
         QVERIFY(stored["meta"]["coordinates"] == volumeCoordinates(kVolume, 1));
 
-        // The fit shows it with its object UUID: an edit replaces that object,
-        // keeping the ids of kept points and the rest of its source.
-        RevisionSelection pins;
-        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            pins[uuid] = db.currentObjectRevision(txn, uuid)->uuid;
-        });
-        session.act(attachment, pins, [&](auto& db, auto& txn) {
-            auto meta = Json::parse(db.objectByUuid(txn, uuid)->meta);
-            meta["source"]["reviewer"] = "kept";
-            db.setMeta(txn, uuid, "source", meta["source"].dump());
-        });
-        auto edited = vc3d::spiral::importEditablePcls(fitDocument(QString::fromStdString(uuid), false), 1.0, {},
-                                                      true, vc3d::spiral::PclRole::Relative);
+        // The fit shows it with its object UUID and the revision it read: an
+        // edit replaces that object, keeping the ids of kept points and the
+        // rest of its source.
+        auto head = [&] {
+            std::string revision;
+            session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                revision = db.currentObjectRevision(txn, uuid)->uuid;
+            });
+            return revision;
+        };
+        auto review = [&](const std::string& note) {
+            session.act(attachment, {{uuid, head()}}, [&](auto& db, auto& txn) {
+                auto meta = Json::parse(db.objectByUuid(txn, uuid)->meta);
+                meta["source"]["reviewer"] = note;
+                db.setMeta(txn, uuid, "source", meta["source"].dump());
+            });
+        };
+        review("kept");
+        auto edited = vc3d::spiral::importEditablePcls(fitDocument(QString::fromStdString(uuid), false, head()), 1.0,
+                                                      {}, true, vc3d::spiral::PclRole::Relative);
+        QVERIFY(edited.front().erase(1));
+        edited.front().appendPreviewPoint(cv::Vec3f(9.0f, 5.0f, 7.0f));
+        // Another editor's change after the draft was read refuses the save
+        // instead of being overwritten, deletion included.
+        const auto before = head();
+        review("changed meanwhile");
+        auto refused = [&](const std::vector<vc3d::spiral::EditablePclDraft>& drafts) {
+            try {
+                vc3d::spiral::savePointCollections(session, attachment, kVolume, drafts);
+            } catch (const std::runtime_error& error) {
+                return std::string(error.what()).find("after this edit began") != std::string::npos;
+            }
+            return false;
+        };
+        QVERIFY(refused(edited));
+        auto stale = edited;
+        stale.front().setDeleted(true);
+        QVERIFY(refused(stale));
+        QVERIFY(read(uuid)["ids"] == Json({10, 20, 30}) && read(uuid)["retired"] == Json(false));
+        QVERIFY(head() != before);
+        review("kept");
+        edited = vc3d::spiral::importEditablePcls(fitDocument(QString::fromStdString(uuid), false, head()), 1.0, {},
+                                                 true, vc3d::spiral::PclRole::Relative);
         QVERIFY(edited.front().erase(1));
         edited.front().appendPreviewPoint(cv::Vec3f(9.0f, 5.0f, 7.0f));
         QVERIFY(vc3d::spiral::savePointCollections(session, attachment, kVolume, edited) == std::vector{uuid});
@@ -115,7 +147,9 @@ private slots:
         QVERIFY(stored["meta"]["source"]["winding_is_absolute"] == Json(false));
         QVERIFY(stored["annotations"][2]["wind_a"] == Json(3.0));
 
-        // Deleting it retires the object.
+        // Deleting it (as read now) retires the object.
+        edited = vc3d::spiral::importEditablePcls(fitDocument(QString::fromStdString(uuid), false, head()), 1.0, {},
+                                                 true, vc3d::spiral::PclRole::Relative);
         edited.front().setDeleted(true);
         vc3d::spiral::savePointCollections(session, attachment, kVolume, edited);
         QVERIFY(read(uuid)["retired"] == Json(true));
@@ -133,8 +167,9 @@ private slots:
         ObjectStoreSession session;
         const auto attachment = session.attach(replica, options);
 
-        const auto uuid = vc3d::spiral::saveBrushPatches(
-            session, attachment, kVolume, 2.0, {{{}, "brush_1", grid(5.0f), false}}).front();
+        const auto created = vc3d::spiral::saveBrushPatches(
+            session, attachment, kVolume, 2.0, {{{}, {}, "brush_1", grid(5.0f), false}}).front();
+        const auto uuid = created.uuid;
         auto read = [&] {
             Json result;
             session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -158,16 +193,61 @@ private slots:
         QVERIFY(session.syncHubAndWait(attachment, std::chrono::seconds(30))->pending.empty());
         session.detach(attachment);
         const auto again = session.attach(replica, options);
-        QCOMPARE(vc3d::spiral::saveBrushPatches(session, again, kVolume, 2.0, {{uuid, "brush_1", grid(9.0f, 4, 4), false}}),
-                 std::vector{uuid});
+        const auto replaced = vc3d::spiral::saveBrushPatches(
+            session, again, kVolume, 2.0, {{uuid, created.revision, "brush_1", grid(9.0f, 4, 4), false}}).front();
+        QVERIFY(replaced.uuid == uuid && !replaced.revision.empty() && replaced.revision != created.revision);
+        std::string replacedGeometry;
         session.read(again, [&](const auto& db, const auto& txn, const auto&) {
-            QVERIFY(db.currentGeometry(txn, uuid)->uuid != first["geometry"].get<std::string>());
+            replacedGeometry = db.currentGeometry(txn, uuid)->uuid;
+            QVERIFY(replacedGeometry != first["geometry"].get<std::string>());
         });
-        vc3d::spiral::saveBrushPatches(session, again, kVolume, 2.0, {{uuid, "brush_1", nullptr, true}});
-        session.read(again, [&](const auto& db, const auto& txn, const auto&) {
+        QVERIFY(session.syncHubAndWait(again, std::chrono::seconds(30))->pending.empty());
+        session.detach(again);
+
+        // Another editor saves it meanwhile: replacing or retiring from the
+        // revision this edit started from is refused, and theirs is kept.
+        const auto other = std::filesystem::path(directory.filePath(QStringLiteral("other.vcobj")).toStdString());
+        OpenOptions otherOptions; otherOptions.author = "other";
+        cloneHub(hub, other, otherOptions);
+        {
+            ObjectStoreSession theirs;
+            const auto mine = theirs.attach(other, otherOptions);
+            const auto saved = vc3d::spiral::saveBrushPatches(
+                theirs, mine, kVolume, 2.0, {{uuid, [&] {
+                    std::string revision;
+                    theirs.read(mine, [&](const auto& db, const auto& txn, const auto&) {
+                        revision = db.currentObjectRevision(txn, uuid)->uuid;
+                    });
+                    return revision;
+                }(), "brush_1", grid(11.0f), false}});
+            QVERIFY(theirs.syncHubAndWait(mine, std::chrono::seconds(30))->pending.empty());
+            theirs.detach(mine);
+        }
+        const auto last = session.attach(replica, options);
+        for (const bool remove : {false, true}) {
+            bool refused = false;
+            try {
+                vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0,
+                                               {{uuid, replaced.revision, "brush_1", grid(13.0f), remove}});
+            } catch (const std::runtime_error& error) {
+                refused = std::string(error.what()).find("after this edit began") != std::string::npos;
+            }
+            QVERIFY(refused);
+        }
+        session.read(last, [&](const auto& db, const auto& txn, const auto&) {
+            QVERIFY(!db.objectByUuid(txn, uuid)->retired);
+            QVERIFY(db.currentGeometry(txn, uuid)->uuid != replacedGeometry);  // theirs
+        });
+        // From the revision now current, it saves.
+        std::string current;
+        session.read(last, [&](const auto& db, const auto& txn, const auto&) {
+            current = db.currentObjectRevision(txn, uuid)->uuid;
+        });
+        vc3d::spiral::saveBrushPatches(session, last, kVolume, 2.0, {{uuid, current, "brush_1", nullptr, true}});
+        session.read(last, [&](const auto& db, const auto& txn, const auto&) {
             QVERIFY(db.objectByUuid(txn, uuid)->retired);
         });
-        session.detach(again);
+        session.detach(last);
     }
 };
 
