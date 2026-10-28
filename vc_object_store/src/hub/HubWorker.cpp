@@ -198,8 +198,10 @@ HubSessionStatus HubWorker::localStatus()
 HubSessionStatus HubWorker::syncOnce(const std::optional<std::string>& resolve, bool push)
 {
     std::lock_guard hub(hub_);
-    if (resolve)
-        for (const auto& conflict : hubStatus(replica_)->conflicts) {
+    // The status outlives the loop: a range over a member of the temporary
+    // optional would dangle.
+    if (const auto before = resolve ? hubStatus(replica_) : std::nullopt)
+        for (const auto& conflict : before->conflicts) {
             const bool object = nlohmann::json::parse(conflict.localRecord).value("record_type", "") == "objects";
             if (*resolve == "local" && object) renewLeases(replica_, {conflict.uuid});
             resolveHubConflict(replica_, conflict.uuid, *resolve);

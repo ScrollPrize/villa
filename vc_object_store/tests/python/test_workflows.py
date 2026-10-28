@@ -631,6 +631,40 @@ def test_a_service_links_and_pins_a_hub_position(tmp_path):
     session.detach(editor)
 
 
+def test_a_session_resolves_a_link_conflict_to_the_hub(tmp_path):
+    """Regression: the session worker's resolve loop read its conflicts
+    from a destroyed temporary."""
+    import time
+    import vc_object_store as vos
+    hub = tmp_path / 'hub.vcobj'
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        a, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        b, _ = put(origin, Fiber([[1, 2, 4], [4, 5, 7]], []), kind='fiber')
+        whole = {'whole_geometry': True}
+        edge = origin.add_edge(dict(a=a, b=b, kind='related', a_anchor=whole, b_anchor=whole))
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    for name in ('mine', 'theirs'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    session = vos.ObjectStoreSession()
+    mine = session.attach(str(tmp_path / 'mine.vcobj'), 'mine', sync_interval_ms=100, push_delay_ms=20)
+    with session.hold_pushes(mine):
+        with ObjectStore.open(str(tmp_path / 'mine.vcobj'), author='mine') as db:
+            db.set_meta(edge, 'note', 'mine')
+        with ObjectStore.open(str(tmp_path / 'theirs.vcobj'), author='theirs') as db:
+            db.set_meta(edge, 'note', 'theirs')
+            db.hub_sync()
+        assert [c['uuid'] for c in session.sync_hub_and_wait(mine, timeout_s=20)['conflicts']] == [edge]
+    session.resolve_hub_conflicts(mine, 'hub')
+    deadline = time.monotonic() + 20
+    while session.hub_status(mine)['conflicts']:
+        assert time.monotonic() < deadline, session.hub_status(mine)['error']
+        time.sleep(0.05)
+    with ObjectStore.open(str(tmp_path / 'mine.vcobj'), read_only=True) as db:
+        assert db.edge(edge)['meta']['note'] == 'theirs'
+    session.detach(mine)
+
+
 def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
     import vc_object_store as vos
     hub = tmp_path / 'share' / 'hub.vcobj'
