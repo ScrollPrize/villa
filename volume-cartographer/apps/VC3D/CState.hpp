@@ -55,6 +55,10 @@ public:
     // so an imported copy hides its catalog placeholder): the user's store,
     // then the volume's Open Data catalog store once attached. Empty without a volume.
     std::vector<vc::objects::AttachmentIdentity> surfaceSources() const;
+    // Decoded surface geometry kept for every store VC3D opens (all workspaces),
+    // up to the surface geometry cache setting; re-read after Settings change.
+    static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
+    static void applySurfaceGeometryCacheSettings();
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     // The sample's catalog store (vc::objects::attachCatalog) beside the

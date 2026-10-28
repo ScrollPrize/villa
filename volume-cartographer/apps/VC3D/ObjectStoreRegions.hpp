@@ -78,7 +78,7 @@ inline Bounds regionBox(const Region& s)
 // The view is clipped from it exactly, so the margin never changes the drawing.
 constexpr double kPrefetchSpanFraction = 0.25;
 constexpr double kPrefetchDepthVx = 32;
-inline Region prefetchRegion(Region s)
+inline Region prefetchRegion(Region s, bool depth = true)
 {
     const double du = kPrefetchSpanFraction * (s.local.upper[0] - s.local.lower[0]);
     const double dv = kPrefetchSpanFraction * (s.local.upper[1] - s.local.lower[1]);
@@ -86,10 +86,24 @@ inline Region prefetchRegion(Region s)
     s.local.upper[0] += du;
     s.local.lower[1] -= dv;
     s.local.upper[1] += dv;
-    s.local.lower[2] -= kPrefetchDepthVx;
-    s.local.upper[2] += kPrefetchDepthVx;
+    if (depth) {
+        s.local.lower[2] -= kPrefetchDepthVx;
+        s.local.upper[2] += kPrefetchDepthVx;
+    }
     s.box = regionBox(s);
     return s;
+}
+// Whether two regions share their mid-plane (the plane a surface cut is made
+// in), to well below a voxel. Viewer axes carry float rounding.
+inline bool sameMidPlane(const Region& a, const Region& b)
+{
+    double offsetA = (a.local.lower[2] + a.local.upper[2]) / 2, offsetB = (b.local.lower[2] + b.local.upper[2]) / 2;
+    for (size_t i = 0; i < 3; ++i) {
+        if (std::abs(a.n[i] - b.n[i]) > 1e-6) return false;
+        offsetA += a.origin[i] * a.n[i];
+        offsetB += b.origin[i] * b.n[i];
+    }
+    return std::abs(offsetA - offsetB) < 1e-3;
 }
 inline double viewSpan(const Region& s)
 {
@@ -126,6 +140,9 @@ struct RegionRequests {
     // Views at least this span (voxels) are queried without a margin: a
     // prefetch there exceeded the store's region budget.
     double prefetchFailedSpan{std::numeric_limits<double>::infinity()};
+    // Surface cuts hold only for their slab's mid-plane: a view on another
+    // plane is read again, and reads get no depth margin.
+    bool planar{false};
     std::shared_ptr<std::atomic_bool> cancelled;
     bool busy{false};
     bool complete{true};
@@ -154,7 +171,7 @@ struct RegionRequests {
     {
         // A complete region (one that reached neither the display limit nor a
         // store budget) holds everything of any view inside its prism.
-        if (complete && coverage && coverage->contains(view)) {
+        if (complete && coverage && coverage->contains(view) && (!planar || sameMidPlane(*coverage, view))) {
             if (busy && cancelled) cancelled->store(true);
             return std::nullopt;
         }
@@ -167,7 +184,7 @@ struct RegionRequests {
                 cancelled->store(true);
             return std::nullopt;
         }
-        const auto query = viewSpan(view) < prefetchFailedSpan ? prefetchRegion(view) : view;
+        const auto query = viewSpan(view) < prefetchFailedSpan ? prefetchRegion(view, !planar) : view;
         busy = true;
         requested = view;
         pending = query;

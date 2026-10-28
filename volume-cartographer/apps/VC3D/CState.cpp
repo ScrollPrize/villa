@@ -42,7 +42,16 @@ vc::objects::OpenOptions viewerOpenOptions()
     vc::objects::OpenOptions options;
     options.catalogTransforms = catalogTransformSnapshot();
     options.geometryCacheBytes = size_t(256) << 20;
+    options.surfaceTiles = CState::surfaceGeometryCache();
     return options;
+}
+
+size_t surfaceGeometryCacheBytes()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const auto gb = settings.value(vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
+                                   vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toLongLong();
+    return size_t(std::max<qlonglong>(0, gb)) << 30;
 }
 
 // The box spanned by `box`'s corners through `m`.
@@ -285,6 +294,17 @@ vc::objects::AttachmentIdentity CState::catalogAttachment(const vcr::catalog::Op
 std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() const
 {
     return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
+}
+
+std::shared_ptr<vc::objects::SurfaceTileCache> CState::surfaceGeometryCache()
+{
+    static const auto cache = std::make_shared<vc::objects::SurfaceTileCache>(surfaceGeometryCacheBytes());
+    return cache;
+}
+
+void CState::applySurfaceGeometryCacheSettings()
+{
+    surfaceGeometryCache()->setCapacity(surfaceGeometryCacheBytes());
 }
 
 std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const

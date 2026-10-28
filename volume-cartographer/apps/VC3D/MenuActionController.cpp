@@ -1250,6 +1250,7 @@ void MenuActionController::showSettingsDialog()
         if (manager)
             manager->applyViewerCacheSettings();
     }
+    CState::applySurfaceGeometryCacheSettings();
 
     dialog->deleteLater();
 }

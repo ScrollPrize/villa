@@ -248,6 +248,12 @@ namespace viewer_cache {
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
     constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
 
+    // App-wide budget for decoded object-store surface geometry (every
+    // surface's tiles read for intersections and lookups), shared by all
+    // workspaces and stores.
+    constexpr auto SURFACE_GEOMETRY_CACHE_GB = "viewer_cache/surface_geometry_cache_gb";
+    constexpr int SURFACE_GEOMETRY_CACHE_GB_DEFAULT = 8;
+
 }
 
 // -----------------------------------------------------------------------------

@@ -16,6 +16,8 @@
 #include <vector>
 
 class CState;
+class PlaneSurface;
+class QuadSurface;
 
 // Where surfaces cross each viewer, from the object store (stored surfaces and
 // the session's drafts; no surface is materialized or indexed here):
@@ -47,6 +49,7 @@ public:
     };
 
 protected:
+    void clearOverlay(VolumeViewerBase* viewer) const override;
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     bool needsOverlayRebuild(VolumeViewerBase* viewer) const override;
     void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
@@ -69,11 +72,31 @@ private:
         QRectF displayedRect;
         std::vector<std::string> targets;
         std::vector<Run> runs;
+        std::uint64_t runsVersion{0};
+        // Stored lines are a group of their own, drawn for this camera and
+        // style: a pan only moves them.
+        // Drafts cut over the whole plane, at their revisions.
+        std::optional<vc3d::store::Region> draftSlab;
+        std::vector<std::string> drafted;
+        std::vector<std::uint64_t> draftRevisions;
+        std::vector<Run> draftRuns;
+        struct Drawn {
+            std::uint64_t runsVersion{0}, styleVersion{0};
+            std::vector<std::uint64_t> draftRevisions;
+            QPointF origin, axisU, axisV;
+            cv::Vec3f planeOrigin, planeNormal;
+            std::vector<float> offsets;
+            std::string active;
+            float opacity{0}, thickness{0};
+            bool operator==(const Drawn&) const = default;
+        };
+        std::optional<Drawn> drawn;
         bool dirty{true};
         bool refreshPending{false};
         // Surface viewers: the planes' cuts of a stored surface.
         std::vector<PlaneCut> cuts;
         std::map<std::string, std::vector<Run>> planeRuns;
+        std::uint64_t cutRevision{0};
         bool cutsBusy{false};
         bool cutsStale{false};
     };
@@ -90,6 +113,20 @@ private:
     std::vector<std::string> targets(VolumeViewerBase* viewer) const;
     std::string activeUuid() const;
     std::vector<PlaneCut> planeCuts(VolumeViewerBase* viewer) const;
+    // The slab of a whole plane (the cut is made in its mid-plane).
+    static std::optional<vc3d::store::Region> planeSlab(PlaneSurface& plane);
+    // How plane viewers draw lines: the active surface's colour and the
+    // dotted copies at the flattened viewer's normal offset or slab bounds.
+    struct LineStyle {
+        std::string active;
+        std::shared_ptr<QuadSurface> activeSurface;
+        std::vector<float> offsets;
+        bool volumetric{false};
+        float opacity{0}, thickness{0};
+    };
+    LineStyle lineStyle(VolumeViewerBase* viewer) const;
+    void addLines(VolumeViewerBase* viewer, const std::vector<Run>& runs, const LineStyle& style,
+                  OverlayBuilder& builder) const;
     // Drafts among `uuids`, cut synchronously.
     std::vector<Run> draftRuns(const std::vector<std::string>& uuids, const vc3d::store::Region& slab) const;
     void drawPlaneViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
@@ -99,6 +136,7 @@ private:
     std::string _volume;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
+    std::uint64_t _styleVersion{0};
     std::set<std::string> _fetching;
     std::map<std::string, QString> _fetchFailures;
     std::shared_ptr<std::atomic_bool> _fetchCancel = std::make_shared<std::atomic_bool>(false);

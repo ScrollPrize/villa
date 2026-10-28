@@ -739,6 +739,35 @@
             </property>
            </widget>
           </item>
+          <item row="10" column="0">
+           <widget class="QLabel" name="labelSurfaceGeometryCache">
+            <property name="text">
+             <string>Surface geometry cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM kept for surface geometry read from object stores (surface intersections and lookups), shared by all workspaces. 0 keeps none: every read decodes its surfaces again.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="1">
+           <widget class="QSpinBox" name="spinSurfaceGeometryCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>8</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM kept for decoded object-store surface geometry, shared by all workspaces and stores. Applies without restart.</string>
+            </property>
+           </widget>
+          </item>
          </layout>
         </widget>
        </item>
