@@ -90,6 +90,7 @@ private:
     void drawSurfaceViewer(VolumeViewerBase* viewer, View& v, OverlayBuilder& builder);
 
     CState* _state;
+    std::string _volume;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> _views;

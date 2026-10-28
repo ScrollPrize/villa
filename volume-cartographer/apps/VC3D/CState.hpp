@@ -50,6 +50,11 @@ public:
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
     // The user's store in that session: the attachment edits go to.
     std::optional<vc::objects::AttachmentIdentity> objectStoreAttachment() const;
+    // The attachments the open volume's surfaces are read from, in the
+    // session's precedence order (an object comes from the first holding it,
+    // so an imported copy hides its catalog placeholder): the user's store,
+    // then the volume's Open Data catalog store once attached. Empty without a volume.
+    std::vector<vc::objects::AttachmentIdentity> surfaceSources() const;
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     // The sample's catalog store (vc::objects::attachCatalog) beside the

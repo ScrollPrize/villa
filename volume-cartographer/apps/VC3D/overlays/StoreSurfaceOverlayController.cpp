@@ -69,7 +69,10 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
             refreshCommittedSurfaces();
         }
     });
-    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string&) { invalidate(); });
+    // volumeChanged also repeats for the same volume; only a new one changes the data.
+    connect(_state, &CState::volumeChanged, this, [this](std::shared_ptr<Volume>, const std::string& volume) {
+        if (std::exchange(_volume, volume) != volume) invalidate();
+    });
     // Edits update their drafts before announcing the surface; intersect
     // targets and planes are named surfaces.
     connect(_state, &CState::surfaceChanged, this, [this](std::string, std::shared_ptr<Surface>, bool) {
@@ -236,9 +239,9 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
             const auto found = _views.find(viewer);
             return found == _views.end() ? nullptr : found->second.get();
         },
-        [session = _state->objectStoreSession(), volume = _state->currentVolumeId(),
+        [session = _state->objectStoreSession(), sources = _state->surfaceSources(), volume = _state->currentVolumeId(),
          uuids](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
-            auto crossings = SurfaceCatalog::region(*session, session->attachments(), volume,
+            auto crossings = SurfaceCatalog::region(*session, sources, volume,
                                                     vc3d::store::regionSlice(query), surfaceOptions(uuids),
                                                     [&] { return cancelled.load(); }, true);
             return Listing{runsOf(std::move(crossings.runs)), crossings.complete};
@@ -264,10 +267,11 @@ void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const 
     v.cutsStale = false;
     using Cut = std::map<std::string, std::vector<Run>>;
     vc3d::store::background<Cut>(this,
-        [session = _state->objectStoreSession(), volume = _state->currentVolumeId(), uuid, cuts] {
+        [session = _state->objectStoreSession(), sources = _state->surfaceSources(), volume = _state->currentVolumeId(),
+         uuid, cuts] {
             Cut result;
             for (const auto& cut : cuts) {
-                auto crossings = SurfaceCatalog::region(*session, session->attachments(), volume,
+                auto crossings = SurfaceCatalog::region(*session, sources, volume,
                                                         vc3d::store::regionSlice(cut.slab), surfaceOptions({uuid}),
                                                         {}, true);
                 result[cut.plane] = runsOf(std::move(crossings.runs));

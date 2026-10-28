@@ -287,6 +287,18 @@ std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() c
     return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
 }
 
+std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const
+{
+    const CState& owner = _objectStoreOwner ? *_objectStoreOwner : *this;
+    std::vector<vc::objects::AttachmentIdentity> sources;
+    if (!_currentVolume) return sources;
+    if (owner._objectStoreAttachment) sources.push_back(*owner._objectStoreAttachment);
+    if (const auto view = _vpkg ? _vpkg->catalogView(currentVolumeId()) : std::nullopt)
+        if (const auto found = owner._catalogAttachments.find(view->sampleId); found != owner._catalogAttachments.end())
+            sources.push_back(found->second);
+    return sources;
+}
+
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
     if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }

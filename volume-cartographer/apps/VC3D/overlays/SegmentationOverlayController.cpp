@@ -803,6 +803,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                  targetColors = std::move(targetColors),
                  threshold,
                  session,
+                 sources = _state->surfaceSources(),
                  volume = _state->currentVolumeId(),
                  cancel]() -> QImage {
                 try {
@@ -845,7 +846,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                                     }
                                 }
                                 // The nearest overlay surface within the threshold colours the sample.
-                                const auto hits = SurfaceCatalog::nearest(*session, session->attachments(), volume,
+                                const auto hits = SurfaceCatalog::nearest(*session, sources, volume,
                                                                           targets, points, threshold);
                                 auto* scanline = reinterpret_cast<QRgb*>(bits + r * bytesPerLine);
                                 for (size_t i = 0; i < points.size(); ++i) {
