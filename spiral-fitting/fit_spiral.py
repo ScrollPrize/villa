@@ -4004,6 +4004,10 @@ class FitContext:
         cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         try:
             candidate = copy.copy(self)
+            # The copy must not keep the old inputs' device state alive
+            # through install: the theta topology's closures hold the old
+            # atlas and strips.
+            candidate.theta_crossing_map = None
             candidate.object_store_inputs = inputs
             verified_patches = dict(inputs.patches)
             candidate._derive_object_store_point_inputs(verified_patches, inputs)

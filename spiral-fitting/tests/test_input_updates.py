@@ -64,6 +64,31 @@ def test_an_update_replaces_the_inputs_and_keeps_the_iteration(state, hub, devic
         assert json.load(stream)['manifest']['position']['sequence'] == position
 
 
+def test_the_old_device_state_is_released_before_the_new_is_built(state, hub, device_stubs,
+                                                                   no_theta_topology, monkeypatch):
+    import weakref
+    import fit_spiral
+    state.initialize(REQUEST)
+    settle(state)
+    session = state.session
+    context = session._context
+    old_atlas = context.patch_atlas
+    # The theta topology's closures hold the old atlas, as the real one does.
+    context.theta_crossing_map = [lambda atlas=old_atlas: atlas]
+    released = weakref.ref(old_atlas)
+    del old_atlas
+    materialize = fit_spiral.PatchAtlas.materialize
+    seen = []
+
+    def checked(self, device=None):
+        seen.append(released() is None)
+        return materialize(self, device)
+    monkeypatch.setattr(fit_spiral.PatchAtlas, 'materialize', checked)
+    position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
+    session.update_inputs(position)
+    assert seen == [True]
+
+
 def test_a_refused_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
                                          monkeypatch):
     import fit_spiral
