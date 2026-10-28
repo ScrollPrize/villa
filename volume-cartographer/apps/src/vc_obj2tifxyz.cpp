@@ -710,6 +710,11 @@ int main(int argc, char *argv[])
     }
     surf->meta = std::move(sourceMeta);
 
+    // The output grid is the flattened mesh, not the source's, so a copied
+    // isometry block (#2279) would be stale; drop it (recompute with
+    // `vc_tifxyz --isometry` on the result).
+    surf->meta.erase("isometry");
+
     // Attach the resampled approval mask so save() writes approval.tif at the
     // new grid size alongside x/y/z.tif.
     if (converter.hasApproval()) {

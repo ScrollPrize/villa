@@ -147,6 +147,10 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    // The scale as loaded from meta.json, before any transform. `resample` is the
+    // only operation that changes the grid density.
+    const cv::Vec2f inputScale = surf->scale();
+
     // Apply operations (resample first, then rotate)
     if (vm.count("resample")) {
         float factor = vm["resample"].as<float>();
@@ -198,10 +202,42 @@ int main(int argc, char* argv[]) {
         surf->meta = utils::Json::object();
     }
 
-    if (vm.count("isometry") && has_transform) {
-        // The grid was just transformed, so use the surface's *current* scale;
-        // meta["scale"] still holds the input's value.
-        vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
+    if (has_transform) {
+        if (vm.count("isometry")) {
+            if (vm.count("resample")) {
+                // #2151 (open) makes QuadSurface::resample *multiply* `scale`, since
+                // scale is grid cells per voxel. Until it lands, resample divides it,
+                // so the written scale — the step this block is measured against — is
+                // wrong for a resampled grid. Refuse rather than store a block that
+                // reports a spurious stretch.
+                const float factor = vm["resample"].as<float>();
+                const cv::Vec2f scale = surf->scale();
+                // With #2151 the new density is scale * factor (cells per voxel);
+                // the unfixed resample divides instead, so this check fails there.
+                const cv::Vec2f expected(inputScale[0] * factor, inputScale[1] * factor);
+                const bool consistent =
+                    std::isfinite(scale[0]) && std::isfinite(scale[1]) &&
+                    std::abs(scale[0] - expected[0]) <= 1e-4f * std::abs(expected[0]) &&
+                    std::abs(scale[1] - expected[1]) <= 1e-4f * std::abs(expected[1]);
+                if (!consistent) {
+                    std::cerr << "Error: --resample with --isometry needs the resample "
+                                 "scale fix in ScrollPrize/villa#2151; without it the "
+                                 "resampled meta.json scale is wrong and the isometry "
+                                 "block would be measured against a wrong step. Run "
+                                 "--resample alone, then --isometry on the result."
+                              << std::endl;
+                    return EXIT_FAILURE;
+                }
+            }
+            // The grid was just transformed, so use the surface's *current* scale;
+            // meta["scale"] still holds the input's value. rotate/smooth keep the
+            // density, so their block is measured against the unchanged step.
+            vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
+        } else {
+            // A transformed grid invalidates any block copied from the input: drop
+            // it rather than carry a stale measurement (`save()` is left as is).
+            surf->meta.erase("isometry");
+        }
     }
 
     if (!has_transform) {

@@ -172,6 +172,10 @@ int main(int argc, char* argv[])
     }
 
     Json meta = Json::parse_file(src / "meta.json");
+    // Trimming drops rows/columns, so an isometry block copied from the source
+    // is measured against the wrong grid; drop it (recompute with
+    // `vc_tifxyz --isometry` on the result).
+    meta.erase("isometry");
     // Identity follows QuadSurface::saveEdited semantics: trimming in
     // place keeps the surface's uuid, but a trim written to a different
     // directory is a new object and must not duplicate the source's

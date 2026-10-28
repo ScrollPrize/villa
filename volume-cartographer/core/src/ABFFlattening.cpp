@@ -2411,6 +2411,9 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     // has nothing to preserve but the 5 keys it sets itself (bbox/type/uuid/
     // format/scale) — see villa#1321.
     result->meta = surface.meta;
+    // The flattened grid is a new tessellation, so a source isometry block (#2279)
+    // would be stale; drop it (recompute with `vc_tifxyz --isometry` on the result).
+    result->meta.erase("isometry");
 
     // Step 7: Optionally rotate to place highest Z values at top (row 0)
     if (config.rotateHighZToTop) {

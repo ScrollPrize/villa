@@ -122,6 +122,19 @@ void scaleMetadata(utils::Json& meta, double factor,
                 meta["bbox"][side][axis] = meta["bbox"][side][axis].get_double() * factor;
     if (meta.contains("area_vx2")) meta["area_vx2"] = meta["area_vx2"].get_double() * factor * factor;
     if (meta.contains("output_step_vx")) meta["output_step_vx"] = meta["output_step_vx"].get_double() * factor;
+    // The isometry block (#2279) is measured in voxel units: its ratios and angles
+    // are scale-invariant under this unit change, but step_vx and stretched_area_vx2
+    // follow the coordinates like area_vx2 above (step x factor, area x factor^2),
+    // so keep the block consistent with the new `scale` instead of dropping it.
+    if (meta.contains("isometry") && meta["isometry"].is_object()) {
+        auto& iso = meta["isometry"];
+        if (iso.contains("step_vx") && iso["step_vx"].is_array() && iso["step_vx"].size() == 2) {
+            for (int i = 0; i < 2; ++i)
+                iso["step_vx"][i] = iso["step_vx"][i].get_double() * factor;
+        }
+        if (iso.contains("stretched_area_vx2"))
+            iso["stretched_area_vx2"] = iso["stretched_area_vx2"].get_double() * factor * factor;
+    }
     if (meta.contains("voxel_size_um")) meta["voxel_size_um"] = meta["voxel_size_um"].get_double() / factor;
     else if (meta.contains("fit_config") && meta["fit_config"].contains("voxel_size_um"))
         meta["voxel_size_um"] = meta["fit_config"]["voxel_size_um"].get_double() / factor;

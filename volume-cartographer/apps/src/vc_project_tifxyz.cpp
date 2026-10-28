@@ -1621,6 +1621,10 @@ int main(int argc, char** argv)
         // stages) and overlay this run's parameters on top, instead of
         // replacing it wholesale — see villa#1321.
         Json meta = src->meta;
+        // The output grid is the reprojected/repaired one, not the source's, so a
+        // copied isometry block (#2279) would be stale; drop it (recompute with
+        // `vc_tifxyz --isometry` on the result).
+        meta.erase("isometry");
         meta["source"] = "vc_project_tifxyz";
         meta["source_tifxyz"] = cfg.source.string();
         meta["umbilicus"] = cfg.umbilicus.string();

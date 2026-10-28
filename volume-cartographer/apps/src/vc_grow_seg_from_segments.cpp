@@ -612,6 +612,9 @@ static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& ta
     cv::Mat_<cv::Vec3f> cutout = (*target_points)(roi).clone();
     auto seed_surface = std::make_unique<QuadSurface>(cutout, target.scale());
     seed_surface->meta = target.meta;
+    // The seed is a cutout of the target, so a copied isometry block (#2279) is
+    // measured against the wrong grid; drop it.
+    seed_surface->meta.erase("isometry");
     seed_surface->meta["source"] = "vc_grow_seg_from_segments_sweep_cutout";
     seed_surface->meta["sweep_target"] = normalized_target.string();
     seed_surface->meta["sweep_cutout_cm"] = cutout_cm;

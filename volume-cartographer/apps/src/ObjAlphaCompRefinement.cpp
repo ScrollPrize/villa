@@ -340,6 +340,9 @@ int process_tifxyz(const std::filesystem::path& src,
 
     if (!surf->meta.is_null()) {
         outSurf.meta = surf->meta;
+        // The refined points moved along their normals, so a copied isometry
+        // block (#2279) is stale; drop it (recompute with `vc_tifxyz --isometry`).
+        outSurf.meta.erase("isometry");
     }
 
     try {
