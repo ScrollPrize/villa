@@ -11,6 +11,81 @@ from pathlib import Path
 def run(config):
     if 'commands' not in config and len(config)!=1:
         raise ValueError('Select exactly one named workflow')
+    if 'fiber_enclosure_reference_eval' in config:
+        from .fiber_enclosure_reference_eval import run as evaluate_enclosures
+        return evaluate_enclosures(config['fiber_enclosure_reference_eval'])
+    if 'fiber_reference_constraint_signs' in config:
+        from .fiber_reference_constraint_signs import run as reference_signs
+        return reference_signs(config['fiber_reference_constraint_signs'])
+    if 'fiber_eval_enclosures' in config:
+        from .fiber_eval_enclosures import run as enclosures
+        return enclosures(config['fiber_eval_enclosures'])
+    if 'fiber_afv_transform' in config:
+        from .fiber_afv_transform import run as transform_afv
+        return transform_afv(config['fiber_afv_transform'])
+    if 'fiber_dataset_union' in config:
+        from .fiber_dataset_union import run as union
+        return union(config['fiber_dataset_union'])
+    if 'fiber_selected_solver_comparison' in config:
+        from .fiber_selected_solver_comparison import run as selected_comparison
+        return selected_comparison(config['fiber_selected_solver_comparison'])
+    if 'fiber_route_import' in config:
+        from .fiber_route_import import run as import_routes
+        return import_routes(config['fiber_route_import'])
+    if 'fiber_irls_benchmark' in config:
+        from .fiber_irls_benchmark import run as run_irls
+        return run_irls(config['fiber_irls_benchmark'])
+    if 'fiber_flow_sgd_full' in config:
+        from .fiber_flow_sgd_full import run as run_sgd_full
+        return run_sgd_full(config['fiber_flow_sgd_full'])
+    if 'fiber_min_flow_full' in config:
+        from .fiber_min_flow_full import run as run_full_flow
+        return run_full_flow(config['fiber_min_flow_full'])
+    if 'fiber_flow_threads' in config:
+        from .fiber_flow_threads import run as run_flow_threads
+        return run_flow_threads(config['fiber_flow_threads'])
+    if 'fiber_flow_stop' in config:
+        from .fiber_flow_threads import stop_previous
+        request=config['fiber_flow_stop']
+        result={'stopped':stop_previous(int(request['pid']),request['expected_command'])}
+        print(json.dumps(result),flush=True)
+        return result
+    if 'fiber_lemon_benchmark' in config:
+        from .fiber_lemon import run as run_lemon
+        return run_lemon(config['fiber_lemon_benchmark'])
+    if 'fiber_lemon_full' in config:
+        from .fiber_lemon import run_full as run_lemon_full
+        return run_lemon_full(config['fiber_lemon_full'])
+    if 'fiber_flow_perpendicular' in config:
+        from .fiber_flow_perpendicular import run as run_flow_perpendicular
+        return run_flow_perpendicular(config['fiber_flow_perpendicular'])
+    if 'fiber_flow_length_sweep' in config:
+        from .fiber_flow_perpendicular import run_length_sweep
+        return run_length_sweep(config['fiber_flow_length_sweep'])
+    if 'fiber_flow_reference_eval' in config:
+        from .fiber_flow_reference_eval import run as run_flow_reference_eval
+        return run_flow_reference_eval(config['fiber_flow_reference_eval'])
+    if 'fiber_flow_reference_analysis' in config:
+        from .fiber_flow_reference_eval import analyze
+        return analyze(config['fiber_flow_reference_analysis'])
+    if 'fiber_flow_reference_rescore' in config:
+        from .fiber_flow_reference_eval import rescore
+        return rescore(config['fiber_flow_reference_rescore'])
+    if 'fiber_pns_benchmark' in config:
+        from .fiber_pns import run as run_pns
+        return run_pns(config['fiber_pns_benchmark'])
+    if 'fiber_flow_uv' in config:
+        from .fiber_flow_uv import run as run_flow_uv
+        return run_flow_uv(config['fiber_flow_uv'])
+    if 'fiber_flow_uv_saved' in config:
+        from .fiber_flow_uv import run_saved
+        return run_saved(config['fiber_flow_uv_saved'])
+    if 'fiber_min_flow_selection' in config:
+        from .fiber_min_flow_selection import run as select_flow
+        return select_flow(config['fiber_min_flow_selection'])
+    if 'fiber_length_histogram' in config:
+        from .fiber_hv_label_comparison import run_histogram
+        return run_histogram(config['fiber_length_histogram'])
     if 'fiber_hv_label_comparison' in config:
         from .fiber_hv_label_comparison import run as compare_hv
         return compare_hv(config['fiber_hv_label_comparison'])
@@ -200,6 +275,9 @@ def run(config):
     if 'fiber_uv_visualization' in config:
         from .fiber_uv_visualization import run as visualize_uv
         return visualize_uv(config['fiber_uv_visualization'])
+    if 'fiber_hv_crop' in config:
+        from .fiber_hv_crop import run as export_hv_crop
+        return export_hv_crop(config['fiber_hv_crop'])
     if 'fiber_hv_stage' in config:
         from .fiber_hv_stage import run as run_hv
         return run_hv(config['fiber_hv_stage'])
