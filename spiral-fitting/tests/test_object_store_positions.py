@@ -269,6 +269,27 @@ def test_a_lost_push_response_recovers_its_position(hub):
     assert prepared.attempts == 1
 
 
+class Unreachable(LostResponse):
+    """A replica whose conditional pushes always lose their response."""
+
+    def hub_sync(self, pull=True, push=True, expected_head=None):
+        report = self.store.hub_sync(pull=pull, push=push, expected_head=expected_head)
+        if expected_head is not None:
+            self.lost.append(report)
+            raise RuntimeError('connection to the hub lost')
+        return report
+
+
+def test_an_unconfirmed_push_is_reported(hub):
+    config = fit_config(hub['service'])
+    with ObjectStore.open(hub['service'], author='service') as store:
+        with pytest.raises(osi.PositionError) as error:
+            osi.prepare_position(Unreachable(store), config, osi.request_from_config(config),
+                                 log=lambda line: None)
+    text = '\n'.join(error.value.problems)
+    assert 'could not be confirmed as published' in text and 'connection to the hub lost' in text
+
+
 def test_a_minimum_ahead_of_the_hub_is_refused(hub):
     with ObjectStore.open(hub['service'], read_only=True) as db:
         head = db.hub_status()['position']

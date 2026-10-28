@@ -1665,7 +1665,10 @@ def _discard_unpublished(store):
     would never be replaced by relinking only the current selection. The
     service replica writes only relationships, so nothing else is lost.
     Returns report lines."""
-    discarded = store.hub_revert()
+    try:
+        discarded = store.hub_revert()
+    except Exception as exc:  # noqa: BLE001 - the next attempt or update retries
+        return [f'unpublished detector writes could not be discarded: {exc}']
     return ([f'discarded {discarded} unpublished detector write(s)'] if discarded else [])
 
 
@@ -1725,7 +1728,14 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         if problems:
             raise LinkRefreshError(notes + problems + ['no links were published']
                                    + _discard_unpublished(store))
-        pushed = _conditional_push(store, head)
+        try:
+            pushed = _conditional_push(store, head)
+        except Exception as exc:  # noqa: BLE001 - reported with what is known
+            raise PositionError(notes + lines + [
+                f'the links made at hub position {head} could not be confirmed as '
+                f'published ({type(exc).__name__}: {exc}); they may have reached the '
+                'hub. The fit is unchanged; the next update reconciles them']
+                + _discard_unpublished(store)) from exc
         if pushed['conflicts']:
             notes.append(f'attempt {attempt}: {len(pushed["conflicts"])} conflict(s) '
                          'resolved to the hub')
