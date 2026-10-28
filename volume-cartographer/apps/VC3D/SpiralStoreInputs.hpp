@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,7 @@ struct FitSurface {
     StoreInputPin pin;
     InputState state = InputState::Missing;
     std::shared_ptr<QuadSurface> surface;  // current geometry; empty when Missing
+    std::string problem;  // why it is missing or unreadable; nothing is shown then
 };
 
 struct FitPointCollection {
@@ -57,6 +59,7 @@ struct FitPointCollection {
     std::vector<int64_t> ids;  // stable point IDs, ascending
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
+    std::string problem;
 };
 
 struct FitFiber {
@@ -64,6 +67,7 @@ struct FitFiber {
     InputState state = InputState::Missing;
     std::string family;  // "H", "V" or ""
     std::vector<cv::Vec3d> controls, line;
+    std::string problem;
 };
 
 // How one relationship the fit consumed stands now, judged as the fit's
@@ -72,12 +76,14 @@ enum class LinkState {
     Fitted,   // consumed at the same generation, approval and endpoint geometry
     Changed,  // still consumed, but any of those differ
     Dropped,  // no longer consumed: removed, rejected, inapplicable or an endpoint gone
+    Added,    // consumed now among the fitted objects, but not by the fit
 };
 const char* linkStateName(LinkState state);
 
 struct FitRelationship {
     std::string uuid, family;
     LinkState state = LinkState::Dropped;
+    std::string a, b;  // endpoint object UUIDs, in the adapter's order
 };
 
 struct FitInputs {
@@ -87,9 +93,10 @@ struct FitInputs {
     std::vector<FitFiber> fibers;
     std::vector<FitRelationship> relationships;
     // Relationships among the fitted objects that a rebuild would consume
-    // and the fit did not.
-    std::size_t addedRelationships = 0;
-    // Why the manifest does not describe this store, or an input it cannot read.
+    // and the fit did not (state Added), by record UUID.
+    std::vector<FitRelationship> addedRelationships;
+    // Why the manifest does not describe this store, or its relationships
+    // cannot be compared; an input's own problem is on its entry.
     std::vector<std::string> problems;
 
     std::size_t count(InputState state) const;
@@ -99,7 +106,7 @@ struct FitInputs {
     {
         return problems.empty() && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
                                                                    + fibers.size()
-            && count(LinkState::Fitted) == relationships.size() && addedRelationships == 0;
+            && count(LinkState::Fitted) == relationships.size() && addedRelationships.empty();
     }
 };
 
@@ -118,5 +125,25 @@ nlohmann::json adapterMetadata(const std::string& kind, const nlohmann::json& me
 // (problems).
 FitInputs readFitInputs(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
                         const nlohmann::json& document);
+
+// What a store commit may have changed, read without reading the rest.
+struct FitInputChanges {
+    // The listed objects read again, and the relationships compared again.
+    FitInputs inputs;
+    // Every relationship compared again: the listed ones, the fitted ones of
+    // a listed object, and the ones a listed object has now.
+    std::set<std::string> checkedRelationships;
+};
+
+// The incremental form of readFitInputs for a store commit: re-read only
+// the manifest objects in `objectUuids` (other UUIDs are ignored) and
+// re-compare only the relationships that involve them or are listed in
+// `relationshipUuids`. Its cost follows the change, not the fit.
+FitInputChanges readFitInputChanges(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
+                                    const nlohmann::json& document, const std::set<std::string>& objectUuids,
+                                    const std::set<std::string>& relationshipUuids);
+
+// Merge changes read from the same manifest into a full read.
+void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes);
 
 } // namespace vc3d::spiral

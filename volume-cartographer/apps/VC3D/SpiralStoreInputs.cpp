@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 namespace vc3d::spiral {
@@ -127,39 +128,174 @@ std::optional<Json> consumedIdentity(const vc::objects::SelectedRelationship& se
 }
 
 // The manifest's consumed relationships against the ones the current heads
-// of the fitted objects give, by record UUID.
+// of the fitted objects give, by record UUID. With `scope`, only those
+// relationships are compared, from the heads of their fitted endpoints.
 void compareRelationships(const ObjectStore& db, const Txn& txn, const Json& manifest,
-                          const std::vector<StoreInputPin>& pins, FitInputs& result)
+                          const std::vector<StoreInputPin>& pins, const std::set<std::string>* scope,
+                          FitInputs& result)
 {
     std::map<std::string, std::string> kinds;
+    for (const auto& pin : pins) kinds[pin.uuid] = pin.kind;
+    const auto inScope = [&](const std::string& uuid) { return !scope || scope->contains(uuid); };
+    const auto fitted = manifest.value("relationships", Json::array());
+    std::set<std::string> endpoints;
+    if (scope) {
+        for (const auto& entry : fitted)
+            if (inScope(entry.at("uuid").get<std::string>()))
+                endpoints.insert({entry.value("a", std::string()), entry.value("b", std::string())});
+        for (const auto& uuid : *scope)
+            if (const auto edge = db.edgeByUuid(txn, uuid)) endpoints.insert({edge->aUuid, edge->bUuid});
+    } else {
+        for (const auto& [uuid, kind] : kinds) endpoints.insert(uuid);
+    }
     vc::objects::RevisionSelection heads;
-    for (const auto& pin : pins) {
-        kinds[pin.uuid] = pin.kind;
-        if (const auto current = db.currentObjectRevision(txn, pin.uuid); current && !current->deleted)
-            heads[pin.uuid] = std::nullopt;
+    for (const auto& uuid : endpoints) {
+        if (!kinds.contains(uuid)) continue;
+        if (const auto current = db.currentObjectRevision(txn, uuid); current && !current->deleted)
+            heads[uuid] = std::nullopt;
     }
     std::map<std::string, Json> consumed;
     try {
         const bool approvedOnly = manifest.value("approved_links_only", false);
-        for (const auto& selected : db.relationshipsAt(txn, heads))
-            if (auto identity = consumedIdentity(selected, kinds, approvedOnly))
-                consumed[selected.relationship.record.uuid] = std::move(*identity);
+        if (!heads.empty())
+            for (const auto& selected : db.relationshipsAt(txn, heads))
+                if (inScope(selected.relationship.record.uuid))
+                    if (auto identity = consumedIdentity(selected, kinds, approvedOnly))
+                        consumed[selected.relationship.record.uuid] = std::move(*identity);
     } catch (const std::exception& error) {
         result.problems.push_back(std::string("relationships: ") + error.what());
         return;
     }
-    for (const auto& fitted : manifest.value("relationships", Json::array())) {
-        FitRelationship entry{fitted.at("uuid").get<std::string>(), fitted.value("family", std::string()),
-                              LinkState::Dropped};
-        if (const auto local = consumed.find(entry.uuid); local != consumed.end()) {
-            entry.state = LinkState::Fitted;
+    for (const auto& entry : fitted) {
+        FitRelationship link{entry.at("uuid").get<std::string>(), entry.value("family", std::string()),
+                             LinkState::Dropped, entry.value("a", std::string()), entry.value("b", std::string())};
+        if (!inScope(link.uuid)) continue;
+        if (const auto local = consumed.find(link.uuid); local != consumed.end()) {
+            link.state = LinkState::Fitted;
             for (const auto& [key, value] : local->second.items())
-                if (fitted.contains(key) && fitted.at(key) != value) entry.state = LinkState::Changed;
+                if (entry.contains(key) && entry.at(key) != value) link.state = LinkState::Changed;
             consumed.erase(local);
         }
-        result.relationships.push_back(std::move(entry));
+        result.relationships.push_back(std::move(link));
     }
-    result.addedRelationships = consumed.size();
+    for (const auto& [uuid, identity] : consumed)
+        result.addedRelationships.push_back({uuid, identity.at("family").get<std::string>(), LinkState::Added,
+                                             identity.at("a").get<std::string>(), identity.at("b").get<std::string>()});
+}
+
+// Read one manifest object as the store holds it now into `result`.
+void readObject(const ObjectStore& db, const Txn& txn, const StoreInputPin& pin, const std::string& volume,
+                FitInputs& result)
+{
+    const auto current = db.currentObjectRevision(txn, pin.uuid);
+    const bool present = current && !current->deleted && current->geometryRevision;
+    auto state = InputState::Missing;
+    Json meta = Json::object();
+    std::string problem;
+    if (present) {
+        meta = Json::parse(current->record.meta);
+        // Compared as values: JSON numbers compare numerically.
+        state = *current->geometryRevision != pin.geometryRevision ? InputState::Edited
+            : !pin.metadata.is_null() && adapterMetadata(pin.kind, meta, current->record.fiber) != pin.metadata
+                ? InputState::MetadataChanged
+                : InputState::Fitted;
+    } else {
+        problem = pin.kind + " " + pin.uuid + " (" + pin.name + ") is not in this store";
+    }
+    FitSurface surface{pin, state, nullptr, {}};
+    FitPointCollection collection;
+    collection.pin = pin;
+    collection.state = state;
+    FitFiber fiber{pin, state, {}, {}, {}, {}};
+    try {
+        std::optional<vc::objects::GeometryRevision> geometry;
+        std::optional<double> scale;
+        if (present) {
+            geometry = db.geometryRevision(txn, *current->geometryRevision);
+            // Stored XYZ -> reference-volume voxels, in the frame the object
+            // declares now.
+            scale = vc::objects::geometryScaleToVolume(meta, volume);
+            if (!scale) throw std::runtime_error("it declares no frame in volume " + volume);
+        }
+        if (geometry && pin.kind == "surface") {
+            auto stored = load_quad_from_store(db, txn, pin.uuid, geometry->uuid);
+            if (*scale != 1.0) {
+                // Invalid vertices keep the sentinel; grid steps follow the frame.
+                auto* points = new cv::Mat_<cv::Vec3f>(stored->rawPointsPtr()->clone());
+                for (auto& point : *points)
+                    if (point[0] != -1.f) point *= float(*scale);
+                auto converted = std::make_unique<QuadSurface>(points, stored->scale() / float(*scale));
+                converted->id = stored->id;
+                converted->meta = stored->meta;
+                converted->tags = stored->tags;
+                const cv::Mat mask = stored->channel("mask");
+                if (!mask.empty()) converted->setChannel("mask", mask);
+                stored = std::move(converted);
+            }
+            surface.surface = std::shared_ptr<QuadSurface>(std::move(stored));
+        } else if (geometry && pin.kind == "point_collection") {
+            collection.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);
+            const auto ids = readIds(db, txn, *geometry);
+            const auto points = readXyz(db, txn, *geometry, "points", *scale);
+            if (ids.size() != points.size()) throw std::runtime_error("point IDs and points differ in length");
+            const auto annotations = Json::parse(db.geometryPointAnnotations(txn, geometry->uuid, "points"));
+            std::vector<std::size_t> order(ids.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return ids[a] < ids[b]; });
+            for (const auto i : order) {
+                collection.ids.push_back(ids[i]);
+                collection.points.push_back(points[i]);
+                const Json annotation = annotations.is_array() && i < annotations.size() ? annotations[i]
+                                                                                         : Json(nullptr);
+                const Json wind = valueOrNull(annotation, "wind_a");
+                collection.windings.push_back(wind.is_number() ? std::optional(wind.get<double>()) : std::nullopt);
+            }
+        } else if (geometry && pin.kind == "fiber") {
+            if (current->record.fiber) fiber.family = current->record.fiber->family;
+            fiber.controls = readXyz(db, txn, *geometry, "control_points", *scale);
+            fiber.line = readXyz(db, txn, *geometry, "line_points", *scale);
+        }
+    } catch (const std::exception& error) {
+        // Nothing of an unreadable input is shown.
+        problem = pin.kind + " " + pin.uuid + ": " + error.what();
+        surface.surface.reset();
+        collection = FitPointCollection{pin, state, false, {}, {}, {}, {}};
+        fiber = FitFiber{pin, state, {}, {}, {}, {}};
+    }
+    if (pin.kind == "surface") {
+        surface.problem = problem;
+        result.surfaces.push_back(std::move(surface));
+    } else if (pin.kind == "point_collection") {
+        collection.problem = problem;
+        result.pointCollections.push_back(std::move(collection));
+    } else if (pin.kind == "fiber") {
+        fiber.problem = problem;
+        result.fibers.push_back(std::move(fiber));
+    }
+}
+
+// The manifest's store and volume; false (with the problem) for another store.
+bool sameStore(const ObjectStore& db, const Txn& txn, const Json& document, FitInputs& result)
+{
+    const auto& manifest = document.at("manifest");
+    result.digest = document.value("digest", std::string());
+    result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
+    result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
+    if (const auto local = db.uuid(txn); local != result.storeUuid) {
+        result.problems.push_back("the fit read store " + result.storeUuid + ", not this store " + local);
+        return false;
+    }
+    return true;
+}
+
+template <typename Entry>
+void replaceByUuid(std::vector<Entry>& entries, std::vector<Entry>& changed)
+{
+    for (auto& entry : changed) {
+        const auto found = std::find_if(entries.begin(), entries.end(),
+                                        [&](const Entry& old) { return old.pin.uuid == entry.pin.uuid; });
+        if (found != entries.end()) *found = std::move(entry);
+    }
 }
 
 } // namespace
@@ -181,6 +317,7 @@ const char* linkStateName(LinkState state)
     case LinkState::Fitted: return "as fitted";
     case LinkState::Changed: return "changed";
     case LinkState::Dropped: return "dropped";
+    case LinkState::Added: return "added";
     }
     return "unknown";
 }
@@ -237,107 +374,60 @@ Json adapterMetadata(const std::string& kind, const Json& meta,
 FitInputs readFitInputs(const ObjectStore& db, const Txn& txn, const Json& document)
 {
     FitInputs result;
-    const auto& manifest = document.at("manifest");
-    result.digest = document.value("digest", std::string());
-    result.storeUuid = manifest.at("store").at("uuid").get<std::string>();
-    result.volumeUuid = manifest.at("volume_uuid").get<std::string>();
-    if (const auto local = db.uuid(txn); local != result.storeUuid) {
-        result.problems.push_back("the fit read store " + result.storeUuid + ", not this store "
-                                  + local);
-        return result;
-    }
+    if (!sameStore(db, txn, document, result)) return result;
     const auto pins = manifestPins(document);
-    for (const auto& pin : pins) {
-        const auto current = db.currentObjectRevision(txn, pin.uuid);
-        const bool present = current && !current->deleted && current->geometryRevision;
-        auto state = InputState::Missing;
-        Json meta = Json::object();
-        if (present) {
-            meta = Json::parse(current->record.meta);
-            // Compared as values: JSON numbers compare numerically.
-            state = *current->geometryRevision != pin.geometryRevision ? InputState::Edited
-                : !pin.metadata.is_null()
-                        && adapterMetadata(pin.kind, meta, current->record.fiber) != pin.metadata
-                    ? InputState::MetadataChanged
-                    : InputState::Fitted;
-        } else {
-            result.problems.push_back(pin.kind + " " + pin.uuid + " (" + pin.name
-                                      + ") is not in this store");
-        }
-        std::optional<vc::objects::GeometryRevision> geometry;
-        std::optional<double> scale;
-        try {
-            if (present) {
-                geometry = db.geometryRevision(txn, *current->geometryRevision);
-                // Stored XYZ -> reference-volume voxels, in the frame the
-                // object declares now.
-                scale = vc::objects::geometryScaleToVolume(meta, result.volumeUuid);
-                if (!scale)
-                    throw std::runtime_error("it declares no frame in volume " + result.volumeUuid);
-            }
-            if (pin.kind == "surface") {
-                FitSurface entry{pin, state, nullptr};
-                if (geometry) {
-                    auto stored = load_quad_from_store(db, txn, pin.uuid, geometry->uuid);
-                    if (*scale != 1.0) {
-                        // Invalid vertices keep the sentinel; grid steps follow the frame.
-                        auto* points = new cv::Mat_<cv::Vec3f>(stored->rawPointsPtr()->clone());
-                        for (auto& point : *points)
-                            if (point[0] != -1.f) point *= float(*scale);
-                        auto converted = std::make_unique<QuadSurface>(
-                            points, stored->scale() / float(*scale));
-                        converted->id = stored->id;
-                        converted->meta = stored->meta;
-                        converted->tags = stored->tags;
-                        const cv::Mat mask = stored->channel("mask");
-                        if (!mask.empty()) converted->setChannel("mask", mask);
-                        stored = std::move(converted);
-                    }
-                    entry.surface = std::shared_ptr<QuadSurface>(std::move(stored));
-                }
-                result.surfaces.push_back(std::move(entry));
-            } else if (pin.kind == "point_collection") {
-                FitPointCollection entry;
-                entry.pin = pin;
-                entry.state = state;
-                if (geometry) {
-                    entry.absolute = valueOrNull(valueOrNull(meta, "source"), "winding_is_absolute") == Json(true);
-                    const auto ids = readIds(db, txn, *geometry);
-                    const auto points = readXyz(db, txn, *geometry, "points", *scale);
-                    if (ids.size() != points.size())
-                        throw std::runtime_error("point IDs and points differ in length");
-                    const auto annotations = Json::parse(
-                        db.geometryPointAnnotations(txn, geometry->uuid, "points"));
-                    std::vector<std::size_t> order(ids.size());
-                    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
-                    std::sort(order.begin(), order.end(),
-                              [&](std::size_t a, std::size_t b) { return ids[a] < ids[b]; });
-                    for (const auto i : order) {
-                        entry.ids.push_back(ids[i]);
-                        entry.points.push_back(points[i]);
-                        const Json annotation = annotations.is_array() && i < annotations.size()
-                            ? annotations[i] : Json(nullptr);
-                        const Json wind = valueOrNull(annotation, "wind_a");
-                        entry.windings.push_back(wind.is_number() ? std::optional(wind.get<double>())
-                                                                  : std::nullopt);
-                    }
-                }
-                result.pointCollections.push_back(std::move(entry));
-            } else if (pin.kind == "fiber") {
-                FitFiber entry{pin, state, {}, {}, {}};
-                if (geometry) {
-                    if (current->record.fiber) entry.family = current->record.fiber->family;
-                    entry.controls = readXyz(db, txn, *geometry, "control_points", *scale);
-                    entry.line = readXyz(db, txn, *geometry, "line_points", *scale);
-                }
-                result.fibers.push_back(std::move(entry));
-            }
-        } catch (const std::exception& error) {
-            result.problems.push_back(pin.kind + " " + pin.uuid + ": " + error.what());
-        }
-    }
-    compareRelationships(db, txn, manifest, pins, result);
+    for (const auto& pin : pins) readObject(db, txn, pin, result.volumeUuid, result);
+    compareRelationships(db, txn, document.at("manifest"), pins, nullptr, result);
     return result;
+}
+
+FitInputChanges readFitInputChanges(const ObjectStore& db, const Txn& txn, const Json& document,
+                                    const std::set<std::string>& objectUuids,
+                                    const std::set<std::string>& relationshipUuids)
+{
+    FitInputChanges changes;
+    if (!sameStore(db, txn, document, changes.inputs)) return changes;
+    const auto pins = manifestPins(document);
+    for (const auto& pin : pins)
+        if (objectUuids.contains(pin.uuid)) readObject(db, txn, pin, changes.inputs.volumeUuid, changes.inputs);
+    // A changed object's links: the fitted ones, and the ones it has now.
+    changes.checkedRelationships = relationshipUuids;
+    for (const auto& entry : document.at("manifest").value("relationships", Json::array()))
+        if (objectUuids.contains(entry.value("a", std::string()))
+            || objectUuids.contains(entry.value("b", std::string())))
+            changes.checkedRelationships.insert(entry.at("uuid").get<std::string>());
+    for (const auto& pin : pins)
+        if (objectUuids.contains(pin.uuid))
+            for (const auto& edge : db.edgesOf(txn, pin.uuid)) changes.checkedRelationships.insert(edge.uuid);
+    compareRelationships(db, txn, document.at("manifest"), pins, &changes.checkedRelationships, changes.inputs);
+    return changes;
+}
+
+void applyFitInputChanges(FitInputs& inputs, FitInputChanges changes)
+{
+    // Every relationship a re-read object has now was compared again, so an
+    // added one at a re-read endpoint that was not found again is gone.
+    std::set<std::string> reread;
+    for (const auto& entry : changes.inputs.surfaces) reread.insert(entry.pin.uuid);
+    for (const auto& entry : changes.inputs.pointCollections) reread.insert(entry.pin.uuid);
+    for (const auto& entry : changes.inputs.fibers) reread.insert(entry.pin.uuid);
+    replaceByUuid(inputs.surfaces, changes.inputs.surfaces);
+    replaceByUuid(inputs.pointCollections, changes.inputs.pointCollections);
+    replaceByUuid(inputs.fibers, changes.inputs.fibers);
+    for (auto& link : changes.inputs.relationships) {
+        const auto found = std::find_if(inputs.relationships.begin(), inputs.relationships.end(),
+                                        [&](const auto& old) { return old.uuid == link.uuid; });
+        if (found != inputs.relationships.end()) *found = std::move(link);
+    }
+    std::erase_if(inputs.addedRelationships, [&](const FitRelationship& link) {
+        return changes.checkedRelationships.contains(link.uuid) || reread.contains(link.a)
+            || reread.contains(link.b);
+    });
+    for (auto& link : changes.inputs.addedRelationships) inputs.addedRelationships.push_back(std::move(link));
+    std::sort(inputs.addedRelationships.begin(), inputs.addedRelationships.end(),
+              [](const auto& left, const auto& right) { return left.uuid < right.uuid; });
+    // Store-level problems describe the latest read.
+    inputs.problems = std::move(changes.inputs.problems);
 }
 
 } // namespace vc3d::spiral

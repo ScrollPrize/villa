@@ -592,11 +592,11 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _inputDigest = digest;
                 loadFitInputs();
             });
-    // Store commits touching the fitted inputs reload them, coalesced.
+    // Store commits touching the fitted inputs re-read what they changed, coalesced.
     _fitInputReload = new QTimer(this);
     _fitInputReload->setSingleShot(true);
     _fitInputReload->setInterval(500);
-    connect(_fitInputReload, &QTimer::timeout, this, [this]() { loadFitInputs(); });
+    connect(_fitInputReload, &QTimer::timeout, this, &SpiralWorkspace::loadFitInputChanges);
     // The inputs can be displayed only from the store the service read.
     connect(_service, &SpiralServiceManager::storeBindingChanged, this,
             [this]() { if (!_inputManifestPath.isEmpty()) loadFitInputs(); });
@@ -787,7 +787,7 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
     for (const auto& entry : result.surfaces) {
         surfaceUpdates.emplace_back(entry.id.toStdString(), entry.surface);
         replacementIds.insert(entry.id);
-        replacement[entry.category].push_back(entry.id);
+        if (!replacement[entry.category].contains(entry.id)) replacement[entry.category].push_back(entry.id);
         replacementSourceIds[entry.id] = entry.sourceId;
         const std::string colorKey = QStringLiteral("%1/%2")
                                          .arg(entry.category == QStringLiteral("shell")
@@ -812,6 +812,12 @@ void SpiralWorkspace::installInputSurfaces(const InputSurfaceLoadResult& result,
                 replacementColors.erase(id.toStdString());
             }
         }
+    }
+    for (const QString& id : result.removedIds) {
+        surfaceUpdates.emplace_back(id.toStdString(), nullptr);
+        for (auto& ids : replacement) ids.removeAll(id);
+        replacementSourceIds.remove(id);
+        replacementColors.erase(id.toStdString());
     }
     _surfaceCategoryIds = replacement;
     _surfaceSourceIds = std::move(replacementSourceIds);
@@ -1814,24 +1820,25 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
 
 void SpiralWorkspace::noteStoreChanges(const vc::objects::StoreSessionEvent& event)
 {
-    if (!_fitInputs || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
+    if (!_fitDocument || event.kind != vc::objects::StoreSessionEvent::Kind::Committed
         || !event.touches({"surface", "point_collection", "fiber", "point-surface",
                            "same-surface", "fiber_branch"}))
         return;
-    bool reload = false;
     const auto before = _changedOtherInputs.size();
     for (const auto& change : event.changes) {
         const QString uuid = QString::fromStdString(change.recordUuid);
-        // A fitted input or a link, which may join two fitted inputs: show
-        // the store as it is now. Other inputs only matter to a rebuild.
-        if (_fitRecords.contains(uuid) || change.kind == "point-surface"
-            || change.kind == "same-surface" || change.kind == "fiber_branch")
-            reload = true;
-        else if (change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber")
+        const bool object = change.kind == "surface" || change.kind == "point_collection" || change.kind == "fiber";
+        // A fitted input, or a link that may involve one, is read again by
+        // itself. Other inputs only matter to a rebuild.
+        if (object && _fitRecords.contains(uuid))
+            _pendingObjectChanges.insert(change.recordUuid);
+        else if (change.kind == "point-surface" || change.kind == "same-surface" || change.kind == "fiber_branch")
+            _pendingLinkChanges.insert(change.recordUuid);
+        else if (object)
             _changedOtherInputs.insert(uuid);
     }
-    if (reload) _fitInputReload->start();
-    else if (_changedOtherInputs.size() != before) updateInputFreshness();
+    if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
+    if (_changedOtherInputs.size() != before) updateInputFreshness();
 }
 
 void SpiralWorkspace::updateInputFreshness()
@@ -1855,8 +1862,8 @@ void SpiralWorkspace::updateInputFreshness()
         notes << tr("%n fitted link(s) differ in the attached store", "", int(links));
     if (const auto links = inputs.count(LinkState::Dropped))
         notes << tr("%n fitted link(s) would no longer be consumed", "", int(links));
-    if (inputs.addedRelationships)
-        notes << tr("%n link(s) among the fitted inputs were not fitted", "", int(inputs.addedRelationships));
+    if (!inputs.addedRelationships.empty())
+        notes << tr("%n link(s) among the fitted inputs were not fitted", "", int(inputs.addedRelationships.size()));
     if (!_changedOtherInputs.isEmpty())
         notes << tr("%n other surface(s), collection(s) or fiber(s) changed, which a "
                     "rebuild's selection may include", "", int(_changedOtherInputs.size()));
@@ -1874,8 +1881,11 @@ void SpiralWorkspace::clearFitInputs(const QString& reason)
 {
     ++_fitInputGeneration;
     _fitInputs.reset();
+    _fitDocument.reset();
     _fitRecords.clear();
     _changedOtherInputs.clear();
+    _pendingObjectChanges.clear();
+    _pendingLinkChanges.clear();
     if (_fitInputReload) _fitInputReload->stop();
     updateInputFreshness();
     for (auto& state : _pclOverlays) {
@@ -1919,6 +1929,13 @@ void SpiralWorkspace::loadFitInputs()
         return;
     }
     const quint64 generation = ++_fitInputGeneration;
+    // Commits from here on are re-read after this read installs; earlier
+    // ones are in it.
+    _fitDocument = std::make_shared<const nlohmann::json>(document);
+    _pendingObjectChanges.clear();
+    _pendingLinkChanges.clear();
+    _fitRecords.clear();
+    for (const auto& pin : vc3d::spiral::manifestPins(document)) _fitRecords.insert(QString::fromStdString(pin.uuid));
     auto* watcher = new QFutureWatcher<std::shared_ptr<vc3d::spiral::FitInputs>>(this);
     connect(watcher, &QFutureWatcher<std::shared_ptr<vc3d::spiral::FitInputs>>::finished, this,
             [this, watcher, generation]() {
@@ -1947,32 +1964,38 @@ void SpiralWorkspace::installFitInputs(
     // Reloads of one fit keep counting the other inputs a rebuild may take.
     if (!_fitInputs || _fitInputs->digest != inputs->digest) _changedOtherInputs.clear();
     _fitInputs = inputs;
-    _fitRecords.clear();
-    for (const auto& entry : inputs->surfaces) _fitRecords.insert(QString::fromStdString(entry.pin.uuid));
-    for (const auto& entry : inputs->pointCollections) _fitRecords.insert(QString::fromStdString(entry.pin.uuid));
-    for (const auto& entry : inputs->fibers) _fitRecords.insert(QString::fromStdString(entry.pin.uuid));
-    for (const auto& entry : inputs->relationships) _fitRecords.insert(QString::fromStdString(entry.uuid));
+    _installedFitInputGeneration = generation;
     updateInputFreshness();
-    using vc3d::spiral::InputState;
     InputSurfaceLoadResult surfaces;
     surfaces.categories = {QStringLiteral("verified")};
-    const QString digest = QString::fromStdString(inputs->digest).left(12);
-    for (const auto& entry : inputs->surfaces) {
-        if (!entry.surface) continue;
-        const QString uuid = QString::fromStdString(entry.pin.uuid);
-        // Keyed and coloured by object UUID, which survives renames.
-        const QString id = QStringLiteral("spiral/verified/%1/%2").arg(digest, uuid);
-        entry.surface->id = id.toStdString();
-        surfaces.surfaces.push_back({QStringLiteral("verified"), id, uuid, entry.surface});
-    }
+    for (const auto& entry : inputs->surfaces)
+        if (entry.surface) surfaces.surfaces.push_back(fitSurfaceEntry(entry));
     installInputSurfaces(surfaces, _inputSurfaceGeneration);
+    rebuildFitPclDocuments();
+    rebuildFitFibers();
+    refreshFitOverlays();
+    showFitInputProblems(*inputs);
+    if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
+}
 
+SpiralWorkspace::InputSurfaceEntry SpiralWorkspace::fitSurfaceEntry(const vc3d::spiral::FitSurface& entry) const
+{
+    const QString uuid = QString::fromStdString(entry.pin.uuid);
+    // Keyed and coloured by object UUID, which survives renames.
+    const QString id = QStringLiteral("spiral/verified/%1/%2")
+                           .arg(QString::fromStdString(_fitInputs->digest).left(12), uuid);
+    entry.surface->id = id.toStdString();
+    return {QStringLiteral("verified"), id, uuid, entry.surface};
+}
+
+void SpiralWorkspace::rebuildFitPclDocuments()
+{
     // Absolute and relative collections carry windings and share the
     // relative overlay; unannotated ones are same-winding collections.
     std::map<vc3d::spiral::PclRole, QJsonObject> collections;
     int collectionId = 0;
-    for (const auto& entry : inputs->pointCollections) {
-        if (entry.state == InputState::Missing) continue;
+    for (const auto& entry : _fitInputs->pointCollections) {
+        if (entry.ids.empty()) continue;
         const bool annotated = entry.absolute
             || std::any_of(entry.windings.begin(), entry.windings.end(),
                            [](const auto& wind) { return wind.has_value(); });
@@ -1992,6 +2015,7 @@ void SpiralWorkspace::installFitInputs(
                 {QStringLiteral("object_uuid"), QString::fromStdString(entry.pin.uuid)},
                 {QStringLiteral("winding_is_absolute"), entry.absolute}}}};
     }
+    const QString digest = QString::fromStdString(_fitInputs->digest).left(12);
     for (const auto role : vc3d::spiral::kEditablePclRoles) {
         auto& state = pclOverlay(role);
         state.document = {};
@@ -2006,15 +2030,99 @@ void SpiralWorkspace::installFitInputs(
         if (out.open(QIODevice::WriteOnly) && out.write(bytes) == bytes.size() && out.commit())
             state.documentPath = path;
     }
+}
+
+void SpiralWorkspace::rebuildFitFibers()
+{
     _fitFibers.clear();
-    for (const auto& entry : inputs->fibers)
+    for (const auto& entry : _fitInputs->fibers)
         if (entry.line.size() > 1)
             _fitFibers.push_back({entry.line, QString::fromStdString(entry.family)});
-    refreshFitOverlays();
+}
 
+void SpiralWorkspace::showFitInputProblems(const vc3d::spiral::FitInputs& inputs)
+{
     QStringList notes;
-    for (const auto& problem : inputs->problems) notes << QString::fromStdString(problem);
+    for (const auto& problem : inputs.problems) notes << QString::fromStdString(problem);
+    const auto add = [&notes](const auto& entries) {
+        for (const auto& entry : entries)
+            if (!entry.problem.empty()) notes << QString::fromStdString(entry.problem);
+    };
+    add(inputs.surfaces);
+    add(inputs.pointCollections);
+    add(inputs.fibers);
     if (!notes.isEmpty()) statusBar()->showMessage(notes.join(QStringLiteral("; ")), 15000);
+}
+
+void SpiralWorkspace::loadFitInputChanges()
+{
+    // One read at a time, on top of the installed full read of the current
+    // manifest; what arrives meanwhile waits for it.
+    if (_shuttingDown || !_fitInputs || !_fitDocument || _fitChangesReading
+        || _installedFitInputGeneration != _fitInputGeneration)
+        return;
+    if (_pendingObjectChanges.empty() && _pendingLinkChanges.empty()) return;
+    const auto session = _state->objectStoreSession();
+    const auto attachment = _state->objectStoreAttachment();
+    if (!session || !attachment) return;
+    _fitChangesReading = true;
+    const quint64 generation = _fitInputGeneration;
+    auto objects = std::exchange(_pendingObjectChanges, {});
+    auto links = std::exchange(_pendingLinkChanges, {});
+    using Changes = std::shared_ptr<vc3d::spiral::FitInputChanges>;
+    auto* watcher = new QFutureWatcher<Changes>(this);
+    connect(watcher, &QFutureWatcher<Changes>::finished, this, [this, watcher, generation]() {
+        const auto changes = watcher->result();
+        watcher->deleteLater();
+        _fitChangesReading = false;
+        if (_shuttingDown) return;
+        if (generation == _fitInputGeneration && generation == _installedFitInputGeneration && _fitInputs)
+            installFitInputChanges(*changes);
+        if (!_pendingObjectChanges.empty() || !_pendingLinkChanges.empty()) _fitInputReload->start();
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, document = _fitDocument,
+                                          objects = std::move(objects), links = std::move(links)]() {
+        auto changes = std::make_shared<vc3d::spiral::FitInputChanges>();
+        try {
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                *changes = vc3d::spiral::readFitInputChanges(db, txn, *document, objects, links);
+            });
+        } catch (const std::exception& error) {
+            changes->inputs.problems.push_back(error.what());
+        }
+        return changes;
+    }));
+}
+
+void SpiralWorkspace::installFitInputChanges(vc3d::spiral::FitInputChanges changes)
+{
+    // Only what changed is replaced: one surface, the PCL overlays when a
+    // collection changed, the fiber overlay when a fiber did.
+    InputSurfaceLoadResult surfaces;
+    for (const auto& entry : changes.inputs.surfaces) {
+        if (entry.surface) {
+            surfaces.surfaces.push_back(fitSurfaceEntry(entry));
+        } else {
+            surfaces.removedIds << QStringLiteral("spiral/verified/%1/%2")
+                                       .arg(QString::fromStdString(_fitInputs->digest).left(12),
+                                            QString::fromStdString(entry.pin.uuid));
+        }
+    }
+    const bool collectionsChanged = !changes.inputs.pointCollections.empty();
+    const bool fibersChanged = !changes.inputs.fibers.empty();
+    showFitInputProblems(changes.inputs);
+    vc3d::spiral::applyFitInputChanges(*_fitInputs, std::move(changes));
+    if (!surfaces.surfaces.empty() || !surfaces.removedIds.isEmpty())
+        installInputSurfaces(surfaces, _inputSurfaceGeneration);
+    if (collectionsChanged) {
+        rebuildFitPclDocuments();
+        for (const auto role : vc3d::spiral::kEditablePclRoles) refreshPclOverlay(role);
+    }
+    if (fibersChanged) {
+        rebuildFitFibers();
+        refreshFiberOverlay();
+    }
+    updateInputFreshness();
 }
 
 void SpiralWorkspace::loadRunDiff()

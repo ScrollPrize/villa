@@ -4,7 +4,7 @@ A Spiral fit's patches, point collections and fibers come from the Spiral
 service's object store and are frozen for the resident fit; see "Object store
 and frozen inputs" and "Connecting from VC3D" in the
 [Spiral fitting README](../../spiral-fitting/README.md). The workspace shows
-them as the attached store holds them now, reloading when they change (fibers
+them as the attached store holds them now, updating each one a commit changes (fibers
 with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
 including its links.

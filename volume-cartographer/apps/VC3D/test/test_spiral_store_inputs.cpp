@@ -18,6 +18,7 @@
 #include <QCryptographicHash>
 #include <QTemporaryDir>
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -182,6 +183,16 @@ struct Fixture {
         return selection;
     }
 
+    vc3d::spiral::FitInputChanges changes(const Json& document, const std::set<std::string>& objects,
+                                          const std::set<std::string>& links)
+    {
+        vc3d::spiral::FitInputChanges result;
+        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            result = vc3d::spiral::readFitInputChanges(db, txn, document, objects, links);
+        });
+        return result;
+    }
+
     vc3d::spiral::FitInputs read(const Json& document)
     {
         vc3d::spiral::FitInputs result;
@@ -191,6 +202,49 @@ struct Fixture {
         return result;
     }
 };
+
+// Everything the workspace displays or reports of a read.
+Json describe(const vc3d::spiral::FitInputs& inputs)
+{
+    Json result = {{"problems", inputs.problems}, {"added", Json::array()}};
+    for (const auto& link : inputs.addedRelationships) result["added"].push_back({link.uuid, link.a, link.b});
+    const auto points = [](const std::vector<cv::Vec3d>& values) {
+        Json list = Json::array();
+        for (const auto& value : values) list.push_back({value[0], value[1], value[2]});
+        return list;
+    };
+    for (const auto& entry : inputs.surfaces) {
+        Json grid = Json::array();
+        if (entry.surface)
+            for (const auto& point : *entry.surface->rawPointsPtr()) grid.push_back({point[0], point[1], point[2]});
+        result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
+                                             {"problem", entry.problem}, {"grid", grid}};
+    }
+    for (const auto& entry : inputs.pointCollections)
+        result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
+                                             {"problem", entry.problem}, {"absolute", entry.absolute},
+                                             {"ids", entry.ids}, {"points", points(entry.points)}};
+    for (const auto& entry : inputs.fibers)
+        result["objects"][entry.pin.uuid] = {{"state", vc3d::spiral::inputStateName(entry.state)},
+                                             {"problem", entry.problem}, {"family", entry.family},
+                                             {"line", points(entry.line)}};
+    for (const auto& link : inputs.relationships)
+        result["links"][link.uuid] = vc3d::spiral::linkStateName(link.state);
+    return result;
+}
+
+// The incremental read of what a commit changed, applied to the previous
+// read, must give what a full read gives.
+vc3d::spiral::FitInputs incremental(Fixture& fixture, const Json& document, vc3d::spiral::FitInputs previous,
+                                    const std::set<std::string>& objects, const std::set<std::string>& links,
+                                    const std::string& what)
+{
+    vc3d::spiral::applyFitInputChanges(previous, fixture.changes(document, objects, links));
+    auto full = fixture.read(document);
+    require(describe(previous) == describe(full), "incremental read differs from a full read after " + what
+                + ":\n" + describe(previous).dump() + "\n" + describe(full).dump());
+    return full;
+}
 
 void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
 {
@@ -220,7 +274,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
 
     using vc3d::spiral::LinkState;
     require(inputs.relationships.size() == 1 && inputs.relationships[0].state == LinkState::Fitted
-                && inputs.addedRelationships == 0,
+                && inputs.addedRelationships.empty(),
             "the fitted link is as fitted");
 
     // A metadata edit the adapter reads, then a geometry edit: what is read
@@ -230,7 +284,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
         db.setMeta(txn, fixture.pcl, "sampling_group", "\"reviewed\"");
         db.setMeta(txn, fixture.surface, "review_note", "\"unrelated\"");
     });
-    inputs = fixture.read(document);
+    inputs = incremental(fixture, document, inputs, {fixture.pcl, fixture.surface}, {}, "metadata edits");
     require(inputs.pointCollections.at(0).state == InputState::MetadataChanged, "metadata change detected");
     require(inputs.surfaces.at(0).state == InputState::Fitted, "unread metadata is no change");
     auto unrecorded = document;
@@ -240,7 +294,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     fixture.session->act(fixture.attachment, fixture.pins({fixture.pcl}), [&](auto& db, auto& txn) {
         db.setMeta(txn, fixture.pcl, "source", R"({"winding_is_absolute":false})");
     });
-    inputs = fixture.read(document);
+    inputs = incremental(fixture, document, inputs, {fixture.pcl}, {}, "a role change");
     require(!inputs.pointCollections.at(0).absolute, "the role is the store's now");
 
     fixture.session->act(fixture.attachment, fixture.pins({fixture.fiber}), [&](auto& db, auto& txn) {
@@ -252,7 +306,7 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
         db.editGeometry(txn, fixture.fiber, {edit}, current->uuid,
                         [](const std::vector<EdgeRecord>&) { return std::vector<GeometryEdgeEdit>{}; });
     });
-    inputs = fixture.read(document);
+    inputs = incremental(fixture, document, inputs, {fixture.fiber}, {}, "a geometry edit");
     require(inputs.fibers.at(0).state == InputState::Edited, "geometry edit detected");
     require(inputs.fibers.at(0).line.size() == 3 && inputs.fibers.at(0).line[1] == cv::Vec3d(0, 0, 0),
             "the edited geometry is read");
@@ -263,20 +317,29 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
                          [&](auto& db, auto& txn) {
         db.setMeta(txn, fixture.link, "distance", "0.25");
     });
-    inputs = fixture.read(document);
+    inputs = incremental(fixture, document, inputs, {}, {fixture.link}, "a link edit");
     require(inputs.relationships.at(0).state == LinkState::Changed, "link edit detected");
+    std::string added;
     fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.fiber}),
                          [&](auto& db, auto& txn) {
         EdgeRecord edge; edge.kind = "same-surface"; edge.aUuid = fixture.surface; edge.bUuid = fixture.fiber;
         edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
-        db.addEdge(txn, edge);
+        added = db.addEdge(txn, edge);
     });
-    inputs = fixture.read(document);
-    require(inputs.addedRelationships == 1, "a new consumable link is reported");
+    inputs = incremental(fixture, document, inputs, {}, {added}, "a new link");
+    require(inputs.addedRelationships.size() == 1 && inputs.addedRelationships[0].uuid == added
+                && inputs.addedRelationships[0].a == fixture.surface,
+            "a new consumable link is reported");
     fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.pcl}),
                          [&](auto& db, auto& txn) { db.setApproval(txn, fixture.link, "rejected"); });
-    inputs = fixture.read(document);
+    inputs = incremental(fixture, document, inputs, {}, {fixture.link}, "a rejection");
     require(inputs.relationships.at(0).state == LinkState::Dropped, "a rejected link is dropped");
+    // Removing the new link: reported by the link alone, or by an endpoint.
+    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.fiber}),
+                         [&](auto& db, auto& txn) { db.removeEdge(txn, added); });
+    require(incremental(fixture, document, inputs, {}, {added}, "a removed link").addedRelationships.empty(),
+            "a removed link is no longer reported");
+    inputs = incremental(fixture, document, inputs, {fixture.fiber}, {}, "a removed link, by its endpoint");
 
     // An object this store does not hold is missing and shows nothing.
     auto missing = document;
@@ -284,7 +347,8 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     inputs = fixture.read(missing);
     require(inputs.surfaces.at(0).state == InputState::Missing && !inputs.surfaces.at(0).surface,
             "a missing object has no geometry");
-    require(!inputs.unchanged() && inputs.problems.size() == 1, "a missing object is reported");
+    require(!inputs.unchanged() && !inputs.surfaces.at(0).problem.empty() && inputs.problems.empty(),
+            "a missing object is reported");
 
     auto other = document;
     other["manifest"]["store"]["uuid"] = util::newUuid();
@@ -342,8 +406,17 @@ int dump(const std::string& spec)
     const auto attachment = session->attach(store, options);
     vc3d::spiral::FitInputs inputs;
     std::map<std::string, std::string> derived;
+    double fullSeconds = 0, changeSeconds = 0;
     session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto start = std::chrono::steady_clock::now();
         inputs = vc3d::spiral::readFitInputs(db, txn, document);
+        const auto middle = std::chrono::steady_clock::now();
+        // What one commit to the first surface and the first link costs.
+        if (!inputs.surfaces.empty() && !inputs.relationships.empty())
+            (void)vc3d::spiral::readFitInputChanges(db, txn, document, {inputs.surfaces[0].pin.uuid},
+                                                    {inputs.relationships[0].uuid});
+        fullSeconds = std::chrono::duration<double>(middle - start).count();
+        changeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - middle).count();
         for (const auto& pin : vc3d::spiral::manifestPins(document)) {
             const auto record = db.objectByUuid(txn, pin.uuid);
             const auto meta = Json::parse(record->meta);
@@ -381,15 +454,19 @@ int dump(const std::string& spec)
                                             {"line", summary(asFloat(entry.line))}};
     std::ofstream(out) << Json{{"frame", "reference-volume voxels, XYZ"}, {"objects", objects}}.dump(1);
     for (const auto& problem : inputs.problems) std::cerr << problem << "\n";
+    for (const auto& entry : inputs.surfaces) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
+    for (const auto& entry : inputs.pointCollections) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
+    for (const auto& entry : inputs.fibers) if (!entry.problem.empty()) std::cerr << entry.problem << "\n";
     using vc3d::spiral::LinkState;
+    std::cout << "read: full " << fullSeconds << " s, one surface and one link " << changeSeconds << " s\n";
     std::cout << "inputs: " << inputs.count(vc3d::spiral::InputState::Fitted) << " as fitted, "
               << inputs.count(vc3d::spiral::InputState::Edited) << " edited, "
               << inputs.count(vc3d::spiral::InputState::MetadataChanged) << " metadata changed, "
               << inputs.count(vc3d::spiral::InputState::Missing) << " missing\n";
     std::cout << "links: " << inputs.count(LinkState::Fitted) << " as fitted, "
               << inputs.count(LinkState::Changed) << " changed, " << inputs.count(LinkState::Dropped)
-              << " dropped, " << inputs.addedRelationships << " added\n";
-    return inputs.problems.empty() ? 0 : 1;
+              << " dropped, " << inputs.addedRelationships.size() << " added\n";
+    return inputs.unchanged() ? 0 : 1;
 }
 } // namespace
 

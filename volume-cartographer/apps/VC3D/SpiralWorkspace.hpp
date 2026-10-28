@@ -13,6 +13,7 @@
 #include <QSet>
 #include <QStringList>
 #include <QTemporaryDir>
+#include <nlohmann/json_fwd.hpp>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <vc_reader/affine.hpp>
@@ -21,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,6 +31,8 @@
 
 namespace vc3d::spiral {
 struct FitInputs;
+struct FitInputChanges;
+struct FitSurface;
 }
 
 class AxisAlignedSliceController;
@@ -133,8 +137,11 @@ private:
         std::shared_ptr<QuadSurface> surface;
     };
     struct InputSurfaceLoadResult {
-        // The surface categories this result replaces; others are kept.
+        // The surface categories this result replaces; others are kept. With
+        // none, the surfaces are added or replaced by ID and `removedIds`
+        // removed, leaving every other surface as it is.
         QStringList categories;
+        QStringList removedIds;
         std::vector<InputSurfaceEntry> surfaces;
         QStringList warnings;
     };
@@ -159,8 +166,16 @@ private:
     void installFitInputs(const std::shared_ptr<vc3d::spiral::FitInputs>& inputs,
                              quint64 generation);
     void clearFitInputs(const QString& reason);
-    // Reload the fit's inputs after a store commit touching them or their
-    // links; count other inputs a rebuild's selection may include.
+    // Re-read only the fitted objects and links store commits changed, and
+    // replace only their overlays (vc3d::spiral::readFitInputChanges).
+    void loadFitInputChanges();
+    void installFitInputChanges(vc3d::spiral::FitInputChanges changes);
+    InputSurfaceEntry fitSurfaceEntry(const vc3d::spiral::FitSurface& entry) const;
+    void rebuildFitPclDocuments();
+    void rebuildFitFibers();
+    void showFitInputProblems(const vc3d::spiral::FitInputs& inputs);
+    // Queue the fitted objects and links a store commit changed for
+    // loadFitInputChanges; count other inputs a rebuild's selection may include.
     void noteStoreChanges(const vc::objects::StoreSessionEvent& event);
     void updateInputFreshness();
     void refreshPclOverlay(vc3d::spiral::PclRole role);
@@ -270,6 +285,14 @@ private:
     QSet<QString> _fitRecords;
     QSet<QString> _changedOtherInputs;
     QTimer* _fitInputReload = nullptr;
+    // The manifest being displayed, and the fitted objects and links changed
+    // by commits not yet read.
+    std::shared_ptr<const nlohmann::json> _fitDocument;
+    std::set<std::string> _pendingObjectChanges;
+    std::set<std::string> _pendingLinkChanges;
+    bool _fitChangesReading = false;
+    // The generation of the full read _fitInputs holds.
+    quint64 _installedFitInputGeneration = 0;
     QTemporaryDir _fitPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
