@@ -4,7 +4,6 @@
 #if UTILS_HAS_CURL
 
 #include <curl/curl.h>
-#include <QXmlStreamReader>
 
 #include <array>
 #include <cstring>
@@ -158,28 +157,210 @@ std::size_t write_callback(char* ptr, std::size_t size,
     return total;
 }
 
+// Reads the XML that S3 error bodies use, and nothing more: an optional UTF-8
+// declaration, elements and attributes with unprefixed ASCII names, text, and
+// predefined or numeric character references. A DTD, comment, processing
+// instruction, CDATA section or namespace prefix fails the scan, so a body
+// that passes is well-formed XML 1.0 with namespaces.
+class XmlScanner {
+public:
+    explicit XmlScanner(std::string_view in) : in_(in) {}
+
+    bool at_end() const { return pos_ == in_.size(); }
+
+    bool skip(std::string_view s) {
+        if (!in_.substr(pos_).starts_with(s)) return false;
+        pos_ += s.size();
+        return true;
+    }
+
+    bool skip_space() {
+        const auto start = pos_;
+        while (pos_ < in_.size() && is_space(in_[pos_])) ++pos_;
+        return pos_ != start;
+    }
+
+    // The XML declaration, if any: version 1.0, UTF-8.
+    bool declaration() {
+        if (!skip("<?xml")) return true;
+        if (!skip_space() || !skip("version") || assigned_value() != "1.0") return false;
+        bool spaced = skip_space();
+        if (spaced && skip("encoding")) {
+            const auto encoding = assigned_value();
+            if (encoding != "UTF-8" && encoding != "utf-8") return false;
+            spaced = skip_space();
+        }
+        if (spaced && skip("standalone")) {
+            const auto standalone = assigned_value();
+            if (standalone != "yes" && standalone != "no") return false;
+            skip_space();
+        }
+        return skip("?>");
+    }
+
+    // An element or attribute name, or empty if none starts here.
+    std::string_view name() {
+        const auto start = pos_;
+        while (pos_ < in_.size() && is_name_char(in_[pos_], pos_ == start)) ++pos_;
+        return in_.substr(start, pos_ - start);
+    }
+
+    // The rest of a start tag; `empty` is set for one that ends in "/>".
+    bool attributes(bool& empty) {
+        std::vector<std::string_view> seen;
+        while (true) {
+            const bool spaced = skip_space();
+            if (skip(">")) return true;
+            if (skip("/>")) {
+                empty = true;
+                return true;
+            }
+            const auto attribute = name();
+            if (!spaced || attribute.empty() || std::ranges::find(seen, attribute) != seen.end())
+                return false;
+            seen.push_back(attribute);
+            const auto value = assigned_value();
+            if (!value) return false;
+            // A default namespace may not name a reserved namespace. Rather than
+            // decode references in it, refuse them.
+            if (attribute == "xmlns" && (value->find('&') != std::string_view::npos ||
+                                         *value == "http://www.w3.org/XML/1998/namespace" ||
+                                         *value == "http://www.w3.org/2000/xmlns/"))
+                return false;
+        }
+    }
+
+    bool end_tag() {
+        skip_space();
+        return skip(">");
+    }
+
+    // Character data up to `end`: '<' in content, or an attribute value's
+    // closing quote. Fails on any character or markup that XML forbids there.
+    std::optional<std::string_view> text(char end) {
+        const auto start = pos_;
+        while (pos_ < in_.size() && in_[pos_] != end) {
+            if (in_[pos_] == '<' || (end == '<' && in_.substr(pos_).starts_with("]]>")))
+                return std::nullopt;
+            if (!(in_[pos_] == '&' ? skip_reference() : skip_char())) return std::nullopt;
+        }
+        return in_.substr(start, pos_ - start);
+    }
+
+    static std::string_view trimmed(std::string_view s) {
+        while (!s.empty() && is_space(s.front())) s.remove_prefix(1);
+        while (!s.empty() && is_space(s.back())) s.remove_suffix(1);
+        return s;
+    }
+
+private:
+    static bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+    static bool is_name_char(char c, bool first) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
+            (!first && ((c >= '0' && c <= '9') || c == '-' || c == '.'));
+    }
+
+    static bool is_xml_char(char32_t c) {
+        return c == '\t' || c == '\n' || c == '\r' || (c >= 0x20 && c <= 0xD7FF) ||
+            (c >= 0xE000 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0x10FFFF);
+    }
+
+    // S? '=' S? and a quoted value, returned without its quotes.
+    std::optional<std::string_view> assigned_value() {
+        skip_space();
+        if (!skip("=")) return std::nullopt;
+        skip_space();
+        if (pos_ == in_.size() || (in_[pos_] != '"' && in_[pos_] != '\'')) return std::nullopt;
+        const char quote = in_[pos_++];
+        const auto value = text(quote);
+        if (!value || !skip({&quote, 1})) return std::nullopt;
+        return value;
+    }
+
+    // One of the five predefined entities, or a character reference.
+    bool skip_reference() {
+        const auto end = in_.find(';', pos_);
+        if (end == std::string_view::npos) return false;
+        const auto ref = in_.substr(pos_ + 1, end - pos_ - 1);
+        pos_ = end + 1;
+        if (ref == "amp" || ref == "lt" || ref == "gt" || ref == "apos" || ref == "quot") return true;
+        if (!ref.starts_with('#')) return false;
+        const bool hex = ref.starts_with("#x");
+        const auto digits = ref.substr(hex ? 2 : 1);
+        if (digits.empty()) return false;
+        char32_t c = 0;
+        for (const char d : digits) {
+            int digit = -1;
+            if (d >= '0' && d <= '9') digit = d - '0';
+            else if (hex && d >= 'a' && d <= 'f') digit = d - 'a' + 10;
+            else if (hex && d >= 'A' && d <= 'F') digit = d - 'A' + 10;
+            if (digit < 0) return false;
+            c = c * (hex ? 16 : 10) + digit;
+            if (c > 0x10FFFF) return false;
+        }
+        return is_xml_char(c);
+    }
+
+    // One UTF-8 character in its shortest form, if XML allows it.
+    bool skip_char() {
+        const auto lead = static_cast<unsigned char>(in_[pos_]);
+        std::size_t length = 0;
+        if (lead < 0x80) length = 1;
+        else if (lead >= 0xC2 && lead < 0xE0) length = 2;
+        else if (lead >= 0xE0 && lead < 0xF0) length = 3;
+        else if (lead >= 0xF0 && lead < 0xF5) length = 4;
+        if (length == 0 || in_.size() - pos_ < length) return false;
+        char32_t c = length == 1 ? lead : lead & (0x7F >> length);
+        for (std::size_t i = 1; i < length; ++i) {
+            const auto next = static_cast<unsigned char>(in_[pos_ + i]);
+            if ((next & 0xC0) != 0x80) return false;
+            c = (c << 6) | (next & 0x3F);
+        }
+        pos_ += length;
+        constexpr std::array<char32_t, 5> shortest{0, 0, 0x80, 0x800, 0x10000};
+        return c >= shortest[length] && is_xml_char(c);
+    }
+
+    std::string_view in_;
+    std::size_t pos_ = 0;
+};
+
 // A 404 from an S3 origin can describe a failed bucket lookup, not an absent
 // object. Do not infer absence from a substring or a partial XML document.
 bool confirms_missing_s3_key(std::string_view body) {
-    QXmlStreamReader xml(QByteArray(body.data(), static_cast<qsizetype>(body.size())));
-    int depth = 0, roots = 0, codes = 0;
-    QString code;
-    while (!xml.atEnd()) {
-        const auto token = xml.readNext();
-        if (token == QXmlStreamReader::DTD) return false;
-        if (token == QXmlStreamReader::StartElement) {
-            ++depth;
-            if (depth == 1 && (++roots != 1 || xml.name() != u"Error")) return false;
-            if (depth == 2 && xml.name() == u"Code") {
-                ++codes;
-                code = xml.readElementText(QXmlStreamReader::ErrorOnUnexpectedElement).trimmed();
-                --depth; // readElementText consumed this element's end token.
-            }
-        } else if (token == QXmlStreamReader::EndElement) {
-            --depth;
+    XmlScanner xml(body);
+    if (!xml.declaration()) return false;
+    std::vector<std::string_view> open;
+    int roots = 0, codes = 0;
+    bool no_such_key = false;
+    while (true) {
+        // Only whitespace may come before or after the root element.
+        const auto text = xml.text('<');
+        if (!text || (open.empty() && !XmlScanner::trimmed(*text).empty())) return false;
+        if (xml.at_end()) break;
+        if (xml.skip("</")) {
+            if (open.empty() || xml.name() != open.back() || !xml.end_tag()) return false;
+            open.pop_back();
+            continue;
+        }
+        xml.skip("<");
+        const auto name = xml.name();
+        bool empty = false;
+        if (name.empty() || !xml.attributes(empty)) return false;
+        if (open.empty() && (++roots != 1 || name != "Error")) return false;
+        if (open.size() == 1 && name == "Code") {
+            if (++codes != 1) return false;
+            if (empty) continue;
+            // Code holds text only, never a child element.
+            const auto code = xml.text('<');
+            if (!code || !xml.skip("</Code") || !xml.end_tag()) return false;
+            no_such_key = XmlScanner::trimmed(*code) == "NoSuchKey";
+        } else if (!empty) {
+            open.push_back(name);
         }
     }
-    return !xml.hasError() && depth == 0 && roots == 1 && codes == 1 && code == u"NoSuchKey";
+    return open.empty() && roots == 1 && codes == 1 && no_such_key;
 }
 
 bool is_s3_endpoint(std::string_view url) {

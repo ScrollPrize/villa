@@ -4,7 +4,7 @@ A failed S3 bucket lookup can return HTTP 404 even when the requested object exi
 
 ## Response policy
 
-For S3 GET and ranged GET requests, absence requires HTTP 404 with a complete XML `Error` document containing exactly one direct `Code` equal to `NoSuchKey`. Empty, HTML, truncated, conflicting, nested-code and other S3 errors remain failures. DTDs are rejected. Unconfirmed responses use the configured retry count and backoff, opening a fresh connection for each retry.
+For S3 GET and ranged GET requests, absence requires HTTP 404 with a complete XML `Error` document containing exactly one direct `Code` equal to `NoSuchKey`. Empty, HTML, truncated, conflicting, nested-code and other S3 errors remain failures. The document must be UTF-8 without a DTD, comment, processing instruction, CDATA section or namespace prefix. Unconfirmed responses use the configured retry count and backoff, opening a fresh connection for each retry.
 
 S3 identity comes from an `s3://` or regional S3 URL, a parsed AWS S3 hostname, the effective redirect URL, or the final response's `Server: AmazonS3` or `x-amz-request-id` header. Identity is retained across retries of that request if a proxy drops those headers. Matching is against the URL authority, not path, query or userinfo text.
 
@@ -32,4 +32,4 @@ ctest --test-dir build-http-tests -R '^(test_http_s3_missing|test_s3_chunk_cache
   --output-on-failure --parallel 1
 ```
 
-Use the platform compiler and dependency flags required by the normal build instructions. The XML classifier links `utils` to Qt Core, already used by VC. The loopback test fixture additionally links Qt Network. There are no new external parser or test-framework downloads.
+Use the platform compiler and dependency flags required by the normal build instructions. The XML check in `utils` is plain C++ and needs neither Qt nor an XML library. The loopback test fixture links Qt Core and Qt Network, already used by VC. There are no new external parser or test-framework downloads.
