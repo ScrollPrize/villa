@@ -34,19 +34,25 @@ NO_DENSE = {'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
 class FrozenInputsRuntime(FakeRuntime):
     def __init__(self, paths, run, preview, scroll, status_callback=None, **kwargs):
         super().__init__()
+        self.paths, self.status_callback = paths, status_callback
+        self.applied = Config(dict(run.config)).as_dict()
+        self.input_generation = 0
+        self._freeze(self.applied['object_store_input_position'])
+
+    def _freeze(self, position):
         import object_store_inputs as osi
         from vc_object_store import ObjectStore
-        config = Config(dict(run.config)).as_dict()
+        config = self.applied
         with ObjectStore.open(config['object_store_path'], read_only=True) as store:
             request = osi.request_from_config(config)
-            if config['object_store_input_position'] is not None:
+            if position is not None:
                 request = dataclasses.replace(request, position=osi.InputPosition(
-                    store.hub_status()['hub_replica'], config['object_store_input_position']))
+                    store.hub_status()['hub_replica'], position))
             snapshot = osi.read_snapshot(store, request)
         manifest = snapshot.manifest()
         manifest['link_refresh'] = {'enabled': False}
         self.digest = osi.manifest_digest(manifest)
-        run_directory = Path(paths.output_directory) / 'run'
+        run_directory = Path(self.paths.output_directory) / 'run'
         run_directory.mkdir(parents=True, exist_ok=True)
         self.manifest_path = run_directory / 'object_store_inputs.json'
         self.manifest_path.write_text(json.dumps({'digest': self.digest, 'manifest': manifest}))
@@ -56,17 +62,24 @@ class FrozenInputsRuntime(FakeRuntime):
             'selection': {kind: manifest['selection'][kind]['count'] for kind in osi.KINDS},
             'relationships': {}, 'excluded_relationships': {}, 'constraints': {},
             'link_refresh': False}
-        self.applied = config
-        if status_callback is not None:
+        if self.status_callback is not None:
             # A real session reports each status change through this; the
             # service publishes the input manifest artifact from it.
-            threading.Timer(0.2, lambda: status_callback(self.status())).start()
+            threading.Timer(0.2, lambda: self.status_callback(self.status())).start()
+
+    def update_inputs(self, position, timeout=1800.0):
+        """A resident input update: the inputs of the position, as pinned."""
+        self.applied = {**self.applied, 'object_store_input_position': position}
+        self._freeze(position)
+        self.input_generation += 1
+        return {'digest': self.digest, 'input_generation': self.input_generation}
 
     def status(self):
         status = super().status()
         status.update(input_digest=self.digest, input_summary=self.summary,
                       input_manifest_path=str(self.manifest_path),
                       input_manifest={'object_store_digest': self.digest},
+                      input_generation=self.input_generation,
                       applied_config=self.applied)
         return status
 
