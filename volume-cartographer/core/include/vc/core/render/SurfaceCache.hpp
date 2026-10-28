@@ -167,8 +167,9 @@ public:
     void setByteCapacity(std::size_t bytes);
 
     void invalidateAll();
-    // Drop the tiles overlapping a changed rectangle of the surface's *grid*
-    // (row/col) space, e.g. a brush edit.
+    // Mark stale the tiles overlapping a changed rectangle of the surface's
+    // *grid* (row/col) space, e.g. a brush edit. They stay drawable until
+    // requestView's refill replaces them, so the region never goes blank.
     void invalidateSurfaceRegion(const cv::Rect& gridCells);
 
     [[nodiscard]] Stats stats() const;

@@ -4,6 +4,7 @@
 #include "internal/Spatial.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometryReader.hpp"
+#include "spatial/SurfaceTiles.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <algorithm>
 #include <bit>
@@ -189,7 +190,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
         if (kind == "surface") {
             const auto rows = a.shape.at(0), cols = a.shape.at(1);
             if (!rows || !cols) continue;
-            constexpr int64_t cells = 32;
+            constexpr int64_t cells = surfaceTileCells;
             const int64_t tileColumns = (std::max<int64_t>(1, cols - 1) + cells - 1) / cells;
             for (int64_t row = 0; row < std::max<int64_t>(1, rows - 1); row += cells) {
                 const int64_t height = std::min(cells + 1, rows - row);

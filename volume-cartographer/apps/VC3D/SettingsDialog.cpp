@@ -70,6 +70,9 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     spinViewerOverlaySurfaceCacheGB->setValue(
         settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                        viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
+    spinSurfaceGeometryCacheGB->setValue(
+        settings.value(viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
+                       viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toInt());
     {
         const QString configured =
             settings.value(viewer::REMOTE_CACHE_DIR).toString().trimmed();
@@ -175,6 +178,7 @@ void SettingsDialog::accept()
     settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
     settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
                       spinViewerOverlaySurfaceCacheGB->value());
+    settings.setValue(viewer_cache::SURFACE_GEOMETRY_CACHE_GB, spinSurfaceGeometryCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text().trimmed());
     settings.setValue(
         perf::REMOTE_CACHE_DELTA3D,

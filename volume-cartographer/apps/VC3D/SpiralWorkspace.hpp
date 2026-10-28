@@ -50,6 +50,7 @@ class VolumePkg;
 class Volume;
 class SpiralOverlayController;
 class QTimer;
+class StoreSurfaceOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
 class SpiralLineDraftOverlay;
@@ -193,10 +194,10 @@ private:
     void updateMinimapViewIndicator();
     void panFlattenedViewerToColumn(float column);
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
-    void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
-                                        const QString& registrationId,
-                                        qint64 generation, quint64 revision,
-                                        bool preserveFocus, int attempt);
+    void syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edited = nullptr);
+    void clearSurfaceDrafts();
+    void installPreviewAlias(const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
+                             qint64 generation, quint64 revision, bool preserveFocus);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void finalizeBrushPaint();
@@ -226,6 +227,11 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
+    std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
+    // Service previews, shells and local brush surfaces are session-only
+    // drafts for store queries. Fitted surfaces retain their stored UUIDs
+    // and are queried directly, without overriding another editor's draft.
+    std::map<std::string, std::weak_ptr<QuadSurface>> _surfaceDrafts;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
     // The display-only overlay of the fit's point collections of one role

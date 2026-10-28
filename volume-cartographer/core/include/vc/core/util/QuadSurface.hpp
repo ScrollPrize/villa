@@ -382,6 +382,8 @@ public:
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
     [[nodiscard]] cv::Vec2f ptrToGrid(const cv::Vec3f& ptr) const;
+    // The pointer at a grid position (column, row): ptrToGrid's inverse.
+    [[nodiscard]] cv::Vec3f gridToPtr(const cv::Vec2f& grid) const;
 
     // Save under this surface's persistent object UUID (meta["uuid"]),
     // minting one when meta has none. Use for in-place edits, renames and
@@ -597,8 +599,11 @@ std::function<cv::Mat(const std::string&)> store_channel_loader(
 void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& uuid, QuadSurface&,
     const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
     const vc::objects::SurfaceProvenance& provenance);
-// Geometry for putGeometry: points, `valid` from the "mask" channel (reduced to the
-// grid: a vertex is valid only if every mask pixel it covers is 255) and the other channels.
+// The surface's grid as stored: points (missing vertices as the sentinel) and
+// validity from the "mask" channel (reduced to the grid: a vertex is valid only
+// if every mask pixel it covers is 255); no other channels. A store draft of it.
+vc::geometry::Surface quad_surface_grid(QuadSurface&);
+// Geometry for putGeometry: quad_surface_grid and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
 // Publish the vertices of `rect` (grid rows/columns) that differ from the stored
 // revision `expected` in one sparse edit: new coordinates also mark the vertex

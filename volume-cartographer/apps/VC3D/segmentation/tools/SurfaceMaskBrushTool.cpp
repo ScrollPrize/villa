@@ -196,7 +196,6 @@ void SurfaceMaskBrushTool::finishStroke()
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
-    refreshSurfacePatchIndex(changedRegion);
     persistSurface();
     _paintedCells.clear();
     _pendingCells.clear();
@@ -476,21 +475,6 @@ cv::Rect SurfaceMaskBrushTool::applyPendingCells()
     return cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
 }
 
-void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegion)
-{
-    if (!_surface || changedRegion.empty()) {
-        return;
-    }
-
-    auto* manager = _module.viewerManager();
-    if (!manager) {
-        return;
-    }
-
-    SurfacePatchIndex::SurfacePtr surface(_surface, [](QuadSurface*) {});
-    manager->refreshSurfacePatchIndex(surface, changedRegion);
-}
-
 void SurfaceMaskBrushTool::invalidateOverlay()
 {
     _module.refreshOverlay();
@@ -501,10 +485,6 @@ void SurfaceMaskBrushTool::invalidateViewers(bool surfaceChanged)
     if (auto* manager = _module.viewerManager()) {
         manager->forEachBaseViewer([surfaceChanged](VolumeViewerBase* viewer) {
             if (viewer) {
-                if (surfaceChanged) {
-                    viewer->invalidateIntersect();
-                    viewer->renderIntersections();
-                }
                 if (surfaceChanged && viewer->surfName() == "segmentation") {
                     viewer->renderVisible(true);
                 }

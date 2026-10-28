@@ -21,6 +21,25 @@ struct VolumeFrame {
     bool registered = false;
 };
 
+// How geometry declared in one frame (`coordinates`, a geometryCoordinates
+// object) maps to `volume`'s voxels, as volumeFrames maps that frame; nothing
+// when the frame is not placed in the volume.
+inline std::optional<VolumeAffine> frameMapping(const nlohmann::json& coordinates, const std::string& volume,
+                                                const VolumeTransforms* transforms)
+{
+    const auto& source = coordinates.at("volume_uuid");
+    const auto& scale = coordinates.at("scale_factor");
+    if (!source.is_string() || !scale.is_number()) return std::nullopt;
+    const double toVolume = 1.0 / scale.get<double>();
+    if (transforms && !transforms->graph.registrations().empty()) {
+        const auto resolution = transforms->resolve(source.get<std::string>(), volume);
+        if (resolution.status != vcr::catalog::TransformStatus::Resolved) return std::nullopt;
+        return resolution.resolved().forward * VolumeAffine::scale(toVolume);
+    }
+    if (source.get<std::string>() != volume) return std::nullopt;
+    return VolumeAffine::scale(toVolume);
+}
+
 inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& volume,
                                              const std::optional<std::string>& kind, bool includeRetired,
                                              const VolumeTransforms* transforms = nullptr)

@@ -37,7 +37,6 @@ private:
     void fillEnclosedStrokeArea();
     void persistSurface();
     [[nodiscard]] cv::Rect applyPendingCells();
-    void refreshSurfacePatchIndex(const cv::Rect& changedRegion);
     void invalidateOverlay();
     void invalidateViewers(bool surfaceChanged);
 

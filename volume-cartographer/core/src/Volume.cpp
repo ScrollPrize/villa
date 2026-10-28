@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -30,6 +31,7 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
@@ -101,7 +103,21 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
     };
 
     const auto loadUrl = [&](const std::string& url) -> std::optional<utils::Json> {
-        const auto body = vc::httpGetString(url, auth);
+        auto& cache = vc::core::util::remoteMetadataCache();
+        std::string body;
+        if (const auto answer = cache.lookup(url)) {
+            if (*answer)
+                body.assign(reinterpret_cast<const char*>((*answer)->data()), (*answer)->size());
+        } else {
+            body = vc::httpGetString(url, auth);
+            if (vc::core::util::RemoteMetadataCache::cacheable(url)) {
+                std::vector<std::byte> bytes(body.size());
+                std::memcpy(bytes.data(), body.data(), body.size());
+                cache.record(url, body.empty()
+                    ? vc::core::util::RemoteMetadataCache::Answer{}
+                    : vc::core::util::RemoteMetadataCache::Answer{std::move(bytes)});
+            }
+        }
         if (body.empty()) {
             return std::nullopt;
         }

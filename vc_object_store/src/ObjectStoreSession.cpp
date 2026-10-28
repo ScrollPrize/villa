@@ -2,6 +2,7 @@
 #include <set>
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "hub/HubWorker.hpp"
+#include "internal/SurfaceDrafts.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
 #include "vc_object_store/Uuid.hpp"
@@ -407,12 +408,140 @@ std::vector<AttachedRecord> ObjectStoreSession::selectObjects(const std::vector<
     return result;
 }
 
+namespace {
+// The attachment a draft's results report.
+AttachmentIdentity draftAttachment(const detail::SurfaceDraft& draft)
+{
+    return draft.attachment.value_or(AttachmentIdentity{});
+}
+}
+
+ObjectStoreSession::Drafts ObjectStoreSession::drafts() const
+{
+    std::lock_guard lock(mutex_);
+    return drafts_;
+}
+
+void ObjectStoreSession::draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>& attachment)
+{
+    JournalEntry change;
+    change.recordUuid = objectUuid;
+    change.kind = "surface";
+    change.changeKind = "draft";
+    events_.push_back({StoreSessionEvent::Kind::Draft, attachment.value_or(AttachmentIdentity{}), 0, {std::move(change)}});
+}
+
+void ObjectStoreSession::setDraft(const std::string& objectUuid, const vc::geometry::Surface& surface,
+                                  const CoordinateJson& coordinates, const std::optional<AttachmentIdentity>& attachment)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    auto draft = std::const_pointer_cast<detail::SurfaceDraft>(detail::makeSurfaceDraft(surface, coordinates, attachment));
+    std::lock_guard lock(mutex_);
+    draft->revision = ++draftRevision_;
+    drafts_[uuid] = std::move(draft);
+    draftChanged(uuid, attachment);
+}
+
+void ObjectStoreSession::updateDraft(const std::string& objectUuid, int64_t row, int64_t column, int64_t rows,
+                                     int64_t columns, std::span<const vc::geometry::SurfacePoint> points,
+                                     std::span<const uint8_t> validity)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::shared_ptr<const detail::SurfaceDraft> current;
+    {
+        std::lock_guard lock(mutex_);
+        const auto found = drafts_.find(uuid);
+        if (found == drafts_.end()) throw std::invalid_argument("no draft of surface " + uuid);
+        current = found->second;
+    }
+    // Edits of one draft come from its editor, one at a time; build outside the lock.
+    auto edited = std::const_pointer_cast<detail::SurfaceDraft>(
+        detail::editSurfaceDraft(*current, row, column, rows, columns, points, validity));
+    std::lock_guard lock(mutex_);
+    const auto found = drafts_.find(uuid);
+    if (found == drafts_.end() || found->second != current)
+        throw std::logic_error("surface draft " + uuid + " changed during an edit");
+    edited->revision = ++draftRevision_;
+    found->second = std::move(edited);
+    draftChanged(uuid, current->attachment);
+}
+
+void ObjectStoreSession::clearDraft(const std::string& objectUuid)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::lock_guard lock(mutex_);
+    const auto found = drafts_.find(uuid);
+    if (found == drafts_.end()) return;
+    const auto attachment = found->second->attachment;
+    drafts_.erase(found);
+    draftChanged(uuid, attachment);
+}
+
+bool ObjectStoreSession::hasDraft(const std::string& objectUuid) const
+{
+    return draftRevision(objectUuid) != 0;
+}
+
+uint64_t ObjectStoreSession::draftRevision(const std::string& objectUuid) const
+{
+    std::lock_guard lock(mutex_);
+    const auto found = drafts_.find(util::canonicalUuid(objectUuid));
+    return found == drafts_.end() ? 0 : found->second->revision;
+}
+
+namespace {
+// Volume transforms for placing drafts, read once per attachment and query.
+class DraftTransforms {
+public:
+    DraftTransforms(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& order,
+                    std::shared_ptr<const VolumeTransforms> given)
+        : session_(session), order_(order), given_(std::move(given)) {}
+    const VolumeTransforms* operator()(const detail::SurfaceDraft& draft) {
+        if (given_) return given_.get();
+        std::optional<AttachmentIdentity> source;
+        if (draft.attachment && session_.current(*draft.attachment)) source = draft.attachment;
+        else if (!order_.empty()) source = order_.front();
+        if (!source) return nullptr;
+        for (const auto& [attachment, transforms] : read_)
+            if (attachment == *source) return transforms.get();
+        auto transforms = std::make_shared<VolumeTransforms>();
+        session_.read(*source, [&](const auto& store, const auto& txn, const auto&) { *transforms = store.volumeTransforms(txn); });
+        read_.emplace_back(*source, transforms);
+        return transforms.get();
+    }
+private:
+    ObjectStoreSession& session_;
+    const std::vector<AttachmentIdentity>& order_;
+    std::shared_ptr<const VolumeTransforms> given_;
+    std::vector<std::pair<AttachmentIdentity, std::shared_ptr<VolumeTransforms>>> read_;
+};
+bool admits(const std::optional<std::vector<std::string>>& uuids, const std::string& uuid)
+{
+    return !uuids || std::any_of(uuids->begin(), uuids->end(), [&](const auto& u) { return util::canonicalUuid(u) == uuid; });
+}
+// A volume target places a draft from another volume through registrations.
+bool needsTransforms(const detail::SurfaceDraft& draft, const std::optional<std::string>& volume)
+{
+    const auto& source = draft.coordinates.at("volume_uuid");
+    return volume && !(source.is_string() && source.get<std::string>() == *volume);
+}
+// Every object a query asks for is drafted: the stores have nothing to add.
+template <class Drafts>
+bool onlyDrafts(const std::optional<std::vector<std::string>>& uuids, const Drafts& drafts)
+{
+    return uuids && std::all_of(uuids->begin(), uuids->end(),
+                                [&](const auto& u) { return drafts.contains(util::canonicalUuid(u)); });
+}
+}
+
 std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector<AttachmentIdentity>& order,
     const RegionSlice& slice, const RegionOptions& options, const RegionCancel& cancel)
 {
+    const auto drafts = options.kind == "surface" ? this->drafts() : Drafts{};
     std::vector<AttachedRegion> result;
     std::vector<AttachmentIdentity> earlier;
-    for (const auto& attachment : order) {
+    const bool stored = !(options.kind == "surface" && onlyDrafts(options.uuids, drafts));
+    for (const auto& attachment : stored ? order : std::vector<AttachmentIdentity>{}) {
         RegionResult region;
         read(attachment, [&](const auto& store, const auto& txn, const auto&) {
             region = store.geometryRegion(txn, slice, options, cancel);
@@ -420,11 +549,38 @@ std::vector<AttachedRegion> ObjectStoreSession::geometryRegion(const std::vector
         std::set<std::string> uuids(region.remote.begin(), region.remote.end());
         for (const auto& run : region.runs) uuids.insert(run.objectUuid);
         const auto hidden = heldBy(*this, earlier, uuids);
-        std::erase_if(region.runs, [&](const VisibleRun& run) { return hidden.contains(run.objectUuid); });
-        std::erase_if(region.remote, [&](const std::string& uuid) { return hidden.contains(uuid); });
+        const auto replaced = [&](const std::string& uuid) { return hidden.contains(uuid) || drafts.contains(uuid); };
+        std::erase_if(region.runs, [&](const VisibleRun& run) { return replaced(run.objectUuid); });
+        std::erase_if(region.remote, replaced);
         result.push_back({attachment, std::move(region)});
         earlier.push_back(attachment);
     }
+    // Drafts, in UUID order with the selected one first, each attachment's
+    // within its own budgets and object limit like a stored attachment's.
+    DraftTransforms transforms(*this, order, options.transforms);
+    const auto selected = options.maximumObjects && options.selected
+        ? std::optional(util::canonicalUuid(*options.selected)) : std::nullopt;
+    std::vector<const Drafts::value_type*> ordered;
+    for (const auto& entry : drafts) ordered.push_back(&entry);
+    std::stable_partition(ordered.begin(), ordered.end(), [&](const auto* entry) { return entry->first == selected; });
+    std::vector<AttachedRegion> drafted;
+    for (const auto* entry : ordered) {
+        const auto& [uuid, draft] = *entry;
+        if (!admits(options.uuids, uuid)) continue;
+        const auto placement = detail::placeDraft(*draft, options.coordinates, options.volume, options.targetScale,
+                                                  options.toTarget,
+                                                  needsTransforms(*draft, options.volume) ? transforms(*draft) : nullptr);
+        if (!placement) continue;
+        const auto attachment = draftAttachment(*draft);
+        auto group = std::find_if(drafted.begin(), drafted.end(), [&](const auto& g) { return g.attachment == attachment; });
+        if (group == drafted.end()) group = drafted.insert(drafted.end(), AttachedRegion{attachment, {}});
+        auto& region = group->result;
+        if (!region.complete()) continue;
+        detail::draftRegion(uuid, *draft, *placement, slice, options, cancel, region);
+        if (region.complete() && options.maximumObjects && region.intersectingObjects == options.maximumObjects)
+            region.stop = RegionStop::ObjectLimit;
+    }
+    for (auto& group : drafted) result.push_back(std::move(group));
     return result;
 }
 
@@ -438,9 +594,10 @@ std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const 
                                                                           const SurfaceProximityQuery& query,
                                                                           const std::vector<std::array<double, 3>>& points)
 {
+    const auto drafts = this->drafts();
     std::vector<std::vector<AttachedHit>> result(points.size());
     std::vector<AttachmentIdentity> earlier;
-    for (const auto& attachment : order) {
+    for (const auto& attachment : onlyDrafts(query.uuids, drafts) ? std::vector<AttachmentIdentity>{} : order) {
         std::vector<std::vector<SurfaceProximityHit>> hits(points.size());
         read(attachment, [&](const auto& store, const auto& txn, const auto&) {
             auto around = query;
@@ -457,8 +614,20 @@ std::vector<std::vector<AttachedHit>> ObjectStoreSession::nearestSurfaces(const 
         const auto hidden = heldBy(*this, earlier, uuids);
         for (std::size_t i = 0; i < points.size(); ++i)
             for (auto& hit : hits[i])
-                if (!hidden.contains(hit.objectUuid)) result[i].push_back({attachment, std::move(hit)});
+                if (!hidden.contains(hit.objectUuid) && !drafts.contains(hit.objectUuid))
+                    result[i].push_back({attachment, std::move(hit)});
         earlier.push_back(attachment);
+    }
+    DraftTransforms transforms(*this, order, query.transforms);
+    for (const auto& [uuid, draft] : drafts) {
+        if (!admits(query.uuids, uuid)) continue;
+        const auto placement = detail::placeDraft(*draft, query.coordinates, query.volume, query.targetScale,
+                                                  query.toTarget,
+                                                  needsTransforms(*draft, query.volume) ? transforms(*draft) : nullptr);
+        if (!placement) continue;
+        for (std::size_t i = 0; i < points.size(); ++i)
+            if (auto hit = detail::draftNearest(uuid, *draft, *placement, points[i], query.tolerance))
+                result[i].push_back({draftAttachment(*draft), std::move(*hit)});
     }
     for (auto& near : result)
         std::stable_sort(near.begin(), near.end(), [](const AttachedHit& a, const AttachedHit& b) {
@@ -580,7 +749,7 @@ std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
 
 bool StoreSessionEvent::touches(std::initializer_list<std::string_view> kinds) const
 {
-    if (kind != Kind::Committed) return true;
+    if (kind != Kind::Committed && kind != Kind::Draft) return true;
     return std::any_of(changes.begin(), changes.end(), [&](const auto& change) {
         return std::find(kinds.begin(), kinds.end(), change.kind) != kinds.end();
     });

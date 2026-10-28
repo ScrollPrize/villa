@@ -70,7 +70,6 @@ signals:
     void previewDiagnosticsChanged(bool enabled);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
-    void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
     void fiberOverlayChanged(bool shown);

@@ -138,8 +138,6 @@ namespace viewer {
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 70;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
-    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
@@ -249,6 +247,12 @@ namespace viewer_cache {
     // leaves the overlay channel on its legacy resident-only sampling path.
     constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
     constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
+
+    // App-wide budget for decoded object-store surface geometry (every
+    // surface's tiles read for intersections and lookups), shared by all
+    // workspaces and stores.
+    constexpr auto SURFACE_GEOMETRY_CACHE_GB = "viewer_cache/surface_geometry_cache_gb";
+    constexpr int SURFACE_GEOMETRY_CACHE_GB_DEFAULT = 8;
 
 }
 

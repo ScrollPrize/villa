@@ -64,6 +64,7 @@ inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice&
         item["object_uuid"] = run.objectUuid; item["revision_uuid"] = run.revisionUuid;
         item["array_name"] = run.arrayName; item["family"] = run.family;
         item["first_segment"] = run.firstSegment; item["points"] = run.points;
+        if (!run.grid.empty()) item["grid"] = run.grid;
         runs.append(item);
     }
     output["runs"] = runs; output["stats"] = stats;

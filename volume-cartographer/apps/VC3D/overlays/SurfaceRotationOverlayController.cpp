@@ -334,7 +334,7 @@ void SurfaceRotationOverlayController::cancelRotate()
     // cancelled-session's transformed output either. A user who
     // wants the on-disk transformed state can reopen the segment.
     if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
     }
     _rotateActive = false;
     _angleDeg = 0.0;
@@ -557,7 +557,7 @@ void SurfaceRotationOverlayController::updatePreview()
     const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
     if (transform.isNoOp()) {
         _previewSurface.reset();
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
         return;
     }
 
@@ -566,7 +566,13 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     transform.applyInMemory(*_previewSurface);
-    _state->setSurface("segmentation", _previewSurface, false, true);
+    showActive(_previewSurface);
+}
+
+void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
+{
+    // CState drafts the shown surface, so store queries see the preview's grid.
+    _state->setSurface("segmentation", surface, false, true);
 }
 
 void SurfaceRotationOverlayController::applyRotation()
@@ -597,7 +603,7 @@ void SurfaceRotationOverlayController::applyRotation()
 
     // No transform: no I/O, nothing to do off-thread.
     if (transform.isNoOp()) {
-        _state->setSurface("segmentation", _sourceSurface, false, true);
+        showActive(_sourceSurface);
         _rotateActive = false;
         _angleDeg = 0.0;
         _horizontalFlip = false;
@@ -655,7 +661,7 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 if (!result.error.isEmpty() || !result.surface) {
                     if (self->_sourceSurface) {
-                        self->_state->setSurface("segmentation", self->_sourceSurface, false, true);
+                        self->showActive(self->_sourceSurface);
                     }
                     self->clearWidgets();
                     self->_rotateActive = false;
@@ -672,16 +678,13 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 if (!self->_saver || !self->_saver(result.surface.get())) {
                     if (self->_sourceSurface) {
-                        self->_state->setSurface("segmentation", self->_sourceSurface, false, true);
+                        self->showActive(self->_sourceSurface);
                     }
                     QMessageBox::warning(nullptr, tr("Surface Transform Failed"),
                                          tr("Failed to save the transformed surface to the object store."));
                     return;
                 }
-                if (self->_viewerManager) {
-                    self->_viewerManager->refreshSurfacePatchIndex(result.surface);
-                }
-                self->_state->setSurface("segmentation", result.surface, false, true);
+                self->showActive(result.surface);
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;

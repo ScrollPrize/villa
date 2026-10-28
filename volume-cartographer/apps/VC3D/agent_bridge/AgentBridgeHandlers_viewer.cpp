@@ -305,18 +305,16 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
     } else {
         o["overlayOpacity"] = mgr->overlayOpacity();
     }
-    o["intersectionMaxSurfaces"] = mgr->intersectionMaxSurfaces();
     // ViewerManager-backed, so meaningful with zero viewers instantiated too.
     QJsonObject volumeWindow;
     volumeWindow["low"] = mgr->volumeWindowLow();
     volumeWindow["high"] = mgr->volumeWindowHigh();
     o["volumeWindow"] = volumeWindow;
-    o["samplingStride"] = mgr->surfacePatchSamplingStride();
     o["zScrollSensitivity"] = mgr->zScrollSensitivity();
     o["segmentationCursorMirroring"] = _window->segmentationCursorMirroringEnabled();
 
     if (firstChunked) {
-        o["planeIntersectionLinesVisible"] = firstChunked->isPlaneIntersectionLinesVisible();
+        o["planeIntersectionLinesVisible"] = firstChunked->planeIntersectionLinesVisible();
         o["showSurfaceNormals"] = firstChunked->isShowSurfaceNormals();
         o["surfaceOverlayEnabled"] = firstChunked->surfaceOverlayEnabled();
         o["normalArrowLengthScale"] = firstChunked->normalArrowLengthScale();
@@ -395,13 +393,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
               _window ? _window->_volumeOverlay.get() : nullptr)
         : nullptr;
 
-    const bool hasIntersectionMaxSurfaces = p.contains("intersectionMaxSurfaces");
-    int intersectionMaxSurfaces = 0;
-    if (hasIntersectionMaxSurfaces) {
-        const int v = p.value("intersectionMaxSurfaces").toInt();
-        intersectionMaxSurfaces = std::max(0, v);
-    }
-
     const bool hasHighlightedSurfaceIds = p.contains("highlightedSurfaceIds");
     std::vector<std::string> highlightedSurfaceIds;
     if (hasHighlightedSurfaceIds) {
@@ -417,10 +408,6 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         volumeWindowLow = static_cast<float>(window.value("low").toDouble());
         volumeWindowHigh = static_cast<float>(window.value("high").toDouble());
     }
-
-    const bool hasSamplingStride = p.contains("samplingStride");
-    const int samplingStride = hasSamplingStride
-        ? p.value("samplingStride").toInt() : 0;
 
     const bool hasZScrollSensitivity = p.contains("zScrollSensitivity");
     const double zScrollSensitivity = hasZScrollSensitivity
@@ -470,16 +457,12 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         update.opacity = overlayOpacity;
         volumeOverlay->apply(update);
     }
-    if (hasIntersectionMaxSurfaces)
-        mgr->setIntersectionMaxSurfaces(intersectionMaxSurfaces);
     // The surface panel owns the highlighted surfaces (its context-menu checkmarks).
     if (hasHighlightedSurfaceIds)
         if (SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr)
             panel->setHighlightedSurfaceIds(highlightedSurfaceIds);
     if (hasVolumeWindow)
         mgr->setVolumeWindow(volumeWindowLow, volumeWindowHigh);
-    if (hasSamplingStride)
-        mgr->setSurfacePatchSamplingStride(samplingStride);
     if (hasZScrollSensitivity)
         mgr->setZScrollSensitivity(zScrollSensitivity);
     if (hasSegmentationCursorMirroring)

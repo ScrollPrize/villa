@@ -8,20 +8,18 @@ and documentation in `cb0e796d8`, and review fixes in `ebc43f070`. Normal
 sources are then addressed by array path rather than multiscales index
 (`89abe9606`, `b793e0b88`, superseding `743d6d6d2`). Stage 0 commits 1–3 landed
 on 2026-10-27 (`0ed53d4ce`, `6221efeba`, `0061bc9b8`); step 4's re-ingest and
-CPU startup smoke are recorded in the CLI acceptance notes, and its GPU fit is
-still to run.
-This document is a plan, not a claim that the service already supports that port:
-the current service cannot start a fit against the store-only `FitContext`
-(it still passes the removed `input_bindings` constructor argument).
+CPU startup smoke are recorded in the CLI acceptance notes. Stage 1 is now
+implemented; its steps 13–14 record below includes the real-data 1,000-step
+service fit, checkpoint and preview acceptance. Stage 2 remains planned.
 
 The CLI acceptance notes record a real-data, single-GPU 1,000-step fit with no
 patch/fiber/PCL files, finite losses, complete provenance and matching no-refresh
 counts/digest. They also record 19 unrelated pre-existing suite failures; real-data
 two-rank fitting and changed-input resume remain unrun (CPU startup/resume tests
 cover those contracts). These limits do not replace the service acceptance below.
-That run predates the array-path normal addressing and stage 0's store
-changes; stage 0 reruns it before stage 1 relies on it (pending: the store was
-re-ingested and its startup refresh checked, but the GPU fit has not rerun).
+That CLI run predates the array-path normal addressing and stage 0's store
+changes. The later stage 1 service acceptance uses the re-ingested stage 0
+store; see its record below for the commands, results and remaining limits.
 
 Port both `spiral-fitting`'s persistent HTTP service and the Spiral workspace in
 `volume-cartographer/apps/VC3D`. Deliver in two stages, after a prerequisite
@@ -698,6 +696,47 @@ step 2's replica-independent identities, step 4's lease, step 10's store
 reads and step 11's freshness tracking. It also depends on the hub
 prerequisites (2.1), which can be settled during stage 1.
 
+### Pre-stage-2 integration of `tifxyz-to-obj-store` (2026-10-28)
+
+Merged the incoming branch through `4ea767e44` before starting the store
+prerequisites. Its surface-query changes replace VC3D's patch index with
+store-backed intersections/proximity queries, add shared decoded-tile caching,
+and provide `ObjectStoreSession::setDraft`, `updateDraft`, `clearDraft` and
+`draftRevision` plus `StoreSessionEvent::Kind::Draft`. These drafts are local
+to the session, never committed or synced; they are not new fit generations.
+The incoming commits do not implement historical hub-position retrieval,
+conditional publication, push holds or the hub crash-recovery prerequisite.
+
+The Spiral integration keeps display registration keys separate from object
+identity: fitted surfaces retain their store UUIDs and are queried directly,
+without replacing a main editor's draft. Service previews, external shells
+and local brush surfaces use session-only drafts for queries; Spiral removes
+its own drafts on teardown. Preserve the stage 1 service protocol, input
+freshness tracking, incremental committed-input reads and fiber overlay.
+The removed intersection-layer and file-input-draft tests are not restored.
+
+Merge validation on Linux:
+
+- Rebuilt the native store with `cmake --build /tmp/vc-object-coordinate-build -j 6`
+  and VC3D plus the relevant test targets in the existing RelWithDebInfo build.
+- `ctest --test-dir /tmp/vc-object-coordinate-build --output-on-failure`:
+  all 15 tests passed, including session surface drafts and hub tests.
+- The 13 selected VC3D/core tests passed: store inputs, service protocol,
+  brush patches, offscreen object-store controller, config profile editor,
+  reload comparison, artifact pins, point placement, point collection edits,
+  preview provenance, surface cache region edits, remote metadata cache and
+  surface catalog. The input-reader regression verifies that displayed fit
+  surfaces can be queried by their store UUID without creating a draft.
+- The object-store Python suite and 16 Spiral service/runtime/input/config
+  test modules passed: 475 tests and 60 subtests, with one skipped test.
+  The process exited successfully but nanobind reported leaked references
+  at shutdown; this validation does not establish that the bindings are leak-free.
+- The rebuilt input reader loaded the nine-object real-data baseline with
+  no missing or changed inputs; `display_geometry_dump.py compare` found its
+  display geometry identical to the baseline.
+- No interactive visual inspection or GPU fitting run was performed for
+  this merge. Stage 2's prerequisites and acceptance tests remain outstanding.
+
 ## Stage 2 — store-backed edits and pinned input updates
 
 This replaces the earlier "live apply" and "shared database over SSH" sketches
@@ -707,18 +746,28 @@ hub position.
 
 ### 2.1 One authoritative store and input positions
 
-- Client and service share one authoritative store. Either there is one
-  [hub](../vc_object_store/docs/README.md#hosted-hub-and-replicas) with a
-  working replica on each side (a mount path or an `sftp://`/`ssh://`
-  address), or a local profile has both processes open one store file. The
+- Client and service share one authoritative
+  [hub](../vc_object_store/docs/README.md#hosted-hub-and-replicas), with a
+  separate working replica on each side. Local profiles use a local hub file
+  through filesystem access; remote profiles can use a mount path or an
+  `sftp://`/`ssh://` address. Local hub/replica setup is managed by the
+  application. Both modes use the same protocol; stage 2 does not add a
+  shared-working-file update path or queue local database writes. The
   HTTP tunnel still carries fit commands and artifacts; store data moves only
   through hub sync. Do not sync live SQLite files or add a store server. An
   existing hub is never opened as an ordinary working store.
-- An **input position** names an immutable store state. It is the hub journal
-  sequence for a hub-backed store, or a `published_at_us` time for a single
-  shared store. The service pins `revision_read_view_at()` on its replica once
-  it has reached that position. Pins and digests use the replica-independent
-  identities from stage 1 step 2.
+- An **input position** names an immutable store state by hub identity and
+  journal sequence, in local and remote mode alike. Retain historical-position
+  semantics, using the store's existing revision history rather than a separate
+  fit-snapshot system. First investigate on-demand retrieval/import of a
+  historical hub state into a replica-local read view, including metadata,
+  tags, deletions, relationship membership/approval and referenced geometry.
+  Geometry revisions alone are insufficient. The exact retrieval API remains
+  store implementation work; do not pass a journal sequence to the existing
+  `published_at_us` API. Pins and digests use stage 1's replica-independent
+  identities. A fresh clone copies the hub's existing history; incremental
+  pulls install current record values and can skip intermediate object and
+  relationship revisions, so those replicas need the historical retrieval path.
 - The service's replica writes only detector relationships, under the
   service's own author (for example `spiral-service@<host>`). It never edits
   objects and so never holds leases; the detectors write only edges and
@@ -738,15 +787,22 @@ hub position.
   worker pulls and pushes every `HubSessionOptions::syncInterval` (15 s) and
   after each action. `hub_sync` requires an idle connection, so the update
   loop holds no other reference to that connection while it syncs.
-- Settle the hub prerequisites before implementation. As of stage 0's store,
-  `hub_sync` returns a `HubSyncReport` with only pulled/pushed counts and
-  conflicts: no journal cursor, push sequence or per-record hub versions; the
-  Python `hub_status` and the revision-at bindings are not bound; the session
-  has no push hold; and no commit addresses the crash-recovery lock check.
-  - Python access to pull and push, to a replica's pulled journal position,
-    to the journal sequence of the service's own push, and to the hub versions
-    of the records a pull installs (2.3's update loop needs all of these);
-  - mapping a hub position to the replica's local read view;
+- Settle the remaining hub prerequisites before the service port. Checked
+  against this branch on 2026-10-28: Python already exposes `hub_sync`
+  (separate pull/push flags), `hub_status`, `revision_selection_at`,
+  `revision_read_view_at` and `relationships_at`. The historical selection
+  APIs take a local publication timestamp, not a hub position.
+  `HubSyncReport` still returns only pulled/pushed counts and conflicts:
+  no journal cursor, push sequence or installed-record versions. The session
+  has no push hold, and the crash-recovery prerequisite below remains open.
+  - Extend the existing Python/C++ sync APIs with the replica's pulled
+    journal position, the resulting position of the service's own push, and
+    an optional expected-head precondition checked atomically with publication;
+  - reconstructing a hub position as a replica-local read view. The current
+    pull installs the latest values of changed records in one local
+    transaction; it does not reproduce every intermediate hub state. Reuse
+    hub history, initially investigating on-demand historical retrieval as
+    described above, rather than requiring all history to sync eagerly;
   - replica lifecycle (clone, reattach, loss);
   - hub placement. Put the hub on the service host: the service opens it by
     local path and needs no credentials, and VC3D reaches it over `sftp://`
@@ -755,8 +811,10 @@ hub position.
     the hub file and its directory, and a `known_hosts` entry; check this at
     startup and fail clearly. Push needs no more access than pull, since every
     hub operation, a pull included, creates `<hub>.lock`;
-  - whether a push needs the replica to have pulled the hub head first, or can
-    land on top of foreign commits (2.3's update loop is written either way);
+  - account for the existing push semantics: version checks are per changed
+    record, not against the whole hub head, so a push can land on top of
+    unrelated foreign commits. Preserve that behavior for ordinary sync;
+    the service's conditional push refuses if the hub head differs from H;
   - behaviour when the hub is unreachable: the resident fit continues and an
     update fails;
   - hub crash recovery (being fixed separately in `vc_object_store`). After a
@@ -765,7 +823,9 @@ hub position.
     `unix-dotfile` and SFTP lock checks see the opener's own lock directory
     as another writer's reserved lock, so the journal is never treated as hot
     and the half-applied push is read. Stage 2 makes the service a regular
-    pusher, so it depends on this fix and its crash test;
+    pusher, so it depends on this fix and its crash test. The existing
+    `test_object_store_hub` simulated-crash case covers lost local bookkeeping
+    after a successful push, not rollback of an interrupted hub transaction;
   - relationship conflicts: relationships are not leased, and two replicas
     changing one relationship (a VC3D edit revalidating its links, or a user
     approval, against a service refresh) conflict.
@@ -779,6 +839,12 @@ hub position.
   coordinate declarations and branch links. A saved edit is a durable revision.
   Discarding a local draft does not roll back history; undo is a new checked
   edit. Do not recreate the old filesystem Apply/Commit model.
+- Reuse the merged session surface-draft APIs and store-backed viewer queries.
+  `Draft` events describe unsaved geometry; `Committed` events describe saved
+  store revisions. Keep that distinction in the four UI states below. A draft
+  may override geometry in local viewer queries, but linking and fit snapshots
+  read committed history only. Saving still needs checked revisions and leases;
+  `setDraft`/`updateDraft` do not save or acquire them.
 - The UI distinguishes four states: an unsaved draft; a saved edit (with hub
   sync pending, pushed or in conflict); inputs linked at a prepared position;
   and the position active in the fit. Store events mark the fit's inputs stale
@@ -807,20 +873,32 @@ hub position.
   1. Pull to the hub head H (at least M).
   2. Run `refresh_links()` over the whole selection at H, so every selected
      object at H is linked, new objects included.
-  3. Push the links; their transaction is at hub position N.
-  4. Pull again. If it installs no foreign records with hub versions between H
-     and N, then N is exactly H plus the service's own links and is linked by
-     construction. Pin N.
-  5. Otherwise return to step 2 from the new head. Re-linking is cheap: the
-     detectors cache unchanged inputs and net no-op writes create no revision.
-  If a push conflicts, resolve every conflict to `"hub"`, since detector output
-  is recomputable and the hub side may hold a user's edit or approval, and
-  return to step 2. Bound the loop; when the bound is hit, fail the update
+  3. Conditionally push the links with expected hub head H. In the same hub
+     write transaction, check the head and either publish all changes at N or
+     publish nothing and return a head-mismatch result. Keep the existing
+     per-record conflict checks. No hub lock is held while detectors run.
+     Even a no-op refresh must validate H atomically; success then returns N=H.
+     Reconcile an uncertain/lost response before retrying: a previously
+     successful publication must recover its original N, not be mistaken for
+     a fresh head mismatch and executed again.
+  4. On success, resolve and pin the exact historical state N. Later hub
+     commits do not change this position; pulling past N must not substitute
+     newer inputs. There is no post-push foreign-record scan.
+  5. On a head mismatch, discard/reconcile unpushed detector output against
+     the hub, pull the new head and restart at step 2. Never retry old results
+     with a new expected head without relinking. An unrelated hub edit also
+     causes a retry; accept this conservative behavior initially.
+  If a push or pull reports conflicts, resolve them to `"hub"`, since this
+  service replica writes only recomputable detector output and the hub side
+  may hold a user's edit or approval. Restart from the newly pulled head.
+  Bound the loop; when the bound is hit, fail the update
   ("inputs kept changing; retry") and keep the active fit. A refresh failure
   likewise leaves the fit untouched and reports the detector writes already
-  pushed. The service never fits its local replica state: it is not a hub
-  position when other commits land before its push. VC3D's push hold (2.2)
-  makes repeats rare.
+  pushed, plus any local detector writes awaiting reconciliation. A successful
+  conditional push establishes N as H plus the service's links. Existing
+  object leases and per-record checks alone do not establish this: they do
+  not freeze selector membership or prevent unrelated hub commits. VC3D's
+  push hold (2.2) makes repeats rare without blocking local saves.
 - N may include edits made after M. That is correct, because the loop linked
   them; report N, and VC3D shows which edits it includes beyond M. Records
   after N are later edits, excluded and shown as stale.
@@ -841,18 +919,33 @@ hub position.
   the fit's links as stale. Every apply refreshes, so the loop needs no store
   record of which detectors ran over which objects. `relationships_at` remains
   a cheap assertion that no pinned link is inapplicable.
+- Input updates change supervision, not trainable parameters. Keep the existing
+  `SpiralAndTransform`, optimizer (including moments), scheduler and iteration
+  count. Adding/removing/editing patches, fibers or PCLs does not introduce
+  parameters. Rebuild their atlases, sampling/index structures and other
+  input-dependent state, and invalidate derived caches. UUID mappings identify
+  inputs and derived indices, not optimizer parameters; never reuse an old
+  array index as an identity. An atlas layout change is not a model rebuild.
+  Model configuration/domain changes remain separate operations; an input
+  update must not implicitly resize or reinterpret the model or its frame.
 - At an acknowledged iteration boundary, pause every rank. Reuse the shared
-  command barriers with a new candidate-generation prepare/install interface
-  on `FitContext`. All ranks validate and agree on the candidate digest before
-  installation. If preparation fails, discard the candidate runtime state and
-  keep the active generation. If installation fails after ranks diverge, stop
-  the session and require recovery rather than resume a mixture of
-  generations.
-- Specify which model and optimizer state survives each update. Preserve it
-  only through validated UUID-based mappings. Changes affecting atlas topology,
-  model domain, parameter shapes or frame require an explicit rebuild. Never
-  reuse runtime indices based on array position. Report any reset before
-  accepting the update.
+  command barriers with a validation/replacement interface on `FitContext`.
+  Validate the pinned host inputs and agree on their digest across ranks
+  before releasing device input state. Optimize for successful updates and
+  low peak device memory: release the old input device stores before building
+  their replacements, rather than retaining two generations. Keep the model
+  and training state described above; do not duplicate them for rollback.
+- Failure semantics have an explicit destructive boundary. Before any rank
+  releases old device input state, a refusal leaves the old fit usable.
+  After release begins, any allocation, materialization or installation failure
+  stops all ranks and marks the session recovery-required, even if only one
+  rank failed. Do not claim that the old generation remains runnable, resume
+  partially installed state, or automatically retry the destructive command.
+  Require an explicit full rebuild or checkpoint recovery. Checkpoint recovery
+  uses the last successfully saved checkpoint; do not promise an automatic
+  pre-update checkpoint. Report the candidate position, failure phase and any
+  already-published links. Publish the new active generation only after every
+  rank has installed it successfully.
 - Version previews, diagnostics, checkpoints, caches and input overlays with
   the session generation, position and digest. An old preview stays viewable as
   old; it cannot overwrite the active generation's display or authorize an edit
@@ -867,7 +960,8 @@ hub position.
   replacement against stage 1 behavior for reconnect, preview freshness and
   checkpoint provenance. Once the comparisons pass, delete the replaced code,
   routes, options and tests.
-- One hub, with a VC3D replica on a mount path and a service replica at an
+- A local hub file with two working replicas, and one remote hub with a VC3D
+  replica on a mount path and a service replica at an
   `sftp://` address: both give identical digests for one position. Test an
   interrupted push or pull, an unreachable hub, and a lease or conflict that
   blocks Update fit inputs.
@@ -878,58 +972,76 @@ hub position.
 - Create/edit/delete patches, PCLs and fibers; annotation and approval changes;
   ordinary versus adjacent branches; empty selections and changed tags. Edits
   after N are excluded and shown as stale.
-- The loop refuses to pin a position with foreign records between its pull
-  and push, and a normal-source change marks the fit's links stale. A detector failure on the service leaves the fit
-  untouched and reports pushed detector writes.
+- The conditional push publishes nothing when the hub advanced after H,
+  including unrelated commits. Test no-op linking, retry limits, lost push
+  responses and a commit immediately after successful publication. A later
+  pull must still recover exactly N. Test historical reads on a fresh clone
+  and a replica that skipped N, including metadata-only and approval changes.
+  A normal-source change marks the fit's links stale. A detector failure
+  leaves the fit untouched and reports pushed detector writes.
 - Applying one position twice is idempotent. Test disconnecting after apply,
   and delayed previews.
-- Two ranks: matching installation, a preparation failure on one rank, and a
-  fatal partial installation. Check that model/optimizer state is preserved or
-  the explicit rebuild happens, then resume from a checkpoint of the applied
-  generation.
+- Two ranks: matching installation, validation failure before device-state
+  release, and allocation/materialization failure after release on either
+  rank. The first leaves the old fit usable; the latter stops every rank and
+  requires recovery. On successful updates, verify model parameters, optimizer
+  moments, scheduler and iteration count are unchanged at the installation
+  boundary, including when input counts and atlas layouts change. Resume from
+  a checkpoint of the applied generation. Measure peak device memory to verify
+  old and replacement input stores are not retained together.
 - Real-data VC3D smoke over a real SSH hub: edit → save → Update fit inputs →
   continue fitting → view the new preview. Old previews remain correctly
-  identified, and a failed preparation leaves the previous resident fit usable.
+  identified. Pre-release validation failure leaves the previous fit usable;
+  post-release failure is visibly recovery-required and can be recovered by
+  an explicit rebuild/checkpoint load.
 
 ### Stage 2 implementation sequence
 
 Split into 2a, store-backed editing with initialize/full-input rebuild at a hub
 position, and 2b, updating a resident fit. 2a gives a usable edit-and-refit
-loop without carrying model and optimizer state across generations, the
-riskiest part. Store prerequisites (steps 1–5) land in `vc_object_store` first,
+loop before replacing input device stores inside a resident fit. Stage 2b
+keeps model and optimizer state in place; its additional risk is incomplete
+replacement of input-dependent state. Store prerequisites (steps 1–5) land in `vc_object_store` first,
 agreed with its owners; the adapter steps (6–7) are shared with the CLI and
 land before the service. Each of 2a and 2b lands its service and VC3D steps
 together with one `API_VERSION` / `kApiVersion` bump; keep service and VC3D
 commits separate.
 
 1. **Store: hub positions.** `HubSyncReport` carries the journal cursor after
-   a pull, the journal sequence of this replica's push, and the records a
-   pull installed with their hub versions; bind `hub_status`. C++ hub tests
-   and Python tests.
+   a pull and the resulting journal position of this replica's push. Extend the
+   existing Python report/status bindings. C++ hub tests and Python tests.
 2. **Store: position to read view.** Map a hub position to the replica's
-   local read view, and bind `revision_read_view_at`/`relationships_at` for
-   it. Test that two replicas give the same selection at one position, by
-   replica-independent identities.
+   local read view, including positions skipped by a pull. Reuse the existing
+   hub history, investigating on-demand historical retrieval/import first,
+   and the historical read bindings where appropriate; their local timestamp
+   arguments must not be mistaken for hub positions. Test that two replicas
+   with different pull histories give the same selection at one position,
+   by replica-independent identities.
 3. **Store: session push hold.** An RAII hold on an attachment's pushes
    (like `LeaseHold`); `syncHubAndWait` reports the position it reached.
 4. **Store: hub crash recovery** and its crash test (in flight separately).
-5. **Store: document** whether a push lands on top of foreign commits or
-   requires pulling the head first.
+5. **Store: conditional publication.** Add an expected-head precondition to
+   push, checked within the publication transaction. Mismatch publishes
+   nothing; success returns N, including N=H for a no-op. Preserve ordinary
+   per-record sync behavior. Test concurrent commits, no-op validation and
+   reconciliation after a lost response; keep publication idempotent.
 6. **Adapter: input positions.** The request and manifest carry the position;
    the snapshot reads at its pinned view. The manifest records the refresh
    parameters (`pcl_link_*`) and the normal source's identity, so a parameter
    or normal change marks the links stale.
 7. **Adapter: link-then-pin.** `prepare_position()` runs 2.3's loop on rank
-   zero: pull, `refresh_links()`, push, pull, foreign-record check, pin.
-   Conflicts resolve to `"hub"`; the loop is bounded and reports detector
-   writes already pushed. Tests on a fixture hub inject a foreign push
-   between loop steps and a conflicting approval.
+   zero: pull H, `refresh_links()`, conditional push at H, pin N. Head
+   mismatch reconciles local detector output, pulls and relinks; conflicts
+   resolve to `"hub"`. Bound retries and report writes already pushed and
+   local writes awaiting reconciliation. Test a foreign push, a conflicting
+   approval, no-op linking, and recovering exact N after a later pull.
 
 Stage 2a:
 
 8. **Service: hub binding.** Launch binds a replica and its hub address under
    the service's author. Startup clones or reattaches the replica and checks
-   ssh batch mode, `known_hosts` and hub reachability, failing clearly.
+   hub reachability and, for remote hub access, ssh batch mode and
+   `known_hosts`, failing clearly. Local access uses filesystem paths.
    Discovery advertises the hub identity and the fitted position. Bump
    `API_VERSION`.
 9. **Service: initialize and full-input rebuild at a position.** Both take M
@@ -938,9 +1050,12 @@ Stage 2a:
    manifest/digest; command IDs make a repeated request idempotent.
 10. **VC3D: hub profiles.** Profiles bind a hub (mount path or `sftp://`) with
     a local replica, compare store UUID and position with the service, and
-    replace stage 1's externally provisioned store. Bump `kApiVersion`.
+    replace stage 1's externally provisioned store. Manage local hub and
+    separate client/service replicas automatically; preserve existing data
+    and pending edits when provisioning or reattaching. Bump `kApiVersion`.
 11. **VC3D: store-backed editing.** Patch brush through `holdForEditing`/
-    `editCurrent`, PCLs through `PointCollectionSync`, fibers through the
+    `editCurrent`, using the merged session draft APIs for unsaved surface
+    display; PCLs through `PointCollectionSync`, fibers through the
     existing store edits; preserve metadata roles, stable IDs, coordinate
     declarations and branch links. Show 2.2's four states.
 12. **VC3D: Update inputs (rebuild form).** Push and wait, stop on and show
@@ -955,15 +1070,18 @@ Stage 2a:
 
 Stage 2b:
 
-15. **Fitter: candidate generations.** A prepare/install interface on
-    `FitContext`, and the state-preservation policy: UUID-keyed model and
-    optimizer mappings; atlas topology, model domain, parameter shape or
-    frame changes refuse and require a rebuild; resets are reported before
-    the update is accepted. CPU unit tests.
+15. **Fitter: input replacement.** A validate/replace interface on
+    `FitContext`. Inventory input-dependent atlases, pools, indices and
+    caches; rebuild/invalidate them while keeping model, optimizer moments,
+    scheduler and iteration count unchanged. Release old input device stores
+    before allocating replacements. No optimizer remapping or model rebuild
+    for changed input counts/layouts. Test the destructive boundary and state
+    preservation; measure device-memory use on representative inputs.
 16. **Runtime: apply at an iteration boundary.** Reuse the shared command
-    barriers; all ranks validate and agree on the candidate digest. A failed
-    preparation discards the candidate and keeps the active generation; a
-    partial installation stops the session. Two-rank tests.
+    barriers; all ranks validate and agree on the candidate digest before
+    releasing old device inputs. Pre-release refusal keeps the old generation;
+    any post-release failure stops all ranks and requires explicit recovery.
+    Publish the generation only after collective success. Two-rank tests.
 17. **Service: apply route.** `POST` with M, command ID and active generation
     returns N, manifest/digest and the new generation; idempotent by command
     ID; reconnect recovers status before replaying. Lift stage 1's
@@ -987,16 +1105,18 @@ landed together: bumping `API_VERSION` and `SpiralServiceManager::kApiVersion`
 couples the stage 1 service and workspace ports into one landing. Deleting the
 old file-input code can follow as a separate patch once the baseline
 comparisons pass. No new fitter/linker numerics are intended beyond the accepted
-CLI port; stage 2 must explicitly report any optimizer resets. Preserve Ubuntu
-and macOS support and existing CUDA/MPS/CPU behavior.
+CLI port; successful stage 2 input updates preserve the existing model and
+optimizer state. Explicit model rebuilds and checkpoint recovery remain
+separate operations. Preserve Ubuntu and macOS support and existing
+CUDA/MPS/CPU behavior.
 
 Use existing environments; no installation/bootstrap is part of this plan.
 From the repository root, use the regression entrypoint below with an existing
 Python environment (`spiral-fitting/.venv` is the documented default, not a
 prerequisite to create here). Include the built `vc_object_store` Python module
 so adapter tests run rather than skip; `VC_OBJECT_STORE_BUILD` names an existing
-store build. Service tests are migration coverage, not evidence that the
-currently unported service works:
+store build. These tests cover the stage 1 service and shared adapter;
+stage 2 adds the position, editing and update acceptance cases above:
 
 ```sh
 AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spiral-fitting/.venv/bin/python -m pytest -q \
@@ -1004,6 +1124,9 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spir
   spiral-fitting/tests/test_revisioned_runtime.py \
   spiral-fitting/tests/test_checkpoint_load.py \
   spiral-fitting/tests/test_service_events.py \
+  spiral-fitting/tests/test_service_object_store.py \
+  spiral-fitting/tests/test_runtime_object_store.py \
+  spiral-fitting/tests/test_preview_restore.py \
   spiral-fitting/tests/test_object_store_startup.py \
   spiral-fitting/tests/test_object_store_inputs.py \
   spiral-fitting/tests/test_object_store_materialize.py \
@@ -1014,12 +1137,11 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting:$VC_OBJECT_STORE_BUILD/python spir
   spiral-fitting/tests/test_run_boundary_settings.py
 ```
 
-`test_revisioned_runtime.py` mocks the removed `prepare_input_changes`; stage 1
-rewrites or deletes it with the input-batch paths. The old file-input service
-behavior is covered by `test_service_editing.py`, `test_service_editing_http.py`,
-`test_input_catalog.py`, `test_input_snapshot.py` and `test_workspace_cleanup.py`
-(not in the command above); use them, at the pre-port checkout, as baseline
-sources.
+Stage 1 removed the live input-batch paths and their old runtime tests.
+The old file-input editing tests are historical baseline sources at the
+pre-port checkout, not tests to restore or run against the current service.
+Retain the captured fixtures under `tests/data/spiral_service_baseline/` and
+the store-backed regression tests as stage 2's comparison baseline.
 
 Capture old-path regression baselines before porting file-input tests to the new
 contract, and add focused service/workspace regressions for the acceptance cases

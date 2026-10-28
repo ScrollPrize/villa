@@ -33,7 +33,6 @@ using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 class CChunkedVolumeViewer;
 class CState;
 class ViewerManager;
-class SurfacePatchIndex;
 class QuadSurface;
 
 

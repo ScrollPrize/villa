@@ -16,6 +16,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -41,7 +42,16 @@ vc::objects::OpenOptions viewerOpenOptions()
     vc::objects::OpenOptions options;
     options.catalogTransforms = catalogTransformSnapshot();
     options.geometryCacheBytes = size_t(256) << 20;
+    options.surfaceTiles = CState::surfaceGeometryCache();
     return options;
+}
+
+size_t surfaceGeometryCacheBytes()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const auto gb = settings.value(vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
+                                   vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toLongLong();
+    return size_t(std::max<qlonglong>(0, gb)) << 30;
 }
 
 // The box spanned by `box`'s corners through `m`.
@@ -286,6 +296,29 @@ std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() c
     return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
 }
 
+std::shared_ptr<vc::objects::SurfaceTileCache> CState::surfaceGeometryCache()
+{
+    static const auto cache = std::make_shared<vc::objects::SurfaceTileCache>(surfaceGeometryCacheBytes());
+    return cache;
+}
+
+void CState::applySurfaceGeometryCacheSettings()
+{
+    surfaceGeometryCache()->setCapacity(surfaceGeometryCacheBytes());
+}
+
+std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const
+{
+    const CState& owner = _objectStoreOwner ? *_objectStoreOwner : *this;
+    std::vector<vc::objects::AttachmentIdentity> sources;
+    if (!_currentVolume) return sources;
+    if (owner._objectStoreAttachment) sources.push_back(*owner._objectStoreAttachment);
+    if (const auto view = _vpkg ? _vpkg->catalogView(currentVolumeId()) : std::nullopt)
+        if (const auto found = owner._catalogAttachments.find(view->sampleId); found != owner._catalogAttachments.end())
+            sources.push_back(found->second);
+    return sources;
+}
+
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
     if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
@@ -366,6 +399,8 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     }
     _currentVolume = std::move(vol);
     updateAnnotationVolume();
+    // The open surface's draft is declared in the volume's voxels.
+    draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surface("segmentation")));
     const auto volumeId = currentVolumeId();
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, volumeId);
@@ -537,6 +572,9 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
+    if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf));
+    }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
         // change should invalidate cached views of the surface map.
@@ -555,9 +593,26 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         if (poiIt != _pois.end() && poiIt->second.get() == delayedFocusPoi) {
             emit poiChanged("focus", delayedFocusPoi);
             delayedFocusPoi->suppressViewerRecenter = false;
-            delayedFocusPoi->suppressTransientPlaneIntersections = false;
         }
     }
+}
+
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
+{
+    // Workspaces sharing the main session draft their own surfaces.
+    if (_objectStoreOwner || !_objectStoreSession) {
+        return;
+    }
+    if (!_activeSurfaceDraft.empty() && (!surface || surface->id != _activeSurfaceDraft)) {
+        _objectStoreSession->clearDraft(_activeSurfaceDraft);
+        _activeSurfaceDraft.clear();
+    }
+    if (!surface || !_currentVolume || !vc::objects::util::isUuid(surface->id)) {
+        return;
+    }
+    _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
+                                  vc::objects::volumeCoordinates(currentVolumeId(), 1));
+    _activeSurfaceDraft = surface->id;
 }
 
 void CState::setSurfacesBatch(
@@ -644,13 +699,11 @@ void CState::setPOI(const std::string& name, POI* poi)
         // Same pointer re-submitted (caller mutated in place) - just signal
         emit poiChanged(name, poi);
         poi->suppressViewerRecenter = false;
-        poi->suppressTransientPlaneIntersections = false;
         return;
     }
     _pois[name] = std::unique_ptr<POI>(poi);
     emit poiChanged(name, poi);
     poi->suppressViewerRecenter = false;
-    poi->suppressTransientPlaneIntersections = false;
 }
 
 POI* CState::poi(const std::string& name)

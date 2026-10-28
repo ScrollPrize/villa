@@ -35,6 +35,13 @@ updates across geometry kinds; `ingestGeometryBatch` shares one-time ingestion
 of decoded geometry and native topology. Both run inside the caller’s transaction
 and retain the database’s existing revision and relationship checks.
 
+A session also holds surface drafts: uncommitted surface grids, in memory
+only, that stand in for their objects (or for objects not created yet) in that
+session's `geometryRegion` and `nearestSurfaces`. They are cut and searched by
+the same tile and triangle rules as stored surfaces, so an editor needs no
+spatial index of its own; committing is still an ordinary geometry edit,
+after which the editor clears the draft.
+
 Fiber JSON version 4 is the transfer format; typed database geometry exports
 in it, including control-only fibers. File import also reads VC3D version 1
 and 3 fibers and stores them as version 4: a level-0 coordinate space becomes

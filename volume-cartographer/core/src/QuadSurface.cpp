@@ -1252,6 +1252,12 @@ cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
             ptr[1] + _center[1] * _scale[1]};
 }
 
+cv::Vec3f QuadSurface::gridToPtr(const cv::Vec2f& grid) const
+{
+    return {grid[0] - _center[0] * _scale[0],
+            grid[1] - _center[1] * _scale[1], 0};
+}
+
 cv::Vec3f QuadSurface::normal(const cv::Vec3f &ptr, const cv::Vec3f &offset)
 {
     ensureLoaded();

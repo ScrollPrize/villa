@@ -26,7 +26,6 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 
@@ -1079,15 +1078,9 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                       std::max(1, static_cast<int>(std::ceil(maxX - minX + roiPad * 2.0f))),
                       std::max(1, static_cast<int>(std::ceil(maxY - minY + roiPad * 2.0f)))};
 
-    // Where surfaces cross the drawing plane around the path: the surface being
-    // edited from its live geometry, the others from the object store.
+    // Where surfaces cross the drawing plane around the path, from the object
+    // store (the surface being edited through its draft).
     std::map<std::string, std::vector<std::array<cv::Vec3f, 2>>> intersections;
-    auto active = _state ? std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation")) : nullptr;
-    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
-    if (active && editPatchIndex && editPatchIndex->containsSurface(active)) {
-        for (auto& [surface, segments] : editPatchIndex->computePlaneIntersections(*plane, planeRoi, {active}))
-            for (const auto& segment : segments) intersections[active->id].push_back({segment.world[0], segment.world[1]});
-    }
     if (_surfaceCatalog && _surfaceCatalog->volume()) {
         auto corner = [&](float x, float y) {
             const cv::Vec3f p = plane->coord({0, 0, 0}, {x, y, 0.0f});
@@ -1102,7 +1095,6 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                                                               _surfaceCatalog->volume()->id(),
                                                               vc3d::store::regionSlice(*region), {});
                 for (const auto& run : crossings.runs) {
-                    if (active && run.objectUuid == active->id && intersections.contains(active->id)) continue;
                     auto& out = intersections[run.objectUuid];
                     for (size_t i = 1; i < run.points.size(); ++i)
                         out.push_back({cv::Vec3f(run.points[i - 1][0], run.points[i - 1][1], run.points[i - 1][2]),

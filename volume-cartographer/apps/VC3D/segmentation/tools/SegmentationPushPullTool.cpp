@@ -35,7 +35,6 @@ namespace
 constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
 constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
 constexpr int kPushPullIntervalMsSlow = 33;   // Alpha mode: ~30fps for responsiveness
-constexpr int kPlaneIntersectionReleaseIdleMs = 180;
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -95,10 +94,19 @@ std::optional<cv::Vec3f> averageNormals(const std::vector<cv::Vec3f>& normals)
     return sum;
 }
 
+// The pointer of `world` on the edited surface (its draft); `ptr` unchanged without a hit.
+void locatePointer(ViewerManager* viewerManager, QuadSurface& surface, const cv::Vec3f& world, cv::Vec3f& ptr)
+{
+    constexpr float kAnywhere = 1e6f;
+    if (const auto hit = viewerManager ? viewerManager->locate(surface, world, kAnywhere) : std::nullopt) {
+        ptr = hit->ptr;
+    }
+}
+
 std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
                                                         const cv::Vec3f& basePtr,
                                                         const SegmentationEditManager::ActiveDrag& drag,
-                                                        SurfacePatchIndex* patchIndex = nullptr)
+                                                        ViewerManager* viewerManager)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
@@ -110,7 +118,7 @@ std::optional<cv::Vec3f> sampleSurfaceNormalsNearCenter(QuadSurface* surface,
     // Try the center first, then nearby samples in order of proximity.
     const auto collectNormalAt = [&](const cv::Vec3f& worldPoint) {
         cv::Vec3f ptrCandidate = basePtr;
-        surface->pointTo(ptrCandidate, worldPoint, std::numeric_limits<float>::max(), 200, patchIndex);
+        locatePointer(viewerManager, *surface, worldPoint, ptrCandidate);
         const cv::Vec3f candidateNormal = surface->normal(ptrCandidate);
         if (isValidNormal(candidateNormal)) {
             normals.push_back(candidateNormal);
@@ -362,13 +370,13 @@ std::optional<cv::Vec3f> computeRobustNormal(QuadSurface* surface,
                                              const cv::Vec3f& centerPtr,
                                              const cv::Vec3f& centerWorld,
                                              const SegmentationEditManager::ActiveDrag& drag,
-                                             SurfacePatchIndex* patchIndex = nullptr)
+                                             ViewerManager* viewerManager)
 {
     if (!surface || !drag.active) {
         return std::nullopt;
     }
 
-    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag, patchIndex);
+    const auto surfaceNormal = sampleSurfaceNormalsNearCenter(surface, centerPtr, drag, viewerManager);
     const auto rowVec = axisVectorFromSamples(AxisDirection::Row, drag);
     const auto colVec = axisVectorFromSamples(AxisDirection::Column, drag);
 
@@ -407,17 +415,6 @@ SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
     , _state(state)
 {
     ensureTimer();
-    _deferredPlaneIntersectionReleaseTimer = new QTimer(&_module);
-    _deferredPlaneIntersectionReleaseTimer->setSingleShot(true);
-    QObject::connect(_deferredPlaneIntersectionReleaseTimer, &QTimer::timeout,
-                     &_module, [this]() {
-        if (!_deferredPlaneIntersectionActiveViewer) {
-            return;
-        }
-        auto* activeViewer = _deferredPlaneIntersectionActiveViewer;
-        _deferredPlaneIntersectionActiveViewer = nullptr;
-        setDeferredPlaneIntersections(activeViewer, false);
-    });
 
     QObject::connect(&_alphaWatcher, &QFutureWatcher<AlphaResult>::finished,
                      &_module, [this]() { applyAlphaResult(); });
@@ -510,15 +507,6 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     _ppState.active = true;
     _ppState.direction = direction;
     _activeViewer = hover.viewer;
-    if (_deferredPlaneIntersectionReleaseTimer) {
-        _deferredPlaneIntersectionReleaseTimer->stop();
-    }
-    if (_deferredPlaneIntersectionActiveViewer &&
-        _deferredPlaneIntersectionActiveViewer != _activeViewer) {
-        setDeferredPlaneIntersections(_deferredPlaneIntersectionActiveViewer, false);
-    }
-    _deferredPlaneIntersectionActiveViewer = _activeViewer;
-    setDeferredPlaneIntersections(_activeViewer, true);
     _undoCaptured = false;
     _lastAlphaStartFailure.clear();
 
@@ -562,7 +550,6 @@ void SegmentationPushPullTool::stop(int direction)
 void SegmentationPushPullTool::stopAll()
 {
     const bool wasActive = _ppState.active;
-    VolumeViewerBase* activeViewer = _activeViewer;
 
     if (wasActive && _activeAlphaEnabled && _alphaComputeRunning) {
         if (_timer && _timer->isActive()) {
@@ -608,16 +595,6 @@ void SegmentationPushPullTool::stopAll()
         _module.emitPendingChanges();
         _module.queueAutosaveVertexUpdates(editedVerts);
         _module.markAutosaveNeeded();
-    }
-
-    if (wasActive) {
-        _deferredPlaneIntersectionActiveViewer = activeViewer;
-        if (_deferredPlaneIntersectionReleaseTimer) {
-            _deferredPlaneIntersectionReleaseTimer->start(kPlaneIntersectionReleaseIdleMs);
-        } else {
-            setDeferredPlaneIntersections(activeViewer, false);
-            _deferredPlaneIntersectionActiveViewer = nullptr;
-        }
     }
 
     _undoCaptured = false;
@@ -685,15 +662,14 @@ bool SegmentationPushPullTool::applyStepInternal()
         return false;
     }
 
-    auto* patchIndex = _editManager->preferredSurfacePatchIndex();
-
     // Get normal directly from grid position (avoids expensive pointTo lookup)
     cv::Vec3f normal = baseSurface->gridNormal(row, col);
     if (!isValidNormal(normal)) {
         // Fallback to robust normal computation if direct lookup fails
         cv::Vec3f ptr(0, 0, 0);
-        baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
-        if (const auto fallbackNormal = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+        locatePointer(_module.viewerManager(), *baseSurface, centerWorld, ptr);
+        if (const auto fallbackNormal = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(),
+                                                            _module.viewerManager())) {
             normal = *fallbackNormal;
         } else {
             _editManager->cancelActiveDrag();
@@ -828,10 +804,10 @@ void SegmentationPushPullTool::launchAlphaCompute()
 
         centerNormal = baseSurface->gridNormal(row, col);
         if (!isValidNormal(centerNormal)) {
-            auto* patchIndex = _editManager->preferredSurfacePatchIndex();
             cv::Vec3f ptr(0, 0, 0);
-            baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
-            if (const auto fallback = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+            locatePointer(_module.viewerManager(), *baseSurface, centerWorld, ptr);
+            if (const auto fallback = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(),
+                                                          _module.viewerManager())) {
                 centerNormal = *fallback;
             } else {
                 failAlphaStart(QStringLiteral("Alpha push/pull aborted: surface normal lookup failed."));
@@ -974,49 +950,16 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         return;
     }
 
-    if (auto* manager = _module.viewerManager()) {
-        _editManager->flushEditSurfacePatchIndex();
-        manager->forEachBaseViewer([viewer](VolumeViewerBase* candidate) {
-            if (!candidate || candidate == viewer) {
-                return;
-            }
-            if (dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
-                candidate->invalidateIntersect("segmentation");
-            }
-        });
-    }
-
     if (const auto touched = _editManager->recentTouchedBounds()) {
         const cv::Rect changedCells(touched->x - 1,
                                     touched->y - 1,
                                     touched->width + 2,
                                     touched->height + 2);
         viewer->invalidateVisRegion("segmentation", changedCells);
-        viewer->invalidateIntersectRegion("segmentation", changedCells);
     } else {
         viewer->invalidateVis();
-        viewer->invalidateIntersect("segmentation");
     }
     viewer->requestRender("push/pull active viewer refresh");
-}
-
-void SegmentationPushPullTool::setDeferredPlaneIntersections(VolumeViewerBase* activeViewer,
-                                                             bool defer)
-{
-    auto* manager = _module.viewerManager();
-    if (!manager) {
-        return;
-    }
-
-    manager->forEachBaseViewer([activeViewer, defer](VolumeViewerBase* candidate) {
-        if (!candidate || candidate == activeViewer) {
-            return;
-        }
-        if (defer && !dynamic_cast<PlaneSurface*>(candidate->currentSurface())) {
-            return;
-        }
-        candidate->setSegmentationIntersectionDeferral(defer);
-    });
 }
 
 void SegmentationPushPullTool::applyAlphaResult()

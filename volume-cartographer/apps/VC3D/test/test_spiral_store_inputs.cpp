@@ -255,6 +255,16 @@ void readsCurrentInputsAndTheirDifferences(const fs::path& directory)
     require(inputs.count(InputState::Fitted) == 3, "every input is as fitted");
 
     const auto& surface = *inputs.surfaces.at(0).surface;
+    require(surface.id == fixture.surface, "input geometry retains its store UUID for viewer queries");
+    SurfaceProximityQuery query;
+    query.uuids = std::vector<std::string>{surface.id};
+    query.volume = kVolume;
+    query.point = {10.5, 20.25, 30};
+    query.tolerance = 0.1;
+    const auto hits = fixture.session->nearestSurfaces({fixture.attachment}, query);
+    require(hits.size() == 1 && hits.front().hit.objectUuid == fixture.surface,
+            "a displayed fit input can be located directly without a session draft");
+    require(!fixture.session->hasDraft(fixture.surface), "reading fit inputs does not create editing drafts");
     const auto& points = *surface.rawPointsPtr();
     require(points.rows == 2 && points.cols == 3, "surface grid shape");
     require(points(0, 1) == cv::Vec3f(11, 20, 30), "scale-1 surface vertices are stored XYZ");

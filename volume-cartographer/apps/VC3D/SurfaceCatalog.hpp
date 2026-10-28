@@ -103,16 +103,27 @@ public:
 
     // Where the surfaces of every source cross `slice` (voxels of `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
-    // read was. Placeholders reached are fetched by the session. Synchronous:
-    // callers run it on a worker thread.
+    // read was. Placeholders reached (geometry not local yet) are listed with
+    // their attachment; fetch them (ObjectStoreSession::ensureGeometry) and
+    // read again to include them.
     struct Crossings {
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
+        std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
                             const std::function<bool()>& cancelled = {});
+
+    // The nearest point of each of `uuids` (drafts or objects of the sources)
+    // within `tolerance` of each of `points` (voxels of `volume`): the hits per
+    // point, nearest first, each with its fractional grid position. Placeholders
+    // reached are queued for fetching, not waited for.
+    static std::vector<std::vector<vc::objects::SurfaceProximityHit>> nearest(
+        vc::objects::ObjectStoreSession& session, const std::vector<vc::objects::AttachmentIdentity>& sources,
+        const std::string& volume, const std::vector<std::string>& uuids,
+        const std::vector<std::array<double, 3>>& points, double tolerance);
 
     // Where tools launched for the open volume read and write: the user's store
     // file (a hosted replica's local file) and the volume's id. Throws without a

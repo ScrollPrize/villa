@@ -19,6 +19,24 @@ struct Listing {
     std::optional<std::vector<std::string>> requested;
 };
 
+// Open Data catalogs hold each surface once per scan of a sample, every copy
+// mapped into the others through the catalog's scan-to-scan registrations.
+// A copy reached only through one of those is another scan's, not listed;
+// pyramid levels, superseded volumes and users' registrations are kept.
+bool otherScanCopy(const VolumeTransforms& transforms, const nlohmann::json& meta, const std::string& volume)
+{
+    const auto coordinates = meta.value("coordinates", nlohmann::json::object());
+    const auto source = coordinates.value("volume_uuid", nlohmann::json(nullptr));
+    if (!source.is_string()) return false;
+    const auto resolution = transforms.resolve(source.get<std::string>(), volume);
+    if (resolution.status != vcr::catalog::TransformStatus::Resolved) return false;
+    const auto& path = resolution.resolved().path;
+    // Steps are registration keys, inverse ones prefixed.
+    return std::any_of(path.begin(), path.end(), [](const std::string& step) {
+        return step.starts_with("catalog:") || step.starts_with("inverse:catalog:");
+    });
+}
+
 // The rows of `requested` (all when nullopt) in the volume, a surface from the
 // first source holding it.
 Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed,
@@ -43,8 +61,10 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
             session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
                 mapping = std::make_shared<const VolumeTransforms>(db.volumeTransforms(txn));
             });
+        const auto meta = nlohmann::json::parse(record.meta);
+        if (otherScanCopy(*mapping, meta, volume)) continue;
         SurfaceCatalog::Row row;
-        row.mapping = mapping->toVolume(nlohmann::json::parse(record.meta), volume);
+        row.mapping = mapping->toVolume(meta, volume);
         row.record = std::move(record);
         row.source = attachment;
         row.catalog = attachment != user;
@@ -224,6 +244,22 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
     return opened;
 }
 
+std::vector<std::vector<SurfaceProximityHit>> SurfaceCatalog::nearest(
+    ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources, const std::string& volume,
+    const std::vector<std::string>& uuids, const std::vector<std::array<double, 3>>& points, double tolerance)
+{
+    std::vector<std::vector<SurfaceProximityHit>> result(points.size());
+    if (uuids.empty() || points.empty()) return result;
+    SurfaceProximityQuery query;
+    query.volume = volume;
+    query.uuids = uuids;
+    query.tolerance = tolerance;
+    auto found = session.nearestSurfaces(sources, query, points);
+    for (size_t i = 0; i < points.size(); ++i)
+        for (auto& hit : found[i]) result[i].push_back(std::move(hit.hit));
+    return result;
+}
+
 SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
@@ -266,13 +302,16 @@ SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, co
                                                  const std::string& volume, const RegionSlice& slice, RegionOptions options,
                                                  const std::function<bool()>& cancelled)
 {
-    Crossings crossings;
     options.kind = "surface";
     options.volume = volume;
+    const auto isCancelled = [&] { return cancelled && cancelled(); };
+    if (isCancelled()) return {{}, false, {}};
+    Crossings crossings;
     for (auto& [attachment, result] : session.geometryRegion(sources, slice, options,
-                                                             [&](const auto&) { return cancelled && cancelled(); })) {
+                                                             [&](const auto&) { return isCancelled(); })) {
         crossings.complete = crossings.complete && result.complete();
         for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
+        for (auto& uuid : result.remote) crossings.remote.emplace_back(attachment, std::move(uuid));
     }
     return crossings;
 }

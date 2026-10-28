@@ -35,7 +35,6 @@ struct POI
     std::optional<cv::Vec3f> surfacePtr;  // Nominal source-surface pointer for exact viewer recentering.
     cv::Vec3f n = {0,0,0};
     bool suppressViewerRecenter = false;
-    bool suppressTransientPlaneIntersections = false;
 };
 
 class CState : public QObject
@@ -51,6 +50,15 @@ public:
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
     // The user's store in that session: the attachment edits go to.
     std::optional<vc::objects::AttachmentIdentity> objectStoreAttachment() const;
+    // The attachments the open volume's surfaces are read from, in the
+    // session's precedence order (an object comes from the first holding it,
+    // so an imported copy hides its catalog placeholder): the user's store,
+    // then the volume's Open Data catalog store once attached. Empty without a volume.
+    std::vector<vc::objects::AttachmentIdentity> surfaceSources() const;
+    // Decoded surface geometry kept for every store VC3D opens (all workspaces),
+    // up to the surface geometry cache setting; re-read after Settings change.
+    static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
+    static void applySurfaceGeometryCacheSettings();
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     // The sample's catalog store (vc::objects::attachCatalog) beside the
@@ -106,6 +114,9 @@ public:
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    // While an edit session publishes the open surface's changed rectangles to
+    // its draft itself, edit updates do not re-draft the whole surface.
+    void setActiveSurfaceEditing(bool editing) { _activeSurfaceEditing = editing; }
     // Apply catalog-style surface additions/replacements/removals atomically
     // from observers' perspective. Individual surface signals are suppressed
     // and one empty-name surfaceChanged signal is emitted after the map is final.
@@ -144,6 +155,12 @@ signals:
 
 private:
     void updateAnnotationVolume();
+    // The open ("segmentation") surface is in memory: while open it is a
+    // draft of the session (in the current volume's voxels), so store
+    // queries read it there rather than from its store.
+    void draftActiveSurface(const std::shared_ptr<QuadSurface>& surface);
+    std::string _activeSurfaceDraft;
+    bool _activeSurfaceEditing = false;
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;

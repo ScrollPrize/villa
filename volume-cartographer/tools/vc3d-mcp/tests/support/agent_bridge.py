@@ -66,7 +66,6 @@ class FakeAgentBridgeServer:
             "intersectionOpacity": 0.5,
             "intersectionThickness": 1.0,
             "overlayOpacity": 0.25,
-            "intersectionMaxSurfaces": 8,
             "planeIntersectionLinesVisible": True,
             "showSurfaceNormals": False,
             "surfaceOverlayEnabled": True,
