@@ -6,6 +6,7 @@
 #include "vc/fiber_tracer/detail/FiberRouteOwnership.hpp"
 #include "vc/fiber_tracer/detail/FiberContinuationGraph.hpp"
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
+#include "vc/fiber_tracer/FiberAttributes.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -16,6 +17,39 @@
 #include <zstd.h>
 
 using namespace vc::fiber_tracer;
+
+TEST_CASE("fiber attributes preserve actual segment scores through resampling reversal and cropping") {
+    FiberPathAttributes a;
+    a.widths={10,20,40};a.normals={{0,1,0},{0,-1,0},{0,1,0}};a.normalValid={1,1,1};
+    a.quality={.25,.75};a.costs={2,6};a.lengths={16,16};
+    const auto r=resampleFiberAttributes({0,16,32},a,{0,8,16,24,32});
+    CHECK(r.widths==std::vector<double>{10,15,20,30,40});
+    CHECK(r.costs==std::vector<double>{1,1,3,3});
+    CHECK(r.quality==std::vector<double>{.25,.25,.75,.75});
+    for(const auto& n:r.normals)CHECK(cv::norm(n)==doctest::Approx(1));
+    nlohmann::json piece={{"points_base",{{8,0,0},{16,0,0},{24,0,0}}}};
+    attachFiberAttributes(piece,r,1,4);
+    const auto& f=piece["fiber_attributes"];
+    CHECK(f["width_mean"]["values"].get<double>()==doctest::Approx(21.25));
+    CHECK(f["modulated_presence_mean"]["values"].get<double>()==doctest::Approx(.5));
+    CHECK(f["tracer_cost_sum"]["values"].get<double>()==doctest::Approx(4));
+    const auto joined=joinFiberAttributes(r,r);
+    CHECK(joined.costs==std::vector<double>{3,3,1,1,1,1,3,3});
+    CHECK(joined.widths.size()==9);
+    const auto clipped=resampleFiberAttributes({0,16,32},a,{0,16,20});
+    CHECK(clipped.costs.back()==doctest::Approx(1.5));
+    CHECK(clipped.quality.back()==doctest::Approx(.75));
+    auto invalid=a;invalid.normalValid[1]=false;
+    const auto withMissing=resampleFiberAttributes({0,16,32},invalid,{0,8,32});
+    CHECK_FALSE(withMissing.normalValid[1]);
+    // New optional fields survive the generic serializer unchanged.
+    piece["point_attributes"]["future_field"]=fiberAttribute({1,2,3},"arbitrary","Future extension");
+    validateStreamFiberAttributes(piece);
+    const auto decoded=nlohmann::json::from_msgpack(nlohmann::json::to_msgpack(piece));
+    CHECK(decoded==piece);
+    piece["point_attributes"]["width"]["values"]={1};
+    CHECK_THROWS(validateFiberAttributes(piece));
+}
 
 TEST_CASE("chunk segment R-tree conservatively contains every nearby segment") {
     std::mt19937_64 rng(1234);

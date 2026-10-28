@@ -120,6 +120,8 @@ class Stream:
         identity=hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()
         record=out/'run.json'
         if record.exists():
+            if json.loads(record.read_text()).get('output_schema'):
+                raise ValueError('Python-reference is a legacy format control; cannot resume attributed native output')
             if json.loads(record.read_text())['identity']!=identity:
                 raise ValueError('resume settings/source differ')
         else:
@@ -378,10 +380,14 @@ def run_native(cfg,out):
     identity=hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()
     record=out/'run.json'
     if record.exists():
-        if json.loads(record.read_text())['identity']!=identity:
+        saved=json.loads(record.read_text())
+        if saved.get('output_schema')!='fiber-stream-attributes-v2':
+            raise ValueError('old fiber output cannot be resumed; start a fresh attributes-v2 run')
+        if saved['identity']!=identity:
             raise ValueError('resume settings/source differ')
     else:
         atomic_json(record,dict(identity=identity,config=cfg,policy='neural-volume+width-v1',
+            output_schema='fiber-stream-attributes-v2',
             coordinates='base voxels',decision_base=options.get('decision_base',64)))
     atomic_json(out/'scheduler.json',dict(backend='native-cooperative-v1',options=options))
     return json.loads(ft.run_stream_volume(field,normals,trace,chunks,json.dumps(options),keys,str(out)))

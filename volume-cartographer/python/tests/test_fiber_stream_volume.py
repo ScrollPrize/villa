@@ -23,6 +23,26 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     assert result['active_fibers']==0 and result['peak_active_fibers']<=40
     assert result['collision_checks']>0 and result['pieces']>0
     pages=sorted((output/'tiles').glob('*.msgpack.zst'))
+    for page in pages:
+        payload=read_page(page)
+        assert payload['version']==2 and payload['attribute_schema_version']==1
+        for piece in payload['pieces']:
+            assert 'width_history_base' not in piece and 'cumulative_cost' not in piece
+            n=len(piece['points_base'])
+            point=piece['point_attributes'];segment=piece['segment_attributes'];fiber=piece['fiber_attributes']
+            for v in point.values():assert len(v['values'])==n
+            for v in segment.values():assert len(v['values'])==n-1
+            np.testing.assert_allclose(point['width']['values'],20)
+            normal=np.array(point['fiber_normal']['values'])
+            np.testing.assert_allclose(np.linalg.norm(normal,axis=1),1,atol=1e-6)
+            length=np.array(segment['traced_length']['values'])
+            quality=np.array(segment['modulated_presence']['values'])
+            cost=np.array(segment['tracer_cost']['values'])
+            assert np.isfinite(cost).all() and (cost>=-1e-9).all()
+            assert ((quality>=-1e-6)&(quality<=1+1e-6)).all()
+            np.testing.assert_allclose(fiber['width_mean']['values'],20)
+            np.testing.assert_allclose(fiber['tracer_cost_sum']['values'],cost.sum())
+            np.testing.assert_allclose(fiber['modulated_presence_mean']['values'],np.average(quality,weights=length))
     before={p.name:(p.stat().st_mtime_ns,p.read_bytes()) for p in pages}
     assert len(pages)==4
     resumed=json.loads(ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output)))
@@ -32,6 +52,15 @@ def test_cooperative_scheduler_cold_ct_and_resume(inputs):
     assert before=={p.name:(p.stat().st_mtime_ns,p.read_bytes()) for p in pages}
     # A native exception must survive future.get(), not be masked by cleanup.
     import pytest
+    # Incompatible historical pages must never be treated as completed work.
+    import msgpack
+    from numcodecs import Zstd
+    original=pages[0].read_bytes()
+    old=read_page(pages[0]);old['version']=1
+    pages[0].write_bytes(Zstd().encode(msgpack.packb(old,use_bin_type=True)))
+    with pytest.raises(ValueError,match='old outputs cannot be reused'):
+        ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output))
+    pages[0].write_bytes(original)
     options['ct_level']=9
     with pytest.raises(ValueError,match='CT level unavailable'):
         ft.run_stream_volume(field,normals,trace,chunk_config(),json.dumps(options),keys,str(output))

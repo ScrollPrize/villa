@@ -1845,8 +1845,60 @@ pilot are retained in `evaluations/cache_pressure_20261028_v1/README.md`.
 
 Output `tiles/X_Y_Z.msgpack.zst` pages belong to seed tiles, not clipping regions:
 their paths can extend far beyond the tile. Each piece includes base coordinates,
-seed provenance, width history/mean, per-half cumulative cost from the seed,
-endpoint reasons and links.
+seed provenance, endpoint reasons and links, plus the attributed output below.
+
+### Extensible fiber attributes (native stream output v2)
+
+The packed storage remains a MessagePack map compressed with Zstd. Native stream
+pages now declare `version: 2`, `attribute_schema_version: 1`; `run.json` declares
+`output_schema: "fiber-stream-attributes-v2"`. Old pages are rejected on resume;
+there is no conversion, backfill or reuse of historical fiber output. Prediction
+and CT caches are independent and reusable.
+
+For N saved `points_base`, each piece has three named dictionaries:
+
+- `point_attributes`: each attribute's `values` contains N entries.
+- `segment_attributes`: N−1 entries; entry i belongs to points i and i+1.
+- `fiber_attributes`: whole-piece values (scalars for the fields below).
+
+Every attribute has `values`, `units` and a human-readable `meaning`. Generic
+readers validate cardinalities and retain unknown optional attributes; a workflow
+separately validates the fields/units it requires. Adding optional names does not
+change the container version. Changing the meaning of an existing name requires
+an explicit schema change. `FiberAttributes.hpp` provides shared creation,
+validation, resampling and piece-summary helpers; `FiberPackedStorage.hpp` retains
+unknown fields during MessagePack roundtrips. This is not the separate strict
+VC3D annotation JSON schema.
+
+| Association | Field | Units / semantics |
+|---|---|---|
+| Point | `fiber_normal` | Unit XYZ axis; null when unavailable |
+| Point | `width` | Local predicted width, base voxels; **not** the running mean |
+| Segment | `modulated_presence` | Actual chosen-step direction/width-modulated presence, before additive smoothness |
+| Segment | `tracer_cost` | Actual incremental chosen-step objective, including smoothness and any enabled additional objective terms |
+| Segment | `traced_length` | Source arc length represented by the segment, base voxels |
+| Fiber | `width_mean` | Piece-local length-weighted mean of local point widths |
+| Fiber | `modulated_presence_mean` | Length-weighted segment quality |
+| Fiber | `modulated_presence_integral` | Sum of quality × represented arc length |
+| Fiber | `tracer_cost_sum` | Sum of segment costs |
+| Fiber | `tracer_cost_per_base_voxel` | Cost sum / represented arc length |
+| Fiber | `traced_length` | Sum of represented arc lengths |
+| Fiber | `coverage_width_reference` | Separate scalar resume state for the unchanged collision policy; **not** the reported piece-average width |
+
+Scores, local widths and scoring normals travel with the chosen beam nodes and
+are emitted when committed. If normal-aware scoring is disabled, only the
+accepted point's normal is sampled for metadata; no scores are re-evaluated.
+The seed normal is sampled once per half at startup. Reversing the backward half
+reverses segment order without negating quality/cost. Normals are axes, not
+signed traversal directions. At resampled points, widths interpolate linearly;
+normals interpolate sign-aligned and normalize, with invalid values propagated.
+Segment scores are re-binned from recorded values by source-arc overlap; clipping
+apportions a step's cost rather than charging it twice. No new inference or path
+re-scoring is performed. `traced_length` distinguishes source arc from a saved
+chord across a bend. The old `width_history_base` and `cumulative_cost` fields
+are absent. Running width means remain internal tracing state only, apart from
+the single coverage reference needed to preserve resume behavior.
+
 `run.json` records the complete settings identity. Repeating the command restores
 completed pages and their ownership, then retries unfinished seed tiles. A lock
 prevents simultaneous writers. Live traces are not checkpointed, and concurrent

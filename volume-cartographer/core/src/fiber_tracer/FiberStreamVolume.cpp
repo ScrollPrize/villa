@@ -1,5 +1,6 @@
 #include "vc/fiber_tracer/FiberStreamVolume.hpp"
 #include "vc/fiber_tracer/FiberVolumeCoverage.hpp"
+#include "vc/fiber_tracer/FiberAttributes.hpp"
 #include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/fiber_tracer/detail/FiberPackedStorage.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -158,7 +159,8 @@ struct Direction {
     std::unique_ptr<FiberTraceCursor> cursor;
     std::deque<FiberTraceCommit> pending;
     std::vector<Vec> points;
-    std::vector<double> widths,losses;
+    std::vector<double> widths; // running means used only by live coverage checks
+    FiberPathAttributes attributes;
     std::vector<uint8_t> outside;
     bool traceDone=false;
     std::string reason;
@@ -180,6 +182,7 @@ struct Pair {
     Direction half[2];
     std::atomic<int> unfinished{2};
     bool prepared=false,resampled=false;
+    FiberPathAttributes attributes;
     std::vector<uint8_t> combinedOutside;
     std::vector<std::pair<std::shared_ptr<Tile>,size_t>> waiters;
 };
@@ -249,7 +252,7 @@ class Stream {
         std::erase(open,tile);
         pool.push(1,[this,tile]{
             detail::writeFiberPacked(output/"tiles"/(tileName(tile->key)+".msgpack.zst"),
-                Json{{"version",1},{"coordinate_units","base_voxels"},{"pieces",std::move(tile->pieces)}});
+                Json{{"version",2},{"attribute_schema_version",1},{"coordinate_units","base_voxels"},{"pieces",std::move(tile->pieces)}});
             ++finishedTiles;
         });
     }
@@ -274,7 +277,8 @@ class Stream {
             active.emplace(pair->id,pair);++startedPairs;peakActive=std::max(peakActive.load(),active.size());
             for(int half=0;half<2;++half) {
                 auto& d=pair->half[half];d.pair=pair.get();d.half=half;d.direction=half?-dir:dir;d.previous=p;
-                d.points.push_back(p);d.widths.push_back(width);d.losses.push_back(0);d.widthMean=width;
+                d.points.push_back(p);d.widths.push_back(width);d.widthMean=width;
+                d.attributes.widths.push_back(width);d.attributes.normals.push_back({});d.attributes.normalValid.push_back(false);
                 pool.push(0,[this,pair,half]{check(pair,half);});
             }
         }
@@ -285,13 +289,19 @@ class Stream {
         auto& d=pair->half[half];
         if(d.pending.empty()&&!d.traceDone) {
             if(!d.cursor) {auto config=trace;config.initialWidthMean=pair->width/scale;config.preserveInitialDirection=true;
+                const auto normal=normals.sampleNormal(pair->seed/scale);
+                d.attributes.normals[0]=normal.normal;d.attributes.normalValid[0]=normal.valid;
                 d.cursor=std::make_unique<FiberTraceCursor>(predictions,pair->seed/scale,d.direction,maximum/scale,config,&normals);}
             d.traceDone=d.cursor->advance();
             for(auto& c:d.cursor->takeCommitted())d.pending.push_back(std::move(c));
         }
         while(!d.pending.empty()) {
             const auto c=d.pending.front();d.pending.pop_front();
-            d.points.push_back(c.point*scale);d.widths.push_back(c.widthMean*scale);d.losses.push_back(c.loss);
+            d.attributes.lengths.push_back(cv::norm(c.point*scale-d.points.back()));
+            d.attributes.widths.push_back(c.sampledWidth*scale);
+            d.attributes.normals.push_back(c.normal);d.attributes.normalValid.push_back(c.normalValid);
+            d.attributes.quality.push_back(c.modulatedPresence);d.attributes.costs.push_back(c.stepCost);
+            d.points.push_back(c.point*scale);d.widths.push_back(c.widthMean*scale);
             d.widthMean=c.widthMean*scale;d.widthCount=uint64_t(c.step)+1;
             d.direction=unit(d.points.back()-d.points[d.points.size()-2]);
             if(c.step%decisionSteps==0){pool.push(0,[this,pair,half]{check(pair,half);});return;}
@@ -299,8 +309,12 @@ class Stream {
         if(d.traceDone) {
             const auto& r=d.cursor->result();d.reason=r.reason;
             if(r.points.size()>d.points.size())throw std::logic_error("cursor missed committed geometry");
-            d.points.clear();for(const auto&p:r.points)d.points.push_back(p*scale);
-            d.widths.resize(d.points.size());d.losses.resize(d.points.size());
+            std::vector<Vec> finalPoints;for(const auto&p:r.points)finalPoints.push_back(p*scale);
+            // Length clipping can shorten the last accepted segment. Carry its
+            // recorded observations proportionally, without re-evaluating it.
+            d.attributes=resampleFiberAttributes(fiberArc(d.points),d.attributes,fiberArc(finalPoints));
+            d.points=std::move(finalPoints);
+            d.widths.resize(d.points.size());
             d.widthMean=r.widthSamples?r.widthMean*scale:pair->width;d.widthCount=std::max<uint64_t>(1,r.widthSamples);
             end(pair,half);return;
         }
@@ -331,12 +345,14 @@ class Stream {
         std::vector<double> arc(d.points.size(),0);
         for(size_t i=1;i<arc.size();++i)arc[i]=arc[i-1]+cv::norm(d.points[i]-d.points[i-1]);
         if(arc.back()<=0)return;
-        std::vector<Vec> p;std::vector<double>w,c;size_t j=0;
+        std::vector<Vec> p;std::vector<double>w,positions;size_t j=0;
         auto at=[&](double a){while(j+2<arc.size()&&arc[j+1]<a)++j;
+            positions.push_back(a);
             double t=arc[j+1]>arc[j]?(a-arc[j])/(arc[j+1]-arc[j]):0;
-            p.push_back(d.points[j]*(1-t)+d.points[j+1]*t);w.push_back(d.widths[j]*(1-t)+d.widths[j+1]*t);c.push_back(d.losses[j]*(1-t)+d.losses[j+1]*t);};
+            p.push_back(d.points[j]*(1-t)+d.points[j+1]*t);w.push_back(d.widths[j]*(1-t)+d.widths[j+1]*t);};
         for(double a=0;a<arc.back();a+=grid)at(a);at(arc.back());
-        d.points=std::move(p);d.widths=std::move(w);d.losses=std::move(c);
+        d.attributes=resampleFiberAttributes(arc,d.attributes,positions);
+        d.points=std::move(p);d.widths=std::move(w);
     }
     void publishNext() {
         std::shared_ptr<Pair> pair;
@@ -348,7 +364,8 @@ class Stream {
     }
     void finish(const std::shared_ptr<Pair>& pair) {
         auto& fw=pair->half[0];auto& bw=pair->half[1];
-        if(!pair->resampled){resample(fw);resample(bw);pair->resampled=true;}
+        if(!pair->resampled){resample(fw);resample(bw);
+            pair->attributes=joinFiberAttributes(bw.attributes,fw.attributes);pair->resampled=true;}
         std::vector<Vec> p(bw.points.rbegin(),bw.points.rend());p.insert(p.end(),fw.points.begin()+1,fw.points.end());
         if(!pair->prepared) {
             if(p.size()>=48 && !ct.sample(p,pair->combinedOutside,[this,pair]{finish(pair);} )){fw.outside={1};return;}
@@ -359,8 +376,8 @@ class Stream {
         }
         if(p.size()>=48) {
             const auto& outside=pair->combinedOutside;
-            std::vector<double>w(bw.widths.rbegin(),bw.widths.rend()),c(bw.losses.rbegin(),bw.losses.rend());
-            w.insert(w.end(),fw.widths.begin()+1,fw.widths.end());c.insert(c.end(),fw.losses.begin()+1,fw.losses.end());
+            std::vector<double>w(bw.widths.rbegin(),bw.widths.rend());
+            w.insert(w.end(),fw.widths.begin()+1,fw.widths.end());
             std::vector<uint8_t> inside(p.size(),1);
             for(size_t i=0;i<p.size();++i)for(int a=0;a<3;++a)if(p[i][a]<lo[a]||p[i][a]>hi[a])inside[i]=0;
             for(size_t i=0;i<outside.size();) {if(!outside[i]){++i;continue;}size_t j=i+1;while(j<outside.size()&&outside[j])++j;
@@ -384,17 +401,20 @@ class Stream {
             }
             for(const auto&[a,b]:parts) {
                 std::vector<Vec> piece(p.begin()+a,p.begin()+b);const auto id=nextFiber++;
-                const double mean=(fw.widthMean*fw.widthCount+bw.widthMean*bw.widthCount-pair->width)/(fw.widthCount+bw.widthCount-1);
                 Json links=Json::array();links.push_back(coverage.owner(piece.front(),unit(piece[1]-piece[0]),radius+grid,w[a],tolerance));
                 links.push_back(coverage.owner(piece.back(),unit(piece.back()-piece[piece.size()-2]),radius+grid,w[b-1],tolerance));
-                coverage.addOwned(piece,id,mean);
                 Json points=Json::array();double length=0;
                 for(size_t i=0;i<piece.size();++i){points.push_back(vectorJson(piece[i]));if(i)length+=cv::norm(piece[i]-piece[i-1]);}
-                Json record{{"id",id},{"points_base",std::move(points)},{"width_mean_base",mean},
-                    {"width_history_base",std::vector<double>(w.begin()+a,w.begin()+b)},
-                    {"cumulative_cost",std::vector<double>(c.begin()+a,c.begin()+b)},
+                Json record{{"id",id},{"points_base",std::move(points)},
                     {"seed_base",vectorJson(pair->seed)},{"seed_direction",vectorJson(pair->dir)},
                     {"reasons",{bw.reason,fw.reason}},{"links",std::move(links)}};
+                attachFiberAttributes(record,pair->attributes,a,b);
+                // Preserve coverage policy independently of reported local-width
+                // statistics. Resume needs the same reference used live.
+                const double mean=(fw.widthMean*fw.widthCount+bw.widthMean*bw.widthCount-pair->width)/(fw.widthCount+bw.widthCount-1);
+                record["fiber_attributes"]["coverage_width_reference"]=fiberAttribute(mean,"base_voxel",
+                    "Parent trace committed width mean used by coverage policy; resume state, not piece width mean");
+                coverage.addOwned(piece,id,mean);
                 {std::lock_guard lock(pair->tile->piecesMutex);pair->tile->pieces.push_back(std::move(record));}
                 ++pieces;kept.fetch_add(length);
             }
@@ -423,9 +443,16 @@ public:
         for(const auto& file:std::filesystem::directory_iterator(output/"tiles")) {
             const auto name=file.path().filename().string();if(!name.ends_with(".msgpack.zst"))continue;
             const auto data=detail::readFiberPacked(file.path());
+            if(data.value("version",0)!=2 || data.value("attribute_schema_version",0)!=1)
+                throw std::invalid_argument("stream resume requires version 2 recorded fiber attributes; old outputs cannot be reused");
             for(const auto& piece:data.at("pieces")) {
+                validateStreamFiberAttributes(piece);
+                const auto& coverageWidth=piece.at("fiber_attributes").at("coverage_width_reference");
+                if(coverageWidth.at("units")!="base_voxel" || !coverageWidth.at("values").is_number() ||
+                   !std::isfinite(coverageWidth.at("values").get<double>()) || coverageWidth.at("values").get<double>()<=0)
+                    throw std::invalid_argument("invalid coverage width reference");
                 std::vector<Vec> line;for(const auto& q:piece.at("points_base"))line.push_back(vectorOf(q));
-                const auto id=piece.at("id").get<int64_t>();coverage.addOwned(line,id,piece.at("width_mean_base"));
+                const auto id=piece.at("id").get<int64_t>();coverage.addOwned(line,id,coverageWidth.at("values"));
                 nextFiber=std::max(nextFiber.load(),id+1);++pieces;
                 for(size_t i=1;i<line.size();++i)kept.fetch_add(cv::norm(line[i]-line[i-1]));
             }
