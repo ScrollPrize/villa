@@ -104,6 +104,7 @@ public:
         return _displayedPreviewSourceIteration;
     }
     QString displayedPreviewInputDigest() const { return _displayedPreviewInputDigest; }
+    qint64 displayedPreviewInputPosition() const { return _displayedPreviewInputPosition; }
 
     // Create the first resident session. The service exposes dataset and
     // checkpoint discovery before this without importing the fit runtime.
@@ -356,6 +357,7 @@ private:
     QString _installedPreviewSession;
     qint64 _displayedPreviewSourceIteration = -1;
     QString _displayedPreviewInputDigest;
+    qint64 _displayedPreviewInputPosition = -1;
     QString _fetchingPreviewArtifact;
     QString _installedDiagnosticsArtifact;
     QString _fetchingDiagnosticsArtifact;

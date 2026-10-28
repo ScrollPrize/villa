@@ -2310,7 +2310,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             .arg(previewIteration)
             .arg(qMax<qint64>(0, currentIteration - previewIteration));
         const QString inputs = vc3d::spiralPreviewInputNote(
-            {previewIteration, _service->displayedPreviewInputDigest()},
+            {previewIteration, _service->displayedPreviewInputDigest(),
+             _service->displayedPreviewInputPosition()},
             status.value(QStringLiteral("input_digest")).toString());
         if (!inputs.isEmpty()) stateText += QStringLiteral(" — ") + inputs;
     }

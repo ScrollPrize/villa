@@ -1512,9 +1512,11 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                         vc3d::spiralPreviewProvenance(manifest);
                     _displayedPreviewSourceIteration = provenance.sourceIteration;
                     _displayedPreviewInputDigest = provenance.inputDigest;
+                    _displayedPreviewInputPosition = provenance.inputPosition;
                 } else {
                     _displayedPreviewSourceIteration = -1;
                     _displayedPreviewInputDigest.clear();
+                    _displayedPreviewInputPosition = -1;
                 }
                 // A newly installed surface has no overlays until its own
                 // diagnostics artifact arrives; the previous generation's
