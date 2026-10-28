@@ -6,6 +6,25 @@ target_compile_features(vc_fiber_view PUBLIC cxx_std_20)
 target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
 set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# Automated Sheet Volume (.asv) reader: the sheet-mesh sibling of the .afv reader.
+# A small standalone static lib depending only on SQLite3 + zlib (+ zstd when present),
+# so the overlay controller and tests can read sheets without the rest of vc_core.
+add_library(vc_sheet_collection STATIC src/SheetCollection.cpp src/SheetStitch.cpp)
+target_include_directories(vc_sheet_collection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(vc_sheet_collection PUBLIC cxx_std_20)
+if(NOT TARGET SQLite::SQLite3)
+    find_package(SQLite3 REQUIRED)
+endif()
+if(NOT TARGET ZLIB::ZLIB)
+    find_package(ZLIB REQUIRED)
+endif()
+target_link_libraries(vc_sheet_collection PUBLIC SQLite::SQLite3 ZLIB::ZLIB)
+if(TARGET zstd::libzstd)
+    target_link_libraries(vc_sheet_collection PUBLIC zstd::libzstd)
+    target_compile_definitions(vc_sheet_collection PRIVATE VC_SHEET_HAVE_ZSTD)
+endif()
+set_target_properties(vc_sheet_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(vc_core
         src/PolylineObj.cpp
         src/AtomicFile.cpp

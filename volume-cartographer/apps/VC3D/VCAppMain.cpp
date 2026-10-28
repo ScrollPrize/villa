@@ -13,6 +13,7 @@
 #include <QImageReader>
 
 #include "CWindow.hpp"
+#include "SheetCollectionController.hpp"
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
@@ -393,6 +394,9 @@ auto main(int argc, char* argv[]) -> int
     QCommandLineOption fiberCollectionOption(
         "object-store", "Attach an existing writable object store (.vcobj) for this session.", "path");
     parser.addOption(fiberCollectionOption);
+    QCommandLineOption sheetCollectionOption(
+        "sheet-collection", "Open a read-only Automated Sheet Volume (.asv) on the loaded volume.", "path");
+    parser.addOption(sheetCollectionOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -602,6 +606,10 @@ auto main(int argc, char* argv[]) -> int
 
         if (parser.isSet(fiberCollectionOption)) {
             aWin.attachObjectStore(parser.value(fiberCollectionOption).trimmed());
+        }
+
+        if (parser.isSet(sheetCollectionOption) && aWin.sheetCollection()) {
+            aWin.sheetCollection()->openCollection(parser.value(sheetCollectionOption).trimmed());
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

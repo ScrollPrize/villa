@@ -10,6 +10,7 @@
 #include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
+#include "SheetCollectionController.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "WrapAnnotationWidget.hpp"
@@ -274,6 +275,14 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachRemoteZarrAct);
     _fileMenu->addAction(_openDataCatalogAct);
+
+    _fileMenu->addAction(QObject::tr("Open Automated Sheet Volume…"), this, [this]() {
+        const auto path = QFileDialog::getOpenFileName(
+            _window, QObject::tr("Open Automated Sheet Volume (.asv)"), {},
+            QObject::tr("Automated Sheet Volume (*.asv);;All files (*)"));
+        if (!path.isEmpty() && _window->sheetCollection())
+            _window->sheetCollection()->openCollection(path);
+    });
 
     _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);

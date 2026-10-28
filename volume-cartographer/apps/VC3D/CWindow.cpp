@@ -57,6 +57,7 @@
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -84,6 +85,7 @@
 #include <QMouseEvent>
 #include <QScrollArea>
 #include <QSignalBlocker>
+#include <QDir>
 #include <QStandardPaths>
 #include <QMenu>
 #include <QMainWindow>
@@ -143,6 +145,7 @@
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
 #include "FiberCollectionController.hpp"
+#include "SheetCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2540,6 +2543,19 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             _persistentCacheWarningBanner, &QWidget::hide);
     _persistentCacheWarningBanner->hide();
     workspaceLayout->addWidget(_persistentCacheWarningBanner);
+    // Sheet-stitch mode banner (shown across the very top while stitching).
+    _sheetStitchBanner = new QFrame(workspaceContainer);
+    _sheetStitchBanner->setObjectName(QStringLiteral("sheetStitchBanner"));
+    _sheetStitchBanner->setStyleSheet(
+        QStringLiteral("QFrame#sheetStitchBanner { background: #0b5394; color: #ffffff; border-bottom: 1px solid #073763; }"));
+    auto* stitchLayout = new QHBoxLayout(_sheetStitchBanner);
+    stitchLayout->setContentsMargins(10, 5, 8, 5);
+    _sheetStitchBannerText = new QLabel(_sheetStitchBanner);
+    _sheetStitchBannerText->setObjectName(QStringLiteral("sheetStitchBannerText"));
+    _sheetStitchBannerText->setWordWrap(true);
+    stitchLayout->addWidget(_sheetStitchBannerText, 1);
+    _sheetStitchBanner->hide();
+    workspaceLayout->insertWidget(0, _sheetStitchBanner);
     workspaceLayout->addWidget(_workspaceTabs, 1);
     setCentralWidget(workspaceContainer);
     connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
@@ -2826,6 +2842,26 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    // Read-only .asv sheet-mesh overlay. Binds itself to the main viewer manager
+    // (attaches to all current and future planar viewers); no identity gate.
+    _sheetCollection = std::make_unique<SheetCollectionController>(_viewerManager.get(), this);
+    // Persist the attached .asv next to the project so it reopens with it.
+    connect(_sheetCollection.get(), &SheetCollectionController::collectionOpened, this,
+            [this](const QString& p) {
+                const QString vp = _state ? _state->vpkgPath() : QString();
+                if (vp.isEmpty())
+                    return;
+                const QString side = vp + ".sheet-collection.json";
+                if (p.isEmpty()) {
+                    QFile::remove(side);
+                    return;
+                }
+                QJsonObject o;
+                o["path"] = QFileInfo(p).absoluteFilePath();
+                QFile f(side);
+                if (f.open(QIODevice::WriteOnly))
+                    f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
+            });
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
@@ -3486,6 +3522,7 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
     addDock(menu, ui.dockWidgetRenderSettings);
     addDock(menu, ui.dockWidgetComposite);
     addDock(menu, _lasagnaDock);
+    addDock(menu, _sheetCollection ? _sheetCollection->dock() : nullptr);
 
     if (_atlasOverviewDock || _atlasSearchDock || _atlasControlDock || _atlasWorkspaceFiberDock) {
         auto* atlasMenu = menu->addMenu(tr("Atlas"));
@@ -3600,6 +3637,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                 viewer,
                                 scenePoint,
                                 globalPos)) {
+                            return;
+                        }
+
+                        if (_sheetCollection &&
+                            _sheetCollection->maybeShowStitchMenu(viewer, scenePoint, globalPos)) {
                             return;
                         }
 
@@ -9056,6 +9098,19 @@ bool CWindow::openVolumePackage(const QString& path,
     const bool opened = OpenVolume(
         path, interactive, errorMessage, preferredVolumeId, openError);
     UpdateView();
+    // Reopen a sheet volume attached to this project, if any.
+    if (opened && _sheetCollection) {
+        const QString vp = _state ? _state->vpkgPath() : QString();
+        if (!vp.isEmpty()) {
+            QFile f(vp + ".sheet-collection.json");
+            if (f.open(QIODevice::ReadOnly)) {
+                const QString ap =
+                    QJsonDocument::fromJson(f.readAll()).object().value("path").toString();
+                if (!ap.isEmpty() && QFileInfo::exists(ap))
+                    _sheetCollection->openCollection(ap);
+            }
+        }
+    }
     return opened;
 }
 
@@ -11364,4 +11419,132 @@ void CWindow::promptHubConflicts()
     box.exec();
     if (box.clickedButton() == useHub) session->resolveHubConflicts("hub");
     else if (box.clickedButton() == keepMine) session->resolveHubConflicts("local");
+}
+
+// --- sheet stitch mode -------------------------------------------------------
+
+namespace
+{
+QString sanitizeSegmentName(const QString& in)
+{
+    QString out;
+    for (QChar ch : in) {
+        if (ch.isLetterOrNumber() || ch == '_' || ch == '-')
+            out.append(ch);
+        else
+            out.append('_');
+    }
+    if (out.isEmpty())
+        out = QStringLiteral("stitch");
+    return out;
+}
+}  // namespace
+
+void CWindow::sheetStitchSetBanner(const QString& text)
+{
+    if (!_sheetStitchBanner || !_sheetStitchBannerText)
+        return;
+    _sheetStitchBannerText->setText(text);
+    _sheetStitchBanner->show();
+}
+
+void CWindow::sheetStitchHideBanner()
+{
+    if (_sheetStitchBanner)
+        _sheetStitchBanner->hide();
+}
+
+void CWindow::sheetStitchEnterLayout()
+{
+    auto* grid = mainViewerSplitGrid(ui.tabSegment);
+    if (!grid)
+        return;
+    if (!_sheetStitchInLayout) {
+        for (int i = 0; i < 4; ++i)
+            _sheetStitchPrevHidden[i] = grid->paneHidden(i);
+        _sheetStitchPrevSeg = _state ? _state->surface("segmentation") : nullptr;  // restore on exit
+        // Force axis-aligned XZ/YZ slices while stitching: otherwise the flat preview
+        // segment makes the segment-relative planes collapse to the XY view
+        // (AxisAlignedSliceController.cpp useCanonical = _enabled || !segment). Restore on exit.
+        _sheetStitchPrevAxisAligned =
+            _axisAlignedSliceController && _axisAlignedSliceController->isEnabled();
+        if (_axisAlignedSliceController && !_sheetStitchPrevAxisAligned)
+            _axisAlignedSliceController->setEnabled(true, ui.chkAxisOverlays, nullptr, /*persist=*/false);
+        _sheetStitchInLayout = true;
+    }
+    grid->exitFullSize();
+    for (int i = 0; i < 4; ++i)
+        grid->setPaneHidden(i, false);  // 3 slices + flattened surface pane
+}
+
+void CWindow::sheetStitchExitLayout()
+{
+    if (auto* grid = mainViewerSplitGrid(ui.tabSegment); grid && _sheetStitchInLayout)
+        for (int i = 0; i < 4; ++i)
+            grid->setPaneHidden(i, _sheetStitchPrevHidden[i]);
+    // Release the preview surface (and its flattened-view SurfaceCache) by restoring
+    // whatever was in the segmentation slot before stitching.
+    if (_sheetStitchInLayout && _state)
+        _state->setSurface("segmentation", _sheetStitchPrevSeg, false, false);
+    // Restore the axis-aligned-slices state we changed on entry.
+    if (_sheetStitchInLayout && _axisAlignedSliceController &&
+        _axisAlignedSliceController->isEnabled() != _sheetStitchPrevAxisAligned)
+        _axisAlignedSliceController->setEnabled(_sheetStitchPrevAxisAligned, ui.chkAxisOverlays, nullptr,
+                                                /*persist=*/false);
+    _sheetStitchPrevSeg.reset();
+    _sheetStitchInLayout = false;
+}
+
+void CWindow::sheetStitchShowPreview(const std::shared_ptr<QuadSurface>& surf)
+{
+    if (!surf || !_state)
+        return;
+    _state->setSurface("segmentation", surf, false, false);
+}
+
+QString CWindow::sheetStitchSaveSegment(const std::shared_ptr<QuadSurface>& surf,
+                                        const QString& baseName, QString& err)
+{
+    if (!surf) {
+        err = tr("no surface to save");
+        return {};
+    }
+    auto pkg = _state ? _state->vpkg() : nullptr;
+    if (!pkg) {
+        err = tr("no volume package is open");
+        return {};
+    }
+
+    std::string volId = _state->currentVolumeId();
+    const QString volName = sanitizeSegmentName(
+        volId.empty() ? QStringLiteral("volume") : QString::fromStdString(volId));
+    const QString baseDir = QDir::homePath() + QStringLiteral("/.VC3D/hercuvit/segments/") + volName;
+    if (!QDir().mkpath(baseDir)) {
+        err = tr("could not create %1").arg(baseDir);
+        return {};
+    }
+    const std::string dir = baseDir.toStdString();
+
+    // Attach that segments dir to the project exactly once, then select it as the
+    // output segments dir so the saved segment registers there.
+    if (!pkg->matchingSegmentsEntry(dir).has_value())
+        pkg->attachSegmentsEntry(dir, {}, /*select=*/true);
+    else
+        pkg->setOutputSegments(dir);
+
+    const QString san = sanitizeSegmentName(baseName);
+    QString id = san;
+    for (int n = 1; QDir(baseDir + "/" + id).exists(); ++n)
+        id = san + "_" + QString::number(n);
+
+    try {
+        surf->saveAsNew(std::filesystem::path((baseDir + "/" + id).toStdString()), false);
+    } catch (const std::exception& e) {
+        err = QString::fromUtf8(e.what());
+        return {};
+    }
+    pkg->addSingleSegmentation(id.toStdString());
+    if (_surfacePanel)
+        _surfacePanel->refreshSurfaceList();
+    return id;
 }

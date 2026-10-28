@@ -11,6 +11,7 @@
 #include <QPointer>
 #include <QString>
 #include <QStringList>
+#include <array>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -56,6 +57,7 @@ class CChunkedVolumeViewer;
 
 class Volume;
 class VolumePkg;
+class QuadSurface;
 class Surface;
 class QuadSurface;
 class RenderBenchRecorder;
@@ -122,6 +124,7 @@ class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
 class FiberCollectionController;
+class SheetCollectionController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
@@ -142,6 +145,19 @@ class CWindow : public QMainWindow
 
 public:
     void attachObjectStore(const QString& path);
+    // Read-only Automated Sheet Volume (.asv) viewer; null until constructed.
+    SheetCollectionController* sheetCollection() const { return _sheetCollection.get(); }
+
+    // --- sheet stitch mode (driven by SheetCollectionController) ---
+    void sheetStitchSetBanner(const QString& text);
+    void sheetStitchHideBanner();
+    void sheetStitchEnterLayout();   // reveal all 4 panes (3 slices + flattened surface)
+    void sheetStitchExitLayout();    // restore the prior pane visibility
+    void sheetStitchShowPreview(const std::shared_ptr<QuadSurface>& surf);  // -> flattened pane
+    // Write the blended surface as a VC3D segment under ~/.VC3D/hercuvit/segments/<volume>/
+    // (attaching that dir once). Returns the new segment id, or "" with `err` set.
+    QString sheetStitchSaveSegment(const std::shared_ptr<QuadSurface>& surf,
+                                   const QString& baseName, QString& err);
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
@@ -423,6 +439,12 @@ private:
     std::vector<std::string> _hubPromptedConflicts;
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
+    QFrame* _sheetStitchBanner{nullptr};
+    QLabel* _sheetStitchBannerText{nullptr};
+    bool _sheetStitchInLayout{false};
+    std::array<bool, 4> _sheetStitchPrevHidden{{false, false, false, false}};
+    std::shared_ptr<Surface> _sheetStitchPrevSeg;  // segmentation slot before the preview took it
+    bool _sheetStitchPrevAxisAligned{false};       // axis-aligned-slices state before stitching
     QTimer* _statusMessageTimer{nullptr};
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
@@ -506,6 +528,7 @@ private:
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
+    std::unique_ptr<SheetCollectionController> _sheetCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
