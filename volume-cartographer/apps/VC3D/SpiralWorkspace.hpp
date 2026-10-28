@@ -28,7 +28,7 @@
 #include <functional>
 
 namespace vc3d::spiral {
-struct PinnedStoreInputs;
+struct FitInputs;
 }
 
 class AxisAlignedSliceController;
@@ -45,6 +45,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class Volume;
 class SpiralOverlayController;
+class QTimer;
 class SpiralMinimap;
 class SpiralBrushController;
 class SpiralLineDraftOverlay;
@@ -151,22 +152,23 @@ private:
     // what is already displayed - it never reloads the surface.
     void installPreviewDiagnostics(const QString& manifestPath,
                                    qint64 generation);
-    // The fit's frozen inputs read from the attached store at the revisions
-    // the session's input manifest pins (vc3d::spiral::readPinnedStoreInputs).
-    void loadPinnedInputs();
-    void installPinnedInputs(const std::shared_ptr<vc3d::spiral::PinnedStoreInputs>& inputs,
+    // The fit's inputs as the attached store holds them now, with how they
+    // differ from what the session's input manifest says the fit read
+    // (vc3d::spiral::readFitInputs).
+    void loadFitInputs();
+    void installFitInputs(const std::shared_ptr<vc3d::spiral::FitInputs>& inputs,
                              quint64 generation);
-    void clearPinnedInputs(const QString& reason);
-    // Count a store commit against the fitted inputs and say how current
-    // they are; nothing is reloaded.
+    void clearFitInputs(const QString& reason);
+    // Reload the fit's inputs after a store commit touching them or their
+    // links; count other inputs a rebuild's selection may include.
     void noteStoreChanges(const vc::objects::StoreSessionEvent& event);
     void updateInputFreshness();
     void refreshPclOverlay(vc3d::spiral::PclRole role);
     void refreshFiberOverlay();
-    void refreshPinnedOverlays();
+    void refreshFitOverlays();
     // Reference-volume voxels -> the preview's volume frame; nullopt (with
     // the reason) when either side lacks or disagrees on a coordinate domain.
-    std::optional<double> pinnedInputScale(QString* error) const;
+    std::optional<double> fitInputScale(QString* error) const;
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -213,11 +215,11 @@ private:
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
     // The display-only overlay of the fit's point collections of one role
     // (same-winding, or relative-winding with the absolute ones), read from
-    // the attached store at the revisions the session's manifest pins.
+    // the attached store as it is now.
     struct PclOverlayState {
         std::unique_ptr<VCCollection> collection;
         std::unique_ptr<PointsOverlayController> overlay;
-        // The pinned collections as a point-collections document, and that
+        // The fit's collections as a point-collections document, and that
         // document on disk for VCCollection::loadFromJSON; empty when none.
         QJsonObject document;
         QString documentPath;
@@ -228,9 +230,9 @@ private:
     {
         return _pclOverlays[vc3d::spiral::pclRoleIndex(role)];
     }
-    // The fit's fibers at their pinned revisions, in reference-volume voxels.
+    // The fit's fibers as the store holds them now, in reference-volume voxels.
     std::unique_ptr<SpiralFiberOverlayController> _fiberOverlay;
-    std::vector<SpiralFiberOverlayController::Fiber> _pinnedFibers;
+    std::vector<SpiralFiberOverlayController::Fiber> _fitFibers;
     bool _fiberOverlayVisible = false;
     LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
@@ -261,14 +263,14 @@ private:
     // The session's input manifest and what the attached store holds of it.
     QString _inputManifestPath;
     QString _inputDigest;
-    quint64 _pinnedInputGeneration = 0;
-    std::shared_ptr<vc3d::spiral::PinnedStoreInputs> _pinnedInputs;
-    // Record UUIDs of the fitted objects and relationships, and those of them
-    // (and of other surfaces, collections and fibers) changed since loading.
-    QSet<QString> _pinnedRecords;
-    QSet<QString> _changedPinnedRecords;
+    quint64 _fitInputGeneration = 0;
+    std::shared_ptr<vc3d::spiral::FitInputs> _fitInputs;
+    // Record UUIDs of the fitted objects and relationships, and of the other
+    // surfaces, collections and fibers changed since the fit's inputs loaded.
+    QSet<QString> _fitRecords;
     QSet<QString> _changedOtherInputs;
-    QTemporaryDir _pinnedPclDocuments;
+    QTimer* _fitInputReload = nullptr;
+    QTemporaryDir _fitPclDocuments;
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
     std::optional<std::array<std::size_t, 3>> _previewBaseShapeZYX;

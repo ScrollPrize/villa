@@ -15,113 +15,108 @@ class QuadSurface;
 
 namespace vc3d::spiral {
 
-// The object-store inputs a Spiral fit froze, read back at the revisions its
-// input manifest pins (object_store_inputs.json, published by the service as
-// its input manifest artifact) and converted to reference-volume voxels, XYZ:
-// the frame the workspace displays. Pins are resolved by geometry revision
-// UUIDs, which every replica of a store shares; the manifest's object
-// revision UUIDs belong to the service's replica and are never used here.
+// The object-store inputs of a Spiral fit, read from the attached store as
+// they are now and converted to reference-volume voxels, XYZ: the frame the
+// workspace displays. The store is edited live; a fit read it once, so each
+// input also says whether it still is what the fit read. The fit's side
+// comes from its input manifest (object_store_inputs.json, published by the
+// service as its input manifest artifact), compared by identities every
+// replica of a store shares: geometry revision UUIDs, the metadata values
+// the adapter read, relationship record UUIDs, generations and approval
+// states. The manifest's object and relationship revision UUIDs belong to
+// the service's replica and are never used here.
 
-// How the local store holds one pinned input.
-enum class PinState {
-    Current,          // its current geometry and fit metadata are the pinned ones
-    Edited,           // the pinned geometry is history: the object changed since
+// How one fitted input stands in the attached store now.
+enum class InputState {
+    Fitted,           // its geometry and the metadata the fit read are unchanged
+    Edited,           // its geometry changed since the fit read it
     MetadataChanged,  // the same geometry, other metadata than the fit read
-    Missing,          // this store does not hold the pinned geometry revision
+    Missing,          // deleted, or not in this store: nothing to show
 };
-const char* pinStateName(PinState state);
+const char* inputStateName(InputState state);
 
+// One object as the manifest records it.
 struct StoreInputPin {
     std::string uuid, kind, name, geometryRevision;
-    std::string metadataSha256;  // empty in manifests from before the hashes
-    double scaleFactor = 1.0;    // stored units per reference-volume voxel
+    // The metadata the adapter read (object_store_inputs.adapter_metadata);
+    // null in manifests that do not record it, which then compare on
+    // geometry only.
+    nlohmann::json metadata;
 };
 
-struct PinnedSurface {
+struct FitSurface {
     StoreInputPin pin;
-    PinState state = PinState::Missing;
-    std::shared_ptr<QuadSurface> surface;  // empty when Missing
+    InputState state = InputState::Missing;
+    std::shared_ptr<QuadSurface> surface;  // current geometry; empty when Missing
 };
 
-struct PinnedPointCollection {
+struct FitPointCollection {
     StoreInputPin pin;
-    PinState state = PinState::Missing;
-    // False when this store lacks the metadata the fit read (no revision of
-    // the pinned geometry has the pinned metadata hash): the role below would
-    // be guessed, so the collection carries no points and is not shown.
-    bool fittedMetadata = false;
-    bool absolute = false;  // meta.source.winding_is_absolute, as fitted
+    InputState state = InputState::Missing;
+    bool absolute = false;  // meta.source.winding_is_absolute, now
     std::vector<int64_t> ids;  // stable point IDs, ascending
     std::vector<cv::Vec3d> points;
     std::vector<std::optional<double>> windings;  // wind_a annotations
 };
 
-struct PinnedFiber {
+struct FitFiber {
     StoreInputPin pin;
-    PinState state = PinState::Missing;
-    std::string family;  // "H", "V" or "" as fitted; "" when that metadata is not held
+    InputState state = InputState::Missing;
+    std::string family;  // "H", "V" or ""
     std::vector<cv::Vec3d> controls, line;
 };
 
-// How the local store holds one relationship the fit consumed, judged as
-// the fit's adapter would consume it today from the fitted objects' heads.
+// How one relationship the fit consumed stands now, judged as the fit's
+// adapter would consume it from the current heads of the fitted objects.
 enum class LinkState {
-    Current,  // consumed with the same anchors, metadata, approval and endpoint geometry
+    Fitted,   // consumed at the same generation, approval and endpoint geometry
     Changed,  // still consumed, but any of those differ
     Dropped,  // no longer consumed: removed, rejected, inapplicable or an endpoint gone
 };
 const char* linkStateName(LinkState state);
 
-struct PinnedRelationship {
+struct FitRelationship {
     std::string uuid, family;
     LinkState state = LinkState::Dropped;
 };
 
-struct PinnedStoreInputs {
+struct FitInputs {
     std::string digest, storeUuid, volumeUuid;
-    std::vector<PinnedSurface> surfaces;
-    std::vector<PinnedPointCollection> pointCollections;
-    std::vector<PinnedFiber> fibers;
-    // The relationships the fit consumed, by record UUID (shared by replicas).
-    std::vector<PinnedRelationship> relationships;
+    std::vector<FitSurface> surfaces;
+    std::vector<FitPointCollection> pointCollections;
+    std::vector<FitFiber> fibers;
+    std::vector<FitRelationship> relationships;
     // Relationships among the fitted objects that a rebuild would consume
     // and the fit did not.
     std::size_t addedRelationships = 0;
-    // Why the manifest does not describe this store, or a pin it cannot read.
+    // Why the manifest does not describe this store, or an input it cannot read.
     std::vector<std::string> problems;
 
-    std::size_t count(PinState state) const;
+    std::size_t count(InputState state) const;
     std::size_t count(LinkState state) const;
-    // Every pinned input is held by this store at its pinned geometry.
-    bool resolved() const { return problems.empty() && count(PinState::Missing) == 0; }
+    // Every input and relationship is as the fit read it.
+    bool unchanged() const
+    {
+        return problems.empty() && count(InputState::Fitted) == surfaces.size() + pointCollections.size()
+                                                                   + fibers.size()
+            && count(LinkState::Fitted) == relationships.size() && addedRelationships == 0;
+    }
 };
 
-// The pins of an input manifest document ({"digest", "manifest"}).
-std::vector<StoreInputPin> manifestPins(const nlohmann::json& manifest);
+// The objects of an input manifest document ({"digest", "manifest"}).
+std::vector<StoreInputPin> manifestPins(const nlohmann::json& document);
 
-// json.dumps(value, sort_keys=True, separators=(",", ":")): the canonical
-// text the Python adapter hashes (ASCII escapes, Python's float repr).
-std::string pythonCanonicalJson(const nlohmann::json& value);
+// The metadata the fit's object-store adapter reads from one object, as
+// object_store_inputs.adapter_metadata builds it.
+nlohmann::json adapterMetadata(const std::string& kind, const nlohmann::json& meta,
+                               const std::optional<vc::objects::FiberDetail>& fiber);
 
-// SHA-256 of the metadata the fit's object-store adapter reads from one
-// object, computed exactly as object_store_inputs.adapter_metadata and
-// content_sha256 do (canonical JSON: sorted keys, no spaces, ASCII escapes).
-std::string adapterMetadataSha256(const std::string& kind, const nlohmann::json& meta,
-                                  const std::optional<vc::objects::FiberDetail>& fiber);
-
-// The content hash of a consumed relationship (StoredRelationship.provenance's
-// content_sha256): its anchors in the manifest's endpoint order, and its
-// metadata.
-std::string relationshipContentSha256(const vc::objects::Anchor& a, const vc::objects::Anchor& b,
-                                      const nlohmann::json& meta);
-
-// Read every pinned input of `document` ({"digest", "manifest"}) from `db`.
-// A store other than the manifest's is refused outright (problems); a pin
-// the store lacks is Missing and carries no geometry rather than falling back
-// to a current head. The consumed relationships are compared with the ones
-// the store's current heads of the fitted objects would give.
-PinnedStoreInputs readPinnedStoreInputs(const vc::objects::ObjectStore& db,
-                                        const vc::objects::Txn& txn,
-                                        const nlohmann::json& document);
+// Read the inputs of `document` ({"digest", "manifest"}) from `db` at their
+// current heads, each with how it differs from what the fit read, and
+// compare the relationships the fit consumed with the ones those heads
+// would give. A store other than the manifest's is refused outright
+// (problems).
+FitInputs readFitInputs(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
+                        const nlohmann::json& document);
 
 } // namespace vc3d::spiral

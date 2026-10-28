@@ -4,10 +4,10 @@ A Spiral fit's patches, point collections and fibers come from the Spiral
 service's object store and are frozen for the resident fit; see "Object store
 and frozen inputs" and "Connecting from VC3D" in the
 [Spiral fitting README](../../spiral-fitting/README.md). The workspace shows
-them from the attached store at the revisions the fit pinned (fibers with
-*Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel reports
-their digest, counts and freshness, including fitted links that differ in the
-attached store.
+them as the attached store holds them now, reloading when they change (fibers
+with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
+reports their digest, counts and what differs from what the fit read,
+including its links.
 
 The input list holds only local drawings: brush patches and drawn point
 collections that a frozen fit does not take. The text filter applies to it.

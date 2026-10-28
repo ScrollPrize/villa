@@ -88,19 +88,20 @@ private slots:
         manager.initializeSession(request);
         QTRY_VERIFY_WITH_TIMEOUT(manager.hasActiveSession(), 30000);
 
-        // The fitted inputs' manifest arrives and resolves in the attached store.
+        // The fitted inputs' manifest arrives, and the attached store holds
+        // its inputs as fitted (geometry, metadata values and links).
         QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 1, 30000);
         QFile manifestFile(manifests.at(0).at(0).toString());
         QVERIFY(manifestFile.open(QIODevice::ReadOnly));
         const auto document = Json::parse(manifestFile.readAll().toStdString());
         QCOMPARE(QString::fromStdString(document.at("digest").get<std::string>()), manifests.at(0).at(1).toString());
-        vc3d::spiral::PinnedStoreInputs inputs;
+        vc3d::spiral::FitInputs inputs;
         session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            inputs = vc3d::spiral::readPinnedStoreInputs(db, txn, document);
+            inputs = vc3d::spiral::readFitInputs(db, txn, document);
         });
-        QVERIFY(inputs.resolved());
+        QVERIFY(inputs.unchanged());
         QCOMPARE(inputs.surfaces.size(), std::size_t{1});
-        QCOMPARE(inputs.surfaces.front().state, vc3d::spiral::PinState::Current);
+        QCOMPARE(inputs.surfaces.front().state, vc3d::spiral::InputState::Fitted);
 
         // The reload rebuild is accepted and rebuilds the session.
         errors.clear();
