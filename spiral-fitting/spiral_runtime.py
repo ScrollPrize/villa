@@ -2803,6 +2803,10 @@ class DistributedInteractiveFitSession:
                 raise RuntimeError("ranks prepared different inputs: " + ", ".join(
                     f"rank {rank} {str(digest)[:12]}" for rank, digest in sorted(digests.items())))
         except BaseException as exc:
+            if self._failed_error is not None:
+                # A rank was lost (or timed out) while preparing: the session
+                # has failed, whatever the other ranks still hold.
+                raise InputUpdateFailed(self._failed_error) from exc
             try:
                 self._call("discard_inputs", {}, timeout=COMMAND_ACK_TIMEOUT_S)
             except BaseException:
@@ -2813,7 +2817,12 @@ class DistributedInteractiveFitSession:
         except BaseException as exc:
             raise InputUpdateFailed(self._fail_session(
                 f"An input update failed after resident inputs were released: {exc}")) from exc
-        return {**prepared[0], **(self._call("publish_inputs", {}, timeout=COMMAND_ACK_TIMEOUT_S) or {})}
+        try:
+            published = self._call("publish_inputs", {}, timeout=COMMAND_ACK_TIMEOUT_S)
+        except BaseException as exc:
+            raise InputUpdateFailed(self._failed_error or self._fail_session(
+                f"An input update was installed but could not be published: {exc}")) from exc
+        return {**prepared[0], **(published or {})}
 
     def save_checkpoint(self, path, timeout=120.0):
         state = self.status()["state"]

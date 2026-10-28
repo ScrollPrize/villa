@@ -172,6 +172,10 @@ class _Coordinator(spiral_runtime.DistributedInteractiveFitSession):
             raise answer
         return answer
 
+    @property
+    def _failed_error(self):
+        return self.failed
+
     def _fail_session(self, cause, *, rank=None, detail=None):
         self.failed = str(cause)
         return self.failed
@@ -192,6 +196,26 @@ def test_the_coordinator_installs_only_what_every_rank_prepared():
             coordinator.update_inputs(7)
         assert coordinator.calls == ['prepare_inputs', 'discard_inputs']
         assert coordinator.failed is None
+
+    # A rank lost while preparing has failed the session: not a refusal.
+    class Lost(_Coordinator):
+        def _call(self, name, *args, **kwargs):
+            if name == 'prepare_inputs':
+                self.calls.append(name)
+                self.failed = 'Timed out waiting for GPU worker ranks [1] to prepare_inputs'
+                raise TimeoutError(self.failed)
+            return super()._call(name, *args, **kwargs)
+    coordinator = Lost({})
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='Timed out'):
+        coordinator.update_inputs(7)
+    assert coordinator.calls == ['prepare_inputs']
+
+    # A publish failure after every rank installed fails the session too.
+    coordinator = _Coordinator({'prepare_inputs': prepared, 'install_inputs': {},
+                                'publish_inputs': RuntimeError('rank 1: publish')})
+    with pytest.raises(spiral_runtime.InputUpdateFailed, match='could not be published'):
+        coordinator.update_inputs(7)
+    assert 'rank 1: publish' in coordinator.failed
 
     # A busy session refuses before any rank is asked.
     coordinator = _Coordinator({})
