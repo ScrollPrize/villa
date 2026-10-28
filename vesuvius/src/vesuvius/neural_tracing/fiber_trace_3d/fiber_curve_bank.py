@@ -29,6 +29,17 @@ class CurveBank:
         self.xyz=np.concatenate(points)
         self.first=np.r_[0,np.cumsum([len(a) for a in arcs])[:-1]]
         self.last=self.first+np.asarray([len(a) for a in arcs])-1
+        self._load_normals(normal_root,normal_solution)
+
+    @classmethod
+    def from_normals(cls,source_ids,normal_root,normal_solution):
+        """Frozen normal-only view: do not reload AFV positions to compare normals."""
+        self=cls.__new__(cls);self.ids=np.unique(source_ids)
+        self._load_normals(normal_root,normal_solution)
+        self.lengths=np.asarray(self.normals[self.normal_first+self.normal_count-1,0])
+        return self
+
+    def _load_normals(self,normal_root,normal_solution):
         doc=json.loads((Path(normal_root)/'index.json').read_text())
         if doc['format']!='fiber-normal-curves' or doc['columns']!=['arc','nx','ny','nz','valid']:raise ValueError('Normal curve format')
         index=np.asarray(doc['index'],np.int64)
@@ -53,10 +64,18 @@ class CurveBank:
         i=np.maximum(self.first[source],np.minimum(i,self.last[source]-1))
         t=(q-self.keys[i])/(self.keys[i+1]-self.keys[i])
         xyz=self.xyz[i]*(1-t[:,None])+self.xyz[i+1]*t[:,None]
+        n,nok=self.sample_normals(source,arc)
+        return xyz,n,nok
+
+    def sample_normals(self,source,arc):
+        source=np.asarray(source);arc=np.asarray(arc)
+        if not (np.isfinite(arc)&(arc>=0)&(arc<=self.lengths[source]+1e-6)).all():
+            raise ValueError('Normal sampling outside source span')
+        arc=np.minimum(arc,self.lengths[source])
         j=self.normal_first[source]+np.minimum((arc/self.spacing).astype(np.int64),self.normal_count[source]-2)
         a=self.normals[j];b=self.normals[j+1]
         f=(arc-a[:,0])/(b[:,0]-a[:,0]);raw=a[:,1:4]*(1-f[:,None])+b[:,1:4]*f[:,None]
         n,nok=unit(raw*self.sign[source,None])
         # Invalid sample gaps are not filled, even if nearby normals are valid.
         nok&=(a[:,4]>0)&(b[:,4]>0)&(np.sum(a[:,1:4]*b[:,1:4],axis=1)>0)
-        return xyz,n,nok
+        return n,nok
