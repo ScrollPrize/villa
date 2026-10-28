@@ -173,10 +173,16 @@ if(VC_MACDEPLOYQT)
 
             # Install-name rewriting invalidates Mach-O signatures. Ad-hoc
             # re-sign each file because arm64 macOS refuses to load it otherwise.
-            execute_process(COMMAND codesign --force --sign - "${_f}"
-                RESULT_VARIABLE _cs_rc ERROR_VARIABLE _cs_err)
-            if(NOT _cs_rc EQUAL 0)
-                message(FATAL_ERROR "codesign failed for ${_f}: ${_cs_err}")
+            # The bundle's main executable is signed by the bundle-level
+            # codesign below. Signing it here first fails on x86_64, where the
+            # linker does not ad-hoc sign the sibling vc_* tools (arm64 ld
+            # always does), so codesign sees unsigned nested code.
+            if(NOT _f MATCHES "/Contents/MacOS/VC3D$")
+                execute_process(COMMAND codesign --force --sign - "${_f}"
+                    RESULT_VARIABLE _cs_rc ERROR_VARIABLE _cs_err)
+                if(NOT _cs_rc EQUAL 0)
+                    message(FATAL_ERROR "codesign failed for ${_f}: ${_cs_err}")
+                endif()
             endif()
         endforeach()
         # Bundle-level signature last (re-signs the main executable and seals
