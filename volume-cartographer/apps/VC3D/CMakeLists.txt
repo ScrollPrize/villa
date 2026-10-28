@@ -21,6 +21,8 @@ set(srcs
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
+    SystemMemory.cpp
+    SystemMemory.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp

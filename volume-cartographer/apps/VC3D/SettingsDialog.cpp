@@ -1,6 +1,7 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
+#include "SystemMemory.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -83,7 +84,7 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     chkEnableFileWatching->setChecked(settings.value(perf::ENABLE_FILE_WATCHING, perf::ENABLE_FILE_WATCHING_DEFAULT).toBool());
 
     // Cache settings
-    spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
+    spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, vc3d::defaultRamCacheSizeGB()).toInt());
     spinViewerSurfaceCacheGB->setValue(
         settings.value(viewer_cache::SURFACE_CACHE_GB,
                        viewer_cache::SURFACE_CACHE_GB_DEFAULT).toInt());
