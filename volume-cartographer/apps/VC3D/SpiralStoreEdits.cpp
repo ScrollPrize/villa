@@ -125,17 +125,27 @@ vc::objects::AttachedCollection storedPointCollection(const EditablePclDraft& dr
     return stored;
 }
 
-std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& session,
-                                              const vc::objects::AttachmentIdentity& attachment,
-                                              const std::string& volume,
-                                              const std::vector<EditablePclDraft>& drafts)
+void setPointCollectionObject(EditablePclDraft& draft, const std::string& uuid, const std::string& revision)
+{
+    QJsonObject metadata = draft.sourceCollection.value(QStringLiteral("metadata")).toObject();
+    metadata[QStringLiteral("object_uuid")] = QString::fromStdString(uuid);
+    metadata[QLatin1String(kLocalObjectRevisionKey)] = QString::fromStdString(revision);
+    draft.sourceCollection[QStringLiteral("metadata")] = metadata;
+}
+
+std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreSession& session,
+                                                       const vc::objects::AttachmentIdentity& attachment,
+                                                       const std::string& volume,
+                                                       const std::vector<EditablePclDraft>& drafts)
 {
     std::vector<vc::objects::AttachedCollection> changed;
-    std::vector<std::string> removed, saved;
+    std::vector<std::string> removed;
+    std::vector<SavedPointCollection> saved(drafts.size());
     std::vector<std::pair<std::size_t, std::string>> replacements;
     vc::objects::RevisionSelection expected;
     for (std::size_t i = 0; i < drafts.size(); ++i) {
         const auto object = pointCollectionObject(drafts[i]);
+        if (object) saved[i].uuid = *object;
         if (object) {
             const std::string revision = drafts[i].sourceCollection.value(QStringLiteral("metadata")).toObject()
                                              .value(QLatin1String(kLocalObjectRevisionKey)).toString().toStdString();
@@ -147,8 +157,12 @@ std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& s
             if (object) removed.push_back(*object);
             continue;
         }
-        if (object) replacements.emplace_back(i, *object);
-        else changed.push_back(storedPointCollection(drafts[i], vc::objects::util::newUuid(), {}));
+        if (object) {
+            replacements.emplace_back(i, *object);
+        } else {
+            saved[i].uuid = vc::objects::util::newUuid();
+            changed.push_back(storedPointCollection(drafts[i], saved[i].uuid, {}));
+        }
     }
     // The meta.source kept is read at the expected revision: the commit is
     // refused unless that is still current.
@@ -165,8 +179,10 @@ std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession& s
         }
     });
     vc::objects::writeVolumeCollections(session, attachment, volume, changed, removed, expected);
-    for (const auto& collection : changed) saved.push_back(collection.uuid);
-    saved.insert(saved.end(), removed.begin(), removed.end());
+    // Each written head is this commit's: the objects are leased on a hosted
+    // replica, and a new one is known to no one else yet.
+    for (std::size_t i = 0; i < drafts.size(); ++i)
+        if (!drafts[i].deleted) saved[i].revision = currentRevision(session, attachment, saved[i].uuid);
     return saved;
 }
 

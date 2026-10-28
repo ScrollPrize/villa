@@ -72,7 +72,8 @@ private slots:
         QCOMPARE(fresh.size(), std::size_t{1});
         const auto created = vc3d::spiral::savePointCollections(session, attachment, kVolume, fresh);
         QCOMPARE(created.size(), std::size_t{1});
-        const auto uuid = created.front();
+        const auto uuid = created.front().uuid;
+        QVERIFY(!created.front().revision.empty());
         auto read = [&](const std::string& object) {
             Json result;
             session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -93,6 +94,18 @@ private slots:
         QVERIFY(stored["meta"]["source"]["winding_is_absolute"] == Json(true));
         QVERIFY(stored["annotations"][1]["wind_a"] == Json(1.0));
         QVERIFY(stored["meta"]["coordinates"] == volumeCoordinates(kVolume, 1));
+        // Saved again before an update brings it into the fit, it replaces
+        // the same object: the draft names it and the revision saved.
+        vc3d::spiral::setPointCollectionObject(fresh.front(), uuid, created.front().revision);
+        fresh.front().appendPreviewPoint(cv::Vec3f(4.0f, 5.0f, 7.0f));
+        const auto again = vc3d::spiral::savePointCollections(session, attachment, kVolume, fresh);
+        QVERIFY(again.front().uuid == uuid && again.front().revision != created.front().revision);
+        QVERIFY(read(uuid)["ids"] == Json({10, 20, 30, 31}));
+        std::size_t collections = 0;
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            collections = db.objectsByKind(txn, "point_collection").size();
+        });
+        QCOMPARE(collections, std::size_t{1});
 
         // The fit shows it with its object UUID and the revision it read: an
         // edit replaces that object, keeping the ids of kept points and the
@@ -132,14 +145,14 @@ private slots:
         auto stale = edited;
         stale.front().setDeleted(true);
         QVERIFY(refused(stale));
-        QVERIFY(read(uuid)["ids"] == Json({10, 20, 30}) && read(uuid)["retired"] == Json(false));
+        QVERIFY(read(uuid)["ids"] == Json({10, 20, 30, 31}) && read(uuid)["retired"] == Json(false));
         QVERIFY(head() != before);
         review("kept");
         edited = vc3d::spiral::importEditablePcls(fitDocument(QString::fromStdString(uuid), false, head()), 1.0, {},
                                                  true, vc3d::spiral::PclRole::Relative);
         QVERIFY(edited.front().erase(1));
         edited.front().appendPreviewPoint(cv::Vec3f(9.0f, 5.0f, 7.0f));
-        QVERIFY(vc3d::spiral::savePointCollections(session, attachment, kVolume, edited) == std::vector{uuid});
+        QVERIFY(vc3d::spiral::savePointCollections(session, attachment, kVolume, edited).front().uuid == uuid);
         stored = read(uuid);
         QVERIFY(stored["ids"] == Json({10, 30, 31}));
         QVERIFY(stored["points"][2] == Json({9.0, 5.0, 7.0}));

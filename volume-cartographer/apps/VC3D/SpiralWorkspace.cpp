@@ -483,7 +483,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 // The fit holds what was saved before the update began: those
                 // drafts are shown as its inputs from now on.
                 _brush->commitSucceeded(drafts);
-                for (const auto& id : drafts) _savedDraftIds.removeAll(id);
+                for (const auto& id : drafts) {
+                    _savedDraftIds.removeAll(id);
+                    _savedCollections.remove(id);
+                }
                 for (const auto& id : patches) {
                     _brush->removePatchDraft(id);
                     _brushPatches.remove(id);
@@ -1333,7 +1336,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
             continue;
         }
         try {
-            const SavedPatch previous = known == _brushPatches.cend() ? SavedPatch{} : *known;
+            const SavedObject previous = known == _brushPatches.cend() ? SavedObject{} : *known;
             const auto written = vc3d::spiral::saveBrushPatches(
                 *session, *attachment, volume, *scale,
                 {{previous.uuid, previous.revision, patch.id.toStdString(), patch.surface, remove}}).front();
@@ -1349,7 +1352,7 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
     }
     if (!collections.empty()) {
         std::vector<vc3d::spiral::EditablePclDraft> drafts;
-        QStringList fitted;
+        QStringList fitted, savedIds;  // savedIds: the collection of each draft
         for (const auto& collection : collections) {
             if (collection.draft) {
                 drafts.push_back(*collection.draft);
@@ -1360,12 +1363,25 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
                 if (imported.empty()) continue;
                 drafts.push_back(std::move(imported.front()));
             }
-            if (vc3d::spiral::pointCollectionObject(drafts.back())) fitted << collection.id;
+            if (vc3d::spiral::pointCollectionObject(drafts.back())) {
+                fitted << collection.id;
+            } else if (const auto known = _savedCollections.constFind(collection.id);
+                       known != _savedCollections.cend()) {
+                // Saved before but not in the fit yet: replace that object.
+                vc3d::spiral::setPointCollectionObject(drafts.back(), known->uuid, known->revision);
+            }
+            savedIds << collection.id;
         }
         QStringList ids;
         for (const auto& collection : collections) ids << collection.id;
         try {
-            vc3d::spiral::savePointCollections(*session, *attachment, volume, drafts);
+            const auto written = vc3d::spiral::savePointCollections(*session, *attachment, volume, drafts);
+            for (std::size_t i = 0; i < written.size(); ++i) {
+                const QString& id = savedIds[int(i)];
+                if (fitted.contains(id)) continue;
+                if (written[i].revision.empty()) _savedCollections.remove(id);
+                else _savedCollections[id] = {written[i].uuid, written[i].revision};
+            }
             for (const auto& id : ids) _brush->finalizationSucceeded(id);
             // Edits of fitted collections are shown from the store now; new
             // ones stay drawn until an update brings them into the fit.

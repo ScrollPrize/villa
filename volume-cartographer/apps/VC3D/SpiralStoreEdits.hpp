@@ -75,15 +75,26 @@ std::optional<std::string> pointCollectionObject(const EditablePclDraft& draft);
 // Not the manifest's object_revision, which names the service replica's.
 inline constexpr const char* kLocalObjectRevisionKey = "local_object_revision";
 
+// Name the store object (and the revision of it) a draft edits: a new
+// collection saved once is replaced, not created again, by its next save.
+void setPointCollectionObject(EditablePclDraft& draft, const std::string& uuid, const std::string& revision);
+
+// A saved draft: its object and the revision the save wrote (empty when it
+// was retired, or when a deleted draft had no object).
+struct SavedPointCollection {
+    std::string uuid, revision;
+};
+
 // Save point-collection drafts and deletions in one checked commit (the
 // store's writeVolumeCollections in the fit volume's voxels): replaced
 // collections keep their identity and their points' ids, new ones are
 // created, deleted ones retired. A replaced or deleted collection is pinned
 // at the revision its draft was read at (metadata.local_object_revision):
 // when another editor changed or retired it since, the commit is refused
-// instead of overwriting their edit. Returns the UUIDs written, in order.
-std::vector<std::string> savePointCollections(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&,
-                                              const std::string& volume,
-                                              const std::vector<EditablePclDraft>& drafts);
+// instead of overwriting their edit. Returns one result per draft, in order.
+std::vector<SavedPointCollection> savePointCollections(vc::objects::ObjectStoreSession&,
+                                                       const vc::objects::AttachmentIdentity&,
+                                                       const std::string& volume,
+                                                       const std::vector<EditablePclDraft>& drafts);
 
 } // namespace vc3d::spiral

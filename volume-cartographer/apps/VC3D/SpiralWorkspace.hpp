@@ -221,14 +221,15 @@ private:
     void setSurfaceCategoryVisible(const QString& category, bool visible);
     void pruneBrushPreviewSurfaces();
     QSet<QString> _retainedBrushPreviewIds;
-    // Brush patches saved to the store, by gesture id (their object and the
-    // revision the save wrote, which their next edit starts from), and
-    // drafts saved but not yet part of the fit (dropped once an input update
-    // includes them).
-    struct SavedPatch {
+    // Brush patches and new point collections saved to the store, by
+    // gesture id (their object and the revision the save wrote, which their
+    // next edit starts from), and drafts saved but not yet part of the fit
+    // (dropped once an input update includes them).
+    struct SavedObject {
         std::string uuid, revision;
     };
-    QHash<QString, SavedPatch> _brushPatches;
+    QHash<QString, SavedObject> _brushPatches;
+    QHash<QString, SavedObject> _savedCollections;
     QStringList _savedDraftIds;
     QStringList _savedPatchIds;
     // Those saved when the input update in flight began.
