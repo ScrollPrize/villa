@@ -78,6 +78,15 @@ struct FiberChunkSeedFit {
     const cv::Vec3d&,const cv::Vec3d&,const FiberChunkPaths&,
     const FiberChunkTraceConfig&,double traceToBaseScale);
 
+// Shared NMS, tube validation and optional position/direction refinement.
+// Bounds must describe a regular expanded chunk. Returned points are base XYZ,
+// widths are in tracer working units. Order is stable, strongest maxima first.
+[[nodiscard]] std::vector<FiberChunkSeedFit> findFiberChunkSeeds(
+    const FiberPredictionSource&,const vc::lasagna::NormalSampler&,
+    const FiberPredictionSource& refinementSource,FiberChunkPaths& bounds,
+    const FiberChunkTraceConfig&,double traceToBaseScale,bool requireWidth,
+    const FiberChunkParallelFor& = {});
+
 // Clears conflicting paths on the supplied copy; preserves path indices and
 // endpoint reasons. Never overwrites construction-cache payloads. Normals use
 // working coordinates, all geometry/thresholds are base voxels.

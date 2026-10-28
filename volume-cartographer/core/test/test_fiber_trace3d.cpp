@@ -5,6 +5,7 @@
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <cmath>
+#include <thread>
 #include <limits>
 #include <string>
 #include <utility>
@@ -1523,6 +1524,29 @@ TEST_CASE("native fiber extrapolation retains its path at invalid directions")
     REQUIRE(result.points.size() == 2);
     CHECK(result.points.front()[0] == doctest::Approx(0.0));
     CHECK(result.points.back()[0] == doctest::Approx(4.0));
+}
+
+TEST_CASE("cooperative cursor preserves exact beam results across worker migration")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels=4;config.beamWidth=8;config.beamLookaheadSteps=2;
+    config.parallelThreads=1;config.preserveInitialDirection=true;
+    const auto expected=vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,{0,0,0},{1,0,0},67,config,&normals);
+    vc::fiber_tracer::FiberTraceCursor cursor(predictions,{0,0,0},{1,0,0},67,config,&normals);
+    bool done=false;int quanta=0;std::vector<vc::fiber_tracer::FiberTraceCommit> committed;
+    while(!done) {
+        std::thread worker([&]{done=cursor.advance();});worker.join();
+        auto next=cursor.takeCommitted();committed.insert(committed.end(),next.begin(),next.end());
+        REQUIRE(++quanta<100);
+    }
+    CHECK(quanta>1);
+    CHECK(cursor.result().reason==expected.reason);
+    CHECK(cursor.result().points==expected.points);
+    REQUIRE(committed.size()+1>=expected.points.size());
+    for(size_t i=0;i<committed.size();++i)CHECK(committed[i].step==int(i+1));
 }
 
 TEST_CASE("native fiber extrapolation fails at invalid start or first step")

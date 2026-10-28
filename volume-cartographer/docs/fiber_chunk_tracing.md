@@ -1725,3 +1725,101 @@ Paths below are relative to `volume-cartographer/`:
 | Python `vc.fiber_trace` bindings | [`fiber_trace.cpp`](../python/vc/fiber_trace.cpp) |
 | Callable evaluation and CLI | [`fiber_evaluation.py`](../python/vc/fiber_evaluation.py) |
 | Construction/filter benchmarks and legacy cache import | [`fiber_chunk_benchmark.py`](../python/vc/fiber_chunk_benchmark.py) |
+
+## Continuous CPU tracing with neural volume coverage rules
+
+`scripts/run_fiber_stream_volume.py CONFIG.json OUTPUT` is an alternative to
+constructing and stitching cached chunk paths. It uses the existing chunk seed
+generator (`findFiberChunkSeeds`, Python `chunk_seeds`) but traces continuously
+with the native beam implementation. A storage boundary does not reset direction
+history or the cumulative arithmetic width mean. No neural model is run here;
+the inputs are completed prediction Zarrs and the CT volume.
+
+The neural coverage rules have a native spatial-index implementation in
+`FiberVolumeCoverage.hpp/.cpp`; regression tests compare it against the shared
+Python reference `vesuvius.neural_tracing.tracers.fibers.tracing.volume_policy`
+used by the neural volume runner. With `policy_grid_base: 8`, the rules are:
+
+- Collision radius 16 base voxels and absolute tangent dot product > 0.8;
+  three consecutive contacts stop a direction. Sibling halves do not collide.
+- Defer nearby starts within 128 base voxels; suppress covered main seeds within
+  16 base voxels. Chunk NMS/tube candidates replace the neural plane/fill-in
+  candidate generator; there is no additional fill-in pass.
+- Preserve the neural CT-zero, duplicate-run trimming, minimum 48-sample piece,
+  and endpoint-link rules. Paths are sampled at 8 base voxels for those rules.
+- The sole extra collision condition is width compatibility: known widths must
+  satisfy the tracer's `width_hard_relative_tolerance`, relative to the querying
+  trace's accumulated width. Unknown widths cannot reject a collision.
+
+This workflow does not enable the chunk conflict filter or FW/BW checks. Its
+collision semantics are not the older normal-oriented ellipse policy. Neither
+stopped directions nor discarded short pieces are GT error measurements.
+
+Use the regular volume runner's prediction, cache, trace and chunk settings,
+plus this section (distances here are base voxels):
+
+```json
+"stream": {
+  "workers": 128,
+  "active_fibers": 1280,
+  "seed_workers": 8,
+  "max_open": 32,
+  "policy_grid_base": 8,
+  "decision_base": 64,
+  "maximum_base": 64000,
+  "ct_locator": "/path/or/url/to/ct.zarr",
+  "ct_level": 2
+}
+```
+
+Set native `parallel_threads: 1` and leave `chunks.gpu_library` empty.
+`FiberStreamVolume.cpp` owns one shared C++ worker pool. Priority queues first
+serve ready collision/CT checks, then completion/admission, then beam advancement
+and bounded seed preparation. `active_fibers` defaults to ten times `workers`
+and counts seed pairs (two directional trace states each), **not OS threads**.
+The legacy `rows` option is accepted as the fallback worker count.
+
+`FiberTraceCursor` suspends the same beam loop used by synchronous VC3D tracing
+at frontier boundaries, retaining its branches, scratch, direction history and
+width mean. It can resume on any pool worker. CT cache misses register a
+continuation with the regular native chunk-cache readiness listener and return
+the worker to other work. Collision queries use native spatial indexes with
+shared-reader locks; final ownership publication is ordered in a single queued
+lane so concurrent finished paths cannot both evade duplicate suppression.
+That lane does not park other workers. Python only prepares metadata, enters
+the native runner with the GIL released, and forwards cancellation.
+
+`progress.json` includes CPU seconds, busy workers, active fibers, CT suspensions
+and per-priority work time/job counts (tiers 0: checks, 1: completion/admission,
+2: trace/seed preparation; tier 3 reserved). `scheduler.json` records the native
+backend and effective limits. This CPU-only workflow does not request GPUs or
+run inference. The previous coordinator is retained only behind the explicit
+`--python-reference` diagnostic flag for matched before/after measurements.
+
+`busy_workers` counts assigned jobs, including jobs blocked in prediction-cache
+reads; it is not CPU utilization. Prediction sampling-window loads currently
+use blocking retained-chunk reads, unlike the asynchronous CT checks above.
+The 2026-10-28 full-volume run exposed a shared-cache eviction/scheduler lock
+cascade after a fast initial pilot: 224 tracing workers waited for chunks while
+an eviction scan held a source mutex and a decode submitter held the shared
+selection gate waiting for that mutex. Small-pilot throughput therefore does
+not establish sustained full-volume throughput. The run was stopped for cache
+integration and pressure testing; this limitation must be verified under a
+filled cache before resuming production.
+
+Output `tiles/X_Y_Z.msgpack.zst` pages belong to seed tiles, not clipping regions:
+their paths can extend far beyond the tile. Each piece includes base coordinates,
+seed provenance, width history/mean, per-half cumulative cost from the seed,
+endpoint reasons and links.
+`run.json` records the complete settings identity. Repeating the command restores
+completed pages and their ownership, then retries unfinished seed tiles. A lock
+prevents simultaneous writers. Live traces are not checkpointed, and concurrent
+ownership decisions are scheduling-dependent; resume is not a promise of a
+bit-identical uninterrupted run. Output formats are versioned independently of
+the existing cached-chunk route format.
+
+Regression tests cover native seed ownership, exact cursor/synchronous beam
+parity across worker migration, cold CT reads, completed-page resume, cancellation,
+coordinate scaling, output roundtrip, and shared neural-policy parity. Local
+production inputs and pilot timings remain under the ephemeral experiment
+directory rather than becoming repository defaults.

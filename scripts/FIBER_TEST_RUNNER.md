@@ -1,5 +1,22 @@
 # Reusable fiber test and experiment runner
 
+`stream-volume-build`, `stream-volume-policy`, `stream-volume-native`,
+`stream-volume-pilot`, `stream-volume-resume`, `stream-volume-comparison`,
+`stream-volume-stop`, `stream-volume-status`, `stream-volume-restart`, and `stream-volume-full` use
+`local/test_stream_volume.py` for the continuous native beam/neural coverage
+workflow. The build runs the native chunk and tracing regressions; policy and
+native suites check sharing, width rejection, coordinate units and queue
+cancellation. The bounded Paris4 pilot reports CPU time, worker-tier time and CT
+suspensions. The comparison alternates three fresh-output runs of each native
+and Python-reference scheduler on the same 32 seed tiles; the native scheduler
+uses ten active fibers per worker. Ownership scheduling is not deterministic,
+so retained length and piece counts are recorded too, not assumed identical.
+The full suite launches a resumable CPU-only background job after the pilot
+gate. Local configs, logs and outputs live in
+`evaluations/paris4_stream_volume_20261027_v1`; it neither infers nor requests
+GPUs. These local suites require that fixture and harness; portable tests are
+under `python/tests/test_fiber_stream_volume.py` and the neural tracer tests.
+
 `native-volume-direct` and `native-volume-direct-report` reuse the local direct
 audit worker for completed9ef89ac3 Paris4 native-resolution predictions. Both
 FWoff/FW512 run CPU-only on56reference fibers/112directions with unchanged tuned

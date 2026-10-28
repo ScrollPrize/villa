@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <coroutine>
 #include <exception>
 #include <fstream>
 #include <future>
@@ -2399,14 +2400,39 @@ template <typename LossAt>
     return result;
 }
 
-[[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
+// One frame owns the exact same beam loop used by synchronous callers. Yielding
+// at a frontier boundary preserves all branches, scoring scratch and history.
+// It never parks an OS thread; a cursor may resume on another worker.
+struct TraceStepper {
+    struct promise_type {
+        FiberTraceOneWayResult result;
+        std::exception_ptr error;
+        TraceStepper get_return_object() {return TraceStepper(std::coroutine_handle<promise_type>::from_promise(*this));}
+        std::suspend_always initial_suspend() noexcept {return {};}
+        std::suspend_always final_suspend() noexcept {return {};}
+        void return_value(FiberTraceOneWayResult value) {result=std::move(value);}
+        void unhandled_exception() {error=std::current_exception();}
+    };
+    std::coroutine_handle<promise_type> handle;
+    explicit TraceStepper(std::coroutine_handle<promise_type> h):handle(h) {}
+    TraceStepper(TraceStepper&& other) noexcept:handle(std::exchange(other.handle,{})) {}
+    TraceStepper(const TraceStepper&)=delete;
+    ~TraceStepper(){if(handle)handle.destroy();}
+    bool advance() {
+        if(!handle.done())handle.resume();
+        if(handle.promise().error)std::rethrow_exception(handle.promise().error);
+        return handle.done();
+    }
+};
+
+[[nodiscard]] TraceStepper traceOneWayCoroutine(
     const FiberPredictionSource& predictions,
-    const FiberTraceOneWayRequest& inputRequest,
+    FiberTraceOneWayRequest inputRequest,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress,
+    FiberTraceProgressCallback progress,
     std::string phase,
     std::optional<double> traceLengthLimitVoxels = std::nullopt,
-    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
+    std::function<bool(const cv::Vec3d&, double, int)> committedStep = {},
     double* observedWidthMean = nullptr, float* committedModulatedPresence = nullptr)
 {
     auto request = inputRequest;
@@ -2436,7 +2462,7 @@ template <typename LossAt>
                 FiberTraceOneWayResult result;
                 result.points = {request.startPoint};
                 result.reason = "invalid_width";
-                return result;
+                co_return result;
             }
         }
     }
@@ -2608,7 +2634,7 @@ template <typename LossAt>
         return result;
     };
     if (initial.reached)
-        return finish(initial, true, "target_plane");
+        co_return finish(initial, true, "target_plane");
     CandidateScoringScratch scoringScratch;
     std::string reason = traceLengthLimitVoxels.has_value()
         ? "trace_distance_not_reached"
@@ -2725,7 +2751,7 @@ template <typename LossAt>
                 std::none_of(scores.begin(),scores.end(),[](const auto& s){return s.valid;})) {
                 const bool rejected=std::any_of(scores.begin(),scores.end(),[](const auto& s){return s.presenceRejected;});
                 const bool widthRejected=std::any_of(scores.begin(),scores.end(),[](const auto& s){return s.widthRejected;});
-                return finish(lastValidState,false,rejected ? "presence_cutoff" : widthRejected ? "width_cutoff" : "no_valid_candidates");
+                co_return finish(lastValidState,false,rejected ? "presence_cutoff" : widthRejected ? "width_cutoff" : "no_valid_candidates");
             }
 
             if (finalLookaheadGeneration) {
@@ -2759,7 +2785,7 @@ template <typename LossAt>
                         event.reason = "target_plane";
                         progress(event);
                     }
-                    return finish(bestReached, true, bestReached.reason);
+                    co_return finish(bestReached, true, bestReached.reason);
                 }
                 const auto pruneStart = TraceClock::now();
                 std::vector<size_t> selectedIndices;
@@ -2851,7 +2877,7 @@ template <typename LossAt>
                     event.reason = "target_plane";
                     progress(event);
                 }
-                return finish(bestReached, true, bestReached.reason);
+                co_return finish(bestReached, true, bestReached.reason);
             }
         }
         if (expanded.empty() && !prunedFinalFrontier)
@@ -2882,7 +2908,7 @@ template <typename LossAt>
                 }
                 if (crossed) break;
             }
-            if (crossed) return finish(*std::min_element(beams.begin(),beams.end(),beamSearchLess),false,"chunk_boundary");
+            if (crossed) co_return finish(*std::min_element(beams.begin(),beams.end(),beamSearchLess),false,"chunk_boundary");
         }
 
         if (updateWidth || committedStep) {
@@ -2896,7 +2922,7 @@ template <typename LossAt>
                     other = other->previous;
                 }
             }
-            if (!observeThrough(common)) return observerStopped();
+            if (!observeThrough(common)) co_return observerStopped();
         }
 
         if (progress) {
@@ -2925,10 +2951,11 @@ template <typename LossAt>
                 : (beams.front().reached ? beams.front().reason : reason);
             progress(event);
         }
+        co_await std::suspend_always{};
     }
 
     if (beams.empty()) {
-        return finish(lastValidState, false, reason);
+        co_return finish(lastValidState, false, reason);
     }
 
     const auto best = std::min_element(
@@ -2936,11 +2963,23 @@ template <typename LossAt>
     const bool reachedTraceLength = traceLengthLimitVoxels.has_value() &&
         stepIndex >= maxSteps;
     const bool reached = best->reached || reachedTraceLength;
-    return finish(
+    co_return finish(
         *best,
         reached,
         reachedTraceLength ? "trace_distance" :
             (best->reached ? best->reason : reason));
+}
+
+[[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
+    const FiberPredictionSource& predictions,const FiberTraceOneWayRequest& request,
+    const vc::lasagna::NormalSampler* normals,const FiberTraceProgressCallback& progress,
+    std::string phase,std::optional<double> limit=std::nullopt,
+    const std::function<bool(const cv::Vec3d&,double,int)>& observe={},
+    double* width=nullptr,float* presence=nullptr)
+{
+    auto loop=traceOneWayCoroutine(predictions,request,normals,progress,std::move(phase),limit,observe,width,presence);
+    while(!loop.advance()) {}
+    return std::move(loop.handle.promise().result);
 }
 
 struct ResampledTrace {
@@ -5263,16 +5302,14 @@ FiberTraceOneWayResult traceFiberOneWay(
         predictions, request, normalSampler, progress, "trace");
 }
 
-FiberTraceOneWayResult traceFiberExtrapolation(
+static FiberTraceOneWayRequest extrapolationRequest(
     const FiberPredictionSource& predictions,
     const cv::Vec3d& startPoint,
     const cv::Vec3d& outwardDirection,
     double distanceVoxels,
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
-    const FiberTraceProgressCallback& progress,
     bool fixInitialDirection,
-    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
     const std::vector<cv::Vec3d>& initialStepDirections)
 {
     validateTraceConfig(config);
@@ -5303,6 +5340,18 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     // to "reach", so the span-bounded endpoint threshold of traceFiberSegment
     // deliberately does not apply.
     request.config = config;
+    return request;
+}
+
+FiberTraceOneWayResult traceFiberExtrapolation(
+    const FiberPredictionSource& predictions,const cv::Vec3d& startPoint,
+    const cv::Vec3d& outwardDirection,double distanceVoxels,const FiberTraceConfig& config,
+    const vc::lasagna::NormalSampler* normalSampler,const FiberTraceProgressCallback& progress,
+    bool fixInitialDirection,const std::function<bool(const cv::Vec3d&,double,int)>& committedStep,
+    const std::vector<cv::Vec3d>& initialStepDirections,double* observedWidthMean)
+{
+    const auto request=extrapolationRequest(predictions,startPoint,outwardDirection,distanceVoxels,
+        config,normalSampler,fixInitialDirection,initialStepDirections);
     return traceOneWayCore(
         predictions,
         request,
@@ -5310,7 +5359,33 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         progress,
         "extrapolation",
         distanceVoxels,
-        committedStep);
+        committedStep, observedWidthMean);
+}
+
+struct FiberTraceCursor::Impl {
+    double width;
+    std::vector<FiberTraceCommit> committed;
+    TraceStepper loop;
+    Impl(const FiberPredictionSource& source,FiberTraceOneWayRequest request,
+        const vc::lasagna::NormalSampler* normals,double distance):
+        width(request.config.initialWidthMean),
+        loop(traceOneWayCoroutine(source,std::move(request),normals,{},"extrapolation",distance,
+            [this](const cv::Vec3d& p,double loss,int step) {
+                committed.push_back({p,loss,width,step});return true;
+            },&width)) {}
+};
+FiberTraceCursor::FiberTraceCursor(const FiberPredictionSource& source,const cv::Vec3d& start,
+    const cv::Vec3d& direction,double distance,const FiberTraceConfig& config,
+    const vc::lasagna::NormalSampler* normals):impl_(std::make_unique<Impl>(source,
+        extrapolationRequest(source,start,direction,distance,config,normals,false,{}),normals,distance)) {}
+FiberTraceCursor::~FiberTraceCursor()=default;
+FiberTraceCursor::FiberTraceCursor(FiberTraceCursor&&) noexcept=default;
+FiberTraceCursor& FiberTraceCursor::operator=(FiberTraceCursor&&) noexcept=default;
+bool FiberTraceCursor::advance(){return impl_->loop.advance();}
+std::vector<FiberTraceCommit> FiberTraceCursor::takeCommitted(){return std::exchange(impl_->committed,{});}
+const FiberTraceOneWayResult& FiberTraceCursor::result() const {
+    if(!impl_->loop.handle.done())throw std::logic_error("trace cursor is not complete");
+    return impl_->loop.handle.promise().result;
 }
 
 std::string traceFiberReplaySegment(const FiberPredictionSource& predictions,

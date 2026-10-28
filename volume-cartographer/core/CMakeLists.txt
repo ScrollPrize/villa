@@ -264,6 +264,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletOnDemand.cpp
     src/fiber_tracer/FiberletPipeline.cpp
     src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberVolumeCoverage.cpp
+    src/fiber_tracer/FiberStreamVolume.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
 target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS} zstd::libzstd)

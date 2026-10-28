@@ -248,6 +248,72 @@ FiberChunkSeedFit refineFiberChunkSeed(const FiberPredictionSource& source,const
     return winner;
 }
 
+std::vector<FiberChunkSeedFit> findFiberChunkSeeds(const FiberPredictionSource& samplesSource,
+    const vc::lasagna::NormalSampler& samplesNormals,const FiberPredictionSource& refinementSource,
+    FiberChunkPaths& bounds,const FiberChunkTraceConfig& c,double scale,bool requireWidth,
+    const FiberChunkParallelFor& parallelFor)
+{
+    const int side=validate(c,scale);
+    auto* tensor=const_cast<detail::FiberChunkTensor*>(dynamic_cast<const detail::FiberChunkTensor*>(&samplesSource));
+    auto idx=[&](int x,int y,int z){return (size_t(z)*side+y)*side+x;};
+    auto point=[&](int x,int y,int z){return bounds.lo+cv::Vec3d(x,y,z)*c.gridBase;};
+    std::vector<float> presence;
+    if(tensor)bounds.timings["seed_grid"]=tensor->seedGrid(bounds.lo,scale,c.gridBase,side,c.seedPresence,presence);
+    else presence.resize(size_t(side)*side*side);
+    for(int z=0;!tensor && z<side;++z) {
+        std::vector<cv::Vec3d> points,dirs(size_t(side)*side,cv::Vec3d(1,0,0));
+        points.reserve(dirs.size());
+        for(int y=0;y<side;++y) for(int x=0;x<side;++x) points.push_back(point(x,y,z)/scale);
+        std::vector<FiberPredictionSample> samples;
+        samplesSource.sampleBatch(points,dirs,1,samples);
+        if(samples.size()!=points.size()) throw std::runtime_error("chunk prediction batch mismatch");
+        for(size_t i=0;i<samples.size();++i) {auto p=best(samples[i]);presence[size_t(z)*side*side+i]=p.valid?p.presence:0;}
+    }
+    const int r=std::lround(c.nmsBase/c.gridBase);
+    std::vector<std::array<int,3>> candidates;
+    for(int z=r;z<side-r;++z) for(int y=r;y<side-r;++y) for(int x=r;x<side-r;++x) {
+        const float p=presence[idx(x,y,z)];if(p<c.seedPresence) continue;
+        bool peak=true;
+        for(int dz=-r;dz<=r&&peak;++dz) for(int dy=-r;dy<=r&&peak;++dy) for(int dx=-r;dx<=r;++dx)
+            if(presence[idx(x+dx,y+dy,z+dz)]>p) {peak=false;break;}
+        if(peak) candidates.push_back({x,y,z});
+    }
+    std::stable_sort(candidates.begin(),candidates.end(),[&](auto a,auto b){return presence[idx(a[0],a[1],a[2])]>presence[idx(b[0],b[1],b[2])];});
+    std::vector<bool> suppressed(presence.size());
+    std::vector<std::array<int,3>> selected;
+    for(const auto& v:candidates) {
+        if(suppressed[idx(v[0],v[1],v[2])]) continue;
+        ++bounds.maxima;
+        for(int dz=-r;dz<=r;++dz) for(int dy=-r;dy<=r;++dy) for(int dx=-r;dx<=r;++dx)
+            suppressed[idx(v[0]+dx,v[1]+dy,v[2]+dz)]=true;
+        selected.push_back(v);
+    }
+    std::vector<FiberChunkSeedFit> seeds(selected.size());
+    const auto process=[&](size_t i) {
+        const auto& v=selected[i];
+        auto p=point(v[0],v[1],v[2]);
+        const auto o=best(samplesSource.sample(p/scale,{1,0,0}));
+        auto d=unit(cv::Vec3d(o.direction));
+        if(!o.valid||cv::norm(d)<.5||!tubeSeed(samplesSource,samplesNormals,p,d,bounds,c,scale)) return;
+        double width=0;
+        if(requireWidth) {
+            std::vector<float> w;samplesSource.sampleWidths({cv::Vec3f(p/scale)},w);
+            if(w.size()!=1||!std::isfinite(w[0])||w[0]<=0) return;
+            width=w[0];
+        }
+        seeds[i]={p,d,width,o.presence};
+        if(c.refineSeed) {
+            const auto fit=refineFiberChunkSeed(refinementSource,p,d,bounds,c,scale);
+            if(fit.score>=0) {seeds[i]=fit;seeds[i].score=o.presence;}
+        }
+    };
+    if(parallelFor&&samplesSource.supportsConcurrentSampling()&&samplesNormals.supportsConcurrentSampling())
+        parallelFor(selected.size(),process);
+    else for(size_t i=0;i<selected.size();++i)process(i);
+    seeds.erase(std::remove_if(seeds.begin(),seeds.end(),[](const auto& s){return s.score<0;}),seeds.end());
+    return seeds;
+}
+
 std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& key,
     const FiberPredictionSource& source,const FiberTraceConfig& trace,
     const vc::lasagna::NormalSampler& normals,const FiberChunkTraceConfig& c,double scale,
@@ -326,60 +392,18 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
             pinned->seal();cfg.pinnedRegion=pinned.get();
         }
     }
-    auto idx=[&](int x,int y,int z){return (size_t(z)*side+y)*side+x;};
-    auto point=[&](int x,int y,int z){return out->lo+cv::Vec3d(x,y,z)*c.gridBase;};
     const auto seedStart=std::chrono::steady_clock::now();
-    std::vector<float> presence;
-    if(tensor)out->timings["seed_grid"]=tensor->seedGrid(out->lo,scale,c.gridBase,side,c.seedPresence,presence);
-    else presence.resize(size_t(side)*side*side);
-    for(int z=0;!tensor && z<side;++z) {
-        std::vector<cv::Vec3d> points,dirs(size_t(side)*side,cv::Vec3d(1,0,0));
-        points.reserve(dirs.size());
-        for(int y=0;y<side;++y) for(int x=0;x<side;++x) points.push_back(point(x,y,z)/scale);
-        std::vector<FiberPredictionSample> samples;
-        source.sampleBatch(points,dirs,1,samples);
-        if(samples.size()!=points.size()) throw std::runtime_error("chunk prediction batch mismatch");
-        for(size_t i=0;i<samples.size();++i) {auto p=best(samples[i]);presence[size_t(z)*side*side+i]=p.valid?p.presence:0;}
-    }
-    const int r=std::lround(c.nmsBase/c.gridBase);
-    std::vector<std::array<int,3>> candidates;
-    for(int z=r;z<side-r;++z) for(int y=r;y<side-r;++y) for(int x=r;x<side-r;++x) {
-        const float p=presence[idx(x,y,z)];if(p<c.seedPresence) continue;
-        bool peak=true;
-        for(int dz=-r;dz<=r&&peak;++dz) for(int dy=-r;dy<=r&&peak;++dy) for(int dx=-r;dx<=r;++dx)
-            if(presence[idx(x+dx,y+dy,z+dz)]>p) {peak=false;break;}
-        if(peak) candidates.push_back({x,y,z});
-    }
-    std::stable_sort(candidates.begin(),candidates.end(),[&](auto a,auto b){return presence[idx(a[0],a[1],a[2])]>presence[idx(b[0],b[1],b[2])];});
-    std::vector<bool> suppressed(presence.size());
-    std::vector<std::array<int,3>> selected;
-    for(const auto& v:candidates) {
-        if(suppressed[idx(v[0],v[1],v[2])]) continue;
-        ++out->maxima;
-        for(int dz=-r;dz<=r;++dz) for(int dy=-r;dy<=r;++dy) for(int dx=-r;dx<=r;++dx)
-            suppressed[idx(v[0]+dx,v[1]+dy,v[2]+dz)]=true;
-        selected.push_back(v);
-    }
+    auto seeds=findFiberChunkSeeds(samplesSource,samplesNormals,source,*out,c,scale,
+        cfg.widthRelativeTolerance>0,parallelFor);
     struct SeedResult {bool accepted=false;std::vector<cv::Vec3d> line;std::array<std::string,2> reasons;};
-    std::vector<SeedResult> results(selected.size());
-    std::vector<Json> gpuSeeds(c.gpuLibrary.empty()?0:selected.size());
+    std::vector<SeedResult> results(seeds.size());
+    std::vector<Json> gpuSeeds(c.gpuLibrary.empty()?0:seeds.size());
     const auto process=[&](size_t i) {
-        const auto& v=selected[i];auto& result=results[i];
-        auto p=point(v[0],v[1],v[2]);const auto o=best(samplesSource.sample(p/scale,{1,0,0}));
-        auto d=unit(cv::Vec3d(o.direction));
-        if(!o.valid||cv::norm(d)<.5||!tubeSeed(samplesSource,samplesNormals,p,d,*out,c,scale)) return;
-        if(cfg.widthRelativeTolerance>0) {
-            std::vector<float> w;samplesSource.sampleWidths({cv::Vec3f(p/scale)},w);
-            if(w.size()!=1||!std::isfinite(w[0])||w[0]<=0) return;
-        }
+        const auto& seed=seeds[i];auto& result=results[i];
+        auto p=seed.point;auto d=seed.direction;
         result.accepted=true;
         auto seedCfg=cfg;
-        if(c.refineSeed) {
-            const auto fit=refineFiberChunkSeed(source,p,d,*out,c,scale);
-            if(fit.score>=0) {
-                p=fit.point;d=fit.direction;seedCfg.initialWidthMean=fit.width;
-            }
-        }
+        if(c.refineSeed) seedCfg.initialWidthMean=seed.width;
         if(!c.gpuLibrary.empty()) {
             gpuSeeds[i]={{"seed",xyz(p/scale)},{"direction",xyz(d)}};
             return;
@@ -391,8 +415,8 @@ std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(const std::array<int,3>& k
         for(size_t j=1;j<fw.points.size();++j) result.line.push_back(fw.points[j]*scale);
         result.reasons={bw.reason,fw.reason};
     };
-    if(parallelFor&&source.supportsConcurrentSampling()&&normals.supportsConcurrentSampling()) parallelFor(selected.size(),process);
-    else for(size_t i=0;i<selected.size();++i) process(i);
+    if(parallelFor&&source.supportsConcurrentSampling()&&normals.supportsConcurrentSampling()) parallelFor(seeds.size(),process);
+    else for(size_t i=0;i<seeds.size();++i) process(i);
     for(auto& result:results) {
         out->seeds+=result.accepted;
         if(result.line.size()>=2) {out->lines.push_back(std::move(result.line));out->endReasons.push_back(result.reasons);}

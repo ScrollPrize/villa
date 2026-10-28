@@ -550,6 +550,31 @@ struct FiberTraceOneWayResult {
     uint64_t widthSamples = 0;
 };
 
+struct FiberTraceCommit {
+    cv::Vec3d point;
+    double loss=0, widthMean=0;
+    int step=0;
+};
+
+// Cooperative frontier advancement. Only one worker may advance a cursor at a
+// time, but ownership may move between workers. No thread is retained on yield.
+// Sources must outlive the cursor. Uses the synchronous tracer's same beam loop.
+class FiberTraceCursor {
+public:
+    FiberTraceCursor(const FiberPredictionSource&,const cv::Vec3d& start,
+        const cv::Vec3d& direction,double distance,const FiberTraceConfig&,
+        const vc::lasagna::NormalSampler* = nullptr);
+    ~FiberTraceCursor();
+    FiberTraceCursor(FiberTraceCursor&&) noexcept;
+    FiberTraceCursor& operator=(FiberTraceCursor&&) noexcept;
+    bool advance(); // true when complete; at most one frontier quantum
+    std::vector<FiberTraceCommit> takeCommitted();
+    const FiberTraceOneWayResult& result() const; // only after completion
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 struct FiberTraceSegmentResult {
     FiberTraceOneWayResult forward;
     FiberTraceOneWayResult reverse;
@@ -720,7 +745,8 @@ struct CandidateScoreDebug {
     // false stops after this point. Only irrevocable points are reported,
     // excluding the seed, before optional final length clipping.
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
-    const std::vector<cv::Vec3d>& initialStepDirections = {});
+    const std::vector<cv::Vec3d>& initialStepDirections = {},
+    double* observedWidthMean = nullptr);
 
 // Evaluation adapter: length-bounded beam tracing towards the reference end,
 // with committed-point observation (no target-plane snapping). widthMean is

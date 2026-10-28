@@ -23,9 +23,17 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <unordered_map>
+#include <chrono>
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberVolumeCoverage.hpp"
+#include "vc/fiber_tracer/FiberStreamVolume.hpp"
+#include <future>
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
 #include "vc/fiber_tracer/FiberCaseQueue.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
@@ -388,6 +396,143 @@ ft::FiberTraceOneWayResult traceExtrapolation(const PredictionFieldHandle& field
     nb::gil_scoped_release release;
     return ft::traceFiberExtrapolation(*field.field, toVec(start), toVec(direction),
                                       distance, checked, samplerPtr(normals));
+}
+
+// Native handoff: trace workers sleep on their own condition variable, without
+// acquiring the GIL. Only the batched policy coordinator materializes Python.
+struct StreamControl {
+    struct Pending {
+        size_t row;Vec3 point,direction;double width;int step;
+        bool answered=false,keep=false;std::condition_variable ready;
+    };
+    std::mutex mutex;std::condition_variable available;
+    bool stopped=false;
+    std::deque<std::shared_ptr<Pending>> events;
+    std::unordered_map<size_t,std::shared_ptr<Pending>> pending;
+    bool request(size_t row,Vec3 p,Vec3 d,double width,int step) {
+        auto e=std::make_shared<Pending>();e->row=row;e->point=p;e->direction=d;e->width=width;e->step=step;
+        std::unique_lock lock(mutex);
+        if(stopped)return false;
+        if(pending.count(row))throw std::logic_error("overlapping streaming requests for one row");
+        pending[row]=e;events.push_back(e);available.notify_one();
+        e->ready.wait(lock,[&]{return stopped||e->answered;});
+        pending.erase(row);
+        return !stopped&&e->keep;
+    }
+    std::vector<std::shared_ptr<Pending>> poll(int milliseconds) {
+        std::unique_lock lock(mutex);
+        available.wait_for(lock,std::chrono::milliseconds(milliseconds),[&]{return stopped||!events.empty();});
+        // Brief bounded coalescing avoids a separate CT/KD query for each head.
+        // Never wait for all traces: slow/I/O-blocked rows cannot stall others.
+        if(!events.empty()&&events.size()<16&&!stopped)
+            available.wait_for(lock,std::chrono::microseconds(500),[&]{return stopped||events.size()>=16;});
+        std::vector<std::shared_ptr<Pending>> out(events.begin(),events.end());events.clear();return out;
+    }
+    void respond(size_t row,bool keep) {
+        std::lock_guard lock(mutex);
+        const auto i=pending.find(row);
+        if(i==pending.end())throw std::logic_error("unknown streaming response");
+        i->second->keep=keep;i->second->answered=true;i->second->ready.notify_one();
+    }
+    void cancel() {
+        std::lock_guard lock(mutex);stopped=true;
+        for(auto& [id,e]:pending)e->ready.notify_one();
+        available.notify_all();
+    }
+};
+
+// Continuous native trace; one handoff per neural-equivalent decision,
+// never per candidate/sample. Callback may wait on a batched coordinator.
+nb::dict traceStream(const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+    Vec3 start, Vec3 direction, double distance, const ft::FiberTraceConfig& config,
+    int decisionSteps, nb::object observe, double initialWidth, size_t row)
+{
+    if(decisionSteps<1)throw std::invalid_argument("decision_steps must be positive");
+    auto checked=checkedConfig(field,config,&normals);
+    if(!std::isfinite(initialWidth)||initialWidth<=0)
+        throw std::invalid_argument("initial width must be positive");
+    checked.initialWidthMean=initialWidth;
+    checked.preserveInitialDirection=true;
+    auto* control=nb::isinstance<StreamControl>(observe)?nb::cast<StreamControl*>(observe):nullptr;
+    double waitSeconds=0;
+    double width=checked.initialWidthMean;
+    std::vector<double> widths,losses;
+    std::vector<cv::Vec3d> observed;
+    observed.push_back(toVec(start));widths.push_back(width);losses.push_back(0);
+    ft::FiberTraceOneWayResult result;
+    {
+        nb::gil_scoped_release release;
+        const auto submit=[&](Vec3 p,Vec3 d,double w,int step) {
+            const auto began=std::chrono::steady_clock::now();
+            bool keep;
+            if(control)keep=control->request(row,p,d,w,step);
+            else {
+                nb::gil_scoped_acquire acquire;
+                keep=nb::cast<bool>(observe(p,d,w,step));
+            }
+            waitSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count();
+            return keep;
+        };
+        if(control&&!submit(start,direction,width,0)) {
+            result.points={toVec(start)};result.reason="observer_stop";
+        } else result=ft::traceFiberExtrapolation(*field.field,toVec(start),toVec(direction),
+            distance,checked,samplerPtr(&normals),{},false,
+            [&](const cv::Vec3d& p,double loss,int step) {
+                observed.push_back(p);widths.push_back(width);losses.push_back(loss);
+                if(step%decisionSteps)return true;
+                auto d=p-observed[observed.size()-2];
+                const auto n=cv::norm(d);if(n>0)d/=n;
+                return submit(fromVec(p),fromVec(d),width,step);
+            },{},&width);
+    }
+    // Clipping can change the last returned point; observations cover all
+    // irrevocable nodes. Store the returned geometry with matching width history.
+    if(result.points.size()>widths.size())
+        throw std::runtime_error("stream missed committed points");
+    widths.resize(result.points.size());losses.resize(result.points.size());
+    nb::dict out;out["points"]=pointsArray(result.points);
+    const auto count=widths.size();
+    out["widths"]=ownedArray(std::move(widths),{count});
+    out["losses"]=ownedArray(std::move(losses),{count});
+    out["reason"]=result.reason;out["wait_seconds"]=waitSeconds;
+    out["width_count"]=std::max<size_t>(1,result.widthSamples);
+    out["width_mean"]=result.widthSamples?result.widthMean:initialWidth;
+    return out;
+}
+
+nb::dict chunkSeeds(const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
+    const std::array<int,3>& key,const ft::FiberChunkTraceConfig& input)
+{
+    auto c=input;
+    if(!c.gpuLibrary.empty())throw std::invalid_argument("seed extraction is CPU only");
+    const double scale=field.scales.traceToBaseScale;
+    ft::FiberChunkPaths bounds;bounds.key=key;
+    for(int a=0;a<3;++a) {
+        bounds.lo[a]=key[a]*c.coreBase-c.haloBase;
+        bounds.hi[a]=(key[a]+1)*c.coreBase+c.haloBase;
+    }
+    std::vector<ft::FiberChunkSeedFit> seeds;
+    {
+        nb::gil_scoped_release release;
+        auto* normalField=dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normals.sampler.get());
+        if(!normalField)throw std::invalid_argument("native seed extraction requires channel normals");
+        ft::detail::FiberChunkTensor tensor(*field.field,*normalField,
+            bounds.lo/scale,bounds.hi/scale,true,c.channelHints,c.workerCacheBytes);
+        seeds=ft::findFiberChunkSeeds(tensor,tensor,*field.field,bounds,c,scale,true);
+    }
+    std::vector<cv::Vec3d> points,dirs;std::vector<double> widths,scores;
+    for(const auto& s:seeds) {
+        // Only the core owns seeds; halo is read support, not extra owners.
+        bool core=true;for(int a=0;a<3;++a)
+            core=core&&s.point[a]>=key[a]*c.coreBase&&s.point[a]<(key[a]+1)*c.coreBase;
+        if(!core)continue;
+        points.push_back(s.point);dirs.push_back(s.direction);
+        widths.push_back(s.width*scale);scores.push_back(s.score);
+    }
+    nb::dict out;out["points_base"]=pointsArray(points);out["directions"]=pointsArray(dirs);
+    const auto count=widths.size();out["widths_base"]=ownedArray(std::move(widths),{count});
+    out["presence"]=ownedArray(std::move(scores),{count});out["maxima"]=bounds.maxima;
+    return out;
 }
 
 struct ChunkPathsHandle {
@@ -1000,6 +1145,64 @@ NB_MODULE(fiber_trace, m)
           "field"_a, "reference_line"_a, "start_index"_a, "target_index"_a,
           "config"_a, "normal_sampler"_a = nb::none(),
           "Trace between two points of a reference polyline, with VC3D's bidirectional meeting check.");
+    nb::class_<StreamControl>(m,"StreamControl")
+        .def(nb::init<>())
+        .def("poll",[](StreamControl& c,int milliseconds) {
+            std::vector<std::shared_ptr<StreamControl::Pending>> events;
+            {nb::gil_scoped_release release;events=c.poll(milliseconds);}
+            nb::list out;
+            for(const auto& e:events) {
+                nb::dict d;d["row"]=e->row;d["point"]=e->point;d["direction"]=e->direction;
+                d["width"]=e->width;d["step"]=e->step;out.append(d);
+            }
+            return out;
+        },"milliseconds"_a=5)
+        .def("respond",&StreamControl::respond,"row"_a,"keep"_a)
+        .def("cancel",&StreamControl::cancel);
+    m.def("trace_stream", &traceStream, "predictions"_a,"normals"_a,
+        "start"_a,"direction"_a,"distance"_a,"config"_a,"decision_steps"_a,"observe"_a,"initial_width"_a,
+        "row"_a=0);
+    m.def("chunk_seeds", &chunkSeeds, "predictions"_a,"normals"_a,"key_xyz"_a,"config"_a);
+    nb::class_<ft::FiberVolumeCoverage>(m,"VolumeCoverage")
+        .def(nb::init<double,size_t>(),"bin_size"_a,"merge_points"_a=50000)
+        .def("add_owned",[](ft::FiberVolumeCoverage& c,const PointsIn& p,int64_t id,double width){
+            auto points=toPoints(p,"points");nb::gil_scoped_release release;c.addOwned(points,id,width);
+        },"points"_a,"id"_a,"width"_a)
+        .def("flush_owned",&ft::FiberVolumeCoverage::flushOwned,nb::call_guard<nb::gil_scoped_release>())
+        .def("owner",[](const ft::FiberVolumeCoverage& c,Vec3 p,Vec3 d,double r,double w,double t,int64_t exclude){
+            nb::gil_scoped_release release;return c.owner(toVec(p),toVec(d),r,w,t,exclude);
+        },"point"_a,"direction"_a,"radius"_a,"width"_a,"tolerance"_a,"exclude"_a=-1)
+        .def("add_live",[](ft::FiberVolumeCoverage& c,Vec3 a,Vec3 b,int64_t pair,uint64_t epoch,double width){
+            nb::gil_scoped_release release;c.addLive(toVec(a),toVec(b),pair,epoch,width);
+        })
+        .def("live_hit",[](const ft::FiberVolumeCoverage& c,Vec3 p,Vec3 d,double r,int64_t pair,uint64_t epoch,double w,double t){
+            nb::gil_scoped_release release;return c.liveHit(toVec(p),toVec(d),r,pair,epoch,w,t);
+        })
+        .def("drop_live",&ft::FiberVolumeCoverage::dropLive,nb::call_guard<nb::gil_scoped_release>());
+    m.def("run_stream_volume",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
+        const ft::FiberTraceConfig& trace,const ft::FiberChunkTraceConfig& chunks,const std::string& options,
+        const std::vector<std::array<int,3>>& keys,const std::string& output) {
+        const auto checked=checkedConfig(field,trace,&normals);
+        const auto cfg=nlohmann::json::parse(options);
+        std::atomic_bool cancel{false};std::string result;
+        auto future=std::async(std::launch::async,[&]{return ft::runFiberStreamVolume(
+            *field.field,*normals.sampler,checked,chunks,cfg,keys,output,cancel).dump();});
+        try {
+            while(true) {
+                bool ready;
+                {nb::gil_scoped_release release;ready=future.wait_for(std::chrono::milliseconds(100))==std::future_status::ready;}
+                if(PyErr_CheckSignals()!=0)throw nb::python_error();
+                if(ready){nb::gil_scoped_release release;result=future.get();break;}
+            }
+        }catch(...) {
+            cancel=true;
+            // get() consumes the future even when the native worker throws.
+            // Only an interrupted, still-associated future needs joining here.
+            if(future.valid()){nb::gil_scoped_release release;future.wait();}
+            throw;
+        }
+        return result;
+    },"predictions"_a,"normals"_a,"trace"_a,"chunks"_a,"options_json"_a,"keys_xyz"_a,"output"_a);
     m.def("trace_extrapolation", &traceExtrapolation,
           "field"_a, "start"_a, "direction"_a, "distance_voxels"_a,
           "config"_a, "normal_sampler"_a = nb::none(),

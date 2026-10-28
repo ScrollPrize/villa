@@ -8,6 +8,17 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "local/fiber_tests.json"
 SUITES = {
+    "stream-volume-build": ("local/test_stream_volume.py::test_build",),
+    "stream-volume-policy": ("local/test_stream_volume.py::test_policy",),
+    "stream-volume-native": ("local/test_stream_volume.py::test_native",),
+    "stream-volume-pilot": ("local/test_stream_volume.py::test_pilot",),
+    "stream-volume-resume": ("local/test_stream_volume.py::test_resume",),
+    "stream-volume-comparison": ("local/test_stream_volume.py::test_comparison",),
+    "stream-volume-full": ("local/test_stream_volume.py::test_full",),
+    "stream-volume-restart": ("local/test_stream_volume.py::test_restart",),
+    "stream-volume-stop": ("local/test_stream_volume.py::test_stop",),
+    "stream-volume-status": ("local/test_stream_volume.py::test_status",),
+    "stream-volume-diagnose-cpu": ("local/test_stream_volume.py::test_diagnose_cpu",),
     "retained-sampling-diagnosis": ("local/test_retained_sampling_diagnosis.py::test_build", "local/test_retained_sampling_diagnosis.py::test_run", "local/test_retained_sampling_diagnosis.py::test_report"),
     "unified-sampling-diagnosis": ("local/test_unified_sampling_diagnosis.py::test_build", "local/test_unified_sampling_diagnosis.py::test_run", "local/test_unified_sampling_diagnosis.py::test_report"),
     "sampling-inpass-profile": ("local/test_sampling_inpass_profile.py::test_build", "local/test_sampling_inpass_profile.py::test_run", "local/test_sampling_inpass_profile.py::test_report"),
