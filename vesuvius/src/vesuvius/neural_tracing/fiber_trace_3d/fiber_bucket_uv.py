@@ -142,14 +142,16 @@ class BucketUV(torch.nn.Module):
         if padding<1:raise ValueError('Bucket UV padding must be positive')
         self.low=-padding;self.count=int(config['winding_count'])+2*padding
         self.values=(None if self.predicted_only else torch.nn.Parameter(torch.zeros(len(self.v_offset_arc),self.count,2,device=device)))
-        source=np.arange(len(d['family'])) if split else d['source_id'];index={int(s):i for i,s in enumerate(source)}
-        self.register_buffer('owner',torch.tensor([index[int(s)] for s in self.saved['v_offset_source']],device=device,dtype=torch.long))
+        source=np.arange(len(d['family'])) if split else d['source_id']
+        sorted_index=np.argsort(source)
+        node_owner=sorted_index[np.searchsorted(source[sorted_index],self.saved['v_offset_source'])]
+        self.register_buffer('owner',torch.as_tensor(node_owner,device=device,dtype=torch.long))
         owners=self.owner.cpu().numpy()
         self.register_buffer('node_ds',torch.as_tensor(
             (self.saved['v_offset_arc']-d['start'][owners])*np.sign(d['node_ds'][owners,-1]),
             device=device,dtype=torch.float32))
-        s=self.saved['v_offset_source'];triples=np.array([[i-1,i,i+1] for i in range(1,len(s)-1)
-                                                       if s[i-1]==s[i]==s[i+1]],dtype=np.int64).reshape(-1,3)
+        s=self.saved['v_offset_source'];middle=np.flatnonzero(s[:-2]==s[2:])+1
+        triples=np.column_stack((middle-1,middle,middle+1))
         self.register_buffer('triples',torch.as_tensor(triples,device=device))
         gaps=self.v_offset_arc[1:]-self.v_offset_arc[:-1]
         self.register_buffer('bend_gaps',torch.where(gaps>0,gaps,torch.ones_like(gaps)))
@@ -226,17 +228,19 @@ class BucketUV(torch.nn.Module):
         z=state.new_zeros(len(edges))
         return sa,sb,z,z
 
-    def field_points(self,state,widths,key):
+    def field_points(self,state,widths,key,rows=None):
         self.curve.sigma_values=self.cavity.values
-        return self.curve.evaluate(state,widths,key)
+        return self.curve.evaluate(state,widths,key,edges=rows)
 
-    def phase_prior_error(self,state,widths,target):
+    def phase_prior_error(self,state,widths,target,rows=None):
         if not self.curve.integer_geometry:
-            return soft.circular(self.field_points(state,widths,'unary')[1]-target).square()
-        h,lp=density.hypotheses(state,self.cavity.values,self.config.get('sigma_max',1.))
-        plan=self.curve.plans['unary'];ids=plan[0]
-        phase=self.curve.hypothesis_queries(state,widths,plan,h[ids,:,0])[1]
-        return (lp[ids].exp()*soft.circular(phase-target[:,None]).square()).sum(1)
+            return soft.circular(self.field_points(state,widths,'unary',rows)[1]-target).square()
+        plan=self.curve.plans['unary']
+        if rows is not None:plan=tuple(x[rows] for x in plan)
+        ids=plan[0]
+        h,lp=density.hypotheses(state[ids],self.cavity.values[ids],self.config.get('sigma_max',1.))
+        phase=self.curve.hypothesis_queries(state,widths,plan,h[:,:,0])[1]
+        return (lp.exp()*soft.circular(phase-target[:,None]).square()).sum(1)
 
     def pair_geometry(self,state,widths,edges):
         if self.curve is not None:self.curve.sigma_values=self.cavity.values

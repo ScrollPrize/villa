@@ -169,6 +169,15 @@ def encode_widths(widths, config):
     return w+torch.log(-torch.expm1(-w))
 
 
+def width_regularization(raw_widths,widths,initial_widths,config):
+    terms={}
+    if config.get('soft_minimum_width',False):
+        threshold=float(config.get('minimum_winding_width',1000.))
+        terms['width_minimum']=config.get('width_minimum_weight',10.)*torch.relu(1.-raw_widths[0]/threshold).square()
+    terms['width_smooth']=config.get('width_smooth',.01)*(torch.diff(widths)/initial_widths.mean()).square().mean()
+    return terms
+
+
 def objective(state, raw_widths, initial_widths, d, samples, config, edges=None, pair_cost=None, extension=None):
     from .fiber_geometry_cache import geometry_evaluation
     with geometry_evaluation(config.get('reuse_objective_geometry',False),config.get('profile_solver',False)):
@@ -179,6 +188,13 @@ def _objective(state, raw_widths, initial_widths, d, samples, config, edges=None
     if config.get('shared_curve_geometry') and getattr(extension,'curve',None) is None:
         raise ValueError('Shared-curve model requires its curve; straight geometry is not a fallback')
     widths = decode_widths(raw_widths,config)
+    section=config.get('_objective_section','all')
+    if section in ('anchor','vertical_anchor'):
+        terms=prior_terms(state,widths,d,samples,config,extension,section,edges)
+        return sum(terms.values()),terms
+    if section=='global':
+        terms=global_terms(state,raw_widths,widths,initial_widths,d,config,extension,pair_cost,edges)
+        return sum(terms.values()),terms
     edges = torch.arange(len(d['i']), device=state.device) if edges is None else edges
     i, j = d['i'][edges], d['j'][edges]
     p = state[:, 3].sigmoid()
@@ -201,9 +217,6 @@ def _objective(state, raw_widths, initial_widths, d, samples, config, edges=None
         'phase': config.get('phase_weight', 1.) * (gate * phase.square()).mean(),
         'vertical': config.get('metric_weight', .02) *
             (gate * (vertical / config.get('v_pair_scale', 1000.)).square()).mean(),
-        'rejection': (d.get('rejection_costs',config.get('rejection_cost',20.)) * (1 - p)).mean(),
-        'entropy': config.get('entropy_weight', .025) *
-            torch.nn.functional.binary_cross_entropy_with_logits(state[:, 3], p, reduction='mean'),
     }
     if pair_cost is not None:
         kwargs={}
@@ -238,34 +251,55 @@ def _objective(state, raw_widths, initial_widths, d, samples, config, edges=None
     if config.get('_diagnostic_pair_only',False):
         terms={k:terms[k] for k in ('winding','phase','vertical')}
         return sum(terms.values()),terms
-    ids = samples['owner']
+    if section=='pairs':return sum(terms.values()),terms
+    terms.update(prior_terms(state,widths,d,samples,config,extension,'anchor'))
+    terms.update(prior_terms(state,widths,d,samples,config,extension,'vertical_anchor'))
+    terms.update(global_terms(state,raw_widths,widths,initial_widths,d,config,extension,pair_cost,edges))
+    return sum(terms.values()),terms
+
+
+def prior_terms(state,widths,d,samples,config,extension,kind,rows=None):
+    """A disjoint sample slice, normalized by full fiber count, never slice size."""
+    selection=slice(None) if rows is None else rows
+    p=state[:,3].sigmoid()
     def offsets(key):
-        return extension.field_offsets(key) if extension is not None and config.get('offset_application')=='all_constraints' else None
-    winding, phase, vertical = (extension.field_points(state,widths,'unary')
-        if getattr(extension,'curve',None) is not None else
-        points(state[ids], d['family'][ids], samples['ds'], widths,offsets('unary')))
+        value=extension.field_offsets(key) if extension is not None and config.get('offset_application')=='all_constraints' else None
+        return None if value is None else value[selection]
     # N centers a distribution over INTEGER labels; it is not geometric phase.
     # A realized endpoint is k+U, whose phase is U modulo one, never N+U.
-    phase_error=(extension.phase_prior_error(state,widths,samples['phase'])
-        if getattr(extension,'curve',None) is not None and hasattr(extension,'phase_prior_error') else
-        circular(phase - samples['phase']).square())
-    unary = config.get('prior_weight', .000625) * phase_error
-    # Equal weight per piece, independent of length/event density/sample count.
-    terms['anchor'] = (p[ids] * unary * samples['weight']).sum() / len(state)
-    vi = samples['v_owner']
-    _, _, vv = (extension.field_points(state,widths,'v_unary')
+    if kind=='anchor':
+        ids=samples['owner'][selection];target=samples['phase'][selection]
+        if getattr(extension,'curve',None) is not None and hasattr(extension,'phase_prior_error'):
+            phase_error=(extension.phase_prior_error(state,widths,target) if rows is None else
+                extension.phase_prior_error(state,widths,target,rows=rows))
+        else:
+            phase=((extension.field_points(state,widths,'unary') if rows is None else
+                extension.field_points(state,widths,'unary',rows=rows))[1]
+                if getattr(extension,'curve',None) is not None else
+                points(state[ids],d['family'][ids],samples['ds'][selection],widths,offsets('unary'))[1])
+            phase_error=circular(phase-target).square()
+        return {'anchor':config.get('prior_weight',.000625)*
+            (p[ids]*phase_error*samples['weight'][selection]).sum()/len(state)}
+    vi = samples['v_owner'][selection]
+    _, _, vv = ((extension.field_points(state,widths,'v_unary') if rows is None else
+        extension.field_points(state,widths,'v_unary',rows=rows))
         if getattr(extension,'curve',None) is not None else
-        points(state[vi], d['family'][vi], samples['v_ds'], widths,offsets('v_unary')))
-    terms['vertical_anchor'] = config.get('v_prior_weight', .01) * (p[vi] *
-        ((vv - samples['v_z']) / config.get('v_prior_scale', 1000.)).square() *
-        samples['v_weight']).sum() / len(state)
+        points(state[vi], d['family'][vi], samples['v_ds'][selection], widths,offsets('v_unary')))
+    return {'vertical_anchor':config.get('v_prior_weight', .01) * (p[vi] *
+        ((vv - samples['v_z'][selection]) / config.get('v_prior_scale', 1000.)).square() *
+        samples['v_weight'][selection]).sum() / len(state)}
+
+
+def global_terms(state,raw_widths,widths,initial_widths,d,config,extension,pair_cost,edges):
+    p=state[:,3].sigmoid()
+    terms=dict(rejection=(d.get('rejection_costs',config.get('rejection_cost',20.))*(1-p)).mean(),
+        entropy=config.get('entropy_weight',.025)*
+            torch.nn.functional.binary_cross_entropy_with_logits(state[:,3],p,reduction='mean'))
+    def offsets(key):
+        return extension.field_offsets(key) if extension is not None and config.get('offset_application')=='all_constraints' else None
     # Radial circumference is an initialization, not a target for the unwrap.
     # Explicit historical recipes may still request their old prior for replay.
-    if config.get('soft_minimum_width',False):
-        threshold=float(config.get('minimum_winding_width',1000.))
-        terms['width_minimum']=config.get('width_minimum_weight',10.)*torch.relu(1.-raw_widths[0]/threshold).square()
-    terms['width_smooth'] = config.get('width_smooth', .01) * (
-        torch.diff(widths) / initial_widths.mean()).square().mean()
+    terms.update(width_regularization(raw_widths,widths,initial_widths,config))
     links = d['links']
     terms['continuation'] = state.sum() * 0
     if len(links):
@@ -290,7 +324,25 @@ def _objective(state, raw_widths, initial_widths, d, samples, config, edges=None
         terms['continuation'] = config.get('continuation_weight', 10.) * (p[a] * p[b] * cost).mean()
     if extension is not None:
         terms.update(extension.terms(state, widths, d, edges))
-    return sum(terms.values()), terms
+    return terms
+
+
+def full_objective_parts(state,raw,widths,data,nodes,config,pair_cost,extension,edge_batch,prior_batch):
+    """Exact additive objective with bounded pair/prior graphs; globals once."""
+    if not getattr(extension,'predicted_only',False):
+        raise ValueError('Disjoint global evaluation requires predicted-only geometry')
+    count=len(data['i'])
+    for start in range(0,count,edge_batch):
+        edges=torch.arange(start,min(start+edge_batch,count),device=state.device)
+        value,terms=objective(state,raw,widths,data,nodes,dict(config,_objective_section='pairs'),edges,pair_cost,extension)
+        weight=len(edges)/count
+        yield value*weight,{k:v*weight for k,v in terms.items()}
+    for kind,key in (('anchor','owner'),('vertical_anchor','v_owner')):
+        for start in range(0,len(nodes[key]),prior_batch):
+            rows=slice(start,min(start+prior_batch,len(nodes[key])))
+            yield objective(state,raw,widths,data,nodes,dict(config,_objective_section=kind),rows,pair_cost,extension)
+    yield objective(state,raw,widths,data,nodes,dict(config,_objective_section='global'),
+        torch.empty(0,dtype=torch.long,device=state.device),pair_cost,extension)
 
 
 @torch.no_grad()
@@ -331,6 +383,64 @@ def prepare_samples(config, d, existing=None):
     with uv._ro(config['afv']) as db:
         meta = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM metadata')}
     axis = load_umbilicus_frame(config['umbilicus'], meta['root'])
+    return prepare_samples_geometry(config,d,read_afv_polylines(config['afv'],np.unique(d['source_id'])),axis,existing)
+
+
+_sample_context = None
+
+
+def _sample_worker_init(context):
+    global _sample_context
+    _sample_context = context
+
+
+def _sample_geometry_batch(batch, context=None):
+    """Vector interpolation in NumPy's native code; never loop over samples."""
+    config,d,axis,existing,node_positions,event_ds,event_order,offsets,groups = (
+        _sample_context if context is None else context)
+    spacing=config.get('arc_prior_spacing_vx')
+    rows=[];vrows=[]
+    for row, xyz in batch:
+        ids = groups[row['id']]
+        family = int(d['family'][ids[0]])
+        arc, _, angle, _ = uv.fiber_geometry(xyz, family, axis)
+        angle *= 1 if config.get('h_convention', 'ccw') == 'ccw' else -1
+        for idx in ids:
+            start, end = d['start'][idx], d['end'][idx]
+            direction = np.sign(d['node_ds'][idx, -1])
+            if direction not in (-1, 1):
+                raise ValueError('Soft model requires resolved signed-arc cache')
+            positions = (node_positions[int(row['id'])] if node_positions is not None else
+                (sample_arcs(arc, angle, start, end,
+                config.get('angular_sample_degrees', 45.) / 360.) if family == 0 else np.array([start, end])))
+            if existing is not None:
+                positions=start+direction*existing['ds'][existing['owner']==idx]
+            grid=np.r_[np.arange(start,end,spacing),end] if spacing is not None else None
+            if grid is not None and family==0:
+                positions=np.unique(np.r_[positions,grid])
+            if len(positions):
+                rows.append(np.column_stack((np.full(len(positions),idx),
+                    direction*(positions-start),np.interp(positions,arc,angle),
+                    np.interp(positions,arc,xyz[:,2]),np.full(len(positions),1/len(positions)))))
+            eds = (direction*(positions-start) if node_positions is not None else
+                   event_ds[event_order[offsets[idx]:offsets[idx + 1]]])
+            if existing is not None:
+                eds=existing['v_ds'][existing['v_owner']==idx]
+            if grid is not None and family==1:
+                eds=np.unique(np.r_[eds,direction*(grid-start)])
+            if node_positions is None and not len(eds):
+                if config.get('shared_curve_geometry'):
+                    raise ValueError('Shared-curve input contains an unsupported fiber without constraint nodes')
+                eds = direction * (np.array([start, end]) - start)
+            if len(eds):
+                vrows.append(np.column_stack((np.full(len(eds),idx),eds,
+                    np.interp(start+direction*eds,arc,xyz[:,2]),np.full(len(eds),1/len(eds)))))
+    return (np.concatenate(rows) if rows else np.empty((0,5)),
+            np.concatenate(vrows) if vrows else np.empty((0,4)))
+
+
+def prepare_samples_geometry(config,d,geometry,axis,existing=None):
+    """Same measured prior samples, accepting a streaming packed-curve source."""
     sources = np.unique(d['source_id'])
     spacing=config.get('arc_prior_spacing_vx')
     if spacing is not None and (not np.isfinite(spacing) or spacing<=0):
@@ -354,43 +464,42 @@ def prepare_samples(config, d, existing=None):
     order = np.argsort(d['source_id'], kind='stable')
     grouped = np.split(order, np.flatnonzero(np.diff(d['source_id'][order])) + 1)
     groups = dict(zip(sources, grouped))
-    for row, xyz in read_afv_polylines(config['afv'], sources):
-        ids = groups[row['id']]
-        family = int(d['family'][ids[0]])
-        arc, _, angle, _ = uv.fiber_geometry(xyz, family, axis)
-        angle *= 1 if config.get('h_convention', 'ccw') == 'ccw' else -1
-        for idx in ids:
-            start, end = d['start'][idx], d['end'][idx]
-            direction = np.sign(d['node_ds'][idx, -1])
-            if direction not in (-1, 1):
-                raise ValueError('Soft model requires resolved signed-arc cache')
-            positions = (node_positions[int(row['id'])] if node_positions is not None else
-                (sample_arcs(arc, angle, start, end,
-                config.get('angular_sample_degrees', 45.) / 360.) if family == 0 else np.array([start, end])))
-            if existing is not None:
-                positions=start+direction*existing['ds'][existing['owner']==idx]
-            # Add measured supervision, never interpolate targets from the old
-            # sparse prior. Keep each family's total prior weight unchanged.
-            grid=np.r_[np.arange(start,end,spacing),end] if spacing is not None else None
-            if grid is not None and family==0:
-                positions=np.unique(np.r_[positions,grid])
-            for pos in positions:
-                rows.append((idx, direction * (pos - start), np.interp(pos, arc, angle),
-                             np.interp(pos, arc, xyz[:, 2]), 1 / len(positions)))
-            eds = (direction*(positions-start) if node_positions is not None else
-                   event_ds[event_order[offsets[idx]:offsets[idx + 1]]])
-            if existing is not None:
-                eds=existing['v_ds'][existing['v_owner']==idx]
-            if grid is not None and family==1:
-                eds=np.unique(np.r_[eds,direction*(grid-start)])
-            if node_positions is None and not len(eds):
-                if config.get('shared_curve_geometry'):
-                    raise ValueError('Shared-curve input contains an unsupported fiber without constraint nodes')
-                eds = direction * (np.array([start, end]) - start)
-            for ds in eds:
-                vrows.append((idx, ds, np.interp(start + direction * ds, arc, xyz[:, 2]), 1 / len(eds)))
-    a = np.asarray(rows).reshape(-1,5)
-    v = np.asarray(vrows).reshape(-1,4)
+    from itertools import islice
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+    workers=int(config.get('prior_sample_workers',1))
+    batch_size=int(config.get('prior_sample_batch',512))
+    if workers<1 or batch_size<1:raise ValueError('Positive prior sample worker/batch counts required')
+    context=(config,d,axis,existing,node_positions,event_ds,event_order,offsets,groups)
+    iterator=iter(geometry)
+    def batches():
+        while batch:=list(islice(iterator,batch_size)):
+            yield batch
+    started=time.monotonic();completed=0
+    def collect(result):
+        nonlocal completed
+        a,v=result;rows.append(a);vrows.append(v);completed+=batch_size
+        if config.get('prior_sample_progress') and (len(rows)%20==0):
+            print(json.dumps(dict(stage='prior_samples',fibers=min(completed,len(sources)),
+                total=len(sources),seconds=time.monotonic()-started)),flush=True)
+    if workers==1:
+        for batch in batches():collect(_sample_geometry_batch(batch,context))
+    else:
+        # Fork shares immutable full-volume arrays; spawn is the portable fallback.
+        # Bounded prefetch avoids materializing the entire curve stream in the parent.
+        method='fork' if 'fork' in mp.get_all_start_methods() else 'spawn'
+        with ProcessPoolExecutor(workers,mp_context=mp.get_context(method),
+                initializer=_sample_worker_init,initargs=(context,)) as pool:
+            from collections import deque
+            pending=deque();stream=iter(batches())
+            for batch in islice(stream,2*workers):
+                pending.append(pool.submit(_sample_geometry_batch,batch))
+            while pending:
+                collect(pending.popleft().result())
+                batch=next(stream,None)
+                if batch is not None:pending.append(pool.submit(_sample_geometry_batch,batch))
+    a = np.concatenate(rows) if rows else np.empty((0,5))
+    v = np.concatenate(vrows) if vrows else np.empty((0,4))
     return dict(owner=a[:, 0].astype(np.int64), ds=a[:, 1], phase=a[:, 2], z=a[:, 3], weight=a[:, 4],
                 v_owner=v[:, 0].astype(np.int64), v_ds=v[:, 1], v_z=v[:, 2], v_weight=v[:, 3])
 
@@ -416,6 +525,9 @@ def constraint_family_filter(d, enabled):
                            removed=removed, retained=total-removed,
                            removed_percent=100*removed/total if total else 0.)
     result = dict(d)
+    if len(keep) and keep.all():
+        # No filtering: do not copy the multi-gigabyte immutable edge corpus.
+        return result,stats
     for key in ('i', 'j', 'ds_a', 'ds_b', 'sign', 'distance', 'parallel',
                 'event_ids', 'phase_a', 'phase_b', 'phase_delta'):
         if key in d: result[key] = d[key][keep]
@@ -489,6 +601,13 @@ def solve(config, *, device=None, pair_cost=None, model='continuous_soft_winding
 
 
 def _solve(config, device, pair_cost, model, diagnostics, extension_factory, parallel):
+    startup=time.monotonic()
+    import faulthandler
+    startup_trace=float(config.get('startup_trace_seconds',0))
+    if startup_trace>0:faulthandler.dump_traceback_later(startup_trace,repeat=True)
+    def stage(name):
+        print(json.dumps(dict(stage='solver_initialization',part=name,
+            seconds=time.monotonic()-startup)),flush=True)
     for key, digest in [('tensor_cache', 'tensor_sha256'), ('soft_samples', 'samples_sha256')]:
         if digest in config and sha256_file(config[key]) != config[digest]:
             raise ValueError(f'Input changed after preparation: {key}')
@@ -525,9 +644,13 @@ def _solve(config, device, pair_cost, model, diagnostics, extension_factory, par
     if config.get('fixed_assignment_offset_refinement', False):
         from .fiber_v_endpoint_offsets import refine_fixed
         return refine_fixed(d, state.detach(), (torch.nn.functional.softplus(raw)+1e-4).detach(), config)
+    stage('before_geometry')
     extension = extension_factory(d,config,device) if extension_factory is not None else None
+    stage('geometry_constructed')
     if extension is not None and (config.get('offset_application')=='all_constraints' or config.get('shared_curve_geometry')):
         extension.prepare_fields(d,samples)
+    stage('query_plans_ready')
+    if startup_trace>0:faulthandler.cancel_dump_traceback_later()
     groups = [{'params': [state], 'lr': config.get('lr', .07348469228349533)},
               {'params': [raw], 'lr': config.get('width_lr', 2.)}]
     if extension is not None:

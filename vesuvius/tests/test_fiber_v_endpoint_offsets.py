@@ -28,6 +28,20 @@ def test_exact_deformation_no_merging_and_equalities():
     np.testing.assert_allclose(o,oo,atol=1e-9)
 
 
+def test_batched_zero_topology_duplicates_and_mask():
+    d,_=fixture()
+    # Duplicate events must share nodes, while excluded events remain unmapped.
+    for key in ('i','j','ds_a','ds_b'):d[key]=np.r_[d[key],d[key][0]]
+    top=off.topology(d,0,event_mask=np.array([True,False,True,True]))
+    assert top['v_offset_a'][0]==top['v_offset_a'][3]
+    assert top['v_offset_b'][0]==top['v_offset_b'][3]
+    assert top['v_offset_a'][1]==top['v_offset_b'][1]==-1
+    np.testing.assert_array_equal(top['v_offset_source'],[7,7,8,8])
+    np.testing.assert_array_equal(top['v_offset_arc'],[99,160,10,70])
+    np.testing.assert_array_equal(top['v_offset_left'],[0,2])
+    np.testing.assert_array_equal(top['v_offset_right'],[1,3])
+
+
 def test_exact_deformation_rigid_translation_free():
     d,_=fixture();top=off.topology(d,0)
     o,check=off.exact_deformation(top,np.full(3,100.),10,10)
