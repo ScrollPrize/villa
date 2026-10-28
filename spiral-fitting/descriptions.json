@@ -79,8 +79,8 @@
     "inputs_filter": "Show only inputs whose entry contains this text (not case-sensitive), such as a name, kind or state.",
     "inputs_show_original": "Include unchanged inputs loaded from the dataset. Hidden inputs remain selected for the fit.",
     "inputs_list": "Local drawing drafts, kept for store-backed editing. They are not part of the fit: its inputs are frozen and come from the service's object store.",
-    "inputs_add": "Inactive: a resident fit's inputs are frozen and come from the service's object store; edit them there and rebuild.",
-    "inputs_commit": "Inactive: a resident fit's inputs are frozen and come from the service's object store; edit them there and rebuild.",
+    "inputs_add": "Save Drafts to Store writes the ready brush patches and point-collection edits into the attached object store as checked revisions (new patches are surfaces tagged spiral-brush, edited collections keep their objects and point ids, removed ones are retired). A hosted replica pushes them to its hub in the background. The fit sees them at its next input update (or, without a hub, when it is rebuilt with current inputs).",
+    "inputs_commit": "Save and Update Fit Inputs saves the ready drafts to the store, then runs Update Fit Inputs: the fit is rebuilt from a hub position including them.",
     "inputs_remove": "Stage removal from subsequent fit steps; Restore is available until Commit. On a local brush edit, Remove discards it.",
     "logs": "Show the spiral service's Python stdout / stderr."
   },
