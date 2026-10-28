@@ -152,11 +152,18 @@ _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
 # flow copy. Reference counting never frees them; only the cyclic collector does, and
 # it runs on Python container-allocation counts, never on device memory (a failed CUDA
 # allocation does not start it), so on a long z range the garbage fills the card.
-# A full collection scans every tracked object, and the setup heap (tracks, pools,
-# configuration) is large and never dies: that scan is what makes a collection per step
-# cost about 0.3 s. gc.freeze() after the first step moves the setup heap out of every
-# later scan, which makes a collection after each step cheap. 0 disables.
+# FIT_SPIRAL_GC_POLICY chooses how the garbage is collected (measurements and trade-offs: GC_CYCLE_LEAK.md):
+#   freeze (default)  gc.freeze() once after the first step moves the large, permanent setup heap (tracks, pools, configuration) out of every later scan,
+#                     then a full collection after every FIT_SPIRAL_GC_EVERY_STEPS-th step (default 1): lowest memory, no measurable speed cost
+#   every-step        a full collection after every step without freezing: same memory, but each collection scans the whole heap (about 0.3 s) - 3x slower on a small window
+#   pressure          a full collection only when the device memory allocated since the last one grew by more than FIT_SPIRAL_GC_GARBAGE_FRACTION (default 0.2) of the card:
+#                     no cost for fits that fit, the peak is the live set plus that fraction of the card
+#   off               Python's own cyclic collector only (the previous behaviour)
+_GC_POLICY = os.environ.get('FIT_SPIRAL_GC_POLICY', 'freeze')
+if _GC_POLICY not in ('freeze', 'every-step', 'pressure', 'off'):
+    raise SystemExit(f"FIT_SPIRAL_GC_POLICY must be freeze, every-step, pressure or off, got {_GC_POLICY!r}")
 _GC_EVERY_STEPS = int(os.environ.get('FIT_SPIRAL_GC_EVERY_STEPS', '1'))
+_GC_GARBAGE_FRACTION = float(os.environ.get('FIT_SPIRAL_GC_GARBAGE_FRACTION', '0.2'))
 
 
 class InputReplacementRefused(RuntimeError):
@@ -3948,13 +3955,18 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
-        if _GC_EVERY_STEPS > 0:
-            if not getattr(self, '_gc_frozen', False):
+        if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
+            if _GC_POLICY == 'freeze' and not getattr(self, '_gc_frozen', False):
                 gc.collect()
                 gc.freeze()
                 self._gc_frozen = True
             if iteration % _GC_EVERY_STEPS == 0:
                 gc.collect()
+        elif _GC_POLICY == 'pressure' and torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            if torch.cuda.memory_allocated(device) - getattr(self, '_gc_floor_bytes', 0) > _GC_GARBAGE_FRACTION * torch.cuda.get_device_properties(device).total_memory:
+                gc.collect()
+                self._gc_floor_bytes = torch.cuda.memory_allocated(device)
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()

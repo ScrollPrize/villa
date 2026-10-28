@@ -125,6 +125,15 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c
 
 See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
 
+## Fit-step memory collection
+
+The fitter's default `FIT_SPIRAL_GC_POLICY=freeze` collects per-step Python
+reference cycles without repeatedly scanning the long-lived setup heap. Use
+`every-step`, `pressure`, or `off` to select another policy; see
+[GC cycle and memory measurements](GC_CYCLE_LEAK.md) for the trade-offs and
+measured CUDA memory impact. These policies change memory reclamation only,
+not fit inputs or numerical updates.
+
 ## Running without CUDA
 
 Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
