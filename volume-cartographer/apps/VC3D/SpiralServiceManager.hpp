@@ -319,7 +319,9 @@ private:
     quint64 _inputUpdateSerial = 0;
     void finishInputUpdate(InputUpdate update, quint64 serial);
     void sendInputUpdate(QJsonObject request, qint64 requested, quint64 serial);
-    void abandonInputUpdate();
+    // The attachment an update holds pushes on: its hold ends with it.
+    std::unique_ptr<vc::objects::AttachmentIdentity> _inputUpdateAttachment;
+    void abandonInputUpdate(const QString& reason);
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
     void prepareSessionRequest(QJsonObject request, bool initialize);

@@ -515,6 +515,9 @@ void SpiralServiceManager::setObjectStore(
     std::shared_ptr<vc::objects::ObjectStoreSession> session,
     std::optional<vc::objects::AttachmentIdentity> attachment)
 {
+    if (_inputUpdateActive && _inputUpdateAttachment
+        && (session != _storeSession.lock() || !attachment || *attachment != *_inputUpdateAttachment))
+        abandonInputUpdate(tr("The attached object store changed"));
     _storeSession = session;
     _storeAttachment = attachment ? std::make_unique<vc::objects::AttachmentIdentity>(*attachment) : nullptr;
     QString path;
@@ -592,24 +595,26 @@ void SpiralServiceManager::updateStoreBinding()
     emit storeBindingChanged();
 }
 
-void SpiralServiceManager::abandonInputUpdate()
+void SpiralServiceManager::abandonInputUpdate(const QString& reason)
 {
-    // The replies of the old connection are dropped, so an update waiting on
-    // one would never finish: end it here. Its outcome on the service is
-    // unknown until the next status names the fit's position.
+    // The replies of the old connection are dropped (or its hold ended with
+    // the attachment), so an update waiting on them would never finish: end
+    // it here. Its outcome on the service is unknown until the next status
+    // names the fit's position.
     if (!_inputUpdateActive) return;
     ++_inputUpdateSerial;
     _inputUpdateHold.reset();
+    _inputUpdateAttachment.reset();
     _inputUpdateActive = false;
     InputUpdate abandoned;
-    abandoned.error = tr("The connection to the Spiral service changed during the update; its outcome "
-                         "is unknown: check the fit's input position");
+    abandoned.error = tr("%1 during the update; its outcome is unknown: check the fit's input position")
+                          .arg(reason);
     emit inputUpdateFinished(abandoned);
 }
 
 void SpiralServiceManager::disconnectFromService()
 {
-    abandonInputUpdate();
+    abandonInputUpdate(tr("The connection to the Spiral service changed"));
     ++_connectionGeneration;
     _leaseOwner = false;
     _poll->stop();
@@ -634,7 +639,7 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     if (ownsProcess()) {
-        abandonInputUpdate();
+        abandonInputUpdate(tr("The connection to the Spiral service changed"));
         ++_connectionGeneration;
         _leaseOwner = false;
         _statusInFlight = false;
@@ -777,6 +782,7 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
     _inputUpdateActive = true;
     const quint64 serial = ++_inputUpdateSerial;
     const vc::objects::AttachmentIdentity attachment = *_storeAttachment;
+    _inputUpdateAttachment = std::make_unique<vc::objects::AttachmentIdentity>(attachment);
     // Held before pushing: the waited sync below still pushes everything
     // saved so far, and nothing pushed meanwhile can slip in between it and
     // the service's link-then-pin loop (which would only make it relink).
@@ -784,6 +790,7 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
         _inputUpdateHold = std::make_shared<vc::objects::PushHold>(session->holdPushes(attachment));
     } catch (const std::exception& error) {
         _inputUpdateActive = false;
+        _inputUpdateAttachment.reset();
         refused.error = QString::fromUtf8(error.what());
         emit inputUpdateFinished(refused);
         return;
@@ -890,6 +897,7 @@ void SpiralServiceManager::finishInputUpdate(InputUpdate update, quint64 serial)
     // Pushes resume; then pull to (at least) the fitted position, so the
     // service's links and any edits it included are here.
     _inputUpdateHold.reset();
+    _inputUpdateAttachment.reset();
     const auto session = _storeSession.lock();
     if (!update.error.isEmpty() || !session || !_storeAttachment) {
         _inputUpdateActive = false;

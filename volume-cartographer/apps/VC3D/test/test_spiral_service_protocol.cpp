@@ -338,6 +338,20 @@ private:
         QTest::qWait(500);
         QCOMPARE(updates.count(), 5);  // the abandoned update's late replies are ignored
 
+        // Detaching the store ends an update too: its push hold went with it.
+        progress.clear();
+        manager.updateFitInputs(request);
+        QTRY_VERIFY_WITH_TIMEOUT(!progress.isEmpty() && progress.last().at(0).toString() == QStringLiteral("linking"),
+                                 60000);
+        manager.setObjectStore(nullptr, std::nullopt);
+        QCOMPARE(updates.count(), 6);
+        update = updates.at(5).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY(update.error.contains(QStringLiteral("attached object store changed")));
+        QVERIFY(!manager.inputUpdateActive() && !session->hubStatus(attachment)->pushesHeld);
+        manager.setObjectStore(session, attachment);
+        QTest::qWait(500);
+        QCOMPARE(updates.count(), 6);
+
         bool released = false;
         manager.releaseSessionLease([&]() { released = true; });
         QTRY_VERIFY_WITH_TIMEOUT(released, 30000);
