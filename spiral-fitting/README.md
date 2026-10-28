@@ -793,18 +793,17 @@ service with `--object-store` set to the attached store; for a remote profile,
 attach a replica of the store the service was started with. The panel's
 *Object store* row compares the store UUIDs: when they differ, or no store is
 attached, the fit's inputs are not displayed. When they match, VC3D downloads
-the session's input manifest and reads each fitted surface, collection and
-fiber at its pinned revision, so the overlays show what was fitted even after
-the store moves on. A collection's role (absolute or relative windings) comes
-from the metadata it was fitted with; a collection whose fitted metadata the
-attached store does not hold is not shown. *Show fitted fibers* in Display
-draws the fibers on the plane views, within the point view tolerance of the
-slice. *Fit inputs* lists the digest, the counts per kind and the links; it
-notes inputs missing from the attached store, fitted inputs edited in the
-store before or after the view loaded, fitted links that differ in the store
-or would no longer be consumed, links among the fitted inputs that were not
-fitted, and other store changes a rebuild's selection may include, and points
-to *Rebuild Fit* to read them.
+the session's input manifest and shows each fitted surface, collection and
+fiber as the attached store holds it now: the store is edited live, and the
+overlays reload when a commit touches the fitted inputs or their links, so
+they agree with the rest of VC3D. The resident fit does not follow. *Fit
+inputs* lists the digest, the counts per kind and the links, and notes what
+differs from what the fit read: inputs no longer in the store, inputs edited
+or with other metadata, fitted links that changed or would no longer be
+consumed, links among the fitted inputs that were not fitted, and other store
+changes a rebuild's selection may include; *Rebuild Fit* reads them.
+*Show fitted fibers* in Display draws the fit's fibers on the plane views,
+within the point view tolerance of the slice.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
 name and voxel resolution and of the Lasagna store layout (zarr groups,

@@ -492,6 +492,10 @@ def test_digest_covers_the_metadata_the_adapter_reads(store_path):
         db.set_meta(walk, 'sampling_group', 'reviewed')
     changed = load(store_path, object_store_refresh_links=False)
     assert changed.digest != inputs.digest
+    # The manifest carries the values read, which clients compare directly.
+    [entry] = [e for e in changed.manifest['objects'] if e['uuid'] == walk]
+    assert entry['metadata']['sampling_group'] == 'reviewed'
+    assert osi.content_sha256(entry['metadata']) == entry['metadata_sha256']
     [problem] = osi.resume_problems({'object_store': inputs.manifest}, changed)
     assert 'objects' in problem
 

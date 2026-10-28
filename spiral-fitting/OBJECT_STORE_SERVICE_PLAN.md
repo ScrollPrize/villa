@@ -227,11 +227,13 @@ Commits (push them together; the adapter is broken between 1 and 3):
 - Advertise the active input manifest/digest in status and artifact provenance.
   Use the CLI manifest format and path-independent digest; compare the selected
   inputs, not just filenames or a nominal store identity. Object revision
-  UUIDs are per replica, so the digest and the pins VC3D resolves must use
-  replica-independent identities (implementation step 2). Verify local display
-  geometry/annotations against the service's pins. On mismatch, explain which
-  inputs differ and refuse to present current local data as the fitted inputs.
-  Preview viewing may remain available with an explicit mismatch indication.
+  UUIDs are per replica, so the digest and the identities VC3D compares must
+  be replica-independent (implementation step 2). VC3D displays its attached
+  store as it is now (the store is edited live) and says which fitted inputs
+  differ from what the fit read; it compares identities, never by
+  re-serializing and hashing on the client. A different store (UUID
+  mismatch) is refused outright. Preview viewing may remain available with an
+  explicit mismatch indication.
 
 ### 1.2 Initialize, run, rebuild and resume through the CLI adapter
 
@@ -269,16 +271,20 @@ Commits (push them together; the adapter is broken between 1 and 3):
 
 ### 1.3 Port the workspace's input display and controls
 
-- Replace file-based rows and overlay loading with store reads pinned to the
-  active selection. Use the shared coordinate helpers: stored XYZ divided by
+- Replace file-based rows and overlay loading with store reads of the fitted
+  objects at their current heads. Use the shared coordinate helpers: stored XYZ divided by
   the object's scale gives reference-volume XYZ; convert to the preview/viewer
   frame explicitly. Preserve invalid patch vertices and stable annotation IDs.
 - Show service connection, local store binding, selection, active manifest,
   resolved volume and input freshness. Require matching volume declarations;
   do not use dataset-root path substitution as an object identity mechanism.
-- Retain read-only patch/fiber/PCL overlays and fit previews. Adapt service PCL
-  display artifacts to the frozen snapshot if still needed; never regenerate
-  fitted-input overlays from unpinned current DB contents.
+- Retain read-only patch/fiber/PCL overlays and fit previews. The overlays
+  follow the store: they show the fitted objects as the store holds them now
+  and reload when a commit touches them or their links. The resident fit does
+  not follow; the freshness notes say what differs and a rebuild reads it.
+  Showing old revisions of an evolving store is not a goal: the main VC3D
+  views show the store's current state, and the Spiral overlays must agree
+  with them.
 - Disable or remove the old file draft upload, Apply/Commit, brush-to-file,
   PCL replacement and tracked-fiber upload actions. Explain that input changes
   require ending/rebuilding the session until stage 2 is available. Preserve
@@ -396,7 +402,10 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
 2. **Adapter: replica-independent input identity.** Identify objects in the
    digest by geometry revision plus a hash of the metadata the adapter reads,
    and relationships by content (family, approval, generation, anchors and
-   endpoint geometry revisions) rather than by revision UUID. Verify which
+   endpoint geometry revisions) rather than by revision UUID. The manifest
+   also records the metadata values themselves (`metadata`), so a client
+   compares values; hashes are the digest's business, not something a C++
+   client recomputes. Verify which
    relationship identifiers the store shares across replicas before
    choosing. Keep the per-replica revision UUIDs in the manifest for local
    resolution, outside `_compared()`. A checkpoint written before this change
@@ -467,8 +476,8 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
    `PublishedPreviewIndex.record`, and the preview-restore matching in
    `_note_checkpoint_state`/`_restore_published_preview`. Remove the dataset-file
    PCL display artifacts (`_publish_pcl_artifact_locked`, the
-   `*_winding_artifact` status keys): VC3D reads PCLs pinned to the manifest
-   (step 10), so no unpinned copy remains.
+   `*_winding_artifact` status keys): VC3D reads PCLs from its attached store
+   (step 10), so no service copy remains.
 8. **Service: checkpoints, autosave and rebuild against frozen inputs.**
    `_checkpoint_refusal` offers a full-input rebuild, or names
    `object_store_allow_changed_inputs`, for a manifest mismatch, and refuses
@@ -491,23 +500,24 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
    path settings are ignored with a note, not mapped to store objects; brush
    working copies under `spiral-working/` are left on disk. Stage 0 already
    removes the one-time migration of the original global settings.
-10. **VC3D: pinned store reads for input overlays.** Add a shared helper
-    beside `ObjectStoreArtifacts.hpp` that reads patches, PCL collections and
-    fibers at the revisions the status manifest pins (`RevisionSelection`,
-    typed snapshot accessors at a geometry revision, aligned annotations,
-    `fiberNetworkJson(selection)`; `currentRevisions(selection)` for the
-    local heads compared against them). Resolve pins by the shared geometry
-    revision UUIDs and check the metadata hashes from step 2, never by the
-    service's object revision UUIDs, so a replica of the service's store
-    resolves them. Convert them with the store's `geometryScaleToVolume`/
-    `volumeCoordinates`, keeping invalid patch vertices and stable point IDs. `fiberTransportPaths` moves onto it rather
-    than keeping a second current-heads export. Replace `loadInputSurfaces`'
-    tifxyz reads and the PCL artifact overlay. Key surfaces and colours by
-    UUID, not directory name. `mapServicePath` remains only for external
-    inputs (shell, lasagna). A revision missing locally marks the overlay
-    mismatched rather than falling back to current heads. Register a
-    `spiral_store_inputs` ctest on a fixture store and compare against step
-    1's coordinates with the same dump entrypoint.
+10. **VC3D: store reads for input overlays.** Add a helper
+    (`SpiralStoreInputs`) that reads the manifest's patches, PCL collections
+    and fibers from the attached store at their current heads and says, per
+    input, whether it is what the fit read: geometry revision UUID (shared
+    by replicas) and the adapter's metadata values from step 2, compared as
+    JSON values. Relationships the fit consumed are compared with the ones
+    the current heads give by record UUID, generation, approval state and
+    endpoint geometry revisions, all replica-independent; changed, dropped
+    and newly consumable links are reported. Never use the service's object
+    revision UUIDs. Convert with the store's `geometryScaleToVolume` from the
+    object's current frame, keeping invalid patch vertices and stable point
+    IDs. Replace `loadInputSurfaces`' tifxyz reads and the PCL artifact
+    overlay, and draw the fibers with a read-only overlay. Key surfaces and
+    colours by UUID, not directory name. `mapServicePath` remains only for
+    external inputs (shell, lasagna). An object the store no longer holds is
+    reported missing and not drawn. Register a `spiral_store_inputs` ctest
+    on a fixture store and compare against step 1's coordinates with the
+    same dump entrypoint.
 11. **VC3D: disable input editing; show bindings and freshness.** Disable
     brush-to-file staging (`finalizeBrushPaint`), PCL replacement and new-PCL
     staging, row Add/Commit/Remove/Restore/conflict actions,
@@ -516,8 +526,9 @@ recheck them after stage 0, which changes the store and VC3D code they cite):
     full-input rebuild until stage 2. Keep the in-memory brush and point
     editors for stage 2. Show service connection, store binding, selection
     counts, manifest digest, resolved volume, and input freshness: store
-    events touching selected objects (`StoreSessionEvent::touches`) mark the
-    overlays and fit stale without reloading them. Previews show their
+    events touching the fitted objects or links (`StoreSessionEvent::touches`)
+    reload the overlays and their freshness notes, coalesced; other inputs a
+    rebuild's selection may include are counted. Previews show their
     digest; a preview from another digest is labelled as such. Stage 0 moves
     VC3D point collections into the store (`PointCollectionSync`); check
     whether the Spiral point editors already write through it, and if so
@@ -667,17 +678,19 @@ checkpoint, exported a preview and released the lease.
   component; 400 slices keep 40.5%. Stage 1 did not change preview export
   or Lasagna publication: narrow windows need a fix there, outside this
   plan.
-- Review follow-up (2026-10-28): the pinned reader compares the manifest's
-  consumed relationships with the ones the attached store's heads of the
-  fitted objects give (content hash, approval, generation, endpoint
-  geometry), so link differences on a replica or made before the view
-  loaded are reported; on the acceptance store all 1,103 are current. A
-  collection's role comes from the object revision holding the fitted
-  metadata hash, else the collection is withheld. Pinned fibers are drawn
-  by a read-only overlay (`SpiralFiberOverlayController`).
+- Review follow-up (2026-10-28): the workspace no longer displays pinned
+  revisions. Steps 10-11 were revised: overlays show the fitted objects as
+  the attached store holds them now and reload on store commits touching
+  them; freshness compares geometry revisions, the manifest's new adapter
+  metadata values and relationship generation/approval/endpoint geometry,
+  with no client-side hashing. Fibers are drawn by a read-only overlay
+  (`SpiralFiberOverlayController`). The display comparisons above ran on an
+  unchanged store, where current and pinned reads coincide; rerun on the
+  acceptance store, the reader finds all 954 objects and 1,103 links as
+  fitted and its dump is byte-identical to the pinned reader's.
 
 Stage 2 has its own sequence (below), after the stage 1 gate. It depends on
-step 2's replica-independent identities, step 4's lease, step 10's pinned
+step 2's replica-independent identities, step 4's lease, step 10's store
 reads and step 11's freshness tracking. It also depends on the hub
 prerequisites (2.1), which can be settled during stage 1.
 
@@ -839,9 +852,9 @@ hub position.
 - Version previews, diagnostics, checkpoints, caches and input overlays with
   the session generation, position and digest. An old preview stays viewable as
   old; it cannot overwrite the active generation's display or authorize an edit
-  against newer geometry. VC3D displays the fitted inputs at the service's
-  pinned position, pulling its own replica forward if it is behind and marking
-  a mismatch otherwise. On reconnect, recover status before replaying commands;
+  against newer geometry. VC3D displays its replica as it is now and compares
+  it with the active position's manifest, as in stage 1; a replica behind
+  the service's position pulls forward first. On reconnect, recover status before replaying commands;
   event cursors alone are not durable applied-state evidence.
 
 ### Stage 2 acceptance

@@ -189,9 +189,13 @@ class StoredObject:
         return content_sha256(adapter_metadata(self.kind, self.meta, self.fiber))
 
     def provenance(self):
+        """``metadata`` is what the adapter read, so a client compares it
+        with an object's current metadata as values; ``metadata_sha256`` is
+        its identity in the digest."""
         return {'uuid': self.uuid, 'kind': self.kind, 'name': self.name,
                 'object_revision': self.object_revision,
                 'geometry_revision': self.geometry_revision,
+                'metadata': adapter_metadata(self.kind, self.meta, self.fiber),
                 'metadata_sha256': self.metadata_sha256,
                 'scale_factor': self.frame.scale_factor}
 
