@@ -2877,12 +2877,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 }
             });
 
-    if (_statusDockPanelHost) {
-        if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
-            statusDockBar->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-            statusBar()->insertWidget(0, statusDockBar, 0);
-        }
-    }
+    // The panel bar stays in its own row above the status bar (inside
+    // StatusDockPanelHost), where it can wrap; QStatusBar would squeeze it.
 
     _statusMessageLabel = new QLabel(this);
     _statusMessageLabel->setObjectName(QStringLiteral("statusMessageLabel"));
