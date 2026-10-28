@@ -83,6 +83,12 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
     assert spiral_service.bind_object_store(hub['service'], 'svc', hub['hub']) == binding
     advertised = binding.advertisement()['hub']
     assert advertised['identity'] == binding.hub_identity and advertised['position'] > 0
+    assert advertised['position_error'] is None
+    # A replica that cannot be read says why rather than reporting nothing.
+    import dataclasses
+    unreadable = dataclasses.replace(binding, path=str(tmp_path / 'gone.vcobj'))
+    advertised = unreadable.advertisement()['hub']
+    assert advertised['position'] is None and advertised['position_error']
     # A plain store, or another hub's replica, is refused for this hub.
     plain = str(tmp_path / 'plain.vcobj')
     ObjectStore.create(plain, author='x').close()

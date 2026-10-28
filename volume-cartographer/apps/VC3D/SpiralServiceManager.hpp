@@ -64,6 +64,7 @@ public:
         QString serviceHub;    // the hub address on the service host
         QString serviceHubIdentity;
         qint64 servicePosition = -1;  // the service replica's last pull
+        QString servicePositionError;  // why it could not be read
         QString localUuid;     // the attachment's store UUID
         QString localPath;
         QString localHub;      // the attachment's hub, when it is a replica

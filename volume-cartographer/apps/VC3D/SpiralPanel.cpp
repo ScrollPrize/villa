@@ -1838,7 +1838,9 @@ void SpiralPanel::updateObjectStoreSummary()
     if (binding.hosted())
         text += tr("\nIt fits positions of hub %1 (%2); its replica is at %3")
                     .arg(binding.serviceHubIdentity, binding.serviceHub,
-                         position(binding.servicePosition));
+                         binding.servicePositionError.isEmpty()
+                             ? position(binding.servicePosition)
+                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
     if (binding.matches())
         text += binding.hosted()
             ? tr("\nAttached here: %1").arg(local)

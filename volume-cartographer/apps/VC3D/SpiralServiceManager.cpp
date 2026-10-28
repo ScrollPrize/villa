@@ -575,6 +575,7 @@ void SpiralServiceManager::updateStoreBinding()
     _storeBinding.serviceHub = hub.value(QStringLiteral("address")).toString();
     _storeBinding.serviceHubIdentity = hub.value(QStringLiteral("identity")).toString();
     _storeBinding.servicePosition = hub.value(QStringLiteral("position")).toInteger(-1);
+    _storeBinding.servicePositionError = hub.value(QStringLiteral("position_error")).toString();
     if (_storeBinding.advertised() && !_storeBinding.matches())
         emit logMessage(
             _storeBinding.localUuid.isEmpty()

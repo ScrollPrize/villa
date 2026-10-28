@@ -223,20 +223,23 @@ class ObjectStoreBinding:
                 "object_store_input_position": None}
 
     def hub_position(self):
-        """The hub position this replica last pulled, read now."""
+        """``(position, error)``: the hub position this replica last pulled,
+        read now (not the fitted one, which is status ``input_position``),
+        or why it could not be read."""
         from vc_object_store import ObjectStore
         try:
             with ObjectStore.open(self.path, read_only=True) as store:
-                return (store.hub_status() or {}).get("position")
-        except Exception:
-            return None
+                return (store.hub_status() or {}).get("position"), None
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            return None, f"{type(exc).__name__}: {exc}"
 
     def advertisement(self):
         result = {"uuid": self.uuid, "path": self.path, "author": self.author,
                   "hub": None}
         if self.hosted:
+            position, error = self.hub_position()
             result["hub"] = {"address": self.hub, "identity": self.hub_identity,
-                             "position": self.hub_position()}
+                             "position": position, "position_error": error}
         return result
 
 
