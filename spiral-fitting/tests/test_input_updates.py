@@ -304,6 +304,14 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     assert position['source'] == 'update' and position['requested'] == reached
     assert position['sequence'] >= reached and position['input_generation'] == 1
     assert status['input_preparation_error'] is None
+    # A model-only rebuild afterwards keeps the updated position.
+    response = state.rebuild({'run': {**REQUEST['run'], 'config': {
+        **REQUEST['run']['config'], 'model_num_flow_stages': 3}}})
+    assert response['stage'] == 'model'
+    rebuilt = settle(state)
+    assert rebuilt['input_position']['sequence'] == position['sequence']
+    assert rebuilt['applied_config']['object_store_input_position'] == position['sequence']
+    assert state.session._context.config['object_store_input_position'] == position['sequence']
 
 
 def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,

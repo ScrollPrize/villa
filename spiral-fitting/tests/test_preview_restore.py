@@ -412,6 +412,43 @@ class ServiceRestoreTests(unittest.TestCase):
             self.assertIsNone(state._preview.artifact)
             self.assertIsNone(state._preview.model_state_sha256)
 
+    def test_a_preview_of_replaced_inputs_does_not_become_current(self):
+        # A preview still publishing when an input update lands is kept
+        # (indexed, viewable as old) but does not displace the display.
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            state = self._state(output)
+            current = self._published(output, 1, DIGEST)
+            current.raw_manifest.update(input_digest="inputs-b",
+                                        input_position={"hub": "h", "sequence": 9})
+            session = mock.Mock()
+            session.status.return_value = {"input_digest": "inputs-b"}
+            state.session = session
+            for generation, published in ((1, current), (2, None)):
+                if published is None:
+                    published = self._published(output, 2, OTHER_DIGEST, iteration=80)
+                    published.raw_manifest.update(input_digest="inputs-a",
+                                                  input_position={"hub": "h", "sequence": 5})
+                raw = output / "raw" / f"g{generation}"
+                raw.mkdir(parents=True)
+                (raw / "manifest.json").write_text("{}")
+                with mock.patch.object(state, "_publish_flattened_preview",
+                                       return_value=(mock.Mock(), published)):
+                    state._maybe_register_artifacts({
+                        "preview_generation": generation,
+                        "preview_manifest_path": str(raw / "manifest.json")})
+                    self.assertTrue(_wait(
+                        lambda: state._preview.completed_generation >= generation))
+            status = state.status()
+            self.assertEqual(state._preview.model_state_sha256, DIGEST)
+            self.assertEqual(status["preview_source_iteration"], 40)
+            self.assertEqual(status["preview_input_position"], {"hub": "h", "sequence": 9})
+            self.assertIsNotNone(PublishedPreviewIndex(output).lookup(
+                OTHER_DIGEST, input_digest="inputs-a"))
+            records = state.events.read_after(0)["events"]
+            self.assertTrue(any("not shown as current" in str(record.get("text", ""))
+                                for record in records), records)
+
     def test_a_surface_from_an_earlier_service_is_registered_afresh(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)

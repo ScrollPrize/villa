@@ -900,6 +900,8 @@ class ServiceState:
                 self._preview.pending_generation)
             response["preview_source_iteration"] = (
                 self._preview.source_fit_iteration)
+            response["preview_input_position"] = copy.deepcopy(
+                self._preview.input_position)
             response["preview_active_source_iteration"] = (
                 self._preview.active_source_fit_iteration)
             response["preview_pending_source_iteration"] = (
@@ -1478,6 +1480,13 @@ class ServiceState:
             return
         with self.lock:
             if self.session_id == session_id:
+                # The live request names the inputs now resident: a later
+                # model-only rebuild (and its checkpoints) keeps this position.
+                if self.session_request:
+                    run = dict(self.session_request.get("run") or {})
+                    run["config"] = {**(run.get("config") or {}),
+                                     "object_store_input_position": prepared.position.sequence}
+                    self.session_request = {**self.session_request, "run": run}
                 self._input_position = {
                     **prepared.position.provenance(), "requested": minimum,
                     "head": prepared.head, "attempts": prepared.attempts,
@@ -2031,14 +2040,28 @@ class ServiceState:
                 "model_state_sha256")
             input_digest = (published.raw_manifest or {}).get("input_digest")
             input_position = (published.raw_manifest or {}).get("input_position")
+            # An input update may have landed while this was publishing: a
+            # surface fitted to replaced inputs stays indexed (viewable as
+            # old) but never displaces the active inputs' display.
+            current_digest = self._current_input_digest()
+            superseded = bool(input_digest and current_digest
+                              and input_digest != current_digest)
             with self.lock:
-                if self.session_id == session_id:
+                if self.session_id == session_id and not superseded:
                     self._preview.artifact = ref
                     self._preview.error = None
                     self._preview.source_fit_iteration = (
                         published.source_fit_iteration)
                     self._preview.model_state_sha256 = model_state
+                    self._preview.input_position = copy.deepcopy(input_position)
                 self.status_generation += 1
+            if superseded:
+                self.events.append(
+                    "log", f"The preview of iteration {published.source_fit_iteration} "
+                    f"was fitted to inputs the fit has since replaced; it is kept "
+                    f"as an old preview, not shown as current",
+                    severity="warning", source="service",
+                    operation="publishing_preview")
             # Remember which model state this surface belongs to, so a
             # checkpoint load that lands on it can re-show it (see
             # _note_checkpoint_state) instead of flattening it again.
@@ -2074,7 +2097,7 @@ class ServiceState:
                         diagnostics_manifest.name,
                         "Indexing preview diagnostics")
                     with self.lock:
-                        if self.session_id == session_id:
+                        if self.session_id == session_id and not superseded:
                             self._preview.diagnostics_artifact = diagnostics_ref
                     self.artifacts.prune("spiral-preview-diagnostics",
                                          session_id, PREVIEW_ARTIFACTS_KEPT)
@@ -2140,6 +2163,17 @@ class ServiceState:
                     target=self._publish_preview_artifact,
                     args=(next_status,), name="spiral-preview-publish",
                     daemon=True).start()
+
+    def _current_input_digest(self):
+        """The resident fit's input digest now (None without a session)."""
+        with self.lock:
+            session = self.session
+        if session is None:
+            return None
+        try:
+            return session.status().get("input_digest")
+        except Exception:  # noqa: BLE001 - a closing session has no inputs
+            return None
 
     def _published_preview_index(self):
         """The on-disk model-state index for this session's output root."""
@@ -2235,6 +2269,7 @@ class ServiceState:
                 self._preview.source_fit_iteration = entry.get(
                     "source_fit_iteration")
                 self._preview.model_state_sha256 = digest
+                self._preview.input_position = copy.deepcopy(entry.get("input_position"))
                 self.status_generation += 1
             self.events.append(
                 "log",

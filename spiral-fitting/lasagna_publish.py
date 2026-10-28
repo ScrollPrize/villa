@@ -526,7 +526,7 @@ class PreviewPublication:
                  "artifact", "diagnostics_artifact", "error", "process",
                  "previous_raw_manifest", "stage_started", "progress",
                  "source_fit_iteration", "active_source_fit_iteration",
-                 "model_state_sha256",
+                 "model_state_sha256", "input_position",
                  "pending_generation", "pending_manifest",
                  "pending_source_fit_iteration", "pending_diagnostics")
 
@@ -558,6 +558,9 @@ class PreviewPublication:
         #: Surface identity of the artifact on display, so a checkpoint load
         #: that lands on the same model state is not re-shown.
         self.model_state_sha256 = None
+        #: The input position the artifact on display was fitted at (its
+        #: raw manifest's), so a client can show an old preview as old.
+        self.input_position = None
         self.pending_generation = 0
         self.pending_manifest = None
         self.pending_source_fit_iteration = None
@@ -583,6 +586,7 @@ class PreviewPublication:
         self.source_fit_iteration = None
         self.active_source_fit_iteration = None
         self.model_state_sha256 = None
+        self.input_position = None
         self.pending_generation = 0
         self.pending_manifest = None
         self.pending_source_fit_iteration = None
