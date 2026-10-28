@@ -98,17 +98,36 @@ class Selector:
 
 
 @dataclasses.dataclass(frozen=True)
+class InputPosition:
+    """An immutable store state: a hosted store's hub (its identity, the
+    ``hub_replica`` of every replica's hub_status) and a journal sequence on
+    it. Every replica reads the same inputs at one position."""
+    hub: str
+    sequence: int
+
+    def provenance(self):
+        return {'hub': self.hub, 'sequence': self.sequence}
+
+    @classmethod
+    def from_provenance(cls, value):
+        return None if value is None else cls(str(value['hub']), int(value['sequence']))
+
+
+@dataclasses.dataclass(frozen=True)
 class InputRequest:
     """What to read: per-kind selectors, the fit volume and the approval policy.
 
     ``fit_volume_uuid`` None infers the volume from the selected objects'
     declarations. ``approved_links_only`` consumes only approved
     relationships; otherwise pending and approved ones are consumed. Rejected
-    relationships are never consumed.
+    relationships are never consumed. ``position`` None reads the store as
+    it is now; an InputPosition reads that hub state through the hub's
+    history (selector membership included), whatever the replica holds now.
     """
     selectors: dict = dataclasses.field(default_factory=dict)
     fit_volume_uuid: str = None
     approved_links_only: bool = False
+    position: InputPosition = None
 
     def __post_init__(self):
         # An unknown key would otherwise leave its kind unselected-by-default:
@@ -246,6 +265,10 @@ class InputSnapshot:
     exclusions: Counter
     notes: list
 
+    @property
+    def position(self):
+        return self.request.position
+
     def objects_of(self, kind):
         return [obj for obj in self.objects.values() if obj.kind == kind]
 
@@ -256,6 +279,7 @@ class InputSnapshot:
         """Complete input/frame provenance, in stable order."""
         return {
             'store': {'path': self.store_path, 'uuid': self.store_uuid},
+            'position': self.position.provenance() if self.position else None,
             'volume_uuid': self.volume_uuid,
             'volume_source': self.volume_source,
             'units': FIT_UNITS,
@@ -281,12 +305,19 @@ def attached_data(record):
     return record['kind'] == 'point_collection' and 'role' in (record.get('meta') or {})
 
 
-def resolve_selector(store, kind, selector):
+def resolve_selector(store, kind, selector, records=None):
     """Explicit sorted UUIDs selected by ``selector`` among active objects.
 
     Default and tag selections leave out attached data; naming it by UUID is
-    an error."""
-    def matching(**query):
+    an error. ``records`` ({UUID: record} of every object at a position,
+    retired ones included) replaces the store's current objects."""
+    def matching(tag=None):
+        if records is not None:
+            return [uuid for uuid, record in records.items()
+                    if record['kind'] == kind and not record.get('retired')
+                    and (tag is None or tag in (record.get('tags') or ()))
+                    and not attached_data(record)]
+        query = {} if tag is None else {'tag': tag}
         return [record['uuid'] for record in store.select_objects(
             object_kind=kind, fields=['uuid', 'meta'], **query) if not attached_data(record)]
 
@@ -295,9 +326,10 @@ def resolve_selector(store, kind, selector):
     selected = set()
     problems = []
     for uuid in selector.uuids or ():
-        record = store.object(uuid)
+        record = store.object(uuid) if records is None else records.get(uuid)
         if record is None:
-            problems.append(f'selected {kind} {uuid} does not exist')
+            problems.append(f'selected {kind} {uuid} does not exist'
+                            + ('' if records is None else ' at this position'))
         elif record['kind'] != kind:
             problems.append(f'selected {kind} {uuid} is a {record["kind"]}')
         elif record.get('retired'):
@@ -421,9 +453,33 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     return consumed, exclusions
 
 
+def check_position(store, position):
+    """Refuse a position this store cannot read: it must be a replica of the
+    position's hub."""
+    status = store.hub_status()
+    if status is None:
+        raise ObjectStoreInputError([
+            f'object store {store.path} is not a hosted replica; input positions '
+            'name hub states'])
+    if status['hub_replica'] != position.hub:
+        raise ObjectStoreInputError([
+            f'input position {position.sequence} belongs to hub {position.hub}; '
+            f'{store.path} replicates hub {status["hub_replica"]}'])
+
+
+def _position_records(store, position):
+    """{UUID: record} of every object at a position, retired ones included."""
+    check_position(store, position)
+    view = store.hub_read_view_at(position.sequence, include_retired=True,
+                                  relationships=False)
+    return {revision['object_uuid']: revision['record'] for revision in view['objects']}
+
+
 def resolve_selection(store, request):
-    """{kind: sorted selected UUIDs} of a request's selectors."""
-    return {kind: resolve_selector(store, kind, request.selector(kind))
+    """{kind: sorted selected UUIDs} of a request's selectors, at the
+    request's position when it names one."""
+    records = None if request.position is None else _position_records(store, request.position)
+    return {kind: resolve_selector(store, kind, request.selector(kind), records)
             for kind in KINDS}
 
 
@@ -440,7 +496,16 @@ def read_snapshot(store, request, uuids=None):
     if uuids is None:
         uuids = resolve_selection(store, request)
     selection = {uuid: None for kind in KINDS for uuid in uuids[kind]}
-    view = store.revision_read_view(selection)
+    if request.position is None:
+        view = store.revision_read_view(selection)
+    else:
+        check_position(store, request.position)
+        view = store.hub_read_view_at(request.position.sequence, list(selection))
+        missing = sorted(set(selection) - set(view['selection']))
+        if missing:
+            raise ObjectStoreInputError([
+                f'selected object {uuid} is not active at input position '
+                f'{request.position.sequence}' for uuid in missing])
 
     notes, problems = [], []
     revisions = {revision['object_uuid']: revision for revision in view['objects']}
@@ -1484,39 +1549,176 @@ def refresh_report(outcomes):
     return lines, problems
 
 
-def _startup_phase(config, request, lasagna, cache_directory, log):
+def _refresh(store, snapshot, config, lasagna, cache_directory, log):
+    """Run the detectors over a snapshot's selection; returns the report
+    lines and problems (refresh_report)."""
+    normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
+    log(normal.describe())
+    if normal.note:
+        log(normal.note)
+    if (normal.kind == 'none' and snapshot.objects_of('fiber')
+            and snapshot.objects_of('surface')):
+        log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
+            'loads no lasagna normals (input_use_normals with normal_x/normal_y '
+            'stores) and object_store_normal_ct_path is unset')
+    return refresh_report(refresh_links(store, snapshot, config, normal, cache_directory))
+
+
+def _hosted(path):
+    """hub_status of the store at ``path`` (None for an ordinary store)."""
+    from vc_object_store import ObjectStore
+    with ObjectStore.open(path, read_only=True) as store:
+        return store.hub_status()
+
+
+def _startup_phase(config, request, lasagna, cache_directory, log, minimum_position=None):
     """Rank zero's startup: resolve the selection once, validate it and its
     frames, then (unless refresh is off) run the detectors as
-    object_store_author. Returns ``(selected UUIDs by kind, report lines)``;
-    raises ObjectStoreInputError on any failure."""
+    object_store_author. A hosted replica links and pins a hub position
+    (prepare_position) instead. Returns ``(selected UUIDs by kind, report
+    lines, InputPosition or None)``; raises ObjectStoreInputError on any
+    failure."""
     from vc_object_store import ObjectStore
 
     refresh = bool(config['object_store_refresh_links'])
     author = config['object_store_author']
+    path = config['object_store_path']
+    if _hosted(path) is not None:
+        if not author:
+            raise ObjectStoreInputError([
+                f'object_store_author is required to pull and link a position of the '
+                f'hosted store {path}'])
+        with ObjectStore.open(path, author=author) as store:
+            prepared = prepare_position(store, config, request, lasagna=lasagna,
+                                        minimum=minimum_position,
+                                        cache_directory=cache_directory, log=log)
+        return prepared.uuids, prepared.lines, prepared.position
+    if minimum_position is not None:
+        raise ObjectStoreInputError([
+            f'object store {path} is not a hosted replica; it has no position '
+            f'{minimum_position}'])
     if refresh and not author:
         raise ObjectStoreInputError([
             'object_store_author is required to refresh links '
             '(or set object_store_refresh_links false)'])
     options = {'author': author} if refresh else {'read_only': True}
-    with ObjectStore.open(config['object_store_path'], **options) as store:
+    with ObjectStore.open(path, **options) as store:
         uuids = resolve_selection(store, request)
         snapshot = read_snapshot(store, request, uuids)
-        normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
         if not refresh:
-            return uuids, ['link refresh: off; reading the store\'s current relationships']
-        log(normal.describe())
-        if normal.note:
-            log(normal.note)
-        if (normal.kind == 'none' and snapshot.objects_of('fiber')
-                and snapshot.objects_of('surface')):
-            log('WARNING: fiber-patch links are refreshed centerline-only: the fit '
-                'loads no lasagna normals (input_use_normals with normal_x/normal_y '
-                'stores) and object_store_normal_ct_path is unset')
-        outcomes = refresh_links(store, snapshot, config, normal, cache_directory)
-    lines, problems = refresh_report(outcomes)
+            return uuids, ['link refresh: off; reading the store\'s current relationships'], None
+        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
     if problems:
         raise LinkRefreshError(problems)
-    return uuids, lines
+    return uuids, lines, None
+
+
+class PositionError(ObjectStoreInputError):
+    """No hub position could be linked and pinned; the active fit is kept."""
+
+
+@dataclasses.dataclass
+class PreparedPosition:
+    """A linked, pinned hub position: ``position`` (N) holds the hub head the
+    links were made at (``head``, H) plus this replica's links; ``minimum``
+    (M) is the position the caller asked to include."""
+    position: InputPosition
+    head: int
+    minimum: int
+    attempts: int
+    uuids: dict
+    lines: list
+
+
+def _awaiting(store):
+    pending = len((store.hub_status() or {}).get('pending') or ())
+    return ([f'{pending} local detector write(s) await reconciliation; the next '
+             'update relinks them'] if pending else [])
+
+
+def _resolve_to_hub(store, conflicts):
+    """This replica writes only recomputable detector output; the hub side
+    may hold a user's edit or approval."""
+    for conflict in conflicts:
+        store.resolve_hub_conflict(conflict['uuid'], 'hub')
+
+
+def _conditional_push(store, head):
+    """Publish this replica's links only on ``head``. An exception may have
+    lost the response of a publication that happened: the retry recognizes
+    it and reports its original position instead of a mismatch."""
+    try:
+        return store.hub_sync(pull=False, push=True, expected_head=head)
+    except Exception:  # noqa: BLE001 - reconcile once, then report
+        return store.hub_sync(pull=False, push=True, expected_head=head)
+
+
+def prepare_position(store, config, request, *, lasagna=None, minimum=None,
+                     cache_directory=None, log=print, attempts=4):
+    """Link, then pin: the update loop of a hosted replica ``store`` (opened
+    read-write as the service's author; it must hold no other edits).
+
+    Pull the hub head H (at least ``minimum``, the position a client's edits
+    reached), refresh links over the whole selection at H, then publish them
+    only if the hub is still at H. Success pins N, H plus these links, which
+    later commits never change. A head mismatch (any commit after H,
+    related or not) or a conflict (resolved to the hub's side) pulls and
+    relinks; ``attempts`` bounds the loop. A detector failure or the bound
+    raises, publishing nothing, and leaves the caller's active inputs alone.
+    With object_store_refresh_links off, the pulled head is the position.
+    """
+    status = store.hub_status()
+    if status is None:
+        raise ObjectStoreInputError([
+            f'object store {store.path} is not a hosted replica; input positions '
+            'name hub states'])
+    hub = status['hub_replica']
+    refresh = bool(config['object_store_refresh_links'])
+    current = dataclasses.replace(request, position=None)
+    notes = []
+    for attempt in range(1, attempts + 1):
+        pulled = store.hub_sync(pull=True, push=False)
+        if pulled['conflicts']:
+            _resolve_to_hub(store, pulled['conflicts'])
+            notes.append(f'attempt {attempt}: {len(pulled["conflicts"])} conflict(s) '
+                         'resolved to the hub')
+            continue
+        head = pulled['pulled_position']
+        if minimum is not None and head < minimum:
+            raise PositionError([
+                f'hub {hub} is at position {head}, before the requested position '
+                f'{minimum}; is this the hub the edits were pushed to?'])
+        if not refresh:
+            position, lines = head, [f'link refresh: off; pinning hub position {head}']
+            break
+        snapshot = read_snapshot(store, current)
+        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        if problems:
+            raise LinkRefreshError(notes + problems + ['no links were published'] + _awaiting(store))
+        pushed = _conditional_push(store, head)
+        if pushed['conflicts']:
+            _resolve_to_hub(store, pushed['conflicts'])
+            notes.append(f'attempt {attempt}: {len(pushed["conflicts"])} conflict(s) '
+                         'resolved to the hub')
+            continue
+        if pushed['head_mismatch']:
+            notes.append(f'attempt {attempt}: the hub moved from {head} to '
+                         f'{pushed["hub_head"]} while linking; relinking')
+            continue
+        position = pushed['published_position']
+        lines = lines + [f'links published at hub position {position} (linked at {head})']
+        break
+    else:
+        raise PositionError(notes + [
+            f'inputs kept changing: no hub position could be linked in {attempts} '
+            'attempts; retry'] + _awaiting(store))
+    pinned = InputPosition(hub, position)
+    if minimum is not None and position > minimum:
+        lines.append(f'position {position} includes hub commits after the requested {minimum}')
+    return PreparedPosition(
+        position=pinned, head=head, minimum=minimum, attempts=attempt,
+        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        lines=notes + lines)
 
 
 def _broadcast(value, dist):
@@ -1554,21 +1756,58 @@ def input_manifest(snapshot, config, normal_source, external_frames=None):
     manifest = snapshot.manifest()
     manifest['materialization'] = {key: config[key] for key in MATERIALIZATION_KEYS}
     manifest['external_frames'] = dict(sorted((external_frames or {}).items()))
-    manifest['link_refresh'] = {
+    manifest['link_refresh'] = link_refresh_provenance(config, normal_source)
+    return manifest
+
+
+# Detector parameters a link refresh runs with (refresh_links), recorded so a
+# later change shows the fit's links as stale.
+LINK_PARAMETER_KEYS = ('pcl_link_distance_tolerance', 'pcl_link_window_points',
+                       'pcl_link_window_min_points')
+
+
+def link_refresh_provenance(config, normal_source):
+    """How links are refreshed: whether, with which detector parameters and
+    which fiber-patch normal source (its identity: kind, volume paths, level
+    and scale)."""
+    return {
         'enabled': bool(config['object_store_refresh_links']),
+        'parameters': {key: config[key] for key in LINK_PARAMETER_KEYS},
         'fiber_patch_normals': normal_source.provenance(),
     }
-    return manifest
+
+
+def stale_link_reasons(manifest, config, normal_source):
+    """Why the links a manifest's inputs consumed would not be the ones a
+    refresh makes now: changed detector parameters or normal source. Links
+    are results of the refresh, so these never change the digest; the next
+    refresh (an input update) relinks."""
+    recorded = (manifest or {}).get('link_refresh') or {}
+    current = link_refresh_provenance(config, normal_source)
+    reasons = []
+    if not recorded.get('enabled'):
+        return reasons
+    if 'parameters' not in recorded:
+        reasons.append('the fit predates recorded link parameters')
+    else:
+        reasons.extend(f'{key} changed from {recorded["parameters"].get(key)!r} to {value!r}'
+                       for key, value in current['parameters'].items()
+                       if recorded['parameters'].get(key) != value)
+    if recorded.get('fiber_patch_normals') != current['fiber_patch_normals']:
+        reasons.append('the fiber-patch normal source changed')
+    return reasons
 
 
 def _compared(manifest):
     """The manifest without what does not define the inputs: the store's
-    local path, the replica-local revision UUIDs (REPLICA_LOCAL_FIELDS) and
-    how links were refreshed (their results are recorded). Two replicas of
+    local path, the replica-local revision UUIDs (REPLICA_LOCAL_FIELDS), how
+    links were refreshed (their results are recorded) and the position they
+    were read at (equal inputs at two positions are equal). Two replicas of
     one store holding the same inputs compare equal."""
     manifest = dict(manifest)
     manifest['store'] = {'uuid': (manifest.get('store') or {}).get('uuid')}
     manifest.pop('link_refresh', None)
+    manifest.pop('position', None)
     for section, fields in REPLICA_LOCAL_FIELDS.items():
         if section in manifest:
             manifest[section] = [
@@ -1678,16 +1917,17 @@ def resume_problems(checkpoint_input_manifest, inputs, allow_changed=False, log=
 
 
 def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
-                    cache_directory=None, log=print):
+                    cache_directory=None, log=print, minimum_position=None):
     """Refresh, freeze and materialize a fit's object-store inputs.
 
     Rank zero (the only process when ``dist`` is None or single-rank) runs
     the one refresh phase unless object_store_refresh_links is off; the
     other ranks wait for its result, and every rank fails when it fails.
-    Every rank then reads the now-immutable store read-only, materializes
-    the same frozen snapshot and closes the store; their manifests must
-    agree before anyone trains. Returns FitInputs carrying ``manifest`` and
-    ``digest``.
+    On a hosted replica that phase links and pins a hub position, including
+    at least ``minimum_position`` (prepare_position). Every rank then reads
+    the now-immutable store (or position) read-only, materializes the same
+    frozen snapshot and closes the store; their manifests must agree before
+    anyone trains. Returns FitInputs carrying ``manifest`` and ``digest``.
     """
     from vc_object_store import ObjectStore
 
@@ -1697,9 +1937,11 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     status = None
     if main:
         try:
-            uuids, lines = _startup_phase(
-                config, request_from_config(config), lasagna, cache_directory, log)
-            status = {'ok': True, 'uuids': uuids, 'lines': lines}
+            uuids, lines, position = _startup_phase(
+                config, request_from_config(config), lasagna, cache_directory, log,
+                minimum_position)
+            status = {'ok': True, 'uuids': uuids, 'lines': lines,
+                      'position': position.provenance() if position else None}
         except ObjectStoreInputError as error:
             status = {'ok': False, 'problems': error.problems}
         except Exception as error:  # noqa: BLE001 - other ranks must hear of it
@@ -1715,9 +1957,12 @@ def load_fit_inputs(config, *, lasagna=None, external_frames=None, dist=None,
     # gathered with the others' results, so all ranks fail together instead
     # of some entering a collective the failed rank never joins.
     inputs, outcome = None, None
+    request = dataclasses.replace(
+        request_from_config(config),
+        position=InputPosition.from_provenance(status['position']))
     try:
         with ObjectStore.open(config['object_store_path'], read_only=True) as store:
-            snapshot = read_snapshot(store, request_from_config(config), status['uuids'])
+            snapshot = read_snapshot(store, request, status['uuids'])
             normal = fiber_normal_source(config, lasagna, snapshot.volume_uuid)
             inputs = materialize_from_config(store, snapshot, config)
         inputs.manifest = input_manifest(snapshot, config, normal, external_frames)

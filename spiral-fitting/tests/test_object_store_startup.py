@@ -460,26 +460,30 @@ def _replicas(store_path, tmp_path):
 
 def test_replicas_of_one_store_give_one_digest(store_path, tmp_path):
     first, second = _replicas(store_path, tmp_path)
-    # Links refreshed on one replica reach the other through the hub. The
-    # pull installs them, and the objects they revise, under the second
-    # replica's own revision UUIDs.
-    load(first, object_store_author='alice')
-    with ObjectStore.open(first, author='alice') as db:
-        assert db.hub_sync(pull=True, push=True)['pushed']
+    # Loading on a hosted replica links and publishes at a hub position.
+    linked = load(first, object_store_author='alice')
+    assert linked.manifest['position']['sequence'] > 0
     with ObjectStore.open(second, author='bob') as db:
         assert db.hub_sync(pull=True, push=False)['pulled']
-    a = load(first, object_store_refresh_links=False)
-    b = load(second, object_store_refresh_links=False)
-    local = lambda inputs: {entry['uuid']: entry['object_revision']
-                            for entry in inputs.manifest['objects']}
-    versions = lambda inputs: {entry['uuid']: entry['revision']
-                               for entry in inputs.manifest['relationships']}
+    # The pull installs the links, and the objects they revise, under the
+    # second replica's own revision UUIDs; the current-state digests agree.
+    def current(path):
+        with ObjectStore.open(path, read_only=True) as db:
+            return osi.read_snapshot(db, osi.request_from_config(fit_config(path)))
+    a, b = current(first), current(second)
+    local = lambda snapshot: {entry['uuid']: entry['object_revision']
+                              for entry in snapshot.manifest()['objects']}
+    versions = lambda snapshot: {entry['uuid']: entry['revision']
+                                 for entry in snapshot.manifest()['relationships']}
     assert local(a).keys() == local(b).keys()
     assert local(a) != local(b) and versions(a) != versions(b)
-    assert a.counts == b.counts and len(versions(a)) == 3
-    assert a.digest == b.digest
-    assert osi.manifest_differences(a.manifest, b.manifest) == []
-    assert osi.resume_problems({'object_store': a.manifest}, b) == []
+    assert len(versions(a)) == 3 and a.digest() == b.digest()
+    # Reading the pinned position gives one manifest on any replica.
+    pinned = load(second, object_store_author='bob', object_store_refresh_links=False)
+    assert pinned.manifest['position'] == linked.manifest['position']
+    assert pinned.counts == linked.counts and pinned.digest == linked.digest
+    assert osi.manifest_differences(linked.manifest, pinned.manifest) == []
+    assert osi.resume_problems({'object_store': linked.manifest}, pinned) == []
 
 
 def test_digest_covers_the_metadata_the_adapter_reads(store_path):
