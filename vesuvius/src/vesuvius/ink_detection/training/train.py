@@ -382,6 +382,54 @@ def _write_json_replace(path: Path, value: Mapping) -> None:
     os.replace(temporary, path)
 
 
+def _cgroup_cpu_limit(
+    proc_cgroup: str = "/proc/self/cgroup", cgroup_root: str = "/sys/fs/cgroup"
+) -> float | None:
+    """Return this process's cgroup CPU quota in CPUs, or None if unlimited."""
+    try:
+        lines = Path(proc_cgroup).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        _, controllers, path = line.split(":", 2)
+        if controllers and "cpu" not in controllers.split(","):
+            continue
+        root = Path(cgroup_root, controllers)
+        # Without a cgroup namespace the mount root, not `path`, is ours.
+        for directory in (root / path.lstrip("/"), root):
+            try:
+                if controllers:
+                    quota = (directory / "cpu.cfs_quota_us").read_text().strip()
+                    period = (directory / "cpu.cfs_period_us").read_text().strip()
+                else:
+                    quota, period = (directory / "cpu.max").read_text().split()
+            except (OSError, ValueError):
+                continue
+            if quota in ("max", "-1"):
+                break
+            return int(quota) / int(period)
+    return None
+
+
+def _limit_numba_threads(worker_id: int) -> None:
+    """Give each DataLoader worker an even share of the usable CPUs for Numba.
+
+    Numba sizes every worker's pool from the CPU affinity, which ignores a
+    container CPU quota, and its OpenMP threads spin while idle, so several
+    full-size pools starve each other. An explicit NUMBA_NUM_THREADS wins.
+    """
+    if "NUMBA_NUM_THREADS" in os.environ:
+        return
+    import numba
+    from torch.utils.data import get_worker_info
+
+    cpus = numba.config.NUMBA_NUM_THREADS
+    quota = _cgroup_cpu_limit()
+    if quota is not None:
+        cpus = min(cpus, max(1, int(quota)))
+    numba.set_num_threads(max(1, cpus // get_worker_info().num_workers))
+
+
 def _run_training(request: TrainingRequest) -> int:
     try:
         import accelerate
@@ -494,6 +542,7 @@ def _run_training(request: TrainingRequest) -> int:
                 "multiprocessing_context": "spawn",
                 "persistent_workers": True,
                 "prefetch_factor": config.prefetch_factor,
+                "worker_init_fn": _limit_numba_threads,
             }
         )
     if config.extra_patches.enabled:
