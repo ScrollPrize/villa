@@ -1419,3 +1419,15 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 
 </details>
+
+## Native C++ API
+
+Readers, sampling, geometry, and the full transform catalog are available to
+C++20 clients through `vc_reader::reader` and `vc_reader::transforms`, including
+CUDA backends. Python and C++ use the same implementations. Configure with
+`VC_READER_BUILD_PYTHON=OFF` to build without Python or nanobind, and select
+`VC_READER_ENABLE_CUDA=ON` or `OFF` for the desired backend.
+
+See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
+array/cache configuration, transform pipelines and replay, device-buffer
+ownership, streams, and a complete CPU/CUDA CT-normal example.

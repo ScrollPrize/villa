@@ -2,7 +2,7 @@
 
 A share of states are seeds (an annotated point with no observed path, the follower's seed-only state); the rest
 are simulated tracer decisions from ``data.samples.simulated_trace`` (``make_sample``'s observed path, without its
-labels) with the follower's own startup mix and tracing error, on the same Paris 4 / AFV sources, fiber splits, CT volumes and CT normalization (``data.datasets``).
+labels) with the follower's own startup mix and tracing error, on the same Paris 4 / fiber-store sources, fiber splits, CT volumes and CT normalization (``data.datasets``).
 The prior heading is what the tracer holds: its trailing 12-voxel fit (``linear12_heading``) once 12 voxels exist.
 Seeds and shorter paths hold a seed heading the model must not rely on, so their prior is the true continuation
 tilted within a wide cone (also used on a share of long paths). The target is ``targets.in_crop_heading`` over the
@@ -19,7 +19,7 @@ from vesuvius.neural_tracing.tracers.fibers.heading_model.model import (
     HeadingConfig, model_inputs, prior_frames)
 from vesuvius.neural_tracing.tracers.fibers.heading_model.targets import in_crop_heading
 from vesuvius.neural_tracing.tracers.fibers.heading_model.frames import family_ids, smoothed_tangent, fiber_corrected_normal
-from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDatasets, load_primary_dataset, open_afv_source, primary_source_spec, read_dataset_config
+from vesuvius.neural_tracing.tracers.fibers.data.datasets import WeightedDatasets, load_primary_dataset, open_fiber_source, primary_source_spec, read_dataset_config
 from vesuvius.neural_tracing.tracers.fibers.data.follow_dataset import FollowDataset
 from vesuvius.neural_tracing.tracers.fibers.data.samples import SampleConfig, simulated_trace
 from vesuvius.neural_tracing.tracers.shared.geometry import traversal_curve
@@ -61,7 +61,7 @@ class Source:
 
 
 def load_sources(dataset_config, out, *, ct_normalization=None):
-    """Paris 4 and AFV sources from a follower dataset config, CT normalization bound to each volume.
+    """Paris 4 and fiber-store sources from a follower dataset config, CT normalization bound to each volume.
 
     Each source's ``spec`` is the follower's CT volume. ``ct_normalization`` (a follower run's ct_normalization.json)
     reuses that run's exact records.
@@ -75,7 +75,7 @@ def load_sources(dataset_config, out, *, ct_normalization=None):
             spec = primary_source_spec(document)
             _, train, validation, _ = load_primary_dataset(document, spec)
         else:
-            train, validation, spec, _ = open_afv_source(entry, document['cache_dir'])
+            train, validation, spec = open_fiber_source(entry, document['cache_dir'])
         sources.append(Source(entry['name'], entry['kind'], float(entry.get('weight', 1.)),
                               spec, train, validation))
     Path(out).mkdir(parents=True, exist_ok=True)

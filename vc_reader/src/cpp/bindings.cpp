@@ -1,5 +1,6 @@
 // Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
+#include "vc_reader/reader.hpp"
 #include "output_pool.hpp"
 
 #include <nanobind/nanobind.h>
@@ -108,6 +109,7 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 
 NB_MODULE(_reader, m)
 {
+    m.def("normalize_zarr_metadata", &vcr::normalizeZarrMetadata);
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
     m.def("_point_origin", [](HostPoints points) -> nb::object {
         if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");

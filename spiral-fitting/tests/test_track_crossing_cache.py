@@ -11,6 +11,7 @@ from build_track_crossings import build_cache
 from tracks import (
     PackedTrackCollection,
     _build_crossing_partner_csr,
+    _db_signatures_match,
     _load_native_track_crossings,
     _pack_track_points,
     _restrict_crossing_partner_csr,
@@ -320,3 +321,39 @@ class TrackCrossingCacheTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DbSignatureMatchTests(unittest.TestCase):
+    NS = 1785295357776482751                 # a real DBM mtime_ns; mirrors keep only 1785295357000000000
+
+    def test_exact_match(self):
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS]]))
+
+    def test_mtime_truncated_to_whole_seconds_matches(self):
+        truncated = self.NS // 1_000_000_000 * 1_000_000_000
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, truncated]]))
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, truncated]], [['tracks.dbm', 10, self.NS]]))
+
+    def test_local_edit_within_the_same_second_does_not_match(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS + 1000]]))
+
+    def test_different_second_does_not_match(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS + 1_000_000_000]]))
+        truncated = self.NS // 1_000_000_000 * 1_000_000_000
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, truncated + 1_000_000_000]]))
+
+    def test_name_or_size_mismatch(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['other.dbm', 10, self.NS]]))
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 11, self.NS]]))
+
+    def test_length_mismatch(self):
+        stored = [['tracks.dbm.dat', 10, self.NS], ['tracks.dbm.dir', 5, self.NS]]
+        self.assertFalse(_db_signatures_match(stored, stored[:1]))
+        self.assertFalse(_db_signatures_match(stored[:1], stored))
+
+    def test_malformed_entries_do_not_match(self):
+        expected = [['tracks.dbm', 10, self.NS]]
+        for stored in (None, {}, [None], [['tracks.dbm', 10]], [['tracks.dbm', None, self.NS]],
+                       [['tracks.dbm', 10, None]], [['tracks.dbm', 'ten', self.NS]]):
+            with self.subTest(stored=stored):
+                self.assertFalse(_db_signatures_match(stored, expected))
