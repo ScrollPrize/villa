@@ -1201,6 +1201,17 @@ Second review round (2026-10-28):
   synchronous service stop on detach plus its -wal/-shm check.
 - The 2b driver after this round: all steps as above, peak +35.9 MB.
 
+Third review round (2026-10-28): `1f2d17b0f` no second VC3D update while
+one runs (and a dropped request no longer reports an outcome);
+`aef428a28` hubRevert is a pull that also replaces the discarded
+relationships (the hub's current edge could be bound to endpoint geometry
+the replica lacked: FOREIGN KEY failure), and `hub_writers`;
+`4d79aaccd` startup refuses a replica others write before reverting
+anything; `060ee801b` an update retires only drawings unchanged since the
+save it included, a save whose revision cannot be read back stands, and
+a refusal because another editor saved first names their revision so
+saving again replaces it.
+
 Acceptance (Linux, RTX 3090 shared with another job; stage 0 acceptance store
 copied as a hub; dataset dir with spiral-scroll.json, umbilicus.json,
 lasagna_inputs, outer_shell, fiber_directions.npz; z 8900–9300):
