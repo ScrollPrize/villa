@@ -605,6 +605,25 @@ def check_project_create(
         )
 
 
+def check_project_workspace(client: BridgeClient, results: Results, root: Path) -> None:
+    """The Project tab opens over the open project (its stores, volumes and
+    caches are read when it is shown) and main is reachable again."""
+    shot = root / "project-tab.png"
+    try:
+        switched, _ = client.call("workspace.switch", {"name": "project"}, timeout=RPC_TIMEOUT)
+        client.call("screenshot.capture", {"target": "window", "filePath": str(shot)}, timeout=RPC_TIMEOUT)
+        back, _ = client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        results.record(
+            "project_workspace",
+            switched == {"workspace": "project"}
+            and back == {"workspace": "main"}
+            and shot.is_file() and shot.stat().st_size > 0,
+            f"switched={switched} back={back} shot={shot.is_file()}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("project_workspace", False, f"{type(error).__name__}: {error}")
+
+
 def check_volume_attach(
     client: BridgeClient,
     results: Results,
@@ -1201,6 +1220,8 @@ def main() -> int:
             check_canvas_normalization(client, results)
 
             check_volume_attach(client, results, tmp_path, project)
+            check_project_workspace(client, results, tmp_path)
+            require_running(proc, results, "project workspace")
             check_c4(client, results, str(project))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

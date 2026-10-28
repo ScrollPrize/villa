@@ -89,6 +89,7 @@ class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
+class ProjectWorkspace;
 class FiberMapWorkspace;
 
 class CWindow : public QMainWindow
@@ -305,6 +306,7 @@ private:
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
     FiberMapWorkspace* _fiberMapWorkspace{nullptr};
+    ProjectWorkspace* _projectWorkspace{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
     QMdiArea *mdiArea;

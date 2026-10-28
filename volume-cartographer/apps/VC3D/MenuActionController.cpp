@@ -2089,9 +2089,18 @@ void MenuActionController::detachEntry()
     if (!ok || picked.isEmpty()) return;
     const int idx = items.indexOf(picked);
     if (idx < 0) return;
-    const QString loc = locations.at(idx);
+    detachEntryAt(locations.at(idx));
+}
+
+void MenuActionController::detachEntryAt(const QString& loc)
+{
+    auto pkg = _window && _window->_state ? _window->_state->vpkg() : nullptr;
+    if (!pkg) return;
+    const QString scope = pkg->entryOwner(loc.toStdString()).empty()
+        ? QObject::tr("It is removed for everyone using this project.")
+        : QObject::tr("Only you see this entry.");
     if (QMessageBox::question(_window, QObject::tr("Detach"),
-            QObject::tr("Remove this entry from the project?\n\n%1").arg(loc),
+            QObject::tr("Remove this entry from the project?\n\n%1\n\n%2").arg(loc, scope),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
         return;
     }

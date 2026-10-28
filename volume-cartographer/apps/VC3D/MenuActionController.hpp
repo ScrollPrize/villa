@@ -88,20 +88,28 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
-private slots:
+    // Remove a project entry (volume, normal grid or Lasagna dataset) by
+    // location, after asking.
+    void detachEntryAt(const QString& location);
+    // Open Data: the sample's project store, made or refreshed from the catalog.
+    void resetOpenDataProject();
+
+public slots:
     void newProject();
     void saveProjectAs();
     void attachVolume();
     void attachNormalGrid();
-    void importUmbilicus();
-    void removeUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
-    void detachEntry();
     void openVolpkg();
-    void openRecentVolpkg();
     void attachRemoteZarr();
     void showSettingsDialog();
+
+private slots:
+    void importUmbilicus();
+    void removeUmbilicus();
+    void detachEntry();
+    void openRecentVolpkg();
     void showAboutDialog();
     void showKeybindings();
     void resetSegmentationViews();
@@ -128,8 +136,6 @@ signals:
 private:
     // The Stores menu: the stores beside the project and the store each kind uses.
     void refreshStoresMenu();
-    // Open Data: the sample's project store, made or refreshed from the catalog.
-    void resetOpenDataProject();
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();

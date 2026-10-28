@@ -3186,7 +3186,8 @@
           "name": {
             "enum": [
               "main",
-              "lasagna"
+              "lasagna",
+              "project"
             ],
             "type": "string"
           }

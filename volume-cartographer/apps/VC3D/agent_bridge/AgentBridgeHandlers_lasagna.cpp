@@ -1,5 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "ProjectWorkspace.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
@@ -390,6 +391,13 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
     const QString name = p.value("name").toString();
+
+    // The Project tab also shows that no project is open.
+    if (name == QLatin1String("project")) {
+        if (_window && _window->_workspaceTabs && _window->_projectWorkspace)
+            _window->_workspaceTabs->setCurrentWidget(_window->_projectWorkspace);
+        return QJsonObject{{"workspace", name}};
+    }
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())

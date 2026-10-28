@@ -130,6 +130,9 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& allLasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
+    // Who a location's resource belongs to: no one (shared, empty) for a
+    // remote one, the author for a local path.
+    [[nodiscard]] std::string entryOwner(const std::string& location) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     // Record an already-loaded volume and its tags as one project change.
@@ -224,9 +227,6 @@ private:
 
     // Read the project record, resources and the author's view from the store.
     void readStore();
-    // Who a location's resource belongs to: no one (shared) for a remote one,
-    // the author for a local path.
-    [[nodiscard]] std::string entryOwner(const std::string& location) const;
     // Write one resource; false when it is already there, unchanged.
     bool writeEntry(const char* kind, const vc::project::Entry& entry);
     void writeView();

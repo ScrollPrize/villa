@@ -154,6 +154,7 @@
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
+#include "ProjectWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -1171,6 +1172,31 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             this, [this](bool) {
                 updateVolumePackageEmptyState();
             });
+
+    // The Project tab drives the File menu's project actions.
+    _projectWorkspace = new ProjectWorkspace(_state, _menuController.get(), this);
+    _projectWorkspace->setProperty("workspaceId", QStringLiteral("project"));
+    const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
+    connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
+    connect(_projectWorkspace, &ProjectWorkspace::hubSyncRequested, this, &CWindow::promptHubConflicts);
+    connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
+        const auto vpkg = _state->vpkg();
+        std::shared_ptr<Volume> volume;
+        try {
+            volume = vpkg ? vpkg->volume(volumeId.toStdString()) : nullptr;
+        } catch (const std::out_of_range&) {
+        }
+        if (!volume) {
+            QMessageBox::warning(this, tr("Error"), tr("Could not load volume."));
+            return;
+        }
+        if (_state->currentVolumeId() != volumeId.toStdString()) {
+            setVolume(volume);
+            syncVolumeSelectionControls(volumeId);
+        }
+        switchToMainWorkspace();
+    });
     connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
         if (_menuController) {
             _menuController->showOpenDataCatalog();
@@ -2434,6 +2460,9 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
         _surfacePanel->refreshPointSetFilterOptions();
     }
 
+    if (_projectWorkspace) {
+        _projectWorkspace->refresh();
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -5537,20 +5566,8 @@ void CWindow::updateHubStatus()
     for (const auto& attachment : openStores(*_state)) {
         const auto status = session->hubStatus(attachment);
         if (!status) continue;
-        QString text;
-        if (!status->conflicts.empty()) {
-            text = tr("Hub: %n conflict(s)", nullptr, int(status->conflicts.size()));
-        } else if (!status->error.empty()) {
-            text = tr("Hub: offline (%1)").arg(QString::fromStdString(status->error));
-        } else if (!status->pending.empty()) {
-            text = tr("Hub: %n pending", nullptr, int(status->pending.size()));
-        } else if (status->syncedAtUs) {
-            text = tr("Hub: synced %1").arg(QDateTime::fromMSecsSinceEpoch(*status->syncedAtUs / 1000)
-                .toString(QStringLiteral("HH:mm:ss")));
-        } else {
-            text = tr("Hub: connecting");
-        }
-        texts << QStringLiteral("%1 %2").arg(QString::fromStdString(session->path(attachment).stem().string()), text);
+        texts << tr("%1 Hub: %2").arg(QString::fromStdString(session->path(attachment).stem().string()),
+                                       hubStatusSummary(*status));
         for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
     }
     if (texts.isEmpty()) {

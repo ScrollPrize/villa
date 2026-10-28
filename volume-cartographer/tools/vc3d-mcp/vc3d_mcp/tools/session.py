@@ -77,12 +77,15 @@ async def vc3d_screenshot(
 
 @mcp.tool()
 async def vc3d_switch_workspace(
-    name: Literal["main", "lasagna"]
+    name: Literal["main", "lasagna", "project"]
 ) -> dict[str, Any]:
-    """Switch VC3D's active workspace tab. Requires a volume package to be open.
+    """Switch VC3D's active workspace tab. "main" and "lasagna" require a
+    volume package to be open.
 
     name: "main" (the default segmentation/navigation workspace -- v1-v4's
-    viewers live here) or "lasagna" (the Lasagna optimization workspace). Any
+    viewers live here), "lasagna" (the Lasagna optimization workspace) or
+    "project" (the project overview: stores, routes, volumes, caches; no
+    viewers -- capture it with vc3d_screenshot of the whole window). Any
     viewers the workspace
     creates register with the ViewerManager and become targetable by
     vc3d_click / vc3d_drag / vc3d_screenshot etc. (they appear in
