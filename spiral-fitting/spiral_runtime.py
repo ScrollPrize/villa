@@ -2126,10 +2126,12 @@ class InteractiveFitSession:
         return {**verdict, **result}
 
     def prepare_inputs(self, position, timeout=1800.0, barrier=None):
-        """Phase 1 of an input update, on this rank. Valid only in Idle."""
+        """Phase 1 of an input update, on this rank. Valid only in Idle; in
+        any other state it refuses before the command is admitted (there is
+        nothing to discard)."""
         with self._condition:
             if self._state is not SessionState.Idle:
-                raise RuntimeError(
+                raise InputUpdateRefused(
                     f"Updating the inputs is not allowed while session state "
                     f"is {self._state.name}")
             epoch = self._enter_epoch_locked("prepare_inputs", barrier)
@@ -2179,6 +2181,8 @@ class InteractiveFitSession:
         """
         try:
             prepared = self.prepare_inputs(position, timeout)
+        except InputUpdateRefused:
+            raise  # not admitted: a discard would be a stray command
         except BaseException as exc:
             try:
                 self.discard_inputs()
@@ -2788,7 +2792,8 @@ class DistributedInteractiveFitSession:
         """
         state = self.status()["state"]
         if state != SessionState.Idle:
-            raise RuntimeError(f"Updating the inputs is not allowed in {state}")
+            raise InputUpdateRefused(
+                f"Updating the inputs is not allowed in {SessionState(state).name}")
         arguments = {"position": int(position), "timeout": timeout}
         try:
             prepared = self._call("prepare_inputs", arguments,

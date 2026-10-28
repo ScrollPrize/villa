@@ -1250,6 +1250,12 @@ class ServiceState:
         return {**self.status(), "accepted": True, "initializing": True,
                 "build_id": build_id}
 
+    def _refuse_during_input_update(self, verb):
+        with self.lock:
+            if self._input_update is not None:
+                raise ApiError(HTTPStatus.CONFLICT,
+                               f"{verb} waits for the input update in progress")
+
     def _hosted(self):
         return self.object_store is not None and self.object_store.hosted
 
@@ -1293,6 +1299,7 @@ class ServiceState:
                 raise ApiError(
                     HTTPStatus.CONFLICT,
                     "There is no fit session to rebuild; initialize it first")
+        self._refuse_during_input_update("A rebuild")
         inputs = request.pop("inputs", "keep")
         if inputs not in ("keep", "reload"):
             raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -1322,6 +1329,9 @@ class ServiceState:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
+            if self._input_update is not None:  # began after the check above
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A rebuild waits for the input update in progress")
             state = self.session.status()["state"] if self.session else None
             if state in SESSION_BUSY_STATES:
                 raise ApiError(
@@ -1447,6 +1457,12 @@ class ServiceState:
             refused(exc, "preparing")
             return
         except BaseException as exc:
+            if not isinstance(exc, InputUpdateFailed) \
+                    and session.status()["state"] != SessionState.Error:
+                # Not past the release (InputUpdateFailed is), and the fit
+                # did not fail: it still holds its inputs.
+                refused(exc, "preparing")
+                return
             cause = _cause(exc)
             with self.lock:
                 self._input_update = None
@@ -2259,6 +2275,7 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "autosave_on_pause must be true or false")
         session = self._require_session()
+        self._refuse_during_input_update("Running")
         if session.status().get("state") != SessionState.Idle:
             raise ApiError(HTTPStatus.CONFLICT,
                            "Running requires an idle session")
@@ -2547,6 +2564,7 @@ class ServiceState:
         if not isinstance(allow_rebuild, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "allow_rebuild must be true or false")
+        self._refuse_during_input_update("Loading a checkpoint")
         path = self._resolve_load_source(request)
         with self.lock:
             session = self.session

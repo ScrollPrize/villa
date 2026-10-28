@@ -104,6 +104,28 @@ def test_a_failure_after_release_fails_the_session(state, hub, device_stubs, no_
         time.sleep(0.02)
 
 
+def test_an_update_of_a_busy_session_is_refused_without_a_command(state, hub, device_stubs,
+                                                                    no_theta_topology):
+    # A run admitted first: the update refuses before admission, and queues
+    # no discard (a stray command would break the running step's barrier).
+    state.initialize(REQUEST)
+    settle(state)
+    session = state.session
+    position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
+    with session._condition:
+        session._state = spiral_runtime.SessionState.Running
+        epoch = session._command_epoch
+    try:
+        with pytest.raises(spiral_runtime.InputUpdateRefused, match='Running'):
+            session.update_inputs(position)
+        with session._condition:
+            assert session._command_epoch == epoch and session._commands == []
+    finally:
+        with session._condition:
+            session._state = spiral_runtime.SessionState.Idle
+    assert session.update_inputs(position)['input_generation'] == 1
+
+
 # ---------------------------------------------------------------------------
 # The distributed coordinator
 # ---------------------------------------------------------------------------
@@ -145,6 +167,13 @@ def test_the_coordinator_installs_only_what_every_rank_prepared():
             coordinator.update_inputs(7)
         assert coordinator.calls == ['prepare_inputs', 'discard_inputs']
         assert coordinator.failed is None
+
+    # A busy session refuses before any rank is asked.
+    coordinator = _Coordinator({})
+    coordinator.status = lambda: {'state': spiral_runtime.SessionState.Running}
+    with pytest.raises(spiral_runtime.InputUpdateRefused, match='Running'):
+        coordinator.update_inputs(7)
+    assert coordinator.calls == []
 
     # A failure past the release on any rank fails the whole session.
     coordinator = _Coordinator({'prepare_inputs': prepared,
@@ -277,6 +306,35 @@ def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_th
             state.lease_lifecycle('client-token', 'session_update_inputs',
                                   {'command_id': 'update-1'}, state.update_inputs)
     assert state.status()['input_generation'] == 0
+
+
+def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_stubs,
+                                                            no_theta_topology, monkeypatch):
+    import threading
+    import spiral_service
+    state.initialize(REQUEST)
+    settle(state)
+    linking, release = threading.Event(), threading.Event()
+    prepare = state._prepare_position
+
+    def slow(*args, **kwargs):
+        linking.set()
+        assert release.wait(30)
+        return prepare(*args, **kwargs)
+    monkeypatch.setattr(state, '_prepare_position', slow)
+    state.update_inputs({})
+    assert linking.wait(30)
+    try:
+        for verb in (lambda: state.run({'iterations': 1}),
+                     lambda: state.rebuild({'inputs': 'reload'}),
+                     lambda: state.load_checkpoint({'path': 'absent.ckpt'})):
+            with pytest.raises(spiral_service.ApiError, match='input update in progress'):
+                verb()
+    finally:
+        release.set()
+    status = _settled_update(state)
+    assert status['state'] == 'Idle' and status['input_preparation_error'] is None
+    assert status['input_generation'] == 1
 
 
 def test_a_plain_store_has_no_input_updates(store_path, tmp_path):
