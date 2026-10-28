@@ -47,8 +47,7 @@ def write_tifxyz(
     write_mask : bool
         If True, write mask.tif. Default True.
     write_isometry : bool
-        If True, write the ``isometry`` block into meta.json (grid stretch
-        against the promised step). Default True.
+        If True, write the ``isometry`` block into meta.json. Default True.
     overwrite : bool
         If True, overwrite existing files. Default False.
 
@@ -214,8 +213,7 @@ class TifxyzWriter:
         if surface.area is not None:
             meta_dict["area"] = surface.area
 
-        # Add grid isometry: how close every edge is to the promised step, so
-        # segments can be compared for stretch (ScrollPrize/villa issue #2279).
+        # Grid isometry: edge stretch against the promised step (#2279).
         if self.write_isometry:
             meta_dict["isometry"] = compute_grid_isometry(
                 surface._x,

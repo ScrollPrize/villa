@@ -1,21 +1,13 @@
 #pragma once
 
 // Grid isometry metrics for a tifxyz surface, the C++ half of ScrollPrize/villa
-// issue #2279. A tifxyz grid is a 2D array of 3D points whose meta.json promises,
-// via `scale`, that neighbouring nodes sit `1 / scale` voxels apart. Nothing in the
-// format records whether the grid keeps that promise, so segments cannot be compared
-// for stretch by a standard number. This header computes the block the issue proposes
-// and writes it under the `isometry` key of a surface's metadata.
-//
-// The metric definitions mirror `vc::surface::SurfaceArea` for validity (a corner is
-// invalid when it is non-finite or the (-1, -1, -1) sentinel) and the issue's field
-// list, and they are stated explicitly here so the block can be compared across
-// segments and against the reference numpy implementation the issue links to
-// (`kit tifxyz isometry`). The same numbers are produced in Python by
-// `vesuvius.tifxyz.compute_grid_isometry`. The flatboi metrics (l2_mean,
-// l2_median, linf, area_error) come from the shared per-triangle core in
-// `TriangleStretch.hpp` (villa #2279 item 4), which flatboi itself also calls, so
-// the grid and flatboi cannot drift.
+// issue #2279. A tifxyz grid promises, via `scale` in meta.json, that neighbouring
+// nodes sit `1 / scale` voxels apart; this header measures how well the grid keeps
+// that promise and writes the block under the `isometry` key of the metadata.
+// Validity follows `vc::surface::SurfaceArea` (non-finite or (-1,-1,-1) sentinel).
+// The flatboi metrics come from the shared core in `TriangleStretch.hpp`, which
+// flatboi itself also calls, so the grid and flatboi cannot drift. The same numbers
+// are produced in Python by `vesuvius.tifxyz.compute_grid_isometry`.
 
 #include <algorithm>
 #include <cmath>
@@ -29,16 +21,13 @@
 
 namespace vc::surface
 {
-// Bumped when thresholds/definitions change, so a stored block can be read against
-// the rules that produced it.
+// Bumped when thresholds/definitions change.
 inline constexpr int kIsometryVersion = 1;
 
-// An edge is "stretched" (the sheet is pulled apart or collapsed there) when it is
-// more than 1.5x or less than 1/1.5x the promised step.
+// An edge is "stretched" when its length is outside [step/1.5, 1.5*step].
 inline constexpr double kIsometryStretchFactor = 1.5;
 
-// within_10pct / within_25pct count an edge as inside the band when its length ratio
-// to the promised step is in [1/1.1, 1.1] / [1/1.25, 1.25].
+// within_10pct / within_25pct: ratio bands [1/1.1, 1.1] / [1/1.25, 1.25].
 inline constexpr double kIsometryWithinFactor10 = 1.1;
 inline constexpr double kIsometryWithinFactor25 = 1.25;
 
@@ -73,10 +62,8 @@ inline bool nodeValid(const Vec& v)
     return isFiniteVec(v) && !isSentinelInvalid(v);
 }
 
-// numpy's linear-method percentile of an ascending-sorted sample, so the C++ block
-// matches the Python writer bit for bit. numpy evaluates the position as
-// (n - 1) * q in double and interpolates with the >= 0.5 branch taken from the upper
-// value, which is what `_lerp` does.
+// numpy's linear-method percentile of an ascending-sorted sample, so the C++
+// block matches the Python writer bit for bit.
 inline double percentileLinear(const std::vector<double>& sorted, double percentile)
 {
     const std::size_t n = sorted.size();
@@ -223,22 +210,17 @@ inline GridIsometryStats computeGridIsometryStats(const cv::Mat_<Vec>& points,
         }
     }
     stats.stretched_nodes = stretchedNodes;
-    // #2279: "their area at one grid cell per node" -- the node count times the
-    // promised cell area, not the 3D area of every cell a stretched node touches.
+    // #2279: node count times one promised cell area, not summed cell areas.
     stats.stretched_area_vx2 = static_cast<double>(stretchedNodes) * step_u * step_v;
 
-    // Cells: all four corners valid. area_ratio and the flatboi metrics are taken
-    // over the same cells; angles at each cell's (r, c) corner.
+    // Cells: all four corners valid; angles at each cell's (r, c) corner.
     std::vector<double> angles;
     angles.reserve(static_cast<std::size_t>(std::max(0, rows - 1)) * std::max(0, cols - 1));
     double cellAreaSum = 0.0;
     std::size_t cellCount = 0;
 
-    // flatboi's stretch metrics come from the shared per-triangle core
-    // (TriangleStretch.hpp, villa #2279 item 4), so the grid and flatboi agree by
-    // construction. Both triangles of a cell have the same diagonal split as
-    // SurfaceArea's quadArea (p00-p10-p11 and p00-p11-p01); their parameter
-    // coordinates are the cell's own uniform ones, column x step_u and row x step_v.
+    // flatboi's stretch metrics from the shared per-triangle core, with the same
+    // diagonal split as SurfaceArea's quadArea (p00-p10-p11, p00-p11-p01).
     std::vector<TriangleStretch> triangles;
     triangles.reserve(2 * static_cast<std::size_t>(std::max(0, rows - 1)) *
                       static_cast<std::size_t>(std::max(0, cols - 1)));
@@ -343,10 +325,9 @@ inline utils::Json computeGridIsometry(const cv::Mat_<Vec>& points, double step_
     return gridIsometryToJson(computeGridIsometryStats(points, step_u, step_v));
 }
 
-// The promised step is `1 / scale`, and `scale` is what the metadata stores. It is
-// read here from the metadata itself (a JSON double) when present, so the block is
-// measured against exactly the number a reader sees -- the surface's own scale is a
-// float32 copy, which would perturb the step it is being compared to.
+// The promised step is `1 / scale`, read from the metadata itself (a JSON double)
+// when present, not the surface's float32 copy, which would perturb the step the
+// block is measured against.
 inline bool isometryStepsFromMeta(const utils::Json& meta, double& step_u, double& step_v)
 {
     if (!meta.is_object() || !meta.contains("scale")) {
@@ -371,8 +352,8 @@ inline bool isometryStepsFromMeta(const utils::Json& meta, double& step_u, doubl
     return true;
 }
 
-// Write the block into an object's metadata next to storeAreaMeta. Empty-scale-safe:
-// a 0 step falls back to length ratios so a block is still produced.
+// Write the block into an object's metadata next to storeAreaMeta. A 0 step
+// falls back to length ratios so a block is still produced.
 inline void storeIsometryMeta(utils::Json& meta, const cv::Mat_<cv::Vec3f>& points, double step_u, double step_v)
 {
     if (step_u <= 0.0) {

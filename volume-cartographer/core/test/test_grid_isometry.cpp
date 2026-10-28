@@ -1,9 +1,5 @@
-// Coverage for the grid-isometry block in GridIsometry.hpp (ScrollPrize/villa
-// issue #2279). The point of the block is that a tifxyz grid's stretch against
-// the step its meta.json promises is a standard, comparable number, so these
-// tests pin the definitions on grids whose isometry is known by construction:
-// an exact grid, a grid stretched along one axis, and a grid with an invalid
-// cell that must be skipped exactly as the area metric skips it.
+// Tests for the grid-isometry block in GridIsometry.hpp (ScrollPrize/villa
+// issue #2279), pinned on grids whose isometry is known by construction.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -59,8 +55,8 @@ TEST_CASE("an exact grid is perfectly isometric")
 
 TEST_CASE("a grid stretched 1.3x along one axis is half outside the 10% band")
 {
-    // 1.3x is beyond the 1.1 factor but still under the 1.5 stretch factor, so
-    // half the edges are outside 10% and no node is flagged as stretched.
+    // 1.3x is beyond the 1.1 factor but under the 1.5 stretch factor: half the
+    // edges outside 10%, no node flagged.
     const auto points = flatGrid(20, 24, 6.5f, 5.0f);
     const auto s = computeGridIsometryStats(points, 5.0, 5.0);
 
@@ -72,8 +68,7 @@ TEST_CASE("a grid stretched 1.3x along one axis is half outside the 10% band")
     CHECK(s.stretched_nodes == 0);
     CHECK(s.stretched_area_vx2 == doctest::Approx(0.0));
     CHECK(s.area_ratio == doctest::Approx(1.3));
-    // The two singular values are 1.3 and 1, so L2 is their root-mean-square and
-    // Linf is the larger one.
+    // Singular values 1.3 and 1: L2 is their root-mean-square, Linf the larger one.
     CHECK(s.l2_mean == doctest::Approx(std::sqrt((1.3 * 1.3 + 1.0) / 2.0)));
     CHECK(s.l2_median == doctest::Approx((1.3 * 1.3 + 1.0) / 2.0));
     CHECK(s.linf == doctest::Approx(1.3));
@@ -81,9 +76,8 @@ TEST_CASE("a grid stretched 1.3x along one axis is half outside the 10% band")
 
 TEST_CASE("stretched_area_vx2 is one promised cell per flagged node")
 {
-    // One interior node pulled out of an exact grid: the flagged area is the node
-    // count times ONE cell (5 * 5), not the summed 3D area of the cells it
-    // touches (issue #2279: "their area at one grid cell per node").
+    // One node pulled out of an exact grid: flagged area is nodes times ONE cell
+    // (5 * 5), not the summed 3D area of the cells it touches (#2279).
     auto points = flatGrid(5, 5, 5.0f, 5.0f);
     points(2, 2)[0] += 10.0f;
     const auto s = computeGridIsometryStats(points, 5.0, 5.0);
@@ -127,9 +121,8 @@ TEST_CASE("computeGridIsometry returns the issue's field list")
 
 TEST_CASE("storeIsometryMeta measures against the metadata scale")
 {
-    // The promised step comes from meta.json's scale (1 / scale), not the
-    // surface's float32 copy, so the block is measured against the number a
-    // reader sees.
+    // The step comes from meta.json's scale (1 / scale), not the surface's
+    // float32 copy.
     auto meta = utils::Json::object();
     meta["scale"] = utils::Json::array();
     meta["scale"].push_back(0.25);
@@ -150,8 +143,8 @@ TEST_CASE("storeIsometryMeta measures against the metadata scale")
 
 TEST_CASE("the shared triangle core matches flatboi's definitions")
 {
-    // A unit right triangle in the xy-plane with the matching parameter triangle:
-    // the map is the identity, so both singular values are 1 and both areas 0.5.
+    // Unit right triangle with the matching parameter triangle: the map is the
+    // identity, so both singular values are 1 and both areas 0.5.
     const double p[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
     const double uv[3][2] = {{0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}};
     const auto m = vc::surface::triangleStretch(p, uv);

@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
         ("rotate,r", po::value<float>(), "Rotate the point grid by a given angle in degrees.")
         ("resample,s", po::value<float>(), "Resample the surface by a scale factor (>1 increases density)")
         ("smooth", po::value<int>()->implicit_value(1), "Laplacian smooth the whole tifxyz grid for the given iterations (default: 1)")
-        ("isometry", "Compute the grid isometry block and write it into the segment's meta.json (backfill for an existing segment); the coordinate TIFFs are left untouched. Can be combined with a transform, in which case the block is written with the transformed surface")
+        ("isometry", "Compute the grid isometry block and write it into meta.json (backfill for an existing segment); the coordinate TIFFs are untouched. With a transform, the block is written for the transformed surface")
         ("interpolation,i", po::value<std::string>()->default_value("bilinear"),
          "Interpolation method: nearest, bilinear (default), cubic, lanczos")
         ("paths,p", po::value<std::vector<std::string>>()->multitoken(), "Path arguments (currently unused).");
@@ -199,19 +199,15 @@ int main(int argc, char* argv[]) {
     }
 
     if (vm.count("isometry") && has_transform) {
-        // Grid isometry block (#2279): how close the grid is to the step its
-        // meta.json scale promises. Written next to the area the writers store.
-        // The grid has just been transformed, so use the surface's *current* scale
-        // (resample/rotate update it); meta["scale"] still holds the input's value.
+        // The grid was just transformed, so use the surface's *current* scale;
+        // meta["scale"] still holds the input's value.
         vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
     }
 
     if (!has_transform) {
-        // Backfill only: write the block into the existing meta.json and leave every
-        // other field (and all of x/y/z.tif) exactly as it was, so published segments
-        // can be stamped in place. save_meta() is deliberately not used: it rewrites
-        // `scale` through the surface's float32 copy, which would perturb the very
-        // step this block is measured against.
+        // Backfill: rewrite only meta.json, leaving x/y/z.tif and every other
+        // field untouched. Not save_meta(), which rewrites `scale` through the
+        // surface's float32 copy and would perturb the measured step.
         const auto meta_path = input_path / "meta.json";
         utils::Json on_disk = utils::Json::parse_file(meta_path);
         if (!on_disk.is_object()) {

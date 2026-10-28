@@ -1,24 +1,11 @@
 """Grid isometry metrics for tifxyz surfaces.
 
-A tifxyz surface is a 2D grid of 3D points whose ``meta.json`` promises, via
-``scale``, that neighbouring nodes sit ``1 / scale`` voxels apart. Nothing in the
-format records whether the grid keeps that promise, so segments cannot be
-compared for stretch by a standard number. This module measures that: how close
-each grid edge is to the promised step, the grid angle, and flatboi's
-area-weighted stretch metrics (see ``volume-cartographer/libs/flatboi/flatboi.cpp``
-``stretch_metrics`` / ``triangle_stretch``).
-
-The result is a plain dict, written under the ``isometry`` key of ``meta.json`` by
-``vesuvius.tifxyz.TifxyzWriter``. Invalid vertices are skipped exactly as
-``vc::surface`` skips cells for the area metric: a corner that is non-finite or the
-``(-1, -1, -1)`` sentinel is not part of any edge, cell or triangle.
-
-This is the Python half of ScrollPrize/villa issue #2279; the C++ writers
-(``GrowPatch`` / ``GrowSurface``) are the schema authority, so the metric
-definitions here are stated explicitly and mirror the issue's specification —
-and the reference implementation the issue links to (``kit tifxyz isometry``
-from ChaseHendrick/Scrolls), which this module matches field for field on real
-segments.
+A tifxyz grid promises, via ``scale`` in ``meta.json``, that neighbouring nodes
+sit ``1 / scale`` voxels apart; nothing in the format records whether it keeps
+that promise. This module measures edge stretch, grid angle and flatboi's
+area-weighted stretch metrics. The result is a dict written under the
+``isometry`` key of ``meta.json``. Python half of ScrollPrize/villa issue
+#2279, matching the ``kit tifxyz isometry`` reference field for field.
 """
 
 from __future__ import annotations
@@ -31,19 +18,16 @@ import numpy as np
 import tifffile
 from numpy.typing import NDArray
 
-# Bumped when the metric thresholds/definitions change, so a stored block can be
-# read against the rules that produced it.
+# Bumped when the metric thresholds/definitions change.
 ISOMETRY_VERSION = 1
 
-# A vertex is the format's invalid sentinel when all three coordinates are -1.
+# A vertex with all three coordinates -1 is the format's invalid sentinel.
 _SENTINEL = -1.0
 
-# An edge is "stretched" (the sheet is pulled apart or collapsed there) when it
-# is more than 1.5x or less than 1/1.5x the promised step.
+# An edge is "stretched" when its length is outside [step/1.5, 1.5*step].
 _STRETCH_FACTOR = 1.5
 
-# Shares reported by within_10pct / within_25pct: the multiplicative band the issue
-# asks for ("within a factor 1.1 and 1.25 of step"), i.e. ratio in [1/factor, factor].
+# Multiplicative bands for within_10pct / within_25pct.
 _WITHIN_FACTOR_10 = 1.1
 _WITHIN_FACTOR_25 = 1.25
 
@@ -159,34 +143,16 @@ def compute_grid_isometry(
 ) -> dict:
     """Measure how isometric a tifxyz grid is against its promised step.
 
-    Parameters
-    ----------
-    x, y, z : NDArray
-        Grid coordinate arrays of shape (H, W) at stored resolution.
-    valid : NDArray, optional
-        Boolean validity mask of shape (H, W); ``None`` uses only the finite /
-        non-sentinel test.
-    scale : tuple
-        The surface's ``(scale_y, scale_x)``, so the promised step is
-        ``(1 / scale_x, 1 / scale_y)`` voxels along the u (column) and v (row) axes.
-    version : int
-        Written as ``version`` so a stored block can be read against the rules
-        that produced it.
+    ``scale`` is the surface's ``(scale_y, scale_x)``; the promised step is
+    ``1 / scale`` voxels. Invalid vertices (non-finite or the -1 sentinel) are
+    skipped exactly as ``vc::surface`` skips cells for the area metric.
 
-    Returns
-    -------
-    dict
-        ``version``, ``step_vx``, ``edges``, ``within_10pct``, ``within_25pct``,
-        ``median_abs_log_ratio``, ``area_ratio``, ``angle_deg`` (a ``[p5, p50, p95]``
-        list), ``stretched_nodes``, ``stretched_area_vx2`` and flatboi's ``l2_mean`` /
-        ``l2_median`` / ``linf`` / ``area_error``.
-
-        ``within_10pct`` / ``within_25pct`` are the share of edges whose length ratio
-        to the promised step is in the multiplicative band ``[1/1.1, 1.1]`` /
-        ``[1/1.25, 1.25]`` — the issue's "within a factor 1.1 / 1.25 of step".
-
-        ``stretched_area_vx2`` is ``stretched_nodes`` times the promised cell area
-        (``step_u * step_v``), the issue's "their area at one grid cell per node".
+    Returns ``version``, ``step_vx``, ``edges``, ``within_10pct`` /
+    ``within_25pct`` (share of edges whose ratio to the step is within a factor
+    1.1 / 1.25), ``median_abs_log_ratio``, ``area_ratio``, ``angle_deg``
+    (``[p5, p50, p95]``), ``stretched_nodes``, ``stretched_area_vx2`` (node count
+    times one promised cell area) and flatboi's ``l2_mean`` / ``l2_median`` /
+    ``linf`` / ``area_error``.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -250,10 +216,8 @@ def compute_grid_isometry(
             touched[1:, :] |= bad
         stretched |= touched
     block["stretched_nodes"] = int((stretched & ok).sum())
-    # Issue #2279 defines this as "their area at one grid cell per node": the stretched
-    # node count times the promised cell area. Summing the 3D area of every cell a
-    # stretched node touches instead would over-count, since one node can touch four
-    # cells (the reference implementation, kit tifxyz isometry, uses the count form).
+    # Issue #2279: node count times one promised cell area (the count form the
+    # reference uses; summing cell areas would over-count).
     block["stretched_area_vx2"] = float(block["stretched_nodes"] * step_u * step_v)
 
     valid_cell = ok[:-1, :-1] & ok[1:, :-1] & ok[:-1, 1:] & ok[1:, 1:]
@@ -278,8 +242,7 @@ def compute_grid_isometry(
         if good.any():
             cos = np.clip(np.einsum("ij,ij->i", e_u[good], e_v[good]) / denom[good], -1.0, 1.0)
             angle = np.degrees(np.arccos(cos))
-            # A [p5, p50, p95] list, the shape the reference (kit tifxyz isometry) and
-            # issue #2279's block use, so a stored block reads the same either way.
+            # [p5, p50, p95] list, as in the reference block.
             block["angle_deg"] = [float(v) for v in np.percentile(angle, (5.0, 50.0, 95.0))]
 
         # flatboi's stretch metrics over the two triangles of every valid cell.
@@ -310,23 +273,9 @@ def update_meta_isometry(
 ) -> dict:
     """Write the ``isometry`` block into an existing tifxyz ``meta.json``.
 
-    The coordinate TIFFs are never touched — only ``meta.json`` is rewritten — so
-    this can stamp the block onto an already saved (or published) segment. It is
-    the Python counterpart of the ``vc_tifxyz --isometry`` backfill proposed in
-    ScrollPrize/villa issue #2279.
-
-    Parameters
-    ----------
-    segment : str | Path
-        A tifxyz directory containing ``x.tif``, ``y.tif``, ``z.tif`` and
-        ``meta.json`` (and optionally ``mask.tif``).
-    version : int
-        Written as ``version`` in the block.
-
-    Returns
-    -------
-    dict
-        The block that was written.
+    Only ``meta.json`` is rewritten; the TIFFs stay untouched, so published
+    segments can be stamped in place. Counterpart of ``vc_tifxyz --isometry``.
+    Returns the block that was written.
     """
     segment = Path(segment)
     meta_path = segment / "meta.json"
