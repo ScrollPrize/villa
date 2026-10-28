@@ -1679,7 +1679,10 @@ def _conditional_push(store, head):
     try:
         return store.hub_sync(pull=False, push=True, expected_head=head)
     except Exception:  # noqa: BLE001 - reconcile once, then report
-        return store.hub_sync(pull=False, push=True, expected_head=head)
+        # Recovery matches the pushed records by value: if one was changed
+        # on the hub meanwhile, a publication that did land reads as a
+        # mismatch (``retried`` lets the caller say so).
+        return {**store.hub_sync(pull=False, push=True, expected_head=head), 'retried': True}
 
 
 def prepare_position(store, config, request, *, lasagna=None, minimum=None,
@@ -1742,7 +1745,10 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
             continue
         if pushed['head_mismatch']:
             notes.append(f'attempt {attempt}: the hub moved from {head} to '
-                         f'{pushed["hub_head"]} while linking; relinking')
+                         f'{pushed["hub_head"]} while linking; relinking'
+                         + (' (the first publication\'s response was lost: it may have '
+                            'landed after the head and been changed since)'
+                            if pushed.get('retried') else ''))
             continue
         position = pushed['published_position']
         lines = lines + [f'links published at hub position {position} (linked at {head})']
