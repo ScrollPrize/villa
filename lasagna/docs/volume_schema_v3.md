@@ -393,8 +393,10 @@ its cache identity so old predictions are not silently reused.
 On-demand accumulation already keeps all raw product channels and their
 shared blend weights in one chunk-local arena record. This remains the
 compound accumulation unit; no per-channel accumulators are introduced.
-Whole-volume mmap accumulator storage, addition order, and precision remain
-unchanged. Only publication combines finalized products into a packed chunk.
+Whole-volume accumulation retains separate raw-channel mmap files and unchanged
+addition order and precision; those scratch files use chunk-major circular-band
+storage for locality. Only publication combines finalized products into a packed
+chunk. Scratch layout is not part of the persisted volume schema.
 
 The accelerated local reader shares the complete decoded payload between
 channel views; it neither re-decodes the same packed chunk once per channel
