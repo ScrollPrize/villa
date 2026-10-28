@@ -667,6 +667,14 @@ checkpoint, exported a preview and released the lease.
   component; 400 slices keep 40.5%. Stage 1 did not change preview export
   or Lasagna publication: narrow windows need a fix there, outside this
   plan.
+- Review follow-up (2026-10-28): the pinned reader compares the manifest's
+  consumed relationships with the ones the attached store's heads of the
+  fitted objects give (content hash, approval, generation, endpoint
+  geometry), so link differences on a replica or made before the view
+  loaded are reported; on the acceptance store all 1,103 are current. A
+  collection's role comes from the object revision holding the fitted
+  metadata hash, else the collection is withheld. Pinned fibers are drawn
+  by a read-only overlay (`SpiralFiberOverlayController`).
 
 Stage 2 has its own sequence (below), after the stage 1 gate. It depends on
 step 2's replica-independent identities, step 4's lease, step 10's pinned

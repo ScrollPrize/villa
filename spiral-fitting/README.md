@@ -787,19 +787,24 @@ displayed locally. It is assumed to correspond to the dataset root the
 service advertises, which is the prefix service paths are translated from;
 without it that overlay is simply marked unavailable.
 
-The fit's patches and point collections are displayed from the object store
-attached in VC3D, never from service files. A local profile launches its
+The fit's patches, point collections and fibers are displayed from the
+object store attached in VC3D, never from service files. A local profile launches its
 service with `--object-store` set to the attached store; for a remote profile,
 attach a replica of the store the service was started with. The panel's
 *Object store* row compares the store UUIDs: when they differ, or no store is
 attached, the fit's inputs are not displayed. When they match, VC3D downloads
-the session's input manifest and reads each fitted surface and collection at
-its pinned revision, so the overlays show what was fitted even after the
-store moves on. *Fit inputs* lists the digest, the counts per kind and the
-links; it notes inputs missing from the attached store, fitted inputs edited
-in the store before or after the view loaded, and other store changes a
-rebuild's selection may include, and points to *Rebuild Fit* to read them.
-Pinned fibers are read but not drawn yet.
+the session's input manifest and reads each fitted surface, collection and
+fiber at its pinned revision, so the overlays show what was fitted even after
+the store moves on. A collection's role (absolute or relative windings) comes
+from the metadata it was fitted with; a collection whose fitted metadata the
+attached store does not hold is not shown. *Show fitted fibers* in Display
+draws the fibers on the plane views, within the point view tolerance of the
+slice. *Fit inputs* lists the digest, the counts per kind and the links; it
+notes inputs missing from the attached store, fitted inputs edited in the
+store before or after the view loaded, fitted links that differ in the store
+or would no longer be consumed, links among the fitted inputs that were not
+fitted, and other store changes a rebuild's selection may include, and points
+to *Rebuild Fit* to read them.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
 name and voxel resolution and of the Lasagna store layout (zarr groups,
