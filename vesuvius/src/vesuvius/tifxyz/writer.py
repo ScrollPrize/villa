@@ -213,6 +213,11 @@ class TifxyzWriter:
         if surface.area is not None:
             meta_dict["area"] = surface.area
 
+        # Extra fields first: the reader keeps every key except uuid/scale/bbox/area
+        # in `extra`, so a segment read back and re-written would otherwise carry its
+        # stale `isometry` block over the fresh one computed below.
+        meta_dict.update(surface.extra)
+
         # Grid isometry: edge stretch against the promised step (#2279).
         if self.write_isometry:
             meta_dict["isometry"] = compute_grid_isometry(
@@ -222,9 +227,8 @@ class TifxyzWriter:
                 valid=surface.valid_vertex_mask,
                 scale=surface._scale,
             )
-
-        # Add extra fields
-        meta_dict.update(surface.extra)
+        else:
+            meta_dict.pop("isometry", None)
 
         # Write JSON
         output_path = self.path / "meta.json"

@@ -31,6 +31,10 @@ _STRETCH_FACTOR = 1.5
 _WITHIN_FACTOR_10 = 1.1
 _WITHIN_FACTOR_25 = 1.25
 
+# ``mask.tif`` keeps a vertex when its channel-0 value is >= 255
+# (lasagna/tifxyz_format.md 4.3), the same rule vc::QuadSurface applies.
+_MASK_RETAIN_VALUE = 255.0
+
 
 def _valid_vertices(
     x: NDArray[Any], y: NDArray[Any], z: NDArray[Any], valid: Optional[NDArray[Any]]
@@ -268,6 +272,74 @@ def compute_grid_isometry(
     return block
 
 
+def _mask_plane(
+    data: NDArray[Any], grid_shape: Tuple[int, int]
+) -> Optional[NDArray[Any]]:
+    """First page's spatial plane with sample 0 selected, or None.
+
+    ``mask.tif`` may be multi-sample (SamplesPerPixel > 1) or multi-page (the C++
+    writer stores the mask with the rendered image as a second page). The loader
+    uses the first page's spatial grid and its sample 0, which this mirrors; the
+    two spatial axes are the pair that is the grid size or an integer multiple of
+    it. Returns a 2D array or None if no pair fits.
+    """
+    if data.ndim == 2:
+        return data
+    if data.ndim != 3:
+        return None
+    height, width = int(grid_shape[0]), int(grid_shape[1])
+
+    def fits(h: int, w: int) -> bool:
+        return (h == height or (height and h % height == 0)) and (
+            w == width or (width and w % width == 0)
+        )
+
+    # (H, W, C) puts the sample axis last; (C, H, W) puts it first.
+    if fits(data.shape[0], data.shape[1]):
+        return data[..., 0]
+    if fits(data.shape[1], data.shape[2]):
+        return data[0]
+    return None
+
+
+def _mask_valid_at_grid(
+    mask_path: Path, grid_shape: Tuple[int, int]
+) -> Optional[NDArray[np.bool_]]:
+    """Boolean validity from ``mask.tif`` per ``lasagna/tifxyz_format.md`` 4.3.
+
+    Only channel 0 is considered; values >= 255 keep a vertex. The mask may be at
+    an integer multiple of the grid resolution, in which case a mask pixel at
+    ``(srcX, srcY)`` maps to grid node ``(srcX / scaleX, srcY / scaleY)`` and any
+    invalid mask pixel invalidates the node it maps to. A non-integer scaling (or
+    a mask smaller than the grid) is ignored, exactly as the loader does.
+    """
+    if not mask_path.exists():
+        return None
+    # Read the first page, so a multi-page mask (mask + image) uses page 0 and a
+    # multi-sample one uses sample 0, matching the loader.
+    with tifffile.TiffFile(str(mask_path)) as tif:
+        if not tif.pages:
+            return None
+        plane = _mask_plane(tif.pages[0].asarray(), grid_shape)
+    if plane is None:
+        return None
+    height, width = int(grid_shape[0]), int(grid_shape[1])
+    mask_h, mask_w = plane.shape[0], plane.shape[1]
+    if (mask_h, mask_w) == (height, width):
+        scale_y, scale_x = 1, 1
+    elif height and width and mask_h % height == 0 and mask_w % width == 0:
+        scale_y, scale_x = mask_h // height, mask_w // width
+    else:
+        return None
+    if plane.dtype == np.bool_:
+        keep = plane.astype(bool, copy=False)
+    else:
+        keep = np.asarray(plane) >= _MASK_RETAIN_VALUE
+    if scale_y == 1 and scale_x == 1:
+        return keep
+    return keep.reshape(height, scale_y, width, scale_x).all(axis=(1, 3))
+
+
 def update_meta_isometry(
     segment: Union[str, Path], *, version: int = ISOMETRY_VERSION
 ) -> dict:
@@ -276,32 +348,34 @@ def update_meta_isometry(
     Only ``meta.json`` is rewritten; the TIFFs stay untouched, so published
     segments can be stamped in place. Counterpart of ``vc_tifxyz --isometry``.
     Returns the block that was written.
+
+    Coordinates are loaded through :func:`read_tifxyz`, so the backfill sees the
+    same ``Z <= 0`` invalidation and ``mask.tif`` rules as every other reader.
     """
+    # Imported here to keep this module's import graph free of reader.
+    from .reader import read_tifxyz
+
     segment = Path(segment)
     meta_path = segment / "meta.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"no meta.json in {segment}")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
     try:
-        x = tifffile.imread(str(segment / "x.tif"))
-        y = tifffile.imread(str(segment / "y.tif"))
-        z = tifffile.imread(str(segment / "z.tif"))
+        # load_mask=False: read_tifxyz then derives validity from Z <= 0 and
+        # writes the (-1, -1, -1) sentinel, which is the rule the C++ loader
+        # uses. The mask is applied separately, with its documented scaling.
+        surface = read_tifxyz(segment, load_mask=False, validate=True)
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"{segment} is not a tifxyz segment: {exc}") from exc
 
-    # meta.json stores scale as [scale_x, scale_y]; the metric takes (scale_y, scale_x).
-    scale = meta.get("scale") or [1.0, 1.0]
-    valid = None
-    mask_path = segment / "mask.tif"
-    if mask_path.exists():
-        valid = tifffile.imread(str(mask_path)) > 0
-
+    valid = _mask_valid_at_grid(segment / "mask.tif", surface._x.shape)
     block = compute_grid_isometry(
-        x,
-        y,
-        z,
+        surface._x,
+        surface._y,
+        surface._z,
         valid=valid,
-        scale=(float(scale[1]), float(scale[0])),
+        scale=surface._scale,
         version=version,
     )
     meta["isometry"] = block
