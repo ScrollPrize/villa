@@ -1144,7 +1144,34 @@ Deviations: track exclusion masks with `track_exclusion_radius > 0` depend on
 the inputs' trusted geometry and are refused for in-place updates (rebuild
 instead). A failed session after an update is recovered through the existing
 rebuild/checkpoint paths. A plain (non-hub) store keeps stage 1's frozen
-semantics rather than being removed.
+semantics rather than being removed. Step 11 does not use `holdForEditing`
+or `PointCollectionSync`: `SpiralStoreEdits` holds leases and pins each
+replaced or retired object at the revision its edit started from (a brush
+patch at the revision its last save wrote, a fitted collection at the
+revision the workspace read, `local_object_revision` in its document), via
+`act`/`editKeepingRelationships` and `writeVolumeCollections(..., expected)`;
+a save is refused when the object has moved on.
+
+Review fixes (2026-10-28, after the record above):
+
+- `5b5e91993` store: `hubRevert` (discard unpushed relationship changes and
+  conflicts), `hubAddress`, `writeVolumeCollections` takes expected pins.
+- `b5ce7cb22` `prepare_position` discards the replica's unpublished links
+  before every attempt and on failure (a head mismatch had relinked over
+  them, so a link to an object deselected meanwhile could be published).
+- `a4100ced4` the service compares hub addresses as the store records them
+  (an `ssh://` hub could not restart).
+- `d3f62a227` an update of a busy session is refused before admission (the
+  single-rank refusal had queued a discard that broke a running step's
+  barrier); Run, rebuild and checkpoint loads wait for an update in flight.
+- `56ff8b695` VC3D ends an update whose connection changed (its pushes were
+  held until restart), disables Run during updates, refuses to rebuild a
+  busy fit for an update.
+- `755dd9003` the update candidate drops the old theta topology, which kept
+  the old atlas and strips alive through the install. Re-measured with the
+  2b driver: peak +35.9 MB (was +48.9 MB), everything else as below.
+- `d1ce39606` VC3D saves pin the revision their edit started from (they
+  pinned the current revision after the lease's pull).
 
 Acceptance (Linux, RTX 3090 shared with another job; stage 0 acceptance store
 copied as a hub; dataset dir with spiral-scroll.json, umbilicus.json,
@@ -1165,8 +1192,9 @@ lasagna_inputs, outer_shell, fiber_directions.npz; z 8900–9300):
   recorded) and edited a collection, pushed to 3886; the in-place update
   (9.2 s) relinked and pinned 4534; patches 181 → 180; model parameters,
   optimiser state, scheduler state and iteration bitwise unchanged, same
-  objects; device memory 737.4 MB before, peak +48.9 MB (theta topology and
-  staging; atlases 11.5 MB each), 737.4 MB after. 300 more iterations, loss
+  objects; device memory 737.4 MB before, peak +48.9 MB (+35.9 MB after
+  `755dd9003`: the new theta topology and staging; atlases 11.5 MB each),
+  737.4 MB after. 300 more iterations, loss
   49.8, finite; previews indexed at positions 3884 and 4534; checkpoint
   records 4534; a refused update (linking) left the fit Idle, digest unchanged,
   training on; a simulated allocation failure after release put the session
