@@ -126,21 +126,20 @@ EVENT_COALESCE_SECONDS = 1.0
 
 _SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
-# The stable code of a refused input change. Inputs are frozen for a resident
-# session; the remedy is an edit in the object store and a full-input
-# rebuild, which the refusal names.
-INPUTS_FROZEN = "inputs_frozen"
+# The stable code of a refused input upload: patches, PCLs and fibers come
+# from the object store, so an upload is never how inputs change.
+INPUTS_IN_OBJECT_STORE = "inputs_in_object_store"
 LEASE_TOKEN_HEADER = "X-Spiral-Session-Token"
 
 
-def inputs_frozen_error():
+def input_upload_error():
     return ApiError(
-        HTTPStatus.CONFLICT,
-        "Fit inputs are frozen for the resident session: patches, PCLs and "
-        "fibers come from the service's object store. Change them there, then "
-        "rebuild with inputs reloaded (POST /session/rebuild with "
-        "\"inputs\": \"reload\").",
-        payload={"code": INPUTS_FROZEN, "rebuild": {"inputs": "reload"}})
+        HTTPStatus.BAD_REQUEST,
+        "Fit inputs are not uploaded: patches, PCLs and fibers come from the "
+        "service's object store. Change them there, then update the fit's "
+        "inputs (POST /session/update-inputs) or rebuild it with inputs "
+        "reloaded.",
+        payload={"code": INPUTS_IN_OBJECT_STORE})
 
 # Base input paths are owned by the service (every launch carries --dataset);
 # a load request may only choose among service-advertised values for these
@@ -254,8 +253,8 @@ SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
 SERVICE_CAPABILITIES = {
     # Patches, PCLs and fibers are read from the bound object store.
     "input_source": "object_store",
-    # A resident session's inputs never change; input-editing routes answer
-    # inputs_frozen.
+    # A resident session's inputs never change (a service without a hub);
+    # a hub-bound service updates them in place instead.
     "inputs_frozen": True,
     # POST /session/rebuild {"inputs": "reload"} rereads the store.
     "input_reload_rebuild": True,
@@ -2960,7 +2959,7 @@ class ServiceState:
     def begin_upload(self, request):
         """Begin a checkpoint upload; fit inputs are never uploaded."""
         if request.get("kind") in ("patch", "fiber", "pcl"):
-            raise inputs_frozen_error()
+            raise input_upload_error()
         return {**self._base(), **self.checkpoint_uploads.begin(request)}
 
     def receive_upload_file(self, upload_id, relative_name, stream, length, *, offset=None):

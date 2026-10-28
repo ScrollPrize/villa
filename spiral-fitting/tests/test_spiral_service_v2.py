@@ -1911,8 +1911,8 @@ class UploadTests(unittest.TestCase):
         return session
 
     def test_fit_inputs_are_never_uploaded(self):
-        # Patches, PCLs and fibers come from the bound object store and are
-        # frozen for a resident session, with or without one.
+        # Patches, PCLs and fibers come from the bound object store; an
+        # upload is never how they change, with or without a session.
         for session in (False, True):
             if session:
                 self._session()
@@ -1924,9 +1924,9 @@ class UploadTests(unittest.TestCase):
                         "kind": kind, "id": "p1",
                         "files": [{"name": "meta.json", "size": 1,
                                    "sha256": "0" * 64}]})
-                self.assertEqual(caught.exception.status, 409)
+                self.assertEqual(caught.exception.status, 400)
                 self.assertEqual(caught.exception.payload["code"],
-                                 "inputs_frozen")
+                                 "inputs_in_object_store")
 
     def test_run_requires_validates_and_propagates_dt_loss_schedule(self):
         session = self._session()

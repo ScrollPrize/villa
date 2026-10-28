@@ -260,6 +260,18 @@ the selection, consumed relationships and constraint counts; `python
 object_store_inputs.py dataset.vcobj --z-begin Z0 --z-end Z1` prints the same
 report without training.
 
+On a hosted replica (a clone of a store hub; see the store's "Hosted hub and
+replicas") the inputs are a **hub position**: startup pulls the hub head,
+refreshes links over the selection, publishes them with a conditional push
+that succeeds only while the hub is still at that head, and pins the
+resulting position, which later hub commits never change. A commit landing
+meanwhile, even an unrelated one, makes it pull and relink (bounded; a
+conflict keeps the hub's side, since this replica writes only recomputable
+links). `object_store_input_position` reads a position exactly, without
+linking. The manifest records the position (outside the digest: equal inputs
+at two positions are equal) and the link parameters and normal source, so a
+later change of either shows the fit's links as stale.
+
 The inputs are frozen for the fit: settings that would relink or re-derive
 them (`config.OBJECT_STORE_PCL_KEYS`, the PCL role toggles, selection and
 frame settings) need a new fit. Each run writes `object_store_inputs.json`
@@ -535,35 +547,66 @@ cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
 run parameters but cannot repoint the session at other host paths or another
 object store.
 
-### Object store and frozen inputs
+### Object store, hub positions and input updates
 
 `--object-store STORE.vcobj` binds the service to one store for its lifetime;
-`--object-store-author NAME` names the author of the links its startup
-refresh writes (default `spiral-service@<host>`). `object_store_path` and
-`object_store_author` are service-owned configuration: `/configuration` lists
-them under `service_owned`, a request that leaves them out or repeats the
-bound values is accepted, and a request naming another store is refused.
+`--object-store-author NAME` names the author of the links it writes (default
+`spiral-service@<host>`). `object_store_path`, `object_store_author` and
+`object_store_input_position` are service-owned configuration: `/configuration`
+lists them under `service_owned`, a request that leaves them out or repeats
+the bound values is accepted, and a request naming another value is refused.
 VC3D removes them from saved profiles before sending a request.
 
-Each build (Initialize Fit, a full Rebuild Fit, a startup resume) selects
-inputs with the `object_store_*` selection keys exactly as the command-line
-fit does, refreshes links unless `object_store_refresh_links` is false, and
-freezes the result. A resident fit's inputs never change: the service has no
-route that adds, edits or removes them, and runs, pauses, checkpoint loads and
-model-only rebuilds keep them. To fit current store content, rebuild with
-`POST /session/rebuild {"inputs": "reload"}` (VC3D: *Rebuild Fit* →
-*Rebuild with Current Inputs*), which tears the session down and rereads the
+**A hub-bound service** (`--object-store-hub HUB`, a path or an
+`sftp://[user@]host/path` address) works on its own replica of that hub:
+STORE is cloned there when absent and otherwise checked to replicate HUB; a
+STORE that already is a replica binds its own hub without the flag. Startup
+pulls once, so an unreachable hub fails the launch; for an `sftp://` hub the
+service's ssh runs in batch mode, so its account needs a key (or agent) with
+write access to the hub file and its directory and a `known_hosts` entry. Put
+the hub on the service host when you can: the service then opens it by path
+and needs no credentials, and VC3D reaches it over `sftp://` with its own ssh
+prompts. The service's replica writes only detector links, pulls and pushes
+only during a build or an update, and is the only detector writer for its
+selection (a command-line refresh against the same hub would conflict with it).
+
+```sh
+python spiral_service.py --dataset DATA --output OUT --object-store ~/spiral/replica.vcobj \
+    --object-store-hub sftp://data-host/share/scroll.hub.vcobj
+```
+
+Each build (Initialize Fit, a full Rebuild Fit) links and pins a hub position,
+including at least the request's `inputs_position` (the position a client's
+pushed edits reached), before tearing anything down: a failure there leaves
+the resident fit untouched and is reported in `input_preparation_error`. A
+checkpoint resumes at the position it recorded. A model-only rebuild keeps the
+position. `POST /session/update-inputs {"inputs_position", "expected_input_generation"}`
+updates a resident fit in place: the service links and pins a position, then
+every rank reads it, prepares its inputs without touching resident state,
+releases the old inputs' device state and installs the new ones at an
+iteration boundary. The model, optimiser, scheduler and iteration are kept;
+status reports `input_update` while one runs and `input_generation`
+afterwards. A refusal (while linking or preparing, on any rank) leaves the fit
+as it was; a failure after the release fails the session
+(`input_preparation_error.recovery_required`): rebuild it or load a
+checkpoint.
+
+**A service without a hub** freezes its inputs: runs, pauses, checkpoint loads
+and model-only rebuilds keep them, and `POST /session/rebuild {"inputs":
+"reload"}` (VC3D: *Rebuild Fit* → *Rebuild with Current Inputs*) rereads the
 store. Without `"inputs"` a rebuild that changes only model configuration
-keeps the frozen inputs and one that changes anything else rereads them; the
+keeps the inputs and one that changes anything else rereads them; the
 response's `inputs` says which happened.
 
-Status carries `input_digest` (the replica-independent digest of the frozen
-selection) and `input_summary` (counts per kind and relationship, the volume,
-whether links were refreshed). Every build publishes the selection, with each
-object's and relationship's revision pins, as an `input_manifest` artifact
+Status carries `input_digest` (the replica-independent digest of the fit's
+selection), `input_summary` (counts per kind and relationship, the volume,
+whether links were refreshed) and `input_position` (hub, sequence, the
+requested position, the head it was linked at, and where it came from). Every
+build and update publishes the selection, with each object's and
+relationship's revision pins, as an `input_manifest` artifact
 (`object_store_inputs.json`). Previews, the preview index and autosave
-metadata record the digest of the inputs they were made from. A checkpoint
-whose recorded inputs differ from the session's is refused with the
+metadata record the digest and position of the inputs they were made from. A
+checkpoint whose recorded inputs differ from the session's is refused with the
 differences, the `{"inputs": "reload"}` remedy and the
 `object_store_allow_changed_inputs` override.
 
@@ -804,6 +847,32 @@ consumed, links among the fitted inputs that were not fitted, and other store
 changes a rebuild's selection may include; *Rebuild Fit* reads them.
 *Show fitted fibers* in Display draws the fit's fibers on the plane views,
 within the point view tolerance of the slice.
+
+With a hub-bound service the profile works through a replica of the
+service's hub: a local profile whose attached store is a replica launches its
+service with its own replica of the same hub (under the output root), and
+*File > Object store > Host Object Store Locally* turns an ordinary attached
+store into a local hub with its path as the replica. For a remote profile,
+attach a replica of the service's hub; *Clone the Service's Hub* (shown when
+the attached store is not one) prefills the hub address, through the SSH
+destination for an SSH profile, or the profile's saved hub address. The
+*Object store* row then compares hub identities and positions as well as
+store UUIDs.
+
+Edits are saved into the replica, not into the fit. *Save Drafts to Store*
+(Shift+E) writes the ready brush patches (new surfaces tagged `spiral-brush`,
+in the preview's frame of the fit volume, or new revisions of ones saved
+earlier) and point-collection edits (fitted collections keep their objects
+and point ids) as checked revisions; the replica's background sync pushes
+them. *Update Fit Inputs* holds the replica's pushes, pushes everything saved
+and waits (hub conflicts stop it and are named), then updates an idle fit in
+place at a position including those edits (initializing one when there is
+none, rebuilding a failed one), and pulls to the position the service
+fitted. It reports the hub commits that position includes beyond the
+request and those after it, which show as stale. *Save and Update Fit
+Inputs* does both. The run panel's position summary shows the four states:
+unsaved drawings, saved edits not yet pushed (or in conflict), a position
+being linked, and the position the fit reads.
 
 `spiral-scroll.json` in the dataset root is the only source of the scroll's
 name and voxel resolution and of the Lasagna store layout (zarr groups,
