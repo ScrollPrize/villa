@@ -123,7 +123,19 @@ PREVIEW_EXPORT_TIMEOUT_S = 1200.0
 # All-rank commands that only a rank with nothing outstanding may enter.
 _QUIESCENT_COMMANDS = frozenset({
     "run", "preflight_checkpoint", "apply_checkpoint", "rebuild_model",
+    "prepare_inputs", "install_inputs", "publish_inputs",
 })
+
+
+class InputUpdateRefused(RuntimeError):
+    """An input update refused before any rank released resident state:
+    the fit continues with the inputs it had."""
+
+
+class InputUpdateFailed(RuntimeError):
+    """An input update failed after resident input state was released on
+    some rank: the session has stopped and needs an explicit rebuild or a
+    checkpoint load."""
 
 
 class CommandBarrierViolation(RuntimeError):
@@ -489,6 +501,45 @@ class DiscardCheckpointCommand(SessionCommand):
     kind: ClassVar[str] = "discard_checkpoint"
 
 
+@dataclasses.dataclass
+class PrepareInputsCommand(SessionCommand):
+    """Phase 1 of an input update: read the inputs of a hub position and
+    derive everything they shape on the host (FitContext.load_replacement_inputs
+    and prepare_input_replacement), touching no resident state. A refusal
+    here, or on any sibling rank, leaves the fit exactly as it was."""
+
+    kind: ClassVar[str] = "prepare_inputs"
+
+    position: int = 0
+
+
+@dataclasses.dataclass
+class InstallInputsCommand(SessionCommand):
+    """Phase 2 of an input update: release the old inputs' device state and
+    install the prepared ones (FitContext.replace_inputs). Issued only once
+    every rank prepared the same inputs. A failure is fatal to the session:
+    the old inputs are gone by then."""
+
+    kind: ClassVar[str] = "install_inputs"
+
+    position: int = 0
+
+
+@dataclasses.dataclass
+class PublishInputsCommand(SessionCommand):
+    """Phase 3 of an input update: report the installed inputs as the
+    session's, once every rank installed them."""
+
+    kind: ClassVar[str] = "publish_inputs"
+
+
+@dataclasses.dataclass
+class DiscardInputsCommand(SessionCommand):
+    """Release prepared inputs no rank will install."""
+
+    kind: ClassVar[str] = "discard_inputs"
+
+
 def merge_session_config(checkpoint, run_config, warn):
     """The configuration a session build resolves before count scaling.
 
@@ -626,6 +677,10 @@ class InteractiveFitSession:
         # apply command that follows it, as (path, payload). Only the fitter
         # thread ever reads or writes it.
         self._pending_checkpoint = None
+        # An input update's prepared candidate, (position, candidate), between
+        # its prepare and install phases; and how many updates were published.
+        self._pending_inputs = None
+        self._input_generation = 0
         self.session_generation = 0
         self._config_revision = 0
         # The all-rank command epoch this rank has entered. It advances only
@@ -686,6 +741,7 @@ class InteractiveFitSession:
                 "supports_input_incorporation": self._context is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
                 "input_digest": getattr(self, "_input_digest", None),
+                "input_generation": getattr(self, "_input_generation", 0),
                 "input_manifest_path": getattr(self, "_input_manifest_path", None),
                 "input_summary": copy.deepcopy(getattr(self, "_input_summary", None)),
                 "progress": self._progress_reporter().snapshot(),
@@ -968,24 +1024,30 @@ class InteractiveFitSession:
         inspecting a checkpoint should not require it. A client that wants to
         see the restored model asks for one.
         """
-        inputs = getattr(context, "object_store_inputs", None)
-        manifest_path = Path(context.out_path) / "object_store_inputs.json"
         with self._condition:
             self._context = context
             self._completed = self._target = context.start_iteration
             self._output_path = context.out_path
-            if inputs is not None and inputs.manifest is not None:
-                from object_store_inputs import input_summary
-                self._input_digest = inputs.digest
-                self._input_position = inputs.manifest.get("position")
-                self._input_summary = input_summary(inputs)
-                self.input_manifest["object_store_digest"] = inputs.digest
-                if manifest_path.is_file():
-                    self._input_manifest_path = str(manifest_path)
+            self._adopt_inputs_locked(context)
         self._record_checkpoint_state(
             getattr(context, "resume_path", None), context.start_iteration)
         self._progress_reporter().clear()
         self._transition(SessionState.Idle, IDLE_PHASE)
+
+    def _adopt_inputs_locked(self, context):
+        """Report the context's object-store inputs as the session's: their
+        digest, position, summary and manifest file. Call with the lock held."""
+        inputs = getattr(context, "object_store_inputs", None)
+        if inputs is None or inputs.manifest is None:
+            return
+        from object_store_inputs import input_summary
+        manifest_path = Path(context.out_path) / "object_store_inputs.json"
+        self._input_digest = inputs.digest
+        self._input_position = inputs.manifest.get("position")
+        self._input_summary = input_summary(inputs)
+        self.input_manifest["object_store_digest"] = inputs.digest
+        if manifest_path.is_file():
+            self._input_manifest_path = str(manifest_path)
 
     def _record_checkpoint_state(self, path, completed_iterations):
         """Name the checkpoint the resident model now equals, if any.
@@ -1090,6 +1152,20 @@ class InteractiveFitSession:
                 continue
             if isinstance(command, DiscardCheckpointCommand):
                 self._run_checkpoint_discard(command)
+                continue
+            if isinstance(command, PrepareInputsCommand):
+                self._run_inputs_prepare(command)
+                continue
+            if isinstance(command, InstallInputsCommand):
+                # Not guarded: a failure past the release unwinds the fitter
+                # thread and fails the session, as apply_checkpoint does.
+                self._run_inputs_install(command)
+                continue
+            if isinstance(command, PublishInputsCommand):
+                self._run_inputs_publish(command)
+                continue
+            if isinstance(command, DiscardInputsCommand):
+                self._run_inputs_discard(command)
                 continue
             if isinstance(command, ExportPreviewCommand):
                 self._run_export_preview(command)
@@ -1251,6 +1327,106 @@ class InteractiveFitSession:
     def _run_checkpoint_discard(self, command):
         """Release a payload no rank will apply and return to Idle."""
         self._release_pending_checkpoint()
+        with self._condition:
+            loading = self._state is SessionState.Loading
+        if loading:
+            self._leave_checkpoint_load()
+        command.complete(discarded=True)
+
+    def _release_pending_inputs(self):
+        """Drop a prepared candidate. Fitter thread only."""
+        pending, self._pending_inputs = self._pending_inputs, None
+        del pending
+
+    def _run_inputs_prepare(self, command):
+        """Read and prepare the inputs of a hub position; touch nothing
+        resident. The session leaves Idle for the whole update, so no run is
+        admitted against the inputs being replaced."""
+        from fit_spiral import InputReplacementRefused
+        try:
+            if self._context is None or getattr(self._context, "object_store_inputs", None) is None:
+                raise RuntimeError("The resident fitter has no object-store inputs to update")
+            self._release_pending_inputs()
+            with self._condition:
+                self._transition_locked(
+                    SessionState.Loading, f"Preparing inputs at hub position {command.position}",
+                    reason=f"input update {command.command_id}")
+            self._publish_status()
+            self._progress_reporter().begin(
+                "loading", "Reading object-store inputs",
+                detail=f"hub position {command.position}")
+            inputs = self._context.load_replacement_inputs(command.position)
+            candidate = self._context.prepare_input_replacement(inputs)
+        except Exception as exc:
+            self._release_pending_inputs()
+            self._leave_checkpoint_load()
+            reason = str(exc) if isinstance(exc, InputReplacementRefused) else f"{type(exc).__name__}: {exc}"
+            command.fail(reason)
+            return
+        self._pending_inputs = (command.position, candidate)
+        with self._condition:
+            self._transition_locked(SessionState.Loading, "Inputs prepared")
+        self._publish_status()
+        command.complete(position=command.position, digest=inputs.digest,
+                         patches=candidate.num_verified_patches,
+                         cross_patch_pcls=len(candidate.cross_patch_pcls),
+                         unattached_strips=len(candidate.unattached_pcl_strips))
+
+    def _run_inputs_install(self, command):
+        """Replace the resident inputs with the prepared ones. Reached only
+        once every rank prepared the same inputs; from the release on there is
+        no unchanged fit to return to, so a failure is re-raised and fails
+        the session."""
+        pending = self._pending_inputs
+        if pending is None or pending[0] != command.position:
+            self._release_pending_inputs()
+            self._leave_checkpoint_load()
+            command.fail(f"No prepared inputs are pending for hub position {command.position}")
+            return
+        self._pending_inputs = None
+        _, candidate = pending
+        try:
+            self._progress_reporter().begin(
+                "loading", "Installing object-store inputs",
+                detail=f"hub position {command.position}")
+            warnings = self._context.replace_inputs(candidate)
+        except BaseException as exc:
+            error = (f"Installing the inputs of hub position {command.position} failed after "
+                     f"their predecessors were released; the fit must be rebuilt or loaded "
+                     f"from a checkpoint: {type(exc).__name__}: {exc}")
+            command.fail(error)
+            raise RuntimeError(error) from exc
+        finally:
+            del candidate, pending
+        self._progress_reporter().clear()
+        with self._condition:
+            for warning in warnings or ():
+                if warning not in self._warnings:
+                    self._warnings.append(warning)
+            self._transition_locked(SessionState.Loading, "Inputs installed")
+        self._publish_status()
+        command.complete(position=command.position)
+
+    def _run_inputs_publish(self, command):
+        """Report the installed inputs as the session's and return to Idle."""
+        with self._condition:
+            self._adopt_inputs_locked(self._context)
+            self._input_generation += 1
+            position = (self._input_position or {}).get("sequence")
+            if self._applied_config is not None:
+                self._applied_config["object_store_input_position"] = position
+            self._config_revision += 1
+            self._latest_metrics = {}
+            revision = self._config_revision
+            self._transition_locked(SessionState.Idle, IDLE_PHASE)
+        self._publish_status()
+        command.complete(digest=self._input_digest, position=self._input_position,
+                         input_generation=self._input_generation,
+                         config_revision=revision)
+
+    def _run_inputs_discard(self, command):
+        """Release prepared inputs no rank will install, and return to Idle."""
+        self._release_pending_inputs()
         with self._condition:
             loading = self._state is SessionState.Loading
         if loading:
@@ -1949,6 +2125,72 @@ class InteractiveFitSession:
         result = self.apply_checkpoint(path, timeout)
         return {**verdict, **result}
 
+    def prepare_inputs(self, position, timeout=1800.0, barrier=None):
+        """Phase 1 of an input update, on this rank. Valid only in Idle."""
+        with self._condition:
+            if self._state is not SessionState.Idle:
+                raise RuntimeError(
+                    f"Updating the inputs is not allowed while session state "
+                    f"is {self._state.name}")
+            epoch = self._enter_epoch_locked("prepare_inputs", barrier)
+            command = PrepareInputsCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed,
+                expected_config_revision=self._config_revision,
+                position=int(position))
+        return self._queue_command(command, timeout)
+
+    def install_inputs(self, position, timeout=1800.0, barrier=None):
+        """Phase 2 of an input update, on this rank."""
+        with self._condition:
+            if self._state is not SessionState.Loading:
+                raise RuntimeError(
+                    f"No input update is in progress (session state is {self._state.name})")
+            epoch = self._enter_epoch_locked("install_inputs", barrier)
+            command = InstallInputsCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed, position=int(position))
+        return self._queue_command(command, timeout)
+
+    def publish_inputs(self, timeout=60.0, barrier=None):
+        """Phase 3 of an input update, on this rank."""
+        with self._condition:
+            epoch = self._enter_epoch_locked("publish_inputs", barrier)
+            command = PublishInputsCommand(
+                session_generation=self.session_generation, epoch=epoch,
+                expected_iteration=self._completed)
+        return self._queue_command(command, timeout)
+
+    def discard_inputs(self, timeout=30.0, barrier=None):
+        """Release prepared inputs after a refusal on any rank."""
+        with self._condition:
+            epoch = self._enter_epoch_locked("discard_inputs", barrier)
+            command = DiscardInputsCommand(
+                session_generation=self.session_generation, epoch=epoch)
+        return self._queue_command(command, timeout)
+
+    def update_inputs(self, position, timeout=1800.0):
+        """Replace the fit's inputs with those of hub ``position`` at an
+        iteration boundary, keeping the model and optimiser state.
+
+        A single-rank session is its own coordinator: prepare (a refusal
+        raises InputUpdateRefused and leaves the fit as it was), install (a
+        failure raises InputUpdateFailed; the session has failed), publish.
+        """
+        try:
+            prepared = self.prepare_inputs(position, timeout)
+        except BaseException as exc:
+            try:
+                self.discard_inputs()
+            except BaseException:
+                traceback.print_exc(limit=4)
+            raise InputUpdateRefused(str(exc)) from exc
+        try:
+            self.install_inputs(position, timeout)
+        except BaseException as exc:
+            raise InputUpdateFailed(str(exc)) from exc
+        return {**prepared, **self.publish_inputs()}
+
     def close(self, timeout=15.0, barrier=None):
         with self._condition:
             self._enter_epoch_locked("close", barrier)
@@ -2030,6 +2272,20 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
                         barrier=barrier)
                 elif name == "discard_checkpoint":
                     result = session.discard_checkpoint(
+                        arguments.get("timeout", 30.0), barrier=barrier)
+                elif name == "prepare_inputs":
+                    result = session.prepare_inputs(
+                        arguments["position"], arguments.get("timeout", 1800.0),
+                        barrier=barrier)
+                elif name == "install_inputs":
+                    result = session.install_inputs(
+                        arguments["position"], arguments.get("timeout", 1800.0),
+                        barrier=barrier)
+                elif name == "publish_inputs":
+                    result = session.publish_inputs(
+                        arguments.get("timeout", 60.0), barrier=barrier)
+                elif name == "discard_inputs":
+                    result = session.discard_inputs(
                         arguments.get("timeout", 30.0), barrier=barrier)
                 elif name == "save_checkpoint":
                     # Coordinator sub-operation: only the publishing rank is
@@ -2518,6 +2774,41 @@ class DistributedInteractiveFitSession:
         result = self._call("apply_checkpoint", arguments,
                             timeout=timeout + COMMAND_ACK_GRACE_S)
         return {**(verdict or {}), **(result or {})}
+
+    def update_inputs(self, position, timeout=1800.0):
+        """Coordinate an input update across every rank.
+
+        Every rank prepares the inputs of hub ``position`` (reading them
+        checks that the ranks agree on their digest); a refusal by any rank
+        discards every candidate and raises InputUpdateRefused, leaving the
+        fit untouched. Only then does every rank release its old inputs and
+        install the new ones: a failure on any rank fails the session
+        (InputUpdateFailed; the watchdog takes the siblings down). The
+        update is published only after every rank installed it.
+        """
+        state = self.status()["state"]
+        if state != SessionState.Idle:
+            raise RuntimeError(f"Updating the inputs is not allowed in {state}")
+        arguments = {"position": int(position), "timeout": timeout}
+        try:
+            prepared = self._call("prepare_inputs", arguments,
+                                  timeout=timeout + COMMAND_ACK_GRACE_S, return_all=True)
+            digests = {rank: result.get("digest") for rank, result in prepared.items()}
+            if len(set(digests.values())) != 1:
+                raise RuntimeError("ranks prepared different inputs: " + ", ".join(
+                    f"rank {rank} {str(digest)[:12]}" for rank, digest in sorted(digests.items())))
+        except BaseException as exc:
+            try:
+                self._call("discard_inputs", {}, timeout=COMMAND_ACK_TIMEOUT_S)
+            except BaseException:
+                traceback.print_exc(limit=4)
+            raise InputUpdateRefused(str(exc)) from exc
+        try:
+            self._call("install_inputs", arguments, timeout=timeout + COMMAND_ACK_GRACE_S)
+        except BaseException as exc:
+            raise InputUpdateFailed(self._fail_session(
+                f"An input update failed after resident inputs were released: {exc}")) from exc
+        return {**prepared[0], **(self._call("publish_inputs", {}, timeout=COMMAND_ACK_TIMEOUT_S) or {})}
 
     def save_checkpoint(self, path, timeout=120.0):
         state = self.status()["state"]
