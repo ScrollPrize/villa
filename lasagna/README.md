@@ -48,6 +48,10 @@ modules; direct and managed inference do not require `PYTHONPATH`.
 
 ### Inference manager
 
+For Qualzz AFV V2 models and plain V/H probability Zarr output, see
+[Qualzz AFV inference](docs/qualzz_afv_inference.md). This uses the same tiled
+engine and GPU manager without writing Lasagna-schema metadata.
+
 `las_manager` provides configuration, discovery, prefetch, and durable tmux
 execution for managed Fiber and Lasagna inference. Initialize its XDG configuration, fill
 in `cache_dir`, `output_dir`, `venv`, and one or more `snapshot_dirs`, then:
