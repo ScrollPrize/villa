@@ -110,6 +110,27 @@ vo::EdgeGeometryRepair repairFromPy(const nb::dict& d)
     return repair;
 }
 
+nb::list overlapCorrespondencesToPy(const std::vector<vc::object_links::OverlapCorrespondences>& results)
+{
+    nb::list out;
+    for (const auto& r : results) {
+        nb::dict item;
+        item["edge_uuid"] = r.edgeUuid; item["a"] = r.aUuid; item["b"] = r.bUuid;
+        item["a_geometry_revision"] = r.aGeometryRevision; item["b_geometry_revision"] = r.bGeometryRevision;
+        item["error"] = r.error.empty() ? nb::none() : nb::cast(r.error);
+        nb::list pairs;
+        for (const auto& pair : r.pairs) {
+            nb::dict q;
+            q["a_grid"] = pair.aGrid; q["b_grid"] = pair.bGrid;
+            q["a_xyz"] = pair.aXyz; q["b_xyz"] = pair.bXyz; q["distance"] = pair.distance;
+            pairs.append(q);
+        }
+        item["pairs"] = pairs;
+        out.append(item);
+    }
+    return out;
+}
+
 nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
 {
     nb::dict d;
@@ -901,31 +922,41 @@ NB_MODULE(_native, m)
             [](PyObjectStore& self, const std::vector<std::string>& edges, const std::string& volume,
                double spacing, std::size_t maxPairs) {
                 const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
-                const auto results = self.withStore<true>([&](auto& db) {
+                return overlapCorrespondencesToPy(self.withStore<true>([&](auto& db) {
                     return vc::object_links::materializeOverlapCorrespondences(db, edges, p);
-                });
-                nb::list out;
-                for (const auto& r : results) {
-                    nb::dict item;
-                    item["edge_uuid"] = r.edgeUuid; item["a"] = r.aUuid; item["b"] = r.bUuid;
-                    item["a_geometry_revision"] = r.aGeometryRevision; item["b_geometry_revision"] = r.bGeometryRevision;
-                    item["error"] = r.error.empty() ? nb::none() : nb::cast(r.error);
-                    nb::list pairs;
-                    for (const auto& pair : r.pairs) {
-                        nb::dict q;
-                        q["a_grid"] = pair.aGrid; q["b_grid"] = pair.bGrid;
-                        q["a_xyz"] = pair.aXyz; q["b_xyz"] = pair.bXyz; q["distance"] = pair.distance;
-                        pairs.append(q);
-                    }
-                    item["pairs"] = pairs;
-                    out.append(item);
-                }
-                return out;
+                }));
             },
             nb::arg("edge_uuids"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0,
             nb::arg("max_pairs") = 256,
             "Point pairs for accepted surface-overlap edges from their stored poses; grids are (row, column), "
             "XYZ in volume voxels, in stored edge endpoint order. A non-null error means the edge failed.")
+        .def(
+            "overlap_correspondences_at",
+            [](PyObjectStore& self, const nb::list& edges, const std::string& volume, double spacing,
+               std::size_t maxPairs) {
+                std::vector<vc::object_links::OverlapEdgeAt> pinned;
+                for (auto item : edges) {
+                    const auto edge = nb::cast<nb::dict>(item);
+                    auto text = [&](const char* key) { return nb::cast<std::string>(edge[key]); };
+                    vc::object_links::OverlapEdgeAt at;
+                    at.uuid = text("uuid"); at.aUuid = text("a"); at.bUuid = text("b");
+                    at.wholeGeometry = nb::cast<bool>(edge["whole_geometry"]);
+                    at.meta = text("meta");
+                    at.aObjectMeta = text("a_object_meta"); at.bObjectMeta = text("b_object_meta");
+                    at.aGeometryRevision = text("a_geometry_revision");
+                    at.bGeometryRevision = text("b_geometry_revision");
+                    pinned.push_back(std::move(at));
+                }
+                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, maxPairs};
+                return overlapCorrespondencesToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::materializeOverlapCorrespondences(db, pinned, p);
+                }));
+            },
+            nb::arg("edges"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0, nb::arg("max_pairs") = 256,
+            "overlap_correspondences from overlap edges as read at an earlier state, e.g. a hub position: dicts "
+            "with uuid, a and b (stored order), whole_geometry, meta (the edge's metadata JSON), a_object_meta and "
+            "b_object_meta (the endpoints' metadata JSON) and a_geometry_revision and b_geometry_revision (which "
+            "this store must hold). Not checked against the store's current state.")
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {

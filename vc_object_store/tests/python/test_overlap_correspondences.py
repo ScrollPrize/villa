@@ -188,3 +188,40 @@ def test_correspondence_agreement_boundary(db, radius, accepted):
         assert all(pair["distance"] == 6 for pair in result["pairs"])
     else:
         assert result["error"] == "no agreeing correspondences under the stored pose"
+
+
+def _as_read(db, edge):
+    """The edge and its endpoints as a reader holding them now would pass them."""
+    import json
+    return {"uuid": edge["uuid"], "a": edge["a"], "b": edge["b"], "whole_geometry": True,
+            "meta": json.dumps(edge["meta"]),
+            "a_object_meta": json.dumps(db.object(edge["a"])["meta"]),
+            "b_object_meta": json.dumps(db.object(edge["b"])["meta"]),
+            "a_geometry_revision": db.current_geometry(edge["a"])["uuid"],
+            "b_geometry_revision": db.current_geometry(edge["b"])["uuid"]}
+
+
+def test_pairs_from_an_earlier_state_ignore_later_changes(db):
+    patch(db, LOW, flat())
+    _, geometry = patch(db, HIGH, flat(10))
+    edge = overlap_edge(db)
+    then = _as_read(db, edge)
+    before = materialize(db, edge)
+    [pinned] = db.overlap_correspondences_at([then], VOLUME)
+    assert pinned == before
+    # Later: HIGH moves (a new geometry revision, the edge re-detected with a
+    # new pose), then the edge is removed. The earlier state still reads the
+    # same pairs, from its recorded pose and geometry.
+    _, moved = patch(db, None, flat(11))
+    geometry["arrays"] = moved["arrays"]
+    db.put_geometry(HIGH, geometry, expected_revision=db.current_geometry(HIGH)["uuid"],
+                    edge_edits=[edge_choice(db, e["uuid"], "keep_recorded")
+                                for e in db.affected_geometry_edges(HIGH, geometry)])
+    db.remove_edge(edge["uuid"])
+    assert db.overlap_correspondences([edge["uuid"]], VOLUME)[0]["error"] == "edge not found"
+    [again] = db.overlap_correspondences_at([then], VOLUME)
+    assert again == before
+    # A revision the store does not hold is an error of that edge.
+    [missing] = db.overlap_correspondences_at(
+        [dict(then, b_geometry_revision="00000000-0000-4000-8000-0000000000ee")], VOLUME)
+    assert "has no geometry revision" in missing["error"] and missing["pairs"] == []

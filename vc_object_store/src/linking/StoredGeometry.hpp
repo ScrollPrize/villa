@@ -5,6 +5,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include <map>
 #include <memory>
+#include <optional>
 
 namespace vc::object_links::detail {
 // One read snapshot for selection and geometry. Payloads can be read one object
@@ -14,7 +15,9 @@ public:
     explicit StoredGeometry(objects::ObjectStore& db) : db_(db), read_(db.read()) {}
     std::vector<objects::ObjectRecord> select(const std::string& kind,
         const std::vector<std::string>& uuids = {});
-    objects::detail::GeometrySnapshot load(const objects::ObjectRecord& object);
+    // The object's current geometry, or the named revision of it.
+    objects::detail::GeometrySnapshot load(const objects::ObjectRecord& object,
+        const std::optional<std::string>& revision = std::nullopt);
     std::string pointAnnotations(const objects::GeometryRevision& revision, const std::string& array) const
     { return db_.geometryPointAnnotations(read_, revision.uuid, array); }
     void validate(const objects::WriteTxn& txn) const;

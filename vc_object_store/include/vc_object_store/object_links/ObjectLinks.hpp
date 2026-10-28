@@ -214,6 +214,24 @@ struct OverlapCorrespondences {
 std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
     const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params);
 
+// An overlap edge as a reader saw it at some earlier state (a hub position,
+// say): the edge record's stored endpoint order, whole-geometry anchors and
+// metadata, and each endpoint's object metadata and geometry revision then.
+// The caller has decided the edge applies at that state; it is not checked
+// for staleness against the store's current state.
+struct OverlapEdgeAt {
+    std::string uuid, aUuid, bUuid;
+    bool wholeGeometry = true;  // both anchors
+    std::string meta;           // the edge's metadata JSON (its fit and pose)
+    std::string aObjectMeta, bObjectMeta;
+    std::string aGeometryRevision, bGeometryRevision;
+};
+// Point pairs from these records and geometry revisions instead of the
+// store's current ones (the revisions must be in this store); otherwise as
+// above.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<OverlapEdgeAt>& edges, const OverlapCorrespondenceParams& params);
+
 // Fiber/track-to-surface strips have stripRowsEachSide rows at stripSpacing
 // on each side of the centerline. Distances are in working voxels.
 struct LineSurfaceParams : CoordinateParams {

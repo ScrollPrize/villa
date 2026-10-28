@@ -76,9 +76,12 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
     for (const auto& object : objects) generations_[object.uuid] = object.generation;
     return objects;
 }
-objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object)
+objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectRecord& object,
+    const std::optional<std::string>& named)
 {
-    const auto revision = db_.currentGeometry(read_, object.uuid);
+    const auto revision = named ? db_.geometryRevision(read_, *named) : db_.currentGeometry(read_, object.uuid);
+    if (named && (!revision || revision->objectUuid != object.uuid))
+        throw std::runtime_error("object " + object.uuid + " has no geometry revision " + *named + " in this store");
     if (!revision) throw std::runtime_error("object " + object.uuid + " has no stored geometry; ingest it before discovery");
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz" || revision->kind != object.kind)
         throw std::runtime_error("unsupported stored geometry for " + object.uuid);
