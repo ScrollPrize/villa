@@ -83,9 +83,10 @@ class SpiralServiceProtocolTest : public QObject
     Q_OBJECT
 
 private slots:
-    // Stage 2a: VC3D edits its replica of the service's hub; Update Fit
-    // Inputs pushes them, the service links and pins a position including
-    // them, and VC3D pulls to it.
+    // VC3D edits its replica of the service's hub; Update Fit Inputs pushes
+    // them, the service links and pins a position including them (the first
+    // initializes the fit, later ones update its inputs in place), and VC3D
+    // pulls to it.
     void updateFitInputsAtAHubPosition()
     {
         try { updateFitInputsAtAHubPositionBody(); }
@@ -212,6 +213,7 @@ private:
         manager.setObjectStore(session, attachment);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
+        QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
         manager.connectToService(protocolProfile(service.port));
         QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
         QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().hosted() && manager.storeBinding().matches(), 10000);
@@ -249,7 +251,8 @@ private:
         QCOMPARE(fitted.at("manifest").at("objects").at(0).at("metadata").at("spiral_patch_erode_cells").get<int>(), 2);
         QVERIFY(session->hubStatus(attachment)->position >= update.fitted);
 
-        // The next one rebuilds it; an edit saved after it is not part of it.
+        // The next one updates the resident fit in place: no new session.
+        QTRY_COMPARE_WITH_TIMEOUT(sessions.count(), 1, 10000);
         edit(3);
         manager.updateFitInputs(request);
         QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 2, 60000);
@@ -259,6 +262,7 @@ private:
         fitted = fittedMetadata(1);
         QCOMPARE(fitted.at("manifest").at("position").at("sequence").get<qint64>(), update.fitted);
         QCOMPARE(fitted.at("manifest").at("objects").at(0).at("metadata").at("spiral_patch_erode_cells").get<int>(), 3);
+        QCOMPARE(sessions.count(), 1);
 
         // A conflict blocks the update and leaves the fit as it was: another
         // replica changes a link this replica changed too, before it pushed.

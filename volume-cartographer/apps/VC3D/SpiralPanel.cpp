@@ -1868,11 +1868,11 @@ void SpiralPanel::startInputUpdate(bool confirm)
                              tr("Advanced config must be a JSON object: %1").arg(error.errorString()));
         return;
     }
-    if (confirm && _sessionState != QStringLiteral("Uninitialized") && _sessionState != QStringLiteral("Error")) {
+    if (confirm && _sessionState == QStringLiteral("Error")) {
         const auto answer = QMessageBox::question(
             this, tr("Update Fit Inputs"),
-            tr("Updating the inputs rebuilds the fit from a hub position including your saved "
-               "edits, discarding what this session has trained. Continue?"));
+            tr("The fit failed; updating its inputs rebuilds it from a hub position including "
+               "your saved edits. Continue?"));
         if (answer != QMessageBox::Yes) return;
     }
     persist();

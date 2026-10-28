@@ -51,7 +51,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 37;
+    static constexpr int kApiVersion = 38;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted only when both
@@ -137,6 +137,9 @@ public:
     // (stopping on hub conflicts), then initialize or rebuild the fit from a
     // hub position including them; finally release the hold and pull to the
     // position the service fitted. ``request`` is the panel's session request.
+    // With an idle resident fit this updates its inputs in place
+    // (POST /session/update-inputs: model and optimiser state are kept);
+    // without a session it initializes one, and a failed session is rebuilt.
     void updateFitInputs(QJsonObject request);
     bool inputUpdateActive() const { return _inputUpdateActive; }
     void runIterations(int iterations, const QJsonObject& runConfig,
@@ -304,6 +307,9 @@ private:
     bool _leaseOwner = false;
     // Update fit inputs in flight: its push hold, released when it finishes.
     bool _inputUpdateActive = false;
+    // The resident session's state and input generation, as last reported.
+    QString _sessionState;
+    qint64 _inputGeneration = 0;
     std::shared_ptr<vc::objects::PushHold> _inputUpdateHold;
     void finishInputUpdate(InputUpdate update);
     void sendInputUpdate(QJsonObject request, qint64 requested);

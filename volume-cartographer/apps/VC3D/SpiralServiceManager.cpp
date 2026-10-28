@@ -819,7 +819,18 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
     const QString tracks = paths.value(QStringLiteral("tracks_dbm")).toString().trimmed();
     if (!tracks.isEmpty()) body[QStringLiteral("paths")] = QJsonObject{{QStringLiteral("tracks_dbm"), tracks}};
     const bool initialize = !_hasActiveSession;
-    if (!initialize) body[QStringLiteral("inputs")] = QStringLiteral("reload");
+    // An idle fit keeps training across the update; a failed one is rebuilt.
+    const bool update = !initialize && _sessionState == QStringLiteral("Idle");
+    QString route = QStringLiteral("/session/initialize");
+    if (update) {
+        route = QStringLiteral("/session/update-inputs");
+        body = {{QStringLiteral("inputs_position"), requested},
+                {QStringLiteral("expected_input_generation"), _inputGeneration},
+                {QStringLiteral("command_id"), commandId()}};
+    } else if (!initialize) {
+        route = QStringLiteral("/session/rebuild");
+        body[QStringLiteral("inputs")] = QStringLiteral("reload");
+    }
     auto failed = [this, requested](const QString& message, const QJsonObject& body) {
         InputUpdate update;
         update.requested = requested;
@@ -830,8 +841,7 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
         if (!body.isEmpty()) handleStatus(body);
         finishInputUpdate(update);
     };
-    postWithRetry(initialize ? QStringLiteral("/session/initialize") : QStringLiteral("/session/rebuild"),
-                  body, Timeout::Load, kMutationRetries,
+    postWithRetry(route, body, Timeout::Load, kMutationRetries,
                   [this, requested](const QJsonObject& response) {
                       handleStatus(response);
                       const QJsonObject position = response.value(QStringLiteral("input_position")).toObject();
@@ -1445,6 +1455,16 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         _hasActiveSession = active;
         emit sessionActiveChanged(active);
     }
+    _sessionState = status.value(QStringLiteral("state")).toString();
+    _inputGeneration = status.value(QStringLiteral("input_generation")).toInteger();
+    // The display follows the fitted position: a replica behind it pulls
+    // forward (bringing the service's links); one ahead shows later edits
+    // as stale through the input freshness.
+    const qint64 fitted = status.value(QStringLiteral("input_position")).toObject()
+                              .value(QStringLiteral("sequence")).toInteger(-1);
+    if (fitted > _storeBinding.localPosition && _storeBinding.matches() && !_inputUpdateActive)
+        if (const auto session = _storeSession.lock(); session && _storeAttachment)
+            session->syncHub(*_storeAttachment);
     if (!active) {
         _synchronizedSessionId.clear();
         _installedPreviewSession.clear();
