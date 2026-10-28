@@ -29,6 +29,15 @@ def test_empty_retained_set_is_not_perfect_agreement():
     assert result['retained']['mismatch_arc_percent'] is None
 
 
+def test_length_histogram_boundaries_and_empty_groups():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_hv_label_comparison import length_histogram
+    result = length_histogram([0, 99, 100, 250, 100000, 200000], [0, 0, 1, 1, 2, 2])
+    assert result['groups']['all']['counts'][:3] == [2, 1, 1]
+    assert result['groups']['all']['counts'][-1] == 2
+    assert sum(result['groups']['all']['counts']) == 6
+    assert length_histogram([100], [0])['groups']['broken']['mean'] is None
+
+
 def test_reject_inconsistent_saved_hard_labels():
     with pytest.raises(ValueError, match='Invalid'):
         comparison([1], [0], [100], [[.1,.8,.1]], [0], [False], [.5])

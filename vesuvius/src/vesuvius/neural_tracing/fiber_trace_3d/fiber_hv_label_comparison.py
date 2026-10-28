@@ -61,6 +61,39 @@ def comparison(ids, original, lengths, probabilities, labels, inherited, cutoffs
                 interpretation='Disagreement with source labels, not anatomical accuracy; broken fibers excluded from mismatch denominators.')
 
 
+def length_histogram(lengths, labels):
+    """Source AFV arc-length histogram; half-open bins, native base voxels."""
+    lengths = np.asarray(lengths, dtype=float)
+    labels = np.asarray(labels)
+    if (lengths.ndim != 1 or labels.shape != lengths.shape or not np.isfinite(lengths).all()
+            or np.any(lengths < 0) or not np.isin(labels, [0, 1, 2]).all()):
+        raise ValueError('Invalid lengths/labels')
+    edges = np.array([0, 100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, np.inf])
+    result = dict(units='native base voxels', bins_lower=edges[:-1].tolist(),
+                  bins_upper=[None if np.isinf(v) else float(v) for v in edges[1:]], groups={})
+    for name, mask in [('all', np.ones(len(lengths), bool)),
+                       *[(name, labels == code) for code, name in enumerate(('H', 'V', 'broken'))]]:
+        values = lengths[mask]
+        counts = np.histogram(values, edges)[0]
+        result['groups'][name] = dict(count=len(values), counts=counts.tolist(),
+            percent=(100 * counts / len(values)).tolist() if len(values) else [0.] * len(counts),
+            mean=float(values.mean()) if len(values) else None,
+            quantiles=dict(zip(('min', 'p25', 'median', 'p75', 'p90', 'p95', 'p99', 'max'),
+                              np.quantile(values, [0, .25, .5, .75, .9, .95, .99, 1]).tolist())) if len(values) else {})
+    return result
+
+
+def run_histogram(config):
+    with np.load(config['comparison'], allow_pickle=False) as data:
+        result = length_histogram(data['lengths_base'], data['labels'])
+    result['input'] = str(Path(config['comparison']).resolve())
+    destination = Path(config['report'])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(destination, result, durable=False)
+    print(json.dumps(result), flush=True)
+    return result
+
+
 def run(config):
     afv = Path(config['afv']).resolve()
     solution = Path(config['solution']).resolve()
