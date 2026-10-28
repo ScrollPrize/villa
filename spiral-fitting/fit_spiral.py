@@ -146,6 +146,17 @@ configure_torch_threads_from_env()
 
 
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
+# Every step builds fresh transform objects (slice-to-spiral transform, the
+# integrated-flow diffeomorphism and its cached-integrator closures) that sit in
+# reference cycles and each hold a full gap-logit lattice copy and a full-resolution
+# flow copy. Reference counting never frees them; only the cyclic collector does, and
+# it runs on Python container-allocation counts, never on device memory (a failed CUDA
+# allocation does not start it), so on a long z range the garbage fills the card.
+# A full collection scans every tracked object, and the setup heap (tracks, pools,
+# configuration) is large and never dies: that scan is what makes a collection per step
+# cost about 0.3 s. gc.freeze() after the first step moves the setup heap out of every
+# later scan, which makes a collection after each step cheap. 0 disables.
+_GC_EVERY_STEPS = int(os.environ.get('FIT_SPIRAL_GC_EVERY_STEPS', '1'))
 
 
 class InputReplacementRefused(RuntimeError):
@@ -2650,6 +2661,8 @@ class FitContext:
         # The optimiser state and the flow-field lattices are the session's
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
+        gc.unfreeze()
+        self._gc_frozen = False
         gc.collect()
         torch.cuda.empty_cache()
         if self.device.type == 'mps':
@@ -3935,6 +3948,13 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
+        if _GC_EVERY_STEPS > 0:
+            if not getattr(self, '_gc_frozen', False):
+                gc.collect()
+                gc.freeze()
+                self._gc_frozen = True
+            if iteration % _GC_EVERY_STEPS == 0:
+                gc.collect()
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()
