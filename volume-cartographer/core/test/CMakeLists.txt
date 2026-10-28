@@ -870,6 +870,7 @@ vc_add_test(NAME test_load_json)
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_remote_file_cache)
+vc_add_test(NAME test_remote_cache_budget_settings)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp

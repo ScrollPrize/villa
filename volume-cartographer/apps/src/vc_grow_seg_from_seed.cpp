@@ -12,6 +12,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
+#include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/tracer/Tracer.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
@@ -408,6 +409,10 @@ static int run_main(int argc, char *argv[])
     utils::Json remote_metadata;
     if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
         remote_metadata["voxelsize"] = requested_voxelsize;
+    if (remote_volume) {
+        // Same VC3D.ini disk budget as the VC3D app, so long traces cannot fill the disk.
+        vc::settings::configureRemoteCacheBudget();
+    }
     auto volume = remote_volume
         ? Volume::NewFromUrl(volume_arg, {}, remote_metadata)
         : Volume::New(vol_path);
