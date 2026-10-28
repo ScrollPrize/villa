@@ -100,6 +100,7 @@ int main() try
     // A draft of the same geometry answers exactly as the stored surface does.
     session.setDraft(stored, tilted(0), coordinates, attachment);
     require(session.hasDraft(stored), "draft is held");
+    const auto firstRevision = session.draftRevision(stored);
     auto events = session.takeEvents();
     require(events.size() == 1 && events[0].kind == StoreSessionEvent::Kind::Draft && events[0].attachment == attachment &&
             events[0].changes.size() == 1 && events[0].changes[0].recordUuid == stored, "setting a draft is a Draft event");
@@ -151,7 +152,9 @@ int main() try
         }
     edited.validity.assign(edited.points.size(), 1);
     for (int r = 30; r < 36; ++r) edited.validity[size_t(r * 40 + 7)] = 0;
+    const auto beforeEdit = session.draftRevision(stored);
     session.updateDraft(stored, 30, 5, 6, 20, patch, validity);
+    require(firstRevision != 0 && session.draftRevision(stored) > beforeEdit, "every draft change is a new revision");
     const auto updated = runsOf(session.geometryRegion(order, slice, surfaces()));
     session.setDraft(stored, edited, coordinates, attachment);
     require(sameRuns(updated, runsOf(session.geometryRegion(order, slice, surfaces()))), "edits are rectangles of the grid");
@@ -161,7 +164,7 @@ int main() try
 
     // Clearing restores the stored geometry.
     session.clearDraft(stored);
-    require(!session.hasDraft(stored) && sameRuns(runsOf(session.geometryRegion(order, slice, surfaces())), committed),
+    require(!session.hasDraft(stored) && session.draftRevision(stored) == 0 && sameRuns(runsOf(session.geometryRegion(order, slice, surfaces())), committed),
             "cleared drafts leave the stored surface");
     session.clearDraft(stored);
 
@@ -188,6 +191,23 @@ int main() try
     auto family = surfaces(); family.family = "any";
     mustFail([&] { (void)session.geometryRegion({}, plane(20.5), family); });
     session.clearDraft(fresh);
+
+    // A shared tile cache: a repeated read decodes nothing and cuts the same.
+    {
+        auto cached = options;
+        cached.readOnly = true;
+        cached.surfaceTiles = std::make_shared<SurfaceTileCache>(size_t(64) << 20);
+        auto reader = ObjectStore::open(path, cached);
+        auto query = surfaces();
+        const auto first = reader.geometryRegion(reader.read(), slice, query);
+        const auto held = cached.surfaceTiles->size();
+        const auto second = reader.geometryRegion(reader.read(), slice, query);
+        require(held > 0 && first.stats.payloadBytes > 0 && second.stats.payloadBytes == 0 &&
+                    sameRuns(first.runs, second.runs) && sameRuns(first.runs, committed),
+                "cached tiles are not read again and cut the same");
+        cached.surfaceTiles->setCapacity(0);
+        require(cached.surfaceTiles->size() == 0, "shrinking the cache evicts");
+    }
     std::cout << "surface draft tests passed\n";
     return 0;
 } catch (const std::exception& error) {

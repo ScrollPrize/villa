@@ -593,6 +593,40 @@ detail::SurfaceTile detail::surfaceTile(GeometryReader& reader, int64_t row, int
         ? reader.rectangle(surfaceValidChannel, row, column, rows, columns) : std::vector<uint8_t>{};
     for (size_t i = 0; i < tile.points.size(); ++i)
         tile.valid[i] = vc::geometry::validSurfacePoint(tile.points[i]) && (channel.empty() || channel[i]);
+    boundSurfaceTileBands(tile, columns);
+    return tile;
+}
+
+void detail::boundSurfaceTileBands(SurfaceTile& tile, int64_t columns)
+{
+    tile.bands.clear();
+    const int64_t rows = columns ? int64_t(tile.points.size()) / columns : 0;
+    for (int64_t first = 0; first + 1 < rows; first += SurfaceTile::bandCells) {
+        const int64_t last = std::min(first + SurfaceTile::bandCells, rows - 1);
+        std::optional<std::array<double, 6>> box;
+        for (int64_t r = first; r <= last; ++r)
+            for (int64_t c = 0; c < columns; ++c) {
+                const auto i = size_t(r * columns + c);
+                if (!tile.valid[i]) continue;
+                const auto& p = tile.points[i];
+                if (!box) box = std::array<double, 6>{p[0], p[1], p[2], p[0], p[1], p[2]};
+                else for (int k = 0; k < 3; ++k) {
+                    (*box)[k] = std::min((*box)[k], double(p[k]));
+                    (*box)[k + 3] = std::max((*box)[k + 3], double(p[k]));
+                }
+            }
+        tile.bands.push_back(box);
+    }
+}
+
+std::shared_ptr<const detail::SurfaceTile> detail::surfaceTile(SurfaceTileCache* cache, const std::string& revision,
+                                                               GeometryReader& reader, int64_t row, int64_t column,
+                                                               int64_t rows, int64_t columns)
+{
+    if (cache)
+        if (auto tile = cache->find(revision, row, column, rows, columns)) return tile;
+    auto tile = std::make_shared<const SurfaceTile>(surfaceTile(reader, row, column, rows, columns));
+    if (cache) cache->insert(revision, row, column, rows, columns, tile);
     return tile;
 }
 

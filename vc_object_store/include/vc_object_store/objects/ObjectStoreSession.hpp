@@ -232,6 +232,9 @@ public:
     // Drop a draft (e.g. after committing it, or abandoning the edit). No-op without one.
     void clearDraft(const std::string& objectUuid);
     bool hasDraft(const std::string& objectUuid) const;
+    // Changes with every set or update of the object's draft (0 without one),
+    // so a reader can keep what it cut from a draft until the draft changes.
+    uint64_t draftRevision(const std::string& objectUuid) const;
     // Files that belong to an object but are not geometry (fitted models, mesh
     // exports): <store>.artifacts/<object uuid>/, created unless `create` is
     // false (looking for a file there). A hosted replica uses the directory
@@ -287,6 +290,7 @@ private:
     using Drafts = std::map<std::string, std::shared_ptr<const detail::SurfaceDraft>>;
     // Guarded by mutex_; queries take a snapshot.
     Drafts drafts_;
+    uint64_t draftRevision_ = 0;
     Drafts drafts() const;
     void draftChanged(const std::string& objectUuid, const std::optional<AttachmentIdentity>&);
 };

@@ -58,6 +58,7 @@ private:
     std::vector<std::pair<size_t, size_t>> segments_;
     std::vector<Point> world_;
     std::vector<double> distance_;
+    std::vector<uint8_t> cellRows_;
 };
 
 template <class Piece> void SurfaceCut::pieces(Piece&& piece) const

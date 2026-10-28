@@ -89,16 +89,31 @@ uint64_t SurfaceCut::add(const SurfaceTile& tile, int64_t row0, int64_t col0, in
     world_.resize(tile.points.size());
     distance_.resize(world_.size());
     const auto& usable = tile.valid;
+    // Cell rows of the bands the plane can reach; a cell elsewhere has all
+    // its vertices on one side. Only their vertices are placed.
+    const int64_t band = SurfaceTile::bandCells;
+    cellRows_.assign(size_t(std::max<int64_t>(rows - 1, 0)), 0);
+    bool reached = false;
+    for (int64_t b = 0; b * band + 1 < rows; ++b) {
+        if (size_t(b) < tile.bands.size() && (!tile.bands[size_t(b)] || !reaches(*tile.bands[size_t(b)]))) continue;
+        reached = true;
+        for (int64_t r = b * band; r < std::min((b + 1) * band, rows - 1); ++r) cellRows_[size_t(r)] = 1;
+    }
+    if (!reached) return tests;
     // Only usable vertices take part in a cell; a region whose usable
     // vertices all lie on one side of the plane has no crossing cell.
     bool below = false, above = false;
-    for (size_t i = 0; i < world_.size(); ++i) {
-        if (!usable[i]) continue;
-        const auto& q = tile.points[i];
-        world_[i] = {q[0], q[1], q[2]};
-        if (toTarget_) world_[i] = toTarget_->apply(world_[i]);
-        distance_[i] = normalDistance(view_, world_[i]) - planeOffset_;
-        (distance_[i] >= 0 ? above : below) = true;
+    for (int64_t r = 0; r < rows; ++r) {
+        if (!((r < rows - 1 && cellRows_[size_t(r)]) || (r > 0 && cellRows_[size_t(r - 1)]))) continue;
+        for (int64_t c = 0; c < cols; ++c) {
+            const auto i = size_t(r * cols + c);
+            if (!usable[i]) continue;
+            const auto& q = tile.points[i];
+            world_[i] = {q[0], q[1], q[2]};
+            if (toTarget_) world_[i] = toTarget_->apply(world_[i]);
+            distance_[i] = normalDistance(view_, world_[i]) - planeOffset_;
+            (distance_[i] >= 0 ? above : below) = true;
+        }
     }
     if (!above || !below) return tests;
     auto global = [&](int64_t r, int64_t c) { return (row0 + r) * columns_ + col0 + c; };
@@ -116,7 +131,7 @@ uint64_t SurfaceCut::add(const SurfaceTile& tile, int64_t row0, int64_t col0, in
         return slot;
     };
     for (int64_t r = 0; r + 1 < rows; ++r)
-        for (int64_t c = 0; c + 1 < cols; ++c) {
+        for (int64_t c = 0; r + 1 < rows && cellRows_[size_t(r)] && c + 1 < cols; ++c) {
             const std::array<int64_t, 4> v{r * cols + c, r * cols + c + 1, (r + 1) * cols + c + 1, (r + 1) * cols + c};
             if (!usable[v[0]] || !usable[v[1]] || !usable[v[2]] || !usable[v[3]]) continue;
             const bool side0 = distance_[v[0]] >= 0;

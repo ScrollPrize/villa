@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/SurfaceTileCache.hpp"
 #include "vc_object_store/objects/VolumeTransforms.hpp"
 
 // SQLite object database with immutable geometry and relationship metadata.
@@ -177,6 +178,9 @@ struct OpenOptions {
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
+    // Decoded surface tiles shared by all connections (and by other stores
+    // given the same cache); none: every read decodes its tiles.
+    std::shared_ptr<SurfaceTileCache> surfaceTiles;
     // An edit whose sparse delta would exceed this many raw bytes is published
     // as a full revision instead (unchanged chunks are shared by hash). Capped
     // at 256 MiB, the largest delta read back.

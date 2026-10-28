@@ -220,7 +220,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         for (const auto& [row0, col0, rows, cols, box] : tilesOf(id)) {
             requestWork(&RegionStats::candidateVisits);
             if (rows < 2 || cols < 2 || !cut.reaches(box)) continue;
-            result.stats.segmentTests += cut.add(surfaceTile(reader, row0, col0, rows, cols), row0, col0, rows, cols);
+            const auto tile = surfaceTile(impl_->options.surfaceTiles.get(), revision, reader, row0, col0, rows, cols);
+            result.stats.segmentTests += cut.add(*tile, row0, col0, rows, cols);
         }
         bool hit = false;
         cut.pieces([&](int64_t segment, bool continues, const auto& start, const auto& end) {

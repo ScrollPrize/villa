@@ -435,8 +435,9 @@ void ObjectStoreSession::setDraft(const std::string& objectUuid, const vc::geome
                                   const CoordinateJson& coordinates, const std::optional<AttachmentIdentity>& attachment)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
-    auto draft = detail::makeSurfaceDraft(surface, coordinates, attachment);
+    auto draft = std::const_pointer_cast<detail::SurfaceDraft>(detail::makeSurfaceDraft(surface, coordinates, attachment));
     std::lock_guard lock(mutex_);
+    draft->revision = ++draftRevision_;
     drafts_[uuid] = std::move(draft);
     draftChanged(uuid, attachment);
 }
@@ -454,11 +455,13 @@ void ObjectStoreSession::updateDraft(const std::string& objectUuid, int64_t row,
         current = found->second;
     }
     // Edits of one draft come from its editor, one at a time; build outside the lock.
-    auto edited = detail::editSurfaceDraft(*current, row, column, rows, columns, points, validity);
+    auto edited = std::const_pointer_cast<detail::SurfaceDraft>(
+        detail::editSurfaceDraft(*current, row, column, rows, columns, points, validity));
     std::lock_guard lock(mutex_);
     const auto found = drafts_.find(uuid);
     if (found == drafts_.end() || found->second != current)
         throw std::logic_error("surface draft " + uuid + " changed during an edit");
+    edited->revision = ++draftRevision_;
     found->second = std::move(edited);
     draftChanged(uuid, current->attachment);
 }
@@ -476,8 +479,14 @@ void ObjectStoreSession::clearDraft(const std::string& objectUuid)
 
 bool ObjectStoreSession::hasDraft(const std::string& objectUuid) const
 {
+    return draftRevision(objectUuid) != 0;
+}
+
+uint64_t ObjectStoreSession::draftRevision(const std::string& objectUuid) const
+{
     std::lock_guard lock(mutex_);
-    return drafts_.contains(util::canonicalUuid(objectUuid));
+    const auto found = drafts_.find(util::canonicalUuid(objectUuid));
+    return found == drafts_.end() ? 0 : found->second->revision;
 }
 
 namespace {

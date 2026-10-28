@@ -81,7 +81,8 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
         }
         const auto row0 = tiles.i64(2), col0 = tiles.i64(3), rows = tiles.i64(4), cols = tiles.i64(5);
         if (rows < 2 || cols < 2) continue;
-        nearest.add(surfaceTile(**reader, row0, col0, rows, cols), row0, col0, rows, cols);
+        nearest.add(*surfaceTile(impl_->options.surfaceTiles.get(), objectRevision, **reader, row0, col0, rows, cols),
+                    row0, col0, rows, cols);
     }
     finish();
     std::sort(result.begin(), result.end(), before);

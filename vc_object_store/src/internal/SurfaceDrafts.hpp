@@ -24,6 +24,7 @@ struct SurfaceDraft {
         std::shared_ptr<const TileData> data;
     };
     int64_t rows = 0, columns = 0;
+    uint64_t revision = 0;  // session-unique, set when it is installed
     CoordinateJson coordinates;
     std::optional<AttachmentIdentity> attachment;
     std::vector<Tile> tiles;

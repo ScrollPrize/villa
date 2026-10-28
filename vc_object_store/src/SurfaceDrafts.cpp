@@ -36,6 +36,7 @@ void finish(SurfaceDraft::Tile& tile, SurfaceDraft::TileData& data)
             (*tile.bounds)[axis + 3] = std::max((*tile.bounds)[axis + 3], double(p[axis]));
         }
     }
+    boundSurfaceTileBands(t, tile.rect.columns);
 }
 
 void reindex(SurfaceDraft& draft)
