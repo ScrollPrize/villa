@@ -2437,7 +2437,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _sessionRunnable = runnable;
     // Initialize is available without a session. Rebuild otherwise needs an
     // idle or failed session.
-    _load->setEnabled(_connected && _service->ownsSessionLease()
+    _load->setEnabled(_connected && _service->ownsSessionLease() && !updatingInputs
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
     const auto& binding = _service->storeBinding();

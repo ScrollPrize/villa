@@ -764,11 +764,15 @@ void SpiralServiceManager::prepareSessionRequest(QJsonObject request,
 
 void SpiralServiceManager::updateFitInputs(QJsonObject request)
 {
+    // A second request while one runs is dropped, not reported as that
+    // update's outcome: inputUpdateFinished belongs to the running one.
+    if (_inputUpdateActive) {
+        emit logMessage(tr("An input update is already in progress"));
+        return;
+    }
     InputUpdate refused;
     const auto session = _storeSession.lock();
-    if (_inputUpdateActive)
-        refused.error = tr("An input update is already in progress");
-    else if (!isReady() || !_leaseOwner)
+    if (!isReady() || !_leaseOwner)
         refused.error = tr("Connect to the Spiral service and own its session lease first");
     else if (!_storeBinding.hosted())
         refused.error = tr("The Spiral service is not bound to a hub: rebuild with current inputs instead");

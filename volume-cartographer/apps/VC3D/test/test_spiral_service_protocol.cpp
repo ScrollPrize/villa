@@ -255,7 +255,13 @@ private:
         QTRY_COMPARE_WITH_TIMEOUT(sessions.count(), 1, 10000);
         edit(3);
         manager.updateFitInputs(request);
+        // A second request while it runs is dropped: it reports nothing, so
+        // the running update's outcome is the only one.
+        manager.updateFitInputs(request);
+        QCOMPARE(updates.count(), 1);
         QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 2, 60000);
+        QTest::qWait(300);
+        QCOMPARE(updates.count(), 2);
         update = updates.at(1).at(0).value<SpiralServiceManager::InputUpdate>();
         QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
         QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 2, 30000);
