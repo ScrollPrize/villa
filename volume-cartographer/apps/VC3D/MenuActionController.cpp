@@ -39,6 +39,7 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/objects/GeometryIngest.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -53,6 +54,9 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDialog>
+#include <QFormLayout>
+#include <QComboBox>
+#include <QCheckBox>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QEventLoop>
@@ -243,6 +247,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _objectStoreMenu->addMenu(_recentObjectStoreMenu);
     refreshRecentObjectStoreMenu();
     _objectStoreMenu->addSeparator();
+    _objectStoreMenu->addAction(QObject::tr("Import from Folder..."), this, &MenuActionController::importIntoObjectStore);
     auto* syncHub = _objectStoreMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
         if (const auto attachment = qWindow->_state->objectStoreAttachment())
             qWindow->_state->objectStoreSession()->syncHub(*attachment);
@@ -2280,6 +2285,143 @@ void MenuActionController::cloneHostedStore()
             return QString();
         } catch (const std::exception& error) {
             return QString::fromUtf8(error.what());
+        }
+    }));
+}
+
+void MenuActionController::importIntoObjectStore()
+{
+    if (!requireObjectStore(QObject::tr("Importing surfaces or fibers"))) return;
+    auto& state = *_window->_state;
+    const auto attachment = state.objectStoreAttachment();
+    const auto session = state.objectStoreSession();
+    if (!attachment || !session->writable(*attachment)) {
+        QMessageBox::warning(_window, QObject::tr("Import from Folder"),
+            QObject::tr("The attached object store is read-only."));
+        return;
+    }
+    const auto volume = state.currentVolume();
+
+    QDialog dialog(_window);
+    dialog.setWindowTitle(QObject::tr("Import from Folder"));
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* form = new QFormLayout;
+    auto* kind = new QComboBox(&dialog);
+    kind->addItem(QObject::tr("tifxyz surfaces"), QStringLiteral("surface"));
+    kind->addItem(QObject::tr("Fibers (vc3d_fiber JSON)"), QStringLiteral("fiber"));
+    form->addRow(QObject::tr("Import:"), kind);
+    auto* row = new QHBoxLayout;
+    auto* folder = new QLineEdit(&dialog);
+    folder->setMinimumWidth(420);
+    folder->setPlaceholderText(QObject::tr("A folder of tifxyz directories, or one tifxyz directory"));
+    auto* browse = new QPushButton(QObject::tr("Browse..."), &dialog);
+    QObject::connect(browse, &QPushButton::clicked, &dialog, [&] {
+        const auto start = folder->text().isEmpty() && state.vpkg()
+            ? QString::fromStdString(state.vpkg()->getVolpkgDirectory()) : folder->text();
+        const auto chosen = QFileDialog::getExistingDirectory(&dialog, QObject::tr("Folder to Import"), start);
+        if (!chosen.isEmpty()) folder->setText(chosen);
+    });
+    QObject::connect(kind, &QComboBox::currentIndexChanged, &dialog, [kind, folder] {
+        folder->setPlaceholderText(kind->currentData().toString() == QStringLiteral("surface")
+            ? QObject::tr("A folder of tifxyz directories, or one tifxyz directory")
+            : QObject::tr("A folder of fiber JSON files"));
+    });
+    row->addWidget(folder);
+    row->addWidget(browse);
+    form->addRow(QObject::tr("Folder:"), row);
+    // The folder's name until the user types tags of their own.
+    auto* tags = new QLineEdit(&dialog);
+    tags->setPlaceholderText(QObject::tr("comma-separated; added to every imported object"));
+    auto tagsEdited = std::make_shared<bool>(false);
+    QObject::connect(tags, &QLineEdit::textEdited, &dialog, [tagsEdited] { *tagsEdited = true; });
+    QObject::connect(folder, &QLineEdit::textChanged, &dialog, [tags, tagsEdited](const QString& text) {
+        if (!*tagsEdited) tags->setText(QFileInfo(QDir::cleanPath(text.trimmed())).fileName());
+    });
+    form->addRow(QObject::tr("Tags:"), tags);
+    auto* bind = new QCheckBox(volume
+        ? QObject::tr("Bind to the active volume (%1)").arg(QString::fromStdString(volume->id()))
+        : QObject::tr("Bind to the active volume (none open: imports stay unbound)"), &dialog);
+    bind->setEnabled(volume != nullptr);
+    bind->setChecked(volume != nullptr);
+    auto* scale = new QLineEdit(&dialog);
+    scale->setPlaceholderText(QObject::tr("stored units per active-volume voxel; no scale is assumed"));
+    scale->setEnabled(bind->isChecked());
+    QObject::connect(bind, &QCheckBox::toggled, scale, &QLineEdit::setEnabled);
+    form->addRow(bind);
+    form->addRow(QObject::tr("Scale:"), scale);
+    layout->addLayout(form);
+    auto* note = new QLabel(QObject::tr("Sources declaring their own coordinates keep them; a conflict with "
+                                        "this binding is reported. Objects already in the store are reported, "
+                                        "not re-imported."), &dialog);
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        bool valid = false;
+        const double value = scale->text().toDouble(&valid);
+        if (!QFileInfo(folder->text().trimmed()).isDir())
+            QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Choose an existing folder."));
+        else if (bind->isChecked() && (!valid || !(value > 0) || !std::isfinite(value)))
+            QMessageBox::warning(&dialog, dialog.windowTitle(), QObject::tr("Enter a positive finite coordinate scale."));
+        else dialog.accept();
+    });
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    const auto kindName = kind->currentData().toString().toStdString();
+    const std::filesystem::path source = folder->text().trimmed().toStdString();
+    const auto coordinates = bind->isChecked()
+        ? vc::objects::volumeCoordinates(volume->id(), scale->text().toDouble()).dump() : std::string("{}");
+    std::vector<std::string> tagNames;
+    for (const auto& tag : tags->text().split(QLatin1Char(','), Qt::SkipEmptyParts))
+        if (const auto name = tag.trimmed(); !name.isEmpty()) tagNames.push_back(name.toStdString());
+
+    auto* progressDialog = new QProgressDialog(QObject::tr("Importing %1...").arg(folder->text().trimmed()), {}, 0, 0, _window);
+    progressDialog->setWindowTitle(QObject::tr("Import from Folder"));
+    progressDialog->setWindowModality(Qt::WindowModal);
+    progressDialog->setMinimumDuration(0);
+    progressDialog->setValue(0);
+    QPointer<QProgressDialog> guardedDialog(progressDialog);
+    auto progress = [guardedDialog](const vc::objects::util::ProgressUpdate& event) {
+        if (!event.total) return;
+        const int completed = int(event.completed), total = int(event.total);
+        const auto detail = QString::fromUtf8(event.detail.data(), qsizetype(event.detail.size()));
+        QMetaObject::invokeMethod(guardedDialog, [guardedDialog, completed, total, detail] {
+            if (!guardedDialog) return;
+            guardedDialog->setMaximum(total);
+            guardedDialog->setValue(completed);
+            if (!detail.isEmpty()) guardedDialog->setLabelText(QObject::tr("Importing %1 (%2 of %3)").arg(detail).arg(completed + 1).arg(total));
+        }, Qt::QueuedConnection);
+    };
+    using Report = vc::objects::GeometryIngestReport;
+    auto* watcher = new QFutureWatcher<Report>(this);
+    connect(watcher, &QFutureWatcher<Report>::finished, this, [this, watcher, progressDialog, kindName] {
+        const auto report = watcher->result();
+        watcher->deleteLater();
+        progressDialog->close();
+        progressDialog->deleteLater();
+        const auto what = kindName == "surface" ? QObject::tr("surface(s)") : QObject::tr("fiber(s)");
+        const auto summary = QObject::tr("Imported %1 %2.").arg(report.ingested).arg(what);
+        if (report.problems.empty()) {
+            _window->showStatusBarMessage(summary, 5000);
+            return;
+        }
+        QStringList problems;
+        for (const auto& problem : report.problems) problems << QString::fromStdString(problem);
+        QMessageBox box(QMessageBox::Warning, QObject::tr("Import from Folder"),
+            summary + QLatin1Char(' ') + QObject::tr("%n item(s) could not be imported.", nullptr, int(problems.size())),
+            QMessageBox::Ok, _window);
+        box.setDetailedText(problems.join(QLatin1Char('\n')));
+        box.exec();
+    });
+    watcher->setFuture(QtConcurrent::run([session, attachment = *attachment, kindName, source, progress, coordinates, tagNames]() {
+        try {
+            return vc::objects::ingestGeometrySource(*session, attachment, kindName, source, progress, coordinates, tagNames);
+        } catch (const std::exception& error) {
+            Report report;
+            report.problems.push_back(error.what());
+            return report;
         }
     }));
 }

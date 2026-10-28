@@ -200,6 +200,14 @@ public:
     // revision here), e.g. "Reset to Open Data Version"; its relationships are
     // kept as recorded.
     void restoreImported(const AttachmentIdentity&, const std::string& objectUuid);
+    // A long job on a writable attachment, e.g. ingestion (objects/GeometryIngest.hpp),
+    // run on the caller's thread. It reads the store outside any transaction and
+    // writes only through `commit`: each call is one transaction, serialized with
+    // the attachment's actions and unchecked, so the job guards its own writes.
+    // `cancelled` is set when the attachment detaches, which waits for the job.
+    using Commit = std::function<void(const Action&)>;
+    using Job = std::function<void(ObjectStore&, const Commit& commit, const std::atomic_bool& cancelled)>;
+    void writeJob(const AttachmentIdentity&, const Job&);
     // Queries across attachments in `order`: an object (by UUID) comes from the
     // first attachment holding it, so an imported copy hides the catalog one.
     std::vector<AttachedRecord> selectObjects(const std::vector<AttachmentIdentity>& order, const ObjectSelection&);

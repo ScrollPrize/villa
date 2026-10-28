@@ -9,6 +9,7 @@ try {
     std::vector<std::pair<std::string, std::filesystem::path>> sources;
     struct Channel { std::string uuid, name; std::filesystem::path image; };
     std::vector<Channel> channels;
+    std::vector<std::string> tags;
     bool showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -27,16 +28,18 @@ try {
             Channel channel; channel.uuid = next(); channel.name = next(); channel.image = next();
             channels.push_back(std::move(channel));
         }
+        else if (arg == "--tag") tags.push_back(next());
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
-                "  --surface DIR               import a new tifxyz surface\n"
+                "  --surface DIR               import a new tifxyz surface, or a folder of them\n"
                 "  --fiber PATH              import new fibers from JSON or a directory\n"
                 "  --point-collections FILE  import new collections from a JSON\n"
                 "  --umbilicus FILE          import a new umbilicus from a vc_umbilicus JSON\n"
                 "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"
                 "  --surface-channel UUID NAME TIFF\n"
                 "                            add or replace a channel of a stored surface\n"
+                "  --tag NAME                tag every imported object (repeatable)\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
@@ -56,7 +59,7 @@ try {
     };
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);
-        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback());
+        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), "{}", tags);
         progress.finish(); print(report);
     }
     for (const auto& channel : channels) {

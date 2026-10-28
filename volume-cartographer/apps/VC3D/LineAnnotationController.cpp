@@ -4275,25 +4275,13 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
         return false;
     }
     try {
-        using namespace vc::objects;
-        const auto connection = _state->objectStoreSession();
-        const auto attachment = *_state->objectStoreAttachment();
-        std::vector<std::string> existing;
-        connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& object : db.objectsByKind(txn, "fiber")) existing.push_back(object.uuid);
-        });
-        auto batch = prepareGeometrySource("fiber", importPath, existing);
-        // Pin only the existing fibers the imported ones link to, so unrelated
-        // edits in the meantime do not fail the import.
-        RevisionSelection expected;
-        connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& uuid : fiberBatchEndpoints(batch))
-                if (const auto head = db.currentObjectRevision(txn, uuid)) expected[uuid] = head->uuid;
-        });
-        for (const auto& source : batch) expected[source.object.uuid] = std::nullopt;
-        const auto count = batch.size();
-        connection->act(attachment, expected, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, std::move(batch)); });
-        if (importedCount) *importedCount = int(count);
+        const auto report = vc::objects::ingestGeometrySource(*_state->objectStoreSession(),
+                                                              *_state->objectStoreAttachment(), "fiber", importPath);
+        if (!report.problems.empty()) {
+            if (errorMessage) *errorMessage = tr("Could not import fibers: %1").arg(QString::fromStdString(report.problems.front()));
+            return false;
+        }
+        if (importedCount) *importedCount = int(report.ingested);
         return true;
     } catch (const std::exception& ex) {
         if (errorMessage) *errorMessage = tr("Could not import fibers: %1").arg(QString::fromUtf8(ex.what()));

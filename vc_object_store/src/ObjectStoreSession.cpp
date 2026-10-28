@@ -246,6 +246,27 @@ void ObjectStoreSession::restoreImported(const AttachmentIdentity& identity, con
     editCurrent(identity, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, history.front().uuid); });
 }
 
+void ObjectStoreSession::writeJob(const AttachmentIdentity& identity, const Job& job)
+{
+    auto attachment = acquire(identity, true);
+    bool committed = false;
+    try {
+        job(attachment->store, [&](const Action& action) {
+            std::lock_guard writer(attachment->writer);
+            auto txn = attachment->store.write();
+            action(attachment->store, txn);
+            txn.commit();
+            committed = true;
+        }, attachment->cancelled);
+    } catch (...) {
+        if (committed && attachment->hub) attachment->hub->requestSync(true);
+        release(*attachment, true);
+        throw;
+    }
+    if (committed && attachment->hub) attachment->hub->requestSync(true);
+    release(*attachment, true);
+}
+
 void ObjectStoreSession::editCurrent(const AttachmentIdentity& identity, const std::vector<std::string>& objectUuids,
                                      const std::function<void(ObjectStore&, WriteTxn&, const std::string&)>& edit)
 {

@@ -59,6 +59,9 @@ public:
     // Empty means cancelled.
     QString objectStoreAuthor();
     void cloneHostedStore();
+    // Collects a kind, a source folder and an optional volume binding, then ingests
+    // it into the attached store in the background (vc::objects::ingestGeometrySource).
+    void importIntoObjectStore();
     void detachObjectStore();
     // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {

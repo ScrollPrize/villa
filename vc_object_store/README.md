@@ -69,6 +69,13 @@ build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --fiber /data/fib
 
 VC3D can also create an empty store (File → Object Store → New Object Store...).
 
+`--surface` takes one tifxyz directory or a folder of them; each surface in a
+folder commits on its own, so a broken one is reported without stopping the
+rest. VC3D runs the same ingestion into its attached store from File → Object
+Store → Import from Folder..., optionally binding the imports to the active
+volume. `--tag NAME` (repeatable; in VC3D the Tags field, which defaults to the
+folder's name) adds tags to every imported object, alongside any the source declares.
+
 ```sh
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --surface /data/surface
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" \
