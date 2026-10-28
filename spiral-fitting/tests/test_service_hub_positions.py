@@ -109,6 +109,19 @@ def test_the_binding_clones_and_checks_its_hub(hub, tmp_path):
                                          str(tmp_path / 'absent-hub.vcobj'))
 
 
+def test_hub_addresses_compare_as_the_store_records_them(tmp_path):
+    # The store records a remote hub in canonical sftp:// form: an ssh://
+    # address, or an unencoded path, must compare equal to it on restart.
+    recorded = 'sftp://host/scrolls/a%20b/hub.vcobj'
+    for given in ('ssh://host/scrolls/a b/hub.vcobj', 'sftp://host/scrolls/a b/hub.vcobj',
+                  recorded):
+        assert spiral_service._canonical_hub(vos, given) == recorded
+    (tmp_path / 'real').mkdir()
+    (tmp_path / 'link').symlink_to(tmp_path / 'real')
+    assert spiral_service._canonical_hub(vos, tmp_path / 'link' / 'hub.vcobj') == \
+        str((tmp_path / 'real' / 'hub.vcobj').resolve())
+
+
 def test_initialize_links_and_pins_the_requested_position(state, hub, device_stubs):
     advertised = state.dataset()
     assert advertised['capabilities']['input_positions'] is True

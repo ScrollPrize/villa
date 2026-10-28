@@ -278,12 +278,13 @@ def default_object_store_author():
     return f"spiral-service@{socket.gethostname()}"
 
 
-def _canonical_hub(address):
-    """A hub address as the store records it: an sftp:// or ssh:// URL as
-    given, a path made absolute."""
-    if "://" in str(address):
-        return str(address)
-    return str(Path(address).expanduser().resolve(strict=False))
+def _canonical_hub(vos, address):
+    """A hub address as the store records it (vos.hub_address: a remote URL
+    in its canonical sftp:// form, a path made absolute), local paths
+    resolved first so a symlinked directory names one hub."""
+    if "://" not in str(address):
+        address = Path(address).expanduser().resolve(strict=False)
+    return vos.hub_address(str(address))
 
 
 _REMOTE_HUB_HINT = (
@@ -318,7 +319,7 @@ def bind_object_store(path, author=None, hub=None):
     if hub is not None and not resolved.exists():
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            vos.hub_clone(_canonical_hub(hub), str(resolved), author)
+            vos.hub_clone(_canonical_hub(vos, hub), str(resolved), author)
         except Exception as exc:
             raise ObjectStoreBindingError(
                 f"cannot clone the hub {hub} to {resolved}: {exc}"
@@ -338,7 +339,7 @@ def bind_object_store(path, author=None, hub=None):
                 f"{resolved} exists and is not a replica of the hub {hub}; "
                 "name a new replica path, or omit --object-store-hub")
         return ObjectStoreBinding(str(resolved), str(uuid), author)
-    if hub is not None and _canonical_hub(hub) != status["hub"]:
+    if hub is not None and _canonical_hub(vos, hub) != status["hub"]:
         raise ObjectStoreBindingError(
             f"{resolved} replicates the hub {status['hub']}, not {hub}")
     remote = "://" in status["hub"]
