@@ -1173,6 +1173,34 @@ Review fixes (2026-10-28, after the record above):
 - `d1ce39606` VC3D saves pin the revision their edit started from (they
   pinned the current revision after the lease's pull).
 
+Second review round (2026-10-28):
+
+- Provenance: `064d55cdd` a preview fitted to replaced inputs stays indexed
+  but is not shown as current (status `preview_input_position`), and the
+  update records its position in the live session request (a model-only
+  rebuild reported the old one); `f5a9b8acd`/`d6dfd3fa5` overlap pairs are
+  materialized from the snapshot's edge, frames and geometry revisions
+  (`overlap_correspondences_at`), not the replica's current state;
+  `3223ce27e` the input manifest is keyed by digest and input generation;
+  `ae41f76b7` discovery reports why the replica's position is unreadable
+  (the advertised position stays the replica's last pull, as documented).
+- Robustness: `e704a11cf` a push whose retry fails is a PositionError;
+  `5feede971` coordinator prepare timeouts and publish failures are
+  InputUpdateFailed; `0087f237f` refusal codes, theta exclusions judged
+  afresh per update, startup drops unpublished links and refuses other
+  edits on the service replica; `313341723` a position needs only the
+  geometry a reader reads (`requireHubGeometry`); `48f140e6d` an indexed hub
+  (and its replicas) has schema version 18, which pre-index binaries refuse;
+  `5e44a783a`/`70eb6cf15` PushHold limits documented, and VC3D ends an update
+  whose attachment changes; `9f403f732` a new collection saved twice
+  replaces its object; `2691f02e4` VC3D saves drawings off the GUI thread;
+  `4101fb6b8` the relink note after a lost publication response.
+- Not changed: lost-push recovery still matches pushed records by value (a
+  push token would need a hub_publications column; the relink is correct and
+  only its note was wrong); Host Object Store Locally relies on the
+  synchronous service stop on detach plus its -wal/-shm check.
+- The 2b driver after this round: all steps as above, peak +35.9 MB.
+
 Acceptance (Linux, RTX 3090 shared with another job; stage 0 acceptance store
 copied as a hub; dataset dir with spiral-scroll.json, umbilicus.json,
 lasagna_inputs, outer_shell, fiber_directions.npz; z 8900–9300):
