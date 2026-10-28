@@ -247,3 +247,87 @@ def test_the_preview_index_records_the_position(tmp_path):
     index.record('state', manifest_path=tmp_path / 'preview.json', session_id='s',
                  generation=1, input_digest='digest', input_position=position)
     assert index._load()['previews']['state']['input_position'] == position
+
+
+# ---------------------------------------------------------------------------
+# Stage 2b step 15: a resident fit's inputs replaced at a new position
+# ---------------------------------------------------------------------------
+
+def _pinned_at_new_position(state, hub, change):
+    """Edit through the editor replica, then link and pin a position on the
+    service replica as an update would. Returns it."""
+    change()
+    config = state.session._context.config
+    with ObjectStore.open(state.object_store.path, author='svc') as store:
+        prepared = osi.prepare_position(store, config, osi.request_from_config(config),
+                                        log=lambda line: None)
+    return prepared.position.sequence
+
+
+def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stubs, monkeypatch):
+    import numpy as np
+    import fit_spiral
+    from object_store_fixture import put_patch
+    state.initialize(REQUEST)
+    settle(state)
+    context = state.session._context
+    before = {name: getattr(context, name) for name in context._INPUT_HOST_ATTRIBUTES}
+    patches = context.num_verified_patches
+
+    def add_patch():
+        with ObjectStore.open(hub['editor'], author='editor') as db:
+            db.hub_sync(pull=True, push=False)
+            rows, cols = np.mgrid[:8, :8]
+            put_patch(db, np.stack([4.0 + rows * 4, np.full(rows.shape, 120.0), 40.0 + cols * 4], axis=-1),
+                      (0.25, 0.25), name='added')
+            db.hub_sync(pull=True, push=True)
+    position = _pinned_at_new_position(state, hub, add_patch)
+    inputs = context.load_replacement_inputs(position)
+    rng = np.random.get_state()
+    candidate = context.prepare_input_replacement(inputs)
+    # Nothing resident changed, and training draws continue as before.
+    assert all(getattr(context, name) is value for name, value in before.items())
+    assert np.array_equal(np.random.get_state()[1], rng[1])
+    assert candidate.num_verified_patches == patches + 1
+    assert candidate.patch_atlas is not context.patch_atlas
+
+    # The device half (theta topology needs the model the stubs leave out).
+    monkeypatch.setattr(fit_spiral.FitContext, '_build_theta_crossing_map', lambda self: [])
+    context.replace_inputs(candidate)
+    assert context.num_verified_patches == patches + 1
+    assert context.object_store_inputs is inputs
+    assert context.config['object_store_input_position'] == position
+    assert context.patch_atlas.zyxs_flat is not None  # materialized
+    import json
+    with open(Path(context.out_path) / 'object_store_inputs.json') as stream:
+        assert json.load(stream)['digest'] == inputs.digest
+
+
+def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device_stubs):
+    import copy
+    import fit_spiral
+    state.initialize(REQUEST)
+    settle(state)
+    context = state.session._context
+    inputs = copy.copy(context.object_store_inputs)
+    inputs.manifest = {**inputs.manifest, 'volume_uuid': 'another-volume'}
+    with pytest.raises(fit_spiral.InputReplacementRefused, match='volume_uuid differs'):
+        context.prepare_input_replacement(inputs)
+    context.using_tracks = True
+    context.config.update({'track_exclusion_radius': 4.0})
+    with pytest.raises(fit_spiral.InputReplacementRefused, match='track exclusion'):
+        context.prepare_input_replacement(context.object_store_inputs)
+
+
+def test_a_failure_after_release_needs_recovery(state, hub, device_stubs, monkeypatch):
+    import fit_spiral
+    state.initialize(REQUEST)
+    settle(state)
+    context = state.session._context
+    candidate = context.prepare_input_replacement(context.object_store_inputs)
+
+    def fail(self, device=None):
+        raise MemoryError('CUDA out of memory')
+    monkeypatch.setattr(fit_spiral.PatchAtlas, 'materialize', fail)
+    with pytest.raises(fit_spiral.InputReplacementFailed, match='rebuild the fit or load a checkpoint'):
+        context.replace_inputs(candidate)

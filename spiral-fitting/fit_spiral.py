@@ -151,6 +151,16 @@ configure_torch_threads_from_env()
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
 
 
+class InputReplacementRefused(RuntimeError):
+    """An input update refused before any resident state was released: the
+    fit continues with the inputs it had."""
+
+
+class InputReplacementFailed(RuntimeError):
+    """An input update failed after resident input state was released: the
+    fit can no longer run, and needs an explicit rebuild or checkpoint load."""
+
+
 class CheckpointVerdict:
     """The result of one CPU-side checkpoint preflight.
 
@@ -3929,6 +3939,130 @@ class FitContext:
         self.resolve_output_path()
         self._write_object_store_manifest()
         return self.out_path
+
+    # ==========================================================================
+    # Input replacement: a resident fit's inputs at a new hub position
+    # ==========================================================================
+
+    # Everything derived from the object-store inputs on the host
+    # (load_host_inputs), which a replacement swaps as a whole. The model,
+    # optimiser, scheduler, iteration count and RNG streams are not here: an
+    # input update changes supervision, never trainable state.
+    _INPUT_HOST_ATTRIBUTES = (
+        'object_store_inputs', 'verified_patches', 'verified_patches_list',
+        'num_verified_patches', 'patch_sampling_probabilities', 'patch_atlas',
+        'trusted_geometry_tree', 'cross_patch_pcls', 'unattached_pcl_strips',
+        'unattached_strip_sampling_groups', 'resolved_links', 'link_components',
+        'unattached_components', 'unattached_component_groups',
+        'unattached_component_edges', 'pcl_sampling_strata',
+    )
+
+    def load_replacement_inputs(self, position):
+        """Every rank: read and materialize the inputs at hub ``position``
+        exactly as pinned (object_store_inputs.load_fit_inputs, which checks
+        that the ranks agree on their digest). Allocates host memory only."""
+        from object_store_inputs import load_fit_inputs
+        config = dict(self.config)
+        config['object_store_input_position'] = int(position)
+        cache = (os.path.join(self.cache_path, 'object_store_strips')
+                 if self.cache_path else None)
+        return load_fit_inputs(
+            config, lasagna=self._lasagna_normal_inputs(),
+            external_frames=self._external_input_frames(), dist=self.dist,
+            cache_directory=cache, log=self.input_log)
+
+    def prepare_input_replacement(self, inputs):
+        """Derive every input-dependent host structure for ``inputs``
+        (FitInputs at the candidate position) without touching the resident
+        fit: the point views, patch atlas (host side), sampling caches,
+        trusted geometry and DT samples, on a shallow copy of this context.
+        The host RNG streams are restored afterwards, so training draws as if
+        nothing had been prepared.
+
+        Raises InputReplacementRefused when the inputs cannot replace these
+        without changing more than supervision: another fit volume or
+        external frames (the model's frame), or track exclusion masks that
+        depend on the trusted geometry. Returns the candidate for
+        replace_inputs().
+        """
+        current = getattr(self, 'object_store_inputs', None)
+        if current is None or current.manifest is None:
+            raise InputReplacementRefused('this fit has no object-store inputs to replace')
+        problems = []
+        for key in ('volume_uuid', 'units', 'external_frames', 'materialization'):
+            if current.manifest.get(key) != inputs.manifest.get(key):
+                problems.append(f'{key} differs from the fit\'s ({current.manifest.get(key)!r}, '
+                                f'not {inputs.manifest.get(key)!r})')
+        if self.using_tracks and float(self.config['track_exclusion_radius']) > 0:
+            problems.append('track exclusion masks depend on the trusted geometry of the '
+                            'inputs (track_exclusion_radius > 0)')
+        if problems:
+            raise InputReplacementRefused(
+                'the inputs cannot replace this fit\'s; rebuild it instead: ' + '; '.join(problems))
+        numpy_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            candidate = copy.copy(self)
+            candidate.object_store_inputs = inputs
+            verified_patches = dict(inputs.patches)
+            candidate._derive_object_store_point_inputs(verified_patches, inputs)
+            patch_inputs = candidate._prepare_patch_inputs(
+                verified_patches, candidate.unattached_pcl_strips, using_tracks=self.using_tracks)
+            for name, value in patch_inputs.items():
+                setattr(candidate, name, value)
+            candidate.verified_patches = verified_patches
+            candidate._prepare_dt_target_samples(candidate.verified_patches_list)
+            return candidate
+        except InputReplacementRefused:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a refusal, with its reason
+            raise InputReplacementRefused(f'{type(exc).__name__}: {exc}') from exc
+        finally:
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+
+    def replace_inputs(self, candidate):
+        """Install a prepared candidate's inputs into the resident fit.
+
+        Destructive from its first line: the old inputs' device state (the
+        materialized patch atlas, the theta topology, DT target caches and
+        the strips' flat bundle) is released before the replacement's is
+        built, so the two never hold device memory together. The model,
+        optimiser, scheduler, iteration count and RNG streams are kept.
+        Any failure raises InputReplacementFailed: the fit is then unusable
+        until an explicit rebuild or checkpoint load.
+        """
+        try:
+            strips = getattr(self, 'unattached_pcl_strips', None)
+            if strips is not None and hasattr(strips, 'flat'):
+                strips.flat = None
+            self.patch_atlas = None
+            self.theta_crossing_map = None
+            if getattr(self, 'dt_target_cache_manager', None) is not None:
+                self.dt_target_cache_manager.reset()
+            gc.collect()
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+            elif self.device.type == 'mps':
+                torch.mps.empty_cache()
+            for name in self._INPUT_HOST_ATTRIBUTES:
+                setattr(self, name, getattr(candidate, name))
+            position = (self.object_store_inputs.manifest.get('position') or {}).get('sequence')
+            self.config.update({'object_store_input_position': position})
+            self.patch_atlas.materialize(self.device)
+            warnings = self._build_theta_crossing_map()
+            if getattr(self, 'dt_target_cache_manager', None) is not None:
+                self.dt_target_cache_manager.reset()
+            if hasattr(self, 'out_path'):
+                self._write_object_store_manifest()
+            return warnings
+        except Exception as exc:
+            raise InputReplacementFailed(
+                f'replacing the fit\'s inputs failed after their device state was released '
+                f'({type(exc).__name__}: {exc}); rebuild the fit or load a checkpoint') from exc
 
     def _write_object_store_manifest(self):
         """Record the frozen object-store inputs' manifest beside the run's
