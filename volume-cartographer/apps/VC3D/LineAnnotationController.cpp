@@ -143,6 +143,9 @@ struct LineAnnotationController::LineAnnotationSession {
     // boundary; optimizer/session geometry stays in canonical base voxels.
     double fiberBaseToVolumeScale = 1.0;
     std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
+    // The stored object's coordinate binding. Snapshots carry it so fibers
+    // derived from this one (split halves, a merge) keep its frame.
+    nlohmann::json coordinateIdentity = nlohmann::json::object();
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
@@ -4473,6 +4476,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberOptimizationMode = fiber.optimizationMode;
     session->modelOnly = fiber.modelOnly;
     session->coordinateBaseShapeZYX = coordinateBaseShapeZYX;
+    session->coordinateIdentity = fiber.coordinateIdentity;
     session->fiberBaseToVolumeScale = fiberBaseToVolumeScale;
     session->branches = fiber.branches;
     session->disableInitialGeneratedHoverFollow =
@@ -17678,6 +17682,7 @@ LineAnnotationController::makeIntersectionLineSession(
     // fiber's coordinate_base_shape_zyx. Geometry here stays in base
     // coordinates; the display transform is applied only when building views.
     session->coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
+    session->coordinateIdentity = fiber.coordinateIdentity;
     session->branches = fiber.branches;
     session->focusedLinePosition = std::clamp(
         focusLinePosition,
@@ -17800,6 +17805,7 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     registerFiberId(fiber.uuid, fiber.id);
     fiber.storePin = session.storePin;
     fiber.coordinateBaseShapeZYX = session.coordinateBaseShapeZYX;
+    fiber.coordinateIdentity = session.coordinateIdentity;
     if (!fiber.coordinateBaseShapeZYX && (!session.storePin || session.storePin->objectRevision.empty())) {
         if (!approximatelyEqual(session.fiberBaseToVolumeScale, 1.0))
             throw std::runtime_error("Cannot save a scaled fiber without its coordinate base shape");
@@ -18177,6 +18183,7 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
         const StoredFiber* saved = &snapshot->fiber;
         if (session.watcher && session.storePin != saved->storePin) session.solveQueue.noteSessionMutated();
         session.storePin = saved->storePin;
+        session.coordinateIdentity = saved->coordinateIdentity;
         const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
         for (size_t i = 0; i < ordering.size(); ++i)
             if (ordering[i] >= 0 && size_t(ordering[i]) < saved->controlPoints.size() &&
