@@ -377,7 +377,12 @@ std::string hubAddress(const std::filesystem::path& hub)
     return isRemotePath(hub) ? canonicalRemotePath(hub) : std::filesystem::absolute(hub).string();
 }
 
-HubSyncReport hubPull(ObjectStore& replica)
+namespace {
+// A pull; records in `discard` (this replica's unpushed changes or
+// conflicts) are replaced by the hub's like any record changed there, in the
+// same transaction as everything else the hub changed since the last pull,
+// so they arrive with the endpoints and geometry they are bound to.
+HubSyncReport pullDiscarding(ObjectStore& replica, const std::set<std::string>& discard)
 {
     DependencyScope dependencyScope;
     HubSyncReport report;
@@ -392,7 +397,7 @@ HubSyncReport hubPull(ObjectStore& replica)
     // state and the advanced cursor describe one hub snapshot.
     auto hubTxn = hub->read();
     const auto cursor = syncCursor(conn(hubTxn));
-    std::set<std::string> ids;
+    std::set<std::string> ids = discard;
     changedRecords(conn(hubTxn), up.cursor, ids);
     std::map<std::string, Json> hubRecords;
     std::map<std::string, int64_t> versions;
@@ -415,7 +420,7 @@ HubSyncReport hubPull(ObjectStore& replica)
     for (const auto& [id, record] : hubRecords) {
         const auto local = syncRecord(replica, txn, id);
         if (local == record) { version.run(id, versions.at(id)); continue; }
-        if (pending.contains(id)) {
+        if (pending.contains(id) && !discard.contains(id)) {
             // Our own earlier push: the hub has nothing newer than our base.
             if (versions.at(id) == knownHubVersion(db, id)) continue;
             conflict.run(id, versions.at(id), record.dump());
@@ -426,6 +431,10 @@ HubSyncReport hubPull(ObjectStore& replica)
         version.run(id, versions.at(id));
     }
     installHubRecords(replica, txn, geometry, hubTxn, install, up.cursor.geometry);
+    Statement done(db, "DELETE FROM hub_pending WHERE record_uuid=?");
+    Statement settled(db, "DELETE FROM hub_conflicts WHERE record_uuid=?");
+    Statement flight(db, "DELETE FROM hub_inflight WHERE record_uuid=?");
+    for (const auto& id : discard) { done.run(id); settled.run(id); flight.run(id); }
     execute(db, "UPDATE hub_upstream SET journal_cursor=?,geometry_cursor=?", cursor.journal, cursor.geometry);
     exec(db, "DELETE FROM hub_leases;");
     writeLeases(db, leases);
@@ -433,6 +442,12 @@ HubSyncReport hubPull(ObjectStore& replica)
     report.pulled = int64_t(install.size());
     report.pulledPosition = cursor.journal;
     return report;
+}
+}
+
+HubSyncReport hubPull(ObjectStore& replica)
+{
+    return pullDiscarding(replica, {});
 }
 
 HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead)
@@ -618,41 +633,21 @@ HubSyncReport hubSync(ObjectStore& replica)
 
 int64_t hubRevert(ObjectStore& replica)
 {
-    DependencyScope dependencyScope;
-    Upstream up;
-    std::shared_ptr<ObjectStore> hub;
     std::set<std::string> ids;
     {
         auto local = replica.read();
-        up = upstream(conn(local));
+        upstream(conn(local));  // throws unless a replica
         // Relationships only: objects (records in object_revisions) stay pending.
         Statement object(conn(local), "SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1");
         for (const auto& id : uuidColumn(conn(local), "SELECT record_uuid FROM hub_pending UNION SELECT record_uuid FROM hub_conflicts")) {
             object.reset(); object.bind(1, id);
             if (!object.row()) ids.insert(id);
         }
-        if (ids.empty()) return 0;
-        hub = openHub(replica, local, up);
     }
-    auto hubTxn = hub->read();
-    std::map<std::string, Json> records;
-    std::map<std::string, int64_t> versions;
-    for (const auto& id : ids) {
-        records[id] = syncRecord(*hub, hubTxn, id);
-        versions[id] = hubVersion(conn(hubTxn), id);
-    }
-    GeometryStage geometry;
-    auto txn = replica.write();
-    pool(txn).hubApply = true;
-    installHubRecords(replica, txn, geometry, hubTxn, records, 0);
-    Statement version(conn(txn), "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version");
-    for (const auto& [id, value] : versions) if (value) version.run(id, value);
-    Statement done(conn(txn), "DELETE FROM hub_pending WHERE record_uuid=?");
-    Statement settled(conn(txn), "DELETE FROM hub_conflicts WHERE record_uuid=?");
-    Statement flight(conn(txn), "DELETE FROM hub_inflight WHERE record_uuid=?");
-    for (const auto& id : ids) { done.run(id); settled.run(id); flight.run(id); }
-    txn.commit();
-    hubTxn.commit();
+    if (ids.empty()) return 0;
+    // The hub's current records may be bound to endpoint geometry this
+    // replica has not pulled: they are installed by a pull, with it.
+    pullDiscarding(replica, ids);
     return int64_t(ids.size());
 }
 
@@ -735,6 +730,17 @@ std::vector<JournalEntry> hubJournal(ObjectStore& replica, int64_t after, int64_
     auto entries = hub->journalSince(txn, after);
     std::erase_if(entries, [&](const JournalEntry& entry) { return entry.seq > upTo; });
     return entries;
+}
+
+std::vector<std::string> hubWriters(ObjectStore& replica)
+{
+    auto txn = replica.read();
+    upstream(conn(txn));  // throws unless a replica
+    std::vector<std::string> authors;
+    Statement rows(conn(txn), "SELECT DISTINCT author FROM journal WHERE seq>(SELECT clone_journal FROM hub_upstream) "
+                              "ORDER BY author");
+    while (rows.row()) authors.push_back(rows.text(0));
+    return authors;
 }
 
 std::optional<HubStatus> hubStatus(ObjectStore& store)

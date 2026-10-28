@@ -98,7 +98,10 @@ HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead 
 HubSyncReport hubSync(ObjectStore& replica);
 // Discard every unpushed relationship change and relationship conflict: each
 // becomes the hub's current record again (relationships the hub never had are
-// removed). Object changes stay pending. For a replica whose relationship
+// removed). That record may be bound to endpoint geometry newer than this
+// replica's, so the revert is a pull: everything the hub changed since the
+// last one is installed with it (nothing is pulled when there is nothing to
+// revert). Object changes stay pending. For a replica whose relationship
 // writes are recomputable (a service's detector links), before it recomputes
 // them. Returns the number of relationships reverted.
 int64_t hubRevert(ObjectStore& replica);
@@ -112,6 +115,11 @@ std::vector<HubLease> renewLeases(ObjectStore& replica, const std::vector<std::s
                                   int64_t seconds = kDefaultLeaseSeconds);
 // Refuses objects with unpushed changes. Leases of other holders are untouched.
 void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects);
+
+// The authors this replica has written as since it was cloned, pulls
+// included (a pull is journaled under the pulling session's author), sorted.
+// Who a replica belongs to: a service refuses one that others write.
+std::vector<std::string> hubWriters(ObjectStore& replica);
 
 // Read the hub's state at a position through the hub's own history: `read`
 // gets the hub, a read transaction and the hub's revision of every object

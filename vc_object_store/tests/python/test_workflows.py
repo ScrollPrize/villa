@@ -631,6 +631,49 @@ def test_a_service_links_and_pins_a_hub_position(tmp_path):
     session.detach(editor)
 
 
+@pytest.mark.parametrize('action', ['retain', 'remove'])
+def test_a_revert_brings_the_endpoints_its_edge_is_bound_to(tmp_path, action):
+    """The hub's current edge can be bound to endpoint geometry changed since
+    this replica last pulled: reverting installs it with that geometry."""
+    import vc_object_store as vos
+    from test_overlap_correspondences import patch, flat, LOW, HIGH
+    hub = str(tmp_path / 'hub.vcobj')
+    whole = dict(whole_geometry=True)
+    with ObjectStore.create(hub, author='curator') as origin:
+        patch(origin, LOW, flat())
+        _, geometry = patch(origin, HIGH, flat(10))
+        edge = origin.add_edge(dict(a=LOW, b=HIGH, kind='related', a_anchor=whole, b_anchor=whole))
+        origin.checkpoint()
+    vos.hub_init(hub, 'curator')
+    for name in ('service', 'editor'):
+        vos.hub_clone(hub, str(tmp_path / f'{name}.vcobj'), name)
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        service.set_meta(edge, 'note', 'service')
+    with ObjectStore.open(str(tmp_path / 'editor.vcobj'), author='editor') as editor:
+        editor.acquire_leases([HIGH])
+        _, moved = patch(editor, None, flat(11))
+        geometry = dict(geometry, arrays=moved['arrays'])
+        editor.put_geometry(HIGH, geometry, expected_revision=editor.current_geometry(HIGH)['uuid'],
+                            edge_edits=[edge_choice(editor, e['uuid'], action)
+                                        for e in editor.affected_geometry_edges(HIGH, geometry)])
+        if action == 'retain':
+            editor.set_meta(edge, 'note', 'editor')
+        assert not editor.hub_sync(pull=True, push=True)['conflicts']
+        expected = editor.edge(edge)
+        state = expected and editor.edge_geometry_state(edge)
+        moved_geometry = editor.current_geometry(HIGH)['uuid']
+    with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as service:
+        assert service.hub_revert() == 1
+        status = service.hub_status()
+        assert status['pending'] == [] and status['conflicts'] == []
+        assert service.current_geometry(HIGH)['uuid'] == moved_geometry
+        assert service.edge(edge) == expected
+        if expected:
+            assert service.edge(edge)['meta']['note'] == 'editor'
+            assert service.edge_geometry_state(edge) == state
+        assert not service.hub_sync(pull=True, push=False)['conflicts']
+
+
 def test_an_indexed_hub_and_its_replicas_gate_older_binaries(tmp_path):
     """A hub with a publication index has its own schema version, which
     binaries from before the index refuse; ordinary stores keep theirs."""

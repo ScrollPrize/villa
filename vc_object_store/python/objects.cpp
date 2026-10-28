@@ -751,7 +751,8 @@ NB_MODULE(_native, m)
             if (self.db.use_count() != 1) throw std::runtime_error("hub_revert requires an idle store");
             nb::gil_scoped_release release;
             return vo::hubRevert(db);
-        }, "Discard every unpushed local change and conflict, restoring the hub's records; returns the count.")
+        }, "Discard every unpushed relationship change and conflict, restoring the hub's records (a pull, so "
+           "endpoints they are bound to arrive with them); object changes stay pending. Returns the count.")
         .def("hub_journal", [](PyObjectStore& self, int64_t after, int64_t upTo) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_journal requires an idle store");
@@ -840,6 +841,11 @@ NB_MODULE(_native, m)
             nb::gil_scoped_release release;
             vo::releaseLeases(db, uuids);
         }, nb::arg("uuids"))
+        .def("hub_writers", [](PyObjectStore& self) {
+            auto& db = self.require();
+            nb::gil_scoped_release release;
+            return vo::hubWriters(db);
+        }, "The authors this replica has written as since it was cloned (pulls included), sorted.")
         .def("hub_status", [](PyObjectStore& self) -> nb::object {
             const auto status = vo::hubStatus(self.require());
             if (!status) return nb::none();
