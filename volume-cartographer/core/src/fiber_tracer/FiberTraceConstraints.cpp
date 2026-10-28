@@ -1683,6 +1683,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
         for(std::size_t globalA=first;globalA<end;++globalA) {
         const auto& sampleA = samples[globalA];
         const auto& pieceA = report.pieces[sampleA.piece];
+        if(config.crossQueryPrefix && pieceA.traceIndex>=config.crossQueryPrefix)continue;
         const cv::Vec3d pointA = pieceA.samplePointsBaseXYZ[sampleA.sample];
         auto& hits=local.hits;
         hits.clear();
@@ -1698,6 +1699,7 @@ FiberTraceConstraintReport extractFiberTraceConstraints(
             if (sampleA.piece == sampleB.piece)
                 continue;
             const auto& pieceB = report.pieces[sampleB.piece];
+            if(config.crossQueryPrefix && pieceB.traceIndex<config.crossQueryPrefix)continue;
             if (pieceA.traceIndex == pieceB.traceIndex)
                 continue;
             if (tracePairFilter && !tracePairFilter(pieceA.traceIndex, pieceB.traceIndex)) {

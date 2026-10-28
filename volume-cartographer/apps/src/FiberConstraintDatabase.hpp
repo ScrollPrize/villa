@@ -47,4 +47,4 @@ nlohmann::json orientFiberConstraintDatabase(
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
     double sampleSpacing, const nlohmann::json& provenance,
     const vc::core::util::Umbilicus* priorUmbilicus = nullptr,
-    bool exportNormalCurves = false);
+    bool exportNormalCurves = false, bool selectedNormalCurves = false);

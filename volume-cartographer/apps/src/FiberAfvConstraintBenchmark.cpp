@@ -159,7 +159,9 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     const auto queryStart=Clock::now();
     std::set<int64_t> ids;
     progress({"catalog",0,0});
-    if(cfg.value("full_volume",false)) {
+    if(cfg.contains("fiber_ids")) {
+        for(const auto& id:cfg.at("fiber_ids"))ids.insert(id.get<int64_t>());
+    } else if(cfg.value("full_volume",false)) {
         double before=std::numeric_limits<double>::infinity(); int64_t after=0;
         while(true) {
             const auto page=afv.catalogByLength(before,after,8192);
@@ -255,6 +257,9 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
              <<" unsigned normals; no alignment"<<std::endl;
     FiberTraceConstraintConfig options;
     options.localEvents=true; options.localKeepWholeFibers=true; options.parallelThreads=threads;
+    options.crossQueryPrefix=cfg.value("cross_query_prefix",std::size_t{0});
+    if(options.crossQueryPrefix>=lines.size() && options.crossQueryPrefix)
+        throw std::invalid_argument("Cross query prefix must leave reference lines");
     // Extraction records continuous evidence; rejection/quantization belongs to
     // downstream processing. Explicit flags retain historical benchmark modes.
     options.certifyWinding=cfg.value("certify_winding",false);
@@ -344,7 +349,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
             cfg.at("orient_database").get<std::string>(),cfg.at(cfg.contains("normal_curves_output")?"normal_curves_output":(umbilicus?"normal_prior_output":"database")).get<std::string>(),
             std::vector<int64_t>(ids.begin(),ids.end()),lines,normals,threads,
             cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr,
-            cfg.contains("normal_curves_output"));
+            cfg.contains("normal_curves_output"),cfg.contains("fiber_ids"));
         result["wall_seconds"]=seconds(started);
         result["resources"]=processResources();
         vc::core::util::ephemeralWriteString(output,result.dump(2)+"\n");

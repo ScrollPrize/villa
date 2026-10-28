@@ -67,6 +67,9 @@ struct FiberTraceConstraintConfig {
     bool localOnePerPair = false;
     bool localReplicateOverlap = false;
     bool localIncludeParallel = true;
+    // Whole input prefix queried only against the suffix. Zero disables this
+    // native bipartite mode; unlike arbitrary callbacks it stays parallel.
+    std::size_t crossQueryPrefix = 0;
     double localMinimumPieceLengthBaseVoxels = 0.0;
     double localSpacingBaseVoxels = 64.0;
     double localTangentSpanBaseVoxels = 16.0;

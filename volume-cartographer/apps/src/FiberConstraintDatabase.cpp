@@ -352,11 +352,13 @@ nlohmann::json orientFiberConstraintDatabase(
     const std::vector<vc::fiber_tracer::FiberletCropTraceLine>& lines,
     const vc::lasagna::LasagnaNormalSampler& normals, int threads,
     double sampleSpacing, const Json& provenance, const vc::core::util::Umbilicus* priorUmbilicus,
-    bool exportNormalCurves)
+    bool exportNormalCurves, bool selectedNormalCurves)
 {
     using namespace vc::fiber_tracer;
     using Clock=std::chrono::steady_clock;
     const auto started=Clock::now();
+    if(selectedNormalCurves && (!exportNormalCurves || sourceIds.empty()))
+        throw std::invalid_argument("Selected normal export requires nonempty curve export");
     if(!std::isfinite(sampleSpacing) || sampleSpacing<=0. || threads<1 || lines.size()!=sourceIds.size())
         throw std::invalid_argument("Invalid normal orientation sampling configuration");
     auto partial=output;
@@ -404,23 +406,38 @@ nlohmann::json orientFiberConstraintDatabase(
         if(!index.emplace(sourceIds[i],i).second)throw std::runtime_error("Duplicate source fiber");
         lengths[i]=makePolylineArcGeometry(lines[i].pointsBaseXYZ).length();
     }
-    auto fiberQuery=prepare(src.get(),"SELECT id,source_index,length_base FROM fibers ORDER BY source_index");
+    std::string selectedList;
+    if(selectedNormalCurves)for(auto id:sourceIds) {
+        if(!selectedList.empty())selectedList+=",";
+        selectedList+=std::to_string(id);
+    }
+    const std::string fiberWhere=selectedNormalCurves?" WHERE id IN ("+selectedList+")":"";
+    const std::string eventWhere=selectedNormalCurves?
+        " WHERE fiber_a IN ("+selectedList+") OR fiber_b IN ("+selectedList+")":"";
+    auto fiberQuery=prepare(src.get(),("SELECT id,source_index,length_base FROM fibers"+fiberWhere+" ORDER BY source_index").c_str());
     size_t fiberCount=0; int rc;
     while((rc=sqlite3_step(fiberQuery.get()))==SQLITE_ROW) {
         if(fiberCount>=sourceIds.size() || sqlite3_column_int64(fiberQuery.get(),0)!=sourceIds[fiberCount] ||
-           sqlite3_column_int64(fiberQuery.get(),1)!=static_cast<int64_t>(fiberCount) ||
+           (!selectedNormalCurves && sqlite3_column_int64(fiberQuery.get(),1)!=static_cast<int64_t>(fiberCount)) ||
            std::abs(sqlite3_column_double(fiberQuery.get(),2)-lengths[fiberCount])>1e-6)
             throw std::runtime_error("Source fiber identity/order/length differs");
         ++fiberCount;
     }
     check(src.get(),rc);
     if(fiberCount!=sourceIds.size())throw std::runtime_error("Source fiber count differs");
-    auto query=prepare(src.get(),"SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz FROM constraints ORDER BY id");
+    auto query=prepare(src.get(),("SELECT id,fiber_a,fiber_b,arc_a,arc_b,ax,ay,az,bx,by,bz FROM constraints"+eventWhere+" ORDER BY id").c_str());
     size_t events=0;
+    std::vector<unsigned char> selectedSlots;
     while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
-        if(sqlite3_column_int64(query.get(),0)!=static_cast<int64_t>(events))throw std::runtime_error("Non-contiguous constraint IDs");
+        if(!selectedNormalCurves && sqlite3_column_int64(query.get(),0)!=static_cast<int64_t>(events))throw std::runtime_error("Non-contiguous constraint IDs");
         for(int side=0;side<2;++side) {
-            const auto i=index.at(sqlite3_column_int64(query.get(),1+side));
+            const auto found=index.find(sqlite3_column_int64(query.get(),1+side));
+            selectedSlots.push_back(found!=index.end());
+            if(found==index.end()) {
+                if(!selectedNormalCurves)throw std::runtime_error("Unknown endpoint source");
+                continue;
+            }
+            const auto i=found->second;
             const double arc=sqlite3_column_double(query.get(),3+side);
             if(!std::isfinite(arc) || arc<0 || arc>lengths[i]+1e-6)throw std::runtime_error("Invalid constraint arc");
             const int c=5+side*3;
@@ -514,11 +531,14 @@ nlohmann::json orientFiberConstraintDatabase(
     const double sweepSeconds=std::chrono::duration<double>(Clock::now()-sweepStarted).count();
     if(priorUmbilicus || exportNormalCurves) {
         // Verify the gauge against ALL stored endpoint normals before exporting priors.
-        query=prepare(src.get(),"SELECT normal_a,normal_b FROM constraints ORDER BY id");
-        size_t count=0;
+        query=prepare(src.get(),("SELECT normal_a,normal_b FROM constraints"+eventWhere+" ORDER BY id").c_str());
+        size_t count=0,checkedEndpoints=0;
+        const auto validationStarted=Clock::now();
         while((rc=sqlite3_step(query.get()))==SQLITE_ROW) {
             for(int side=0;side<2;++side) {
                 const auto slot=2*count+side;
+                if(!selectedSlots[slot])continue;
+                ++checkedEndpoints;
                 const auto n=Json::parse(reinterpret_cast<const char*>(sqlite3_column_text(query.get(),side)));
                 if(n.at("valid").get<bool>()!=bool(valid[slot]))throw std::runtime_error("Prior endpoint validity mismatch");
                 if(valid[slot]) {
@@ -527,11 +547,14 @@ nlohmann::json orientFiberConstraintDatabase(
                 }
             }
             ++count;
+            if(count%1000000==0)std::cout<<"validate frozen normals events="<<count<<"/"<<events
+                <<" endpoints="<<checkedEndpoints<<" seconds="
+                <<std::chrono::duration<double>(Clock::now()-validationStarted).count()<<std::endl;
         }
         check(src.get(),rc);if(count!=events)throw std::runtime_error("Prior endpoint count mismatch");
         if(exportNormalCurves) {
             curveStream.close();if(!curveStream)throw std::runtime_error("Normal curve write failed");
-            Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"samples",curveSamples},
+            Json stats={{"fibers",fiberCount},{"checked_endpoints",checkedEndpoints},{"samples",curveSamples},
                 {"invalid_samples",invalid},{"sample_spacing_base",sampleSpacing},
                 {"sampling_seconds",sampleSeconds},{"sweep_seconds",sweepSeconds},
                 {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
@@ -544,7 +567,7 @@ nlohmann::json orientFiberConstraintDatabase(
         }
         std::vector<double> agreement(lines.size());
         for(size_t i=0;i<lines.size();++i)agreement[i]=priorWeight[i]>0?priorSum[i]/priorWeight[i]:0.;
-        Json stats={{"fibers",fiberCount},{"checked_endpoints",2*events},{"sample_spacing_base",sampleSpacing},
+        Json stats={{"fibers",fiberCount},{"checked_endpoints",checkedEndpoints},{"sample_spacing_base",sampleSpacing},
             {"invalid_samples",invalid},{"sweep_seconds",sweepSeconds},
             {"total_seconds",std::chrono::duration<double>(Clock::now()-started).count()}};
         Json document={{"format","fiber-outward-priors"},{"version",1},{"source_database",input.string()},

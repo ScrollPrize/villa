@@ -144,6 +144,32 @@ TEST_CASE("Bounded polyline visits preserve closed boundaries and duplicate vert
         }
 }
 
+TEST_CASE("Native bipartite query preserves callback-filtered cross constraints")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(3);
+    lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    lines[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    lines[2].pointsBaseXYZ={{512,-512,30},{512,512,30}};
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=4;
+    const auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .5;};
+    const auto baseline=extractFiberTraceConstraints(lines,cfg,sampler,{},
+        [](size_t a,size_t b){return (a<1)!=(b<1);});
+    cfg.crossQueryPrefix=1;
+    const auto actual=extractFiberTraceConstraints(lines,cfg,sampler);
+    REQUIRE(actual.constraints.size()==baseline.constraints.size());
+    REQUIRE(!actual.constraints.empty());
+    for(size_t i=0;i<actual.constraints.size();++i) {
+        const auto& a=actual.constraints[i];const auto& b=baseline.constraints[i];
+        CHECK(a.pieceA==b.pieceA);CHECK(a.pieceB==b.pieceB);
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.windingDistance==b.windingDistance);
+        CHECK(actual.pieces[a.pieceA].traceIndex==0);
+        CHECK(actual.pieces[a.pieceB].traceIndex!=0);
+    }
+}
+
 TEST_CASE("Extraction progress observes stages without changing constraints")
 {
     using namespace vc::fiber_tracer;
