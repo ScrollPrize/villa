@@ -1277,7 +1277,7 @@ void SpiralWorkspace::addPatchToCurrentFit(
     QMessageBox::information(this, tr("Add patch to the Spiral fit"),
                              tr("Surfaces in the object store are fit inputs when the fit's selection "
                                 "includes them (by default, every active surface). %1")
-                                 .arg(SpiralServiceManager::inputsFrozenMessage()));
+                                 .arg(SpiralServiceManager::inputChangesMessage()));
 }
 
 void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
@@ -1286,7 +1286,7 @@ void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberId
     QMessageBox::information(this, tr("Add fibers to the Spiral fit"),
                              tr("Fibers in the object store are fit inputs when the fit's selection "
                                 "includes them (by default, every active fiber). %1")
-                                 .arg(SpiralServiceManager::inputsFrozenMessage()));
+                                 .arg(SpiralServiceManager::inputChangesMessage()));
 }
 
 void SpiralWorkspace::finalizeBrushPaint()

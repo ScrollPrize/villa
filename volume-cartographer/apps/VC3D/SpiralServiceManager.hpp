@@ -190,8 +190,9 @@ public:
     // after the surface, so this follows what the panel is displaying rather
     // than being on by default.
     void setPreviewDiagnostics(bool enabled) { _previewDiagnosticsWanted = enabled; }
-    // Why no input change reaches a resident fit: its inputs are frozen.
-    static QString inputsFrozenMessage();
+    // How input changes reach a fit: saved in the store, then an input update
+    // (or, without a hub, a rebuild with current inputs).
+    static QString inputChangesMessage();
     // Whether this client holds the service's session lease, which every
     // mutating request needs.
     bool ownsSessionLease() const { return _leaseOwner; }

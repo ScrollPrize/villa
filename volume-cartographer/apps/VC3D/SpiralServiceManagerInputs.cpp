@@ -1,6 +1,6 @@
 #include "SpiralServiceManager.hpp"
 
-QString SpiralServiceManager::inputsFrozenMessage()
+QString SpiralServiceManager::inputChangesMessage()
 {
     return tr("Fit inputs come from the object store, and a resident fit keeps the inputs it "
               "read. Save edits to the store, then use Update Fit Inputs (or, for a service "
