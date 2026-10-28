@@ -365,6 +365,8 @@ NB_MODULE(_native, m)
         return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(meta)), volume);
     }, nb::arg("meta"), nb::arg("volume"),
        "Volume voxels per stored unit for an object whose meta binds it to volume; None when it is not.");
+    m.def("hub_address", [](const std::filesystem::path& hub) { return vo::hubAddress(hub); }, nb::arg("hub"),
+          "A hub address as replicas record it (hub_status()['hub']).");
     m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
           "Turn a local store with no other connections into a hub for a network share.");
     m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
@@ -723,6 +725,12 @@ NB_MODULE(_native, m)
            "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases. "
            "With expected_head (push only), publish only while the hub is still at that position; "
            "the report's head_mismatch says it was not.")
+        .def("hub_revert", [](PyObjectStore& self) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_revert requires an idle store");
+            nb::gil_scoped_release release;
+            return vo::hubRevert(db);
+        }, "Discard every unpushed local change and conflict, restoring the hub's records; returns the count.")
         .def("hub_journal", [](PyObjectStore& self, int64_t after, int64_t upTo) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_journal requires an idle store");

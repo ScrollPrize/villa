@@ -80,6 +80,10 @@ std::optional<int64_t> hubLockAge(const std::filesystem::path& hub);
 // The next open rolls back any interrupted write from its journal.
 void removeHubLock(const std::filesystem::path& hub);
 
+// A hub address as replicas record it: an sftp:// or ssh:// address in its
+// canonical sftp:// form, a path made absolute.
+std::string hubAddress(const std::filesystem::path& hub);
+
 // Install hub changes. Records with unpushed local changes become conflicts.
 HubSyncReport hubPull(ObjectStore& replica);
 // Publish local changes atomically. Refuses while conflicts are unresolved;
@@ -92,6 +96,12 @@ HubSyncReport hubPull(ObjectStore& replica);
 HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead = std::nullopt);
 // Pull, then push.
 HubSyncReport hubSync(ObjectStore& replica);
+// Discard every unpushed relationship change and relationship conflict: each
+// becomes the hub's current record again (relationships the hub never had are
+// removed). Object changes stay pending. For a replica whose relationship
+// writes are recomputable (a service's detector links), before it recomputes
+// them. Returns the number of relationships reverted.
+int64_t hubRevert(ObjectStore& replica);
 
 // All-or-nothing. Refuses objects another replica holds and objects this
 // replica has not pulled the latest hub version of (pull, then retry).

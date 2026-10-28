@@ -217,6 +217,23 @@ int main() try
             "retry recovers the original position");
     require(state(alice, lost)["relationships"][ab]["meta"]["note"] == "lost response", "the recovered position reads");
 
+    // Reverting discards unpushed local changes: a new link disappears, an
+    // edited one gets the hub's record back, and nothing is pending.
+    {
+        hubPull(alice);
+        const auto before = meta(alice, ab);
+        setNote(alice, ab, "unpushed");
+        const auto fresh = addFiber(alice);
+        const auto extra = link(alice, fresh, b);
+        require(hubRevert(alice) == 2, "both links reverted");
+        require(meta(alice, ab) == before, "the hub's record is back");
+        require(hubStatus(alice)->pending == std::vector<std::string>{fresh}, "object changes stay pending");
+        auto txn = alice.read();
+        require(!alice.edgeByUuid(txn, extra), "a link the hub never had is gone");
+    }
+    require(hubAddress("ssh://host/a b.vcobj") == "sftp://host/a%20b.vcobj" || hubAddress("ssh://host/a b.vcobj").rfind("sftp://", 0) == 0,
+            "a remote hub address is canonical sftp://");
+
     // A hub made before the publication index reads its head, and starts the
     // index with its next write.
     {

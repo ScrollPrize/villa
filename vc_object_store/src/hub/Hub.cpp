@@ -286,7 +286,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
               const util::ProgressCallback& progress)
 {
     if (std::filesystem::exists(replicaPath)) throw std::runtime_error("hub: clone refuses existing " + replicaPath.string());
-    const auto hub = isRemotePath(hubPath) ? canonicalRemotePath(hubPath) : std::filesystem::absolute(hubPath).string();
+    const auto hub = hubAddress(hubPath);
     auto partial = replicaPath; partial += ".partial";
     // A leftover journal would be replayed into the new copy.
     auto removePartial = [&] {
@@ -370,6 +370,11 @@ void detachHub(const std::filesystem::path& path, const std::string& author)
         } catch (...) { sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
     } catch (...) { sqlite3_close(db); throw; }
     sqlite3_close(db);
+}
+
+std::string hubAddress(const std::filesystem::path& hub)
+{
+    return isRemotePath(hub) ? canonicalRemotePath(hub) : std::filesystem::absolute(hub).string();
 }
 
 HubSyncReport hubPull(ObjectStore& replica)
@@ -609,6 +614,46 @@ HubSyncReport hubSync(ObjectStore& replica)
     report.publishedPosition = pushed.publishedPosition;
     report.conflicts = std::move(pushed.conflicts);
     return report;
+}
+
+int64_t hubRevert(ObjectStore& replica)
+{
+    DependencyScope dependencyScope;
+    Upstream up;
+    std::shared_ptr<ObjectStore> hub;
+    std::set<std::string> ids;
+    {
+        auto local = replica.read();
+        up = upstream(conn(local));
+        // Relationships only: objects (records in object_revisions) stay pending.
+        Statement object(conn(local), "SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1");
+        for (const auto& id : uuidColumn(conn(local), "SELECT record_uuid FROM hub_pending UNION SELECT record_uuid FROM hub_conflicts")) {
+            object.reset(); object.bind(1, id);
+            if (!object.row()) ids.insert(id);
+        }
+        if (ids.empty()) return 0;
+        hub = openHub(replica, local, up);
+    }
+    auto hubTxn = hub->read();
+    std::map<std::string, Json> records;
+    std::map<std::string, int64_t> versions;
+    for (const auto& id : ids) {
+        records[id] = syncRecord(*hub, hubTxn, id);
+        versions[id] = hubVersion(conn(hubTxn), id);
+    }
+    GeometryStage geometry;
+    auto txn = replica.write();
+    pool(txn).hubApply = true;
+    installHubRecords(replica, txn, geometry, hubTxn, records, 0);
+    Statement version(conn(txn), "INSERT INTO hub_versions VALUES(?,?) ON CONFLICT(record_uuid) DO UPDATE SET version=excluded.version");
+    for (const auto& [id, value] : versions) if (value) version.run(id, value);
+    Statement done(conn(txn), "DELETE FROM hub_pending WHERE record_uuid=?");
+    Statement settled(conn(txn), "DELETE FROM hub_conflicts WHERE record_uuid=?");
+    Statement flight(conn(txn), "DELETE FROM hub_inflight WHERE record_uuid=?");
+    for (const auto& id : ids) { done.run(id); settled.run(id); flight.run(id); }
+    txn.commit();
+    hubTxn.commit();
+    return int64_t(ids.size());
 }
 
 std::vector<HubLease> acquireLeases(ObjectStore& replica, const std::vector<std::string>& objects, int64_t seconds)
