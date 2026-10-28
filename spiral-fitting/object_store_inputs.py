@@ -1641,17 +1641,15 @@ class PreparedPosition:
     lines: list
 
 
-def _awaiting(store):
-    pending = len((store.hub_status() or {}).get('pending') or ())
-    return ([f'{pending} local detector write(s) await reconciliation; the next '
-             'update relinks them'] if pending else [])
-
-
-def _resolve_to_hub(store, conflicts):
-    """This replica writes only recomputable detector output; the hub side
-    may hold a user's edit or approval."""
-    for conflict in conflicts:
-        store.resolve_hub_conflict(conflict['uuid'], 'hub')
+def _discard_unpublished(store):
+    """Restore the hub's relationships over this replica's unpublished
+    detector output (and any relationship conflicts): it was computed for
+    an older head, and a link to an object retired or deselected since
+    would never be replaced by relinking only the current selection. The
+    service replica writes only relationships, so nothing else is lost.
+    Returns report lines."""
+    discarded = store.hub_revert()
+    return ([f'discarded {discarded} unpublished detector write(s)'] if discarded else [])
 
 
 def _conditional_push(store, head):
@@ -1673,9 +1671,10 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     reached), refresh links over the whole selection at H, then publish them
     only if the hub is still at H. Success pins N, H plus these links, which
     later commits never change. A head mismatch (any commit after H,
-    related or not) or a conflict (resolved to the hub's side) pulls and
-    relinks; ``attempts`` bounds the loop. A detector failure or the bound
-    raises, publishing nothing, and leaves the caller's active inputs alone.
+    related or not) or a conflict discards this replica's unpublished links
+    (the hub's side wins), pulls and relinks; ``attempts`` bounds the loop.
+    A detector failure or the bound raises, publishing nothing (and
+    discarding the links), and leaves the caller's active inputs alone.
     With object_store_refresh_links off, the pulled head is the position.
     """
     status = store.hub_status()
@@ -1688,9 +1687,11 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     current = dataclasses.replace(request, position=None)
     notes = []
     for attempt in range(1, attempts + 1):
+        # Every attempt links from a clean head: earlier output, from a
+        # failed update or a previous attempt, is discarded first.
+        notes.extend(f'attempt {attempt}: {line}' for line in _discard_unpublished(store))
         pulled = store.hub_sync(pull=True, push=False)
         if pulled['conflicts']:
-            _resolve_to_hub(store, pulled['conflicts'])
             notes.append(f'attempt {attempt}: {len(pulled["conflicts"])} conflict(s) '
                          'resolved to the hub')
             continue
@@ -1705,10 +1706,10 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
         snapshot = read_snapshot(store, current)
         lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
         if problems:
-            raise LinkRefreshError(notes + problems + ['no links were published'] + _awaiting(store))
+            raise LinkRefreshError(notes + problems + ['no links were published']
+                                   + _discard_unpublished(store))
         pushed = _conditional_push(store, head)
         if pushed['conflicts']:
-            _resolve_to_hub(store, pushed['conflicts'])
             notes.append(f'attempt {attempt}: {len(pushed["conflicts"])} conflict(s) '
                          'resolved to the hub')
             continue
@@ -1722,7 +1723,7 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     else:
         raise PositionError(notes + [
             f'inputs kept changing: no hub position could be linked in {attempts} '
-            'attempts; retry'] + _awaiting(store))
+            'attempts; retry'] + _discard_unpublished(store))
     pinned = InputPosition(hub, position)
     if minimum is not None and position > minimum:
         lines.append(f'position {position} includes hub commits after the requested {minimum}')

@@ -163,17 +163,55 @@ def test_continuous_edits_fail_the_update_cleanly(hub, monkeypatch):
     with pytest.raises(osi.PositionError) as error:
         prepare(hub['service'], attempts=3)
     text = '\n'.join(error.value.problems)
-    assert 'inputs kept changing' in text and 'await reconciliation' in text
-    # Nothing the service linked reached the hub.
+    assert 'inputs kept changing' in text and 'discarded 3 unpublished' in text
+    # Nothing the service linked reached the hub, or stays pending on it.
     with ObjectStore.open(hub['editor'], author='editor') as db:
         db.hub_sync(pull=True, push=False)
         assert db.edges_by_kind('point-surface') == []
-    # Once the edits stop, the next update reconciles the local links.
+    with ObjectStore.open(hub['service'], read_only=True) as db:
+        assert db.hub_status()['pending'] == []
+        assert db.edges_by_kind('point-surface') == []
+    # Once the edits stop, the next update links afresh.
     monkeypatch.setattr(osi, 'refresh_links', original)
     prepared = prepare(hub['service'])
     with ObjectStore.open(hub['service'], read_only=True) as db:
         assert db.hub_status()['pending'] == []
         assert len(db.hub_read_view_at(prepared.position.sequence)['relationships']) == 3
+
+
+def test_a_deselection_while_linking_discards_its_links(hub, monkeypatch):
+    # Links computed for a head where `far` was selected must not be
+    # published at a later head where it is not: relinking only the current
+    # selection would never replace them.
+    names = _names(hub['editor'])
+    far, near = names['far'], names['near']
+    for uuid in (near, far):
+        _edit(hub['editor'], 'editor', _lease_and(
+            uuid, lambda db, uuid=uuid: db.upsert_object({**db.object(uuid), 'tags': ['reviewed']})))
+    original = osi.refresh_links
+    raced = []
+
+    def racing(store, snapshot, *args, **kwargs):
+        outcomes = original(store, snapshot, *args, **kwargs)
+        if not raced:
+            raced.append(_edit(hub['editor'], 'editor', _lease_and(
+                far, lambda db: db.upsert_object({**db.object(far), 'tags': []}))))
+        return outcomes
+
+    monkeypatch.setattr(osi, 'refresh_links', racing)
+    config = fit_config(hub['service'], object_store_patch_tags=['reviewed'],
+                        object_store_patch_uuids=[])
+    with ObjectStore.open(hub['service'], author='service') as store:
+        prepared = osi.prepare_position(store, config, osi.request_from_config(config),
+                                        log=lambda line: None)
+    assert prepared.attempts == 2 and prepared.uuids['surface'] == [near]
+    assert any('discarded 3 unpublished' in line for line in prepared.lines)
+    with ObjectStore.open(hub['service'], read_only=True) as db:
+        view = db.hub_read_view_at(prepared.position.sequence)
+        assert db.hub_status()['pending'] == []
+    surfaces = {uuid for r in view['relationships'] for uuid in (r['record']['a'], r['record']['b'])}
+    assert near in surfaces and far not in surfaces
+    assert len(view['relationships']) == 2
 
 
 def test_a_conflicting_approval_keeps_the_hub_side(hub, monkeypatch):
