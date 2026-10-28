@@ -388,22 +388,30 @@ int main(int argc, char** argv)
             slice.localBounds = {-1, -1, -1, 3, 3, 1};
             RegionOptions query;
             query.uuids = std::vector<std::string>{ids[0], ids[1]};
-            const auto crossings = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true);
+            const auto cold = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
+            std::set<std::string> reached;
+            for (const auto& [attachment, uuid] : cold.remote) reached.insert(uuid);
+            require(cold.runs.empty() && reached == std::set<std::string>{ids[0], ids[1]},
+                    "a cold query lists the selected placeholders it reached");
+            for (const auto& [attachment, uuid] : cold.remote) remoteSession.ensureGeometry(attachment, uuid);
+            const auto crossings = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
             std::set<std::string> crossed;
             for (const auto& run : crossings.runs) crossed.insert(run.objectUuid);
-            require(crossings.complete && crossed == std::set<std::string>{ids[0], ids[1]} && fetchCount == 2,
-                    "one cold query returns all required intersections after fetching only selected surfaces");
-            const auto warm = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true);
+            require(crossings.complete && crossings.remote.empty() && crossed == std::set<std::string>{ids[0], ids[1]} &&
+                        fetchCount == 2,
+                    "fetched placeholders are read, and only the selected surfaces were fetched");
+            const auto warm = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
             require(warm.complete && warm.runs.size() == crossings.runs.size() && fetchCount == 2,
                     "warm queries reuse fetched geometry");
             query.uuids = std::vector<std::string>{ids[2]};
+            const auto failing = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query);
             bool failed = false;
-            try { SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query, {}, true); }
+            try { for (const auto& [attachment, uuid] : failing.remote) remoteSession.ensureGeometry(attachment, uuid); }
             catch (const GeometryUnavailable&) { failed = true; }
-            require(failed, "fetch errors are reported instead of publishing an empty complete overlay");
+            require(failing.remote.size() == 1 && failed, "fetch errors are reported to the fetcher");
             query.uuids = std::vector<std::string>{ids[3]};
             const auto cancelled = SurfaceCatalog::region(remoteSession, {remote}, volume->id(), slice, query,
-                                                          [] { return true; }, true);
+                                                          [] { return true; });
             require(!cancelled.complete && cancelled.runs.empty() && fetchCount == 2,
                     "cancelled queries neither publish intersections nor fetch more surfaces");
         }

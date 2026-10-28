@@ -103,17 +103,18 @@ public:
 
     // Where the surfaces of every source cross `slice` (voxels of `volume`),
     // with `options` (uuids, budgets) per source; complete when every source's
-    // read was. Placeholders reached are queued for fetching. With
-    // waitForGeometry, waits for them and re-reads before returning; use that
-    // only on a worker thread.
+    // read was. Placeholders reached (geometry not local yet) are listed with
+    // their attachment; fetch them (ObjectStoreSession::ensureGeometry) and
+    // read again to include them.
     struct Crossings {
         std::vector<vc::objects::VisibleRun> runs;
         bool complete = true;
+        std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
     static Crossings region(vc::objects::ObjectStoreSession& session,
                             const std::vector<vc::objects::AttachmentIdentity>& sources, const std::string& volume,
                             const vc::objects::RegionSlice& slice, vc::objects::RegionOptions options,
-                            const std::function<bool()>& cancelled = {}, bool waitForGeometry = false);
+                            const std::function<bool()>& cancelled = {});
 
     // The nearest point of each of `uuids` (drafts or objects of the sources)
     // within `tolerance` of each of `points` (voxels of `volume`): the hits per

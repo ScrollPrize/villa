@@ -6,6 +6,7 @@
 #include <QPolygonF>
 #include <QString>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -24,7 +25,8 @@ class CState;
 //  - surface viewers: where the viewer's intersect planes ("seg xy/xz/yz") cut
 //    its surface, drawn on the surface through each crossing's grid position.
 // Drafts change while they are edited, so their lines are cut on the spot;
-// stored surfaces are read on the thread pool.
+// stored surfaces are read on the thread pool. Catalog placeholders reached
+// are fetched one at a time in the background and drawn as each arrives.
 class StoreSurfaceOverlayController : public ViewerOverlayControllerBase
 {
     Q_OBJECT
@@ -53,6 +55,7 @@ private:
     struct Listing {
         std::vector<Run> runs;
         bool complete = true;
+        std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> remote;
     };
     // A plane cutting a surface viewer's surface.
     struct PlaneCut {
@@ -76,6 +79,9 @@ private:
     };
     void request(VolumeViewerBase* viewer, const vc3d::store::Region& region, const std::vector<std::string>& uuids);
     void requestCuts(VolumeViewerBase* viewer, const std::string& uuid, const std::vector<PlaneCut>& cuts);
+    // Fetch placeholders' geometry (not already fetching or failed); each
+    // arrival is a commit, which reads the views again.
+    void fetch(const std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>>& remote);
     // Data changed: query every view again.
     void invalidate();
     // Stored geometry changed: keep displayed lines and let an in-flight read finish first.
@@ -93,5 +99,8 @@ private:
     std::string _volume;
     std::vector<std::string> _surfaces;
     std::set<std::string> _highlighted;
+    std::set<std::string> _fetching;
+    std::map<std::string, QString> _fetchFailures;
+    std::shared_ptr<std::atomic_bool> _fetchCancel = std::make_shared<std::atomic_bool>(false);
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> _views;
 };

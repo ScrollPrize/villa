@@ -84,6 +84,7 @@ StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, View
 
 StoreSurfaceOverlayController::~StoreSurfaceOverlayController()
 {
+    _fetchCancel->store(true);
     for (auto& [viewer, view] : _views)
         if (view->region.cancelled) view->region.cancelled->store(true);
 }
@@ -107,8 +108,41 @@ void StoreSurfaceOverlayController::setHighlighted(const std::vector<std::string
     refreshAll();
 }
 
+void StoreSurfaceOverlayController::fetch(const std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>>& remote)
+{
+    std::vector<std::pair<vc::objects::AttachmentIdentity, std::string>> batch;
+    for (const auto& entry : remote)
+        if (!_fetchFailures.contains(entry.second) && _fetching.insert(entry.second).second) batch.push_back(entry);
+    if (batch.empty()) return;
+    using Failures = std::map<std::string, QString>;
+    vc3d::store::background<Failures>(this,
+        [session = _state->objectStoreSession(), batch, cancel = _fetchCancel] {
+            Failures failures;
+            for (const auto& [attachment, uuid] : batch) {
+                if (cancel->load()) break;
+                try {
+                    session->ensureGeometry(attachment, uuid, [&] { return cancel->load(); });
+                } catch (const std::exception& error) {
+                    if (!cancel->load()) failures[uuid] = QString::fromUtf8(error.what());
+                }
+            }
+            return failures;
+        },
+        [this, batch, cancel = _fetchCancel](vc3d::store::Outcome<Failures> outcome) {
+            if (cancel->load()) return;
+            for (const auto& [attachment, uuid] : batch) _fetching.erase(uuid);
+            _fetchFailures.merge(outcome.value);
+            for (auto& [viewer, view] : _views) view->dirty = true;
+            refreshAll();
+        });
+}
+
 void StoreSurfaceOverlayController::invalidate()
 {
+    _fetchCancel->store(true);
+    _fetchCancel = std::make_shared<std::atomic_bool>(false);
+    _fetching.clear();
+    _fetchFailures.clear();
     for (auto& [viewer, view] : _views) {
         view->region.reset();
         view->runs.clear();
@@ -243,12 +277,15 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
          uuids](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
             auto crossings = SurfaceCatalog::region(*session, sources, volume,
                                                     vc3d::store::regionSlice(query), surfaceOptions(uuids),
-                                                    [&] { return cancelled.load(); }, true);
-            return Listing{runsOf(std::move(crossings.runs)), crossings.complete};
+                                                    [&] { return cancelled.load(); });
+            return Listing{runsOf(std::move(crossings.runs)), crossings.complete, std::move(crossings.remote)};
         },
         [this, viewer](View& v, Listing* listing) {
             v.dirty = true;
-            if (listing) v.runs = std::move(listing->runs);
+            if (listing) {
+                v.runs = std::move(listing->runs);
+                fetch(listing->remote);
+            }
             // Commits made while it read: show this read, then read once more.
             if (std::exchange(v.refreshPending, false)) v.region.refresh();
             refreshViewer(viewer);
@@ -272,8 +309,7 @@ void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const 
             Cut result;
             for (const auto& cut : cuts) {
                 auto crossings = SurfaceCatalog::region(*session, sources, volume,
-                                                        vc3d::store::regionSlice(cut.slab), surfaceOptions({uuid}),
-                                                        {}, true);
+                                                        vc3d::store::regionSlice(cut.slab), surfaceOptions({uuid}));
                 result[cut.plane] = runsOf(std::move(crossings.runs));
             }
             return result;
@@ -315,7 +351,11 @@ void StoreSurfaceOverlayController::drawPlaneViewer(VolumeViewerBase* viewer, Vi
     if (!stored.empty()) request(viewer, *current, stored);
 
     const auto notice = !v.region.error.isEmpty() ? tr("Surfaces: %1").arg(v.region.error)
-                        : v.region.busy ? tr("Fetching surface intersections…")
+                        : !_fetching.empty() ? tr("Fetching %n surface(s)…", nullptr, int(_fetching.size()))
+                        : !_fetchFailures.empty()
+                            ? tr("%n surface(s) could not be fetched: %1", nullptr, int(_fetchFailures.size()))
+                                  .arg(_fetchFailures.begin()->second)
+                        : v.region.busy ? tr("Reading surface intersections…")
                         : v.region.loaded && !v.region.complete ? tr("Partial surface view · zoom in")
                                                                 : QString{};
     if (!notice.isEmpty()) {

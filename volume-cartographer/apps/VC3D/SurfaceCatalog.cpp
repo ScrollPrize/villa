@@ -19,6 +19,24 @@ struct Listing {
     std::optional<std::vector<std::string>> requested;
 };
 
+// Open Data catalogs hold each surface once per scan of a sample, every copy
+// mapped into the others through the catalog's scan-to-scan registrations.
+// A copy reached only through one of those is another scan's, not listed;
+// pyramid levels, superseded volumes and users' registrations are kept.
+bool otherScanCopy(const VolumeTransforms& transforms, const nlohmann::json& meta, const std::string& volume)
+{
+    const auto coordinates = meta.value("coordinates", nlohmann::json::object());
+    const auto source = coordinates.value("volume_uuid", nlohmann::json(nullptr));
+    if (!source.is_string()) return false;
+    const auto resolution = transforms.resolve(source.get<std::string>(), volume);
+    if (resolution.status != vcr::catalog::TransformStatus::Resolved) return false;
+    const auto& path = resolution.resolved().path;
+    // Steps are registration keys, inverse ones prefixed.
+    return std::any_of(path.begin(), path.end(), [](const std::string& step) {
+        return step.starts_with("catalog:") || step.starts_with("inverse:catalog:");
+    });
+}
+
 // The rows of `requested` (all when nullopt) in the volume, a surface from the
 // first source holding it.
 Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed,
@@ -43,8 +61,10 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
             session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
                 mapping = std::make_shared<const VolumeTransforms>(db.volumeTransforms(txn));
             });
+        const auto meta = nlohmann::json::parse(record.meta);
+        if (otherScanCopy(*mapping, meta, volume)) continue;
         SurfaceCatalog::Row row;
-        row.mapping = mapping->toVolume(nlohmann::json::parse(record.meta), volume);
+        row.mapping = mapping->toVolume(meta, volume);
         row.record = std::move(record);
         row.source = attachment;
         row.catalog = attachment != user;
@@ -280,34 +300,19 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
 
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,
                                                  const std::string& volume, const RegionSlice& slice, RegionOptions options,
-                                                 const std::function<bool()>& cancelled, bool waitForGeometry)
+                                                 const std::function<bool()>& cancelled)
 {
     options.kind = "surface";
     options.volume = volume;
     const auto isCancelled = [&] { return cancelled && cancelled(); };
-    for (;;) {
-        if (isCancelled()) return {{}, false};
-        auto results = session.geometryRegion(sources, slice, options,
-                                              [&](const auto&) { return isCancelled(); });
-        bool fetched = false;
-        for (const auto& [attachment, result] : results) {
-            if (!waitForGeometry) break;
-            for (const auto& uuid : result.remote) {
-                if (isCancelled()) return {{}, false};
-                // Region reads queue remote geometry but do not wait for it.
-                // Wait outside the read transaction, then read the whole batch
-                // again instead of publishing each arriving surface separately.
-                session.ensureGeometry(attachment, uuid, isCancelled);
-                fetched = true;
-            }
-        }
-        if (fetched) continue;
-        Crossings crossings;
-        for (auto& [attachment, result] : results) {
-            crossings.complete = crossings.complete && result.complete();
-            for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
-        }
-        return crossings;
+    if (isCancelled()) return {{}, false, {}};
+    Crossings crossings;
+    for (auto& [attachment, result] : session.geometryRegion(sources, slice, options,
+                                                             [&](const auto&) { return isCancelled(); })) {
+        crossings.complete = crossings.complete && result.complete();
+        for (auto& run : result.runs) crossings.runs.push_back(std::move(run));
+        for (auto& uuid : result.remote) crossings.remote.emplace_back(attachment, std::move(uuid));
     }
+    return crossings;
 }
 
