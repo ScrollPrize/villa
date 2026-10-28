@@ -179,6 +179,8 @@ set(srcs
     overlays/ViewerOverlayControllerBase.hpp
     overlays/SpiralOverlayController.cpp
     overlays/SpiralOverlayController.hpp
+    overlays/SpiralFiberOverlayController.cpp
+    overlays/SpiralFiberOverlayController.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp

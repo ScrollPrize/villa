@@ -55,6 +55,8 @@ public:
     // unavailable overlay is unchecked and explains itself in the tooltip.
     void setPclOverlayAvailable(vc3d::spiral::PclRole role, bool available,
                                 const QString& reason = {});
+    // The same for the fitted-fiber overlay.
+    void setFiberOverlayAvailable(bool available, const QString& reason = {});
     [[nodiscard]] double pointViewTolerance() const;
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
@@ -71,6 +73,7 @@ signals:
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pclOverlayChanged(vc3d::spiral::PclRole role, bool shown);
+    void fiberOverlayChanged(bool shown);
     void pointViewToleranceChanged(double tolerance);
     void pythonOutputRequested();
     void removeLocalPatchRequested(const QString& id);
@@ -133,6 +136,7 @@ private:
     QSpinBox* _maximumDisplayedWinding = nullptr;
     QCheckBox* _showSurfaceIntersections = nullptr;
     std::array<QCheckBox*, vc3d::spiral::kEditablePclRoles.size()> _showPclOverlays{};
+    QCheckBox* _showFiberOverlay = nullptr;
     QDoubleSpinBox* _pointViewTolerance = nullptr;
     QComboBox* _lossMap = nullptr;
     QCheckBox* _lossMapDiagnostics = nullptr;

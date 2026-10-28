@@ -2,6 +2,7 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
+#include "overlays/SpiralFiberOverlayController.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -161,7 +162,11 @@ private:
     void noteStoreChanges(const vc::objects::StoreSessionEvent& event);
     void updateInputFreshness();
     void refreshPclOverlay(vc3d::spiral::PclRole role);
-    void refreshPclOverlays();
+    void refreshFiberOverlay();
+    void refreshPinnedOverlays();
+    // Reference-volume voxels -> the preview's volume frame; nullopt (with
+    // the reason) when either side lacks or disagrees on a coordinate domain.
+    std::optional<double> pinnedInputScale(QString* error) const;
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
     void updateRunDiffOverlay();
@@ -223,6 +228,10 @@ private:
     {
         return _pclOverlays[vc3d::spiral::pclRoleIndex(role)];
     }
+    // The fit's fibers at their pinned revisions, in reference-volume voxels.
+    std::unique_ptr<SpiralFiberOverlayController> _fiberOverlay;
+    std::vector<SpiralFiberOverlayController::Fiber> _pinnedFibers;
+    bool _fiberOverlayVisible = false;
     LineAnnotationController* _lineAnnotationController = nullptr;
     std::unique_ptr<SegmentationOverlayController> _surfaceOverlapOverlay;
     SpiralServiceManager* _service = nullptr;

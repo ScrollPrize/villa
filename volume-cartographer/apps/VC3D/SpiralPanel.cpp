@@ -489,6 +489,13 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         displayDialogLayout->addWidget(toggle);
         _showPclOverlays[vc3d::spiral::pclRoleIndex(role)] = toggle;
     }
+    _showFiberOverlay = new QCheckBox(tr("Show fitted fibers"), _displayDialog);
+    _showFiberOverlay->setObjectName(QStringLiteral("spiralShowFittedFibers"));
+    _showFiberOverlay->setEnabled(false);
+    describe(QStringLiteral("display_fitted_fibers"), {_showFiberOverlay});
+    setToolTipNote(_showFiberOverlay, tr("The fit has no fibers to show"));
+    connect(_showFiberOverlay, &QCheckBox::toggled, this, &SpiralPanel::fiberOverlayChanged);
+    displayDialogLayout->addWidget(_showFiberOverlay);
 
     auto* pointToleranceRow = new QWidget(_displayDialog);
     auto* pointToleranceLayout = new QHBoxLayout(pointToleranceRow);
@@ -1678,6 +1685,16 @@ void SpiralPanel::setPclOverlayAvailable(vc3d::spiral::PclRole role,
                                      ? tr("No compatible %1 artifact is available")
                                            .arg(vc3d::spiral::pclRoleDisplayName(role))
                                      : reason);
+}
+
+void SpiralPanel::setFiberOverlayAvailable(bool available, const QString& reason)
+{
+    if (!_showFiberOverlay) return;
+    _showFiberOverlay->setEnabled(available);
+    if (!available) _showFiberOverlay->setChecked(false);
+    setToolTipNote(_showFiberOverlay,
+                   available ? QString()
+                             : reason.isEmpty() ? tr("The fit has no fibers to show") : reason);
 }
 
 void SpiralPanel::describe(const QString& id, std::initializer_list<QWidget*> widgets)

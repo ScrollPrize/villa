@@ -15,6 +15,7 @@
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
+#include "overlays/SpiralFiberOverlayController.hpp"
 #include "overlays/SpiralOverlayController.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -328,6 +329,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             vc3d::spiral::pclRoleHasWindingAnnotations(role));
         _brush->setPclHitOverlay(role, state.overlay.get());
     }
+    _fiberOverlay = std::make_unique<SpiralFiberOverlayController>(this);
+    _fiberOverlay->bindToViewerManager(_viewerManager.get());
     _surfaceOverlapOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _surfaceOverlapOverlay->setViewerManager(_viewerManager.get());
     _viewerManager->setSegmentationOverlay(_surfaceOverlapOverlay.get());
@@ -528,10 +531,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 if (_brush) _brush->setPclSourceVisible(role, shown);
                 if (state.overlay) state.overlay->setVisible(shown);
             });
+    connect(_panel, &SpiralPanel::fiberOverlayChanged, this, [this](bool shown) {
+        _fiberOverlayVisible = shown;
+        if (_fiberOverlay) _fiberOverlay->setVisible(shown);
+    });
     const auto applyPointViewTolerance = [this](double tolerance) {
         for (auto& state : _pclOverlays) {
             if (state.overlay) state.overlay->setViewTolerance(tolerance);
         }
+        if (_fiberOverlay) _fiberOverlay->setSlabHalfDepth(tolerance);
         if (_brush) _brush->setPointViewTolerance(tolerance);
     };
     applyPointViewTolerance(_panel->pointViewTolerance());
@@ -1658,7 +1666,7 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _previewSourceId = result.surfaceId;
     _previewBaseShapeZYX = result.baseShapeZYX;
     updatePreviewCoordinateScale();
-    refreshPclOverlays();
+    refreshPinnedOverlays();
     _previewComponents = result.components;
     _previewWindingIds = result.windingIds;
     _previewRunDiffImagePath = result.runDiffImagePath;
@@ -1717,9 +1725,52 @@ void SpiralWorkspace::installPreviewDiagnostics(const QString& manifestPath,
     updateLossMapOverlay();
 }
 
-void SpiralWorkspace::refreshPclOverlays()
+void SpiralWorkspace::refreshPinnedOverlays()
 {
     for (const auto role : vc3d::spiral::kEditablePclRoles) refreshPclOverlay(role);
+    refreshFiberOverlay();
+}
+
+std::optional<double> SpiralWorkspace::pinnedInputScale(QString* error) const
+{
+    // The pinned inputs are in reference-volume voxels: the scroll's base
+    // shape, mapped onto the preview's coordinate domain.
+    QString shapeError;
+    const auto scrollShape = parseBaseShapeZYX(
+        _service->advertisedDataset().value(QStringLiteral("scroll_spec")).toObject()
+            .value(QStringLiteral("base_shape_zyx")), &shapeError);
+    if (!_previewBaseShapeZYX || !scrollShape) {
+        *error = tr("The preview or the scroll specification has no coordinate-domain metadata");
+        return std::nullopt;
+    }
+    try {
+        return vc::lasagna::dyadicCoordinateScaleBetweenShapes(*scrollShape, *_previewBaseShapeZYX);
+    } catch (const std::exception& exception) {
+        *error = tr("The coordinate domain is incompatible: %1").arg(QString::fromUtf8(exception.what()));
+        return std::nullopt;
+    }
+}
+
+void SpiralWorkspace::refreshFiberOverlay()
+{
+    if (!_panel || !_fiberOverlay) return;
+    _fiberOverlay->setFibers({});
+    if (_pinnedFibers.empty()) {
+        _panel->setFiberOverlayAvailable(false, _pinnedInputs ? tr("The fit has no fibers") : QString());
+        return;
+    }
+    QString error;
+    const auto scale = pinnedInputScale(&error);
+    if (!scale) {
+        _panel->setFiberOverlayAvailable(false, error);
+        return;
+    }
+    auto fibers = _pinnedFibers;
+    for (auto& fiber : fibers)
+        for (auto& point : fiber.line) point *= *scale;
+    _fiberOverlay->setFibers(std::move(fibers));
+    _panel->setFiberOverlayAvailable(true);
+    _fiberOverlay->setVisible(_fiberOverlayVisible);
 }
 
 void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
@@ -1736,27 +1787,13 @@ void SpiralWorkspace::refreshPclOverlay(vc3d::spiral::PclRole role)
                                        : QString());
         return;
     }
-    // The pinned collections are in reference-volume voxels: the scroll's
-    // base shape, mapped onto the preview's coordinate domain.
-    QString shapeError;
-    const auto scrollShape = parseBaseShapeZYX(
-        _service->advertisedDataset().value(QStringLiteral("scroll_spec")).toObject()
-            .value(QStringLiteral("base_shape_zyx")), &shapeError);
-    if (!_previewBaseShapeZYX || !scrollShape) {
-        _panel->setPclOverlayAvailable(
-            role, false,
-            tr("The preview or the scroll specification has no coordinate-domain metadata"));
+    QString scaleError;
+    const auto pinnedScale = pinnedInputScale(&scaleError);
+    if (!pinnedScale) {
+        _panel->setPclOverlayAvailable(role, false, scaleError);
         return;
     }
-    double scale = 1.0;
-    try {
-        scale = vc::lasagna::dyadicCoordinateScaleBetweenShapes(*scrollShape, *_previewBaseShapeZYX);
-    } catch (const std::exception& error) {
-        _panel->setPclOverlayAvailable(
-            role, false, tr("The %1 PCL coordinate domain is incompatible: %2")
-                             .arg(roleName, QString::fromUtf8(error.what())));
-        return;
-    }
+    const double scale = *pinnedScale;
     if (!state.collection->loadFromJSON(state.documentPath.toStdString())) {
         _panel->setPclOverlayAvailable(
             role, false, tr("The pinned %1 point collections are invalid").arg(roleName));
@@ -1801,6 +1838,20 @@ void SpiralWorkspace::updateInputFreshness()
     const auto changed = inputs.count(PinState::Edited) + inputs.count(PinState::MetadataChanged);
     if (changed)
         notes << tr("%n fitted input(s) changed in the store before this view loaded", "", int(changed));
+    const auto withheld = std::count_if(inputs.pointCollections.begin(), inputs.pointCollections.end(),
+                                        [](const auto& entry) {
+                                            return entry.state != PinState::Missing && !entry.fittedMetadata;
+                                        });
+    if (withheld)
+        notes << tr("%n fitted point collection(s) are not shown: the attached store lacks the "
+                    "metadata they were fitted with", "", int(withheld));
+    using vc3d::spiral::LinkState;
+    if (const auto links = inputs.count(LinkState::Changed))
+        notes << tr("%n fitted link(s) differ in the attached store", "", int(links));
+    if (const auto links = inputs.count(LinkState::Dropped))
+        notes << tr("%n fitted link(s) would no longer be consumed", "", int(links));
+    if (inputs.addedRelationships)
+        notes << tr("%n link(s) among the fitted inputs were not fitted", "", int(inputs.addedRelationships));
     if (!_changedPinnedRecords.isEmpty())
         notes << tr("%n fitted object(s) or link(s) changed since", "", int(_changedPinnedRecords.size()));
     if (!_changedOtherInputs.isEmpty())
@@ -1828,10 +1879,11 @@ void SpiralWorkspace::clearPinnedInputs(const QString& reason)
         state.document = {};
         state.documentPath.clear();
     }
+    _pinnedFibers.clear();
     InputSurfaceLoadResult cleared;
     cleared.categories = {QStringLiteral("verified")};
     installInputSurfaces(cleared, _inputSurfaceGeneration);
-    refreshPclOverlays();
+    refreshPinnedOverlays();
     if (!reason.isEmpty()) statusBar()->showMessage(reason, 15000);
 }
 
@@ -1896,7 +1948,7 @@ void SpiralWorkspace::installPinnedInputs(
     for (const auto& entry : inputs->surfaces) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
     for (const auto& entry : inputs->pointCollections) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
     for (const auto& entry : inputs->fibers) _pinnedRecords.insert(QString::fromStdString(entry.pin.uuid));
-    for (const auto& uuid : inputs->relationshipUuids) _pinnedRecords.insert(QString::fromStdString(uuid));
+    for (const auto& entry : inputs->relationships) _pinnedRecords.insert(QString::fromStdString(entry.uuid));
     updateInputFreshness();
     using vc3d::spiral::PinState;
     InputSurfaceLoadResult surfaces;
@@ -1917,7 +1969,7 @@ void SpiralWorkspace::installPinnedInputs(
     std::map<vc3d::spiral::PclRole, QJsonObject> collections;
     int collectionId = 0;
     for (const auto& entry : inputs->pointCollections) {
-        if (entry.state == PinState::Missing) continue;
+        if (entry.state == PinState::Missing || !entry.fittedMetadata) continue;
         const bool annotated = entry.absolute
             || std::any_of(entry.windings.begin(), entry.windings.end(),
                            [](const auto& wind) { return wind.has_value(); });
@@ -1951,7 +2003,11 @@ void SpiralWorkspace::installPinnedInputs(
         if (out.open(QIODevice::WriteOnly) && out.write(bytes) == bytes.size() && out.commit())
             state.documentPath = path;
     }
-    refreshPclOverlays();
+    _pinnedFibers.clear();
+    for (const auto& entry : inputs->fibers)
+        if (entry.line.size() > 1)
+            _pinnedFibers.push_back({entry.line, QString::fromStdString(entry.family)});
+    refreshPinnedOverlays();
 
     QStringList notes;
     for (const auto& problem : inputs->problems) notes << QString::fromStdString(problem);

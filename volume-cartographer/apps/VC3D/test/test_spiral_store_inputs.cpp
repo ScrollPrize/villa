@@ -1,6 +1,7 @@
 // The Spiral workspace's pinned reads of a fit's object-store inputs: pins
 // resolve by geometry revision, coordinates convert to reference-volume
-// voxels, and the metadata hash matches the Python adapter's.
+// voxels, roles come from the fitted metadata, consumed relationships are
+// compared with the store's, and the hashes match the Python adapter's.
 //
 // With SPIRAL_STORE_INPUTS_DUMP=STORE|MANIFEST|OUT it instead reads MANIFEST's
 // pins from STORE and writes OUT in display_geometry_dump.py's format, for
@@ -70,10 +71,52 @@ void metadataHashesMatchThePythonAdapter()
                 std::string("metadata hash differs from the Python adapter for ") + item.kind + " " + item.meta);
 }
 
+// Expected text from json.dumps(sort_keys=True, separators=(",", ":")).
+void canonicalJsonMatchesPython()
+{
+    const Json value = {
+        {"f", {0.1, 1e-05, 0.0001, 1e16, 1e15, 123456.789, -0.0, 5e-324, 1.7976931348623157e308, 2.5,
+               100.0, 1.0 / 3, 1e22, 0.30000000000000004, -1.5e-07, 12345678901234567.0}},
+        {"s", "\xc3\xbcn\xc3\xaf\n\""},
+        {"i", {1, -2, int64_t(1000000000000000000)}},
+        {"n", nullptr},
+        {"b", {true, false}},
+        {"k", {{"b", 1}, {"a", Json::object()}}}};
+    const std::string expected =
+        R"({"b":[true,false],"f":[0.1,1e-05,0.0001,1e+16,1000000000000000.0,123456.789,-0.0,5e-324,)"
+        R"(1.7976931348623157e+308,2.5,100.0,0.3333333333333333,1e+22,0.30000000000000004,-1.5e-07,)"
+        R"(1.2345678901234568e+16],"i":[1,-2,1000000000000000000],"k":{"a":{},"b":1},"n":null,)"
+        R"("s":"\u00fcn\u00ef\n\""})";
+    const auto text = vc3d::spiral::pythonCanonicalJson(value);
+    require(text == expected, "canonical JSON differs from Python's: " + text);
+}
+
+// Expected hashes from object_store_inputs.content_sha256 of
+// {"a_anchor", "b_anchor", "meta"} with the binding's anchor dictionaries.
+void relationshipHashesMatchThePythonAdapter()
+{
+    Anchor surface;
+    surface.points = {{"points", {0, 1}}};
+    surface.position = std::array<double, 3>{10.5, 20.25, 30.1};
+    Anchor point;
+    point.points = {{"point_ids", {4}}};
+    require(vc3d::spiral::relationshipContentSha256(surface, point, {{"distance", 0.125}, {"source", "linker"}})
+                == "b4bd93221c171d46fd7210e76e1195362b9a97d396edd6e2ab3b27a01abe006e",
+            "point relationship hash differs from the Python adapter");
+    Anchor whole;
+    whole.wholeGeometry = true;
+    whole.channels = {"mask"};
+    whole.metadataKeys = {"coordinates"};
+    whole.direction = std::array<double, 3>{0.0, -1e-05, 1.0};
+    require(vc3d::spiral::relationshipContentSha256(whole, Anchor{}, Json::object())
+                == "621acf914b0b769564a430b6f9e9aa84b9e2c9d70fe47d87246e9ab0c3df3cd8",
+            "whole-geometry relationship hash differs from the Python adapter");
+}
+
 struct Fixture {
     std::shared_ptr<ObjectStoreSession> session = std::make_shared<ObjectStoreSession>();
     AttachmentIdentity attachment;
-    std::string surface, pcl, fiber;
+    std::string surface, pcl, fiber, link;
 
     explicit Fixture(const fs::path& path)
     {
@@ -115,12 +158,22 @@ struct Fixture {
             // A fiber at scale 4.
             ObjectRecord line; line.uuid = fiber; line.kind = "fiber"; line.name = "fiber";
             line.meta = Json{{"coordinates", volumeCoordinates(kVolume, 4)}}.dump();
+            line.fiber = FiberDetail{"H", true};
             db.upsertObject(txn, line);
             GeometryData fiberData{"fiber", 1, "source_xyz", "{}",
                                    {array("control_points", "<f8", {2, 3}, std::vector<double>{4, 8, 12, 12, 16, 20}),
                                     array("line_points", "<f8", {3, 3}, std::vector<double>{4, 8, 12, 8, 12, 16, 12, 16, 20}),
                                     array("control_point_ids", "<i8", {2}, std::vector<int64_t>{0, 1})}};
             db.putGeometry(txn, fiber, fiberData);
+        });
+        // The collection's point 4 lies on the patch.
+        session->act(attachment, pins({surface, pcl}), [&](auto& db, auto& txn) {
+            EdgeRecord edge; edge.kind = "point-surface"; edge.aUuid = surface; edge.bUuid = pcl;
+            edge.aAnchor.points = {{"points", {0, 1}}};
+            edge.aAnchor.position = std::array<double, 3>{11, 20, 30};
+            edge.bAnchor.points = {{"point_ids", {4}}};
+            edge.meta = R"({"distance":0.125})";
+            link = db.addEdge(txn, edge);
         });
     }
 
@@ -143,9 +196,27 @@ struct Fixture {
                                    {"scale_factor", scale}});
             }
         });
+        // The link as the adapter records it: surface end first.
+        Json relationships = Json::array();
+        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& selected : db.relationshipsAt(txn, {{surface, std::nullopt}, {pcl, std::nullopt}})) {
+                const auto& version = selected.relationship;
+                const bool stored = version.record.aUuid == surface;
+                const auto& a = stored ? version.record.aAnchor : version.record.bAnchor;
+                const auto& b = stored ? version.record.bAnchor : version.record.aAnchor;
+                relationships.push_back(
+                    {{"uuid", version.record.uuid}, {"revision", "another-replica"}, {"kind", version.record.kind},
+                     {"family", "pcl_patch"}, {"approval_state", version.record.approvalState},
+                     {"generation", version.record.generation}, {"a", surface},
+                     {"a_geometry_revision", *(stored ? version.aGeometryRevision : version.bGeometryRevision)},
+                     {"b", pcl},
+                     {"b_geometry_revision", *(stored ? version.bGeometryRevision : version.aGeometryRevision)},
+                     {"content_sha256", vc3d::spiral::relationshipContentSha256(a, b, Json::parse(version.record.meta))}});
+            }
+        });
         return {{"digest", "fixture"},
                 {"manifest", {{"store", {{"uuid", storeUuid}, {"path", "/service/host/path"}}},
-                              {"volume_uuid", kVolume}, {"objects", objects}, {"relationships", Json::array()}}}};
+                              {"volume_uuid", kVolume}, {"objects", objects}, {"relationships", relationships}}}};
     }
 
     // Checked writes expect the current revisions of what they change.
@@ -192,6 +263,12 @@ void pinnedReadsConvertToReferenceVoxels(const fs::path& directory)
     const auto& fiber = inputs.fibers.at(0);
     require(fiber.line.size() == 3 && fiber.line[1] == cv::Vec3d(2, 3, 4), "scale-4 fiber line");
     require(fiber.controls.back() == cv::Vec3d(3, 4, 5), "scale-4 fiber controls");
+    require(fiber.family == "H", "fitted fiber family");
+
+    using vc3d::spiral::LinkState;
+    require(inputs.relationships.size() == 1 && inputs.relationships[0].state == LinkState::Current
+                && inputs.addedRelationships == 0,
+            "the fitted link is current");
 
     // A metadata edit the adapter reads, then a geometry edit: the pinned
     // geometry is still what is read, and its state says what changed.
@@ -203,6 +280,20 @@ void pinnedReadsConvertToReferenceVoxels(const fs::path& directory)
     inputs = fixture.read(document);
     require(inputs.pointCollections.at(0).state == PinState::MetadataChanged, "metadata change detected");
     require(inputs.surfaces.at(0).state == PinState::Current, "unread metadata is no change");
+    // The role is the fitted one, not the current head's.
+    fixture.session->act(fixture.attachment, fixture.pins({fixture.pcl}), [&](auto& db, auto& txn) {
+        db.setMeta(txn, fixture.pcl, "source", R"({"winding_is_absolute":false})");
+    });
+    inputs = fixture.read(document);
+    require(inputs.pointCollections.at(0).fittedMetadata && inputs.pointCollections.at(0).absolute,
+            "the role comes from the fitted metadata");
+    auto unknown = document;
+    unknown["manifest"]["objects"][1]["metadata_sha256"] = std::string(64, '0');
+    inputs = fixture.read(unknown);
+    require(!inputs.pointCollections.at(0).fittedMetadata && inputs.pointCollections.at(0).points.empty(),
+            "a collection whose fitted metadata is not held is withheld");
+    require(inputs.problems.size() == 1, "the withheld collection is reported");
+
     fixture.session->act(fixture.attachment, fixture.pins({fixture.fiber}), [&](auto& db, auto& txn) {
         const auto current = db.currentGeometry(txn, fixture.fiber);
         const double moved[3] = {0, 0, 0};
@@ -215,6 +306,27 @@ void pinnedReadsConvertToReferenceVoxels(const fs::path& directory)
     inputs = fixture.read(document);
     require(inputs.fibers.at(0).state == PinState::Edited, "geometry edit detected");
     require(inputs.fibers.at(0).line.size() == 3, "the pinned geometry is still read");
+
+    // Links: an edit changes the fitted one, a new one among the fitted
+    // inputs is reported, and a rejected one is no longer consumed.
+    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.pcl}),
+                         [&](auto& db, auto& txn) {
+        db.setMeta(txn, fixture.link, "distance", "0.25");
+    });
+    inputs = fixture.read(document);
+    require(inputs.relationships.at(0).state == LinkState::Changed, "link edit detected");
+    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.fiber}),
+                         [&](auto& db, auto& txn) {
+        EdgeRecord edge; edge.kind = "same-surface"; edge.aUuid = fixture.surface; edge.bUuid = fixture.fiber;
+        edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
+        db.addEdge(txn, edge);
+    });
+    inputs = fixture.read(document);
+    require(inputs.addedRelationships == 1, "a new consumable link is reported");
+    fixture.session->act(fixture.attachment, fixture.pins({fixture.surface, fixture.pcl}),
+                         [&](auto& db, auto& txn) { db.setApproval(txn, fixture.link, "rejected"); });
+    inputs = fixture.read(document);
+    require(inputs.relationships.at(0).state == LinkState::Dropped, "a rejected link is dropped");
 
     // A pin this store lacks is missing, never replaced by a current head.
     auto missing = document;
@@ -319,6 +431,10 @@ int dump(const std::string& spec)
                                             {"line", summary(asFloat(entry.line))}};
     std::ofstream(out) << Json{{"frame", "reference-volume voxels, XYZ"}, {"objects", objects}}.dump(1);
     for (const auto& problem : inputs.problems) std::cerr << problem << "\n";
+    using vc3d::spiral::LinkState;
+    std::cout << "links: " << inputs.count(LinkState::Current) << " current, "
+              << inputs.count(LinkState::Changed) << " changed, " << inputs.count(LinkState::Dropped)
+              << " dropped, " << inputs.addedRelationships << " added\n";
     return inputs.resolved() ? 0 : 1;
 }
 } // namespace
@@ -330,6 +446,8 @@ int main(int argc, char** argv)
         if (const char* spec = std::getenv("SPIRAL_STORE_INPUTS_DUMP"); spec && *spec)
             return dump(spec);
         metadataHashesMatchThePythonAdapter();
+        canonicalJsonMatchesPython();
+        relationshipHashesMatchThePythonAdapter();
         QTemporaryDir directory;
         pinnedReadsConvertToReferenceVoxels(directory.path().toStdString());
     } catch (const std::exception& error) {
