@@ -1546,7 +1546,53 @@ TEST_CASE("cooperative cursor preserves exact beam results across worker migrati
     CHECK(cursor.result().reason==expected.reason);
     CHECK(cursor.result().points==expected.points);
     REQUIRE(committed.size()+1>=expected.points.size());
-    for(size_t i=0;i<committed.size();++i)CHECK(committed[i].step==int(i+1));
+    double cumulative=0;
+    for(size_t i=0;i<committed.size();++i) {
+        CHECK(committed[i].step==int(i+1));
+        CHECK(committed[i].modulatedPresence>=0);
+        CHECK(committed[i].modulatedPresence<=1);
+        CHECK(committed[i].stepCost>=1-committed[i].modulatedPresence-1e-6);
+        CHECK(committed[i].normalValid);
+        CHECK(cv::norm(committed[i].normal)==doctest::Approx(1));
+        cumulative+=committed[i].stepCost;
+        CHECK(cumulative==doctest::Approx(committed[i].loss).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("cursor records local widths and chosen quality instead of running averages")
+{
+    class WidthPrediction final:public vc::fiber_tracer::FiberPredictionSource {
+    public:
+        vc::fiber_tracer::FiberPredictionSample sample(const cv::Vec3d&,const cv::Vec3d&) const override {
+            vc::fiber_tracer::FiberPredictionSample s;s.options.push_back({{1,0,0},.8f,true});return s;
+        }
+        void sampleWidths(const std::vector<cv::Vec3f>& p,std::vector<float>& out) const override {
+            out.clear();for(const auto& v:p)out.push_back(20.f+.05f*v[0]);
+        }
+    } predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels=4;config.coneAngleDegrees=0;config.beamWidth=1;config.parallelThreads=1;
+    config.smoothnessWeight=config.smoothnessNormalWeight=config.smoothnessTangentWeight=0;
+    config.cumulativeSmoothnessTangentWeight=0;
+    config.widthRelativeTolerance=1;config.initialWidthMean=20;
+    for(const double hard:{0.,.2}) {
+        config.widthHardRelativeTolerance=hard;
+        vc::fiber_tracer::FiberTraceCursor cursor(predictions,{0,0,0},{1,0,0},16,config,&normals);
+        std::vector<vc::fiber_tracer::FiberTraceCommit> all;
+        bool done=false;while(!done) {
+            done=cursor.advance();const auto next=cursor.takeCommitted();all.insert(all.end(),next.begin(),next.end());
+        }
+        REQUIRE(all.size()==4);
+        for(const auto& p:all) {
+            CHECK(p.sampledWidth==doctest::Approx(20+.05*p.point[0]));
+            CHECK(p.sampledWidth>p.widthMean);
+            CHECK(p.normalValid);
+            CHECK(p.modulatedPresence>0);
+            CHECK(p.modulatedPresence<.8);
+            CHECK(p.stepCost==doctest::Approx(1-p.modulatedPresence));
+        }
+    }
 }
 
 TEST_CASE("native fiber extrapolation fails at invalid start or first step")

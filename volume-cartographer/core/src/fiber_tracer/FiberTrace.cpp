@@ -769,6 +769,9 @@ struct BeamState {
         float modulatedPresence = 0.0f;
         float cutoffPresence = 0.0f;
         float sampledWidth = 0.0f;
+        float stepCost = 0.0f;
+        TraceVec normal{};
+        bool normalValid = false;
     };
 
     std::shared_ptr<const PathNode> path;
@@ -790,7 +793,8 @@ struct BeamState {
     std::shared_ptr<const BeamState::PathNode> previous,
     const TraceVec& point,
     float cumulativeLoss = 0.0f, float modulatedPresence = 0.0f,
-    float cutoffPresence = 0.0f, float sampledWidth = 0.0f)
+    float cutoffPresence = 0.0f, float sampledWidth = 0.0f,
+    float stepCost = 0.0f, TraceVec normal = {}, bool normalValid = false)
 {
     auto node = std::make_shared<BeamState::PathNode>();
     node->point = point;
@@ -798,6 +802,9 @@ struct BeamState {
     node->modulatedPresence = modulatedPresence;
     node->cutoffPresence = cutoffPresence;
     node->sampledWidth = sampledWidth;
+    node->stepCost = stepCost;
+    node->normal = normal;
+    node->normalValid = normalValid;
     node->previous = std::move(previous);
     node->length = node->previous ? node->previous->length + 1 : 1;
     return node;
@@ -834,6 +841,8 @@ struct CandidateScore {
     float cutoffPresence = 0;
     float sampledWidth = 0;
     bool widthRejected = false;
+    TraceVec normal{};
+    bool normalValid = false;
 };
 
 FiberPredictionSample sampleTracePrediction(const FiberPredictionSource& source,
@@ -1122,7 +1131,9 @@ float directionModulatedPresence(float presence, const TraceVec& prevStep,
         }
     }
     return {bestLoss, selectedCurrent.direction, selectedCurrent.presence,
-            std::isfinite(bestLoss), {}, bestPresence, false, bestCutoffPresence};
+            std::isfinite(bestLoss), {}, bestPresence, false, bestCutoffPresence,
+            0, false, precomputedNormal ? precomputedNormal->normal : TraceVec{},
+            precomputedNormal && precomputedNormal->valid};
 }
 
 void decodePredictionAndNormalCornerPoint(
@@ -1260,7 +1271,8 @@ void decodePredictionAndNormalCornerPoint(
         bestLoss,
         selectedCurrent.direction,
         selectedCurrent.presence,
-        std::isfinite(bestLoss), {}, bestPresence, false, bestCutoffPresence};
+        std::isfinite(bestLoss), {}, bestPresence, false, bestCutoffPresence,
+        0, false, smoothNormal, smoothNormalValid};
 }
 
 [[nodiscard]] CandidateScore candidateLossFromCorners(
@@ -1480,8 +1492,8 @@ void sampleCandidateNormals(
         if(!combinedSampler)sampleTraceWidths(predictions, candidatePoints, presenceScales, config);
         if (presenceScales.size() != tasks.size())
             throw std::runtime_error("invalid width batch size");
+        rawWidths=presenceScales;
         if (config.widthHardRelativeTolerance > 0) {
-            rawWidths=presenceScales;
             widthAccepted.reserve(presenceScales.size());
             for (const float value : presenceScales)
                 widthAccepted.push_back(std::isfinite(value) && value > 0 &&
@@ -2018,7 +2030,7 @@ void updateTargetPlaneCrossings(
     const BeamState& parent = parents[task.beamIndex];
     BeamState out = parent;
     out.path = appendBeamPathPoint(parent.path, candidate.point, candidate.loss, score.modulatedPresence,
-        score.cutoffPresence, score.sampledWidth);
+        score.cutoffPresence, score.sampledWidth, score.loss, score.normal, score.normalValid);
     out.previousStepDirection = task.direction;
     out.currentSampleDirection = score.selectedCurrentDirection;
     out.historyDirection = updateHistoryDirection(
@@ -2433,7 +2445,8 @@ struct TraceStepper {
     std::string phase,
     std::optional<double> traceLengthLimitVoxels = std::nullopt,
     std::function<bool(const cv::Vec3d&, double, int)> committedStep = {},
-    double* observedWidthMean = nullptr, float* committedModulatedPresence = nullptr)
+    double* observedWidthMean = nullptr, float* committedModulatedPresence = nullptr,
+    std::function<void(const FiberTraceCommit&)> committedAttributes = {})
 {
     auto request = inputRequest;
     const TraceVec start = toTraceVec(request.startPoint);
@@ -2602,6 +2615,20 @@ struct TraceStepper {
             observedPath = *it;
             if (committedModulatedPresence) *committedModulatedPresence = request.config.replayPresenceIgnoreWidth ?
                 observedPath->cutoffPresence : observedPath->modulatedPresence;
+            if (committedAttributes) {
+                FiberTraceCommit value{toVec3d(observedPath->point),
+                    observedPath->cumulativeLoss, request.config.widthReferenceMean,
+                    static_cast<int>(observedPath->length - 1), observedPath->sampledWidth,
+                    observedPath->modulatedPresence, observedPath->stepCost,
+                    toVec3d(observedPath->normal), observedPath->normalValid};
+                // If normals weren't needed for scoring, sample only the
+                // accepted point. Scores themselves are never re-evaluated.
+                if(normalSampler && !normalAwareSmoothnessEnabled(request.config)) {
+                    const auto normal=normalSampler->sampleNormal(value.point);
+                    value.normal=normal.normal;value.normalValid=normal.valid;
+                }
+                committedAttributes(value);
+            }
             if (committedStep && !committedStep(toVec3d(observedPath->point),
                     observedPath->cumulativeLoss, static_cast<int>(observedPath->length - 1)))
                 return false;
@@ -5370,9 +5397,8 @@ struct FiberTraceCursor::Impl {
         const vc::lasagna::NormalSampler* normals,double distance):
         width(request.config.initialWidthMean),
         loop(traceOneWayCoroutine(source,std::move(request),normals,{},"extrapolation",distance,
-            [this](const cv::Vec3d& p,double loss,int step) {
-                committed.push_back({p,loss,width,step});return true;
-            },&width)) {}
+            [](const cv::Vec3d&,double,int) {return true;}, &width, nullptr,
+            [this](const FiberTraceCommit& value) {committed.push_back(value);})) {}
 };
 FiberTraceCursor::FiberTraceCursor(const FiberPredictionSource& source,const cv::Vec3d& start,
     const cv::Vec3d& direction,double distance,const FiberTraceConfig& config,

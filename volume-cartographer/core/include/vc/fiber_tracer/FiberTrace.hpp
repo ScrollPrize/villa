@@ -554,6 +554,10 @@ struct FiberTraceCommit {
     cv::Vec3d point;
     double loss=0, widthMean=0;
     int step=0;
+    // Observations from the chosen beam node, not a later re-evaluation.
+    double sampledWidth=0, modulatedPresence=0, stepCost=0;
+    cv::Vec3d normal{};
+    bool normalValid=false;
 };
 
 // Cooperative frontier advancement. Only one worker may advance a cursor at a
