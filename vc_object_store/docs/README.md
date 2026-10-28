@@ -373,6 +373,9 @@ own history: records, tags, approvals, deletions and relationship membership as
 they were, whatever this replica pulled since. Geometry revisions are shared and
 are read locally; the replica must have pulled to the position, or published
 it. A hub made before the index reads only its head until its next write.
+`hubJournal(replica, after, upTo)` (session `hubJournal`, Python
+`hub_journal`) lists the hub's journal entries between two positions: what a
+position includes beyond another, and by whom.
 - `hubPush(replica, expectedHead)` publishes only while the hub is still at
   that position, checked in the publishing hub transaction. Otherwise it
   publishes nothing and reports `headMismatch` with the hub's head, even when the
