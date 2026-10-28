@@ -102,7 +102,11 @@ namespace detail { struct HubLeaseCounts; struct HubPushHolds; class HubWorker; 
 // Keeps a hosted replica's background sync from pushing while it lives, e.g.
 // while a service links and pins a hub position this replica reached. Local
 // edits still commit and pull still runs; they push once no hold remains.
-// syncHubAndWait pushes regardless.
+// syncHubAndWait pushes regardless. A sync already running when the hold is
+// taken may still push: syncHubAndWait after taking a hold waits for a sync
+// that starts later, so its position includes such a push. A hold belongs to
+// its attachment and ends with it: a detached and reattached store is not
+// held.
 class PushHold {
 public:
     PushHold() = default;
