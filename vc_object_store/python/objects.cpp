@@ -736,7 +736,7 @@ NB_MODULE(_native, m)
         }, nb::arg("position"), nb::arg("include_retired") = false,
            "The hub's object revisions at a hub position (hub revision UUIDs).")
         .def("hub_read_view_at", [](PyObjectStore& self, int64_t position, const std::optional<std::vector<std::string>>& objects,
-                                    bool includeRetired) {
+                                    bool includeRetired, bool withRelationships) {
             auto& db = self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("hub_read_view_at requires an idle store");
             vo::RevisionSelection selected;
@@ -754,7 +754,7 @@ NB_MODULE(_native, m)
                         selected.emplace(object, revision);
                         revisions.push_back(std::move(*value));
                     }
-                    relationships = hub.relationshipsAt(txn, selected);
+                    if (withRelationships) relationships = hub.relationshipsAt(txn, selected);
                 });
             }
             nb::dict result, resolved;
@@ -771,9 +771,10 @@ NB_MODULE(_native, m)
             result["position"] = position;
             return result;
         }, nb::arg("position"), nb::arg("object_uuids") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("relationships") = true,
            "revision_read_view of the hub's state at a hub position: objects present then (or those of object_uuids "
-           "present then), their records and relationship applicability, read from the hub's history. Geometry "
-           "revisions it names are read from this replica.")
+           "present then), their records and (unless relationships=False) relationship applicability, read from the "
+           "hub's history. Geometry revisions it names are read from this replica.")
         .def("acquire_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
             auto& db = self.require();
             std::vector<vo::HubLease> leases;

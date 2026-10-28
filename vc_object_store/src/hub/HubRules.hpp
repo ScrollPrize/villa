@@ -21,6 +21,8 @@ struct HubPublication { int64_t position = 0, previous = 0, publishedAtUs = 0; s
 HubPublication hubPublicationAt(sqlite3* hub, int64_t position);
 // The publication that journaled a record version (a hubVersion), if recorded.
 std::optional<HubPublication> hubPublicationOf(sqlite3* hub, int64_t version);
+// The hub write that directly followed a position, if recorded.
+std::optional<HubPublication> hubPublicationAfter(sqlite3* hub, int64_t previous);
 int64_t hubHead(sqlite3* hub);
 // Capture the cursors that delimit this write's changes; call after BEGIN.
 void beginHubWrite(sqlite3*, StatementPool&);

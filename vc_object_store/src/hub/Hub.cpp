@@ -49,6 +49,8 @@ std::shared_ptr<ObjectStore> openHub(const ObjectStore& replica, const Txn& txn,
         if (!hub.store) {
             OpenOptions options;
             options.author = replica.author();
+            // A read-only replica (no author) only reads hub positions.
+            options.readOnly = options.author.empty();
             options.sharedFile = true;
             options.busyTimeoutMs = kHubBusyTimeoutMs;
             hub.store = std::make_shared<ObjectStore>(ObjectStore::open(up.hub, options));
@@ -456,7 +458,11 @@ HubSyncReport hubPush(ObjectStore& replica, std::optional<int64_t> expectedHead)
         const auto handle = openHub(replica, local, up);
         auto hubTxn = handle->read();
         const auto head = hubHead(conn(hubTxn));
+        // A retry after this replica's own publication on top of the head
+        // completed, but its response was lost, recovers that position.
+        const auto next = head == *expectedHead ? std::nullopt : hubPublicationAfter(conn(hubTxn), *expectedHead);
         if (head == *expectedHead) report.publishedPosition = head;
+        else if (next && next->replica == self) report.publishedPosition = next->position;
         else { report.headMismatch = true; report.hubHead = head; }
         return report;
     }

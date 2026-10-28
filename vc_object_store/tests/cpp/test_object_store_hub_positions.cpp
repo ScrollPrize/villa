@@ -194,8 +194,12 @@ int main() try
     // No-op linking validates the head too.
     report = hubPush(alice, n);
     require(report.publishedPosition == n && !report.headMismatch, "no-op push at the head returns N=H");
+    // Against the head its own publication followed, it recovers that
+    // publication (a lost response); against an older head, a mismatch.
     report = hubPush(alice, h2);
-    require(report.headMismatch && report.hubHead == n, "no-op push against an old head is a mismatch");
+    require(!report.headMismatch && report.publishedPosition == n, "no-op retry recovers its publication");
+    report = hubPush(alice, h);
+    require(report.headMismatch && report.hubHead == n, "no-op push against a foreign successor is a mismatch");
 
     // A lost response: the publication happened but this replica lost its
     // bookkeeping. The retry against the same head recovers N, even after

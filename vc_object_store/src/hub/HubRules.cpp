@@ -121,6 +121,15 @@ HubPublication hubPublicationAt(sqlite3* hub, int64_t position)
     return result;
 }
 
+std::optional<HubPublication> hubPublicationAfter(sqlite3* hub, int64_t previous)
+{
+    if (!hasPublications(hub)) return std::nullopt;
+    Statement row(hub, "SELECT position,previous,published_at_us,replica FROM hub_publications "
+                       "WHERE previous=? AND position>? ORDER BY position LIMIT 1", previous, previous);
+    if (!row.row()) return std::nullopt;
+    return publication(row);
+}
+
 std::optional<HubPublication> hubPublicationOf(sqlite3* hub, int64_t version)
 {
     if (!hasPublications(hub)) return std::nullopt;
