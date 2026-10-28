@@ -10,6 +10,7 @@ os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 import hashlib
 import logging
 import shutil
+import tempfile
 import math
 import time
 from typing import List, Tuple, Optional
@@ -634,9 +635,9 @@ def reduce_partitions(
     H, W = pred_shape
     logger.info(f"Starting reduce phase: will blend {num_parts} partitions tile-by-tile (tile_size={tile_size})")
 
-    # Cache directory for partition zarrs (network filesystem -> local /tmp)
-    cache_dir = "/tmp/partition_cache"
-    os.makedirs(cache_dir, exist_ok=True)
+    # Cache directory for partition zarrs (network filesystem -> local /tmp), fresh per call: partitions are named
+    # by part id only, so a shared directory would hand a later reduce the copies of an earlier one.
+    cache_dir = tempfile.mkdtemp(prefix="partition_cache_")
 
     # Open all partition zarr arrays once (outside the generator loop)
     logger.info(f"Caching and opening {num_parts} partition zarr arrays in parallel...")
@@ -710,7 +711,7 @@ def reduce_partitions(
             W, H, tile_size, pixel_resolution_um, scale_bar_length_um
         )
 
-    def tile_generator():
+    def blended_tiles():
         """Lazily generate tiles by blending partitions on-the-fly."""
         total_tiles = ((H + tile_size - 1) // tile_size) * ((W + tile_size - 1) // tile_size)
 
@@ -765,6 +766,12 @@ def reduce_partitions(
                     yield result_uint8
                     pbar.update(1)
                     tile_idx_x += 1
+
+    def tile_generator():
+        try:
+            yield from blended_tiles()
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
     return tile_generator(), pred_shape
 
