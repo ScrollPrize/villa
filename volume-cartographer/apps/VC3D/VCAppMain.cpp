@@ -16,6 +16,7 @@
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
+#include "SystemMemory.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
 #include "vc/core/render/ChunkCache.hpp"
@@ -516,7 +517,7 @@ auto main(int argc, char* argv[]) -> int
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, vc3d::defaultRamCacheSizeGB()).toULongLong();
         automaticDownloadParallelism = settings.value(
             perf::REMOTE_DOWNLOAD_AUTOMATIC,
             perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
