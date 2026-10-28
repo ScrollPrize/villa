@@ -247,6 +247,7 @@ int main() try
         };
         auto hold = session.holdPushes(attachment);
         require(session.hubStatus(attachment)->pushesHeld, "status shows the hold");
+        require(session.hubStatus(attachment)->hubReplica == hubStatus(bob)->hubReplica, "status names the hub");
         session.act(attachment, endpoints(), [&](auto& store, auto& txn) { store.setMeta(txn, ab, "note", "\"held\""); });
         std::this_thread::sleep_for(std::chrono::milliseconds(600));
         require(session.hubStatus(attachment)->pending.size() == 1, "background sync does not push under a hold");

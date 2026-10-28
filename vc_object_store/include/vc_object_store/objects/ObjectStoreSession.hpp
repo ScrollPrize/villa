@@ -88,6 +88,9 @@ struct HubSessionStatus {
     std::string error;                  // last failed sync; empty once one succeeds
     std::optional<int64_t> syncedAtUs;  // last successful sync, UTC Unix microseconds
     std::vector<HubLease> leases;       // as of the last hub contact
+    // The hub this replica belongs to: its address and identity (positions
+    // belong to the identity).
+    std::string hub, hubReplica;
     // The hub position (objects/Hub.hpp) the last successful sync reached: its
     // push's publication when it published, else the state it pulled.
     int64_t position = 0;

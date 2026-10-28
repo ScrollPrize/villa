@@ -34,6 +34,7 @@ nb::object sessionHubStatus(const std::optional<vo::HubSessionStatus>& status)
     result["error"] = status->error; result["synced_at_us"] = status->syncedAtUs;
     result["leases"] = hubLeases(status->leases);
     result["position"] = status->position; result["pushes_held"] = status->pushesHeld;
+    result["hub"] = status->hub; result["hub_replica"] = status->hubReplica;
     return result;
 }
 

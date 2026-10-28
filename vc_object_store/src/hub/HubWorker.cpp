@@ -180,6 +180,8 @@ HubSessionStatus HubWorker::localStatus()
 {
     HubSessionStatus result;
     if (const auto status = hubStatus(replica_)) {
+        result.hub = status->hub.string();
+        result.hubReplica = status->hubReplica;
         result.pending = status->pending;
         result.conflicts = status->conflicts;
         result.leases = status->leases;
