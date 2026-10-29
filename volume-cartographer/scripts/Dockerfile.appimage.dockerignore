@@ -5,6 +5,8 @@
 !spiral-fitting/**
 !vc_object_store/
 !vc_object_store/**
+!vc_reader/
+!vc_reader/**
 !vesuvius/
 !vesuvius/src/
 !vesuvius/src/vc3d_fiber_format/
@@ -12,6 +14,8 @@
 
 # Never send generated or local-only content from the included subtrees.
 **/build/
+**/build-*/
+**/.venv/
 **/dist/
 **/.cache/
 **/__pycache__/

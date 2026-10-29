@@ -640,7 +640,8 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
     set(VC_DELTA3D_BUILD_PYTHON OFF)
     set(VC_DELTA3D_BUILD_TESTS OFF)
-    set(VC_DELTA3D_INSTALL_CPP OFF)
+    # vc_reader's installed native target exports this dependency.
+    set(VC_DELTA3D_INSTALL_CPP ON)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
         GIT_TAG v0.2.0
@@ -749,6 +750,12 @@ if(TARGET vc_objects)
     # The sibling object store builds DLLs on Windows (cmake/ObjectStore.cmake).
     get_target_property(_vc_object_store_dir vc_objects SOURCE_DIR)
     list(APPEND _vc_install_dirs "${_vc_object_store_dir}")
+endif()
+if(TARGET vc_reader_native)
+    # Include the reader (and SFTP DLL on Windows) in the runtime component,
+    # which AppImage and app-bundle packaging install independently of headers.
+    get_target_property(_vc_reader_dir vc_reader_native SOURCE_DIR)
+    list(APPEND _vc_install_dirs "${_vc_reader_dir}")
 endif()
 foreach(_dir IN LISTS _vc_install_dirs)
     get_filename_component(_dir "${_dir}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")

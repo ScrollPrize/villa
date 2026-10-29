@@ -45,6 +45,7 @@ RUN apt-get update \
 COPY volume-cartographer/ /src/volume-cartographer/
 COPY spiral-fitting/ /src/spiral-fitting/
 COPY vc_object_store/ /src/vc_object_store/
+COPY vc_reader/ /src/vc_reader/
 COPY vesuvius/src/vc3d_fiber_format/ /src/vesuvius/src/vc3d_fiber_format/
 WORKDIR /src/volume-cartographer
 
