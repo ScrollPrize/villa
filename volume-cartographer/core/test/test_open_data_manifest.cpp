@@ -543,7 +543,7 @@ TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume s
     std::filesystem::remove_all(root);
 }
 
-TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
+TEST_CASE("Open-data Lasagna attaches only its scan, opened at a working level in VC3D")
 {
     vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
@@ -570,20 +570,20 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
     auto pkg = vc::test::emptyProject(options);
     const auto result = attachOpenDataSampleVolumes(*pkg, sample);
 
-    CHECK(result.attachedVolumeEntries == 2);
-    REQUIRE(pkg->volumeEntries().size() == 2);
+    CHECK(result.attachedVolumeEntries == 1);
+    REQUIRE(pkg->volumeEntries().size() == 1);
     CHECK(pkg->volumeEntries()[0].location ==
           "http://127.0.0.1:9/source.zarr");
-    CHECK(pkg->volumeEntries()[1].location ==
-          "http://127.0.0.1:9/source.zarr#vc-base-scale=2");
     CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[0]));
-    CHECK(vc::project::usesAnonymousRemoteAuth(pkg->volumeEntries()[1]));
-    // The catalog names the rebased view: its volume at level 2.
+    // Opened at level 2, the entry still names the scan: its volume at level 2.
     vcr::catalog::OpenDataManifest catalog;
     catalog.samples = {sample};
-    const auto view = vc::project::catalogVolumeView(&catalog, pkg->volumeEntries()[1].location);
+    const auto view = vc::project::catalogVolumeView(&catalog, "http://127.0.0.1:9/source.zarr#vc-base-scale=2");
     REQUIRE(view);
     CHECK((view->volumeId == "high-resolution" && view->level == 2 && view->source));
+    // Attaching the sample again keeps the one entry.
+    CHECK(attachOpenDataSampleVolumes(*pkg, sample).attachedVolumeEntries == 0);
+    CHECK(pkg->volumeEntries().size() == 1);
 }
 
 TEST_CASE("Selected Lasagna does not implicitly attach scan views")

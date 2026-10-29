@@ -162,24 +162,17 @@ int main()
         require(registrations.resolve("vol1", "missing").status == TransformStatus::Unavailable, "unrelated volume");
 
         // Opened volumes: the source zarr at a base level, a derived dataset at its level.
-        require(levelVolumeId("vol1", 0) == "vol1" && levelVolumeId("vol1", 2) == "vol1@L2", "level ids");
         const auto zarrUrl =
             std::string("https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/volumes/vol1.zarr");
         const auto atL2 = manifest.volumeAt(zarrUrl + "/", 2);
-        require(atL2 && atL2->sampleId == "PHerc0139" && atL2->volumeId == "vol1" && atL2->level == 2 && atL2->source &&
-                    atL2->frameId() == "vol1@L2",
+        require(atL2 && atL2->sampleId == "PHerc0139" && atL2->volumeId == "vol1" && atL2->level == 2 && atL2->source,
                 "source volume at a base level");
-        require(manifest.volumeAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr")->level == 0,
-                "published source path");
+        const auto atL0 = manifest.volumeAt("s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
+        require(atL0 && atL0->level == 0, "published source path");
+        require(!atL0->sameGrid(*atL2) && atL2->sameGrid(*manifest.volumeAt(zarrUrl, 2)), "a level is its own grid");
         require(!manifest.volumeAt("https://example.test/other.zarr"), "unknown volume");
-        RegistrationGraph levels;
-        levels.addSample(*sample);
-        const auto down = levels.resolve("vol1", "vol1@L2");
-        require(down.status == TransformStatus::Resolved && down.resolved().forward(0, 0) == 0.25, "level edge");
-        const auto across = levels.resolve("vol1@L1", "vol2@L1");
-        require(across.status == TransformStatus::Resolved && across.resolved().forward(0, 0) == 0.5 &&
-                    across.resolved().forward(0, 3) == 5,
-                "levels compose with registrations");
+        // The transform and the supersession only: a pyramid level is a scale of its volume.
+        require(registrations.registrations().size() == 2, "no level registrations");
 
         // Segments.
         const auto& segment = sample->segments.front();

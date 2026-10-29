@@ -55,19 +55,13 @@ size_t surfaceGeometryCacheBytes()
     return size_t(std::max<qlonglong>(0, gb)) << 30;
 }
 
-// The box spanned by `box`'s corners through `m`.
-Rect3D mappedBox(const Rect3D& box, const vcr::catalog::Affine& m)
+// The box spanned by `box`'s corners scaled by `scale` (positive).
+Rect3D scaledBox(const Rect3D& box, double scale)
 {
     Rect3D result;
-    result.low = cv::Vec3f::all(std::numeric_limits<float>::infinity());
-    result.high = cv::Vec3f::all(-std::numeric_limits<float>::infinity());
-    for (int corner = 0; corner < 8; ++corner) {
-        const auto p = m.apply({(corner & 1 ? box.high : box.low)[0], (corner & 2 ? box.high : box.low)[1],
-                                (corner & 4 ? box.high : box.low)[2]});
-        for (int axis = 0; axis < 3; ++axis) {
-            result.low[axis] = std::min(result.low[axis], float(p[axis]));
-            result.high[axis] = std::max(result.high[axis], float(p[axis]));
-        }
+    for (int axis = 0; axis < 3; ++axis) {
+        result.low[axis] = std::min(box.low[axis], box.high[axis]) * float(scale);
+        result.high[axis] = std::max(box.low[axis], box.high[axis]) * float(scale);
     }
     return result;
 }
@@ -559,7 +553,7 @@ void CState::updateAnnotationVolume()
 std::optional<Rect3D> CState::focusBounds() const
 {
     if (!_focusBounds || !_annotationVolume) return std::nullopt;
-    return mappedBox(*_focusBounds, _annotationVolume->fromVolume.inverse());
+    return scaledBox(*_focusBounds, _annotationVolume->scale);
 }
 
 std::optional<Rect3D> CState::activeFocusBounds() const
@@ -580,7 +574,7 @@ void CState::setFocusBounds(const Rect3D& bounds)
 {
     if (!_annotationVolume)
         return;
-    const auto normalized = mappedBox(bounds, _annotationVolume->fromVolume);
+    const auto normalized = scaledBox(bounds, 1.0 / _annotationVolume->scale);
     for (int axis = 0; axis < 3; ++axis)
         if (!std::isfinite(normalized.low[axis]) || !std::isfinite(normalized.high[axis]))
             return;
@@ -752,11 +746,11 @@ void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface)
         _objectStoreSession->clearDraft(_activeSurfaceDraft);
         _activeSurfaceDraft.clear();
     }
-    if (!surface || !_currentVolume || !vc::objects::util::isUuid(surface->id)) {
+    if (!surface || !_annotationVolume || !vc::objects::util::isUuid(surface->id)) {
         return;
     }
     _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
-                                  vc::objects::volumeCoordinates(currentVolumeId(), 1));
+                                  vc::objects::volumeCoordinates(*_annotationVolume));
     _activeSurfaceDraft = surface->id;
 }
 

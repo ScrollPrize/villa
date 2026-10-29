@@ -523,8 +523,11 @@ NB_MODULE(_native, m)
             const auto document = self.withRead<true>([&](auto& db, auto& txn) { return vo::attachedDocument(db, txn, owner, role); });
             return document ? jsonLoads(document->dump()) : nb::none();
         }, nb::arg("owner_uuid"), nb::arg("role"), "The document attached to owner in role, or None.")
-        .def("point_collections", [](PyObjectStore& self, const std::vector<std::string>& uuids, const std::string& volume) {
-            const auto collections = self.withRead<true>([&](auto& db, auto& txn) { return vo::pointCollections(db, txn, uuids, volume); });
+        .def("point_collections", [](PyObjectStore& self, const std::vector<std::string>& uuids, const std::string& volume,
+                                     double targetScale) {
+            const auto collections = self.withRead<true>([&](auto& db, auto& txn) {
+                return vo::pointCollections(db, txn, uuids, vo::VolumeVoxels{volume, targetScale});
+            });
             nb::list out;
             for (const auto& collection : collections) {
                 nb::dict item;
@@ -535,8 +538,9 @@ NB_MODULE(_native, m)
                 out.append(item);
             }
             return out;
-        }, nb::arg("uuids"), nb::arg("volume"),
-           "Point collections by UUID (any role), in the volume's voxels: uuid, name, ids, points, annotations, source.")
+        }, nb::arg("uuids"), nb::arg("volume"), nb::arg("target_scale") = 1.0,
+           "Point collections by UUID (any role), in the volume's voxels at target_scale: uuid, name, ids, points, "
+           "annotations, source.")
         .def("attachments", [](PyObjectStore& self, const std::string& owner, const std::optional<std::string>& role) {
             const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.attachments(txn, owner, role); });
             nb::list out; for (const auto& record : records) out.append(edgeToPy(record));
@@ -591,11 +595,11 @@ NB_MODULE(_native, m)
             const std::optional<std::string>& family, const std::optional<double>& minLength,
             const std::string& orderBy, const std::optional<std::string>& afterUuid,
             const std::optional<double>& afterLength, bool includeRetired,
-            const std::optional<std::string>& volume, bool includeUnbound) {
+            const std::optional<std::string>& volume, bool includeUnbound, double targetScale) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
-            selection.volume = volume; selection.includeUnbound = includeUnbound;
+            selection.volume = volume; selection.includeUnbound = includeUnbound; selection.targetScale = targetScale;
             const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); });
             const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list result;
@@ -607,7 +611,7 @@ NB_MODULE(_native, m)
            nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
            nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false,
-           nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false)
+           nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false, nb::arg("target_scale") = 1.0)
         .def("geometry_region", &geometryRegionFromPy, nb::arg("slice"),
              nb::arg("options") = vo::RegionOptions{}, nb::arg("cancel") = nb::none())
         .def("nearest_surfaces", [](PyObjectStore& self, const std::array<double, 3>& point, double tolerance,
@@ -630,10 +634,10 @@ NB_MODULE(_native, m)
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
             const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset,
             const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired,
-            const std::optional<std::string>& volume) {
+            const std::optional<std::string>& volume, double targetScale) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
-            selection.volume = volume;
+            selection.volume = volume; selection.targetScale = targetScale;
             const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); });
             nb::list result;
             for (const auto& r : regions) {
@@ -647,7 +651,7 @@ NB_MODULE(_native, m)
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt, nb::arg("include_retired") = false,
-           nb::arg("volume") = std::nullopt,
+           nb::arg("volume") = std::nullopt, nb::arg("target_scale") = 1.0,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,

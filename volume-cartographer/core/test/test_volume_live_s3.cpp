@@ -76,7 +76,8 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
                             "usage": "public-read"}]}]}]}}}}})"));
     auto project = store.open(deferred);
     REQUIRE(project->addVolumeEntry(url, {"vc-remote-auth:anonymous"}));
-    REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
+    // A working level is the same entry, not a second volume.
+    CHECK_FALSE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
     project = store.open(deferred);
     project->resolveDeferredEntries();
     const auto volume = project->volume("20260102150214");
@@ -114,29 +115,40 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
             << " decoded bytes, " << fetches->load() << " remote chunk fetches");
     CHECK(vc::objects::geometryScaleToVolume(fiber, volume->id()) == 1.0);
     CHECK(vc::objects::volumeCoordinates(volume->id(), 1) == fiber.at("coordinates"));
-    REQUIRE(project->volumeIDs().size() == 2);
-    for (const auto& id : project->volumeIDs()) {
-        if (id != volume->id()) {
-            const auto rebased = project->volume(id);
-            CHECK(rebased->id() == "20260102150214@L2");
-            // Both show the catalog volume, at their levels: different frames.
-            const auto view = project->catalogView(rebased->id());
-            REQUIRE(view);
-            CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
-            CHECK_FALSE(project->overlayCompatible(volume->id(), rebased->id()));
-            CHECK(project->overlayCompatible(rebased->id(), rebased->id()));
-            CHECK(rebased->voxelSize() == doctest::Approx(4 * 2.399));
-            CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
-            CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
-            // Annotations on either level are kept in the level-0 catalog volume.
-            const auto annotation = vc::project::annotationVolume(project.get(), *rebased);
-            CHECK(annotation.id == "20260102150214");
-            CHECK(annotation.fromVolume.apply({1, 2, 3}) == std::array<double, 3>{4, 8, 12});
-            REQUIRE(annotation.voxelSizeUm);
-            CHECK(*annotation.voxelSizeUm == doctest::Approx(2.399));
-            CHECK(vc::project::annotationVolume(project.get(), *volume).id == "20260102150214");
-        }
-    }
+    REQUIRE(project->volumeIDs() == std::vector<std::string>{"20260102150214"});
+    CHECK(vc::project::annotationVolume(project.get(), *volume).volume == "20260102150214");
+
+    // The same volume at working level 2: its ID, entry and objects stay; its
+    // voxels are 4 of the volume's own.
+    const auto levelZeroCache = volume->remotePersistentCachePath();
+    REQUIRE(project->setVolumeLevel("20260102150214", 2));
+    CHECK_FALSE(project->setVolumeLevel("20260102150214", 2));
+    const auto coarse = project->volume("20260102150214");
+    REQUIRE(coarse);
+    CHECK(coarse != volume);
+    CHECK(coarse->baseScaleLevel() == 2);
+    CHECK(project->volumeEntries().size() == 1);
+    CHECK(project->volumeEntries().front().location == url + "#vc-base-scale=2");
+    const auto view = project->catalogView(coarse->id());
+    REQUIRE(view);
+    CHECK((view->sampleId == "PHerc0139" && view->volumeId == "20260102150214" && view->level == 2 && view->source));
+    CHECK(project->overlayCompatible(coarse->id(), coarse->id()));
+    CHECK(coarse->voxelSize() == doctest::Approx(4 * 2.399));
+    CHECK(coarse->remotePersistentCachePath() != levelZeroCache);
+    // Objects made on it are kept in the volume's own voxels, at its scale.
+    const auto annotation = vc::project::annotationVolume(project.get(), *coarse);
+    CHECK(annotation.volume == "20260102150214");
+    CHECK(annotation.scale == 0.25);
+    REQUIRE(annotation.voxelSizeUm);
+    CHECK(*annotation.voxelSizeUm == doctest::Approx(2.399));
+    // The project reopens at the level, and goes back to level 0.
+    project = store.open(deferred);
+    project->resolveDeferredEntries();
+    REQUIRE(project->volume("20260102150214"));
+    CHECK(project->volume("20260102150214")->baseScaleLevel() == 2);
+    REQUIRE(project->setVolumeLevel("20260102150214", 0));
+    CHECK(project->volumeEntries().front().location == url);
+    CHECK(project->volume("20260102150214")->remotePersistentCachePath() == levelZeroCache);
 
     // Optional read-only validation against a local replica of the PHerc0139 hub.
     if (const char* path = std::getenv("VC_TEST_CATALOG_FIBER_STORE")) {

@@ -130,7 +130,7 @@ int runObjectStoreControllerTests()
             QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
             QObject::connect(&controller, &Controller::fibersChanged, [&] { ++fibersChanged; });
             const auto attachment = *state.storeFor("fiber");
-            require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id()) &&
+            require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, {volume->id()}) &&
                         !controller.umbilicusStatus().available,
                     "a volume without a stored umbilicus has none");
             auto add = [&](const std::string& name) {
@@ -145,7 +145,7 @@ int runObjectStoreControllerTests()
                 return uuid;
             };
             const auto first = add("scroll");
-            const auto stored = vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id());
+            const auto stored = vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, {volume->id()});
             require(changed > 0, "committing an umbilicus announces it");
             require(fibersChanged == 0, "a commit touching no fiber leaves the fiber caches alone");
             require(stored && stored->uuid == first &&
@@ -153,7 +153,7 @@ int runObjectStoreControllerTests()
                     "the stored umbilicus is read in the volume's voxels");
             require(controller.umbilicusStatus().available && controller.umbilicusStatus().text == "scroll",
                     "the fiber map status names the stored umbilicus");
-            const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->id);
+            const auto snapshot = controller.umbilicusForSnapshot(state.annotationVolume()->volume);
             require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
             const auto token = controller.umbilicusFingerprint();
             add("second");
@@ -188,7 +188,7 @@ int runObjectStoreControllerTests()
             points->setCollectionAnchor2d(anchored, cv::Vec2f(1, 1));
             points->addPoint("correction", {7, 7, 7});
             const auto attachment = *state.storeFor("fiber");
-            auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, volume->id()); };
+            auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, {volume->id()}); };
             require(settle([&] { return stored().size() == 1 && stored()[0].points.points.size() == 2; }),
                     "an edited collection reaches the store after the debounce");
             require(stored()[0].name == "seeds", "the store holds the collection's name");
@@ -208,7 +208,7 @@ int runObjectStoreControllerTests()
             }
             auto edited = stored()[0];
             edited.points.points[1] = {3, 3, 3};
-            vc::objects::writeVolumeCollections(*state.objectStoreSession(), attachment, volume->id(), {edited}, {});
+            vc::objects::writeVolumeCollections(*state.objectStoreSession(), attachment, {volume->id()}, {edited}, {});
             state.pollObjectStoreChanges();
             require(settle([&] {
                         const auto found = points->getAllCollections().find(*points->getCollectionId("seeds"));

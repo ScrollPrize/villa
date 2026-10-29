@@ -720,8 +720,9 @@ std::vector<std::optional<ViewerManager::SurfaceLocation>> ViewerManager::locate
             queried.push_back({points[i][0], points[i][1], points[i][2]});
             sources.push_back(i);
         }
-    const auto hits = SurfaceCatalog::nearest(*session, _state->surfaceSources(), _state->currentVolumeId(), {surface.id},
-                                              queried, tolerance);
+    const auto hits = SurfaceCatalog::nearest(*session, _state->surfaceSources(),
+                                              _state->annotationVolume().value_or(vc::project::AnnotationVolume{}),
+                                              {surface.id}, queried, tolerance);
     for (size_t i = 0; i < queried.size(); ++i)
         if (!hits[i].empty()) {
             const auto& hit = hits[i].front();

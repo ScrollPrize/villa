@@ -298,6 +298,7 @@ private:
         QString name;        // record name; the UUID when unnamed
         QString store;       // the store file (a hosted replica's local file)
         QString volumeUuid;  // the current volume, which outputs are bound to
+        double voxelScale = 1;  // tools' voxels per voxel of it (its working level)
     };
     // The listed surface `id` in a writable store, stored in the current volume's
     // voxels (tools read stored coordinates) or, for a tool that reads through

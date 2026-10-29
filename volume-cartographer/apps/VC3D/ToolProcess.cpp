@@ -33,7 +33,11 @@ QStringList ToolProcess::arguments(const Launch& launch)
 {
     QStringList args = launch.args;
     if (!launch.store.isEmpty()) args << QStringLiteral("--store") << launch.store;
-    if (!launch.volume.isEmpty()) args << QStringLiteral("--volume-uuid") << launch.volume;
+    if (!launch.volume.isEmpty()) {
+        args << QStringLiteral("--volume-uuid") << launch.volume;
+        if (launch.voxelScale != 1)
+            args << QStringLiteral("--voxel-scale") << QString::number(launch.voxelScale, 'g', 17);
+    }
     return args;
 }
 

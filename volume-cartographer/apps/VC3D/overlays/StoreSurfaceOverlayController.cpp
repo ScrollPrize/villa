@@ -290,7 +290,8 @@ void StoreSurfaceOverlayController::request(VolumeViewerBase* viewer, const vc3d
             const auto found = _views.find(viewer);
             return found == _views.end() ? nullptr : found->second.get();
         },
-        [session = _state->objectStoreSession(), sources = _state->surfaceSources(), volume = _state->currentVolumeId(),
+        [session = _state->objectStoreSession(), sources = _state->surfaceSources(),
+         volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
          uuids](const vc3d::store::Region& query, const std::atomic_bool& cancelled) {
             auto crossings = SurfaceCatalog::region(*session, sources, volume,
                                                     vc3d::store::regionSlice(query), surfaceOptions(uuids),
@@ -322,7 +323,8 @@ void StoreSurfaceOverlayController::requestCuts(VolumeViewerBase* viewer, const 
     v.cutsStale = false;
     using Cut = std::map<std::string, std::vector<Run>>;
     vc3d::store::background<Cut>(this,
-        [session = _state->objectStoreSession(), sources = _state->surfaceSources(), volume = _state->currentVolumeId(),
+        [session = _state->objectStoreSession(), sources = _state->surfaceSources(),
+         volume = vc::objects::VolumeVoxels(_state->annotationVolume().value_or(vc::project::AnnotationVolume{})),
          uuid, cuts] {
             Cut result;
             for (const auto& cut : cuts) {

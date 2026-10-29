@@ -776,8 +776,11 @@ void SurfacePanelController::bindSurface(const std::string& id)
         return;
     }
     try {
+        // Units per voxel of the open volume, so per voxel of its store volume
+        // at the open volume's scale of it.
+        const auto& voxels = _catalog->voxels();
         _catalog->session()->editCurrent(*_catalog->attachment(), {id}, [&](auto& db, auto& txn, const auto& uuid) {
-            db.bindGeometryCoordinates(txn, uuid, volume->id(), *scale);
+            db.bindGeometryCoordinates(txn, uuid, voxels.volume, *scale * voxels.scale);
         });
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
@@ -1635,7 +1638,7 @@ void SurfacePanelController::refreshStoreFilters()
     }
     struct Answers { ProximityAnswer focus, pointSets; std::optional<ZRangeAnswer> zRange; std::optional<TagAnswer> tags; };
     vc3d::store::background<Answers>(this,
-        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->volume()->id(), focus, pointSets,
+        [session = _catalog->session(), sources = _catalog->sources(), volume = _catalog->voxels(), focus, pointSets,
          focusRadius, zRange, tags]() {
             auto answer = [&](const auto& sets, double tolerance) {
                 ProximityAnswer result;
@@ -1643,7 +1646,8 @@ void SurfacePanelController::refreshStoreFilters()
                 result.tolerance = tolerance;
                 vc::objects::SurfaceProximityQuery query;
                 query.tolerance = tolerance;
-                query.volume = volume;
+                query.volume = volume.volume;
+                query.targetScale = volume.scale;
                 for (const auto& points : sets) {
                     std::set<std::string> any, all;
                     bool first = true;
@@ -1667,7 +1671,8 @@ void SurfacePanelController::refreshStoreFilters()
                 constexpr double kUnbounded = std::numeric_limits<double>::max();
                 vc::objects::ObjectSelection selection;
                 selection.kind = "surface";
-                selection.volume = volume;
+                selection.volume = volume.volume;
+                selection.targetScale = volume.scale;
                 selection.bbox = std::array<double, 6>{-kUnbounded, -kUnbounded, (*zRange)[0],
                                                        kUnbounded, kUnbounded, (*zRange)[1]};
                 ZRangeAnswer reached{*zRange, {}};

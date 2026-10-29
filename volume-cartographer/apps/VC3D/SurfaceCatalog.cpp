@@ -22,7 +22,7 @@ struct Listing {
 // Open Data catalogs hold each surface once per scan of a sample, every copy
 // mapped into the others through the catalog's scan-to-scan registrations.
 // A copy reached only through one of those is another scan's, not listed;
-// pyramid levels, superseded volumes and users' registrations are kept.
+// superseded volumes and users' registrations are kept.
 bool otherScanCopy(const VolumeTransforms& transforms, const nlohmann::json& meta, const std::string& volume)
 {
     const auto coordinates = meta.value("coordinates", nlohmann::json::object());
@@ -38,7 +38,7 @@ bool otherScanCopy(const VolumeTransforms& transforms, const nlohmann::json& met
 }
 
 // The rows of `requested` (all when nullopt) in the volume.
-Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed, const std::string& volume,
+Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed, const VolumeVoxels& volume,
              const std::optional<std::vector<std::string>>& requested, const std::atomic_bool& cancel)
 {
     Listing listing;
@@ -46,7 +46,8 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
     if (requested && requested->empty()) return listing;
     ObjectSelection selection;
     selection.kind = "surface";
-    selection.volume = volume;
+    selection.volume = volume.volume;
+    selection.targetScale = volume.scale;
     selection.includeUnbound = true;
     if (requested) selection.uuids = *requested;
     std::map<AttachmentIdentity, std::shared_ptr<const VolumeTransforms>, decltype([](const auto& a, const auto& b) {
@@ -60,9 +61,9 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
                 mapping = std::make_shared<const VolumeTransforms>(db.volumeTransforms(txn));
             });
         const auto meta = nlohmann::json::parse(record.meta);
-        if (otherScanCopy(*mapping, meta, volume)) continue;
+        if (otherScanCopy(*mapping, meta, volume.volume)) continue;
         SurfaceCatalog::Row row;
-        row.mapping = mapping->toVolume(meta, volume);
+        row.mapping = mapping->toVolume(meta, volume.volume, volume.scale);
         row.record = std::move(record);
         row.source = attachment;
         listing.rows.push_back(std::move(row));
@@ -86,11 +87,13 @@ SurfaceCatalog::~SurfaceCatalog()
     if (cancelled_) cancelled_->store(true);
 }
 
-void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume)
+void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachment, std::shared_ptr<Volume> volume,
+                               const VolumeVoxels& voxels)
 {
-    if (attachment_ == attachment && volume_ == volume) return;
+    if (attachment_ == attachment && volume_ == volume && voxels_ == voxels) return;
     attachment_ = attachment;
     volume_ = std::move(volume);
+    voxels_ = voxels;
     restart();
 }
 
@@ -98,7 +101,7 @@ void SurfaceCatalog::readNow(const std::vector<std::string>& uuids)
 {
     if (!volume_) return;
     const std::atomic_bool notCancelled{false};
-    auto listing = list(*session_, sources(), volume_->id(), uuids, notCancelled);
+    auto listing = list(*session_, sources(), voxels_, uuids, notCancelled);
     for (const auto& uuid : uuids) rows_.erase(uuid);
     for (auto& row : listing.rows) rows_[row.record.uuid] = std::move(row);
     emit rowsChanged();
@@ -177,7 +180,7 @@ void SurfaceCatalog::schedule()
     busy_ = true;
     cancelled_ = std::make_shared<std::atomic_bool>(false);
     vc3d::store::background<Listing>(this,
-        [session = session_, listed, volume = volume_->id(), requested, cancel = cancelled_]() {
+        [session = session_, listed, volume = voxels_, requested, cancel = cancelled_]() {
             return list(*session, listed, volume, requested, *cancel);
         },
         [this, generation = generation_, requested](vc3d::store::Outcome<Listing> result) {
@@ -198,13 +201,13 @@ void SurfaceCatalog::schedule()
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid, const std::optional<std::string>& revision) const
 {
     if (!volume_) throw std::runtime_error("Open a volume first");
-    if (const auto* listed = row(uuid)) return open(session_, listed->source, volume_->id(), uuid, revision);
+    if (const auto* listed = row(uuid)) return open(session_, listed->source, voxels_, uuid, revision);
     if (!attachment_) throw std::runtime_error("Attach an object store and open a volume first");
-    return open(session_, *attachment_, volume_->id(), uuid, revision);
+    return open(session_, *attachment_, voxels_, uuid, revision);
 }
 
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSession>& session,
-                                            const AttachmentIdentity& attachment, const std::string& volume,
+                                            const AttachmentIdentity& attachment, const VolumeVoxels& volume,
                                             const std::string& uuid, const std::optional<std::string>& at)
 {
     Opened opened;
@@ -221,8 +224,9 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
         }
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const GeometrySnapshot snapshot(db, txn);
-        const auto view = current ? snapshot.viewTransformedAt(uuid, volume)
-                                  : snapshot.surface(uuid, revision->geometryRevision).viewTransformedAt(volume);
+        const auto view = current ? snapshot.viewTransformedAt(uuid, volume.volume, volume.scale)
+                                  : snapshot.surface(uuid, revision->geometryRevision)
+                                        .viewTransformedAt(volume.volume, volume.scale);
         opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,&view);
         opened.view = view.frame();
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
@@ -234,13 +238,14 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
 }
 
 std::vector<std::vector<SurfaceProximityHit>> SurfaceCatalog::nearest(
-    ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources, const std::string& volume,
+    ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources, const VolumeVoxels& volume,
     const std::vector<std::string>& uuids, const std::vector<std::array<double, 3>>& points, double tolerance)
 {
     std::vector<std::vector<SurfaceProximityHit>> result(points.size());
     if (uuids.empty() || points.empty()) return result;
     SurfaceProximityQuery query;
-    query.volume = volume;
+    query.volume = volume.volume;
+    query.targetScale = volume.scale;
     query.uuids = uuids;
     query.tolerance = tolerance;
     auto found = session.nearestSurfaces(sources, query, points);
@@ -253,7 +258,7 @@ SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
     if (!session_->writable(*attachment_)) throw std::runtime_error("The object store is read-only.");
-    return {session_->path(*attachment_), volume_->id()};
+    return {session_->path(*attachment_), voxels_};
 }
 
 std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const SurfaceProvenance& provenance,
@@ -262,18 +267,19 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
     const auto uuid = util::newUuid();
     session_->act(*attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        create_quad_in_store(db, txn, uuid, surface, name, tags, volumeCoordinates(volume_->id(), 1), provenance);
+        create_quad_in_store(db, txn, uuid, surface, name, tags, volumeCoordinates(voxels_), provenance);
     });
     surface.id = uuid;
     return uuid;
 }
 
 SurfaceCatalog::Crossings SurfaceCatalog::region(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& sources,
-                                                 const std::string& volume, const RegionSlice& slice, RegionOptions options,
+                                                 const VolumeVoxels& volume, const RegionSlice& slice, RegionOptions options,
                                                  const std::function<bool()>& cancelled)
 {
     options.kind = "surface";
-    options.volume = volume;
+    options.volume = volume.volume;
+    options.targetScale = volume.scale;
     const auto isCancelled = [&] { return cancelled && cancelled(); };
     if (isCancelled()) return {{}, false, {}};
     Crossings crossings;

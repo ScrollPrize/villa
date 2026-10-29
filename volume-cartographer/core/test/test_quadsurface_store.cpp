@@ -252,28 +252,38 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
     }
     {
         StoreSurfaces surfaces(dir / "objects.vcobj", "vc_test_tool");
-        auto inVolume = surfaces.load(uuid, true, std::string("vol"));
+        auto inVolume = surfaces.load(uuid, true, VolumeVoxels{"vol"});
         CHECK((*inVolume->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 4));
         CHECK_THROWS(surfaces.update(uuid, *inVolume));
-        CHECK_THROWS(surfaces.load(uuid, true, std::string("other-volume")));
+        CHECK_THROWS(surfaces.load(uuid, true, VolumeVoxels{"other-volume"}));
         // A volume registered to "vol" (here shifted by 10 in x) reads through the store's mapping.
         const auto registration = util::newUuid();
         surfaces.objects().session()->act(surfaces.objects().attachment(), {{registration, std::nullopt}}, [&](auto& db, auto& txn) {
             VolumeAffine shift; shift(0, 3) = 10;
             db.registerVolumeTransform(txn, "vol", "registered", shift, "test registration", registration);
         });
-        auto registered = surfaces.load(uuid, true, std::string("registered"));
+        auto registered = surfaces.load(uuid, true, VolumeVoxels{"registered"});
         CHECK((*registered->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         CHECK_THROWS(surfaces.update(uuid, *registered));
         // A new surface made from it is in the registered volume's voxels.
         const auto derived = surfaces.create(*registered, "derived", nlohmann::json::object(), {uuid});
-        auto reread = surfaces.load(derived, true, std::string("registered"));
+        auto reread = surfaces.load(derived, true, VolumeVoxels{"registered"});
         CHECK((*reread->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         auto derivedInStore = surfaces.load(derived);
         CHECK_THROWS(surfaces.create(*derivedInStore, "mixed", nlohmann::json::object(), {uuid, derived}));
         auto inStore = surfaces.load(uuid);
         CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
         CHECK_NOTHROW(surfaces.update(uuid, *inStore));
+        // At working level 1 (half the volume's voxels): read there, and what is
+        // made from it is bound to the volume at that scale.
+        auto coarse = surfaces.load(uuid, true, VolumeVoxels{"vol", 0.5});
+        CHECK((*coarse->rawPointsPtr())(1, 1) == cv::Vec3f(0.5f, 0.5f, 2));
+        const auto atLevel = surfaces.create(*coarse, "at-level", nlohmann::json::object(), {uuid});
+        surfaces.objects().session()->read(surfaces.objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            CHECK(nlohmann::json::parse(db.objectByUuid(txn, atLevel)->meta).at("coordinates") ==
+                  vc::objects::volumeCoordinates("vol", 0.5));
+        });
+        CHECK((*surfaces.load(atLevel, true, VolumeVoxels{"vol"})->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 4));
     }
     std::error_code ignored;
     fs::remove_all(dir, ignored);

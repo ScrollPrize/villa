@@ -243,8 +243,14 @@ private slots:
     QString lastVolumeSettingKeyForCurrentPackage() const;
     QString rememberedVolumeIdForCurrentPackage() const;
     void rememberCurrentVolumeForPackage(const QString& volumeId) const;
-    // Volume coordinates of `from` in `to` when switching volumes, when the two are related.
-    std::optional<vcr::catalog::Affine> volumeTransformForSwitch(const std::string& from, const std::string& to) const;
+    // Volume coordinates of `from` in `to` (the two volumes' store voxels) when
+    // switching volumes or working levels, when the two are related.
+    std::optional<vcr::catalog::Affine> volumeTransformForSwitch(const vc::objects::VolumeVoxels& from,
+                                                                 const vc::objects::VolumeVoxels& to) const;
+    // Reopen the current volume at working level `level` (the same volume, its
+    // voxels 2^level of its own); refused while a surface is being edited.
+    void setVolumeLevel(int level);
+    void syncVolumeLevelControl();
     void resetSegmentationViews(bool persistLayout = true);
     void onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
@@ -260,6 +266,7 @@ private:
     CState* _state;
 
     QComboBox* volSelect{nullptr};
+    QSpinBox* _volumeLevelSpin{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
 
 

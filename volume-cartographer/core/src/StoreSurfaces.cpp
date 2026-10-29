@@ -4,6 +4,7 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 
+#include <cmath>
 #include <stdexcept>
 
 StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool) : objects_(store, tool) {}
@@ -13,7 +14,7 @@ StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::stri
 StoreSurfaces::~StoreSurfaces() = default;
 
 std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity,
-                                                 const std::optional<std::string>& volume)
+                                                 const std::optional<vc::objects::VolumeVoxels>& volume)
 {
     std::unique_ptr<QuadSurface> surface;
     std::string objectRevision, revision;
@@ -21,7 +22,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
     const auto& session = objects_.session();
     session->read(objects_.attachment(), [&](const auto& db, const auto& txn, const auto&) {
         if (volume) {
-            const auto view = vc::objects::GeometrySnapshot(db, txn).viewTransformedAt(uuid, *volume);
+            const auto view = vc::objects::GeometrySnapshot(db, txn).viewTransformedAt(uuid, volume->volume, volume->scale);
             identity = view.mapping() == vc::objects::VolumeAffine::identity();
             surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, &view);
         } else {
@@ -37,7 +38,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
 
 std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
-                                  const std::optional<std::string>& volume)
+                                  const std::optional<vc::objects::VolumeVoxels>& volume)
 {
     const auto coordinates = objects_.coordinatesFor(sources, volume);
     const auto uuid = vc::objects::util::newUuid();
@@ -75,7 +76,26 @@ bool StoreOutputArgs::parse(const std::string& arg)
     if (const auto v = value("--store")) store = *v;
     else if (const auto v = value("--name")) name = *v;
     else if (const auto v = value("--tag")) tags.push_back(*v);
-    else if (const auto v = value("--volume-uuid")) volume = *v;
-    else return false;
+    else if (const auto v = value("--volume-uuid")) {
+        if (!volume) volume.emplace();
+        volume->volume = *v;
+    } else if (const auto v = value("--voxel-scale")) {
+        if (!volume) volume.emplace();
+        volume->scale = parseVoxelScale(*v);
+    } else return false;
     return true;
+}
+
+double parseVoxelScale(const std::string& value)
+{
+    size_t used = 0;
+    double scale = 0;
+    try {
+        scale = std::stod(value, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (used != value.size() || !std::isfinite(scale) || scale <= 0)
+        throw std::invalid_argument("--voxel-scale must be a finite positive number: " + value);
+    return scale;
 }

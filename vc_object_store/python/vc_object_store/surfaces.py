@@ -50,9 +50,10 @@ def read_surface(store, surface_uuid, *, volume, geometry_revision=None, target_
 
 
 def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, sources=(), meta=None,
-                   channels=None, tags=(), author=None):
-    """A new surface holding ``xyz`` ((rows, columns, 3) in voxels of ``volume``; vertices are missing by the
-    store's validity rule) with grid ``scale`` (one number or a pair), bound to ``volume``, with per-vertex ``channels`` and
+                   channels=None, tags=(), author=None, voxel_scale=1.0):
+    """A new surface holding ``xyz`` ((rows, columns, 3) in voxels of ``volume`` at ``voxel_scale`` of its own;
+    vertices are missing by the store's validity rule) with grid ``scale`` (one number or a pair), bound to those
+    voxels, with per-vertex ``channels`` and
     meta.provenance {tool, parameters, sources}. ``meta`` is kept except tifxyz file keys (the store's
     createSurface). Returns its UUID."""
     points = np.ascontiguousarray(np.asarray(xyz, dtype="<f4"))
@@ -70,6 +71,6 @@ def create_surface(store, xyz, *, name, scale, volume, tool, parameters=None, so
     surface_uuid = str(uuidlib.uuid4())
     with ObjectStore.open(str(store), author=author or getpass.getuser()) as db:
         with db.write(expected_revisions={surface_uuid: None}) as tx:
-            tx.create_surface(surface_uuid, name, list(tags), dict(volume_uuid=str(volume), scale_factor=1), tool,
+            tx.create_surface(surface_uuid, name, list(tags), dict(volume_uuid=str(volume), scale_factor=float(voxel_scale)), tool,
                               parameters or {}, list(sources), meta or {}, geometry)
     return surface_uuid

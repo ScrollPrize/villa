@@ -172,9 +172,9 @@ std::string deriveLocalVolumeId(const std::filesystem::path& path)
     return out.str();
 }
 
-std::string deriveRebasedRemoteVolumeId(const std::string& descriptiveId,
-                                        const std::string& sourceUrl,
-                                        int baseScaleLevel)
+std::string deriveRebasedRemoteCacheId(const std::string& descriptiveId,
+                                       const std::string& sourceUrl,
+                                       int baseScaleLevel)
 {
     const std::string identity = sourceUrl + "#vc-base-scale=" +
                                  std::to_string(baseScaleLevel);
@@ -808,10 +808,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // Preserve the historical source cache name before project metadata can
     // replace the annotation UUID (for example, with an open-data catalog ID).
     // Upstream metadata UUIDs still name their existing caches; otherwise the
-    // name remains URL-derived. Rebased views keep their own cache namespace.
+    // name remains URL-derived. A working level keeps its own cache namespace
+    // (its chunk levels are renumbered), but not its own volume ID.
     vol->remoteCacheId_ = vol->id();
     if (spec.baseScaleLevel > 0) {
-        vol->remoteCacheId_ = deriveRebasedRemoteVolumeId(
+        vol->remoteCacheId_ = deriveRebasedRemoteCacheId(
             vol->remoteCacheId_, remoteUrl, spec.baseScaleLevel);
     }
 
@@ -844,13 +845,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
                 "rebased remote volume requires a positive logical voxel-size override "
                 "or trustworthy native voxel size metadata");
         }
-
-        // A caller's uuid (the catalog's level volume) names this view;
-        // otherwise it gets one of its own.
-        const bool named = metadata.is_object() && metadata.contains("uuid") && metadata["uuid"].is_string() &&
-                           !metadata["uuid"].get_string().empty();
-        if (!named)
-            vol->metadata_["uuid"] = deriveRebasedRemoteVolumeId(vol->id(), remoteUrl, spec.baseScaleLevel);
     }
 
     return vol;

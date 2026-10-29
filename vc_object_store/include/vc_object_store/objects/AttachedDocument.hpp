@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
@@ -57,17 +58,18 @@ void replaceAttachedCollections(ObjectStoreSession&, const AttachmentIdentity&, 
                                 const nlohmann::json& coordinates, const std::optional<ViewFrame>& frame = std::nullopt);
 
 // A volume's point collections: the live point_collection objects whose
-// coordinates map to `volume` (bound to it, or through a registration) and
-// that are no object's attached data (no meta.role), in its voxels.
-std::vector<AttachedCollection> volumeCollections(const ObjectStore&, const Txn&, const std::string& volume);
+// coordinates map to `volume`'s volume (bound to it, or through a
+// registration) and that are no object's attached data (no meta.role), in
+// `volume`.
+std::vector<AttachedCollection> volumeCollections(const ObjectStore&, const Txn&, const VolumeVoxels& volume);
 // The same, read from a session's attachment.
-std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume);
-// The live point collections `uuids` (any role), in `volume`'s voxels and in
-// that order. Throws for one that is missing or does not map to the volume.
+std::vector<AttachedCollection> volumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume);
+// The live point collections `uuids` (any role), in `volume` and in that
+// order. Throws for one that is missing or does not map to the volume.
 std::vector<AttachedCollection> pointCollections(const ObjectStore&, const Txn&, const std::vector<std::string>& uuids,
-                                                 const std::string& volume);
-// In one commit: `changed` (in `volume`'s voxels) are created, bound to its
-// voxels, or revised keeping their points' identity; `removed` are retired.
-void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume,
+                                                 const VolumeVoxels& volume);
+// In one commit: `changed` (in `volume`) are created, bound to `volume`, or
+// revised keeping their points' identity; `removed` are retired.
+void writeVolumeCollections(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume,
                             const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed);
 }

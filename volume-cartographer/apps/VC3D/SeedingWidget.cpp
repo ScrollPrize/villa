@@ -1092,7 +1092,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         if (region) {
             try {
                 const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
-                                                              _surfaceCatalog->volume()->id(),
+                                                              _surfaceCatalog->voxels(),
                                                               vc3d::store::regionSlice(*region), {});
                 for (const auto& run : crossings.runs) {
                     auto& out = intersections[run.objectUuid];
@@ -1409,7 +1409,8 @@ void SeedingWidget::launchBatchProcess(int index, const QStringList& toolArgs)
     launch.ompThreads = _batchOmpThreads;
     launch.workingDirectory = _batchWorkingDir;
     launch.store = QString::fromStdString(_batchStore.store.string());
-    launch.volume = QString::fromStdString(_batchStore.volume);
+    launch.volume = QString::fromStdString(_batchStore.volume.volume);
+    launch.voxelScale = _batchStore.volume.scale;
     launch.lowPriority = true;
     if (!run->start(launch)) {
         vc3d::ToolProcess::Result failed;

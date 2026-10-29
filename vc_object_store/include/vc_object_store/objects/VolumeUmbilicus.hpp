@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
@@ -14,10 +15,11 @@ struct VolumeUmbilicus {
 // The current revisions of the umbilici that map to `volume`: the pins of an
 // edit that replaces or removes them.
 RevisionSelection volumeUmbilicusRevisions(const ObjectStore&, const Txn&, const std::string& volume);
-// The umbilicus of `volume`; nullopt when it has none. Throws when several map to it.
-std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore&, const Txn&, const std::string& volume);
+// The umbilicus of `volume`'s volume, its points in `volume`; nullopt when it
+// has none. Throws when several map to it.
+std::optional<VolumeUmbilicus> volumeUmbilicus(const ObjectStore&, const Txn&, const VolumeVoxels& volume);
 // The same, read from a session's attachment.
-std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const AttachmentIdentity&, const std::string& volume);
+std::optional<VolumeUmbilicus> volumeUmbilicus(ObjectStoreSession&, const AttachmentIdentity&, const VolumeVoxels& volume);
 // Makes `record` (an umbilicus whose meta.coordinates map to `volume`) with
 // `geometry` the umbilicus of `volume`, retiring those it replaces. The
 // caller's checked transaction pins volumeUmbilicusRevisions and expects

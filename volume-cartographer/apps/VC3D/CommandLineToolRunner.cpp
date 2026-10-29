@@ -67,9 +67,10 @@ void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
     _remoteRegion = region;
 }
 
-void CommandLineToolRunner::setStore(const QString& storePath)
+void CommandLineToolRunner::setStore(const QString& storePath, double voxelScale)
 {
     _storePath = storePath;
+    _voxelScale = voxelScale;
 }
 
 void CommandLineToolRunner::setSurface(const QString& uuid)
@@ -134,9 +135,10 @@ void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
     _optAlignGrid = alignGrid;
 }
 
-void CommandLineToolRunner::setRenderVolume(const QString& volumeUuid)
+void CommandLineToolRunner::setRenderVolume(const QString& volumeUuid, double voxelScale)
 {
     _renderVolumeUuid = volumeUuid;
+    _renderVoxelScale = voxelScale;
 }
 
 void CommandLineToolRunner::setRenderAdvanced(
@@ -340,13 +342,15 @@ bool CommandLineToolRunner::executeCustomCommand(const QString& command,
                                                  const QString& label,
                                                  ExecutionOptions options,
                                                  const QString& store,
-                                                 const QString& volume)
+                                                 const QString& volume,
+                                                 double voxelScale)
 {
     _customCommand = command;
     _customArgs = args;
     _customLabel = label;
     _customStore = store;
     _customVolume = volume;
+    _customVoxelScale = voxelScale;
     return execute(Tool::CustomCommand, options);
 }
 
@@ -397,6 +401,7 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
         launch.args = _customArgs;
         launch.store = _customStore;
         launch.volume = _customVolume;
+        launch.voxelScale = _customVoxelScale;
         return launch;
     }
     launch.args = buildArguments(tool);
@@ -404,6 +409,7 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
     launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
                     : tool == Tool::MergePatch ? QString()
                                                : _volumeUuid;
+    launch.voxelScale = tool == Tool::RenderTifXYZ ? _renderVoxelScale : _voxelScale;
     return launch;
 }
 

@@ -88,7 +88,7 @@ VC3D.
 | `voxelSize()` | `double` | Physical voxel size from metadata |
 | `dtype()` | `vc::render::ChunkDtype` | Volume dtype |
 | `numScales()` | `size_t` | Number of scale slots known to the volume |
-| `baseScaleLevel()` | `int` | Always `0` |
+| `baseScaleLevel()` | `int` | Working level: the source pyramid level opened as level 0 (remote `#vc-base-scale=N`), else `0`; the ID does not change with it |
 | `hasScaleLevel(int level)` | `bool` | Whether a physical zarr array exists for the level |
 | `presentScaleLevels()` | `std::vector<int>` | Physical scale levels |
 | `firstPresentScaleLevel()` | `int` | Finest available physical scale |

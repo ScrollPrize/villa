@@ -26,6 +26,7 @@ import getpass
 import hashlib
 import importlib
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -684,14 +685,16 @@ def _stored_model_path(ref: dict[str, Any]) -> Path:
     return path
 
 
-def _stored_corr_points(uuids: list[Any], volume: str | None) -> dict[str, Any]:
-    """The job's correction point collections, read from the service store in ``volume``'s voxels, as VC3D's
+def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: float) -> dict[str, Any]:
+    """The job's correction point collections, read from the service store in ``volume``'s voxels at
+    ``target_scale``, as VC3D's
     collection JSON: ``{"collections": {"1": {uuid, name, points: {id: {p, ...}}, ...}, ...}}`` in request order."""
     if volume is None:
         raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
     from vc_object_store.documents import point_collections
     collections: dict[str, Any] = {}
-    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume), start=1):
+    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume,
+                                                                target_scale), start=1):
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
         collection["name"] = stored["name"]
@@ -714,6 +717,14 @@ def _request_store_volume(body: dict[str, Any]) -> str | None:
     if not volume:
         raise ValueError("a store request needs volume_uuid")
     return volume
+
+
+def _request_voxel_scale(body: dict[str, Any]) -> float:
+    """The scale of a store request's voxels to its volume's own (``voxel_scale``, 2^-N at working level N)."""
+    scale = float(body.get("voxel_scale", 1.0))
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"voxel_scale must be finite and positive, got {scale}")
+    return scale
 
 
 def _resolve_object_ref(ref_raw: Any) -> Path:
@@ -1041,7 +1052,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
     if collection_uuids is not None:
         if not isinstance(collection_uuids, list):
             raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
-        resolved_cfg["corr_points"] = _stored_corr_points(collection_uuids, _request_store_volume(body))
+        resolved_cfg["corr_points"] = _stored_corr_points(
+            collection_uuids, _request_store_volume(body), _request_voxel_scale(body))
 
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
@@ -1863,6 +1875,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
     try:
         store_volume = _request_store_volume(body)
+        store_voxel_scale = _request_voxel_scale(body)
         if store_volume is not None:
             job.set_running("loading", 0, 0, 0.0, stage_name="Syncing the object store")
             _require_store().sync()
@@ -1975,6 +1988,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if store_volume is not None:
             args_section["store"] = _require_store().path
             args_section["volume-uuid"] = store_volume
+            args_section["voxel-scale"] = store_voxel_scale
         if not omit_model_output:
             args_section["model-output"] = str(model_output)
         # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
@@ -2075,7 +2089,8 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             import fit2tifxyz
             export_argv = ["--input", str(model_output)]
             if store_volume is not None:
-                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume])
+                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume,
+                                    "--voxel-scale", repr(store_voxel_scale)])
             else:
                 export_argv.extend(["--output", str(output_dir)])
             if body.get("single_segment"):

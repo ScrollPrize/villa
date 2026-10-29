@@ -261,7 +261,7 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setStore("objects.vcobj");
+        runner.setStore("objects.vcobj", 1.0);
         runner.setSurface("surface-uuid");
         const QString zarrPath = QDir::temp().filePath("render.zarr");
         runner.setOutputPattern(zarrPath);
@@ -285,7 +285,7 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setStore("objects.vcobj");
+        runner.setStore("objects.vcobj", 1.0);
         runner.setSurface("surface-uuid");
         runner.setOutputPattern(QDir::temp().filePath("render_layers"));
         runner.setRenderParams(1.0f, 0, 4);
@@ -302,7 +302,7 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setStore("objects.vcobj");
+        runner.setStore("objects.vcobj", 1.0);
         runner.setSurface("surface-uuid");
         runner.setOutputPattern(QDir::temp().filePath("render_layers"));
         const QStringList arguments =
@@ -324,13 +324,14 @@ private slots:
             return at >= 0 && at + 1 < args.size() ? args.at(at + 1) : QString();
         };
         CommandLineToolRunner runner(nullptr, {});
-        runner.setStore("objects.vcobj");
+        runner.setStore("objects.vcobj", 1.0);
 
         runner.setTraceParams("volume.zarr", "vol", "source", "trace", "params.json", "src-uuid");
         auto args = runner.argumentsForTesting(CommandLineToolRunner::Tool::GrowSegFromSegment);
         QCOMPARE(value(args, "--store"), QString("objects.vcobj"));
         QCOMPARE(value(args, "--surface"), QString("src-uuid"));
         QCOMPARE(value(args, "--volume-uuid"), QString("vol"));
+        QVERIFY2(!args.contains("--voxel-scale"), "the volume's own voxels need no scale");
         QCOMPARE(value(args, "--tag"), QString("trace"));
 
         runner.setNeighborCopyParams("volume.zarr", "params.json", "resume-uuid", "vol", "copy", "");
@@ -354,6 +355,13 @@ private slots:
         QCOMPARE(args.at(args.lastIndexOf("--surface") + 1), QString("child-uuid"));
         QVERIFY(args.contains("--explicit-roles"));
         QVERIFY(!args.contains("--parent") && !args.contains("--child"));
+
+        // At a working level the tools work in that level's voxels of the volume.
+        runner.setStore("objects.vcobj", 0.25);
+        runner.setTraceParams("volume.zarr", "vol", "source", "trace", "params.json", "src-uuid");
+        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::GrowSegFromSegment);
+        QCOMPARE(value(args, "--volume-uuid"), QString("vol"));
+        QCOMPARE(value(args, "--voxel-scale"), QString("0.25"));
     }
 
     void createdSurfacesComeFromReportLines()

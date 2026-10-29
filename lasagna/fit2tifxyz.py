@@ -37,14 +37,17 @@ class ExportConfig:
 	flatten_map_output: str | None = None
 	store: str | None = None
 	volume_uuid: str | None = None
+	voxel_scale: float = 1.0
 	tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class _StoreTarget:
-	"""Where store-mode exports go: new surfaces bound to ``volume``, their side files in artifact directories."""
+	"""Where store-mode exports go: new surfaces bound to ``volume``'s voxels at ``voxel_scale``, their side files
+	in artifact directories."""
 	session: stored_surfaces.StoreSession
 	volume: str
+	voxel_scale: float
 	tags: tuple[str, ...]
 	sources: tuple[str, ...]
 	created: list
@@ -75,6 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	g.add_argument("--output", default=None, help="Output directory (or --store)")
 	g.add_argument("--store", default=None, help="Create the surfaces in this VC object store instead")
 	g.add_argument("--volume-uuid", default=None, help="With --store: the volume the surfaces' coordinates are in")
+	g.add_argument("--voxel-scale", type=float, default=1.0,
+				   help="With --store: those coordinates are at this scale of the volume's voxels (2^-N at level N)")
 	g.add_argument("--tag", action="append", default=[], help="With --store: tag the created surfaces")
 	g.add_argument("--prefix", default="winding_", help="Output tifxyz directory prefix")
 	g.add_argument("--single-segment", action="store_true", default=False,
@@ -323,7 +328,7 @@ def _write_atlas_control_results(written: _Written, results: dict | None, store:
 	attach_document(
 		store.session.path, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
 		position_key="target_xyz", name="atlas control points results", volume=store.volume,
-		author=store.session.author)
+		voxel_scale=store.voxel_scale, author=store.session.author)
 
 
 def _write_corr_points_results(written: _Written, results: dict | None, store: _StoreTarget | None) -> None:
@@ -338,7 +343,8 @@ def _write_corr_points_results(written: _Written, results: dict | None, store: _
 	from vc_object_store.documents import attach_document
 	attach_document(
 		store.session.path, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
-		position_key="p", name="correction points results", volume=store.volume, author=store.session.author)
+		position_key="p", name="correction points results", volume=store.volume,
+		voxel_scale=store.voxel_scale, author=store.session.author)
 
 
 ATLAS_RESULTS_ROLE = "lasagna_atlas_control_points_results"
@@ -1102,7 +1108,7 @@ def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, 
 	from vc_object_store.surfaces import create_surface
 	surface_uuid = create_surface(
 		store.session.path, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
-		meta=meta, channels=channels, tags=store.tags, author=store.session.author)
+		meta=meta, channels=channels, tags=store.tags, author=store.session.author, voxel_scale=store.voxel_scale)
 	store.created.append(surface_uuid)
 	print(f"surface_uuid: {surface_uuid}", flush=True)
 	artifacts = store.session.artifact_directory(surface_uuid)
@@ -1257,6 +1263,7 @@ def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = 
 		),
 		store=args.store,
 		volume_uuid=args.volume_uuid,
+		voxel_scale=float(args.voxel_scale),
 		tags=tuple(args.tag),
 	)
 	if (cfg.store is None) == (args.output is None):
@@ -1302,7 +1309,8 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 		job_spec = None
 	store = None
 	if store_session is not None:
-		store = _StoreTarget(session=store_session, volume=str(cfg.volume_uuid), tags=cfg.tags,
+		store = _StoreTarget(session=store_session, volume=str(cfg.volume_uuid), voxel_scale=cfg.voxel_scale,
+							 tags=cfg.tags,
 							 sources=_stored_sources(job_spec), created=created if created is not None else [])
 	object_refs = st.get("_object_refs_", None)
 	if not isinstance(object_refs, dict):

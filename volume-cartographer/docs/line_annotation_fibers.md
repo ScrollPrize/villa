@@ -674,8 +674,8 @@ is stored per project together with its enabled state. UI fields and viewer
 mask APIs use the current volume's voxel coordinates, but `focus_bounds` in
 the project JSON uses the source annotation grid (`coordinate_frame:
 "annotation"`). The same frame derivation used by the Fiber Map supplies the
-conversion: exact catalog coordinate factors take precedence, and untagged
-rebased volumes use their pyramid-base factor. Bounds are converted on read,
+conversion: the open volume's store voxels (`vc::project::annotationVolume`),
+whose scale is 2^-level at a working level or a prediction's level. Bounds are converted on read,
 not repeatedly rewritten on volume changes, so switching pyramid levels or
 reopening with another preferred level preserves the region. With no usable
 volume frame, the mask is unavailable; stored bounds are retained. Bounds with

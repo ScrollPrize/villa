@@ -4,7 +4,9 @@
 #include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/VolumeTransforms.hpp>
+#include "vc/core/util/RemoteUrl.hpp"
 
 #include "StatusDockPanelHost.hpp"
 
@@ -570,7 +572,7 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
             ? vc3d::opendata::normalGridsCatalogView(*pkg, *owningEntry)
             : std::nullopt;
         if (view) {
-            if (published && published->frameId() == view->frameId()) {
+            if (published && published->sameGrid(*view)) {
                 if (checkedPath) *checkedPath = candidateStr;
                 qCInfo(lcSegGrowth) << "Normal grid resolved by catalog frame to" << candidateStr;
                 return candidateStr;
@@ -2373,23 +2375,14 @@ void CWindow::clearSurfaceSelection()
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
-    const std::string previousVolumeId = _state ? _state->currentVolumeId() : std::string{};
-    std::string targetVolumeId;
-    if (_state && _state->vpkg() && newvol) {
-        for (const auto& id : _state->vpkg()->volumeIDs()) {
-            if (_state->vpkg()->volume(id) == newvol) {
-                targetVolumeId = id;
-                break;
-            }
-        }
-    }
-    if (targetVolumeId.empty() && newvol) {
-        targetVolumeId = newvol->id();
-    }
-
+    const auto previousVoxels = _state->annotationVolume();
+    // Another volume, or the same at another working level: other voxels.
+    const auto targetVoxels = newvol ? std::optional(vc::project::annotationVolume(_state->vpkg().get(), *newvol))
+                                     : std::nullopt;
     const auto navigationTransform =
-        (hadVolume && newvol && previousVolumeId != targetVolumeId)
-            ? volumeTransformForSwitch(previousVolumeId, targetVolumeId)
+        (hadVolume && previousVoxels && targetVoxels &&
+         vc::objects::VolumeVoxels(*previousVoxels) != vc::objects::VolumeVoxels(*targetVoxels))
+            ? volumeTransformForSwitch(*previousVoxels, *targetVoxels)
             : std::optional<vcr::catalog::Affine>{};
 
     // Switch both independent states before revalidating the canonical overlay.
@@ -2754,7 +2747,8 @@ void CWindow::CreateWidgets(void)
         _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
     }
     auto updateSurfaceSource = [this]() {
-        _surfaceCatalog->setSource(_state->storeFor("surface"), _state->currentVolume());
+        _surfaceCatalog->setSource(_state->storeFor("surface"), _state->currentVolume(),
+                                   _state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
         LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->storeFor("surface"));
     };
     connect(_state, &CState::objectStoreChanged, _surfaceCatalog.get(),
@@ -3705,6 +3699,22 @@ void CWindow::CreateWidgets(void)
     }
 
     connectVolumeSelector(volSelect);
+    // The working level: the volume opened at a coarser pyramid level, VC3D and
+    // the tools it runs working in that level's voxels. Objects are kept in the
+    // volume's own, so they show at every level.
+    if (ui.volSelect && ui.volSelect->layout()) {
+        _volumeLevelSpin = new QSpinBox(ui.volSelect);
+        _volumeLevelSpin->setObjectName(QStringLiteral("volumeLevelSpin"));
+        _volumeLevelSpin->setRange(0, vc::kMaxRemoteVolumeBaseScale);
+        _volumeLevelSpin->setPrefix(tr("L"));
+        _volumeLevelSpin->setToolTip(tr("Working level: work in this pyramid level's voxels (2^level of the "
+                                        "volume's own). Objects are kept in the volume's own voxels and show at "
+                                        "every level."));
+        ui.volSelect->layout()->addWidget(_volumeLevelSpin);
+        connect(_volumeLevelSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &CWindow::setVolumeLevel);
+        connect(_state, &CState::volumeChanged, this, [this]() { syncVolumeLevelControl(); });
+        syncVolumeLevelControl();
+    }
 
     auto* filterDropdown = ui.btnFilterDropdown;
     auto* cmbPointSetFilter = new QComboBox(this);
@@ -4442,7 +4452,8 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
     settings.setValue(key, volumeId);
 }
 
-std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std::string& from, const std::string& to) const
+std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::objects::VolumeVoxels& from,
+                                                                      const vc::objects::VolumeVoxels& to) const
 {
     // The store's resolution (catalog registrations, its own and its route
     // choices); without a store, the cached catalog's registrations.
@@ -4454,9 +4465,38 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std:
     } else if (const auto catalog = vc3d::opendata::cachedCatalog()) {
         transforms.graph.addCatalog(*catalog);
     }
-    const auto resolution = transforms.resolve(from, to);
-    if (resolution.status != vcr::catalog::TransformStatus::Resolved) return std::nullopt;
-    return resolution.resolved().forward;
+    return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);
+}
+
+void CWindow::setVolumeLevel(int level)
+{
+    const auto volume = _state->currentVolume();
+    if (!volume || !volume->isRemote() || level == volume->baseScaleLevel()) return;
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        statusBar()->showMessage(tr("Stop editing the surface before changing the working level."), 5000);
+        syncVolumeLevelControl();
+        return;
+    }
+    try {
+        _state->vpkg()->setVolumeLevel(volume->id(), level);
+    } catch (const std::exception& error) {
+        QMessageBox::warning(this, tr("Working Level"),
+                             tr("Could not open %1 at level %2:\n%3")
+                                 .arg(QString::fromStdString(volume->id())).arg(level).arg(QString::fromUtf8(error.what())));
+        syncVolumeLevelControl();
+        return;
+    }
+    setVolume(_state->vpkg()->volume(volume->id()));
+    refreshVolumeSelectionUi(QString::fromStdString(volume->id()));
+}
+
+void CWindow::syncVolumeLevelControl()
+{
+    if (!_volumeLevelSpin) return;
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    const QSignalBlocker blocker(_volumeLevelSpin);
+    _volumeLevelSpin->setValue(volume ? volume->baseScaleLevel() : 0);
+    _volumeLevelSpin->setEnabled(volume && volume->isRemote());
 }
 
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)

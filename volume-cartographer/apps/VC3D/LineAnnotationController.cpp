@@ -349,7 +349,7 @@ std::vector<vc::geometry::Point> storedFiberLinePoints(
     const vc::objects::FiberView& view, const std::optional<vc3d::line_annotation::FiberVolumeFrame>& frame)
 {
     if (!frame) return view.linePoints(0, view.linePointCount());
-    const auto shown = view.viewTransformedAt(frame->volume);
+    const auto shown = view.viewTransformedAt(frame->volume.volume, frame->volume.scale);
     if (shown.mapping() != frame->storedToVolume)
         throw std::runtime_error("The fiber's volume registration changed; reopen it");
     return shown.points("line_points", 0, view.linePointCount());
@@ -361,8 +361,7 @@ namespace {
 // A point of the current volume in the volume its annotations are kept in.
 cv::Vec3d inAnnotationVolume(const vc::project::AnnotationVolume& annotation, const cv::Vec3d& point)
 {
-    const auto p = annotation.fromVolume.apply({point[0], point[1], point[2]});
-    return {p[0], p[1], p[2]};
+    return point / annotation.scale;
 }
 }  // namespace
 
@@ -1630,18 +1629,18 @@ LineAnnotationController::LineAnnotationController(CState* state,
         connect(_state,
                 &CState::volumeChanged,
                 this,
-                [this](const std::shared_ptr<Volume>&,
-                       const std::string& volumeId) {
+                [this](const std::shared_ptr<Volume>& volume,
+                       const std::string&) {
                     // CState re-emits for a reselection of the current volume
                     // (package UI refreshes do this); only an actual switch
                     // changes what views were built from. Guarded here rather
                     // than in CState, whose other consumers may rely on the
                     // re-emission. Cleared on package change, since two
                     // projects can name a volume identically.
-                    if (volumeId == _lastVolumeChangedId) {
+                    if (!_lastVolumeChanged.expired() && _lastVolumeChanged.lock() == volume) {
                         return;
                     }
-                    _lastVolumeChangedId = volumeId;
+                    _lastVolumeChanged = volume;
                     onActiveVolumeChanged();
                 });
         // Without this an attach or detach would not reach normal orientation
@@ -5449,20 +5448,22 @@ LineAnnotationController::FiberSummary LineAnnotationController::summarizeStored
 }
 
 const LineAnnotationController::StoredUmbilicus&
-LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
+LineAnnotationController::storedUmbilicus(const vc::objects::VolumeVoxels& voxels) const
 {
     const auto attachment = _state ? _state->storeFor("umbilicus") : std::nullopt;
-    const auto key = (attachment ? attachment->storeUuid : std::string{}) + "/" + volumeId;
+    const auto key = (attachment ? attachment->storeUuid : std::string{}) + "/" + voxels.volume + "/" +
+                     QString::number(voxels.scale, 'g', 17).toStdString();
     const auto [found, inserted] = _storedUmbilici.try_emplace(key);
     if (!inserted) return found->second;
     auto& stored = found->second;
-    if (!attachment || volumeId.empty()) {
+    if (!attachment || voxels.volume.empty()) {
         stored.problem = tr("no object store or volume");
         return stored;
     }
     try {
-        stored.umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, volumeId);
-        if (!stored.umbilicus) stored.problem = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(volumeId));
+        stored.umbilicus = vc::objects::volumeUmbilicus(*_state->objectStoreSession(), *attachment, voxels);
+        if (!stored.umbilicus)
+            stored.problem = tr("no umbilicus maps to volume %1").arg(QString::fromStdString(voxels.volume));
     } catch (const std::exception& error) {
         stored.problem = QString::fromUtf8(error.what());
     }
@@ -5472,10 +5473,10 @@ LineAnnotationController::storedUmbilicus(const std::string& volumeId) const
 QString LineAnnotationController::umbilicusFingerprint() const
 {
     // Changes whenever the answer does: uuid@revision, else why there is none.
-    if (!_state || !_state->storeFor("umbilicus") || _state->currentVolumeId().empty()) {
+    if (!_state || !_state->storeFor("umbilicus") || !_state->annotationVolume()) {
         return {};
     }
-    const auto& stored = storedUmbilicus(_state->currentVolumeId());
+    const auto& stored = storedUmbilicus(*_state->annotationVolume());
     return stored.umbilicus ? QString::fromStdString(stored.umbilicus->uuid + "@" + stored.umbilicus->objectRevision)
                             : stored.problem;
 }
@@ -5483,7 +5484,7 @@ QString LineAnnotationController::umbilicusFingerprint() const
 LineAnnotationController::UmbilicusStatus
 LineAnnotationController::umbilicusStatus() const
 {
-    const auto& stored = storedUmbilicus(_state ? _state->currentVolumeId() : std::string{});
+    const auto& stored = storedUmbilicus(_state ? _state->annotationVolume().value_or(vc::project::AnnotationVolume{}) : vc::project::AnnotationVolume{});
     if (!stored.umbilicus) return {false, stored.problem};
     return {true, QString::fromStdString(stored.umbilicus->name.empty() ? stored.umbilicus->uuid : stored.umbilicus->name)};
 }
@@ -5505,10 +5506,10 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // current volume shows, every pyramid level alike), at its voxel size.
     const auto annotation = _state ? _state->annotationVolume() : std::nullopt;
     if (!annotation) return snapshot;
-    snapshot.annotationVolume = annotation->id;
+    snapshot.annotationVolume = annotation->volume;
     snapshot.voxelSizeUm = annotation->voxelSizeUm;
     if (snapshot.voxelSizeUm) {
-        Logger()->info("Fiber map: laid out in volume {} at {:g} um per voxel", annotation->id, *snapshot.voxelSizeUm);
+        Logger()->info("Fiber map: laid out in volume {} at {:g} um per voxel", annotation->volume, *snapshot.voxelSizeUm);
     } else {
         Logger()->info("Fiber map: no voxel size available; the map will report "
                        "lengths in voxels");
@@ -5517,7 +5518,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // The scroll's z extent in that same volume, so it pairs with voxelSizeUm.
     if (const auto volume = _state->currentVolume())
         snapshot.annotationZSlices = static_cast<int>(std::llround(
-            annotation->fromVolume.apply({0.0, 0.0, double(volume->numSlices())}, true)[2]));
+            double(volume->numSlices()) / annotation->scale));
 
     // Which catalog volume this is, for the map's winding sense.
     snapshot.catalogVolume = fiberMapCatalogVolume();
@@ -5602,7 +5603,7 @@ LineAnnotationController::FiberMapSnapshot LineAnnotationController::fiberMapSna
     // Which umbilicus resolves, which frame it is in, and what to say about it
     // are one question with several exits, answered by umbilicusForSnapshot()
     // so this function stays the data export it reads as.
-    SnapshotUmbilicus umbilicus = umbilicusForSnapshot(annotation->id);
+    SnapshotUmbilicus umbilicus = umbilicusForSnapshot(annotation->volume);
     snapshot.umbilicusMessage = std::move(umbilicus.message);
     snapshot.umbilicusLabel = std::move(umbilicus.label);
     snapshot.umbilicusCenters = std::move(umbilicus.centers);
@@ -5613,8 +5614,8 @@ LineAnnotationController::SnapshotUmbilicus
 LineAnnotationController::umbilicusForSnapshot(const std::string& annotationVolume) const
 {
     SnapshotUmbilicus result;
-    // Read in the annotation volume, the fibers' frame on the map.
-    const auto& stored = storedUmbilicus(annotationVolume);
+    // Read in the annotation volume's own voxels, the fibers' frame on the map.
+    const auto& stored = storedUmbilicus({annotationVolume, 1});
     const auto& umbilicus = stored.umbilicus;
     if (!umbilicus) {
         result.message = stored.problem;
@@ -5764,7 +5765,7 @@ void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg>
     std::vector<uint64_t> ids{0};
     for (const auto& pane : _panes) if (pane.session) ids.push_back(pane.session->fiberId);
     discardFiberPanes(ids);
-    _lastVolumeChangedId.clear();
+    _lastVolumeChanged.reset();
     ++_packageGeneration;
     invalidateScrollUmbilicus();
     resetStoreDerivedState();
@@ -6464,7 +6465,7 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
         const auto volume = _state ? _state->currentVolume() : nullptr;
         if (!volume)
             throw std::runtime_error("An active volume is required to bind a new fiber");
-        linkedFiber.coordinateIdentity["coordinates"] = vc::objects::volumeCoordinates(volume->id(), 1.0);
+        linkedFiber.coordinateIdentity["coordinates"] = vc::objects::volumeCoordinates(*_state->annotationVolume());
         const uint64_t linkedFiberId = linkedFiber.id;
         commitFibers({&parentFiber, &linkedFiber});
         return linkedFiberId;
@@ -11223,12 +11224,13 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
         _scrollUmbilicus.reset();
         return _scrollUmbilicus;
     }
-    const auto key = attachment->storeUuid + "/" + volume->id();
+    const auto voxels = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
+    const auto key = attachment->storeUuid + "/" + voxels.volume + "/" + QString::number(voxels.scale, 'g', 17).toStdString();
     if (_scrollUmbilicusVolumeId == key) return _scrollUmbilicus;
     _scrollUmbilicusVolumeId = key;
     _scrollUmbilicus.reset();
     _umbilicusNotice.clear();
-    const auto& stored = storedUmbilicus(volume->id());
+    const auto& stored = storedUmbilicus(voxels);
     if (stored.umbilicus) {
         std::vector<cv::Vec3f> points;
         for (const auto& p : stored.umbilicus->points) points.emplace_back(float(p[0]), float(p[1]), float(p[2]));
@@ -12312,16 +12314,15 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
         const auto& annotation = _state->annotationVolume();
         if (!volume || !annotation) { fail(tr("An active volume is required to bind a new fiber.")); return; }
         const auto shape = volume->shape();
-        const auto mapped = annotation->fromVolume.apply({double(shape[2]), double(shape[1]), double(shape[0])}, true);
-        const auto voxel = annotation->fromVolume.apply({1.0, 1.0, 1.0}, true);
+        const double voxel = 1.0 / annotation->scale;
         for (int axis = 0; axis < 3; ++axis)
-            if (std::abs(double((*baseShapeZYX)[2 - axis]) - mapped[axis]) > std::max(1.0, std::abs(voxel[axis]))) {
+            if (std::abs(double((*baseShapeZYX)[2 - axis]) - shape[2 - axis] * voxel) > std::max(1.0, voxel)) {
                 fail(tr("The inference dataset's base grid (%1 x %2 x %3 ZYX) is not volume %4's.")
                          .arg((*baseShapeZYX)[0]).arg((*baseShapeZYX)[1]).arg((*baseShapeZYX)[2])
-                         .arg(QString::fromStdString(annotation->id)));
+                         .arg(QString::fromStdString(annotation->volume)));
                 return;
             }
-        creationBinding = {{"coordinates", vc::objects::volumeCoordinates(annotation->id, 1.0)}};
+        creationBinding = {{"coordinates", vc::objects::volumeCoordinates(annotation->volume, 1.0)}};
     }
 
     struct HeadlessResult {
@@ -12963,10 +12964,12 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
     }
     std::vector<std::string> selected;
     connection->read(*attachment,[&](const auto& db,const auto& txn,const auto&) {
-        vc::objects::ObjectSelection selection;selection.kind="fiber";selection.volume=volume->id();
+        const auto& target=*_state->annotationVolume();
+        vc::objects::ObjectSelection selection;selection.kind="fiber";selection.volume=target.volume;
+        selection.targetScale=target.scale;
         selection.bbox=stripBounds;
         for(const auto& region:db.spatialRegions(txn,selection)) selected.push_back(region.objectUuid);
-        request.unboundFibers=static_cast<size_t>(db.unboundObjectCount(txn,"fiber",volume->id()));
+        request.unboundFibers=static_cast<size_t>(db.unboundObjectCount(txn,"fiber",target.volume));
     });
     std::sort(selected.begin(),selected.end());
     selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
@@ -14628,7 +14631,7 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     if ((!fiber.storePin || fiber.storePin->objectRevision.empty()) && _state && _state->currentVolume()) {
         // A fiber created in an annotation pane is in the volume's voxels.
         for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == fiber.uuid) {
-            snapshot.fiber.coordinateIdentity["coordinates"]=vc::objects::volumeCoordinates(_state->currentVolume()->id(),1.0);
+            snapshot.fiber.coordinateIdentity["coordinates"]=vc::objects::volumeCoordinates(*_state->annotationVolume());
             break;
         }
     }
@@ -14762,6 +14765,7 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     if (!attachment || (uuids && uuids->empty())) return result;
     const bool readOnly = !connection->writable(*attachment);
     const auto volume = _state->currentVolume();
+    const vc::objects::VolumeVoxels target = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto& cancel) {
         // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
         const auto transforms = volume ? std::optional(db.volumeTransforms(txn)) : std::nullopt;
@@ -14781,12 +14785,12 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 const auto view = GeometrySnapshot(db, txn).fiber(object.uuid, *head.geometryRevision);
                 const auto metadata = nlohmann::json::parse(object.meta);
                 if (transforms)
-                    if (const auto mapping = transforms->toVolume(metadata, volume->id()))
-                        fiber.frame = vc3d::line_annotation::FiberVolumeFrame{volume->id(), *mapping};
+                    if (const auto mapping = transforms->toVolume(metadata, target.volume, target.scale))
+                        fiber.frame = vc3d::line_annotation::FiberVolumeFrame{target, *mapping};
                 vc::geometry::Fiber geometry;
                 geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
                 geometry.controlPoints = fiber.frame
-                    ? view.viewTransformedAt(volume->id()).points("control_points", 0, view.controlPointCount())
+                    ? view.viewTransformedAt(target.volume, target.scale).points("control_points", 0, view.controlPointCount())
                     : view.controlPoints(0, view.controlPointCount());
                 if (withLines) geometry.linePoints = storedFiberLinePoints(view, fiber.frame);
                 const auto source = metadata.value("source", nlohmann::json::object());
@@ -14920,11 +14924,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     const auto attachment = _state ? _state->storeFor("fiber") : std::nullopt;
     if (!attachment || uuids.empty()) return readStoredFibers(uuids, lines);
     // Bound fibers decode in the open volume's voxels.
-    const auto volume = _state->currentVolume();
-    const auto volumeId = volume ? volume->id() : std::string{};
-    if (volumeId != _storedFiberDecodeVolume) {
+    const vc::objects::VolumeVoxels voxels = _state->annotationVolume().value_or(vc::project::AnnotationVolume{});
+    if (voxels != _storedFiberDecodeVolume) {
         _storedFiberDecodeCache.clear();
-        _storedFiberDecodeVolume = volumeId;
+        _storedFiberDecodeVolume = voxels;
     }
     // Same filter and order as readStoredFibers: requested order, first
     // occurrence, live fibers only.
@@ -15053,7 +15056,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 const auto inverse = fiber.frame->storedToVolume.inverse();
                 auto canonical = edited;
                 if (db.objectByUuid(txn, fiber.uuid)) {
-                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume);
+                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume.volume,
+                                                                                fiber.frame->volume.scale);
                     if (shown.mapping() != fiber.frame->storedToVolume)
                         throw std::runtime_error("The fiber's volume registration changed; reopen it");
                     canonical = shown.canonicalFiber(edited);
@@ -15245,7 +15249,9 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
         tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
     if (!scale) return false;
     connection->editCurrent(pin.attachment,{fiber.uuid},[&](auto& db,auto& txn,const auto& uuid){
-        db.bindGeometryCoordinates(txn,uuid,volume->id(),*scale);
+        // Units per voxel of the open volume: per voxel of its store volume at its scale.
+        const auto& target=*_state->annotationVolume();
+        db.bindGeometryCoordinates(txn,uuid,target.volume,*scale*target.scale);
     });
     return true;
 }
@@ -15260,7 +15266,9 @@ bool LineAnnotationController::fiberBoundToVolume(uint64_t id, const std::shared
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto object = db.objectByUuid(txn, uuid);
         bound = object && !object->retired &&
-                db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta), volume->id()).has_value();
+                db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta),
+                                                  vc::project::annotationVolume(_state->vpkg().get(), *volume).volume)
+                    .has_value();
     });
     return bound;
 }
@@ -15268,7 +15276,8 @@ bool LineAnnotationController::fiberBoundToVolume(uint64_t id, const std::shared
 bool LineAnnotationController::fiberInVolume(const StoredFiber& fiber) const
 {
     const auto volume = _state ? _state->currentVolume() : nullptr;
-    return volume && fiber.storePin && fiber.frame && fiber.frame->volume == volume->id();
+    return volume && fiber.storePin && fiber.frame && _state->annotationVolume() &&
+           fiber.frame->volume == vc::objects::VolumeVoxels(*_state->annotationVolume());
 }
 
 uint64_t LineAnnotationController::fiberIdForUuid(const std::string& uuid) const

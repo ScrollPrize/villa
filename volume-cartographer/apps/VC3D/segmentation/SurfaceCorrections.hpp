@@ -13,7 +13,6 @@
 #include <vector>
 #include <string>
 
-class Volume;
 
 namespace vc3d::corrections {
 
@@ -26,11 +25,12 @@ std::map<uint64_t, utils::Json> read(vc::objects::ObjectStoreSession& session,
                                      const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
 
 // Make the surface's corrections exactly `collections`: new ones become objects
-// bound to `volume` at its voxel scale, changed ones get new geometry (mapped
+// bound to `volume` (the open volume's voxels), changed ones get new geometry (mapped
 // back through `view` to each collection's stored frame), and dropped ones are
 // retired. One checked action.
 void write(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-           const std::string& surfaceUuid, const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
+           const std::string& surfaceUuid, const std::map<uint64_t, utils::Json>& collections,
+           const vc::objects::VolumeVoxels& volume,
            const std::optional<vc::objects::ViewFrame>& view = std::nullopt);
 
 // A growth that used corrections, kept for training: the surface's geometry
@@ -52,6 +52,6 @@ struct GrowthAnnotation {
 // Store it as a point_collection attached to the surface (role
 // "growth_annotation"). Returns the new object's UUID.
 std::string writeGrowthAnnotation(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
-                                  const GrowthAnnotation& annotation, const Volume& volume);
+                                  const GrowthAnnotation& annotation, const vc::objects::VolumeVoxels& volume);
 
 } // namespace vc3d::corrections

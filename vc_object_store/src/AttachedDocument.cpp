@@ -213,22 +213,23 @@ void replaceAttachedCollections(ObjectStoreSession& session, const AttachmentIde
     });
 }
 
-std::vector<AttachedCollection> volumeCollections(const ObjectStore& store, const Txn& txn, const std::string& volume)
+std::vector<AttachedCollection> volumeCollections(const ObjectStore& store, const Txn& txn, const VolumeVoxels& volume)
 {
     std::vector<AttachedCollection> result;
     ObjectSelection selection;
     selection.kind = "point_collection";
-    selection.volume = volume;
+    selection.volume = volume.volume;
+    selection.targetScale = volume.scale;
     for (const auto& object : store.selectObjects(txn, selection)) {
         if (nlohmann::json::parse(object.meta).contains("role")) continue;
         if (const auto head = store.currentGeometry(txn, object.uuid))
-            result.push_back(readCollection(store, txn, object, head->uuid, ViewFrame{volume, 1}));
+            result.push_back(readCollection(store, txn, object, head->uuid, ViewFrame{volume.volume, volume.scale}));
     }
     return result;
 }
 
 std::vector<AttachedCollection> pointCollections(const ObjectStore& store, const Txn& txn, const std::vector<std::string>& uuids,
-                                                 const std::string& volume)
+                                                 const VolumeVoxels& volume)
 {
     std::vector<AttachedCollection> result;
     for (const auto& uuid : uuids) {
@@ -237,20 +238,20 @@ std::vector<AttachedCollection> pointCollections(const ObjectStore& store, const
             throw std::runtime_error("point collection not found: " + uuid);
         const auto head = store.currentGeometry(txn, object->uuid);
         if (!head) throw std::runtime_error("point collection has no geometry: " + uuid);
-        result.push_back(readCollection(store, txn, *object, head->uuid, ViewFrame{volume, 1}));
+        result.push_back(readCollection(store, txn, *object, head->uuid, ViewFrame{volume.volume, volume.scale}));
     }
     return result;
 }
 
 std::vector<AttachedCollection> volumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                  const std::string& volume)
+                                                  const VolumeVoxels& volume)
 {
     std::vector<AttachedCollection> result;
     session.read(attachment, [&](const auto& store, const auto& txn, const auto&) { result = volumeCollections(store, txn, volume); });
     return result;
 }
 
-void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& volume,
+void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentity& attachment, const VolumeVoxels& volume,
                             const std::vector<AttachedCollection>& changed, const std::vector<std::string>& removed)
 {
     RevisionSelection pins;
@@ -265,7 +266,7 @@ void writeVolumeCollections(ObjectStoreSession& session, const AttachmentIdentit
     session.editKeepingRelationships(attachment, pins, {}, [&](auto& store, auto& txn, const auto&) {
         for (const auto& collection : changed)
             writeCollection(store, txn, util::canonicalUuid(collection.uuid), collection,
-                            {{"coordinates", volumeCoordinates(volume, 1)}}, ViewFrame{volume, 1});
+                            {{"coordinates", volumeCoordinates(volume)}}, ViewFrame{volume.volume, volume.scale});
         for (const auto& uuid : removed)
             if (const auto object = store.objectByUuid(txn, util::canonicalUuid(uuid)); object && !object->retired)
                 store.retireObject(txn, object->uuid);

@@ -227,7 +227,7 @@ int main(int argc, char** argv)
               QByteArrayLiteral("model"));
     LasagnaServiceManager::instance().setObjectStore(session, attachment);
     SurfaceCatalog catalog(session);
-    catalog.setSource(attachment, volume);
+    catalog.setSource(attachment, volume, {volume->id()});
     QElapsedTimer catalogTimer;
     catalogTimer.start();
     while ((catalog.loading() || catalog.rows().size() < 4) && catalogTimer.elapsed() < 10000) {
@@ -361,6 +361,8 @@ int main(int argc, char** argv)
     require(g_lastLasagnaOptimizationRequest[QStringLiteral("volume_uuid")].toString() ==
                 QStringLiteral("lasagna-test-volume"),
             "Launches should name the volume their surfaces are in");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("voxel_scale")].toDouble() == 1.0,
+            "Launches should name the scale of the voxels they work in");
 
     emit LasagnaServiceManager::instance().statusMessage(QStringLiteral("preparing"));
     require(panel._progressLabel->text() == QStringLiteral("preparing"),

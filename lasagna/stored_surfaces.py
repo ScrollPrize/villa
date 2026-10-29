@@ -117,8 +117,9 @@ class StoredSurface:
 			return np.array(store.read_geometry_arrays([self.revision], name).values)
 
 
-def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSurface:
-	"""The referenced surface in voxels of ``volume``, through the store's mapping to it."""
+def read_surface(store: str | Path, ref: str, *, volume: str | None, target_scale: float = 1.0) -> StoredSurface:
+	"""The referenced surface in voxels of ``volume`` at ``target_scale`` of its own (``--voxel-scale``), through
+	the store's mapping to it."""
 	from vc_object_store.surfaces import read_surface as read_grid
 	parsed = parse_surface_ref(ref)
 	if parsed is None:
@@ -126,4 +127,5 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSu
 	surface_uuid, revision = parsed
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
-	return StoredSurface(store, surface_uuid, read_grid(store, surface_uuid, volume=volume, geometry_revision=revision))
+	grid = read_grid(store, surface_uuid, volume=volume, geometry_revision=revision, target_scale=target_scale)
+	return StoredSurface(store, surface_uuid, grid)

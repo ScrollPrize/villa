@@ -670,11 +670,6 @@ const OpenDataSample* OpenDataManifest::findSample(std::string_view id) const no
     return it == samples.end() ? nullptr : &*it;
 }
 
-std::string levelVolumeId(std::string_view volumeId, int level)
-{
-    return level == 0 ? std::string(volumeId) : std::string(volumeId) + "@L" + std::to_string(level);
-}
-
 std::optional<OpenDataVolumeView> OpenDataManifest::volumeAt(std::string_view url, int baseLevel) const
 {
     const auto trimmed = [](std::string value) {

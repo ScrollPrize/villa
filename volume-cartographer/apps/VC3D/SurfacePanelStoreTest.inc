@@ -64,7 +64,7 @@ int runSurfacePanelStoreTests()
         SurfaceCatalog catalog(state.objectStoreSession());
         QObject::connect(&state, &CState::objectStoreChanged, &catalog,
                          [&](const StoreSessionEvent& event) { catalog.handle(event); });
-        catalog.setSource(attachment, volume);
+        catalog.setSource(attachment, volume, {volume->id()});
         SurfaceTreeWidget tree;
         tree.setColumnCount(TIMESTAMP_COLUMN + 1);
         SurfacePanelController panel({&tree}, &state, &catalog, nullptr, {});
@@ -172,7 +172,7 @@ int runSurfacePanelStoreTests()
         // The level the open volume shows, as the catalog registers it.
         vc::objects::registerVolumeTransform(*state.objectStoreSession(), catalogAttachment, "catalog-volume", "panel-volume",
                                              vc::objects::VolumeAffine::scale(0.5), "pyramid level 1");
-        catalog.setSource(state.storeFor("surface"), volume);
+        catalog.setSource(state.storeFor("surface"), volume, {volume->id()});
         pump([&] { return tree.topLevelItemCount() == 2; }, "the sample's surfaces are listed");
         require(catalog.row(shown)->fromCatalog() && catalog.row(shown)->source == catalogAttachment, "rows know their store");
         require(catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5) && !catalog.row(shown)->toolInput(),

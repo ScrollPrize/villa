@@ -92,6 +92,9 @@ public:
     [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
+    // The working level: the source pyramid level this volume opened as its
+    // level 0 (a remote locator's #vc-base-scale=N), so one voxel is 2^N
+    // source voxels. The volume keeps its ID at every working level.
     [[nodiscard]] int baseScaleLevel() const noexcept { return baseScaleLevel_; }
     [[nodiscard]] bool hasExplicitVoxelSizeOverride() const noexcept
     {

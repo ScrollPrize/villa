@@ -26,10 +26,12 @@ public:
         // A tool name (vc3d::findToolExecutable) or an executable path.
         QString tool;
         QStringList args;
-        // The store contract: `--store` and `--volume-uuid` follow `args` when set
-        // (tools take options anywhere; a script's path stays first).
+        // The store contract: `--store`, `--volume-uuid` and (when not 1)
+        // `--voxel-scale` follow `args` when set (tools take options anywhere;
+        // a script's path stays first).
         QString store;
         QString volume;
+        double voxelScale = 1;
         // OMP_NUM_THREADS for the run, when positive.
         int ompThreads = -1;
         // Variables added to the system environment.

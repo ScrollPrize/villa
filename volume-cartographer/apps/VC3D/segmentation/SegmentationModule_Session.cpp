@@ -409,12 +409,12 @@ void SegmentationModule::saveCorrections()
         _correctionsSaveTimer->stop();
     }
     if (!_pointCollection || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
-        !_state || !_state->currentVolume()) {
+        !_state || !_state->annotationVolume()) {
         return;
     }
     try {
         vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
-                                 _pointCollection->anchoredCollections(), *_state->currentVolume(), _storeEdit->view());
+                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit->view());
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
         emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);

@@ -1810,19 +1810,22 @@ void MenuActionController::importUmbilicus()
         storedUnitsPerVoxel = *entered;
     }
 
+    // The umbilicus belongs to the open volume's store volume: units per voxel
+    // of the open volume are units per voxel of that one at its scale.
+    const auto target = state.annotationVolume().value_or(vc::project::AnnotationVolume{});
     vc::objects::RevisionSelection replaced;
     state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, volume->id());
+        replaced = vc::objects::volumeUmbilicusRevisions(db, txn, target.volume);
     });
     if (!replaced.empty() &&
         QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
-            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(volume->id())))
+            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(target.volume)))
             != QMessageBox::Yes)
         return;
 
     try {
-        vc::objects::importVolumeUmbilicus(*state.objectStoreSession(), *attachment, volume->id(), umbilicus,
-            storedUnitsPerVoxel, QFileInfo(file).completeBaseName().toStdString(),
+        vc::objects::importVolumeUmbilicus(*state.objectStoreSession(), *attachment, target.volume, umbilicus,
+            storedUnitsPerVoxel * target.scale, QFileInfo(file).completeBaseName().toStdString(),
             {{"tool", "vc3d-import-umbilicus"},
              {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
                              {"frame", binding.frame.empty() ? std::string("entered") : binding.frame}}},
@@ -1839,7 +1842,7 @@ void MenuActionController::removeUmbilicus()
 {
     auto& state = *_window->_state;
     const auto attachment = state.storeFor("umbilicus");
-    const auto volumeId = state.currentVolumeId();
+    const auto volumeId = state.annotationVolume() ? state.annotationVolume()->volume : std::string{};
     if (!attachment || volumeId.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
             QObject::tr("Open a project and a volume first."));
@@ -2448,7 +2451,9 @@ void MenuActionController::importIntoObjectStore()
     }
     const std::filesystem::path source = folder->text().trimmed().toStdString();
     const auto coordinates = bind->isChecked()
-        ? vc::objects::volumeCoordinates(volume->id(), scale->text().toDouble()).dump() : std::string("{}");
+        ? vc::objects::volumeCoordinates(state.annotationVolume()->volume,
+                                         scale->text().toDouble() * state.annotationVolume()->scale).dump()
+        : std::string("{}");
     std::vector<std::string> tagNames;
     for (const auto& tag : tags->text().split(QLatin1Char(','), Qt::SkipEmptyParts))
         if (const auto name = tag.trimmed(); !name.isEmpty()) tagNames.push_back(name.toStdString());

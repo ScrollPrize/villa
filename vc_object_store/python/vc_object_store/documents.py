@@ -10,11 +10,12 @@ import uuid as uuidlib
 from ._native import ObjectStore
 
 
-def attach_document(store, object_uuid, document, *, role, list_key, position_key, name, volume, author=None) -> str:
+def attach_document(store, object_uuid, document, *, role, list_key, position_key, name, volume, author=None,
+                    voxel_scale=1.0) -> str:
     """Attach ``document`` to ``object_uuid`` in ``role`` as a new point collection named ``name`` whose positions
-    are in voxels of ``volume``. Returns the collection's UUID."""
+    are in voxels of ``volume`` at ``voxel_scale`` of its own. Returns the collection's UUID."""
     collection_uuid = str(uuidlib.uuid4())
-    coordinates = dict(volume_uuid=str(volume), scale_factor=1)
+    coordinates = dict(volume_uuid=str(volume), scale_factor=float(voxel_scale))
     with ObjectStore.open(str(store), author=author or getpass.getuser()) as db:
         head = db.current_object_revision(object_uuid)
         expected = {collection_uuid: None, object_uuid: head["uuid"] if head else None}
@@ -30,9 +31,9 @@ def attached_document(store, object_uuid, role):
 
 
 
-def point_collections(store, uuids, volume) -> list[dict]:
+def point_collections(store, uuids, volume, voxel_scale=1.0) -> list[dict]:
     """The point collections ``uuids`` (any role; objects/AttachedDocument.hpp ``pointCollections``) in ``volume``'s
-    voxels, in that order: each ``uuid``, ``name``, point ``ids`` and ``points``, one annotation per point and the
-    rest of the collection as ``source``."""
+    voxels at ``voxel_scale`` of its own, in that order: each ``uuid``, ``name``, point ``ids`` and ``points``, one
+    annotation per point and the rest of the collection as ``source``."""
     with ObjectStore.open(str(store), read_only=True, reader_pool_size=1) as db:
-        return db.point_collections([str(u) for u in uuids], str(volume))
+        return db.point_collections([str(u) for u in uuids], str(volume), float(voxel_scale))

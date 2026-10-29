@@ -2782,9 +2782,9 @@ void SpiralWorkspace::syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edit
     if (!session) {
         return;
     }
-    const auto volume = _state->currentVolumeId();
+    const auto& volume = _state->annotationVolume();
     std::set<std::string> shown;
-    if (!volume.empty()) {
+    if (volume) {
         for (const auto& surface : _state->surfaces()) {
             const auto quad = std::dynamic_pointer_cast<QuadSurface>(surface);
             if (!quad) {
@@ -2800,7 +2800,7 @@ void SpiralWorkspace::syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edit
             if (drafted.lock() == quad && quad != edited) {
                 continue;
             }
-            session->setDraft(quad->id, quad_surface_grid(*quad), vc::objects::volumeCoordinates(volume, 1));
+            session->setDraft(quad->id, quad_surface_grid(*quad), vc::objects::volumeCoordinates(*volume));
             drafted = quad;
         }
     }

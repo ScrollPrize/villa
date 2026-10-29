@@ -162,10 +162,10 @@ int main() try {
         vc::geometry::Umbilicus u;u.points={{2,4,6},{4,6,8}};
         {auto txn=db.write({{first.uuid,std::nullopt}});setVolumeUmbilicus(db,txn,"c",first,u);txn.commit();}
         {
-            auto read=db.read();const auto found=volumeUmbilicus(db,read,"c");
+            auto read=db.read();const auto found=volumeUmbilicus(db,read,{"c"});
             require(found&&found->uuid==first.uuid&&found->points.front()==std::array<double,3>{1,2,3},
                     "the volume's umbilicus in its voxels");
-            require(!volumeUmbilicus(db,read,"d"),"a volume without one has none");
+            require(!volumeUmbilicus(db,read,{"d"}),"a volume without one has none");
         }
         auto second=first;second.uuid=vc::objects::util::newUuid();second.name="second";
         RevisionSelection pins;{auto read=db.read();pins=volumeUmbilicusRevisions(db,read,"c");}
@@ -174,7 +174,7 @@ int main() try {
         {auto txn=db.write(pins);setVolumeUmbilicus(db,txn,"c",second,u);txn.commit();}
         {
             auto read=db.read();
-            require(volumeUmbilicus(db,read,"c")->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
+            require(volumeUmbilicus(db,read,{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
                     "importing replaces the volume's umbilicus");
         }
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
@@ -186,7 +186,7 @@ int main() try {
         auto extra=first;extra.uuid=vc::objects::util::newUuid();
         {auto txn=db.write();db.upsertObject(txn,extra);db.putGeometry(txn,extra.uuid,vc::geometry::encode(u));txn.commit();}
         bool several=false;
-        try{auto read=db.read();(void)volumeUmbilicus(db,read,"c");}catch(const std::runtime_error&){several=true;}
+        try{auto read=db.read();(void)volumeUmbilicus(db,read,{"c"});}catch(const std::runtime_error&){several=true;}
         require(several,"several umbilici for one volume are refused");
     }
     {
@@ -247,13 +247,15 @@ int main() try {
         const auto binding=umbilicusBinding(stamped,half,std::nullopt);
         require(!binding.refusal&&!binding.confirm&&binding.storedUnitsPerVoxel==2.0,"a stamped grid binds as stated");
         importVolumeUmbilicus(session,attachment,"v",stamped,*binding.storedUnitsPerVoxel,"stamped",{{"tool","test"}});
-        auto found=volumeUmbilicus(session,attachment,"v");
+        auto found=volumeUmbilicus(session,attachment,{"v"});
         require(found&&found->name=="stamped"&&found->points.front()==std::array<double,3>{10,5,0},"imported in the volume's voxels");
+        require(volumeUmbilicus(session,attachment,{"v",0.5})->points.front()==std::array<double,3>{5,2.5,0},
+                "an umbilicus is read at a scale of the volume's voxels");
         const auto plain=readUmbilicusFile(write("plain.txt","# z, y, x\n0, 10, 20\n390, 12, 22\n"));
         const auto asked=umbilicusBinding(plain,half,std::nullopt);
         require(!asked.refusal&&asked.confirm,"an unstamped file is confirmed");
         importVolumeUmbilicus(session,attachment,"v",plain,1.0,"plain",{{"tool","test"}});
-        found=volumeUmbilicus(session,attachment,"v");
+        found=volumeUmbilicus(session,attachment,{"v"});
         require(found&&found->name=="plain","importing again replaces the volume's umbilicus");
         const auto malformed=readUmbilicusFile(write("bad.json",R"({"points":[[0,1,2]],"metadata":{"volume_width":-5}})"));
         require(umbilicusBinding(malformed,half,std::nullopt).refusal.has_value(),"malformed frame metadata is refused");
@@ -271,17 +273,17 @@ int main() try {
         collection.points.ids={4,9};collection.points.points={{1,2,3},{4,5,6}};
         collection.annotations=nlohmann::json::array({{{"wind_a",1}},{{"wind_a",2}}});
         collection.source={{"color",{1,0,0}}};
-        writeVolumeCollections(session,attachment,"w",{collection},{});
-        auto found=volumeCollections(session,attachment,"w");
+        writeVolumeCollections(session,attachment,{"w"},{collection},{});
+        auto found=volumeCollections(session,attachment,{"w"});
         require(found.size()==1&&found[0].name=="seeds"&&found[0].points.ids==std::vector<vc::geometry::PointId>{4,9}&&
                 found[0].points.points[1]==std::array<double,3>{4,5,6}&&found[0].annotations[1]["wind_a"]==2&&
                 found[0].source["color"]==nlohmann::json({1,0,0}),"a volume's collection reads back as written");
-        const auto registered=volumeCollections(session,attachment,"w2");
+        const auto registered=volumeCollections(session,attachment,{"w2"});
         require(registered.size()==1&&registered[0].points.points[0]==std::array<double,3>{2,4,6},
                 "collections are read through a registration");
         collection.points.points[0]={7,8,9};
-        writeVolumeCollections(session,attachment,"w",{collection},{});
-        found=volumeCollections(session,attachment,"w");
+        writeVolumeCollections(session,attachment,{"w"},{collection},{});
+        found=volumeCollections(session,attachment,{"w"});
         require(found.size()==1&&found[0].points.points[0]==std::array<double,3>{7,8,9}&&found[0].points.ids[1]==9,
                 "a revision keeps point identity");
         // Attached data (a surface's corrections) is no volume collection.
@@ -290,9 +292,17 @@ int main() try {
         session.act(attachment,{{surface.uuid,std::nullopt}},[&](auto& db,auto& txn){db.upsertObject(txn,surface);});
         AttachedCollection corrections=collection;corrections.uuid=vc::objects::util::newUuid();
         replaceAttachedCollections(session,attachment,surface.uuid,"corrections",{corrections},volumeCoordinates("w",1));
-        require(volumeCollections(session,attachment,"w").size()==1,"attached collections are not the volume's");
-        writeVolumeCollections(session,attachment,"w",{},{collection.uuid});
-        require(volumeCollections(session,attachment,"w").empty(),"a removed collection is retired");
+        require(volumeCollections(session,attachment,{"w"}).size()==1,"attached collections are not the volume's");
+        writeVolumeCollections(session,attachment,{"w"},{},{collection.uuid});
+        require(volumeCollections(session,attachment,{"w"}).empty(),"a removed collection is retired");
+        // At a working level: written and read at a scale of the volume's voxels.
+        AttachedCollection coarse=collection;coarse.uuid=vc::objects::util::newUuid();
+        writeVolumeCollections(session,attachment,{"w",0.25},{coarse},{});
+        const auto full=volumeCollections(session,attachment,{"w"});
+        require(full.size()==1&&full[0].points.points[0]==std::array<double,3>{28,32,36},
+                "a collection written at a scale is bound at that scale");
+        const auto again=volumeCollections(session,attachment,{"w",0.25});
+        require(again.size()==1&&again[0].points.points[0]==std::array<double,3>{7,8,9},"and reads back at it");
     }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
