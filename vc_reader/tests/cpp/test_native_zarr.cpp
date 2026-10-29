@@ -222,6 +222,64 @@ void local(const fs::path& root, const std::vector<uint16_t>& v)
     require(vcr::zarr::Group::open(group.string(), {}).levels().size() == 2, "plain numbered levels");
 }
 
+void sparseLevels(const fs::path& root)
+{
+    const auto path = root / "sparse.zarr";
+    write_text(path / "3/.zarray", kZarray);
+    write_text(path / "10/.zarray", kZarray);
+    auto group = vcr::zarr::Group::open(path.string(), {});
+    require(group.levels() == std::vector<std::string>{"3", "10"}, "implicit sparse group numeric order");
+    auto selected = vcr::zarr::openPyramidLevel(path.string(), 10, {});
+    require(selected.location == (path / "10").string(), "sparse physical selection");
+    must_fail([&] { vcr::zarr::openPyramidLevel(path.string(), 0, {}); }, "sparse levels must not rebase");
+    must_fail([&] { vcr::zarr::openPyramidLevel(path.string(), -1, {}); }, "negative level refused");
+    require(vcr::zarr::openPyramidLevel((path / "3").string(), 0, {}).meta.shape == vcr::Index{4,4,4},
+            "root array selection");
+    must_fail([&] { vcr::zarr::openPyramidLevel((path / "3").string(), 1, {}); }, "root has only level zero");
+
+    write_text(path / ".zattrs", R"({"multiscales":[{"datasets":[{"path":"10"},{"path":"3"}]}]})");
+    require(vcr::zarr::openPyramidLevel(path.string(), 3, {}).location == (path / "3").string(),
+            "numeric OME paths retain physical level");
+    write_text(path / ".zattrs", R"({"multiscales":[{"datasets":[{"path":"3"},{"path":"03"}]}]})");
+    must_fail([&] { vcr::zarr::openPyramidLevel(path.string(), 3, {}); }, "duplicate numeric levels refused");
+    write_text(path / "coarse/.zarray", kZarray);
+    write_text(path / ".zattrs", R"({"multiscales":[{"datasets":[{"path":"3"},{"path":"coarse"}]}]})");
+    require(vcr::zarr::openPyramidLevel(path.string(), 1, {}).location == (path / "coarse").string(),
+            "named OME levels use advertised order");
+
+    // A remote metadata hook sees the same sparse topology without needing a
+    // directory listing. Only the selected level is opened, never its siblings.
+    std::vector<std::string> requested;
+    vcr::zarr::OpenOptions options;
+    options.metadata = [&](const std::string& location, const std::string& name) -> std::optional<std::string> {
+        requested.push_back(location + "/" + name);
+        if (name == ".zgroup" && location == "https://example.invalid/sparse") return R"({"zarr_format":2})";
+        if (name == ".zarray" && location == "https://example.invalid/sparse/3") return kZarray;
+        return {};
+    };
+    auto remote = vcr::zarr::openPyramidLevel("https://example.invalid/sparse", 3, options, 5);
+    require(remote.meta.shape == vcr::Index{4,4,4}, "remote bounded sparse probing");
+    require(std::find(requested.begin(), requested.end(), "https://example.invalid/sparse/5/.zarray") == requested.end(),
+            "remote probing respects limit");
+    options.metadata = [&](const std::string& location, const std::string& name) -> std::optional<std::string> {
+        if (location != "https://example.invalid/sparse") throw std::runtime_error("unexpected child metadata fetch");
+        if (name == ".zgroup") return R"({"zarr_format":2})";
+        if (name == ".zmetadata") return Json{{"metadata", {{"3/.zarray", Json::parse(kZarray)},
+                                                           {"10/.zarray", Json::parse(kZarray)},
+                                                           {"10/.zattrs", Json::object()}}}}.dump();
+        return {};
+    };
+    auto indexed = vcr::zarr::Group::open("https://example.invalid/sparse", options);
+    require(indexed.levels() == std::vector<std::string>{"3", "10"}, "consolidated sparse discovery");
+
+    const auto v3path = root / "sparse-v3.zarr";
+    vcr::zarr::CreateOptions create;
+    create.version = 3; create.shape = {4,4,4}; create.chunks = {2,2,2};
+    auto writer = vcr::zarr::Writer::create(v3path / "4", create);
+    require(vcr::zarr::openPyramidLevel(v3path.string(), 4, {}).meta.v3.has_value(), "v3 sparse level");
+    require(vcr::zarr::openPyramidLevel(writer.path().string(), 0, {}).meta.v3.has_value(), "v3 root array");
+}
+
 void remote(const fs::path& root, const std::vector<uint16_t>& v)
 {
     const auto group = root / "remote.zarr";
@@ -371,6 +429,7 @@ int main(int argc, char** argv)
         metadata();
         localShards(root);
         local(root, v);
+        sparseLevels(root);
         if (!sftp_fixture::install(root)) {
             std::cout << "metadata and local groups passed; no OpenSSH sftp-server for remote cases\n";
             return 0;

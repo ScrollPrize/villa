@@ -195,6 +195,14 @@ struct ArrayHints {
 };
 OpenedArray openArray(const std::string& location, const OpenOptions& options, ArrayHints hints = {});
 
+// Select one physical pyramid level without opening the other arrays. A root
+// array is level 0. Numeric dataset paths retain their numbers (including gaps);
+// other OME dataset paths use their advertised order. Without OME metadata,
+// discovers numbered arrays locally or probes remote levels [0, probeLevels).
+// Missing levels throw; no implicit renumbering or downsampling is performed.
+OpenedArray openPyramidLevel(const std::string& location, int level, const OpenOptions& options,
+                             int probeLevels = 32);
+
 class Group {
 public:
     static Group open(const std::string& location, OpenOptions options);
@@ -205,9 +213,11 @@ public:
     const OpenOptions& options() const { return options_; }
     // OME-NGFF multiscales (empty without them).
     Json multiscales() const;
-    // Paths of the pyramid levels, finest first: the first multiscales' datasets,
-    // else the arrays "0", "1", ... up to the first absent one.
-    std::vector<std::string> levels();
+    // Paths from the first multiscales' datasets, otherwise numbered arrays.
+    // Local and consolidated groups include gaps, sorted numerically. Remote
+    // groups without an index stop at the first absent level unless probeLevels
+    // is positive, in which case all levels [0, probeLevels) are checked.
+    std::vector<std::string> levels(int probeLevels = 0);
 
     enum class NodeKind { Array, Group };
     // The child at a path, its metadata when it is an array; nullopt when absent.

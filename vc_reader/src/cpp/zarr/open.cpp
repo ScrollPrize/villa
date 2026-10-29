@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -21,6 +23,28 @@ std::string stripSlashes(std::string s)
 bool digits(const std::string& s)
 {
     return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); });
+}
+
+int levelNumber(const std::string& path)
+{
+    int value = 0;
+    const auto [end, error] = std::from_chars(path.data(), path.data() + path.size(), value);
+    if (error != std::errc{} || end != path.data() + path.size() || value < 0)
+        throw std::invalid_argument("invalid numeric pyramid level: " + path);
+    return value;
+}
+
+std::vector<std::string> localNumberedChildren(const fs::path& root)
+{
+    std::vector<std::string> paths;
+    if (fs::is_directory(root))
+        for (const auto& child : fs::directory_iterator(root)) {
+            const auto name = child.path().filename().string();
+            if (digits(name) && child.is_directory() &&
+                (fs::exists(child.path() / ".zarray") || fs::exists(child.path() / "zarr.json")))
+                paths.push_back(name);
+        }
+    return paths;
 }
 
 MetadataReader reader(const OpenOptions& options)
@@ -219,7 +243,9 @@ Group Group::open(const std::string& input, OpenOptions options)
     if (!zgroup && !zattrs) {
         if (read(location, ".zarray"))
             throw std::invalid_argument(location + " is an array, not a group");
-        throw std::runtime_error("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
+        // Zarr v2 permits implicit parent groups in local hierarchies.
+        if (remote || localNumberedChildren(location).empty())
+            throw std::runtime_error("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
     }
     Json attrs = zattrs ? Json::parse(*zattrs) : Json::object();
     if (remote && options.cacheWrites) {
@@ -266,8 +292,10 @@ Json Group::multiscales() const
     return ms.is_array() ? ms : Json::array();
 }
 
-std::vector<std::string> Group::levels()
+std::vector<std::string> Group::levels(int probeLevels)
 {
+    if (probeLevels < 0)
+        throw std::invalid_argument("probeLevels must be nonnegative");
     std::vector<std::string> out;
     const auto ms = multiscales();
     if (!ms.empty()) {
@@ -277,12 +305,79 @@ std::vector<std::string> Group::levels()
         }
         return out;
     }
-    while (true) {
-        const auto n = node(std::to_string(out.size()));
-        if (!n || n->first != NodeKind::Array)
-            return out;
-        out.push_back(std::to_string(out.size()));
+    std::vector<std::string> candidates;
+    if (!isRemote(location_)) {
+        candidates = localNumberedChildren(location_);
     }
+    const auto meta = consolidated();
+    if (meta && meta->is_object()) {
+        for (const auto& [key, value] : meta->items()) {
+            const auto slash = key.find('/');
+            const auto name = key.substr(0, slash);
+            if (slash != std::string::npos && digits(name) && key.substr(slash) == "/.zarray")
+                candidates.push_back(name);
+        }
+    }
+    if (!isRemote(location_) || meta) {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            const int na = levelNumber(a), nb = levelNumber(b);
+            return na == nb ? a < b : na < nb;
+        });
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        for (const auto& path : candidates)
+            if (const auto n = node(path); n && n->first == NodeKind::Array)
+                out.push_back(path);
+        return out;
+    }
+    for (int level = 0; probeLevels == 0 || level < probeLevels; ++level) {
+        const auto path = std::to_string(level);
+        const auto n = node(path);
+        if (n && n->first == NodeKind::Array)
+            out.push_back(path);
+        else if (probeLevels == 0)
+            break;
+    }
+    return out;
+}
+
+OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOptions& options,
+                             int probeLevels)
+{
+    if (level < 0 || probeLevels < 0)
+        throw std::invalid_argument("pyramid level and probeLevels must be nonnegative");
+    const auto location = stripSlashes(input);
+    std::optional<Json> root;
+    if (options.offline && isRemote(location)) {
+        root = cachedSourceZarray(options.cacheDirs, options.access.cacheUrl(location), {}, {},
+                                 options.vc3dVolumeDir);
+    } else {
+        const auto read = reader(options);
+        root = readJsonNode(read, location, ".zarray");
+        if (!root) {
+            const auto v3 = readJsonNode(read, location, "zarr.json");
+            if (v3 && v3->value("node_type", "") == "array") root = v3;
+        }
+    }
+    if (root) {
+        if (level != 0) throw std::out_of_range("a root array has only pyramid level 0");
+        ArrayHints hints;
+        hints.metadata = std::move(root);
+        return openArray(location, options, std::move(hints));
+    }
+    auto group = Group::open(location, options);
+    const auto paths = group.levels(probeLevels);
+    const bool numeric = std::all_of(paths.begin(), paths.end(), digits);
+    std::set<int> seen;
+    std::optional<std::string> selected;
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        const int number = numeric ? levelNumber(paths[i]) : static_cast<int>(i);
+        if (!seen.insert(number).second)
+            throw std::invalid_argument("duplicate pyramid level " + std::to_string(number));
+        if (number == level) selected = paths[i];
+    }
+    if (!selected)
+        throw std::out_of_range("pyramid level " + std::to_string(level) + " is not present in " + location);
+    return group.array(*selected);
 }
 
 std::optional<Json> Group::consolidated()
