@@ -14,6 +14,7 @@
 
 #include <QElapsedTimer>
 #include <QFile>
+#include <QJsonArray>
 #include <QProcess>
 #include <QSignalSpy>
 #include <QTemporaryDir>
@@ -68,6 +69,19 @@ bool startService(ServiceProcess& service, const QString& python, const QTempora
     return service.port > 0;
 }
 
+// What VC3D sends of a project of the objects' volume "vol": the fixture
+// dataset's scroll specification states the scroll, and this its umbilicus.
+QJsonObject protocolProject()
+{
+    const QJsonObject umbilicus{
+        {QStringLiteral("uuid"), QStringLiteral("6c1f0e4e-6d7a-4d55-9d0c-2b8f9a0c1e11")},
+        {QStringLiteral("revision"), QStringLiteral("a7d5c3e0-1b2c-4d3e-8f90-0a1b2c3d4e5f")},
+        {QStringLiteral("points_zyx"), QJsonArray{QJsonArray{0, 32, 32}, QJsonArray{64, 32, 32}}}};
+    return {{QStringLiteral("name"), QStringLiteral("protocol")},
+            {QStringLiteral("volumes"), QJsonObject{{QStringLiteral("vol"),
+                QJsonObject{{QStringLiteral("umbilicus"), umbilicus}}}}}};
+}
+
 SpiralServiceProfile protocolProfile(int port)
 {
     SpiralServiceProfile profile;
@@ -113,6 +127,7 @@ private slots:
         QVERIFY(startService(service, python, directory, QString::fromStdString(storePath.string())));
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
+        manager.setProjectSource(protocolProject);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
         QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
@@ -216,6 +231,7 @@ private slots:
 
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
+        manager.setProjectSource(protocolProject);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy errors(&manager, &SpiralServiceManager::errorOccurred);
         SpiralServiceProfile profile;
@@ -294,6 +310,7 @@ private:
                              QString::fromStdString(hubPath.string())));
         SpiralServiceManager manager;
         manager.setObjectStore(session, attachment);
+        manager.setProjectSource(protocolProject);
         QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
         QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
         QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
@@ -438,6 +455,7 @@ private:
         QVERIFY(update.error.contains(QStringLiteral("attached object store changed")));
         QVERIFY(!manager.inputUpdateActive() && !session->hubStatus(attachment)->pushesHeld);
         manager.setObjectStore(session, attachment);
+        manager.setProjectSource(protocolProject);
         QTest::qWait(500);
         QCOMPARE(updates.count(), 6);
 

@@ -230,6 +230,8 @@ set(srcs
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
     SpiralSessionSync.hpp
+    SpiralProjectInputs.cpp
+    SpiralProjectInputs.hpp
     SpiralStoreInputs.cpp
     SpiralStoreInputs.hpp
     SpiralStoreEdits.cpp

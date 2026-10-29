@@ -106,6 +106,9 @@ private:
                             const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
     void applyScrollSpec(const QJsonObject& spec);
+    // The scroll the session fits and its project volume (its request's
+    // "scroll" and "project").
+    void applySessionScroll(const QJsonObject& request);
     void updateStatus(const QJsonObject& status);
     void updateWarnings(const QJsonObject& status);
     void refreshInputVisibility();

@@ -6,6 +6,7 @@
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
+#include "SpiralProjectInputs.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralStoreInputs.hpp"
 #include "SpiralStoreEdits.hpp"
@@ -418,6 +419,15 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 
     _service = new SpiralServiceManager(this);
     bindInputStore();
+    // A fit reads the open project's facts and umbilicus; the service
+    // receives them with every build, as it cannot read the project file.
+    _service->setProjectSource([this]() {
+        const auto pkg = _state->vpkg();
+        if (!pkg) throw std::runtime_error("no project is open");
+        return vc3d::spiral::projectBlock(pkg->name(), vc3d::spiral::projectVolumeFacts(*pkg),
+                                          _state->objectStoreSession().get(),
+                                          _state->storeFor("umbilicus"));
+    });
 
     _pythonOutputDialog = new QDialog(this, Qt::Window);
     _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));
@@ -703,6 +713,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _sessionPaths = paths;
                 _sessionRunConfig = request.value(QStringLiteral("run")).toObject()
                     .value(QStringLiteral("config")).toObject();
+                _sessionScroll = request.value(QStringLiteral("scroll")).toObject();
                 _previewSource.reset();
                 _previewBaseShapeZYX.reset();
                 _fiberBaseShapeZYX.reset();
@@ -1986,14 +1997,13 @@ void SpiralWorkspace::refreshFitOverlays()
 
 std::optional<double> SpiralWorkspace::fitInputScale(QString* error) const
 {
-    // The fit's inputs are read in reference-volume voxels: the scroll's base
-    // shape, mapped onto the preview's coordinate domain.
+    // The fit's inputs are read in reference-volume voxels: the session's
+    // scroll's base shape, mapped onto the preview's coordinate domain.
     QString shapeError;
     const auto scrollShape = parseBaseShapeZYX(
-        _service->advertisedDataset().value(QStringLiteral("scroll_spec")).toObject()
-            .value(QStringLiteral("base_shape_zyx")), &shapeError);
+        _sessionScroll.value(QStringLiteral("base_shape_zyx")), &shapeError);
     if (!_previewBaseShapeZYX || !scrollShape) {
-        *error = tr("The preview or the scroll specification has no coordinate-domain metadata");
+        *error = tr("The preview or the session's scroll has no coordinate-domain metadata");
         return std::nullopt;
     }
     try {

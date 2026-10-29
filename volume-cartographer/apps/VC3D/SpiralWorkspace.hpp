@@ -295,6 +295,8 @@ private:
     qint64 _requestedPreviewGeneration = -1;
     QJsonObject _sessionPaths;
     QJsonObject _sessionRunConfig;
+    // The scroll the session fits (its request's "scroll").
+    QJsonObject _sessionScroll;
     struct LineAnnotationDraft {
         std::shared_ptr<QuadSurface> surface;
         std::vector<QPointF> surfacePoints;

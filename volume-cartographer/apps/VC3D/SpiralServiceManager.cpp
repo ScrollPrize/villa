@@ -929,6 +929,13 @@ void SpiralServiceManager::sendInputUpdate(QJsonObject request, qint64 requested
         if (!body.isEmpty()) handleStatus(body);
         finishInputUpdate(update, serial);
     };
+    // A build (not an update of the resident fit) reads the project again.
+    if (!update) {
+        if (const QString error = addProject(body); !error.isEmpty()) {
+            failed(error, {});
+            return;
+        }
+    }
     postWithRetry(route, body, Timeout::Load, kMutationRetries,
                   [this, requested, serial](const QJsonObject& response) {
                       handleStatus(response);
@@ -1013,8 +1020,23 @@ void SpiralServiceManager::rebuildWithDefaults()
                         {QStringLiteral("command_id"), commandId()}});
 }
 
+QString SpiralServiceManager::addProject(QJsonObject& body) const
+{
+    try {
+        if (!_projectSource) return tr("No project is open");
+        body[QStringLiteral("project")] = _projectSource();
+        return {};
+    } catch (const std::exception& error) {
+        return tr("The project's Spiral inputs could not be read: %1").arg(QString::fromUtf8(error.what()));
+    }
+}
+
 void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 {
+    if (const QString error = addProject(request); !error.isEmpty()) {
+        emit errorOccurred(error);
+        return;
+    }
     postWithRetry(QStringLiteral("/session/rebuild"), request, Timeout::Load, kMutationRetries,
                   [this](const QJsonObject& response) {
                       handleStatus(response);
@@ -1023,6 +1045,10 @@ void SpiralServiceManager::sendRebuildRequest(QJsonObject request)
 
 void SpiralServiceManager::sendInitializeRequest(QJsonObject request)
 {
+    if (const QString error = addProject(request); !error.isEmpty()) {
+        emit errorOccurred(error);
+        return;
+    }
     postWithRetry(QStringLiteral("/session/initialize"), request, Timeout::Load,
                   kMutationRetries, [this](const QJsonObject& response) {
                       handleStatus(response);

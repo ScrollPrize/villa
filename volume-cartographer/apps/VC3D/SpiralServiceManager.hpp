@@ -51,7 +51,7 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 39;
+    static constexpr int kApiVersion = 40;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted only when both
@@ -119,6 +119,11 @@ public:
     bool isReady() const { return _connectionState == ConnectionState::Ready; }
     bool hasActiveSession() const { return _hasActiveSession; }
     QJsonObject advertisedDataset() const { return _advertisedDataset; }
+    // The "project" block every initialize and rebuild carries
+    // (SpiralProjectInputs): the service reads the project's facts and
+    // umbilicus from it, not from the project file. Throws when the project
+    // cannot be described; the request is then not sent.
+    void setProjectSource(std::function<QJsonObject()> source) { _projectSource = std::move(source); }
     const SpiralServiceProfile& profile() const { return _profile; }
     bool ownsProcess() const;
     qint64 displayedPreviewSourceIteration() const
@@ -350,6 +355,8 @@ private:
     void abandonInputUpdate(const QString& reason);
     void sendRebuildRequest(QJsonObject request);
     void sendInitializeRequest(QJsonObject request);
+    // Adds the project block to `body`; the error when it cannot be read.
+    QString addProject(QJsonObject& body) const;
     void prepareSessionRequest(QJsonObject request, bool initialize);
     void sendLoadCheckpoint(QJsonObject body, const QString& hostPath,
                             const QString& localPath);
@@ -385,6 +392,7 @@ private:
     int _eventFailures = 0;
     qint64 _lastEventCursor = 0;
     QJsonObject _advertisedDataset;
+    std::function<QJsonObject()> _projectSource;
     QJsonObject _configurationDefaults;
     QJsonObject _appliedConfiguration;
     qint64 _sessionRevision = 0;

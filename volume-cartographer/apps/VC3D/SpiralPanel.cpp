@@ -248,9 +248,10 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
     addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
-    // Read-only, because spiral-scroll.json in the dataset root is the only
-    // source of these: the service rejects a request that restates them. They
-    // are still shown, because a fit's meaning depends on them.
+    // Read-only: the project's fit volume (and, for what it does not know,
+    // spiral-scroll.json in the dataset root) is the only source of these, and
+    // the service rejects a request that restates them. They are still shown,
+    // because a fit's meaning depends on them.
     _scrollSummary = new QLabel(tr("No scroll specification loaded"), pathsContents);
     _scrollSummary->setObjectName(QStringLiteral("spiralScrollSummary"));
     _scrollSummary->setWordWrap(true);
@@ -1602,8 +1603,9 @@ void SpiralPanel::setRemoteMode(bool remote)
             _pathBrowseButtons[it.key()]->setVisible(false);
     }
     _save->setVisible(true);
-    for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
-        setToolTipNote(edit->parentWidget(), tr("Service-host path, owned by the service"));
+    setToolTipNote(_paths["dataset_root"]->parentWidget(), tr("Service-host path, owned by the service"));
+    setToolTipNote(_paths["umbilicus"]->parentWidget(),
+                   tr("The project's umbilicus of the fit volume, written by the service for the fit"));
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1942,24 +1944,36 @@ void SpiralPanel::updatePositionSummary()
 void SpiralPanel::applyScrollSpec(const QJsonObject& spec)
 {
     if (spec.isEmpty()) {
-        // A missing or invalid specification is a missing_required condition
-        // the service reports; the panel says so where the values would be.
+        // An invalid specification is a missing_required condition the
+        // service reports; the panel says so where the values would be.
         const QString unavailable = tr("No valid spiral-scroll.json in the dataset root");
         _scrollSummary->setText(unavailable);
         _lasagnaSummary->setText(unavailable);
         return;
     }
-    const double voxelSize = spec.value(QStringLiteral("voxel_size_um")).toDouble();
-    _scrollSummary->setText(
-        tr("%1 — %2 µm/voxel, outward %3")
-            .arg(spec.value(QStringLiteral("name")).toString())
-            .arg(voxelSize, 0, 'g', 4)
-            .arg(spec.value(QStringLiteral("spiral_outward_sense")).toString()));
+    // The dataset's optional specification states the Lasagna layout; the
+    // scroll's facts come from the project's fit volume (applySessionScroll).
+    if (!_hasSession)
+        _scrollSummary->setText(tr("From the project's fit volume when a fit is built"));
     _lasagnaSummary->setText(
         tr("normals in zarr group %1, SDT in %2, coordinate scale %3")
-            .arg(spec.value(QStringLiteral("normal_zarr_group")).toString())
+            .arg(spec.value(QStringLiteral("normal_zarr_group")).toString(QStringLiteral("4")))
             .arg(spec.value(QStringLiteral("surf_sdt_zarr_group")).toString())
-            .arg(spec.value(QStringLiteral("lasagna_scale")).toInt()));
+            .arg(spec.value(QStringLiteral("lasagna_scale")).toInt(4)));
+}
+
+void SpiralPanel::applySessionScroll(const QJsonObject& request)
+{
+    const QJsonObject scroll = request.value(QStringLiteral("scroll")).toObject();
+    const QJsonObject project = request.value(QStringLiteral("project")).toObject();
+    _scrollSummary->setText(
+        tr("%1 — volume %2, %3 µm/voxel, outward %4; umbilicus revision %5")
+            .arg(scroll.value(QStringLiteral("name")).toString(),
+                 project.value(QStringLiteral("volume")).toString())
+            .arg(scroll.value(QStringLiteral("voxel_size_um")).toDouble(), 0, 'g', 4)
+            .arg(scroll.value(QStringLiteral("spiral_outward_sense")).toString(),
+                 project.value(QStringLiteral("umbilicus")).toObject()
+                     .value(QStringLiteral("revision")).toString()));
 }
 
 QJsonObject SpiralPanel::sessionRequest() const
@@ -2192,6 +2206,7 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _hasManualEdits = false;
     _hasSession = true;
+    applySessionScroll(request);
     // Reload comparisons use the panel's adopted representation. The host
     // request is canonical and sparse, whereas the form expands the active
     // session defaults; both describe the same resident fit.

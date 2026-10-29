@@ -10,6 +10,15 @@ with *Show fitted fibers* in Display), and *Fit inputs* in the Spiral panel
 reports their digest, counts and what differs from what the fit read,
 including its links.
 
+The scroll's facts and the umbilicus are the open project's: every build
+request sends the service, which cannot read the project file, each project
+volume's voxel size, a catalog volume's orientation and full-resolution
+shape, and the umbilicus the project's umbilicus store holds for it (see
+"The VC3D project's inputs" in the README). The fit uses the entry of the
+volume its inputs name; import an umbilicus for that volume (File > Import
+Umbilicus) before building. The panel's *Scroll* line shows the session's
+scroll, volume and umbilicus revision.
+
 The input list holds local drawings: brush patches and drawn point
 collections. *Save Drafts to Store* (Shift+E) saves the ready ones into that
 store as checked revisions, each pinned at the revision its edit
@@ -29,7 +38,7 @@ configured build directory:
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C volume-cartographer/build -j2 VC3D \
   test_spiral_brush_patch test_spiral_store_inputs test_spiral_store_edits \
-  test_spiral_service_protocol
+  test_spiral_project_inputs test_spiral_service_protocol
 QT_QPA_PLATFORM=offscreen \
   SPIRAL_TEST_PYTHON="$PWD/spiral-fitting/.venv/bin/python" \
   PYTHONPATH=<vc_object_store build>/python \
