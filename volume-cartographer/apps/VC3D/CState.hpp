@@ -70,10 +70,6 @@ public:
     void detachStore(const vc::objects::AttachmentIdentity&);
     void detachStoreReference(const std::string& id);
     void replaceStoreReference(const std::string& id, const std::filesystem::path& path);
-    // Close a store, keeping its project reference as an unavailable store
-    // (e.g. while its file is moved); replaceStoreReference reopens it.
-    // Returns the reference.
-    std::string closeStore(const vc::objects::AttachmentIdentity&);
     static const std::vector<std::string>& routableKinds();
     std::optional<vc::objects::AttachmentIdentity> storeFor(std::string_view kind) const;
     std::vector<vc::objects::AttachmentIdentity> surfaceSources() const;

@@ -51,20 +51,28 @@ public:
 
     // The one service API version this build speaks; the handshake refuses
     // anything else. Reported to the user so a mismatch is self-explanatory.
-    static constexpr int kApiVersion = 38;
+    static constexpr int kApiVersion = 39;
 
     // The object store a service reads its fit inputs from, beside the one
     // attached in this VC3D. Inputs are displayed as fitted only when both
     // are the same store (the same UUID: a hub replica shares it). A service
     // bound to a hub replica fits hub positions; it matches only a replica
     // of the same hub (the hub identity), whose positions are comparable.
+    // A local service on a plain store shares the file with this VC3D and
+    // fits positions of the store itself.
     struct StoreBinding {
         QString serviceUuid;   // /dataset object_store.uuid
         QString servicePath;   // where the service host opened it
         QString serviceHub;    // the hub address on the service host
         QString serviceHubIdentity;
-        qint64 servicePosition = -1;  // the service replica's last pull
+        qint64 servicePosition = -1;  // the service replica's last pull (a shared store's head)
         QString servicePositionError;  // why it could not be read
+        // Whose positions the service fits: its hub's, or (a plain store
+        // shared in place) the store's own; empty when it fits none.
+        QString servicePositions;
+        // The attachment is the service's own store file: a local service
+        // on the same path, which saves reach without a hub.
+        bool sameFile = false;
         QString localUuid;     // the attachment's store UUID
         QString localPath;
         QString localHub;      // the attachment's hub, when it is a replica
@@ -80,12 +88,18 @@ public:
             return advertised() && serviceUuid == localUuid
                 && (!hosted() || serviceHubIdentity == localHubIdentity);
         }
+        // The service fits positions; a client can name one (its saved
+        // edits) when it replicates the service's hub or shares its file.
+        bool positioned() const { return !servicePositions.isEmpty(); }
+        bool shared() const { return positioned() && !hosted() && sameFile && matches(); }
+        bool canUpdate() const { return matches() && (hosted() || shared()); }
         // Which stores are bound, without sync progress (positions, pending
         // edits, conflicts), which every hub sync updates.
         QStringList identity() const
         {
-            return {serviceUuid, serviceHubIdentity, localUuid, localPath, localHubIdentity,
-                    matches() ? QStringLiteral("matches") : QString()};
+            return {serviceUuid, serviceHubIdentity, servicePositions, localUuid, localPath,
+                    localHubIdentity, matches() ? QStringLiteral("matches") : QString(),
+                    shared() ? QStringLiteral("shared") : QString()};
         }
     };
 
@@ -126,17 +140,18 @@ public:
     // This is how a service stuck in Error recovers.
     void rebuildWithDefaults();
 
-    // One "Update fit inputs" (stage 2a: a full-input rebuild at a hub
-    // position). Needs a service bound to a hub and a replica of that hub
-    // attached here (storeBinding().matches()).
+    // One "Update fit inputs": the resident fit's inputs replaced in place
+    // (or a rebuild) at a position. Needs a service that fits positions and
+    // either a replica of its hub or its own store file attached here
+    // (storeBinding().canUpdate()).
     struct InputUpdate {
-        qint64 requested = -1;  // M: where this replica's pushed edits reached
-        qint64 head = -1;       // H: the hub head the service linked at
+        qint64 requested = -1;  // M: where this store's saved (pushed) edits reached
+        qint64 head = -1;       // H: the head the service linked at
         qint64 fitted = -1;     // N: H plus the service's links; the fit's inputs
         QString error;          // empty on success
         QStringList problems;   // the service's reasons, or the hub conflicts
         bool conflicts = false; // hub conflicts blocked the push
-        // Hub commits the position includes beyond M by other writers, and
+        // Commits the position includes beyond M by other writers, and
         // commits after N (excluded: they show as stale).
         QStringList includedBeyondRequested;
         QStringList afterFitted;
@@ -312,6 +327,9 @@ private:
     void claimSessionLease();
     void clearSessionLease();
     void updateStoreBinding();
+    void updateSameFile();
+    // A store's journal head: the position a shared store's saves reached.
+    static qint64 storeHead(vc::objects::ObjectStoreSession&, const vc::objects::AttachmentIdentity&);
     QString _sessionLeaseId;
     bool _leaseOwner = false;
     // Update fit inputs in flight: its push hold, released when it finishes.

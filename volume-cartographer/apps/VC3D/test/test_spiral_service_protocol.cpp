@@ -93,6 +93,89 @@ private slots:
         catch (const std::exception& error) { QFAIL(error.what()); }
     }
 
+    // No hub: a service on this machine shares VC3D's store file. Saves are
+    // already in it; Update Fit Inputs names the store's head, and the
+    // service links and pins a position of the store itself.
+    void updateFitInputsOfASharedStore()
+    {
+        const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");
+        if (python.isEmpty()) QSKIP("Set SPIRAL_TEST_PYTHON to a Spiral Python environment with vc_object_store");
+        qRegisterMetaType<SpiralServiceManager::InputUpdate>();
+        QTemporaryDir directory;
+        const auto storePath = std::filesystem::path(directory.filePath(QStringLiteral("inputs.vcobj")).toStdString());
+        OpenOptions options; options.author = "vc3d-test";
+        { auto created = ObjectStore::create(storePath, options); }
+        auto session = std::make_shared<ObjectStoreSession>();
+        const auto attachment = session->attach(storePath, options);
+        const auto surface = addSurface(*session, attachment);
+
+        ServiceProcess service;
+        QVERIFY(startService(service, python, directory, QString::fromStdString(storePath.string())));
+        SpiralServiceManager manager;
+        manager.setObjectStore(session, attachment);
+        QSignalSpy manifests(&manager, &SpiralServiceManager::inputManifestAvailable);
+        QSignalSpy updates(&manager, &SpiralServiceManager::inputUpdateFinished);
+        QSignalSpy sessions(&manager, &SpiralServiceManager::sessionSynchronized);
+        manager.connectToService(protocolProfile(service.port));
+        QTRY_VERIFY_WITH_TIMEOUT(manager.isReady() && manager.ownsSessionLease(), 30000);
+        QTRY_VERIFY_WITH_TIMEOUT(manager.storeBinding().shared(), 10000);
+        QVERIFY(!manager.storeBinding().hosted() && manager.storeBinding().canUpdate());
+
+        auto edit = [&](int cells) {
+            RevisionSelection pins;
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                pins[surface] = db.currentObjectRevision(txn, surface)->uuid;
+            });
+            session->act(attachment, pins, [&](auto& db, auto& txn) {
+                db.setMeta(txn, surface, "source", Json{{"spiral_patch_erode_cells", cells}}.dump());
+            });
+        };
+        auto fittedCells = [&](int index) {
+            QFile file(manifests.at(index).at(0).toString());
+            if (!file.open(QIODevice::ReadOnly)) return -1;
+            const auto document = Json::parse(file.readAll().toStdString());
+            return document.at("manifest").at("objects").at(0).at("metadata").at("spiral_patch_erode_cells").get<int>();
+        };
+        const QJsonObject config{{"dense_spacing_mode", "grad_mag"}, {"loss_weight_dense_spacing", 0},
+                                 {"loss_weight_dense_normals", 0}, {"loss_weight_shell_outer", 0}};
+        const QJsonObject request{{"run", QJsonObject{{"z_begin", 0}, {"z_end", 10}, {"config", config}}}};
+
+        edit(2);
+        manager.updateFitInputs(request);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 1, 60000);
+        auto update = updates.at(0).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
+        QVERIFY(update.requested > 0 && update.fitted >= update.requested);
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 1, 30000);
+        QCOMPARE(fittedCells(0), 2);
+
+        // The next one updates the resident fit in place.
+        QTRY_COMPARE_WITH_TIMEOUT(sessions.count(), 1, 10000);
+        edit(3);
+        manager.updateFitInputs(request);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 2, 60000);
+        update = updates.at(1).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 2, 30000);
+        QCOMPARE(fittedCells(1), 3);
+        QCOMPARE(sessions.count(), 1);
+
+        // Edits after the fitted position are reported as excluded.
+        edit(4);
+        manager.updateFitInputs(request);
+        QTRY_COMPARE_WITH_TIMEOUT(updates.count(), 3, 60000);
+        update = updates.at(2).at(0).value<SpiralServiceManager::InputUpdate>();
+        QVERIFY2(update.error.isEmpty(), qPrintable(update.error + update.problems.join(QStringLiteral("; "))));
+        QVERIFY(update.afterFitted.isEmpty());
+        edit(5);
+        QTRY_COMPARE_WITH_TIMEOUT(manifests.count(), 3, 30000);
+        QCOMPARE(fittedCells(2), 4);
+
+        bool released = false;
+        manager.releaseSessionLease([&]() { released = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(released, 30000);
+    }
+
     void storeBackedSessionLifecycle()
     {
         const auto python = qEnvironmentVariable("SPIRAL_TEST_PYTHON");

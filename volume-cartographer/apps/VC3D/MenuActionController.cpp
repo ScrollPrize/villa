@@ -2258,11 +2258,6 @@ void MenuActionController::refreshStoresMenu()
         _window->promptHubConflicts();
     });
     sync->setEnabled(!hosted.empty());
-    auto* host = _storesMenu->addMenu(QObject::tr("Host Store Locally"));
-    for (const auto& attachment : attached)
-        if (session->writable(attachment) && !session->hubStatus(attachment))
-            host->addAction(storeName(attachment), this, [this, attachment]() { hostStoreLocally(attachment); });
-    host->setEnabled(!host->isEmpty());
     auto* detach = _storesMenu->addMenu(QObject::tr("Detach Store"));
     detach->setEnabled(!attached.empty());
     for (const auto& attachment : attached)
@@ -2369,74 +2364,6 @@ void MenuActionController::cloneHostedStore(bool asProject, const QString& prefi
         } catch (const std::exception& error) {
             return QString::fromUtf8(error.what());
         }
-    }));
-}
-
-void MenuActionController::hostStoreLocally(const vc::objects::AttachmentIdentity& attachment)
-{
-    auto& state = *_window->_state;
-    const auto session = state.objectStoreSession();
-    if (!session->writable(attachment) || session->hubStatus(attachment)) return;
-    const QString path = QString::fromStdString(session->path(attachment).string());
-    const QFileInfo info(path);
-    const QString hub = info.dir().filePath(info.completeBaseName() + QStringLiteral(".hub.vcobj"));
-    if (QFileInfo::exists(hub)) {
-        QMessageBox::critical(_window, QObject::tr("Cannot host store"),
-            QObject::tr("%1 already exists. Clone that hub instead, or move it away.").arg(hub));
-        return;
-    }
-    const auto reply = QMessageBox::question(_window, QObject::tr("Host Store Locally"),
-        QObject::tr("The store moves to the hub %1, and %2 becomes this computer's replica of it, "
-                    "holding the same objects. Spiral services then fit hub positions: edits are "
-                    "saved here, pushed to the hub, and reach a fit when you update its inputs.\n\n"
-                    "Close every other program using %2 first. Continue?").arg(hub, path));
-    if (reply != QMessageBox::Yes) return;
-    const auto author = objectStoreAuthor();
-    if (author.isEmpty()) return;
-    std::string reference;
-    try {
-        // The project keeps its reference while the file is moved, then reopens it.
-        reference = state.closeStore(attachment);
-    } catch (const std::exception& error) {
-        QMessageBox::critical(_window, QObject::tr("Cannot close store"), QString::fromUtf8(error.what()));
-        return;
-    }
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, path, reference] {
-        const auto error = watcher->result();
-        watcher->deleteLater();
-        if (!error.isEmpty())
-            QMessageBox::critical(_window, QObject::tr("Cannot host store"), error);
-        // The replica on success; the untouched store when hosting never began.
-        if (!QFileInfo::exists(path)) return;
-        try {
-            _window->_state->replaceStoreReference(reference, path.toStdString());
-        } catch (const std::exception& reopenError) {
-            QMessageBox::critical(_window, QObject::tr("Cannot reopen store"), QString::fromUtf8(reopenError.what()));
-        }
-    });
-    watcher->setFuture(QtConcurrent::run([path, hub, author]() {
-        for (const auto* suffix : {"-wal", "-shm", "-journal"})
-            if (QFileInfo::exists(path + QLatin1String(suffix)))
-                return QObject::tr("%1 is still open elsewhere (%2 exists); close it and try again")
-                    .arg(path, path + QLatin1String(suffix));
-        if (!QFile::rename(path, hub)) return QObject::tr("Cannot move %1 to %2").arg(path, hub);
-        try {
-            vc::objects::initHub(hub.toStdString(), author.toStdString());
-        } catch (const std::exception& error) {
-            QFile::rename(hub, path);
-            return QString::fromUtf8(error.what());
-        }
-        try {
-            vc::objects::OpenOptions options;
-            options.author = author.toStdString();
-            vc::objects::cloneHub(hub.toStdString(), path.toStdString(), options);
-        } catch (const std::exception& error) {
-            return QObject::tr("The hub %1 was created, but cloning it to %2 failed: %3. "
-                               "Clone it with File > Stores > Clone Hosted Store.")
-                .arg(hub, path, QString::fromUtf8(error.what()));
-        }
-        return QString();
     }));
 }
 

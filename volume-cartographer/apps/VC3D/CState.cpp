@@ -377,24 +377,6 @@ void CState::detachStoreReference(const std::string& id)
     emit storeRoutesChanged();
     emit umbilicusChanged();
 }
-std::string CState::closeStore(const vc::objects::AttachmentIdentity& attachment)
-{
-    if (_objectStoreOwner) return _objectStoreOwner->closeStore(attachment);
-    const auto reference = std::find_if(_storeReferences.begin(), _storeReferences.end(),
-        [&](const auto& entry) { return entry.second == attachment; });
-    if (reference == _storeReferences.end()) throw std::invalid_argument("Store is not attached to this project");
-    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
-    if (_pointCollectionSync && !_pointCollectionSync->flush())
-        throw std::runtime_error("Pending point-collection edits could not be saved");
-    const auto id = reference->first;
-    _objectStoreSession->detach(attachment);
-    std::erase(_attachedStores, attachment);
-    _storeReferences.erase(reference);
-    pollObjectStoreChanges();
-    emit storeRoutesChanged();
-    emit umbilicusChanged();
-    return id;
-}
 void CState::replaceStoreReference(const std::string& id, const std::filesystem::path& path)
 {
     if (_objectStoreOwner) { _objectStoreOwner->replaceStoreReference(id, path); return; }

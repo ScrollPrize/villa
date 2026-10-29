@@ -23,8 +23,6 @@ class QMenuBar;
 class CWindow;
 class Volume;
 
-namespace vc::objects { struct AttachmentIdentity; }
-
 namespace vc3d::opendata {
 
 struct OpenDataSampleProjectResult;
@@ -64,10 +62,6 @@ public:
     // a Spiral service's hub); the replica is routed to ``routeKinds``.
     void cloneHostedStore(bool asProject, const QString& hub = {},
                           const std::vector<std::string>& routeKinds = {});
-    // Make an attached ordinary store a hosted one on this machine: it
-    // becomes the hub <name>.hub.vcobj beside it and its own path a replica,
-    // so services can fit hub positions of it.
-    void hostStoreLocally(const vc::objects::AttachmentIdentity& attachment);
     // Collects a kind, a source folder and an optional volume binding, then ingests
     // it into the kind's store in the background (vc::objects::ingestGeometrySource).
     void importIntoObjectStore();

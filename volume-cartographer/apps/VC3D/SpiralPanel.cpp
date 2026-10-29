@@ -1175,7 +1175,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                     for (const QString& problem : update.problems) lines << QStringLiteral("  ") + problem;
                     _warnings->setText(lines.join(QStringLiteral("\n")));
                 } else {
-                    lines << tr("Updated: the fit reads hub position %1 (your edits reached %2; linked at %3)")
+                    lines << tr("Updated: the fit reads position %1 (your edits reached %2; linked at %3)")
                                  .arg(update.fitted).arg(update.requested).arg(update.head);
                     if (!update.includedBeyondRequested.isEmpty())
                         lines << tr("It includes %n later hub commit(s) by others:", nullptr,
@@ -1675,15 +1675,15 @@ void SpiralPanel::setLocalDraftsReady(bool ready)
 
 void SpiralPanel::updateDraftActions()
 {
-    // Saving needs only a writable store; the update needs the hub-bound
-    // service as well (the workspace and manager say why when not).
+    // Saving needs only a writable store; the update needs a service whose
+    // positions this store can name as well (the workspace and manager say
+    // why when not).
     if (_addInputs) _addInputs->setEnabled(_localDraftsReady);
     if (_commitInputs)
-        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().matches()
-                                  && _service->storeBinding().hosted() && _updateInputs
-                                  && _updateInputs->isEnabled());
+        _commitInputs->setEnabled(_localDraftsReady && _service->storeBinding().canUpdate()
+                                  && _updateInputs && _updateInputs->isEnabled());
     if (_commitHint)
-        _commitHint->setText(_service->storeBinding().hosted()
+        _commitHint->setText(_service->storeBinding().canUpdate()
             ? tr("Saved drafts reach the fit at its next input update.")
             : tr("Saved drafts reach the fit when it is rebuilt with current inputs."));
 }
@@ -1841,10 +1841,17 @@ void SpiralPanel::updateObjectStoreSummary()
                          binding.servicePositionError.isEmpty()
                              ? position(binding.servicePosition)
                              : tr("an unknown position (%1)").arg(binding.servicePositionError));
+    else if (binding.positioned())
+        text += tr("\nIt fits positions of the store itself, now at %1")
+                    .arg(binding.servicePositionError.isEmpty()
+                             ? position(binding.servicePosition)
+                             : tr("an unknown position (%1)").arg(binding.servicePositionError));
     if (binding.matches())
         text += binding.hosted()
             ? tr("\nAttached here: %1").arg(local)
-            : tr("\nThe same store is attached here");
+            : binding.shared()
+                ? tr("\nThe same store file is attached here: saved edits reach the fit at its next update")
+                : tr("\nThe same store is attached here");
     else if (binding.localUuid.isEmpty())
         text += tr("\nNo store is attached here: fit inputs cannot be displayed");
     else if (binding.serviceUuid == binding.localUuid)
@@ -1858,8 +1865,8 @@ void SpiralPanel::updateObjectStoreSummary()
 
 void SpiralPanel::startInputUpdate(bool confirm)
 {
-    if (!_service->storeBinding().hosted()) {
-        _warnings->setText(tr("The Spiral service is not bound to a hub: saved edits reach the fit "
+    if (!_service->storeBinding().positioned()) {
+        _warnings->setText(tr("The Spiral service fits no store positions: saved edits reach the fit "
                               "when it is rebuilt with current inputs"));
         return;
     }
@@ -1873,7 +1880,7 @@ void SpiralPanel::startInputUpdate(bool confirm)
     if (confirm && _sessionState == QStringLiteral("Error")) {
         const auto answer = QMessageBox::question(
             this, tr("Update Fit Inputs"),
-            tr("The fit failed; updating its inputs rebuilds it from a hub position including "
+            tr("The fit failed; updating its inputs rebuilds it from a position including "
                "your saved edits. Continue?"));
         if (answer != QMessageBox::Yes) return;
     }
@@ -1888,7 +1895,7 @@ void SpiralPanel::startInputUpdate(bool confirm)
 void SpiralPanel::updatePositionSummary()
 {
     const auto& binding = _service->storeBinding();
-    if (!binding.hosted()) {
+    if (!binding.positioned()) {
         _positionSummary->setVisible(false);
         return;
     }
@@ -1898,11 +1905,11 @@ void SpiralPanel::updatePositionSummary()
         const qint64 sequence = position.value(QStringLiteral("sequence")).toInteger();
         const QJsonValue requested = position.value(QStringLiteral("requested"));
         lines << (position.value(QStringLiteral("source")).toString() == QStringLiteral("checkpoint")
-                      ? tr("The fit reads hub position %1, recorded by its checkpoint").arg(sequence)
+                      ? tr("The fit reads position %1, recorded by its checkpoint").arg(sequence)
                   : requested.isNull()
-                      ? tr("The fit reads hub position %1 (linked at %2)")
+                      ? tr("The fit reads position %1 (linked at %2)")
                             .arg(sequence).arg(position.value(QStringLiteral("head")).toInteger())
-                      : tr("The fit reads hub position %1 (requested %2, linked at %3)")
+                      : tr("The fit reads position %1 (requested %2, linked at %3)")
                             .arg(sequence).arg(requested.toInteger())
                             .arg(position.value(QStringLiteral("head")).toInteger()));
     }
@@ -2441,11 +2448,13 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
                       && (runnable || state == QStringLiteral("Error")
                           || state == QStringLiteral("Uninitialized")));
     const auto& binding = _service->storeBinding();
-    _updateInputs->setVisible(binding.hosted());
-    _updateInputs->setEnabled(_load->isEnabled() && binding.matches()
+    _updateInputs->setVisible(binding.positioned());
+    _updateInputs->setEnabled(_load->isEnabled() && binding.canUpdate()
                               && status.value(QStringLiteral("input_preparation")).isNull());
     if (!binding.matches() && binding.hosted())
         setToolTipNote(_updateInputs, tr("Attach a replica of the service's hub first"));
+    else if (!binding.canUpdate() && binding.positioned())
+        setToolTipNote(_updateInputs, tr("Route Spiral's inputs to the service's own store file first"));
     else
         setToolTipNote(_updateInputs, {});
     updatePositionSummary();
