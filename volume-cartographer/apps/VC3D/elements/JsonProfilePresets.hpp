@@ -17,7 +17,6 @@ inline QString robustTracerParams2Json()
         "  \"normal_weight\": 4.0,\n"
         "  \"straight_weight\": 10.0,\n"
         "  \"dist_weight\": 1.0,\n"
-        "  \"direction_weight\": 0.0,\n"
         "  \"sdir_weight\": 1.0,\n"
         "  \"correction_weight\": 1.0,\n"
         "  \"reference_ray_weight\": 0.0\n"

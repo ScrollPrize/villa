@@ -130,8 +130,6 @@ set(srcs
     segmentation/panels/SegmentationCustomParamsPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
-    segmentation/panels/SegmentationDirectionFieldPanel.cpp
-    segmentation/panels/SegmentationDirectionFieldPanel.hpp
     segmentation/panels/SegmentationManualAddPanel.cpp
     segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp

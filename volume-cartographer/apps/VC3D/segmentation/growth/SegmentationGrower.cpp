@@ -569,7 +569,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
     }
 
-    request.directionFields = _context.widget->directionFieldConfigs();
 
     if (!_context.widget->customParamsValid()) {
         const QString errorText = _context.widget->customParamsError();

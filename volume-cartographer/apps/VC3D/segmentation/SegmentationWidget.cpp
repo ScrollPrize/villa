@@ -7,7 +7,6 @@
 #include "panels/SegmentationCorrectionsPanel.hpp"
 #include "panels/SegmentationCustomParamsPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
-#include "panels/SegmentationDirectionFieldPanel.hpp"
 #include "panels/SegmentationLasagnaPanel.hpp"
 #include "panels/SegmentationManualAddPanel.hpp"
 #include "VCSettings.hpp"
@@ -47,9 +46,6 @@ void SegmentationWidget::buildUi()
 
     _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_editingPanel);
-
-    _directionFieldPanel = new SegmentationDirectionFieldPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_directionFieldPanel);
 
     _neuralTracerPanel = new SegmentationNeuralTracerPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_neuralTracerPanel);
@@ -183,13 +179,11 @@ void SegmentationWidget::syncUiState()
 
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->setVisible(true);
-    _directionFieldPanel->setVisible(!manualAddVisible);
     _neuralTracerPanel->setVisible(!manualAddVisible);
     _correctionsPanel->setVisible(!manualAddVisible);
     _customParamsPanel->setVisible(!manualAddVisible);
     _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
     _customParamsPanel->syncUiState(_editingEnabled);
-    _directionFieldPanel->syncUiState(_editingEnabled);
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _neuralTracerPanel->syncUiState();
     _lasagnaPanel->syncUiState(_editingEnabled, false);
@@ -206,7 +200,6 @@ void SegmentationWidget::restoreSettings()
     _editingPanel->restoreSettings(settings);
     _growthPanel->restoreSettings(settings);
     _manualAddPanel->restoreSettings(settings);
-    _directionFieldPanel->restoreSettings(settings);
     _correctionsPanel->restoreSettings(settings);
     _customParamsPanel->restoreSettings(settings);
     _maskBrushRadius = std::clamp(settings.value(segmentation::MASK_BRUSH_RADIUS,
@@ -366,13 +359,6 @@ void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, 
 {
     _correctionsPanel->setCorrectionCollections(collections, activeId);
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
-}
-
-// --- Direction field delegations ---
-
-std::vector<SegmentationDirectionFieldConfig> SegmentationWidget::directionFieldConfigs() const
-{
-    return _directionFieldPanel->directionFieldConfigs();
 }
 
 // --- Custom params delegations ---

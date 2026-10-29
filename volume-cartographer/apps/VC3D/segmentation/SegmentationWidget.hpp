@@ -22,7 +22,6 @@ class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
 class SegmentationNeuralTracerPanel;
-class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
 class SegmentationManualAddPanel;
 
@@ -108,7 +107,6 @@ public:
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
 
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
-    [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
     // "Draw mask" brush radius in voxels.
     [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
@@ -218,7 +216,6 @@ private:
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
-    SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};

@@ -68,46 +68,6 @@ QString directionToString(SegmentationGrowthDirection direction)
     }
 }
 
-bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          std::vector<DirectionField>& out,
-                          QString& error)
-{
-    if (!config.isValid()) {
-        return true;
-    }
-
-    const QString path = config.path.trimmed();
-    if (path.isEmpty()) {
-        return true;
-    }
-
-    const std::string zarrPath = path.toStdString();
-    std::error_code fsError;
-    if (!std::filesystem::exists(zarrPath, fsError)) {
-        const QString reason = fsError ? QString::fromStdString(fsError.message()) : QString();
-        error = reason.isEmpty()
-            ? QStringLiteral("Direction field directory does not exist: %1").arg(path)
-            : QStringLiteral("Direction field directory error (%1): %2").arg(path, reason);
-        return false;
-    }
-
-    try {
-        const int scaleLevel = std::clamp(config.scale, 0, 5);
-
-        const float weight = static_cast<float>(std::clamp(config.weight, 0.0, 10.0));
-        out.emplace_back(segmentationDirectionFieldOrientationKey(config.orientation).toStdString(),
-                         zarrPath, scaleLevel, weight);
-    } catch (const std::exception& ex) {
-        error = QStringLiteral("Failed to load direction field at %1: %2").arg(path, QString::fromStdString(ex.what()));
-        return false;
-    } catch (...) {
-        error = QStringLiteral("Failed to load direction field at %1: unknown error").arg(path);
-        return false;
-    }
-
-    return true;
-}
-
 void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload, VCCollection& collection)
 {
     for (const auto& entry : payload.collections) {
@@ -371,19 +331,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         populateCorrectionsCollection(request.corrections, correctionCollection);
     }
 
-    std::vector<DirectionField> directionFields;
-    for (const auto& config : request.directionFields) {
-        if (!config.isValid()) {
-            continue;
-        }
-
-        QString loadError;
-        if (!appendDirectionField(config, directionFields, loadError)) {
-            result.error = loadError;
-            return result;
-        }
-    }
-
     try {
         qCInfo(lcSegGrowth) << "Calling tracer()";
         qCInfo(lcSegGrowth) << "  cacheRoot:" << context.cacheRoot;
@@ -393,20 +340,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         qCInfo(lcSegGrowth) << "  corrections collections:" << collectionCount;
         if (request.correctionsZRange) {
             qCInfo(lcSegGrowth) << "  corrections z-range:" << request.correctionsZRange->first << request.correctionsZRange->second;
-        }
-        if (!directionFields.empty()) {
-            int idx = 0;
-            for (const auto& config : request.directionFields) {
-                if (!config.isValid()) {
-                    continue;
-                }
-                qCInfo(lcSegGrowth)
-                    << "  direction field[#" << idx << "] path:" << config.path
-                    << "orientation:" << segmentationDirectionFieldOrientationKey(config.orientation)
-                    << "scale:" << config.scale
-                    << "weight:" << config.weight;
-                ++idx;
-            }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
 
@@ -434,7 +367,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       params,
                                       context.cacheRoot.toStdString(),
                                       static_cast<float>(context.voxelSize),
-                                      directionFields,
                                       context.resumeSurface,
                                       std::filesystem::path(),
                                       utils::Json{},

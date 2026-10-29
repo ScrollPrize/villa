@@ -448,10 +448,8 @@ private:
 };
 
 struct TraceData {
-    TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
-    const std::vector<DirectionField> &direction_fields;
     cv::Mat_<uchar> allowed_growth_mask;
 
     vcr::slice::Cached* raw_volume = nullptr;
@@ -608,7 +606,6 @@ struct TraceParameters {
 enum LossType {
     DIST,
     STRAIGHT,
-    DIRECTION,
     SNAP,
     NORMAL,
     SDIR,
@@ -626,7 +623,6 @@ struct LossSettings {
         w[LossType::NORMAL] = 10.0f;
         w[LossType::STRAIGHT] = 0.2;
         w[LossType::DIST] = 1.0f;
-        w[LossType::DIRECTION] = 1.0f;
         w[LossType::SDIR] = 1.0f;
         w[LossType::CORRECTION] = 1.0f;
         w[LossType::REFERENCE_RAY] = 0.0f;
@@ -661,7 +657,6 @@ struct LossSettings {
         set_weight("normal_weight", LossType::NORMAL);
         set_weight("straight_weight", LossType::STRAIGHT);
         set_weight("dist_weight", LossType::DIST);
-        set_weight("direction_weight", LossType::DIRECTION);
         set_weight("sdir_weight", LossType::SDIR);
         set_weight("correction_weight", LossType::CORRECTION);
         set_weight("reference_ray_weight", LossType::REFERENCE_RAY);
@@ -1305,51 +1300,6 @@ static int conditional_normal_loss(int bit, const cv::Vec2i &p, cv::Mat_<uint16_
 
 
 
-int gen_direction_loss(ceres::Problem &problem,
-    const cv::Vec2i &p,
-    const int off_dist,
-    cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc,
-    std::vector<DirectionField> const &direction_fields,
-    const LossSettings& settings)
-{
-    // Add losses saying that the local basis vectors of the patch at loc(p) should match those of the given fields
-
-    if (!loc_valid(state(p)))
-        return 0;
-
-    cv::Vec2i const p_off_horz{p[0], p[1] + off_dist};
-    cv::Vec2i const p_off_vert{p[0] + off_dist, p[1]};
-
-    const float baseWeight = settings(LossType::DIRECTION, p);
-
-    int count = 0;
-    for (const auto &field: direction_fields) {
-        const float totalWeight = baseWeight * field.weight;
-        if (totalWeight <= 0.0f) {
-            continue;
-        }
-        if (field.direction == "horizontal") {
-            if (!loc_valid(state(p_off_horz)))
-                continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
-        } else if (field.direction == "vertical") {
-            if (!loc_valid(state(p_off_vert)))
-                continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
-        } else if (field.direction == "normal") {
-            if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
-                continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
-        } else {
-            assert(false);
-        }
-        ++count;
-    }
-
-    return count;
-}
-
 //create all valid losses for this point
 // Forward declarations
 static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &loc, TraceData& trace_data, const LossSettings &settings);
@@ -1420,26 +1370,6 @@ static int add_losses(ceres::Problem &problem, const cv::Vec2i &p, TraceParamete
 
     return count;
 }
-
-static int conditional_direction_loss(int bit,
-    const cv::Vec2i &p,
-    const int u_off,
-    cv::Mat_<uint16_t> &loss_status,
-    ceres::Problem &problem,
-    cv::Mat_<uint8_t> &state,
-    cv::Mat_<cv::Vec3d> &loc,
-    const LossSettings& settings,
-    std::vector<DirectionField> const &direction_fields)
-{
-    if (!direction_fields.size())
-        return 0;
-
-    int set = 0;
-    cv::Vec2i const off{0, u_off};
-    if (!loss_mask(bit, p, off, loss_status))
-        set = set_loss_mask(bit, p, off, loss_status, gen_direction_loss(problem, p, u_off, state, loc, direction_fields, settings));
-    return set;
-};
 
 //create only missing losses so we can optimize the whole problem
 static int gen_corr_loss(ceres::Problem &problem, const cv::Vec2i &p, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &dpoints, TraceData& trace_data, const LossSettings &settings)
@@ -1640,10 +1570,6 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     count += conditional_sdirichlet_loss(6, p,                    loss_status, problem, params, settings, /*eps_abs=*/1e-8, /*eps_rel=*/1e-2);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i(-1, 0), loss_status, problem, params, settings, 1e-8, 1e-2);
     count += conditional_sdirichlet_loss(6, p + cv::Vec2i( 0,-1), loss_status, problem, params, settings, 1e-8, 1e-2);
-
-    //normal field
-    count += conditional_direction_loss(9, p, 1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
-    count += conditional_direction_loss(9, p, -1, loss_status, problem, params.state, params.dpoints, settings, trace_data.direction_fields);
 
     //gridstore normals
     count += conditional_normal_loss(10, p                   , loss_status, problem, params, trace_data, settings);
@@ -1948,7 +1874,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
     if (volume.array.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
@@ -2012,7 +1938,7 @@ QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, c
             std::cout << "Neural tracer not active" << std::endl;
         }
     }
-    TraceData trace_data(direction_fields);
+    TraceData trace_data;
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
 
@@ -2132,7 +2058,6 @@ QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, c
     std::cout << "GrowPatch loss weights:\n"
               << "  DIST: " << loss_settings.w[LossType::DIST]
               << " STRAIGHT: " << loss_settings.w[LossType::STRAIGHT]
-              << " DIRECTION: " << loss_settings.w[LossType::DIRECTION]
               << " SNAP: " << loss_settings.w[LossType::SNAP]
               << " NORMAL: " << loss_settings.w[LossType::NORMAL]
               << " REFERENCE_RAY: " << loss_settings.w[LossType::REFERENCE_RAY]

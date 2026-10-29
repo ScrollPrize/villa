@@ -142,41 +142,6 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
     return false;
 }
 
-static auto load_direction_fields(Json const&params)
-{
-    std::vector<DirectionField> direction_fields;
-    if (params.contains("direction_fields")) {
-        if (!params["direction_fields"].is_array()) {
-            std::cerr << "WARNING: direction_fields must be an array; ignoring" << std::endl;
-        }
-        for (auto const& direction_field : params["direction_fields"]) {
-            std::string const zarr_path = direction_field["zarr"].get_string();
-            std::string const direction = direction_field["dir"].get_string();
-            if (!std::ranges::contains(std::vector{"horizontal", "vertical", "normal"}, direction)) {
-                std::cerr << "WARNING: invalid direction in direction_field " << zarr_path << "; skipping" << std::endl;
-                continue;
-            }
-            int const ome_scale = direction_field["scale"].get_int();
-            std::optional<std::filesystem::path> confidenceRoot;
-            if (direction_field.contains("weight_zarr"))
-                confidenceRoot = direction_field["weight_zarr"].get_string();
-            float weight = 1.0f;
-            if (direction_field.contains("weight")) {
-                try {
-                    weight = std::clamp(direction_field["weight"].get_float(), 0.0f, 10.0f);
-                } catch (const std::exception& ex) {
-                    std::cerr << "WARNING: invalid weight for direction field " << zarr_path << ": " << ex.what() << std::endl;
-                }
-            }
-
-            direction_fields.emplace_back(direction, zarr_path, ome_scale, weight, confidenceRoot);
-            const auto& shape = direction_fields.back().native->arrays[0]->meta.shape;
-            std::cout << "direction field dataset shape [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
-        }
-    }
-    return direction_fields;
-}
-
 // A remote chunk fetch that fails after its retries ends in a std::runtime_error. run_main catches
 // it only around tracer(), so elsewhere, as at the seed point, it would abort the process. Catch
 // what reaches main here (a throw inside an OpenMP loop may not), report it and exit non-zero, as
@@ -477,8 +442,6 @@ static int run_main(int argc, char *argv[])
                   << std::endl;
         return EXIT_FAILURE;
     }
-
-    auto direction_fields = load_direction_fields(params);
 
     std::unordered_map<std::string,QuadSurface*> surfs;
     std::vector<QuadSurface*> surfs_v;
@@ -1585,7 +1548,7 @@ static int run_main(int argc, char *argv[])
         std::unique_ptr<QuadSurface> refined;
         try {
             refined.reset(tracer(tracing_volume, 1.0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
-                                 load_direction_fields(refine), out_surf.get(),
+                                 out_surf.get(),
                                  store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
         } catch (const std::exception& e) {
             std::cerr << "ERROR: vc_grow_seg_from_seed: neighbor refinement failed: " << e.what() << std::endl;
@@ -1598,7 +1561,7 @@ static int run_main(int argc, char *argv[])
 
     QuadSurface *surf = nullptr;
     try {
-        surf = tracer(tracing_volume, 1.0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+        surf = tracer(tracing_volume, 1.0, origin, params, cache_root.string(), voxelsize, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
     } catch (const std::exception& e) {
         // A growth failure (e.g. a remote normal-grid store whose metadata
         // could not be fetched) must exit as a normal tool failure, not crash

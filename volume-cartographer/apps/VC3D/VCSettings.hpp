@@ -373,13 +373,11 @@ namespace segmentation {
     constexpr auto GROUP_EDITING_EXPANDED = "group_editing_expanded";
     constexpr auto GROUP_DRAG_EXPANDED = "group_drag_expanded";
     constexpr auto GROUP_PUSH_PULL_EXPANDED = "group_push_pull_expanded";
-    constexpr auto GROUP_DIRECTION_FIELD_EXPANDED = "group_direction_field_expanded";
     constexpr auto GROUP_NEURAL_TRACER_EXPANDED = "group_neural_tracer_expanded";
 
     constexpr bool GROUP_EDITING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_DRAG_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_PUSH_PULL_EXPANDED_DEFAULT = true;
-    constexpr bool GROUP_DIRECTION_FIELD_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NEURAL_TRACER_EXPANDED_DEFAULT = true;
 
     // Drag tool (note: these are stored in a QSettings group)
@@ -413,7 +411,6 @@ namespace segmentation {
     constexpr auto GROWTH_METHOD = "growth_method";
     constexpr auto GROWTH_STEPS = "growth_steps";
     constexpr auto GROWTH_DIRECTION_MASK = "growth_direction_mask";
-    constexpr auto DIRECTION_FIELDS = "direction_fields";
     constexpr auto GROWTH_KEYBINDS_ENABLED = "growth_keybinds_enabled";
 
     constexpr bool GROWTH_KEYBINDS_ENABLED_DEFAULT = true;

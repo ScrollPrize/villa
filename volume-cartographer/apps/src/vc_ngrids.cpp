@@ -249,7 +249,7 @@ static FitOutputMaterializeStats materialize_fit_output_spool(
 }
 
 static inline uint8_t encode_dir_component(float v) {
-    // Match the direction-field encoding used by growth constraints:
+    // Direction-field encoding:
     // decode: (u8 - 128) / 127 -> [-1, 1]
     if (!std::isfinite(v)) return 128;
     v = std::max(-1.0f, std::min(1.0f, v));
