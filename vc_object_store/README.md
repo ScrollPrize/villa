@@ -161,7 +161,9 @@ and `store.edit_transformed_surface(view, ...)`.
 `availableTransforms(txn, uuid)` and each geometry view’s `availableTransforms()`
 (`available_transforms` in Python) list reachable
 volumes and ambiguity. Incompatible or ambiguous view requests fail explicitly.
-Registrations and path choices are revisioned store objects. Open Data registrations
+Registrations and path choices are revisioned store objects. A choice settles both
+directions of its volume pair: the reverse direction follows the chosen route
+backwards unless it has an explicit choice of its own. Open Data registrations
 can be supplied through `OpenOptions::catalogTransforms`, or `catalog=catalog`
 when opening a Python store with a `vc_reader.Catalog`. Catalog parsing, affine
 composition and path resolution are implemented in vc_reader's native library,
