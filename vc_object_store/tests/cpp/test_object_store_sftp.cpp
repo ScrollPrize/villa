@@ -5,7 +5,9 @@
 #include "TestSupport.hpp"
 #include "HubTestSupport.hpp"
 #include "sftp/SftpVfs.hpp"
+#include "hub/HubWorker.hpp"
 #include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
 #include <nlohmann/json.hpp>
@@ -26,6 +28,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <future>
 #include <unistd.h>
 
 using namespace vc::objects;
@@ -396,6 +399,45 @@ void hosting(const std::filesystem::path& root)
     mustFail([&] { removeHubLock(hubPath); });
     require(std::filesystem::exists(hubPath.string() + ".lock/process-v1"), "process lock inode remains");
 
+    // A live editor must be able to retain its lease while sync waits for
+    // another client's remote process lock. The fixture log is a barrier:
+    // do not rely on sleeping long enough for the worker to start syncing.
+    {
+        ObjectStoreSession session;
+        const auto attachment = session.attach(alicePath, as("alice"));
+        const auto sync = [&] {
+            const auto status = session.syncHubAndWait(attachment, std::chrono::seconds(20));
+            require(status && status->error.empty(), "session sync succeeds");
+        };
+        sync();
+        auto editing = session.holdLeases(attachment, {a});
+        sync();
+        const auto log = root / "held-lease-connections";
+        setenv("VC_SFTP_TEST_CONNECTION_LOG", log.c_str(), 1);
+        auto gate = std::make_unique<vc::objects::detail::RemoteHubScope>(hubUrl);
+        const auto before = std::filesystem::file_size(log);
+        auto syncing = std::async(std::launch::async, sync);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::filesystem::file_size(log) == before && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool started = std::filesystem::file_size(log) > before;
+        auto holding = std::async(std::launch::async, [&] { return session.holdLeases(attachment, {a, a}); });
+        const bool retained = holding.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        // Release before assertions/future destruction even on regression.
+        gate.reset();
+        auto duplicate = holding.get();
+        syncing.get();
+        unsetenv("VC_SFTP_TEST_CONNECTION_LOG");
+        require(started && retained, "existing lease hold does not wait for blocked remote sync");
+        editing.reset();
+        sync();
+        mustFail([&] { acquireLeases(bob, {a}); }); // duplicate hold still owns it
+        duplicate.reset();
+        sync();
+        acquireLeases(bob, {a});
+        releaseLeases(bob, {a});
+    }
+
 }
 // Faults run against real OpenSSH sftp-server and the production flock command.
 void processLocks(const std::filesystem::path& root, const std::filesystem::path& realStore = {})
@@ -664,6 +706,23 @@ int main(int argc, char** argv)
 try {
     if (argc > 1 && std::string(argv[1]) == "-T") return fakeSsh(argc, argv);
     urls();
+    {
+        vc::objects::detail::HubLeaseCounts holds;
+        holds.counts["held"] = 1;
+        HubStatus status;
+        status.replica = "self";
+        status.leases.push_back({"held", "self", {}, {}, 0, 100});
+        require(!holds.retain({"held", "missing"}, status, 50) && holds.counts.at("held") == 1,
+                "mixed lease retention is all-or-nothing");
+        require(!holds.retain({"held"}, status, 100) && !holds.retain({"held"}, status, 101),
+                "expiring or expired lease requires the slow path");
+        require(holds.retain({"held", "held"}, status, 99) && holds.counts.at("held") == 3,
+                "duplicate valid holds are counted independently");
+        status.leases.front().holder = "other";
+        require(!holds.retain({"held"}, status, 50), "changed lease owner is not reused");
+        status.leases.clear();
+        require(!holds.retain({"held"}, status, 50), "released lease is not reused");
+    }
     std::string server;
     for (const auto* candidate : {"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server", "/usr/libexec/sftp-server",
                                   "/usr/libexec/openssh/sftp-server"})

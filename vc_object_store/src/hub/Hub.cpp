@@ -425,6 +425,17 @@ HubSyncReport hubPull(ObjectStore& replica)
     auto txn = replica.write();
     pool(txn).hubApply = true;
     auto* db = conn(txn);
+    // An idle poll must not turn replication bookkeeping into a database
+    // change: data_version would discard warm geometry and spatial caches.
+    // Check under the local writer lock, including leases (which have no
+    // journal entry), before deciding that there is nothing to persist.
+    const auto current = upstream(db).cursor;
+    if (hubRecords.empty() && current.journal == cursor.journal &&
+        current.geometry == cursor.geometry && readLeases(db) == leases) {
+        // Let the unchanged transaction roll back: commit runs publication
+        // cleanup, whose DELETE statements can themselves dirty SQLite pages.
+        return report;
+    }
     const auto pending = uuidColumn(db, "SELECT record_uuid FROM hub_pending UNION SELECT record_uuid FROM hub_conflicts");
     std::map<std::string, Json> install;
     Statement conflict(db, "INSERT INTO hub_conflicts VALUES(?,?,?) ON CONFLICT(record_uuid) DO UPDATE SET "

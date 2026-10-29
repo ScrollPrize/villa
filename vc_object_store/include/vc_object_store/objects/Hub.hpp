@@ -19,6 +19,7 @@ struct HubLease {
     std::string holder;  // replica UUID
     std::string author, host;
     int64_t acquiredUs = 0, expiresUs = 0;  // UTC Unix microseconds
+    bool operator==(const HubLease&) const = default;
 };
 
 // A record changed both here and on the hub. Resolve with resolveHubConflict.
