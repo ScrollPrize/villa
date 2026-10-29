@@ -1,6 +1,9 @@
 // vcr::grid::Surface interpolates a QuadSurface's vertex grid as QuadSurface::gen
 // does: the same positions, normals and missing pixels, in both interpolation
-// modes, with holes, strict quad validity and separate pieces.
+// modes, with holes, strict quad validity and separate pieces. One deliberate
+// difference: gen() blended a missing vertex's (-1, -1, -1) into the positions of
+// its cells; vcr::grid blends only present vertices, so those cells are checked
+// for that instead.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -10,6 +13,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <random>
 
@@ -58,7 +62,17 @@ void compare(QuadSurface& quad, const vcr::grid::SurfaceOptions& options)
         const auto raster = rasterFor(quad, size, scale, offset);
         std::vector<float> xyz(std::size_t(size.area()) * 3), nrm(xyz.size());
         surface.resample(raster, xyz.data(), nrm.data());
-        int compared = 0, mismatched = 0;
+        int compared = 0, mismatched = 0, besideHoles = 0;
+        // Whether the cell under a pixel (clamped like gen's bilinear lookup) has a missing vertex.
+        const auto missing = [&](const cv::Vec3f& p) { return p[0] == -1.f && p[1] == -1.f && p[2] == -1.f; };
+        const auto besideHole = [&](int x, int y) {
+            const double gx = std::clamp(raster.x0 + x * raster.sx, 0.0, double(points.cols - 1));
+            const double gy = std::clamp(raster.y0 + y * raster.sy, 0.0, double(points.rows - 1));
+            const int x0 = int(gx), y0 = int(gy);
+            const int x1 = std::min(x0 + 1, points.cols - 1), y1 = std::min(y0 + 1, points.rows - 1);
+            return missing(points(y0, x0)) || missing(points(y0, x1)) || missing(points(y1, x0)) ||
+                   missing(points(y1, x1));
+        };
         for (int y = 0; y < size.height; ++y)
             for (int x = 0; x < size.width; ++x) {
                 const cv::Vec3f g = coords(y, x), gn = normals(y, x);
@@ -71,6 +85,13 @@ void compare(QuadSurface& quad, const vcr::grid::SurfaceOptions& options)
                 }
                 if (!gValid)
                     continue;
+                if (besideHole(x, y)) {
+                    // Only present vertices (x, y >= 0, z >= 70 on this sheet) enter the position.
+                    ++besideHoles;
+                    if (!(p[0] >= 0.0f && p[1] >= 0.0f && p[2] >= 70.0f))
+                        ++mismatched;
+                    continue;
+                }
                 ++compared;
                 for (int a = 0; a < 3; ++a) {
                     if (std::abs(g[a] - p[a]) > 1e-2f)
@@ -82,6 +103,8 @@ void compare(QuadSurface& quad, const vcr::grid::SurfaceOptions& options)
             }
         CAPTURE(scale);
         CHECK(compared > 1000);
+        if (scale < 4.0f && !options.strictQuads)  // strict quads drop every cell with a hole
+            CHECK(besideHoles > 0);
         CHECK(mismatched == 0);
     }
 }
@@ -96,7 +119,15 @@ TEST_CASE("vcr::grid::Surface matches QuadSurface::gen")
                 CAPTURE(int(mode));
                 CAPTURE(strict);
                 CAPTURE(pieces);
-                QuadSurface quad(wavyGrid(40, 30), cv::Vec2f(0.05f, 0.05f));
+                auto grid = wavyGrid(40, 30);
+                {
+                    // A hole inside the views at scales 0.5 and 1.3 (they share their
+                    // top-left corner with the small 4.0 view, which it stays out of).
+                    QuadSurface probe(grid, cv::Vec2f(0.05f, 0.05f));
+                    const auto r = rasterFor(probe, {97, 61}, 4.0f, {-160.0f, -100.0f, 0.0f});
+                    grid(int(r.y0 + 1.5), int(r.x0 + 2.5)) = cv::Vec3f(-1, -1, -1);
+                }
+                QuadSurface quad(grid, cv::Vec2f(0.05f, 0.05f));
                 quad.setGenInterpolation(mode);
                 quad.setStrictQuadRenderValidity(strict);
                 vcr::grid::SurfaceOptions options;
