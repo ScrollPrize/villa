@@ -1,6 +1,6 @@
-// Sampling from local data alone: Array::sample_nearest_local / sample_linear_local
-// sample what memory and the disk layers hold, flag the points only a remote fetch
-// could supply, and never fetch.
+// Sampling from the caches alone: Array::sample_nearest_cached / sample_linear_cached
+// sample what memory and the disk caches hold, flag the points only the source (a
+// remote, the array's own store) could supply, and never read the source.
 #include <vc_reader/array.hpp>
 
 #include <chrono>
@@ -22,7 +22,7 @@ void require(bool value, const std::string& message)
 int main()
 {
     namespace fs = std::filesystem;
-    const auto path = fs::temp_directory_path() / ("vcr-native-local-" +
+    const auto path = fs::temp_directory_path() / ("vcr-native-cached-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{path};
     try {
@@ -74,60 +74,76 @@ int main()
         }
         const std::size_t n = coords.size() / 3;
 
-        std::vector<float> linear(n), localLinear(n);
-        std::vector<std::uint8_t> nearest(n), localNearest(n), missing(n);
+        std::vector<float> linear(n), cachedLinear(n);
+        std::vector<std::uint8_t> nearest(n), cachedNearest(n), missing(n);
         reference.sample_linear(coords.data(), n, u8, false, linear.data());
         reference.sample_nearest(coords.data(), n, nearest.data());
         const float sentinel = -12345.f;
         const auto no_fetch = [&] {
-            require(array.stats().remote_fetches == 0, "local-only reads fetched");
+            require(array.stats().remote_fetches == 0, "cache-only reads fetched");
         };
 
         // Chunk 0 comes from the disk cache; chunks 1 and 2 need the remote and are missing,
         // their outputs untouched; the outside point needs no chunk.
-        std::fill(localLinear.begin(), localLinear.end(), sentinel);
-        array.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        std::fill(cachedLinear.begin(), cachedLinear.end(), sentinel);
+        array.sample_linear_cached(coords.data(), n, u8, false, cachedLinear.data(), missing.data());
         no_fetch();
         require(array.stats().disk_hits > 0, "chunk 0 read from the disk cache");
-        require(!missing[0] && localLinear[0] == linear[0], "disk-cached point");
-        require(missing[1] && localLinear[1] == sentinel, "border point with a neighbour only the remote has");
-        require(missing[2] && missing[3] && localLinear[2] == sentinel, "remote-only points");
-        require(!missing[4] && localLinear[4] == 7.f, "outside point reads as fill");
+        require(!missing[0] && cachedLinear[0] == linear[0], "disk-cached point");
+        require(missing[1] && cachedLinear[1] == sentinel, "border point with a neighbour only the remote has");
+        require(missing[2] && missing[3] && cachedLinear[2] == sentinel, "remote-only points");
+        require(!missing[4] && cachedLinear[4] == 7.f, "outside point reads as fill");
         for (std::size_t p = singles; p < n; ++p)
-            require(missing[p] && localLinear[p] == sentinel, "run in a remote-only chunk");
-        std::fill(localNearest.begin(), localNearest.end(), std::uint8_t{200});
-        array.sample_nearest_local(coords.data(), n, localNearest.data(), missing.data());
+            require(missing[p] && cachedLinear[p] == sentinel, "run in a remote-only chunk");
+        std::fill(cachedNearest.begin(), cachedNearest.end(), std::uint8_t{200});
+        array.sample_nearest_cached(coords.data(), n, cachedNearest.data(), missing.data());
         no_fetch();
-        require(!missing[0] && localNearest[0] == nearest[0], "disk-cached nearest point");
-        require(missing[2] && missing[3] && localNearest[2] == 200, "remote-only nearest points");
-        require(!missing[4] && localNearest[4] == 7, "outside nearest point");
+        require(!missing[0] && cachedNearest[0] == nearest[0], "disk-cached nearest point");
+        require(missing[2] && missing[3] && cachedNearest[2] == 200, "remote-only nearest points");
+        require(!missing[4] && cachedNearest[4] == 7, "outside nearest point");
         for (std::size_t p = singles; p < n; ++p)
-            require(missing[p] && localNearest[p] == 200, "nearest run in a remote-only chunk");
+            require(missing[p] && cachedNearest[p] == 200, "nearest run in a remote-only chunk");
 
         // The other chunks arrive in the disk cache (chunk 2 as known-missing): every point
         // equals the blocking reference and nothing is fetched.
         write_chunk(cache, 1);
         std::ofstream(cache / "0.0.2.missing").put('\n');
-        array.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        array.sample_linear_cached(coords.data(), n, u8, false, cachedLinear.data(), missing.data());
         for (std::size_t p = 0; p < n; ++p)
-            require(!missing[p] && localLinear[p] == linear[p], "linear point " + std::to_string(p));
-        array.sample_nearest_local(coords.data(), n, localNearest.data(), missing.data());
+            require(!missing[p] && cachedLinear[p] == linear[p], "linear point " + std::to_string(p));
+        array.sample_nearest_cached(coords.data(), n, cachedNearest.data(), missing.data());
         for (std::size_t p = 0; p < n; ++p)
-            require(!missing[p] && localNearest[p] == nearest[p], "nearest point " + std::to_string(p));
+            require(!missing[p] && cachedNearest[p] == nearest[p], "nearest point " + std::to_string(p));
         no_fetch();
 
-        // A purely local array: everything is local, nothing is ever missing.
-        reference.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        // A local store is the array's source: its chunks are missing until a blocking read
+        // brings them into memory, and the cache-only read does not touch the store.
+        vcr::Array local(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+        local.sample_linear_cached(coords.data(), n, u8, false, cachedLinear.data(), missing.data());
+        require(local.stats().disk_hits == 0, "cache-only read of a local store read the store");
         for (std::size_t p = 0; p < n; ++p)
-            require(!missing[p] && localLinear[p] == linear[p], "local store point " + std::to_string(p));
+            require(missing[p] == (p != 4), "local store point " + std::to_string(p) + " before loading");
+        local.sample_linear(coords.data(), n, u8, false, linear.data());
+        local.sample_linear_cached(coords.data(), n, u8, false, cachedLinear.data(), missing.data());
+        for (std::size_t p = 0; p < n; ++p)
+            require(!missing[p] && cachedLinear[p] == linear[p], "local store point " + std::to_string(p) + " loaded");
+
+        // An array without any source reads as fill, never missing.
+        vcr::ArraySpec sourceless = spec;
+        sourceless.identity = "sourceless";
+        sourceless.layers.clear();
+        vcr::Array empty(sourceless, std::make_shared<vcr::MemoryCache>(1 << 20));
+        empty.sample_nearest_cached(coords.data(), n, cachedNearest.data(), missing.data());
+        for (std::size_t p = 0; p < n; ++p)
+            require(!missing[p] && cachedNearest[p] == 7, "sourceless point " + std::to_string(p));
 
         // Non-finite points read as NaN without a chunk, as in the blocking call.
         const double nan_point[3]{std::nan(""), 0.0, 0.0};
         float nan_value = 0;
         std::uint8_t nan_missing = 1;
-        array.sample_linear_local(nan_point, 1, u8, false, &nan_value, &nan_missing);
+        array.sample_linear_cached(nan_point, 1, u8, false, &nan_value, &nan_missing);
         require(std::isnan(nan_value) && !nan_missing, "non-finite point");
-        std::cout << "Native local-only sampling passed\n";
+        std::cout << "Native cache-only sampling passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
