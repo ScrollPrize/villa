@@ -13,6 +13,7 @@ from uuid import uuid4
 import numpy as np
 import tifffile
 
+from .isometry import compute_grid_isometry
 from .types import Tifxyz
 from .upsampling import compute_grid_bounds
 
@@ -26,6 +27,7 @@ def write_tifxyz(
     compression: Optional[str] = "lzw",
     tile_size: Optional[int] = 1024,
     write_mask: bool = True,
+    write_isometry: bool = True,
     overwrite: bool = False,
 ) -> Path:
     """Write a Tifxyz object to a tifxyz directory.
@@ -44,6 +46,8 @@ def write_tifxyz(
         be memory-mapped as written (VC3D's mmap layout).
     write_mask : bool
         If True, write mask.tif. Default True.
+    write_isometry : bool
+        If True, write the ``isometry`` block into meta.json. Default True.
     overwrite : bool
         If True, overwrite existing files. Default False.
 
@@ -61,6 +65,7 @@ def write_tifxyz(
         path,
         compression=compression,
         tile_size=tile_size,
+        write_isometry=write_isometry,
         overwrite=overwrite,
     )
     return writer.write(surface, write_mask=write_mask)
@@ -89,12 +94,14 @@ class TifxyzWriter:
         *,
         compression: Optional[str] = "lzw",
         tile_size: Optional[int] = 1024,
+        write_isometry: bool = True,
         overwrite: bool = False,
     ) -> None:
         """Initialize writer."""
         self.path = Path(path)
         self.compression = compression
         self.tile_size = tile_size
+        self.write_isometry = write_isometry
         self.overwrite = overwrite
 
     def _ensure_directory(self) -> None:
@@ -206,8 +213,22 @@ class TifxyzWriter:
         if surface.area is not None:
             meta_dict["area"] = surface.area
 
-        # Add extra fields
+        # Extra fields first: the reader keeps every key except uuid/scale/bbox/area
+        # in `extra`, so a segment read back and re-written would otherwise carry its
+        # stale `isometry` block over the fresh one computed below.
         meta_dict.update(surface.extra)
+
+        # Grid isometry: edge stretch against the promised step (#2279).
+        if self.write_isometry:
+            meta_dict["isometry"] = compute_grid_isometry(
+                surface._x,
+                surface._y,
+                surface._z,
+                valid=surface.valid_vertex_mask,
+                scale=surface._scale,
+            )
+        else:
+            meta_dict.pop("isometry", None)
 
         # Write JSON
         output_path = self.path / "meta.json"

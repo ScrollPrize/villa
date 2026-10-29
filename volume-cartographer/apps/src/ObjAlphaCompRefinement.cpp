@@ -330,6 +330,9 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
     auto out = std::make_unique<QuadSurface>(refined, surf.scale());
     if (!surf.meta.is_null()) {
         out->meta = surf.meta;
+        // The refined points moved along their normals, so a copied isometry
+        // block (#2279) is stale; drop it.
+        out->meta.erase("isometry");
     }
     if (cfg.gen_vertexcolor) {
         std::cerr << "warning: gen_vertexcolor not supported for surface output; ignoring flag\n";

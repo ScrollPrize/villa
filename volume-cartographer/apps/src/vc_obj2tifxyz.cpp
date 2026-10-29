@@ -230,7 +230,11 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     surf->meta = std::move(sourceMeta);
-    
+
+    // The output grid is the flattened mesh, not the source's, so a copied
+    // isometry block (#2279) would be stale; drop it.
+    surf->meta.erase("isometry");
+
     if (!store_output.store.empty()) {
         try {
             nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};

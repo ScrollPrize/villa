@@ -10,6 +10,7 @@
 #include "vc/core/util/Tiff.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/SurfaceArea.hpp"
+#include "vc/core/util/GridIsometry.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -2643,6 +2644,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
+        vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
         surf->meta["max_gen"] = stop_gen;
         surf->meta["elapsed_time_s"] = f_timer.seconds();
 
@@ -2748,6 +2750,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         surf->meta = utils::Json::parse(meta_params.dump());
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
+        vc::surface::storeIsometryMeta(surf->meta, *surf->rawPointsPtr(), surf->scale());
         surf->meta["max_gen"] = generation;
         {
             auto seed_arr = utils::Json::array();

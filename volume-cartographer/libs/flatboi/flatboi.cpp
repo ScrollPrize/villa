@@ -35,6 +35,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
+#include "vc/core/util/TriangleStretch.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <unistd.h>
@@ -389,80 +390,31 @@ struct Flatboi {
     return uv.rowwise() - mn;
   }
 
-  static void triangle_stretch(
-      const Eigen::Matrix<double,3,3>& t3d,
-      const Eigen::Matrix<double,3,2>& t2d,
-      double& L2, double& G, double& area3d, double& area2d_abs)
-  {
-    using std::sqrt;
-    const Eigen::RowVector3d q1 = t3d.row(0), q2 = t3d.row(1), q3 = t3d.row(2);
-    const double s1=t2d(0,0), t1=t2d(0,1);
-    const double s2=t2d(1,0), t2v=t2d(1,1);
-    const double s3=t2d(2,0), t3v=t2d(2,1);
-
-    const double A = ((s2 - s1) * (t3v - t1) - (s3 - s1) * (t2v - t1)) / 2.0;
-    if (std::abs(A) < 1e-30) { L2=G=area3d=area2d_abs=0.0; return; }
-
-    const Eigen::RowVector3d Ss = ( q1*(t2v - t3v) + q2*(t3v - t1) + q3*(t1 - t2v) ) / (2.0*A);
-    const Eigen::RowVector3d St = ( q1*(s3 - s2)   + q2*(s1 - s3)   + q3*(s2 - s1)   ) / (2.0*A);
-
-    const double a = Ss.dot(Ss), b = Ss.dot(St), c = St.dot(St);
-    G  = sqrt( ((a + c) + sqrt((a - c)*(a - c) + 4.0*b*b)) / 2.0 );
-    L2 = sqrt( (a + c) / 2.0 );
-
-    const double ab = (q2 - q1).norm(), bc = (q3 - q2).norm(), ca = (q1 - q3).norm();
-    const double s  = (ab + bc + ca) / 2.0;
-    area3d = sqrt(std::max(0.0, s*(s - ab)*(s - bc)*(s - ca)));
-    area2d_abs = std::abs(A);
-  }
-
-  static double weighted_median(const std::vector<double>& data, const std::vector<double>& weights) {
-    std::vector<size_t> idx(data.size());
-    std::iota(idx.begin(), idx.end(), 0);
-    std::sort(idx.begin(), idx.end(), [&](size_t i, size_t j){ return data[i] < data[j]; });
-    double wsum = 0.0; for (double w: weights) wsum += w;
-    double acc = 0.0;
-    for (size_t k = 0; k < idx.size(); ++k) {
-      acc += weights[idx[k]];
-      if (acc >= 0.5 * wsum) return data[idx[k]];
-    }
-    return data[idx.back()];
-  }
-
-  // returns (L2_mean, L2_median, Linf, area_error)
+  // Per-triangle stretch from the shared Eigen-free core (TriangleStretch.hpp,
+  // villa #2279 item 4); returns (L2_mean, L2_median, Linf, area_error).
   std::tuple<double,double,double,double> stretch_metrics(const Eigen::MatrixXd& uv_in) const {
     bool per_vertex = (uv_in.rows() == V.rows() && uv_in.cols() == 2);
     const int T = F.rows();
-    std::vector<double> l2_all(T,0.0), linf_all(T,0.0), area3d_all(T,0.0), area2d_all(T,0.0), per_tri_area(T,0.0);
-    double nom=0.0, sum_area3d=0.0;
+    std::vector<vc::surface::TriangleStretch> tris;
+    tris.reserve(T);
 
     for (int t = 0; t < T; ++t) {
-      Eigen::Matrix<double,3,3> tri3d;
-      tri3d.row(0)=V.row(F(t,0)); tri3d.row(1)=V.row(F(t,1)); tri3d.row(2)=V.row(F(t,2));
-      Eigen::Matrix<double,3,2> tri2d;
+      const double p[3][3] = {
+        {V(F(t,0),0), V(F(t,0),1), V(F(t,0),2)},
+        {V(F(t,1),0), V(F(t,1),1), V(F(t,1),2)},
+        {V(F(t,2),0), V(F(t,2),1), V(F(t,2),2)},
+      };
+      double uv[3][2] = {};
       if (per_vertex) {
-        tri2d.row(0)=uv_in.row(F(t,0)); tri2d.row(1)=uv_in.row(F(t,1)); tri2d.row(2)=uv_in.row(F(t,2));
+        for (int k = 0; k < 3; ++k) { uv[k][0]=uv_in(F(t,k),0); uv[k][1]=uv_in(F(t,k),1); }
       } else {
-        tri2d.row(0)=TC.row(FTC(t,0));  tri2d.row(1)=TC.row(FTC(t,1));  tri2d.row(2)=TC.row(FTC(t,2));
+        for (int k = 0; k < 3; ++k) { uv[k][0]=TC(FTC(t,k),0);  uv[k][1]=TC(FTC(t,k),1); }
       }
-
-      double L2,G,A3,A2; triangle_stretch(tri3d,tri2d,L2,G,A3,A2);
-      linf_all[t]=G; area3d_all[t]=A3; area2d_all[t]=A2; l2_all[t]=L2*L2;
-      nom += l2_all[t]*area3d_all[t]; sum_area3d += area3d_all[t];
+      tris.push_back(vc::surface::triangleStretch(p, uv));
     }
 
-    const double l2_mean   = (sum_area3d>0.0)? std::sqrt(nom/sum_area3d) : 0.0;
-    const double l2_median = weighted_median(l2_all, area3d_all);
-    const double linf      = *std::max_element(linf_all.begin(), linf_all.end());
-
-    double sumA3=0.0,sumA2=0.0; for (int t=0;t<T;++t){ sumA3+=area3d_all[t]; sumA2+=area2d_all[t]; }
-    for (int t=0;t<T;++t){
-      const double alpha=(sumA3>0)? area3d_all[t]/sumA3 : 0.0;
-      const double beta =(sumA2>0)? area2d_all[t]/sumA2 : 0.0;
-      per_tri_area[t] = (alpha>beta) ? (1.0 - (beta/(alpha + 1e-30))) : (1.0 - (alpha/(beta + 1e-30)));
-    }
-    double area_err=0.0; for (double v: per_tri_area) area_err += v; area_err /= std::max(1, T);
-    return {l2_mean, l2_median, linf, area_err};
+    const vc::surface::StretchMetrics m = vc::surface::aggregateStretch(tris);
+    return {m.l2_mean, m.l2_median, m.linf, m.area_error};
   }
 
   // Run SLIM from the mesh's own UVs.

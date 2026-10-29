@@ -77,6 +77,8 @@ vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
 
+vc_add_test(NAME test_grid_isometry)
+
 vc_add_test(NAME test_voxel_size_metadata)
 
 vc_add_test(NAME test_read_interpolated_render)
