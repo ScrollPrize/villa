@@ -16,12 +16,12 @@
 
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include "vc_reader/zarr.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
@@ -416,9 +416,20 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
         }
 
-        QuadSurface* surface = tracer(*context.volume,
+        // The tracer reads the working level through vc_reader's shared chunk service.
+        const auto service = vcr::chunks::processService();
+        auto level = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
+            context.volume->sourceLocation(), context.level + context.volume->baseScaleLevel(),
+            context.volume->sourceOpenOptions()));
+        const auto source = service->addSource({std::shared_ptr<vcr::Array>(level, level->array.get())});
+        struct RemoveSource {
+            vcr::chunks::Service& service;
+            vcr::chunks::SourceId source;
+            ~RemoveSource() { service.removeSource(source); }
+        } removeSource{*service, source};
+        vcr::slice::Cached tracingVolume{*level->array, *service, source};
+        QuadSurface* surface = tracer(tracingVolume,
                                       1.0f,
-                                      context.level,
                                       origin,
                                       params,
                                       context.cacheRoot.toStdString(),

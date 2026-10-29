@@ -817,7 +817,6 @@ if(VC_TESTING)
         test_lasagna_line_view_surfaces
         test_lasagna_normal_sampler
         test_fiber_side_strip_intersections
-        test_chunked_tensor
         test_direction_field
         test_growth_config
         test_growth_helpers

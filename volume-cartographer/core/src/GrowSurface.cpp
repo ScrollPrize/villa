@@ -15,7 +15,6 @@
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 
 #include "growth_strategies/CandidateOrdering.hpp"
 #include "growth_strategies/GrowthConfig.hpp"

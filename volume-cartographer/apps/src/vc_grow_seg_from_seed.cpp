@@ -9,9 +9,10 @@
 
 #include <opencv2/imgproc.hpp>
 #include "utils/Json.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include "vc_reader/chunks.hpp"
+#include "vc_reader/slice.hpp"
+#include "vc_reader/zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
@@ -77,22 +78,21 @@ static bool is_remote_volume_path(const std::string& path)
            path.rfind("s3://", 0) == 0;
 }
 
-static bool chunk_has_source_data(vc::render::IChunkedArray& chunks,
-                                  int level,
-                                  size_t iz,
-                                  size_t iy,
-                                  size_t ix)
+static bool chunk_has_source_data(vcr::slice::Cached& volume, std::int64_t iz, std::int64_t iy, std::int64_t ix)
 {
-    const auto result = chunks.getChunkBlocking(level,
-                                                static_cast<int>(iz),
-                                                static_cast<int>(iy),
-                                                static_cast<int>(ix));
-    if (result.status == vc::render::ChunkStatus::Error) {
-        throw std::runtime_error(result.error.empty()
-            ? std::string("Failed to read zarr chunk")
-            : result.error);
-    }
-    return result.status == vc::render::ChunkStatus::Data;
+    const auto result = volume.service.get({volume.source, volume.level, iz, iy, ix});
+    if (result.status == vcr::chunks::Status::Error)
+        throw std::runtime_error("Failed to read zarr chunk: " + result.error);
+    return result.status == vcr::chunks::Status::Data;
+}
+
+// Trilinear volume value at an XYZ location.
+static double volume_value(vcr::slice::Cached& volume, const cv::Vec3d& xyz)
+{
+    const float point[3] = {float(xyz[0]), float(xyz[1]), float(xyz[2])};
+    float value = 0.0f;
+    vcr::slice::points(volume, vcr::ElementType{'u', 1, false}, point, 1, vcr::slice::Order::Linear, &value);
+    return value;
 }
 
 std::string time_str()
@@ -108,13 +108,6 @@ std::string time_str()
     oss << std::setfill('0') << std::setw(3) << ms.count();
 
     return oss.str();
-}
-
-template <typename T, typename I>
-float get_val(I &interp, cv::Vec3d l) {
-    T v;
-    interp.Evaluate(l[2], l[1], l[0], &v);
-    return v;
 }
 
 bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec3d& origin,
@@ -390,14 +383,21 @@ static int run_main(int argc, char *argv[])
         std::cerr << std::endl;
         return EXIT_FAILURE;
     }
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        size_t(params.value("cache_size", 1e9)));
-    auto* chunk_cache = volume->chunkedCache();
+    vcr::chunks::Service::Options service_options;
+    service_options.decodedBytes = size_t(params.value("cache_size", 1e9));
+    auto service = vcr::chunks::configureProcessService(service_options);
+    auto level0 = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
+        volume->sourceLocation(), volume->baseScaleLevel(), volume->sourceOpenOptions()));
+    if (level0->meta.type.kind != 'u' || level0->meta.itemsize() != 1) {
+        std::cerr << "ERROR: the tracer reads uint8 volumes, not " << level0->meta.dtype << std::endl;
+        return EXIT_FAILURE;
+    }
+    const auto volume_source = service->addSource({std::shared_ptr<vcr::Array>(level0, level0->array.get())});
+    vcr::slice::Cached tracing_volume{*level0->array, *service, volume_source};
     const std::array<int, 3> volume_shape_zyx{
-        volume->numSlices(),
-        volume->sliceHeight(),
-        volume->sliceWidth()};
-    const auto chunk_shape_zyx = chunk_cache->chunkShape(0);
+        int(level0->meta.shape[0]), int(level0->meta.shape[1]), int(level0->meta.shape[2])};
+    const std::array<int, 3> chunk_shape_zyx{
+        int(level0->meta.chunks[0]), int(level0->meta.chunks[1]), int(level0->meta.chunks[2])};
 
     std::cout << "zarr dataset size for scale group 0 "
               << "[" << volume_shape_zyx[0] << ", " << volume_shape_zyx[1] << ", " << volume_shape_zyx[2] << "]"
@@ -405,10 +405,6 @@ static int run_main(int argc, char *argv[])
     std::cout << "chunk shape shape "
               << "[" << chunk_shape_zyx[0] << ", " << chunk_shape_zyx[1] << ", " << chunk_shape_zyx[2] << "]"
               << std::endl;
-
-    passTroughComputor pass;
-    Chunked3d<uint8_t,passTroughComputor> tensor(pass, volume_shape_zyx, chunk_cache, 0);
-    CachedChunked3dInterpolator<uint8_t,passTroughComputor> interpolator(tensor);
 
     auto chunk_size = chunk_shape_zyx;
 
@@ -548,7 +544,7 @@ static int run_main(int argc, char *argv[])
                 {
                     cv::Vec2i p = {rand() % h, rand() % w};
                     
-                    if (points(p)[0] != -1 && get_val<double,CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, points(p)) >= 128) {
+                    if (points(p)[0] != -1 && volume_value(tracing_volume, points(p)) >= 128) {
                         found = true;
                         origin = points(p);
                         break;
@@ -574,7 +570,7 @@ static int run_main(int argc, char *argv[])
                         cv::Vec2i p_eval = p;
                         for(int r=0;r<5;r++) {
                             cv::Vec2i p_eval = p+r*searchdir;
-                            if (points(p_eval)[0] == -1 || get_val<double,CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, points(p_eval)) < 128) {
+                            if (points(p_eval)[0] == -1 || volume_value(tracing_volume, points(p_eval)) < 128) {
                                 found = false;
                                 break;
                             }
@@ -649,13 +645,11 @@ static int run_main(int argc, char *argv[])
             mode = "resume";
         } else if (use_old_args && argc == 7) {
             mode = "explicit_seed";
-            double v;
-            interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
+            const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
         } else if (!use_old_args && origin[0] != 0 && origin[1] != 0 && origin[2] != 0) {
             mode = "explicit_seed";
-            double v;
-            interpolator.Evaluate(origin[2], origin[1], origin[0], &v);
+            const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
         }
         else {
@@ -675,7 +669,7 @@ static int run_main(int argc, char *argv[])
                 chunk_id[1] = origin[1]/chunk_id[1];
                 chunk_id[2] = origin[0]/chunk_id[2];
 
-                if (!chunk_has_source_data(*chunk_cache, 0, chunk_id[0], chunk_id[1], chunk_id[2]))
+                if (!chunk_has_source_data(tracing_volume, chunk_id[0], chunk_id[1], chunk_id[2]))
                     continue;
 
                 cv::Vec3d dir = {static_cast<double>((rand() % 1024) - 512),
@@ -684,9 +678,8 @@ static int run_main(int argc, char *argv[])
                 cv::normalize(dir, dir);
 
                 for(int i=0;i<128;i++) {
-                    double v;
                     cv::Vec3d p = origin + i*dir;
-                    interpolator.Evaluate(p[2], p[1], p[0], &v);
+                    const double v = volume_value(tracing_volume, p);
                     if (v >= 128) {
                         if (store ? !stored_surfaces_near(p, 2.0).empty()
                                   : check_existing_segments(tgt_dir, p, name_prefix, search_effort))
@@ -918,7 +911,7 @@ static int run_main(int argc, char *argv[])
                     }
 
                     const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
-                    const float v = get_val<double, CachedChunked3dInterpolator<uint8_t,passTroughComputor>>(interpolator, pos);
+                    const float v = volume_value(tracing_volume, pos);
                     if (!std::isfinite(v)) {
                         continue;
                     }
@@ -1591,7 +1584,7 @@ static int run_main(int argc, char *argv[])
         add_target_context(refine_meta, vol_path);
         std::unique_ptr<QuadSurface> refined;
         try {
-            refined.reset(tracer(*volume, 1.0, 0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
+            refined.reset(tracer(tracing_volume, 1.0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
                                  load_direction_fields(refine), out_surf.get(),
                                  store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
         } catch (const std::exception& e) {
@@ -1605,7 +1598,7 @@ static int run_main(int argc, char *argv[])
 
     QuadSurface *surf = nullptr;
     try {
-        surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+        surf = tracer(tracing_volume, 1.0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
     } catch (const std::exception& e) {
         // A growth failure (e.g. a remote normal-grid store whose metadata
         // could not be fetched) must exit as a normal tool failure, not crash

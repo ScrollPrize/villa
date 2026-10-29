@@ -24,6 +24,7 @@ class IChunkedArray;
 struct OpenedChunkedZarr;
 }
 namespace utils { class ZarrArray; }
+namespace vcr::zarr { struct OpenOptions; }
 
 struct CompositeParams;
 
@@ -73,6 +74,12 @@ public:
     // logical base level included. Annotation IDs do not rename disk caches.
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
+
+    // Where vc_reader opens this volume's source: the local path or remote URL
+    // (s3:// for signed S3), with the credentials and the VC3D cache directory to
+    // open it with. Working level L is physical pyramid level L + baseScaleLevel().
+    [[nodiscard]] std::string sourceLocation() const;
+    [[nodiscard]] vcr::zarr::OpenOptions sourceOpenOptions() const;
 
     [[nodiscard]] int sliceWidth() const noexcept;
     [[nodiscard]] int sliceHeight() const noexcept;
@@ -215,6 +222,7 @@ protected:
     std::string remoteUrl_;
     std::string remoteLocator_;
     std::string remoteCacheId_;
+    std::string remoteSourceCacheId_;  // the cache of the physical (not rebased) pyramid
     int baseScaleLevel_ = 0;
     bool hasExplicitVoxelSizeOverride_ = false;
     vc::HttpAuth remoteAuth_;

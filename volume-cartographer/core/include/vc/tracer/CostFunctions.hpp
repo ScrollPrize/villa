@@ -1,6 +1,5 @@
 #pragma once
 
-#include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/tracer/DirectionField.hpp"
 #include <iostream>
 #include "vc/core/util/NormalGridVolume.hpp"
@@ -309,44 +308,6 @@ struct ZLocationLoss {
         return new ceres::AutoDiffCostFunction<ZLocationLoss, 1, 2>(new ZLocationLoss(m, z, w));
     }
     
-};
-
-template <typename T, typename C>
-struct SpaceLineLossAcc {
-    SpaceLineLossAcc(Chunked3d<T,C> &t, int steps, float w) : _steps(steps), _w(w)
-    {
-        _interpolator.resize(_steps-1);
-        for(int i=1;i<_steps;i++)
-            _interpolator[i-1].reset(new CachedChunked3dInterpolator<T,C>(t));
-    };
-    template <typename E>
-    bool operator()(const E* const la, const E* const lb, E* residual) const {
-        E v;
-        E sum = E(0);
-
-        bool ign = false;
-
-        for(int i=1;i<_steps;i++) {
-            E f2 = E(float(i)/_steps);
-            E f1 = E(1.0f-float(i)/_steps);
-            _interpolator[i-1].get()->template Evaluate<E>(f1*la[2]+f2*lb[2], f1*la[1]+f2*lb[1], f1*la[0]+f2*lb[0], &v);
-            sum += E(_w)*v;
-        }
-
-        residual[0] = sum/E(_steps-1);
-
-        return true;
-    }
-
-    std::vector<std::unique_ptr<CachedChunked3dInterpolator<T,C>>> _interpolator;
-    int _steps;
-    float _w;
-
-    static ceres::CostFunction* Create(Chunked3d<T,C> &t, int steps, float w = 1.0)
-    {
-        return new ceres::AutoDiffCostFunction<SpaceLineLossAcc, 1, 3, 3>(new SpaceLineLossAcc(t, steps, w));
-    }
-
 };
 
 struct FiberDirectionLoss {

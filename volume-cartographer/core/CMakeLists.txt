@@ -248,12 +248,10 @@ add_library(vc_tracer
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp
-    src/ChunkedTensor.cpp
     src/growth_strategies/CandidateOrdering.cpp
     src/growth_strategies/GrowthConfig.cpp
 )
 target_link_libraries(vc_tracer PUBLIC vc_core Ceres::ceres)
-target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
     foreach(_lib vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)

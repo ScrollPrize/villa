@@ -38,6 +38,7 @@
 #include "vc/core/render/ChunkFetch.hpp"
 #include "utils/hash.hpp"
 #include "utils/zarr.hpp"
+#include "vc_reader/zarr.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
@@ -811,6 +812,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // name remains URL-derived. A working level keeps its own cache namespace
     // (its chunk levels are renumbered), but not its own volume ID.
     vol->remoteCacheId_ = vol->id();
+    vol->remoteSourceCacheId_ = vol->remoteCacheId_;
     if (spec.baseScaleLevel > 0) {
         vol->remoteCacheId_ = deriveRebasedRemoteCacheId(
             vol->remoteCacheId_, remoteUrl, spec.baseScaleLevel);
@@ -848,6 +850,37 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     }
 
     return vol;
+}
+
+std::string Volume::sourceLocation() const
+{
+    if (!isRemote_)
+        return path_.string();
+    if (remoteAuth_.empty())
+        return remoteUrl_;
+    // Signed requests name the bucket: https://BUCKET.s3[.REGION].amazonaws.com/KEY.
+    const auto scheme = remoteUrl_.find("://");
+    const std::string rest = scheme == std::string::npos ? remoteUrl_ : remoteUrl_.substr(scheme + 3);
+    const auto slash = rest.find('/');
+    const std::string host = rest.substr(0, slash);
+    const auto s3 = host.find(".s3.");
+    if (s3 == std::string::npos || host.find(".amazonaws.com") == std::string::npos)
+        throw std::runtime_error("signed requests need an S3 virtual-host URL: " + remoteUrl_);
+    return "s3://" + host.substr(0, s3) + (slash == std::string::npos ? std::string() : rest.substr(slash));
+}
+
+vcr::zarr::OpenOptions Volume::sourceOpenOptions() const
+{
+    vcr::zarr::OpenOptions options;
+    if (!isRemote_)
+        return options;
+    if (!remoteAuth_.empty())
+        options.access = vcr::zarr::s3Access(sourceLocation(),
+            vcr::Auth{"s3", remoteAuth_.access_key, remoteAuth_.secret_key,
+                      remoteAuth_.session_token, remoteAuth_.region});
+    if (!remoteCacheRoot_.empty())
+        options.vc3dVolumeDir = remoteCacheRoot_ / remoteSourceCacheId_;
+    return options;
 }
 
 std::filesystem::path Volume::remotePersistentCachePath() const
