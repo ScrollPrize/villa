@@ -1,0 +1,135 @@
+// Sampling from local data alone: Array::sample_nearest_local / sample_linear_local
+// sample what memory and the disk layers hold, flag the points only a remote fetch
+// could supply, and never fetch.
+#include <vc_reader/array.hpp>
+
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+namespace {
+
+void require(bool value, const std::string& message)
+{
+    if (!value) throw std::runtime_error(message);
+}
+
+}  // namespace
+
+int main()
+{
+    namespace fs = std::filesystem;
+    const auto path = fs::temp_directory_path() / ("vcr-native-local-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{path};
+    try {
+        // Shape (4, 4, 12), chunks 4^3. The whole volume as a local store (the blocking
+        // reference), and a network volume whose decoded disk cache starts with chunk 0.
+        const auto store = path / "store", cache = path / "cache";
+        fs::create_directories(store);
+        fs::create_directories(cache);
+        const auto value_at = [](int z, int y, int x) { return std::uint8_t(z * 48 + y * 12 + x); };
+        const auto write_chunk = [&](const fs::path& root, int cx) {
+            std::vector<std::uint8_t> chunk(64);
+            for (int z = 0; z < 4; ++z)
+                for (int y = 0; y < 4; ++y)
+                    for (int x = 0; x < 4; ++x)
+                        chunk[(z * 4 + y) * 4 + x] = value_at(z, y, cx * 4 + x);
+            std::ofstream output(root / ("0.0." + std::to_string(cx)), std::ios::binary);
+            output.write(reinterpret_cast<const char*>(chunk.data()), std::streamsize(chunk.size()));
+        };
+        write_chunk(store, 0);
+        write_chunk(store, 1);  // chunk 0.0.2 is not stored
+        write_chunk(cache, 0);
+
+        vcr::ArraySpec spec;
+        spec.shape = {4, 4, 12};
+        spec.chunks = {4, 4, 4};
+        spec.fill = {7};
+        spec.identity = store.string();
+        spec.layers.push_back({"array", store.string(), "", "", false});
+        vcr::Array reference(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+
+        vcr::ArraySpec remote = spec;
+        remote.identity = "remote";
+        remote.layers = {{"decoded", cache.string(), "", "", false}};
+        remote.remote_url = "http://127.0.0.1:9/never-fetched";  // nothing listens: a fetch fails
+        remote.http.retries = 0;
+        vcr::Array array(remote, std::make_shared<vcr::MemoryCache>(1 << 20));
+        require(array.remote(), "the network volume has a remote");
+        const vcr::ElementType u8{'u', 1, false};
+
+        // Points (z, y, x): in chunk 0; on the chunk 0/1 border (linear needs both); in
+        // chunk 1; in the unstored chunk 2; outside the array; a run of 64 points in chunk 1.
+        std::vector<double> coords{1.25, 2.5, 1.5,  1.0, 1.0, 3.5,  2.0, 2.25, 5.75,
+                                   0.5, 0.5, 9.0,   -5.0, 0.0, 0.0};
+        const std::size_t singles = coords.size() / 3;
+        for (int i = 0; i < 64; ++i) {
+            coords.push_back(i % 4 * 0.75);
+            coords.push_back(i / 16 * 0.75);
+            coords.push_back(4.0 + (i / 4 % 4) * 0.75);
+        }
+        const std::size_t n = coords.size() / 3;
+
+        std::vector<float> linear(n), localLinear(n);
+        std::vector<std::uint8_t> nearest(n), localNearest(n), missing(n);
+        reference.sample_linear(coords.data(), n, u8, false, linear.data());
+        reference.sample_nearest(coords.data(), n, nearest.data());
+        const float sentinel = -12345.f;
+        const auto no_fetch = [&] {
+            require(array.stats().remote_fetches == 0, "local-only reads fetched");
+        };
+
+        // Chunk 0 comes from the disk cache; chunks 1 and 2 need the remote and are missing,
+        // their outputs untouched; the outside point needs no chunk.
+        std::fill(localLinear.begin(), localLinear.end(), sentinel);
+        array.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        no_fetch();
+        require(array.stats().disk_hits > 0, "chunk 0 read from the disk cache");
+        require(!missing[0] && localLinear[0] == linear[0], "disk-cached point");
+        require(missing[1] && localLinear[1] == sentinel, "border point with a neighbour only the remote has");
+        require(missing[2] && missing[3] && localLinear[2] == sentinel, "remote-only points");
+        require(!missing[4] && localLinear[4] == 7.f, "outside point reads as fill");
+        for (std::size_t p = singles; p < n; ++p)
+            require(missing[p] && localLinear[p] == sentinel, "run in a remote-only chunk");
+        std::fill(localNearest.begin(), localNearest.end(), std::uint8_t{200});
+        array.sample_nearest_local(coords.data(), n, localNearest.data(), missing.data());
+        no_fetch();
+        require(!missing[0] && localNearest[0] == nearest[0], "disk-cached nearest point");
+        require(missing[2] && missing[3] && localNearest[2] == 200, "remote-only nearest points");
+        require(!missing[4] && localNearest[4] == 7, "outside nearest point");
+        for (std::size_t p = singles; p < n; ++p)
+            require(missing[p] && localNearest[p] == 200, "nearest run in a remote-only chunk");
+
+        // The other chunks arrive in the disk cache (chunk 2 as known-missing): every point
+        // equals the blocking reference and nothing is fetched.
+        write_chunk(cache, 1);
+        std::ofstream(cache / "0.0.2.missing").put('\n');
+        array.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        for (std::size_t p = 0; p < n; ++p)
+            require(!missing[p] && localLinear[p] == linear[p], "linear point " + std::to_string(p));
+        array.sample_nearest_local(coords.data(), n, localNearest.data(), missing.data());
+        for (std::size_t p = 0; p < n; ++p)
+            require(!missing[p] && localNearest[p] == nearest[p], "nearest point " + std::to_string(p));
+        no_fetch();
+
+        // A purely local array: everything is local, nothing is ever missing.
+        reference.sample_linear_local(coords.data(), n, u8, false, localLinear.data(), missing.data());
+        for (std::size_t p = 0; p < n; ++p)
+            require(!missing[p] && localLinear[p] == linear[p], "local store point " + std::to_string(p));
+
+        // Non-finite points read as NaN without a chunk, as in the blocking call.
+        const double nan_point[3]{std::nan(""), 0.0, 0.0};
+        float nan_value = 0;
+        std::uint8_t nan_missing = 1;
+        array.sample_linear_local(nan_point, 1, u8, false, &nan_value, &nan_missing);
+        require(std::isnan(nan_value) && !nan_missing, "non-finite point");
+        std::cout << "Native local-only sampling passed\n";
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

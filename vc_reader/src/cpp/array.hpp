@@ -385,12 +385,13 @@ public:
         sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out);
     }
 
-    // sample_nearest and sample_linear from memory alone: no disk, remote or compute
-    // I/O, so they never wait for a fetch. A point that needs a chunk that is neither in
-    // the memory cache nor a queued cache write gets missing[p] = 1 and its output is
-    // left as it was; every other point is sampled as by the blocking call, with
+    // sample_nearest and sample_linear from local data alone: the memory cache, queued
+    // cache writes and the disk layers (the local store and disk caches), never a remote
+    // fetch or a chunk computation, so they never wait for the network. A point that needs
+    // a chunk that only a fetch (or computation) could supply gets missing[p] = 1 and its
+    // output is left as it was; every other point is sampled as by the blocking call, with
     // missing[p] = 0 (points outside the array read as fill without any chunk).
-    void sample_nearest_cached(const double* coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing)
+    void sample_nearest_local(const double* coords, std::size_t n, std::uint8_t* out, std::uint8_t* missing)
     {
         if (ndim() == 3)
             read_points_as<3>(PointCoordinates{coords, ndim()}, n, out, missing);
@@ -398,8 +399,8 @@ public:
             read_points_as<0>(PointCoordinates{coords, ndim()}, n, out, missing);
     }
 
-    void sample_linear_cached(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
-                              std::uint8_t* missing)
+    void sample_linear_local(const double* coords, std::size_t n, const ElementType& type, bool out64, void* out,
+                             std::uint8_t* missing)
     {
         sample_linear_coordinates(PointCoordinates{coords, ndim()}, n, type, out64, out, missing);
     }
@@ -622,7 +623,7 @@ private:
         // `data` holds the chunk's bytes from byte offset `origin` on.
         std::function<void(const std::uint8_t* data, std::int64_t origin, const Work&)> read;
         std::function<void(const Work&)> fill;  // the chunk is not stored
-        // Set for reads from memory alone: the chunk is not in memory, and is not read.
+        // Set for reads from local data alone: only a fetch could supply the chunk.
         std::function<void(const Work&)> miss;
     };
 
@@ -630,7 +631,7 @@ private:
     void run(std::vector<Work>& work, const std::vector<Index>& out_strides, const PointOp* op,
              const BoxOutput* output = nullptr, bool stream = false)
     {
-        if (spec_.hint && (!cache_ || stream) && !(op && op->miss))
+        if (spec_.hint && (!cache_ || stream))
             pool_.parallel_for(work.size(), [&](std::size_t i) { hint(work[i]); });
         pool_.parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
     }
@@ -1051,7 +1052,7 @@ private:
         std::vector<Splits> split;
         std::vector<std::uint64_t> base;  // segment -> its first slot in raw
         std::vector<std::uint8_t> raw;
-        std::vector<std::uint8_t> raw_missing;  // memory-only reads: split neighbours not in memory
+        std::vector<std::uint8_t> raw_missing;  // local-only reads: split neighbours only a fetch has
         std::vector<Point> points;
         std::vector<Run> runs;
         if (missing)
@@ -1444,10 +1445,6 @@ private:
                 return;
             }
         }
-        if (op && op->miss) {
-            op->miss(w);
-            return;
-        }
         for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
             const LayerSpec& l = spec_.layers[li];
             if ((!cache_ || stream) && codecs_[li] == Codec::Raw) {
@@ -1469,12 +1466,16 @@ private:
                 return;
             }
         }
-        if (spec_.offline)
-            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
-        if (!http_ && !source_ && !spec_.compute) {
+        if (!http_ && !source_ && !spec_.compute && !spec_.offline) {
             fill_pieces(w, out_strides, op, output);
             return;
         }
+        if (op && op->miss) {
+            op->miss(w);
+            return;
+        }
+        if (spec_.offline)
+            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
         ChunkPtr chunk = fetch(w.idx, k);
         if (cache_)
             cache_->put(ck, chunk);
