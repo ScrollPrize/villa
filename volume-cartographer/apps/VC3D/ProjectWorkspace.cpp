@@ -20,12 +20,13 @@
 #include <QFileInfo>
 #include <QFileDialog>
 #include <QFormLayout>
-#include <QGroupBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
+#include <QMenu>
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
@@ -34,6 +35,7 @@
 #include <QStackedWidget>
 #include <QTimer>
 #include <QTreeWidget>
+#include <QTreeWidgetItemIterator>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrent>
@@ -44,10 +46,10 @@
 
 namespace {
 
-enum StoreColumn { StoreName, StoreRole, StoreAccess, StoreHosting, StoreSurfaces, StoreFibers,
-                   StorePointCollections, StoreSize, StorePath, StoreColumns };
-enum ResourceColumn { ResName, ResLocation, ResVisibility, ResTags, ResShape, ResVoxel, ResLevels,
-                      ResType, ResCache, ResColumns };
+enum StoreColumn { StoreName, StoreAccess, StoreSurfaces, StoreFibers, StorePointCollections, StoreSize,
+                   StoreFolder, StoreColumns };
+enum ResourceColumn { ResName, ResLocation, ResTags, ResShape, ResVoxel, ResLevels, ResType, ResCache,
+                      ResColumns };
 // Item data: what a resource row is.
 constexpr int kLocationRole = Qt::UserRole;      // project entry location (detachable rows)
 constexpr int kVolumeIdRole = Qt::UserRole + 1;  // volume id (viewable rows)
@@ -110,6 +112,54 @@ QPushButton* button(const QString& text, QWidget* parent, QHBoxLayout* row)
     return b;
 }
 
+// A button whose menu holds the actions; returns the menu to fill.
+QMenu* menuButton(const QString& text, QWidget* parent, QHBoxLayout* row)
+{
+    auto* menu = new QMenu(parent);
+    button(text, parent, row)->setMenu(menu);
+    return menu;
+}
+
+// Secondary text: details, hints, column notes.
+void dim(QWidget* widget)
+{
+    auto palette = widget->palette();
+    palette.setColor(QPalette::WindowText, palette.color(QPalette::PlaceholderText));
+    palette.setColor(QPalette::Text, palette.color(QPalette::PlaceholderText));
+    widget->setPalette(palette);
+}
+
+// A section's title, with its actions to the right on the same line.
+QHBoxLayout* section(const QString& title, QWidget* parent, QVBoxLayout* layout)
+{
+    auto* row = new QHBoxLayout;
+    auto* label = new QLabel(title, parent);
+    auto font = label->font();
+    font.setBold(true);
+    font.setPointSizeF(font.pointSizeF() * 1.15);
+    label->setFont(font);
+    row->addWidget(label);
+    row->addStretch(1);
+    layout->addSpacing(14);
+    layout->addLayout(row);
+    return row;
+}
+
+void addGap(QHBoxLayout* row)
+{
+    row->addSpacing(12);
+}
+
+// Hide columns that no row fills (e.g. Tags when nothing is tagged).
+void hideEmptyColumns(QTreeWidget* tree, int first)
+{
+    for (int c = first; c < tree->columnCount(); ++c) {
+        bool used = false;
+        for (QTreeWidgetItemIterator it(tree); *it && !used; ++it) used = !(*it)->text(c).isEmpty();
+        tree->setColumnHidden(c, !used);
+    }
+}
+
 void reveal(const QString& location)
 {
     if (location.isEmpty()) return;
@@ -167,25 +217,31 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
     emptyLayout->addStretch(2);
     _pages->addWidget(empty);
 
-    // The overview.
+    // The overview: the project, then its data, its stores and the caches.
     auto* scroll = new QScrollArea(_pages);
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
     auto* page = new QWidget(scroll);
     auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(16, 12, 16, 12);
+    layout->setSpacing(6);
     scroll->setWidget(page);
     _pages->addWidget(scroll);
 
-    auto* top = new QHBoxLayout;
-    layout->addLayout(top);
-
-    // Project
-    auto* projectBox = new QGroupBox(tr("Project"), page);
-    auto* projectLayout = new QVBoxLayout(projectBox);
-    auto* projectForm = new QFormLayout;
-    projectLayout->addLayout(projectForm);
-    _name = new QLineEdit(projectBox);
+    // Project: its name (edited in place), one line of details, its actions.
+    auto* title = new QHBoxLayout;
+    layout->addLayout(title);
+    _name = new QLineEdit(page);
     _name->setObjectName(QStringLiteral("projectName"));
+    _name->setToolTip(tr("Project name; click to rename."));
+    _name->setFrame(false);
+    _name->setStyleSheet(QStringLiteral("QLineEdit#projectName { background: transparent; }"
+                                        "QLineEdit#projectName:focus { background: palette(base); }"));
+    auto nameFont = _name->font();
+    nameFont.setBold(true);
+    nameFont.setPointSizeF(nameFont.pointSizeF() * 1.5);
+    _name->setFont(nameFont);
+    _name->setMaximumWidth(520);
     connect(_name, &QLineEdit::editingFinished, this, [this]() {
         const auto pkg = _state->vpkg();
         const auto name = _name->text().trimmed().toStdString();
@@ -198,101 +254,79 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
             _name->setText(QString::fromStdString(pkg->name()));
         }
     });
-    projectForm->addRow(tr("Name:"), _name);
-    const auto addLabel = [&](const QString& title) {
-        auto* label = new QLabel(projectBox);
-        label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        label->setWordWrap(true);
-        projectForm->addRow(title, label);
-        return label;
-    };
-    _storePath = addLabel(tr("Project file:"));
-    _directory = addLabel(tr("Folder:"));
-    _access = addLabel(tr("Access:"));
-    _hosting = addLabel(tr("Hosting:"));
-    _author = addLabel(tr("You are:"));
-    _sample = addLabel(tr("Open Data:"));
-    auto* projectButtons = new QHBoxLayout;
-    connect(button(tr("Save As..."), projectBox, projectButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::saveProjectAs);
-    _resetOpenData = button(tr("Reset to Open Data..."), projectBox, projectButtons);
+    title->addWidget(_name, 1);
+    _resetOpenData = button(tr("Reset to Open Data..."), page, title);
     connect(_resetOpenData, &QPushButton::clicked, _menu, &MenuActionController::resetOpenDataProject);
-    connect(button(tr("Open Folder"), projectBox, projectButtons), &QPushButton::clicked, this, [this]() {
-        reveal(_state->projectDirectory());
-    });
-    projectButtons->addStretch(1);
-    projectLayout->addLayout(projectButtons);
-    projectLayout->addStretch(1);
-    top->addWidget(projectBox, 1);
+    connect(button(tr("Save As..."), page, title), &QPushButton::clicked, _menu, &MenuActionController::saveProjectAs);
+    _revealProject = button(tr("Open Folder"), page, title);
+    connect(_revealProject, &QPushButton::clicked, this, [this]() { reveal(_state->projectDirectory()); });
+    _details = new QLabel(page);
+    _details->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _details->setWordWrap(true);
+    _details->setContentsMargins(_name->textMargins().left() + 2, 0, 0, 0);
+    dim(_details);
+    layout->addWidget(_details);
 
-    // Caches
-    auto* cacheBox = new QGroupBox(tr("Caches"), page);
-    auto* cacheLayout = new QVBoxLayout(cacheBox);
-    auto* cacheForm = new QFormLayout;
-    cacheLayout->addLayout(cacheForm);
-    const auto addBar = [&](const QString& title, const QString& tip, QProgressBar*& bar, QLabel*& text) {
-        auto* cell = new QWidget(cacheBox);
-        auto* cellLayout = new QVBoxLayout(cell);
-        cellLayout->setContentsMargins(0, 0, 0, 0);
-        cellLayout->setSpacing(2);
-        bar = new QProgressBar(cell);
-        bar->setTextVisible(false);
-        bar->setMaximumHeight(10);
-        text = new QLabel(cell);
-        cellLayout->addWidget(bar);
-        cellLayout->addWidget(text);
-        auto* label = new QLabel(title, cacheBox);
-        label->setToolTip(tip);
-        cell->setToolTip(tip);
-        cacheForm->addRow(label, cell);
-    };
-    addBar(tr("Volume chunks (RAM):"), tr("Decoded volume chunks held in memory, shared by every viewer."),
-           _ramBar, _ramText);
-    addBar(tr("Volume chunks (disk):"),
-           tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit, "
-              "or when the disk runs low."),
-           _diskBar, _diskText);
-    _diskPath = new QLabel(cacheBox);
-    _diskPath->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    _diskPath->setWordWrap(true);
-    cacheForm->addRow(tr("Disk cache folder:"), _diskPath);
-    addBar(tr("Surface geometry (RAM):"), tr("Decoded surface tiles kept for every open store."),
-           _surfaceBar, _surfaceText);
-    auto* cacheButtons = new QHBoxLayout;
-    connect(button(tr("Cache Settings..."), cacheBox, cacheButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::showSettingsDialog);
-    connect(button(tr("Open Cache Folder"), cacheBox, cacheButtons), &QPushButton::clicked, this, []() {
-        reveal(vc3d::remoteCachePath());
+    // Data
+    auto* dataHeader = section(tr("Data"), page, layout);
+    auto* add = menuButton(tr("Add"), page, dataHeader);
+    add->addAction(tr("Volume..."), _menu, &MenuActionController::attachVolume);
+    add->addAction(tr("Remote Zarr..."), _menu, &MenuActionController::attachRemoteZarr);
+    add->addSeparator();
+    add->addAction(tr("Normal Grid..."), _menu, &MenuActionController::attachNormalGrid);
+    add->addSeparator();
+    add->addAction(tr("Lasagna Dataset..."), _menu, &MenuActionController::attachLasagnaManifest);
+    add->addAction(tr("Remote Lasagna Dataset..."), _menu, &MenuActionController::attachRemoteLasagnaManifest);
+    connect(button(tr("Open Data Catalog..."), page, dataHeader), &QPushButton::clicked, _menu,
+            &MenuActionController::showOpenDataCatalog);
+    addGap(dataHeader);
+    _viewVolume = button(tr("View"), page, dataHeader);
+    _viewVolume->setToolTip(tr("Show this volume in the viewers (or double-click it)."));
+    connect(_viewVolume, &QPushButton::clicked, this, [this]() {
+        if (auto* item = _resources->currentItem()) {
+            const auto id = item->data(0, kVolumeIdRole).toString();
+            if (!id.isEmpty()) emit volumeActivationRequested(id);
+        }
     });
-    cacheButtons->addStretch(1);
-    cacheLayout->addLayout(cacheButtons);
-    cacheLayout->addStretch(1);
-    top->addWidget(cacheBox, 1);
+    _revealResource = button(tr("Open Folder"), page, dataHeader);
+    connect(_revealResource, &QPushButton::clicked, this, [this]() {
+        if (auto* item = _resources->currentItem()) reveal(item->data(0, kRevealRole).toString());
+    });
+    _detachResource = button(tr("Detach"), page, dataHeader);
+    connect(_detachResource, &QPushButton::clicked, this, [this]() {
+        if (auto* item = _resources->currentItem()) {
+            const auto location = item->data(0, kLocationRole).toString();
+            if (!location.isEmpty()) _menu->detachEntryAt(location);
+        }
+    });
+    _resources = new QTreeWidget(page);
+    _resources->setObjectName(QStringLiteral("projectResources"));
+    _resources->setColumnCount(ResColumns);
+    _resources->setHeaderLabels({tr("Name"), tr("Location"), tr("Tags"), tr("Size"), tr("Voxel"), tr("Levels"),
+                                 tr("Type"), tr("Disk cache")});
+    _resources->headerItem()->setToolTip(ResShape, tr("x × y × z voxels"));
+    _resources->headerItem()->setToolTip(ResCache, tr("Downloaded chunks of a remote volume (Caches › Measure)."));
+    _resources->setMinimumHeight(220);
+    _resources->setUniformRowHeights(true);
+    _resources->setAlternatingRowColors(true);
+    connect(_resources, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateResourceButtons);
+    connect(_resources, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item) {
+        const auto id = item ? item->data(0, kVolumeIdRole).toString() : QString();
+        if (!id.isEmpty()) emit volumeActivationRequested(id);
+    });
+    layout->addWidget(_resources, 1);
 
-    // Stores
-    auto* storeBox = new QGroupBox(tr("Stores"), page);
-    auto* storeLayout = new QVBoxLayout(storeBox);
-    _stores = new QTreeWidget(storeBox);
-    _stores->setObjectName(QStringLiteral("projectStores"));
-    _stores->setRootIsDecorated(false);
-    _stores->setColumnCount(StoreColumns);
-    _stores->setHeaderLabels({tr("Store"), tr("Role"), tr("Access"), tr("Hosting"), tr("Surfaces"), tr("Fibers"),
-                              tr("Point collections"), tr("Size"), tr("Path")});
-    _stores->header()->setStretchLastSection(true);
-    connect(_stores, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateStoreButtons);
-    storeLayout->addWidget(_stores);
-    auto* storeButtons = new QHBoxLayout;
-    auto* storeTools = new QHBoxLayout;
-    connect(button(tr("New Store..."), storeBox, storeButtons), &QPushButton::clicked, _menu, &MenuActionController::newStore);
-    connect(button(tr("Attach Store..."), storeBox, storeButtons), &QPushButton::clicked, this,
-            [this]() { _menu->attachStore(false); });
-    connect(button(tr("Attach Read-only..."), storeBox, storeButtons), &QPushButton::clicked, this,
-            [this]() { _menu->attachStore(true); });
-    connect(button(tr("Clone Hosted Store..."), storeBox, storeTools), &QPushButton::clicked, this,
-            [this]() { _menu->cloneHostedStore(false); });
-    connect(button(tr("Import from Folder..."), storeBox, storeTools), &QPushButton::clicked, _menu,
+    // Stores, and which one each kind is kept in.
+    auto* storeHeader = section(tr("Stores"), page, layout);
+    auto* addStore = menuButton(tr("Add"), page, storeHeader);
+    addStore->addAction(tr("New Store..."), _menu, &MenuActionController::newStore);
+    addStore->addAction(tr("Attach Store..."), this, [this]() { _menu->attachStore(false); });
+    addStore->addAction(tr("Attach Read-only..."), this, [this]() { _menu->attachStore(true); });
+    addStore->addAction(tr("Clone Hosted Store..."), this, [this]() { _menu->cloneHostedStore(false); });
+    connect(button(tr("Import from Folder..."), page, storeHeader), &QPushButton::clicked, _menu,
             &MenuActionController::importIntoObjectStore);
-    _syncStores = button(tr("Sync Hosted Now"), storeBox, storeTools);
+    _syncStores = button(tr("Sync Now"), page, storeHeader);
+    _syncStores->setToolTip(tr("Sync every hosted store now."));
     connect(_syncStores, &QPushButton::clicked, this, [this]() {
         const auto session = _state->objectStoreSession();
         std::vector<vc::objects::AttachmentIdentity> stores = _state->attachedStores();
@@ -300,21 +334,15 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
             if (session->hubStatus(store)) session->syncHub(store);
         emit hubSyncRequested();
     });
-    _revealStore = button(tr("Open Folder"), storeBox, storeTools);
+    addGap(storeHeader);
+    _revealStore = button(tr("Open Folder"), page, storeHeader);
     connect(_revealStore, &QPushButton::clicked, this, [this]() {
         if (const auto store = selectedStore())
             reveal(QString::fromStdString(_state->objectStoreSession()->path(*store).string()));
     });
-    _detachStore = button(tr("Detach"), storeBox, storeButtons);
-    connect(_detachStore, &QPushButton::clicked, this, [this]() {
-        const auto* item = _stores->currentItem();
-        if (!item) return;
-        try { _state->detachStoreReference(item->data(0, kStoreIndexRole).toString().toStdString()); }
-        catch (const std::exception& error) {
-            QMessageBox::critical(this, tr("Cannot detach store"), QString::fromUtf8(error.what()));
-        }
-    });
-    connect(button(tr("Locate / Replace..."), storeBox, storeButtons), &QPushButton::clicked, this, [this]() {
+    _replaceStore = button(tr("Locate..."), page, storeHeader);
+    _replaceStore->setToolTip(tr("Point this store reference at another .vcobj file."));
+    connect(_replaceStore, &QPushButton::clicked, this, [this]() {
         const auto* item = _stores->currentItem();
         if (!item || !_state->vpkg() || !_state->vpkg()->writable()) return;
         const auto id = item->data(0, kStoreIndexRole).toString().toStdString();
@@ -323,16 +351,40 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
         try { _state->replaceStoreReference(id, path.toStdString()); }
         catch (const std::exception& error) { QMessageBox::warning(this, tr("Cannot replace store"), QString::fromUtf8(error.what())); }
     });
-    storeButtons->addStretch(1);
-    storeTools->addStretch(1);
-    storeLayout->addLayout(storeButtons);
-    storeLayout->addLayout(storeTools);
-    auto* routesTitle = new QLabel(tr("Where new and listed objects are kept:"), storeBox);
-    storeLayout->addWidget(routesTitle);
-    _routesForm = new QFormLayout;
-    _routesForm->setFieldGrowthPolicy(QFormLayout::FieldsStayAtSizeHint);
+    _detachStore = button(tr("Detach"), page, storeHeader);
+    connect(_detachStore, &QPushButton::clicked, this, [this]() {
+        const auto* item = _stores->currentItem();
+        if (!item) return;
+        try { _state->detachStoreReference(item->data(0, kStoreIndexRole).toString().toStdString()); }
+        catch (const std::exception& error) {
+            QMessageBox::critical(this, tr("Cannot detach store"), QString::fromUtf8(error.what()));
+        }
+    });
+    auto* storeRow = new QHBoxLayout;
+    storeRow->setSpacing(16);
+    layout->addLayout(storeRow);
+    _stores = new QTreeWidget(page);
+    _stores->setObjectName(QStringLiteral("projectStores"));
+    _stores->setRootIsDecorated(false);
+    _stores->setAlternatingRowColors(true);
+    _stores->setColumnCount(StoreColumns);
+    _stores->setHeaderLabels({tr("Store"), tr("Access"), tr("Surfaces"), tr("Fibers"), tr("Point collections"),
+                              tr("Size"), tr("Folder")});
+    _stores->header()->setStretchLastSection(true);
+    connect(_stores, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateStoreButtons);
+    storeRow->addWidget(_stores, 1);
+    _routesPanel = new QWidget(page);
+    auto* routesLayout = new QVBoxLayout(_routesPanel);
+    routesLayout->setContentsMargins(0, 0, 0, 0);
+    auto* routesTitle = new QLabel(tr("Each kind is kept in"), _routesPanel);
+    routesTitle->setToolTip(tr("The store new objects of each kind are saved to, and whose objects are listed."));
+    dim(routesTitle);
+    routesLayout->addWidget(routesTitle);
+    auto* routesForm = new QFormLayout;
+    routesForm->setFieldGrowthPolicy(QFormLayout::FieldsStayAtSizeHint);
+    routesForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
     for (const auto& kind : CState::routableKinds()) {
-        auto* combo = new QComboBox(storeBox);
+        auto* combo = new QComboBox(_routesPanel);
         combo->setObjectName(QStringLiteral("projectRoute_%1").arg(QString::fromStdString(kind)));
         combo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
         connect(combo, &QComboBox::activated, this, [this, kind, combo](int index) {
@@ -343,73 +395,55 @@ ProjectWorkspace::ProjectWorkspace(CState* state, MenuActionController* menu, QW
             }
         });
         _routes.push_back(combo);
-        _routesForm->addRow(kindTitle(kind) + QLatin1Char(':'), combo);
+        routesForm->addRow(kindTitle(kind), combo);
     }
-    storeLayout->addLayout(_routesForm);
-    layout->addWidget(storeBox);
+    routesLayout->addLayout(routesForm);
+    routesLayout->addStretch(1);
+    storeRow->addWidget(_routesPanel, 0, Qt::AlignTop);
 
-    // Data
-    auto* dataBox = new QGroupBox(tr("Data"), page);
-    auto* dataLayout = new QVBoxLayout(dataBox);
-    _resources = new QTreeWidget(dataBox);
-    _resources->setObjectName(QStringLiteral("projectResources"));
-    _resources->setColumnCount(ResColumns);
-    _resources->setHeaderLabels({tr("Name"), tr("Location"), tr("Seen by"), tr("Tags"), tr("Size (x × y × z)"),
-                                 tr("Voxel"), tr("Levels"), tr("Type"), tr("Disk cache")});
-    _resources->setMinimumHeight(240);
-    _resources->setUniformRowHeights(true);
-    connect(_resources, &QTreeWidget::itemSelectionChanged, this, &ProjectWorkspace::updateResourceButtons);
-    connect(_resources, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item) {
-        const auto id = item ? item->data(0, kVolumeIdRole).toString() : QString();
-        if (!id.isEmpty()) emit volumeActivationRequested(id);
-    });
-    dataLayout->addWidget(_resources, 1);
-    auto* attachButtons = new QHBoxLayout;
-    connect(button(tr("Attach Volume..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::attachVolume);
-    connect(button(tr("Attach Remote Zarr..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::attachRemoteZarr);
-    connect(button(tr("Attach Normal Grid..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::attachNormalGrid);
-    connect(button(tr("Attach Lasagna..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::attachLasagnaManifest);
-    connect(button(tr("Attach Remote Lasagna..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::attachRemoteLasagnaManifest);
-    connect(button(tr("Open Data Catalog..."), dataBox, attachButtons), &QPushButton::clicked, _menu,
-            &MenuActionController::showOpenDataCatalog);
-    attachButtons->addStretch(1);
-    dataLayout->addLayout(attachButtons);
-    auto* itemButtons = new QHBoxLayout;
-    _viewVolume = button(tr("View Volume"), dataBox, itemButtons);
-    connect(_viewVolume, &QPushButton::clicked, this, [this]() {
-        if (auto* item = _resources->currentItem()) {
-            const auto id = item->data(0, kVolumeIdRole).toString();
-            if (!id.isEmpty()) emit volumeActivationRequested(id);
-        }
-    });
-    _revealResource = button(tr("Open Folder / Copy URL"), dataBox, itemButtons);
-    connect(_revealResource, &QPushButton::clicked, this, [this]() {
-        if (auto* item = _resources->currentItem()) reveal(item->data(0, kRevealRole).toString());
-    });
-    _detachResource = button(tr("Detach"), dataBox, itemButtons);
-    connect(_detachResource, &QPushButton::clicked, this, [this]() {
-        if (auto* item = _resources->currentItem()) {
-            const auto location = item->data(0, kLocationRole).toString();
-            if (!location.isEmpty()) _menu->detachEntryAt(location);
-        }
-    });
-    _measureCaches = button(tr("Measure Disk Cache"), dataBox, itemButtons);
+    // Caches: one meter each, side by side.
+    auto* cacheHeader = section(tr("Caches"), page, layout);
+    _measureCaches = button(tr("Measure Volume Caches"), page, cacheHeader);
     _measureCaches->setToolTip(tr("Add up the downloaded chunks of each remote volume (reads the cache folders)."));
     connect(_measureCaches, &QPushButton::clicked, this, &ProjectWorkspace::measureVolumeCaches);
-    itemButtons->addStretch(1);
-    dataLayout->addLayout(itemButtons);
-    layout->addWidget(dataBox, 1);
+    connect(button(tr("Settings..."), page, cacheHeader), &QPushButton::clicked, _menu,
+            &MenuActionController::showSettingsDialog);
+    _revealCache = button(tr("Open Folder"), page, cacheHeader);
+    connect(_revealCache, &QPushButton::clicked, this, []() { reveal(vc3d::remoteCachePath()); });
+    auto* caches = new QGridLayout;
+    caches->setHorizontalSpacing(24);
+    caches->setVerticalSpacing(3);
+    layout->addLayout(caches);
+    const auto addBar = [&](int column, const QString& name, const QString& tip, QProgressBar*& bar, QLabel*& text) {
+        auto* label = new QLabel(name, page);
+        bar = new QProgressBar(page);
+        bar->setTextVisible(false);
+        bar->setMaximumHeight(8);
+        text = new QLabel(page);
+        text->setWordWrap(true);
+        dim(text);
+        for (QWidget* w : {static_cast<QWidget*>(label), static_cast<QWidget*>(bar), static_cast<QWidget*>(text)})
+            w->setToolTip(tip);
+        caches->addWidget(label, 0, column);
+        caches->addWidget(bar, 1, column);
+        caches->addWidget(text, 2, column, Qt::AlignTop);
+        caches->setColumnStretch(column, 1);
+        return label;
+    };
+    addBar(0, tr("Volume chunks in memory"), tr("Decoded volume chunks held in memory, shared by every viewer."),
+           _ramBar, _ramText);
+    _diskCell = addBar(1, tr("Volume chunks on disk"),
+                       tr("Chunks of remote volumes downloaded to disk. Older chunks are removed past the limit, "
+                          "or when the disk runs low."),
+                       _diskBar, _diskText);
+    addBar(2, tr("Surface geometry in memory"), tr("Decoded surface tiles kept for every open store."),
+           _surfaceBar, _surfaceText);
 
     _measure = new QFutureWatcher<QHash<QString, quint64>>(this);
     connect(_measure, &QFutureWatcher<QHash<QString, quint64>>::finished, this, [this]() {
         for (auto [path, size] : _measure->result().asKeyValueRange()) _cacheBytes[path] = size;
         _measureCaches->setEnabled(true);
-        _measureCaches->setText(tr("Measure Disk Cache"));
+        _measureCaches->setText(tr("Measure Volume Caches"));
         rebuildResources();
     });
 
@@ -488,13 +522,13 @@ void ProjectWorkspace::rebuildProject()
     const auto session = _state->objectStoreSession();
     if (!_name->hasFocus()) _name->setText(QString::fromStdString(pkg->name()));
     _name->setReadOnly(!pkg->writable());
-    _storePath->setText(QString::fromStdString(pkg->path().string()));
-    _directory->setText(_state->projectDirectory());
-    _access->setText(pkg->writable() ? tr("Read-write") : tr("Read-only"));
-    _hosting->setText(tr("Local project file"));
-    _author->setText(CState::storeAuthor());
+    QStringList details{QString::fromStdString(pkg->path().string()),
+                        pkg->writable() ? tr("read-write") : tr("read-only"),
+                        tr("editing as %1").arg(CState::storeAuthor())};
     const auto sample = vc3d::opendata::openDataProjectSample(*pkg);
-    _sample->setText(sample ? tr("Made from sample %1").arg(QString::fromStdString(*sample)) : tr("—"));
+    if (sample) details << tr("made from Open Data sample %1").arg(QString::fromStdString(*sample));
+    _details->setText(details.join(QStringLiteral("  ·  ")));
+    _revealProject->setToolTip(_state->projectDirectory());
     _resetOpenData->setVisible(sample.has_value());
     _resetOpenData->setEnabled(sample && pkg->writable());
 }
@@ -506,26 +540,38 @@ void ProjectWorkspace::rebuildStores()
     const auto selectedId = _stores->currentItem() ? _stores->currentItem()->data(0, kStoreIndexRole).toString() : QString();
     QSignalBlocker block(_stores);
     _stores->clear();
+    const auto projectDirectory = QFileInfo(_state->projectDirectory()).absoluteFilePath();
+    // A store's folder, or "project folder" for the usual case.
+    const auto folder = [&](const std::filesystem::path& path) {
+        const auto directory = QFileInfo(QString::fromStdString(path.string())).absolutePath();
+        return directory == projectDirectory ? tr("project folder") : directory;
+    };
     for (const auto& reference : _state->vpkg()->document().data().at("stores")) {
         const auto id = reference.at("id").get<std::string>();
         const auto available = _state->storeReference(id);
         auto* item = new QTreeWidgetItem(_stores);
         item->setData(0, kStoreIndexRole, QString::fromStdString(id));
         if (selectedId == QString::fromStdString(id)) _stores->setCurrentItem(item);
+        for (int c : {StoreSurfaces, StoreFibers, StorePointCollections, StoreSize})
+            item->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
         if (!available) {
-            item->setText(StoreName, QString::fromStdString(reference.at("location").get<std::string>()));
-            item->setText(StoreAccess, tr("Unavailable"));
-            item->setText(StorePath, QString::fromStdString(_state->vpkg()->document().resolve(reference.at("location")).string()));
+            const auto path = _state->vpkg()->document().resolve(reference.at("location"));
+            item->setText(StoreName, QString::fromStdString(path.filename().string()));
+            item->setText(StoreAccess, tr("Missing"));
+            item->setToolTip(StoreAccess, tr("Not found at %1. Use Locate... to point at it.")
+                                              .arg(QString::fromStdString(path.string())));
+            item->setForeground(StoreAccess, QColor(0xd2, 0x8b, 0x00));
+            item->setText(StoreFolder, folder(path));
+            item->setToolTip(StoreFolder, QString::fromStdString(path.string()));
             continue;
         }
         const auto& store = *available;
         const auto path = session->path(store);
         item->setText(StoreName, QString::fromStdString(path.filename().string()));
         item->setToolTip(StoreName, tr("Store UUID %1").arg(QString::fromStdString(store.storeUuid)));
-        item->setText(StoreRole, tr("Attached"));
-        item->setText(StoreAccess, session->writable(store) ? tr("Read-write") : tr("Read-only"));
-        const auto hub = session->hubStatus(store);
-        item->setText(StoreHosting, hub ? hubStatusSummary(*hub) : tr("Local"));
+        QString access = session->writable(store) ? tr("Read-write") : tr("Read-only");
+        if (const auto hub = session->hubStatus(store)) access += tr(" · hosted, %1").arg(hubStatusSummary(*hub));
+        item->setText(StoreAccess, access);
         std::map<std::string, int64_t> counts;
         try {
             session->read(store, [&](const vc::objects::ObjectStore& s, const vc::objects::ReadTxn& txn,
@@ -542,19 +588,19 @@ void ProjectWorkspace::rebuildStores()
         item->setText(StoreSurfaces, count("surface"));
         item->setText(StoreFibers, count("fiber"));
         item->setText(StorePointCollections, count("point_collection"));
-        for (int c : {StoreSurfaces, StoreFibers, StorePointCollections, StoreSize})
-            item->setTextAlignment(c, Qt::AlignRight | Qt::AlignVCenter);
         std::error_code ec;
         const auto size = std::filesystem::file_size(path, ec);
         item->setText(StoreSize, ec ? QString() : bytes(size));
-        item->setText(StorePath, QString::fromStdString(path.string()));
-        item->setToolTip(StorePath, item->text(StorePath));
+        item->setText(StoreFolder, folder(path));
+        item->setToolTip(StoreFolder, QString::fromStdString(path.string()));
     }
-    for (int c = 0; c < StorePath; ++c) _stores->resizeColumnToContents(c);
-    // As tall as its rows, so the data list below gets the room.
+    for (int c = 0; c < StoreFolder; ++c) _stores->resizeColumnToContents(c);
+    // As tall as its rows (or the routes beside it), so the data list above gets the room.
     const int rowHeight = _stores->topLevelItemCount() ? _stores->visualItemRect(_stores->topLevelItem(0)).height() : 0;
-    _stores->setFixedHeight(_stores->header()->sizeHint().height() + 2 * _stores->frameWidth() +
-                            std::max(1, _stores->topLevelItemCount()) * std::max(rowHeight, fontMetrics().height() + 4) + 4);
+    _stores->setFixedHeight(std::max(_routesPanel->sizeHint().height(),
+                                     _stores->header()->sizeHint().height() + 2 * _stores->frameWidth() +
+                                         std::max(1, _stores->topLevelItemCount()) *
+                                             std::max(rowHeight, fontMetrics().height() + 4) + 4));
     updateStoreButtons();
 }
 
@@ -571,7 +617,7 @@ void ProjectWorkspace::rebuildRoutes()
             const auto id = reference.at("id").get<std::string>();
             const auto store = _state->storeReference(id);
             QString name = QString::fromStdString(reference.at("location").get<std::string>());
-            if (!store) name += tr(" [unavailable]");
+            if (!store) name += tr(" [missing]");
             else if (!_state->objectStoreSession()->writable(*store)) name += tr(" [read-only]");
             combo->addItem(name, QString::fromStdString(id));
             if (data.at("selections").at(kinds[k]) == id) combo->setCurrentIndex(combo->count() - 1);
@@ -600,8 +646,6 @@ void ProjectWorkspace::rebuildResources()
         item->setText(ResName, QFileInfo(trimmedLocation(location)).fileName());
         item->setText(ResLocation, location);
         item->setToolTip(ResLocation, resolved(entry.location));
-        item->setText(ResVisibility, tr("Project"));
-        item->setToolTip(ResVisibility, tr("A resource referenced by this project file."));
         QStringList tags;
         for (const auto& tag : entry.tags) tags << QString::fromStdString(tag);
         item->setText(ResTags, tags.join(QStringLiteral(", ")));
@@ -623,10 +667,9 @@ void ProjectWorkspace::rebuildResources()
         if (volume.isRemote()) {
             const auto cache = QString::fromStdString(volume.remotePersistentCachePath().string());
             const auto measured = _cacheBytes.find(cache);
-            item->setText(ResCache, measured != _cacheBytes.end() ? bytes(*measured) : tr("not measured"));
-            item->setToolTip(ResCache, cache);
-        } else {
-            item->setText(ResCache, tr("local"));
+            item->setText(ResCache, measured != _cacheBytes.end() ? bytes(*measured) : tr("—"));
+            item->setToolTip(ResCache, measured != _cacheBytes.end() ? cache : tr("Not measured yet: Caches › Measure."));
+            item->setTextAlignment(ResCache, Qt::AlignRight | Qt::AlignVCenter);
         }
         item->setData(0, kVolumeIdRole, qid);
         item->setData(0, kRevealRole, volumeLocation(volume));
@@ -642,7 +685,7 @@ void ProjectWorkspace::rebuildResources()
     };
     const auto group = [&](const QString& title, int count) {
         auto* item = new QTreeWidgetItem(_resources);
-        item->setText(ResName, QStringLiteral("%1 (%2)").arg(title).arg(count));
+        item->setText(ResName, QStringLiteral("%1  %2").arg(title).arg(count));
         item->setFirstColumnSpanned(true);
         auto font = item->font(0);
         font.setBold(true);
@@ -691,18 +734,21 @@ void ProjectWorkspace::rebuildResources()
         auto* item = new QTreeWidgetItem(volumes);
         const auto volume = pkg->volume(id);
         describeVolume(item, id, *volume);
-        item->setText(ResLocation, volumeLocation(*volume));
-        item->setText(ResVisibility, tr("via dataset"));
+        item->setText(ResLocation, tr("%1 (via dataset)").arg(volumeLocation(*volume)));
+        item->setToolTip(ResLocation, tr("Loaded by a dataset; not listed in the project file."));
     }
     volumes->setExpanded(true);
 
+    // Groups with nothing in them are left out (Add lists what can be attached).
     const auto& grids = pkg->normalGridEntries();
-    auto* gridGroup = group(tr("Normal grids"), int(grids.size()));
-    for (const auto& entry : grids) entryItem(gridGroup, entry)->setText(ResType, tr("normal grid"));
-    gridGroup->setExpanded(true);
+    if (!grids.empty()) {
+        auto* gridGroup = group(tr("Normal grids"), int(grids.size()));
+        for (const auto& entry : grids) entryItem(gridGroup, entry)->setText(ResType, tr("normal grid"));
+        gridGroup->setExpanded(true);
+    }
 
     const auto& lasagna = pkg->allLasagnaDatasetEntries();
-    auto* lasagnaGroup = group(tr("Lasagna datasets"), int(lasagna.size()));
+    auto* lasagnaGroup = lasagna.empty() ? nullptr : group(tr("Lasagna datasets"), int(lasagna.size()));
     for (const auto& entry : lasagna) {
         auto* item = entryItem(lasagnaGroup, entry);
         const bool fiber = vc::project::isFiberLasagnaEntry(entry);
@@ -712,8 +758,9 @@ void ProjectWorkspace::rebuildResources()
         if (selected) type += tr(" (selected)");
         item->setText(ResType, type);
     }
-    lasagnaGroup->setExpanded(true);
+    if (lasagnaGroup) lasagnaGroup->setExpanded(true);
 
+    hideEmptyColumns(_resources, ResLocation);
     for (int c = 0; c < ResColumns; ++c) _resources->resizeColumnToContents(c);
     _resources->setColumnWidth(ResLocation, std::clamp(_resources->columnWidth(ResLocation), 160, 520));
     updateResourceButtons();
@@ -727,17 +774,21 @@ void ProjectWorkspace::updateCaches()
         setBar(_ramBar, _ramText, stats.decodedBytes, stats.maximumBytes);
     }
     const auto root = vc3d::remoteCachePathFs();
-    _diskPath->setText(QString::fromStdString(root.string()));
+    const auto rootText = QString::fromStdString(root.string());
+    _revealCache->setToolTip(rootText);
+    _diskCell->setToolTip(tr("Chunks of remote volumes downloaded to %1. Older chunks are removed past the limit, "
+                             "or when the disk runs low.").arg(rootText));
     if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(root)) {
         const auto stats = budget->stats();
         // Free space is measured with the first trim; until then it reads 0.
         QStringList extra;
-        if (stats.freeBytes || stats.lowSpace) extra << tr("%1 free on disk").arg(bytes(stats.freeBytes));
+        if (stats.freeBytes || stats.lowSpace) extra << tr("%1 free").arg(bytes(stats.freeBytes));
         if (stats.minimumFreeBytes) extra << tr("keeps %1 free").arg(bytes(stats.minimumFreeBytes));
         if (stats.scanInFlight) extra << tr("counting...");
         setBar(_diskBar, _diskText, stats.managedBytes,
                stats.maximumBytes ? std::optional<quint64>(*stats.maximumBytes) : std::nullopt,
                extra.join(QStringLiteral(" · ")));
+        // Overrides the dimmed palette while space is low.
         _diskText->setStyleSheet(stats.lowSpace ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
     } else {
         _diskBar->setEnabled(false);
@@ -759,10 +810,11 @@ void ProjectWorkspace::updateStoreButtons()
     const auto store = selectedStore();
     _detachStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable() && _state->vpkg()->document().data().at("stores").size() > 1);
     _revealStore->setEnabled(store.has_value());
+    _replaceStore->setEnabled(_stores->currentItem() && _state->vpkg() && _state->vpkg()->writable());
     const auto session = _state->objectStoreSession();
     bool hosted = false;
     for (const auto& attached : _state->attachedStores()) hosted = hosted || session->hubStatus(attached);
-    _syncStores->setEnabled(hosted);
+    _syncStores->setVisible(hosted);
 }
 
 void ProjectWorkspace::updateResourceButtons()
@@ -771,7 +823,9 @@ void ProjectWorkspace::updateResourceButtons()
     _viewVolume->setEnabled(item && !item->data(0, kVolumeIdRole).toString().isEmpty());
     _detachResource->setEnabled(item && !item->data(0, kLocationRole).toString().isEmpty() &&
                                 _state->vpkg() && _state->vpkg()->writable());
-    _revealResource->setEnabled(item && !item->data(0, kRevealRole).toString().isEmpty());
+    const auto location = item ? item->data(0, kRevealRole).toString() : QString();
+    _revealResource->setEnabled(!location.isEmpty());
+    _revealResource->setText(vc::project::isLocationRemote(location.toStdString()) ? tr("Copy URL") : tr("Open Folder"));
 }
 
 void ProjectWorkspace::measureVolumeCaches()

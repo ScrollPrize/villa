@@ -14,7 +14,6 @@
 class CState;
 class MenuActionController;
 class QComboBox;
-class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QProgressBar;
@@ -79,12 +78,8 @@ private:
 
     // Project
     QLineEdit* _name = nullptr;
-    QLabel* _storePath = nullptr;
-    QLabel* _directory = nullptr;
-    QLabel* _author = nullptr;
-    QLabel* _access = nullptr;
-    QLabel* _hosting = nullptr;
-    QLabel* _sample = nullptr;
+    QLabel* _details = nullptr;  // path · access · author · Open Data sample
+    QPushButton* _revealProject = nullptr;
     QPushButton* _resetOpenData = nullptr;
 
     // Stores
@@ -92,7 +87,8 @@ private:
     QPushButton* _detachStore = nullptr;
     QPushButton* _syncStores = nullptr;
     QPushButton* _revealStore = nullptr;
-    QFormLayout* _routesForm = nullptr;
+    QPushButton* _replaceStore = nullptr;
+    QWidget* _routesPanel = nullptr;
     std::vector<QComboBox*> _routes;  // CState::routableKinds() order
 
     // Volumes, normal grids, Lasagna datasets
@@ -109,7 +105,8 @@ private:
     QLabel* _ramText = nullptr;
     QProgressBar* _diskBar = nullptr;
     QLabel* _diskText = nullptr;
-    QLabel* _diskPath = nullptr;
+    QWidget* _diskCell = nullptr;
+    QPushButton* _revealCache = nullptr;
     QProgressBar* _surfaceBar = nullptr;
     QLabel* _surfaceText = nullptr;
 };
