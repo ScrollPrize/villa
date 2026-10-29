@@ -103,14 +103,27 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                     proposedArray = target;
                     const size_t stride = scalarBytes * 3;
                     if (!idsName.empty()) {
-                        for (size_t i = 0; i < count; ++i) {
-                            GeometrySequencePart part; part.count = 1;
+                        // Retained points reference the head revision; a run of
+                        // consecutive retained rows is one reference part, as the
+                        // structural edit reads every reference part's source
+                        // arrays and annotations in full (one part per point made
+                        // an insert into an n-point sequence cost n such reads).
+                        for (size_t i = 0; i < count;) {
+                            GeometrySequencePart part;
                             if (const auto it = rows.find(newIds[i]); it != rows.end()) {
                                 part.revision = head; part.start = it->second;
-                                std::copy_n(old.bytes.begin() + it->second * stride, stride, proposedArray.bytes.begin() + i * stride);
+                                size_t run = 0;
+                                for (auto row = it->second; i + run < count; ++run, ++row) {
+                                    const auto next = rows.find(newIds[i + run]);
+                                    if (next == rows.end() || next->second != row) break;
+                                    std::copy_n(old.bytes.begin() + row * stride, stride, proposedArray.bytes.begin() + (i + run) * stride);
+                                }
+                                part.count = run; i += run;
                             } else {
+                                part.count = 1;
                                 part.bytes.assign(target.bytes.begin() + i * stride, target.bytes.begin() + (i + 1) * stride);
                                 part.ids = {newIds[i]};
+                                ++i;
                             }
                             edit.parts.push_back(std::move(part));
                         }

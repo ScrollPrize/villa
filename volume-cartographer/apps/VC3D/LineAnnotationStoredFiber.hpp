@@ -97,6 +97,12 @@ struct StoredFiber {
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.
     std::vector<FiberBranchRef> branches;
+    // Every fiber_branch relationship incident to this fiber when it was
+    // read, applicable or not, as (edge uuid, peer uuid). A relationship that
+    // is inapplicable today decodes no branch but can become applicable
+    // again through the peer's geometry alone, so the decode cache's reverse
+    // index is built from this list rather than from `branches`.
+    std::vector<std::pair<std::string, std::string>> relationshipPeers;
     vc::fiber_tracer::FiberHvClassification hvClassification;
     std::string manualHvTag;
     std::vector<std::string> tags;

@@ -1,4 +1,5 @@
 #include "SpiralWorkspace.hpp"
+#include "PublicationMetrics.hpp"
 
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
@@ -1514,6 +1515,7 @@ bool SpiralWorkspace::stageFiberInputs(const std::vector<uint64_t>& fiberIds)
 void SpiralWorkspace::refreshTrackedFibers()
 {
     if (!_service || !_lineAnnotationController || _trackedFiberPaths.isEmpty()) return;
+    vc3d::metrics::Span span("consumer.spiral_tracked", [&] { return "fibers=" + std::to_string(_trackedFiberPaths.size()); });
     std::vector<uint64_t> ids;
     for (const auto& uuid : _trackedFiberPaths.keys()) {
         const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());

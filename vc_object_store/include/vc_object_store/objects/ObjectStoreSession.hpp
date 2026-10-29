@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <string_view>
 #include <functional>
+#include <string_view>
 #include <mutex>
 #include <condition_variable>
 #include <map>
@@ -80,6 +81,14 @@ struct AttachedHit {
 struct HubSessionOptions {
     std::chrono::milliseconds syncInterval{15000};
     std::chrono::milliseconds pushDelay{2000};  // after a local action, to batch edits
+    // Optional span trace for the worker's sync phases and lease waits: called
+    // with begin=true/false in strictly nested pairs on the thread doing the work
+    // ("sync", "sync.wait", "sync.pull", "sync.renew", "sync.push",
+    // "sync.release"; "hold", "hold.wait", "hold.acquire", "hold.pull";
+    // "start" before a worker claims the replica, "stop.release" when it
+    // stops). The callback must not call the hub or the session: it runs on
+    // the worker thread inside a hub operation.
+    std::function<void(std::string_view name, bool begin)> trace;
 };
 
 struct HubSessionStatus {
@@ -258,7 +267,12 @@ public:
     // Hosted replicas: lease objects before editing them, pulling once if the
     // hub is ahead. Blocks on the hub; throws HubLeaseRefused when another
     // replica holds one. Returns an empty hold for other stores.
-    LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects);
+    // `createdHere`: every object was created in this session under an
+    // identity generated here and never pushed, so no lease is needed until
+    // the push grants the creator lease (which the hold then keeps). Never
+    // pass it for an imported or otherwise supplied identity: that may exist
+    // on the hub already and is leased like any other object.
+    LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects, bool createdHere = false);
     // Editing an object from the revision on screen: lease it (leasing may first
     // pull the hub's newer record), then check that the pin is still its current
     // revision. Throws when it is not.
@@ -281,6 +295,10 @@ private:
     std::shared_ptr<Attachment> acquire(const AttachmentIdentity&, bool write);
     void release(Attachment&, bool write);
     void retire(const std::shared_ptr<Attachment>&);
+    // Starts a hosted replica's hub worker (throws when another owner manages it).
+    void startWorker(Attachment&, const HubSessionOptions&);
+    // Announces an opened attachment and starts its fetcher.
+    void announce(const std::shared_ptr<Attachment>&);
     void observe(Attachment&);
     void hubChanged(const Attachment*);
     void startFetching(Attachment&);

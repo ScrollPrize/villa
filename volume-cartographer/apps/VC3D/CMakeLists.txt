@@ -51,6 +51,8 @@ set(srcs
     FiberLineGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
+    PublicationMetrics.cpp
+    PublicationMetrics.hpp
     LineAnnotationFiberSegments.cpp
     LineAnnotationStructuralEdits.cpp
     LineAnnotationFiberSegments.hpp

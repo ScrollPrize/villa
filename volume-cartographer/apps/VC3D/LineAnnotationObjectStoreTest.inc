@@ -1,4 +1,6 @@
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QThread>
@@ -67,6 +69,16 @@ int runObjectStoreControllerTests()
                 controller._sideStripStoredSnapshotCache.size() == snapshots,
                 "hub status preserves fiber generation and warm snapshots");
     };
+    // The publication span log is exercised on the real controller path and
+    // read back at the end (VC3D_PUBLICATION_METRICS=<file> keeps the file).
+    const std::string metricsFile = [] {
+        if (const char* keep = std::getenv("VC3D_PUBLICATION_METRICS")) return std::string(keep);
+        return (std::filesystem::temp_directory_path() / ("vc3d-pubmetrics-test-" + vc::objects::util::newUuid() + ".log")).string();
+    }();
+    const char* metricsPath = metricsFile.c_str();
+    vc3d::metrics::enable(metricsPath);
+    QObject heartbeatOwner;
+    vc3d::metrics::startHeartbeat(&heartbeatOwner);
     try {
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
@@ -526,6 +538,137 @@ int runObjectStoreControllerTests()
             a=resolve(a.uuid);b=resolve(b.uuid);
         }
         {
+            // Per-record invalidation: a Committed event evicts the changed
+            // fibers, the cached fibers whose branch records describe them and
+            // both endpoints of every changed edge; unrelated entries survive.
+            auto warm = [&](std::initializer_list<std::string> uuids) {
+                controller.clearDecodedFiberCache();
+                (void)controller.readStoredFibersCached(std::vector<std::string>(uuids), false);
+            };
+            auto cached = [&](const std::string& uuid) { return controller._storedFiberDecodeCache.contains(uuid); };
+            Controller::StoredFiber c;
+            c.uuid = vc::objects::util::newUuid(); c.id = controller.nextFiberId(); c.fileName = "third.json";
+            c.username = "test"; c.startedAt = "20260101"; c.sequence = 3;
+            for (int x : {0,10,20}) { c.controlPoints.emplace_back(cv::Vec3d{x*1.,5,1}); c.linePoints.emplace_back(x*1.,5,1); }
+            std::vector<Controller::FiberSaveSnapshot> third{controller.makeFiberSaveSnapshot(c)};
+            controller.commitFiberStoreAction(third); c = third[0].fiber;
+            state.pollObjectStoreChanges();
+            warm({a.uuid, b.uuid, c.uuid});
+            require(cached(a.uuid) && cached(b.uuid) && cached(c.uuid), "warm decode cache");
+            require(controller._storedFiberReferencedBy[b.uuid].contains(a.uuid) &&
+                    controller._storedFiberReferencedBy[a.uuid].contains(b.uuid), "reverse index records branch targets");
+            const auto edgeUuid = resolve(a.uuid).branches.front().edgeUuid;
+            require(controller._storedFiberEdgeHolders[edgeUuid].size() == 2, "reverse index records edge holders");
+            const auto wholesaleBefore = controller._storeChangeCounters.wholesale;
+            auto cEdit = resolve(c.uuid); cEdit.tags.push_back("b-test"); controller.commitFibers({&cEdit});
+            state.pollObjectStoreChanges();
+            require(!cached(c.uuid) && cached(a.uuid) && cached(b.uuid), "an unlinked fiber's commit evicts only itself");
+            require(controller._lastStoreInvalidation.complete &&
+                    controller._lastStoreInvalidation.uuids == std::set<std::string>{c.uuid}, "affected set is the changed fiber");
+            warm({a.uuid, b.uuid, c.uuid});
+            auto aEdit = resolve(a.uuid); aEdit.tags.push_back("b-test"); controller.commitFibers({&aEdit});
+            state.pollObjectStoreChanges();
+            require(!cached(a.uuid) && !cached(b.uuid) && cached(c.uuid), "a linked fiber's commit evicts its referrers");
+            warm({a.uuid, b.uuid, c.uuid});
+            aEdit = resolve(a.uuid); aEdit.fileName = "renamed.json"; controller.commitFibers({&aEdit});
+            state.pollObjectStoreChanges();
+            require(!cached(a.uuid) && !cached(b.uuid) && cached(c.uuid), "a rename evicts the fiber and its referrers");
+            warm({a.uuid, b.uuid, c.uuid});
+            aEdit = resolve(a.uuid); aEdit.branches[0].pending = false; controller.commitFibers({&aEdit});
+            state.pollObjectStoreChanges();
+            require(!cached(a.uuid) && !cached(b.uuid) && cached(c.uuid) && controller._lastStoreInvalidation.complete,
+                    "an edge change evicts both endpoints");
+            // An edge-only change (approval set directly on the store) journals
+            // neither endpoint; both still leave the cache.
+            warm({a.uuid, b.uuid, c.uuid});
+            {
+                const auto connection = state.objectStoreSession();
+                const auto attachment = *state.storeFor("fiber");
+                RevisionSelection expected{{a.uuid, resolve(a.uuid).storePin->objectRevision},
+                                           {b.uuid, resolve(b.uuid).storePin->objectRevision}};
+                connection->act(attachment, expected, [&](auto& db, auto& txn) { db.setApproval(txn, edgeUuid, "pending"); });
+            }
+            state.pollObjectStoreChanges();
+            require(!cached(a.uuid) && !cached(b.uuid) && cached(c.uuid) && controller._lastStoreInvalidation.complete,
+                    "an edge-only approval change evicts both endpoints");
+            require(resolve(a.uuid).branches[0].pending, "the direct approval change is visible");
+            // A relationship that decodes no branch (inapplicable today) still
+            // makes its holder depend on the peer.
+            warm({a.uuid, b.uuid, c.uuid});
+            {
+                auto inapplicable = controller._storedFiberDecodeCache.at(a.uuid);
+                require(inapplicable.relationshipPeers.size() == 1 && inapplicable.relationshipPeers[0].second == b.uuid,
+                        "incident relationships are recorded with the decoded fiber");
+                inapplicable.branches.clear();
+                controller.cacheDecodedFiber(inapplicable);
+                require(controller._storedFiberReferencedBy[b.uuid].contains(a.uuid), "the dependency survives without a decoded branch");
+            }
+            auto bEditOnly = resolve(b.uuid); bEditOnly.tags.push_back("b-peer"); controller.commitFibers({&bEditOnly});
+            state.pollObjectStoreChanges();
+            require(!cached(a.uuid) && !cached(b.uuid) && cached(c.uuid),
+                    "the peer's change evicts a holder whose relationship decoded no branch");
+            // One-holder regression: only a is cached. Removing the link also
+            // advances b's revision without a journal entry of its own; b is
+            // recovered from a's cached branch record, in the same event that
+            // carries a's own fiber entry.
+            warm({a.uuid});
+            require(cached(a.uuid) && !cached(b.uuid), "only the holder is cached");
+            aEdit = resolve(a.uuid); aEdit.branches.clear(); controller.commitFibers({&aEdit});
+            state.pollObjectStoreChanges();
+            require(controller._lastStoreInvalidation.complete && controller._lastStoreInvalidation.uuids.contains(b.uuid),
+                    "the far endpoint of a removed edge comes from the holder's branch record");
+            require(resolve(b.uuid).branches.empty(), "the link is gone on both sides");
+            require(controller._storeChangeCounters.wholesale == wholesaleBefore, "no wholesale fallback so far");
+            // Re-link, then remove the edge behind the controller's back with no
+            // holder cached: the far endpoint is unknown, so the cache clears.
+            aEdit = resolve(a.uuid); auto bEdit = resolve(b.uuid);
+            Controller::FiberBranchRef relink;
+            relink.controlPointIndex=0; relink.branchControlPointIndex=0; relink.branchFiberId=bEdit.id; relink.branchFileName=bEdit.fileName;
+            relink.controlPointPosition=aEdit.controlPoints[0]; relink.branchControlPointPosition=bEdit.controlPoints[0];
+            relink.controlPointDirection={1,0,0}; relink.branchControlPointDirection={1,0,0};
+            aEdit.branches.push_back(relink);
+            std::swap(relink.controlPointPosition, relink.branchControlPointPosition); relink.branchFiberId=aEdit.id; relink.branchFileName=aEdit.fileName;
+            bEdit.branches.push_back(relink);
+            batch={controller.makeFiberSaveSnapshot(aEdit),controller.makeFiberSaveSnapshot(bEdit)};
+            controller.commitFiberStoreAction(batch);
+            state.pollObjectStoreChanges();
+            const auto relinked = resolve(a.uuid);
+            require(relinked.branches.size() == 1, "relinked");
+            warm({c.uuid});
+            {
+                const auto connection = state.objectStoreSession();
+                const auto attachment = *state.storeFor("fiber");
+                RevisionSelection expected{{a.uuid, relinked.storePin->objectRevision},
+                                           {b.uuid, resolve(b.uuid).storePin->objectRevision}};
+                connection->act(attachment, expected, [&](auto& db, auto& txn) { db.removeEdge(txn, relinked.branches.front().edgeUuid); });
+            }
+            state.pollObjectStoreChanges();
+            require(!controller._lastStoreInvalidation.complete && controller._storeChangeCounters.wholesale == wholesaleBefore + 1 &&
+                    !cached(c.uuid), "a removed edge nobody cached clears the decode cache");
+            warm({a.uuid, b.uuid, c.uuid});
+            std::vector<Controller::FiberSaveSnapshot> none;
+            controller.commitFiberStoreAction(none, {resolve(c.uuid)});
+            state.pollObjectStoreChanges();
+            require(!cached(c.uuid) && cached(a.uuid) && cached(b.uuid), "retiring evicts the retired fiber only");
+            require(controller._storedFiberReferencedBy.empty() && controller._storedFiberEdgeHolders.empty(),
+                    "reverse indexes are empty once no cached fiber has a branch");
+            // Leave a and b linked for the sections below.
+            aEdit = resolve(a.uuid); bEdit = resolve(b.uuid);
+            relink.branchFiberId=bEdit.id; relink.branchFileName=bEdit.fileName;
+            relink.controlPointPosition=aEdit.controlPoints[0]; relink.branchControlPointPosition=bEdit.controlPoints[0];
+            aEdit.branches = {relink};
+            std::swap(relink.controlPointPosition, relink.branchControlPointPosition); relink.branchFiberId=aEdit.id; relink.branchFileName=aEdit.fileName;
+            bEdit.branches = {relink};
+            batch={controller.makeFiberSaveSnapshot(aEdit),controller.makeFiberSaveSnapshot(bEdit)};
+            controller.commitFiberStoreAction(batch);
+            state.pollObjectStoreChanges();
+            a=resolve(a.uuid);b=resolve(b.uuid);
+            require(a.branches.size() == 1 && b.branches.size() == 1, "a and b are linked again");
+            std::cerr << "per-record invalidation: " << controller._storeChangeCounters.events << " events, "
+                      << controller._storeChangeCounters.decodeEvictions << " decode evictions, "
+                      << controller._storeChangeCounters.wholesale << " wholesale\n";
+        }
+        {
             QTemporaryDir directory;
             const auto target = fs::path(directory.path().toStdString()) / "service.vcobj";
             { auto db = ObjectStore::create(target, options); }
@@ -901,6 +1044,162 @@ int runObjectStoreControllerTests()
             std::cerr << "real-data smoke: " << count << " fibers; edit, shared link, split/merge and reopen; "
                       << roundtrip.controlPoints.size() << " controls and " << roundtrip.linePoints.size() << " planned line points preserved\n";
             state.closeProject();
+        }
+        {
+            // Hosted replica: a session's hold keeps the creator lease the
+            // first push grants (bob cannot take it), activation refused by
+            // the hub leaves a factory session read-only with the reason, and
+            // a successful activation holds the lease.
+            qputenv("VC3D_HUB_SYNC_INTERVAL_MS", "200");
+            qputenv("VC3D_HUB_PUSH_DELAY_MS", "50");
+            const auto stem = path.parent_path() / ("vc3d-hub-test-" + vc::objects::util::newUuid());
+            const auto hubPath = stem.string() + "-hub.vcobj", replicaPath = stem.string() + "-replica.vcobj",
+                       bobPath = stem.string() + "-bob.vcobj";
+            { auto hub = ObjectStore::create(hubPath, options); }
+            initHub(hubPath, "vc3d-controller-test");
+            cloneHub(hubPath, replicaPath, options);
+            OpenOptions bobOptions; bobOptions.author = "bob";
+            cloneHub(hubPath, bobPath, bobOptions);
+            auto bob = ObjectStore::open(bobPath, bobOptions);
+            state.closeProject();
+            openStoreAsProject(state, QString::fromStdString(replicaPath), "vc3d-controller-test");
+            auto settle = [&](const std::function<bool()>& condition, const char* message) {
+                QElapsedTimer timer; timer.start();
+                while (!condition() && timer.elapsed() < 20000) { QApplication::processEvents(); QThread::msleep(20); }
+                require(condition(), message);
+            };
+            auto bobCanAcquire = [&](const std::string& uuid) {
+                try { hubPull(bob); acquireLeases(bob, {uuid}); return true; } catch (const HubLeaseRefused&) { return false; }
+            };
+            auto seed = std::make_shared<Controller::LineAnnotationSession>();
+            seed->fiberUuid = vc::objects::util::newUuid();
+            seed->fiberId = controller.fiberIdForUuid(seed->fiberUuid);
+            controller.ensureSessionFiberIdentity(*seed);
+            require(controller.holdSessionLease(*seed), "a never-pushed fiber is held without a hub lease");
+            Controller::StoredFiber hosted;
+            hosted.uuid = seed->fiberUuid; hosted.id = seed->fiberId; hosted.fileName = seed->fiberFileName;
+            hosted.username = "test"; hosted.startedAt = "20260101"; hosted.sequence = 9;
+            for (int x : {0,10,20}) { hosted.controlPoints.emplace_back(cv::Vec3d{x*1.,9,1}); hosted.linePoints.emplace_back(x*1.,9,1); }
+            std::vector<Controller::FiberSaveSnapshot> hostedBatch{controller.makeFiberSaveSnapshot(hosted)};
+            controller.commitFiberStoreAction(hostedBatch); hosted = hostedBatch[0].fiber;
+            settle([&] {
+                hubPull(bob);
+                auto txn = bob.read();
+                return bob.objectByUuid(txn, hosted.uuid).has_value();
+            }, "the hosted commit is pushed");
+            require(!bobCanAcquire(hosted.uuid), "the held seed keeps its creator lease across the push");
+            seed->editingLeases.reset();
+            settle([&] { return bobCanAcquire(hosted.uuid); }, "the lease is released once the hold ends");
+            // bob holds the lease now: activation is refused with the reason.
+            const auto stored = controller.readStoredFiber(hosted.id, true);
+            require(stored.has_value(), "the hosted fiber reads back");
+            auto refused = controller.makeIntersectionLineSession(*stored, 1.0, cv::Vec3d{0,0,1}, "hosted_refused", nullptr);
+            QString reason;
+            require(!controller.activateSessionEditing(*refused, &reason) && refused->readOnly && refused->suppressFiberSave &&
+                    !reason.isEmpty() && refused->readOnlyReason == reason.toStdString(),
+                    "a refused lease leaves the factory session read-only with the reason");
+            {
+                // Its snapshot carries the refusal: a direct commit is refused too.
+                auto snapshot = controller.storedFiberFromSession(*refused);
+                require(snapshot.readOnly && snapshot.editorError == refused->readOnlyReason, "the snapshot carries the refusal");
+                bool refusedCommit = false;
+                try { controller.commitFibers({&snapshot}); } catch (const std::exception&) { refusedCommit = true; }
+                require(refusedCommit, "a refused session's snapshot cannot be committed");
+                require(controller.refuseIfReadOnly(*refused), "mutating handlers refuse the session");
+                // A real handler on a pane showing the refused session changes nothing,
+                // even once the competitor has let the lease go.
+                releaseLeases(bob, {hosted.uuid});
+                controller._panes.push_back(Controller::PaneRecord{0, Controller::SourceKind::Plane, "hosted_refused", {}, refused});
+                const auto controlsBefore = refused->controlPoints.size();
+                const auto generationBefore = controller.readStoredFiber(hosted.id)->generation;
+                controller.handleGeneratedControlPointDelete("hosted_refused", 0.0, cv::Vec3f{0, 9, 1});
+                controller.handleGeneratedSpanSplit("hosted_refused", 0, 1, false);
+                QApplication::processEvents();
+                require(refused->controlPoints.size() == controlsBefore && refused->readOnly &&
+                        controller.readStoredFiber(hosted.id)->generation == generationBefore,
+                        "refused handlers leave the session and the store unchanged");
+                controller._panes.pop_back();
+                hubPull(bob); acquireLeases(bob, {hosted.uuid});
+            }
+            releaseLeases(bob, {hosted.uuid});
+            auto activated = controller.makeIntersectionLineSession(*stored, 1.0, cv::Vec3d{0,0,1}, "hosted_activated", nullptr);
+            require(controller.activateSessionEditing(*activated, &reason) && !activated->readOnly, "activation holds the lease");
+            require(!bobCanAcquire(hosted.uuid), "an activated session keeps its fiber leased");
+            activated.reset();
+            settle([&] { return bobCanAcquire(hosted.uuid); }, "the lease goes once the activated session is gone");
+            releaseLeases(bob, {hosted.uuid});
+            state.closeProject();
+            qunsetenv("VC3D_HUB_SYNC_INTERVAL_MS"); qunsetenv("VC3D_HUB_PUSH_DELAY_MS");
+            std::cerr << "hosted replica: seed hold, refused and successful activation checked\n";
+        }
+        {
+            // Spans nest strictly per thread and every one closes without an
+            // unbalanced end, commits carry their journal interval, the
+            // Committed handler reports the sequence range it observed, the
+            // heartbeat ran, nothing was dropped or failed, and the log ends
+            // with its quit and end markers.
+            // Recording cost first: the overhead a recorded span adds to the
+            // thread that records it (two attributes, begin and end), which
+            // bounds what the measurement itself adds to a click.
+            double perSpanNs = 0;
+            {
+                constexpr int kSpans = 20000;
+                const auto start = std::chrono::steady_clock::now();
+                for (int i = 0; i < kSpans; ++i) { vc3d::metrics::Span bench("bench", "i=1"); bench.attr("k=2"); }
+                perSpanNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count() / double(kSpans);
+                require(perSpanNs < 50000, "recording a span costs far less than a frame");
+            }
+            vc3d::metrics::shutdown();
+            {
+                // Disabled: no span is opened and the call costs next to nothing.
+                constexpr int kSpans = 100000;
+                const auto start = std::chrono::steady_clock::now();
+                uint64_t opened = 0;
+                for (int i = 0; i < kSpans; ++i) { vc3d::metrics::Span off("off"); opened += off.id(); }
+                const auto offNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count() / double(kSpans);
+                require(opened == 0 && !vc3d::metrics::enabled(), "no span is recorded once recording is off");
+                require(offNs < 2000, "a disabled span is a cheap no-op");
+                std::cerr << "publication metrics: " << perSpanNs << " ns per recorded span, " << offNs << " ns per disabled span\n";
+            }
+            std::ifstream log(metricsPath);
+            std::map<std::string, std::vector<std::string>> stacks;  // thread -> open ids
+            bool nested = true, dropped = false, quitSeen = false, endSeen = false;
+            int acts = 0, committed = 0, heartbeatsSeen = 0;
+            std::string line;
+            while (std::getline(log, line)) {
+                std::istringstream words(line);
+                std::string kind, side, id, parent, thread;
+                words >> kind;
+                if (kind == "hb") { ++heartbeatsSeen; continue; }
+                if (kind == "header") {
+                    if (line.find(" quit=1") != std::string::npos) quitSeen = true;
+                    if (line.find(" end=1 failures=0") != std::string::npos) endSeen = quitSeen;
+                    continue;
+                }
+                if (kind == "event") { if (line.find("metrics_dropped") != std::string::npos) dropped = true; continue; }
+                if (kind != "span") continue;
+                words >> side >> id >> parent >> thread;
+                auto& stack = stacks[thread];
+                if (side == "B") {
+                    if ((stack.empty() ? "0" : stack.back()) != parent) nested = false;
+                    stack.push_back(id);
+                } else if (side == "E") {
+                    if (stack.empty() || stack.back() != id || line.find("unbalanced=1") != std::string::npos) nested = false;
+                    else stack.pop_back();
+                }
+                if (side == "E" && line.find("seq_before=") != std::string::npos && line.find("seq_after=") != std::string::npos) ++acts;
+                if (side == "B" && line.find(" committed ") != std::string::npos && line.find("seq_last=") != std::string::npos) ++committed;
+            }
+            require(nested && std::all_of(stacks.begin(), stacks.end(), [](const auto& e) { return e.second.empty(); }),
+                    "publication metrics spans nest strictly and all close");
+            require(acts > 0, "publication metrics record the journal interval of every commit");
+            require(committed > 0, "publication metrics record the Committed handler");
+            require(heartbeatsSeen > 0, "the publication metrics heartbeat ran");
+            require(!dropped && vc3d::metrics::failures() == 0, "no publication metrics record was dropped or failed");
+            require(quitSeen && endSeen, "the log ends with its quit marker and a clean end marker");
+            std::cerr << "publication metrics: " << acts << " commits, " << committed << " Committed events, "
+                      << heartbeatsSeen << " heartbeats logged\n";
+            if (!std::getenv("VC3D_PUBLICATION_METRICS")) std::filesystem::remove(metricsPath);
         }
         std::cerr << "vc3d object store controller tests passed\n";
     } catch(const std::exception& error) { std::cerr << "vc3d object store test: " << error.what() << '\n'; return 1; }

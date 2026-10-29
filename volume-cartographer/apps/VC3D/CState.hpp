@@ -58,6 +58,9 @@ public:
     static QString storeAuthor();
     // Open Options for attaching stores to the viewer's session.
     static vc::objects::OpenOptions storeOpenOptions(const QString& author, bool readOnly);
+    // Hub sync options for a hosted replica: library defaults, or the
+    // publication-metrics overrides and span trace when a measurement runs.
+    static vc::objects::HubSessionOptions storeHubOptions();
 
     // Project references are stable IDs; attachments exist only for available stores.
     std::optional<vc::objects::AttachmentIdentity> storeReference(const std::string& id) const;

@@ -68,6 +68,12 @@ public:
         VolumeViewerBase* viewer, const QPointF& scenePoint, qreal maxDistancePx) const;
     void detachViewer(VolumeViewerBase* viewer) override;
 
+    // Publication metrics: the request the catalog rows being emitted answer
+    // (every request is announced as `event catalog.request id=N cause=S`
+    // when it starts; the span that scheduled it is its cause, 0 when none).
+    uint64_t catalogCause() const { return catalogCause_; }
+    uint64_t catalogRequest() const { return catalogRequest_; }
+
 signals:
     void catalogChanged(std::vector<FiberCollectionController::CatalogRow> rows, bool morePages);
     void statusChanged(bool attached, const QString& text);
@@ -109,6 +115,7 @@ private:
     Selection selection_;
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};
+    uint64_t catalogCause_{0}, catalogRequest_{0}, catalogRequests_{0}, catalogCauseNext_{0};
     bool catalogPendingReset_{false};
     struct Click {
         QPointer<QObject> viewport;

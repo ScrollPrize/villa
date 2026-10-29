@@ -217,6 +217,13 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         v["kind"] = (dynamic_cast<CChunkedVolumeViewer*>(e.viewer) != nullptr)
                         ? QStringLiteral("chunked") : QStringLiteral("other");
         v["scale"] = e.viewer->getCurrentScale();
+        // Logical viewport size: scene coordinates for canvas.* calls range
+        // over [0, width) x [0, height) (screenshots report physical pixels).
+        if (auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(e.viewer);
+            chunked && chunked->graphicsView() && chunked->graphicsView()->viewport()) {
+            v["viewportWidth"] = chunked->graphicsView()->viewport()->width();
+            v["viewportHeight"] = chunked->graphicsView()->viewport()->height();
+        }
         viewers.push_back(v);
     }
     result["viewers"] = viewers;

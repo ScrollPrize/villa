@@ -6,6 +6,7 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <tuple>
+#include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <cstring>
@@ -358,6 +359,47 @@ int main() try {
         auto read = store.read();
         const auto points = store.readGeometryArray(read, third, "points");
         require(std::vector<uint8_t>(points.begin() + 24, points.begin() + 48) == doubles({10, 11, 12}), "the edit lands by element offset");
+    }
+    {
+        // Inserting one control point into a long annotated sequence must not
+        // cost work proportional to the sequence length per retained point:
+        // retained runs are referenced as whole parts, not one part per point.
+        const size_t n = 300;
+        const auto uuid = util::newUuid();
+        vc::geometry::Fiber fiber;
+        Json attributes = Json::array();
+        for (size_t i = 0; i < n; ++i) {
+            fiber.controlPoints.push_back({double(i), 0, 0}); fiber.controlPointIds.push_back(int64_t(i) * 2);
+            attributes.push_back(Json{{"note", i}});
+        }
+        fiber.linePoints = fiber.controlPoints;
+        std::string head;
+        auto pins = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+            ObjectRecord object; object.uuid = uuid; object.kind = "fiber";
+            object.meta = Json{{"source",{{"control_points_attributes", attributes}}}}.dump();
+            db.upsertObject(txn, object); head = db.putGeometry(txn, uuid, vc::geometry::encode(fiber));
+        });
+        auto inserted = fiber; const size_t at = n / 2;
+        inserted.controlPoints.insert(inserted.controlPoints.begin() + at, {double(at) - .5, 1, 0});
+        inserted.controlPointIds.insert(inserted.controlPointIds.begin() + at, 999);
+        auto transformed = attributes; transformed.insert(transformed.begin() + at, Json{{"note", "inserted"}});
+        detail::GeometryWork work;
+        session.act(attachment, pins, [&](auto& db, auto& txn) {
+            std::string next;
+            {
+                detail::GeometryWorkScope scope(work);
+                next = updateGeometryArrays(db, txn, uuid, vc::geometry::encode(inserted), head,
+                                            {{"control_points", transformed.dump()}});
+            }
+            const auto result = std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn, next)));
+            require(result.controlPoints == inserted.controlPoints && result.controlPointIds == inserted.controlPointIds,
+                    "inserted sequence keeps every retained point and identity in order");
+            require(Json::parse(db.geometryPointAnnotations(txn, next, "control_points")) == transformed,
+                    "inserted sequence carries the transformed annotations");
+        });
+        // One part per point read the whole identity table once per point
+        // (about n*n rows); whole-run references read it a handful of times.
+        require(work.identityRows < 20 * n, "insert work is linear in the sequence length");
     }
     std::cout << "generic geometry editing and coordinates passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

@@ -88,14 +88,6 @@ void writeLeases(sqlite3* db, const std::vector<HubLease>& leases)
         put.run(lease.objectUuid, lease.holder, lease.author, lease.host, lease.acquiredUs, lease.expiresUs);
 }
 
-std::set<std::string> uuidColumn(sqlite3* db, const char* sql)
-{
-    std::set<std::string> ids;
-    Statement rows(db, sql);
-    while (rows.row()) ids.insert(rows.text(0));
-    return ids;
-}
-
 std::vector<HubConflict> conflicts(ObjectStore& replica, const Txn& txn)
 {
     std::vector<HubConflict> result;
@@ -575,16 +567,19 @@ HubSyncReport hubSync(ObjectStore& replica)
 
 std::vector<HubLease> acquireLeases(ObjectStore& replica, const std::vector<std::string>& objects, int64_t seconds)
 {
+    const auto ownership = requireLeaseOwnership(replica.path());
     return grantLeases(replica, objects, seconds, true);
 }
 
 std::vector<HubLease> renewLeases(ObjectStore& replica, const std::vector<std::string>& objects, int64_t seconds)
 {
+    const auto ownership = requireLeaseOwnership(replica.path());
     return grantLeases(replica, objects, seconds, false);
 }
 
 void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects)
 {
+    const auto ownership = requireLeaseOwnership(replica.path());
     auto local = replica.read();
     const auto up = upstream(conn(local));
     const auto self = replicaIdentity(conn(local));
