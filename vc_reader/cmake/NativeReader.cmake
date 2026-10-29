@@ -26,10 +26,16 @@ endif()
 # the module carries no shared library of its own to install.
 option(VC_READER_SHARED_READER "Build the native reader as a shared library" ON)
 if(VC_READER_SHARED_READER)
-    add_library(vc_reader_native SHARED "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+    add_library(vc_reader_native SHARED)
 else()
-    add_library(vc_reader_native STATIC "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp")
+    add_library(vc_reader_native STATIC)
 endif()
+target_sources(vc_reader_native PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/meta.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/access.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/layers.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/zarr/open.cpp")
 add_library(vc_reader::reader ALIAS vc_reader_native)
 set_target_properties(vc_reader_native PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME reader)
 target_compile_features(vc_reader_native PUBLIC cxx_std_20)

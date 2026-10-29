@@ -1,9 +1,8 @@
-// Zarr arrays read over sftp:// through the production transport. The test
-// executable doubles as `ssh` on PATH and execs the installed OpenSSH
-// sftp-server, so no network, sshd or credentials are involved.
+// Zarr arrays read over sftp:// through the production transport (see sftp_fixture.hpp).
 #include "vc_reader/reader.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/native/http.hpp"
+#include "sftp_fixture.hpp"
 
 #include <unistd.h>
 
@@ -26,17 +25,6 @@ void require(bool condition, const std::string& message)
         throw std::runtime_error(message);
 }
 
-int fakeSsh(int argc, char** argv)
-{
-    const std::vector<std::string> args(argv + 1, argv + argc);
-    const auto has = [&](const std::string& value) { return std::find(args.begin(), args.end(), value) != args.end(); };
-    if (!has("-s") || !has("--") || args.back() != "sftp" || !has("test-host"))
-        return 42;
-    const char* server = std::getenv("VCR_SFTP_TEST_SERVER");
-    execl(server, server, "-e", static_cast<char*>(nullptr));
-    return 43;
-}
-
 void write_file(const fs::path& path, const std::vector<uint8_t>& bytes)
 {
     fs::create_directories(path.parent_path());
@@ -50,7 +38,6 @@ void write_text(const fs::path& path, const std::string& text)
     std::ofstream(path) << text;
 }
 
-std::string sftp_url(const fs::path& path) { return "sftp://test-host" + vcr::sftp::encodePath(path.string()); }
 
 // 4^3 uint8 array of 2^3 chunks; chunk (1,1,1) is absent and reads as fill 5.
 std::vector<uint8_t> volume()
@@ -89,17 +76,8 @@ void check(const std::string& location, const std::vector<uint8_t>& v, const std
 
 int main(int argc, char** argv)
 {
-    if (fs::path(argv[0]).filename() == "ssh")
-        return fakeSsh(argc, argv);
-    const char* server = nullptr;
-    for (const auto* candidate : {"/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server", "/usr/libexec/sftp-server",
-                                  "/usr/libexec/openssh/sftp-server"})
-        if (fs::exists(candidate))
-            server = candidate;
-    if (!server) {
-        std::cout << "test_native_sftp: no installed OpenSSH sftp-server; skipped\n";
-        return 77;
-    }
+    if (const int status = sftp_fixture::run_as_ssh(argc, argv); status >= 0)
+        return status;
     const auto root = fs::temp_directory_path() /
                       ("vc-reader-sftp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {
@@ -111,11 +89,10 @@ int main(int argc, char** argv)
         }
     } cleanup{root};
     try {
-        fs::create_directories(root / "bin");
-        fs::create_symlink(fs::canonical("/proc/self/exe"), root / "bin" / "ssh");
-        setenv("PATH", ((root / "bin").string() + ":" + std::getenv("PATH")).c_str(), 1);
-        setenv("VCR_SFTP_TEST_SERVER", server, 1);
-
+        if (!sftp_fixture::install(root)) {
+            std::cout << "test_native_sftp: no installed OpenSSH sftp-server; skipped\n";
+            return 77;
+        }
         const auto v = volume();
         // Zarr v2, raw chunks.
         const auto v2 = root / "v2.zarr";
@@ -127,7 +104,7 @@ int main(int argc, char** argv)
                     if (cz + cy + cx < 3)
                         write_file(v2 / (std::to_string(cz) + "." + std::to_string(cy) + "." + std::to_string(cx)),
                                    chunk_of(v, cz, cy, cx));
-        check(sftp_url(v2), v, "v2");
+        check(sftp_fixture::url(v2), v, "v2");
         check("ssh://test-host" + vcr::sftp::encodePath(v2.string()), v, "ssh:// alias");
 
         // Zarr v3, one shard of all eight chunks: index and chunks are byte ranges.
@@ -157,17 +134,17 @@ int main(int argc, char** argv)
         const auto* p = reinterpret_cast<const uint8_t*>(index.data());
         shard.insert(shard.end(), p, p + index.size() * sizeof(uint64_t));
         write_file(v3 / "c/0/0/0", shard);
-        check(sftp_url(v3), v, "v3 sharded");
+        check(sftp_fixture::url(v3), v, "v3 sharded");
 
         // The transport itself: ranges, absent objects, listing.
         vcr::HttpClient http(vcr::HttpOptions{});
         std::vector<uint8_t> body;
-        require(!http.get(sftp_url(v2 / "1.1.1"), body), "absent object reads as not found");
-        const auto ranged = http.get_range(sftp_url(v3 / "c/0/0/0"), body, "-16", 16);
+        require(!http.get(sftp_fixture::url(v2 / "1.1.1"), body), "absent object reads as not found");
+        const auto ranged = http.get_range(sftp_fixture::url(v3 / "c/0/0/0"), body, "-16", 16);
         require(ranged.status == 206 && body.size() == 16 && ranged.content_range == "bytes " +
                     std::to_string(shard.size() - 16) + "-" + std::to_string(shard.size() - 1) + "/" +
                     std::to_string(shard.size()), "suffix range");
-        const auto listed = vcr::sftp::Fetcher().list(sftp_url(root));
+        const auto listed = vcr::sftp::Fetcher().list(sftp_fixture::url(root));
         require(listed.size() == 3 && listed[0].directory && listed[0].name == "bin", "directory listing");
         std::cout << "sftp:// v2, ssh:// alias, sharded v3, ranges and listing passed\n";
     } catch (const std::exception& e) {

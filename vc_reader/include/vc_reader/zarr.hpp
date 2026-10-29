@@ -1,0 +1,229 @@
+#pragma once
+// Opening Zarr v2/v3 arrays and groups, local or remote (http(s)://, s3://,
+// sftp://), with the disk caches other tools already wrote: vc_reader/vesuvius
+// decoded caches and VC3D mirror and Delta3D caches. The same implementation
+// backs the Python reader.
+
+#include "vc_reader/native/array.hpp"
+#include "vc_reader/native/disk_cache.hpp"
+#include "vc_reader/native/element_type.hpp"
+#include "vc_reader/native/http.hpp"
+#include "vc_reader/native/memory_cache.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace vcr::zarr {
+using Json = nlohmann::json;
+
+// http(s)://, s3://, s3+REGION:// and sftp:// / ssh:// locations.
+bool isRemote(const std::string& location);
+// The https:// URL of an s3:// location (public buckets only), otherwise unchanged.
+std::string httpUrl(const std::string& location);
+
+// ---- metadata ------------------------------------------------------------------------
+
+struct ArrayMeta {
+    Index shape, chunks;
+    std::string dtype;               // numpy typestr, e.g. "|u1", "<u2", "<f4"
+    ElementType type;                // how stored elements read as numbers
+    std::vector<std::uint8_t> fill;  // one element, in stored byte order
+    std::string separator = ".";
+    Json compressor;                 // v2 compressor object, or null
+    Json filters;                    // v2 filters, or null
+    std::string order = "C";
+    struct V3 {
+        std::string prefix;          // chunk key prefix ("c/" or "c.")
+        Index shards;                // chunks per shard along each axis; empty when unsharded
+        bool indexEnd = true, indexCrc = false;
+        Json metadata;               // the zarr.json as stored
+    };
+    std::optional<V3> v3;
+    Json raw;                        // the metadata as a v2 .zarray
+
+    std::size_t itemsize() const { return type.itemsize; }
+    // The reader's codec id ("" uncompressed); throws when the chunks cannot be decoded.
+    std::string codec() const;
+    std::size_t chunkBytes() const;
+    // .zarray of the same array stored uncompressed (the decoded-cache layout).
+    Json decodedZarray() const;
+    // .zarray of the decoded chunks stored with lossless Delta3D (as VC3D writes them).
+    Json delta3dZarray() const;
+};
+
+// Parses a .zarray or v3 zarr.json. Throws for unsupported layouts and dtypes;
+// whether the chunks can be decoded is checked by codec().
+ArrayMeta parseArrayMeta(const Json& metadata);
+
+// ---- access --------------------------------------------------------------------------
+
+// How requests under one root are made: anonymous, HTTP basic or signed S3.
+struct Access {
+    enum class Kind { Anonymous, Basic, S3 };
+    Kind kind = Kind::Anonymous;
+    Auth auth;             // the credentials handed to the HTTP client
+    std::string endpoint;  // S3-compatible server (path-style URLs); empty for AWS
+
+    // The URL to GET for a remote location.
+    std::string url(const std::string& location) const;
+    // Canonical cache identity of a location, independent of credentials.
+    std::string cacheUrl(const std::string& location) const;
+};
+
+enum class AuthMode {
+    Auto,       // s3:// buckets outside the public channels use AWS credentials when there are any
+    Anonymous,
+    Aws,        // AWS credentials from the environment and ~/.aws; an error when there are none
+};
+Access resolveAccess(const std::string& location, AuthMode mode = AuthMode::Auto, bool offline = false);
+// Fixed S3 keys (auth.kind "s3"). An empty region asks the bucket, then AWS_REGION.
+Access s3Access(const std::string& location, Auth keys, std::string endpoint = {});
+Access basicAccess(std::string user, std::string password);
+// AWS keys from AWS_ACCESS_KEY_ID/..., then the AWS_PROFILE (or default) profile of
+// the shared credentials and config files. kind is "s3"; region is the profile's.
+std::optional<Auth> awsCredentials(const std::string& profile = {});
+// A bucket's region from S3's x-amz-bucket-region header (cached); nullopt if unknown.
+std::optional<std::string> bucketRegion(const std::string& bucket);
+
+// Reads one metadata object (e.g. ".zarray") of a node. nullopt only when it does not exist.
+using MetadataReader = std::function<std::optional<std::string>(const std::string& location, const std::string& name)>;
+MetadataReader metadataReader(const Access& access, int connections = 4);
+
+// ---- disk caches ---------------------------------------------------------------------
+
+// VC3D's cache directory name for a remote volume: <last path part>-<fnv1a64 hex>.
+std::string vc3dVolumeId(std::string url);
+// VC3D's remote cache root as VC3D resolves it; nullopt if it does not exist.
+std::optional<std::filesystem::path> vc3dCacheRoot();
+// cache_dir/<scheme>/<host or bucket>/<path>; public buckets are keyed by their s3:// form.
+std::filesystem::path decodedCachePath(const std::filesystem::path& cacheDir, const std::string& url);
+// One SQLite eviction index per directory and process, shared by writers.
+std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std::int64_t> maxBytes);
+
+// VC3D's shared lease on one of its cache directories (flock LOCK_SH).
+class Vc3dLease {
+public:
+    explicit Vc3dLease(const std::filesystem::path& volumeDir);
+    ~Vc3dLease();
+    Vc3dLease(const Vc3dLease&) = delete;
+    Vc3dLease& operator=(const Vc3dLease&) = delete;
+    bool acquire();
+    void release();
+
+private:
+    std::filesystem::path path_;
+    int fd_ = -1;
+};
+
+// One cache directory holding chunks of one array, in one format.
+struct CacheLayer {
+    std::string kind;          // "decoded", "vc3d-mirror" or "vc3d-delta3d"
+    std::string root;          // directory of the level's chunk files
+    ArrayMeta stored;          // how the layer stores chunks
+    std::string emptyRoot;     // vc3d-delta3d: where missing-chunk markers live
+    bool allowLossy = false;
+    std::shared_ptr<Vc3dLease> lease;
+    std::string budgetRoot;    // the selected decoded writer when a byte limit applies
+    LayerSpec spec() const;
+};
+
+struct LayerOptions {
+    std::optional<std::string> groupUrl, levelKey;  // OME-Zarr group and level path; finds VC3D caches
+    std::optional<std::filesystem::path> vc3dVolumeDir;  // a VC3D cache directory named by its owner
+    bool writable = true, allowLossy = false, compress = false;
+    std::optional<std::int64_t> maxBytes;
+};
+
+// Every existing cache of `url` under `cacheDirs` (in order), and the index of the
+// layer to append fetched chunks to (-1: none). "vc3d" in cacheDirs stands for
+// VC3D's cache root. Appends go to the first layer that holds the array; if none
+// does and writing is allowed, a new decoded cache is created under the first directory.
+struct Layers {
+    std::vector<CacheLayer> layers;
+    int writer = -1;
+};
+Layers openLayers(const std::vector<std::string>& cacheDirs, const std::string& url, const ArrayMeta& source,
+                  const LayerOptions& options);
+// The source metadata of `url` as the caches record it, for opening offline.
+std::optional<Json> cachedSourceZarray(const std::vector<std::string>& cacheDirs, const std::string& url,
+                                       const std::optional<std::string>& groupUrl,
+                                       const std::optional<std::string>& levelKey,
+                                       const std::optional<std::filesystem::path>& vc3dVolumeDir = {});
+// Every cache directory that mirrors the remote node (group or array) at `url`.
+std::vector<std::filesystem::path> cachedNodeDirs(const std::vector<std::string>& cacheDirs, const std::string& url);
+std::vector<std::filesystem::path> cacheRoots(const std::vector<std::string>& cacheDirs);
+void atomicWrite(const std::filesystem::path& path, const std::string& data);
+
+// ---- arrays and groups ---------------------------------------------------------------
+
+struct OpenOptions {
+    Access access;
+    std::vector<std::string> cacheDirs;
+    std::optional<std::filesystem::path> vc3dVolumeDir;
+    bool cacheWrites = true;
+    std::optional<std::int64_t> cacheMaxBytes;
+    bool compressCache = false, allowLossyCache = false;
+    std::shared_ptr<MemoryCache> memoryCache;
+    std::size_t threads = 0;  // 0: 32 remote, min(16, cores) local
+    int connections = 16;
+    std::string readMode = "mmap";  // "mmap" or "slab"
+    bool offline = false;           // remote arrays: metadata and chunks only from the caches
+    MetadataReader metadata;        // replaces direct metadata requests (e.g. a caller's metadata cache)
+};
+
+struct OpenedArray {
+    std::string location;
+    ArrayMeta meta;
+    Json attributes;  // v3 attributes (with _ARRAY_DIMENSIONS); v2 arrays: their .zattrs when read
+    std::vector<CacheLayer> layers;
+    int writer = -1;
+    std::unique_ptr<Array> array;
+};
+
+struct ArrayHints {
+    std::optional<std::string> group, levelKey;  // inferred from a digits-only last path part when absent
+    std::optional<Json> metadata;                // already-read .zarray/zarr.json
+};
+OpenedArray openArray(const std::string& location, const OpenOptions& options, ArrayHints hints = {});
+
+class Group {
+public:
+    static Group open(const std::string& location, OpenOptions options);
+
+    const std::string& location() const { return location_; }
+    const Json& attributes() const { return attributes_; }
+    int version() const { return version_; }
+    const OpenOptions& options() const { return options_; }
+    // OME-NGFF multiscales (empty without them).
+    Json multiscales() const;
+    // Paths of the pyramid levels, finest first: the first multiscales' datasets,
+    // else the arrays "0", "1", ... up to the first absent one.
+    std::vector<std::string> levels();
+
+    enum class NodeKind { Array, Group };
+    // The child at a path, its metadata when it is an array; nullopt when absent.
+    std::optional<std::pair<NodeKind, Json>> node(const std::string& key);
+    OpenedArray array(const std::string& key);
+    Group group(const std::string& key);
+
+private:
+    Group(std::string location, OpenOptions options, Json attributes, int version);
+    std::optional<Json> consolidated();
+
+    std::string location_;
+    OpenOptions options_;
+    Json attributes_;
+    int version_ = 2;
+    std::map<std::string, std::optional<std::pair<NodeKind, Json>>> nodes_;
+    std::optional<std::optional<Json>> consolidated_;
+};
+
+}  // namespace vcr::zarr
