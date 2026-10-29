@@ -269,33 +269,38 @@ struct ChunkLookup {
     std::int64_t chunkOf(std::int64_t v, int a) const { return shift[a] >= 0 ? v >> shift[a] : v / block[a]; }
     float load(const unsigned char* p) const { return float(loader(p)); }
 
+    // A sample's chunk is almost always the last one used: that check stays inline, the
+    // rest (other slots, reading a chunk) is out of line.
     const unsigned char* voxel(const std::int64_t* v, bool& available)
     {
         const std::int64_t c[3]{chunkOf(v[0], 0), chunkOf(v[1], 1), chunkOf(v[2], 2)};
         const std::int64_t key = (c[0] * grid[1] + c[1]) * grid[2] + c[2];
-        Slot* slot = slots[last].key == key ? &slots[last] : nullptr;
-        for (std::size_t k = 0; !slot && k < slots.size(); ++k)
-            if (slots[k].key == key)
-                slot = &slots[last = k];
-        if (!slot) {
-            slot = &slots[last = next];
-            next = (next + 1) % slots.size();
-            slot->key = key;
-            const Index idx{c[0], c[1], c[2]};
-            if (cachedOnly) {
-                auto [found, data] = array->cached_chunk(idx);
-                slot->available = found;
-                slot->chunk = std::move(data);
-            } else {
-                slot->available = true;
-                slot->chunk = array->chunk(idx);
-            }
-        }
-        available = slot->available;
-        if (!available || !slot->chunk)
+        const Slot& slot = slots[last].key == key ? slots[last] : find(key, c);
+        available = slot.available;
+        if (!available || !slot.chunk)
             return nullptr;
-        return slot->chunk->data() + (v[0] - c[0] * block[0]) * stride[0] + (v[1] - c[1] * block[1]) * stride[1] +
+        return slot.chunk->data() + (v[0] - c[0] * block[0]) * stride[0] + (v[1] - c[1] * block[1]) * stride[1] +
                (v[2] - c[2] * block[2]) * stride[2];
+    }
+
+    [[gnu::noinline]] const Slot& find(std::int64_t key, const std::int64_t* c)
+    {
+        for (std::size_t k = 0; k < slots.size(); ++k)
+            if (slots[k].key == key)
+                return slots[last = k];
+        Slot& slot = slots[last = next];
+        next = (next + 1) % slots.size();
+        slot.key = key;
+        const Index idx{c[0], c[1], c[2]};
+        if (cachedOnly) {
+            auto [found, data] = array->cached_chunk(idx);
+            slot.available = found;
+            slot.chunk = std::move(data);
+        } else {
+            slot.available = true;
+            slot.chunk = array->chunk(idx);
+        }
+        return slot;
     }
 };
 
@@ -362,7 +367,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                     std::size_t li = 0;
                     for (; li < lookups.size(); ++li) {
                         float c[3];
-                        levelIndex(maps[li], at, c);
+                        levelIndex(maps[li], at[0], at[1], at[2], c);
                         if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
                             break;
                     }

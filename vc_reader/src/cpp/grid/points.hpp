@@ -13,6 +13,13 @@
 #else
 #define VCR_POINTS_HD
 #endif
+// point() is large (the Hermite patch): left to itself the host compiler calls its
+// small geometry helpers out of line, several calls per pixel.
+#if !defined(__CUDA_ARCH__) && (defined(__GNUC__) || defined(__clang__))
+#define VCR_POINTS_FLATTEN __attribute__((flatten))
+#else
+#define VCR_POINTS_FLATTEN
+#endif
 
 namespace vcr::grid {
 
@@ -61,15 +68,16 @@ VCR_POINTS_HD inline Hermite hermite(float t)
 // (optional) the unit normal in physical space, and `step` (optional) the move in
 // output coordinates per unit of physical offset along it (destination's linear
 // part applied to the normal).
-VCR_POINTS_HD inline bool point(const PointMap& g, const GridView& v, float x, float y, float* point, float* normal,
-                                float* step = nullptr)
+VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const GridView& v, float x, float y, float* point,
+                                                   float* normal, float* step = nullptr)
 {
     using geometry::V;
     using geometry::vector;
     if (!std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 || x > float(g.width - 1) || y > float(g.height - 1) ||
         g.width < 2 || g.height < 2)
         return false;
-    const int col = int(fminf(floorf(x), float(g.width - 2))), row = int(fminf(floorf(y), float(g.height - 2)));
+    const float lastCol = float(g.width - 2), lastRow = float(g.height - 2);  // x, y finite here
+    const int col = int(floorf(x) < lastCol ? floorf(x) : lastCol), row = int(floorf(y) < lastRow ? floorf(y) : lastRow);
     const float u = x - float(col), w = y - float(row);
     const int at[4]{row * g.width + col, row * g.width + col + 1, (row + 1) * g.width + col, (row + 1) * g.width + col + 1};
     for (int k = 0; k < 4; ++k)
@@ -107,8 +115,11 @@ VCR_POINTS_HD inline bool point(const PointMap& g, const GridView& v, float x, f
             m[k] = vector(v.normals + 3 * at[k]);
         n = (m[0] * (1 - u) + m[1] * u) * (1 - w) + (m[2] * (1 - u) + m[3] * u) * w;
     }
-    const float scale = fmaxf(fabsf(n.x), fmaxf(fabsf(n.y), fabsf(n.z)));
-    if (!(scale > 0) || !geometry::finite(n))
+    if (!geometry::finite(n))
+        return false;
+    const float ax = fabsf(n.x), ay = fabsf(n.y), az = fabsf(n.z);
+    const float scale = ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+    if (!(scale > 0))
         return false;
     n = n * (1 / scale);
     n = n * (1 / sqrtf(geometry::dot(n, n)));
@@ -126,3 +137,4 @@ VCR_POINTS_HD inline bool point(const PointMap& g, const GridView& v, float x, f
 }  // namespace vcr::grid
 
 #undef VCR_POINTS_HD
+#undef VCR_POINTS_FLATTEN

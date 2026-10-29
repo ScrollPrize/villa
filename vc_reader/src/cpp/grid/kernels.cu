@@ -90,7 +90,7 @@ __global__ void samplePixels(Params P)
         for (; li < P.levelCount; ++li) {
             BrickLookup lookup(P.levels[li].source, li == 0 ? P.lacking : nullptr);
             float c[3];
-            levelIndex(P.levels[li].map, at, c);
+            levelIndex(P.levels[li].map, at[0], at[1], at[2], c);
             if (sampling::point(lookup, P.levels[li].map.base, c, P.order, value))
                 break;
         }

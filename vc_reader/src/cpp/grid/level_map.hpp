@@ -36,10 +36,13 @@ inline LevelMap levelMap(const std::array<double, 3>& scale, const std::array<do
     return m;
 }
 
-VCR_LEVEL_MAP_HD inline void levelIndex(const LevelMap& m, const float* p, float* c)
+// The indices of the XYZ point (x, y, z). Scalars, not an array: a vectorized load of a
+// point just stored one coordinate at a time stalls on store forwarding.
+VCR_LEVEL_MAP_HD inline void levelIndex(const LevelMap& m, float x, float y, float z, float* c)
 {
-    for (int a = 0; a < 3; ++a)
-        c[a] = m.scale[a] * (p[2 - a] - m.ref[2 - a]) + m.local[a];
+    c[0] = m.scale[0] * (z - m.ref[2]) + m.local[0];
+    c[1] = m.scale[1] * (y - m.ref[1]) + m.local[1];
+    c[2] = m.scale[2] * (x - m.ref[0]) + m.local[2];
 }
 
 }  // namespace vcr::grid
