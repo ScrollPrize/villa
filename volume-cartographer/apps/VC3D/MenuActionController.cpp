@@ -249,7 +249,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
     _fileMenu->addAction(_openAct);
-    _fileMenu->addAction(QObject::tr("Clone Hosted Project..."), this, [this]() { cloneHostedStore(true); });
+    _cloneHostedProjectAct = new QAction(QObject::tr("Clone Hosted Project..."), this);
+    connect(_cloneHostedProjectAct, &QAction::triggered, this, [this]() { cloneHostedStore(true); });
+    _fileMenu->addAction(_cloneHostedProjectAct);
     _fileMenu->addAction(_saveProjectAsAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
@@ -1572,6 +1574,7 @@ void MenuActionController::registerCommands()
     const QString file = QObject::tr("File");
     catalog->add(QStringLiteral("new_project"), _newProjectAct, file);
     catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::OpenVolpkg.id), _openAct, file);
+    catalog->add(QStringLiteral("clone_hosted_project"), _cloneHostedProjectAct, file);
     catalog->add(QStringLiteral("save_project_as"), _saveProjectAsAct, file);
     catalog->add(QStringLiteral("attach_volume"), _attachVolumeAct, file);
     catalog->add(QStringLiteral("attach_normal_grid"), _attachNormalGridAct, file);

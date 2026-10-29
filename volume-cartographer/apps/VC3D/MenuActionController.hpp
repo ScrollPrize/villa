@@ -209,6 +209,7 @@ private:
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
+    QAction* _cloneHostedProjectAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _importUmbilicusAct{nullptr};
