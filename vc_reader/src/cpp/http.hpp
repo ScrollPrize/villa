@@ -235,6 +235,8 @@ private:
         std::optional<sftp::Attributes> found;
         try {
             found = fetcher->read(url, range, [&] { reset(); response = {}; }, [&](const sftp::Attributes& a, uint64_t first, uint64_t count) {
+                if (ranged && !range.suffix && count == 0 && range.length.value_or(1) != 0)
+                    throw std::runtime_error("sftp range starts past the end of " + url);
                 response.status = ranged ? 206 : 200;
                 response.etag = "\"" + std::to_string(a.modified.value_or(0)) + "-" + std::to_string(*a.size) + "\"";
                 if (!if_match.empty() && if_match != response.etag)

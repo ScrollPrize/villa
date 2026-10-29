@@ -119,9 +119,7 @@ std::optional<Attributes> Fetcher::read(std::string_view location, const ByteRan
         if (range.suffix) {
             count = std::min(range.length.value_or(size), size);
             first = size - count;
-        } else {
-            if (first > size || (range.length && first == size && *range.length))
-                throw std::runtime_error("SFTP read starts past the end of " + url.str());
+        } else if (first < size) {
             count = range.length ? std::min(*range.length, size - first) : size - first;
         }
         begin(attributes, first, count);

@@ -169,7 +169,8 @@ public:
     // Streams the range of the file to sink. nullopt when the file does not
     // exist; PermissionDenied and other server answers throw StatusError.
     // reset() runs before each attempt, so sink sees one attempt's bytes;
-    // begin(attributes, first, count) runs once the range is resolved.
+    // begin(attributes, first, count) runs once the range is resolved. A range
+    // starting at or past the end resolves to count 0; begin may throw to refuse it.
     std::optional<Attributes> read(std::string_view url, const ByteRange& range,
                                    const std::function<void()>& reset,
                                    const std::function<void(const Attributes&, uint64_t, uint64_t)>& begin,
