@@ -46,10 +46,12 @@ public:
     void pinRegion(vc::render::PinnedChunkRegion&, const cv::Vec3d& lo, const cv::Vec3d& hi) const;
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
-    [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const;
-    [[nodiscard]] bool hasPredDtChannel() const;
-    [[nodiscard]] std::optional<double> predDtSpacing() const;
     [[nodiscard]] double windingDistance(const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
+    [[nodiscard]] double normalAlignedWindingDistance(
+        const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
+    [[nodiscard]] std::vector<double> normalAlignedWindingDistancesBatch(
+        const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+        double stepVx = 8.0, int parallelThreads = 0) const;
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(const std::vector<cv::Vec3d>& volumePoints, bool withDerivative) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(

@@ -1,13 +1,10 @@
-// Cover QuadSurface::save force_overwrite atomic-exchange, save_meta error
-// branches, and readOverlappingJson legacy-directory rejection.
+// Cover QuadSurface::save force_overwrite atomic-exchange and identity rules.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Uuid.hpp"
-#include "vc/core/types/Segmentation.hpp"
-#include "vc/core/types/VolumePkg.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -40,19 +37,16 @@ cv::Mat_<cv::Vec3f> grid(int rows = 8, int cols = 8, float z = 0.f)
 
 } // namespace
 
-TEST_CASE("new patch UUID survives metadata and geometry saves")
+TEST_CASE("new surface UUID survives metadata and geometry saves")
 {
     auto root = tmpDir("identity");
-    auto segDir = root / "named_patch";
+    auto segDir = root / "named_surface";
     QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
     created.save(segDir);
     QuadSurface loaded(segDir);
     const std::string uuid = loaded.meta["uuid"].get_string();
-    CHECK(vc::util::isUuid(uuid));
-    CHECK(loaded.id == "named_patch");
-    loaded.id = "changed_display_name";
-    loaded.save_meta();
-    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    CHECK(vc::objects::util::isUuid(uuid));
+    CHECK(loaded.id == "named_surface");
     loaded.ensureLoaded();
     loaded.saveOverwrite();
     CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
@@ -68,7 +62,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         created.save(segDir);
     }
     const std::string uuid = QuadSurface(segDir).objectUuid();
-    REQUIRE(vc::util::isUuid(uuid));
+    REQUIRE(vc::objects::util::isUuid(uuid));
 
     // In-place geometry edit (crop/flip/rotate path): save over the source.
     {
@@ -86,7 +80,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         loaded->saveAsNew(copyDir);
     }
     const std::string copyUuid = QuadSurface(copyDir).objectUuid();
-    CHECK(vc::util::isUuid(copyUuid));
+    CHECK(vc::objects::util::isUuid(copyUuid));
     CHECK(copyUuid != uuid);
 
     // saveEdited decides by destination.
@@ -101,7 +95,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         loaded->saveEdited(segDir, editedDir);
     }
     const std::string editedUuid = QuadSurface(editedDir).objectUuid();
-    CHECK(vc::util::isUuid(editedUuid));
+    CHECK(vc::objects::util::isUuid(editedUuid));
     CHECK(editedUuid != uuid);
     CHECK(editedUuid != copyUuid);
 
@@ -113,69 +107,6 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         created.save(catalogDir);
     }
     CHECK(QuadSurface(catalogDir).objectUuid() == "catalog-representation-id");
-    fs::remove_all(root);
-}
-
-TEST_CASE("catalog-derived local copies use directory keys across reloads")
-{
-    const auto root = tmpDir("catalog_copy");
-    struct RestoreAutosaveRoot {
-        fs::path previous = VolumePkg::autosaveRoot();
-        ~RestoreAutosaveRoot() { VolumePkg::setAutosaveRoot(previous); }
-    } restoreAutosaveRoot;
-    VolumePkg::setAutosaveRoot(root / "autosave");
-    const auto source = root / "catalog";
-    const auto output = root / "local";
-    fs::create_directories(output);
-    QuadSurface original(grid(), cv::Vec2f(1.f, 1.f));
-    original.meta["uuid"] = "catalog-representation-id";
-    original.meta["vc_open_data_representation"] = "published-transformed";
-    original.meta["vc_open_data_coordinate_space"] = "sample/volume@L0";
-    original.meta["vc_open_data_segment_long_id"] = "source-segment";
-    original.save(source);
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(output.string()));
-    const auto destination = output / "copy";
-
-    SUBCASE("Copy Surface metadata-only identity reset") {
-        fs::copy(source, destination, fs::copy_options::recursive);
-        auto copy = Segmentation::New(destination);
-        copy->resetIdentityForCopy();
-        copy->setName("copy");
-        copy->saveMetadata();
-        CHECK(copy->id() == "copy");
-    }
-    SUBCASE("Save Transformed and other derived saves") {
-        auto copy = load_quad_from_tifxyz(source.string());
-        copy->saveAsNew(destination);
-        CHECK(copy->id == "copy");
-    }
-    SUBCASE("saveEdited to a different directory") {
-        auto copy = load_quad_from_tifxyz(source.string());
-        copy->saveEdited(source, destination);
-    }
-
-    REQUIRE(pkg->addSingleSegmentation("copy"));
-    REQUIRE(pkg->segmentation("copy"));
-    const auto uuid = pkg->segmentation("copy")->uuid();
-    CHECK(vc::util::isUuid(uuid));
-    CHECK(uuid != "catalog-representation-id");
-    REQUIRE(pkg->loadSurface("copy"));
-    CHECK(pkg->loadSurface("copy")->id == "copy");
-    REQUIRE(pkg->reloadSingleSegmentation("copy"));
-    CHECK(pkg->segmentation("copy")->uuid() == uuid);
-    // A fresh project avoids reusing cached Segmentation objects.
-    pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(output.string()));
-    REQUIRE(pkg->segmentation("copy"));
-    const auto& meta = pkg->segmentation("copy")->metadata();
-    CHECK_FALSE(meta.contains("vc_open_data_representation"));
-    CHECK(meta["vc_open_data_coordinate_space"].get_string() == "sample/volume@L0");
-    CHECK(meta["vc_open_data_segment_long_id"].get_string() == "source-segment");
-    // The source remains a catalog surface, including on an in-place save.
-    original.save(source, true);
-    CHECK(Segmentation(source).id() == "catalog-representation-id");
-    CHECK(Segmentation(source).metadata().contains("vc_open_data_representation"));
     fs::remove_all(root);
 }
 
@@ -277,68 +208,6 @@ TEST_CASE("load rolls back an interrupted multi-file save generation")
     fs::remove_all(root);
 }
 
-TEST_CASE("saveChannel: writes only the channel tif, no snapshot, round-trips")
-{
-    auto root = tmpDir("savechannel");
-    auto segDir = root / "seg";
-
-    // Place the seg dir under a paths/ dir so it mimics <volpkg>/paths/<seg>.
-    // saveSnapshot() would write backups beside the seg dir (paths/backups/).
-    auto volpkg = root / "scroll.volpkg";
-    auto pathsDir = volpkg / "paths";
-    fs::create_directories(pathsDir);
-    segDir = pathsDir / "seg";
-
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta["uuid"] = "uuid-a";
-    qs.save(segDir.string(), /*force_overwrite=*/false);
-    REQUIRE(fs::exists(segDir / "x.tif"));
-
-    // Capture x.tif mtime so we can assert saveChannel leaves it untouched.
-    auto xMtimeBefore = fs::last_write_time(segDir / "x.tif");
-
-    cv::Mat_<cv::Vec3b> approval(8, 8, cv::Vec3b(0, 0, 0));
-    approval(2, 3) = cv::Vec3b(0, 255, 0);  // BGR
-    qs.setChannel("approval", approval);
-    qs.saveChannel("approval");
-
-    CHECK(fs::exists(segDir / "approval.tif"));
-
-    // Replacing an existing channel file needs an explicit replace operation
-    // on Windows; std::filesystem::rename alone leaves the first save in place.
-    approval(2, 3) = cv::Vec3b(255, 0, 0);
-    qs.setChannel("approval", approval);
-    qs.saveChannel("approval");
-
-    // No backups/ directory: saveChannel must not snapshot the segment.
-    CHECK_FALSE(fs::exists(pathsDir / "backups"));
-    CHECK_FALSE(fs::exists(volpkg / "backups"));
-    // x.tif untouched (not rewritten).
-    CHECK(fs::last_write_time(segDir / "x.tif") == xMtimeBefore);
-
-    QuadSurface reloaded(segDir);
-    cv::Mat got = reloaded.channel("approval", SURF_CHANNEL_NORESIZE);
-    REQUIRE(got.channels() == 3);
-    CHECK(got.at<cv::Vec3b>(2, 3) == cv::Vec3b(255, 0, 0));
-    CHECK(got.at<cv::Vec3b>(0, 0) == cv::Vec3b(0, 0, 0));
-
-    fs::remove_all(root);
-}
-
-TEST_CASE("saveChannel: absent or empty channel is a no-op")
-{
-    auto root = tmpDir("savechannel_noop");
-    auto segDir = root / "seg";
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta["uuid"] = "uuid-a";
-    qs.save(segDir.string(), /*force_overwrite=*/false);
-
-    qs.saveChannel("approval");  // never set
-    CHECK_FALSE(fs::exists(segDir / "approval.tif"));
-
-    fs::remove_all(root);
-}
-
 TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
 {
     auto root = tmpDir("noforce");
@@ -359,83 +228,6 @@ TEST_CASE("save without force_overwrite + existing dir throws (or overwrites)")
     }
     CHECK(true);
     fs::remove_all(root);
-}
-
-TEST_CASE("save_meta: requires path")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.meta = utils::Json::object();
-    qs.meta["uuid"] = "x";
-    qs.meta["format"] = "tifxyz";
-    qs.meta["type"] = "seg";
-    CHECK_THROWS(qs.save_meta());
-}
-
-TEST_CASE("save_meta: requires object metadata (not null)")
-{
-    auto root = tmpDir("nullmeta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.meta = utils::Json{}; // null
-    CHECK_THROWS(qs.save_meta());
-    fs::remove_all(root);
-}
-
-TEST_CASE("save_meta: requires object (not array) metadata")
-{
-    auto root = tmpDir("arrmeta");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.meta = utils::Json::array();
-    CHECK_THROWS(qs.save_meta());
-    fs::remove_all(root);
-}
-
-TEST_CASE("readOverlappingJson: legacy 'overlapping' directory triggers error")
-{
-    auto root = tmpDir("legacy_overlap");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    // Drop a sentinel 'overlapping' subdir.
-    fs::create_directories(segDir / "overlapping");
-
-    QuadSurface qs(segDir);
-    qs.path = segDir;
-    CHECK_THROWS(qs.readOverlappingJson());
-    fs::remove_all(root);
-}
-
-TEST_CASE("readOverlappingJson: empty path is a no-op")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    // path is empty by default — should silently return.
-    qs.readOverlappingJson();
-    CHECK(true);
-}
-
-TEST_CASE("writeOverlappingJson: empty path is a no-op")
-{
-    QuadSurface qs(grid(), cv::Vec2f(1.f, 1.f));
-    qs.setOverlappingIds({"a", "b"});
-    qs.writeOverlappingJson(); // no-throw
-    CHECK(true);
-}
-
-TEST_CASE("readMaskTimestamp: returns nullopt for an invalid dir")
-{
-    auto ts = QuadSurface::readMaskTimestamp("/__no__/__where__");
-    CHECK_FALSE(ts.has_value());
 }
 
 TEST_CASE("lookupDepthIndex: with 'd' channel as float matrix")

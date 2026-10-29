@@ -43,7 +43,6 @@ static Scalar scalar(nb::handle value) {
     if (nb::isinstance<Uniform>(value)) return nb::cast<Uniform>(value);
     if (nb::isinstance<Normal>(value)) return nb::cast<Normal>(value);
     if (nb::isinstance<Choice>(value)) return nb::cast<Choice>(value);
-    if (nb::isinstance<BalancedContrast>(value)) return nb::cast<BalancedContrast>(value);
     if (nb::isinstance<Named>(value)) return nb::cast<Named>(value);
     if (nb::isinstance<nb::tuple>(value) || nb::isinstance<nb::list>(value)) {
         auto values = nb::cast<std::vector<double>>(value); require(values.size() == 2, "range needs two bounds"); return Uniform{values[0], values[1]};
@@ -133,7 +132,7 @@ static nb::tuple export_result(RunResult result, bool plan, const std::map<std::
         else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(std::move(level), inputs, inplace)); arrays[nb::str(name.c_str())] = levels; }
         sources[nb::str(name.c_str())] = nb::str(f.source.c_str());
     }
-    return nb::make_tuple(arrays, sources, nb::cast(result.timings), plan ? nb::cast(std::move(result.plan)) : nb::none());
+    return nb::make_tuple(arrays, sources, plan ? nb::cast(std::move(result.plan)) : nb::none());
 }
 
 #include "volumetric_bindings.hpp"
@@ -143,11 +142,10 @@ NB_MODULE(_transforms, m) {
     nb::class_<Uniform>(m, "Uniform").def(nb::init<double, double>(), "low"_a, "high"_a);
     nb::class_<Normal>(m, "Normal").def(nb::init<double, double>(), "mean"_a = 0., "std"_a = .1);
     nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);
-    nb::class_<BalancedContrast>(m, "BalancedContrast").def(nb::init<double, double>(), "low"_a = .75, "high"_a = 1.25);
     nb::class_<Named>(m, "Param").def(nb::init<std::string>(), "name"_a);
     nb::class_<Target>(m, "Target");
     m.def("Image", [](double fill, nb::object valid) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"));
-    m.def("Label", [](nb::object ignore_value, double fill) { Target t; t.role = Role::Label; t.fill = ignore_value.is_none() ? fill : nb::cast<double>(ignore_value); return t; }, "ignore_value"_a = nb::none(), "fill"_a = 0.);
+    m.def("Label", [](double fill) { Target t; t.role = Role::Label; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ScalarField", [](double fill) { Target t; t.role = Role::Scalar; t.fill = fill; return t; }, "fill"_a = 0.);
     m.def("ValidMask", [] { Target t; t.role = Role::Valid; return t; });
     m.def("Points", [](const std::string& order, const std::string& outside) { Target t; t.role = Role::Points; t.components = order; t.outside = outside; return t; }, "order"_a = "zyx", "outside"_a = "keep");
@@ -294,36 +292,33 @@ NB_MODULE(_transforms, m) {
     bind<OneOf>(m, "OneOf", [](auto& t, auto& a) { t.transforms = a.get("transforms", t.transforms); t.weights = a.get("weights", t.weights); });
 
     nb::class_<Plan>(m, "Plan")
-        .def_prop_ro("steps", [](const Plan& p) { return p.steps.size(); })
         .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
     m.def("cuda_available", &cuda::available);
 #ifdef VC_READER_CUDA
     nb::class_<DeviceOutputs>(m, "DeviceOutputs")
         .def("export", &DeviceOutputs::mark_exported)
         .def("check", &DeviceOutputs::check, nb::call_guard<nb::gil_scoped_release>());
-    m.def("_set_stream", [](std::uintptr_t handle) { vcr::device::current_stream() = handle ? vcr::device::stream_handle(handle) : nullptr; });
 #endif
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
         .def_prop_ro("backend", &Pipeline::backend)
 #ifdef VC_READER_CUDA
-        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace,
-                              bool async, const NamedValues& params) {
-            return run_device(p,inputs,seed,record,profile,inplace,nullptr,async,params);
-        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false, "async_"_a = false, "params"_a = NamedValues{})
-        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "inplace"_a, "async_"_a, "out"_a,
-             "allocator"_a = nb::none(), "stream"_a = nb::none())
+        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool inplace,
+                              const NamedValues& params) {
+            return run_device(p,inputs,seed,record,inplace,nullptr,params);
+        }, "inputs"_a, "seed"_a, "record"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
+        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "allocator"_a, "stream"_a)
         .def("replay_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, const Plan& plan) {
-            return run_device(p,inputs,0,false,false,false,&plan);
+            return run_device(p,inputs,0,false,false,&plan);
         })
 #endif
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
-        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace, const NamedValues& params) {
+        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool inplace, const NamedValues& params) {
             if (inplace) writable_inputs(inputs);
             RunResult result;
-            { nb::gil_scoped_release release; NamedScope named(&params); result = p.run(import_sample(p, inputs, inplace), seed, record, profile); }
+            { nb::gil_scoped_release release; NamedScope named(&params); result = p.run(import_sample(p, inputs, inplace), seed, record); }
             return export_result(std::move(result), record, inputs, inplace);
-        }, "inputs"_a, "seed"_a, "record"_a = false, "profile"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
+        }, "inputs"_a, "seed"_a, "record"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
         .def("replay", [](const Pipeline& p, const std::map<std::string, Input>& inputs, const Plan& plan) {
             RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
             return export_result(std::move(result), false, inputs);
@@ -337,7 +332,4 @@ NB_MODULE(_transforms, m) {
         }
         return value;
     });
-    m.def("translate_crop_box", &translate_crop_box, "box"_a, "points"_a, "seed"_a,
-          "p"_a = .3, "minimum"_a = 10, "maximum"_a = 40, "keep"_a = 1. / 3, "attempts"_a = 24,
-          nb::call_guard<nb::gil_scoped_release>());
 }

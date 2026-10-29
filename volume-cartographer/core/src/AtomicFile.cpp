@@ -251,4 +251,33 @@ std::size_t cleanupAtomicWriteTemporaryFiles(
     return abandoned.size();
 }
 
+StagedDirectory::StagedDirectory(std::filesystem::path target)
+    : target_(std::move(target))
+{
+    std::random_device random;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        staging_ = target_.parent_path() /
+                   ("." + target_.filename().string() + ".partial-" + std::to_string(random()));
+        std::error_code error;
+        if (std::filesystem::create_directories(staging_, error)) return;
+        if (error) throw std::system_error(error, "cannot create staging directory " + staging_.string());
+    }
+    throw std::runtime_error("cannot reserve a staging directory for " + target_.string());
+}
+
+StagedDirectory::~StagedDirectory()
+{
+    if (committed_) return;
+    std::error_code ignored;
+    std::filesystem::remove_all(staging_, ignored);
+}
+
+void StagedDirectory::commit()
+{
+    std::error_code error;
+    if (std::filesystem::exists(target_, error)) std::filesystem::remove_all(target_);
+    std::filesystem::rename(staging_, target_);
+    committed_ = true;
+}
+
 } // namespace vc::core::util

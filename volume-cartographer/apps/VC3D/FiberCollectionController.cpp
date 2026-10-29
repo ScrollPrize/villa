@@ -1,362 +1,327 @@
 #include "FiberCollectionController.hpp"
+#include <vc_object_store/geometry/ArrayBytes.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "CState.hpp"
 #include "ViewerManager.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include "ObjectStoreRegions.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
-#include <QCheckBox>
-#include <QCryptographicHash>
-#include <QDockWidget>
-#include <QDoubleSpinBox>
-#include <QFileDialog>
-#include <QFileInfo>
-#include <QFormLayout>
+#include <QColor>
 #include <QFutureWatcher>
 #include <QGraphicsView>
 #include <QGuiApplication>
-#include <QFrame>
-#include <QLabel>
-#include <QLineEdit>
-#include <QListWidget>
-#include <QMainWindow>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPolygonF>
-#include <QPushButton>
-#include <QSaveFile>
 #include <QScopeGuard>
 #include <QSettings>
-#include <QSignalBlocker>
-#include <QSlider>
-#include <QSpinBox>
 #include <QStyleHints>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <set>
 #include <unordered_set>
 #include <utility>
 
 using vc::fibers::Bounds;
-using vc::fibers::FiberCollection;
 using vc::fibers::Point;
 using Json = nlohmann::json;
+using vc3d::store::background;
+using vc3d::store::Outcome;
 namespace
 {
-cv::Vec3f cvpoint(const Point& p, double scale = 1)
+constexpr int64_t kCatalogPageSize = 200;
+cv::Vec3f cvpoint(const Point& p)
 {
-    return {float(p[0] * scale), float(p[1] * scale), float(p[2] * scale)};
-}
-Point point(const cv::Vec3f& p, double scale = 1)
-{
-    return {p[0] * scale, p[1] * scale, p[2] * scale};
-}
-Point sub(const Point& a, const Point& b)
-{
-    return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+    return {float(p[0]), float(p[1]), float(p[2])};
 }
 double dot(const Point& a, const Point& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
-Point normalized(Point p)
-{
-    const double n = std::sqrt(dot(p, p));
-    if (!(n > 0))
-        throw std::runtime_error("Degenerate slice frame");
-    for (auto& x : p)
-        x /= n;
-    return p;
-}
-bool contains(const Bounds& outer, const Bounds& inner)
+bool inside(const Point& local, const Bounds& bounds)
 {
     for (size_t i = 0; i < 3; ++i)
-        if (inner.lower[i] < outer.lower[i] || inner.upper[i] > outer.upper[i])
+        if (local[i] < bounds.lower[i] || local[i] > bounds.upper[i])
             return false;
     return true;
 }
-struct RegionResult {
-    vc::fibers::RegionPage page;
-    Bounds coverage;
-};
-template <class T>
-struct Outcome {
-    T value{};
-    QString error;
-};
-template <class T, class Work, class Done>
-void background(QObject* parent, Work work, Done done)
+// Consecutive groups are separated by the golden angle; saturation and value
+// bands keep unusually large sets distinct.
+QColor groupColor(uint64_t id)
 {
-    auto* watcher = new QFutureWatcher<Outcome<T>>(parent);
-    QObject::connect(watcher, &QFutureWatcher<Outcome<T>>::finished, parent, [watcher, done]() {
-        auto result = watcher->future().takeResult();
-        watcher->deleteLater();
-        done(std::move(result));
-    });
-    watcher->setFuture(QtConcurrent::run([work]() {
-        Outcome<T> result;
-        try {
-            result.value = work();
-        } catch (const std::exception& error) {
-            result.error = QString::fromUtf8(error.what());
-        }
-        return result;
-    }));
+    const int hue = static_cast<int>((id * 137ULL) % 360ULL);
+    const int saturation = 190 + static_cast<int>((id / 360ULL) % 3ULL) * 25;
+    const int value = 255 - static_cast<int>((id / 1080ULL) % 3ULL) * 20;
+    return QColor::fromHsv(hue, saturation, value);
+}
+// The look of one linked control point, from every link on it, by the Line
+// Annotation views' marker rule: pending wins, automatic only while every
+// pending link on the point is automatic, the same-H/V warning of the winning
+// state, a triangle for any adjacent link.
+struct LinkMark {
+    bool linked = false;
+    bool pending = false;
+    bool humanPending = false;
+    bool sameHvPending = false;
+    bool sameHvApproved = false;
+    bool adjacent = false;
+    void add(const vc::objects::EdgeRecord& edge, bool sameHv)
+    {
+        const auto meta = Json::parse(edge.meta);
+        const bool linkPending = edge.approvalState != "approved";
+        const bool linkAdjacent = meta.value("adjacent", false);
+        const bool automatic = linkPending && !linkAdjacent && meta.value("auto", false);
+        linked = true;
+        pending = pending || linkPending;
+        humanPending = humanPending || (linkPending && !automatic);
+        adjacent = adjacent || linkAdjacent;
+        if (sameHv) (linkPending ? sameHvPending : sameHvApproved) = true;
+    }
+    bool automatic() const { return pending && !humanPending; }
+    bool sameHv() const { return pending ? sameHvPending : sameHvApproved; }
+};
+// Whether a link joins two fibers of the same known H/V family.
+std::function<bool(const vc::objects::EdgeRecord&)> sameFamilyTest(
+    const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+    const std::vector<vc::objects::EdgeRecord>& edges)
+{
+    vc::objects::ObjectSelection selection;
+    for (const auto& edge : edges) {
+        selection.uuids.push_back(edge.aUuid);
+        selection.uuids.push_back(edge.bUuid);
+    }
+    std::map<std::string, std::string> families;
+    if (!selection.uuids.empty())
+        for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber"}))
+            if (object.fiber && !object.fiber->family.empty()) families[object.uuid] = object.fiber->family;
+    return [families = std::move(families)](const vc::objects::EdgeRecord& edge) {
+        const auto a = families.find(edge.aUuid), b = families.find(edge.bUuid);
+        return a != families.end() && b != families.end() && a->second == b->second;
+    };
+}
+ViewerOverlayControllerBase::OverlayStyle linkMarkStyle(const LinkMark& mark, float opacity)
+{
+    const auto rgb = vc3d::line_annotation::linkStateRgb(mark.pending, mark.sameHv(), mark.automatic());
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(rgb.r, rgb.g, rgb.b, 245);
+    style.brushColor = QColor(rgb.r, rgb.g, rgb.b, 175);
+    style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+    style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
+    style.penWidth = 2.0;
+    style.z = 95;
+    return style;
+}
+struct SelectedFiber {
+    FiberCollectionController::CatalogRow row;
+    vc::objects::PinnedObject pin;
+    int64_t pointCount = 0;
+    // In volume voxels, for a fiber bound to the volume.
+    std::optional<double> volumeLength;
+};
+struct RegionResult {
+    // The store's runs, in volume voxels.
+    std::vector<vc::objects::VisibleRun> runs;
+    bool complete = true;
+    // The store stopped at the display limit (maximumObjects).
+    bool limited{false};
+    struct Control {
+        std::string uuid;
+        int index = 0;
+        Point position;
+    };
+    std::vector<Control> controls;
+    struct Ring {
+        Point position;
+        LinkMark mark;
+    };
+    std::vector<Ring> rings;
+    // Visible fiber -> smallest UUID of its linked component.
+    std::map<std::string, std::string> linkGroups;
+};
+struct ChainResult {
+    struct Chain {
+        std::string uuid;
+        std::vector<cv::Vec3f> points;
+        // Per control point (unlinked when !linked).
+        std::vector<LinkMark> linkMarks;
+    };
+    std::vector<Chain> chains;
+    std::map<std::string, std::string> linkGroups;
+};
+// Smallest UUID of each linked component among the given fibers.
+std::map<std::string, std::string> linkGroupsOf(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+                                                const std::set<std::string>& linked, const std::set<std::string>& drawn,
+                                                const std::atomic_bool& cancelled)
+{
+    std::map<std::string, std::string> groups;
+    for (const auto& uuid : linked) {
+        if (groups.contains(uuid)) continue;
+        const auto component = db.componentOf(txn, uuid, {"fiber_branch"}, &cancelled);
+        const auto representative = *std::min_element(component.begin(), component.end());
+        for (const auto& member : component)
+            if (drawn.contains(member)) groups[member] = representative;
+    }
+    return groups;
+}
+// Stored coordinates -> volume voxels of each listed object bound to the volume.
+template <class Keys>
+std::map<std::string, vc::objects::VolumeAffine> volumeMappings(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+                                                                const Keys& objects, const vc::objects::VolumeVoxels& volume)
+{
+    vc::objects::ObjectSelection selection;
+    for (const auto& [uuid, value] : objects) selection.uuids.push_back(uuid);
+    const auto transforms = db.volumeTransforms(txn);
+    std::map<std::string, vc::objects::VolumeAffine> mappings;
+    for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"meta"}))
+        if (const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale))
+            mappings.emplace(object.uuid, *mapping);
+    return mappings;
+}
+
+// The control points of fiber geometry revisions in a volume's voxels
+// (`mappings[i]` maps revision i's stored frame).
+std::vector<std::vector<std::array<double, 3>>> controlsInVolume(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+    const std::vector<std::string>& revisions, const std::vector<vc::objects::VolumeAffine>& mappings)
+{
+    const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
+    if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
+    std::vector<std::vector<std::array<double, 3>>> result(revisions.size());
+    for (size_t i = 0; i < revisions.size(); ++i)
+        for (const auto& position : vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i)))
+            result[i].push_back(mappings[i].apply(position));
+    return result;
 }
 }  // namespace
 
 struct FiberCollectionController::View {
-    // One in-flight query per view; successive workers reuse its connection/LRU.
-    // Capturing this context keeps it alive if the collection/view is detached.
-    struct Reader { std::unique_ptr<FiberCollection> collection; };
-    std::shared_ptr<Reader> reader;
-    std::optional<Slice> requested, displayed, coverageSlice;
-    std::optional<Bounds> coverage, pendingBounds;
-    std::vector<vc::fibers::Block> blocks;
-    std::shared_ptr<std::atomic_bool> cancelled;
-    bool busy{false};
-    bool complete{true};
+    vc3d::store::RegionRequests region;
+    std::optional<Slice> displayed;
+    // Visible runs with the runtime ID of their fiber.
+    struct Run {
+        uint64_t fiber = 0;
+        vc::objects::VisibleRun run;
+    };
+    std::vector<Run> runs;
+    struct Control {
+        uint64_t fiber = 0;
+        int index = 0;
+        Point position;
+    };
+    std::vector<Control> controls;
+    std::vector<RegionResult::Ring> rings;
+    std::unordered_map<uint64_t, uint64_t> linkGroups;
+    struct Chain {
+        uint64_t fiber = 0;
+        std::vector<cv::Vec3f> points;
+        std::vector<LinkMark> linkMarks;
+    };
+    std::vector<Chain> chains;
+    std::optional<std::array<double, 6>> chainBox;
+    // The installed region stopped at the display limit.
+    bool limited{false};
     bool dirty{true};
     QRectF displayedRect;
-    qreal displayedWidth{}, displayedDpr{};
-    bool displayedRainbow{};
-    QString error;
+    qreal displayedDpr{};
+    FiberDisplayOptions displayedOptions;
     struct Hit {
         QPointF a, b;
         int64_t fiber;
     };
     std::vector<Hit> hits;
+    struct ControlHit {
+        QPointF position;
+        uint64_t fiber = 0;
+        int index = 0;
+    };
+    std::vector<ControlHit> controlHits;
 };
 
-FiberCollectionController::FiberCollectionController(CState* state, ViewerManager* manager, QMainWindow* window, LineAnnotationController* annotations)
-    : ViewerOverlayControllerBase("fiber-collection", window), state_(state), manager_(manager), annotations_(annotations)
+FiberCollectionController::FiberCollectionController(CState* state, ViewerManager* manager, QObject* parent, LineAnnotationController* annotations)
+    : ViewerOverlayControllerBase("fiber-collection", parent), state_(state), manager_(manager), annotations_(annotations)
 {
-    dock_ = new QDockWidget(tr("Automated Fiber Volume"), window);
-    dock_->setObjectName("fiberCollectionsDock");
-    auto* body = new QWidget(dock_);
-    auto* layout = new QVBoxLayout(body);
-    layout->setSpacing(10);
-    auto addSection = [body, layout](const QString& title, int stretch = 0, QWidget** separatorOut = nullptr) {
-        if (layout->count()) {
-            auto* separator = new QFrame(body);
-            separator->setFrameShape(QFrame::HLine);
-            separator->setFrameShadow(QFrame::Plain);
-            separator->setForegroundRole(QPalette::Mid);
-            layout->addWidget(separator);
-            if (separatorOut) *separatorOut = separator;
-        }
-        auto* section = new QWidget(body);
-        auto* contents = new QVBoxLayout(section);
-        contents->setContentsMargins(0, 0, 0, 0);
-        contents->setSpacing(8);
-        auto* heading = new QLabel(title, section);
-        auto font = heading->font();
-        font.setBold(true);
-        heading->setFont(font);
-        contents->addWidget(heading);
-        layout->addWidget(section, stretch);
-        return contents;
-    };
-    auto* collectionLayout = addSection(tr("Volume"));
-    auto* collectionActions = new QHBoxLayout;
-    auto* open = new QPushButton(tr("Open volume…"), body);
-    detach_ = new QPushButton(tr("Detach volume"), body);
-    detach_->setEnabled(false);
-    collectionActions->addWidget(open, 1);
-    collectionActions->addWidget(detach_);
-    collectionLayout->addLayout(collectionActions);
-    visible_ = new QCheckBox(tr("Show volume · read only"), body);
-    visible_->setChecked(true);
-    collectionLayout->addWidget(visible_);
-    status_ = new QLabel(tr("Open an Automated Fiber Volume (.afv)."), body);
-    status_->setObjectName("fiberCollectionStatus");
-    status_->setWordWrap(true);
-    collectionLayout->addWidget(status_);
-    auto* filtersLayout = addSection(tr("Filters"));
-    auto* filterForm = new QFormLayout;
-    filterForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    filterForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    auto* displayLayout = addSection(tr("Display"));
-    auto* form = new QFormLayout;
-    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    minLength_ = new QDoubleSpinBox(body);
-    minLength_->setObjectName("fiberCollectionMinLengthMm");
-    minLength_->setRange(0, 1000000);
-    minLength_->setDecimals(2);
-    minLength_->setSingleStep(1);
-    minLength_->setKeyboardTracking(false);
-    minLength_->setToolTip(tr("Minimum length of the complete fiber in millimeters, inclusive. 0 shows all lengths. Applies to the catalog and visible fibers before the display limit."));
-    distance_ = new QDoubleSpinBox(body);
-    distance_->setRange(0.1, 1000);
-    distance_->setValue(3);
-    lineWidth_ = new QDoubleSpinBox(body);
-    lineWidth_->setObjectName("fiberCollectionLineWidth");
-    lineWidth_->setRange(0.5, 12);
-    lineWidth_->setDecimals(1);
-    lineWidth_->setSingleStep(0.5);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    minLength_->setValue(settings.value("fiberCollections/minLengthMm", 0.0).toDouble());
-    maxDisplayed_ = new QSpinBox(body);
-    maxDisplayed_->setObjectName("fiberCollectionMaxDisplayed");
-    maxDisplayed_->setRange(0, 10000000);
-    maxDisplayed_->setSpecialValueText(tr("All"));
-    maxDisplayed_->setSingleStep(100);
-    maxDisplayed_->setValue(settings.value("fiberCollections/maxDisplayed", 1000).toInt());
-    maxDisplayed_->setToolTip(tr("Maximum visible fibers in each viewport, sampled only among fibers intersecting its current slice. Stable random priorities. 0 shows all. A visible selected fiber is included within this limit."));
-    lineWidth_->setValue(settings.value("fiberCollections/lineWidth", 3.0).toDouble());
-    filterForm->addRow(tr("Minimum length (mm)"), minLength_);
-    filtersLayout->addLayout(filterForm);
-    form->addRow(tr("Max displayed fibers"), maxDisplayed_);
-    form->addRow(tr("Slice distance ± (L0 vx)"), distance_);
-    form->addRow(tr("Line width (px)"), lineWidth_);
-    displayLayout->addLayout(form);
-    horizontal_ = new QCheckBox(tr("Horizontal"), body);
-    horizontal_->setObjectName("fiberCollectionHorizontal");
-    horizontal_->setChecked(settings.value("fiberCollections/showHorizontal", true).toBool());
-    vertical_ = new QCheckBox(tr("Vertical"), body);
-    vertical_->setObjectName("fiberCollectionVertical");
-    vertical_->setChecked(settings.value("fiberCollections/showVertical", true).toBool());
-    auto* orientations = new QHBoxLayout;
-    orientations->addWidget(horizontal_);
-    orientations->addWidget(vertical_);
-    filtersLayout->addLayout(orientations);
-    rainbow_ = new QCheckBox(tr("Rainbow colors"), body);
-    rainbow_->setObjectName("fiberCollectionRainbow");
-    rainbow_->setChecked(settings.value("fiberCollections/rainbowColors", false).toBool());
-    displayLayout->addWidget(rainbow_);
-    auto* fibersLayout = addSection(tr("Fibers · longest first"), 1);
-    list_ = new QListWidget(body);
-    list_->setObjectName("fiberCollectionList");
-    list_->setMinimumHeight(120);
-    list_->setToolTip(tr("Click a fiber to select it and focus the main views."));
-    fibersLayout->addWidget(list_, 1);
-    next_ = new QPushButton(tr("Next page"), body);
-    next_->setObjectName("fiberCollectionNextPage");
-    auto* pages = new QHBoxLayout;
-    auto* first = new QPushButton(tr("First page"), body);
-    first->setObjectName("fiberCollectionFirstPage");
-    pages->addWidget(first);
-    pages->addWidget(next_);
-    fibersLayout->addLayout(pages);
-    connect(first, &QPushButton::clicked, this, [this]() { listPage(true); });
-    idInput_ = new QLineEdit(body);
-    idInput_->setObjectName("fiberCollectionIdInput");
-    idInput_->setPlaceholderText(tr("Fiber ID · Enter to select"));
-    fibersLayout->addWidget(idInput_);
-    openAnnotation_ = new QPushButton(tr("Open in Line Annotation"), body);
-    openAnnotation_->setObjectName("fiberCollectionOpenAnnotation");
-    openAnnotation_->setEnabled(false);
-    fibersLayout->addWidget(openAnnotation_);
-    annotationStatus_ = new QLabel(body);
-    annotationStatus_->setObjectName("fiberCollectionAnnotationStatus");
-    annotationStatus_->setWordWrap(true);
-    annotationStatus_->hide();
-    fibersLayout->addWidget(annotationStatus_);
-    auto* selectionLayout = addSection(tr("Selection"), 0, &selectionSeparator_);
-    selectionSection_ = selectionLayout->parentWidget();
-    selectionSection_->setObjectName("fiberCollectionSelectionSection");
-    selection_ = new QLabel(tr("Click a trace to select it in the list."), body);
-    selection_->setObjectName("fiberCollectionSelection");
-    selection_->setWordWrap(true);
-    selectionLayout->addWidget(selection_);
-    along_ = new QSlider(Qt::Horizontal, body);
-    along_->setEnabled(false);
-    selectionLayout->addWidget(along_);
-    dock_->setWidget(body);
-    window->addDockWidget(Qt::RightDockWidgetArea, dock_);
-    dock_->hide();
-    connect(open, &QPushButton::clicked, this, [this]() {
-        // macOS hides the native file-type selector when there is only one filter.
-        const auto path = QFileDialog::getOpenFileName(
-            dock_, tr("Open Automated Fiber Volume (.afv)"), {},
-            tr("Automated Fiber Volume (*.afv);;All files (*)"));
-        if (!path.isEmpty())
-            openCollection(path);
+    options_.minLengthMm = settings.value("fiberCollections/minLengthMm", 0.0).toDouble();
+    options_.maxDisplayed = settings.value("fiberCollections/maxDisplayed", 5000).toInt();
+    options_.lineWidth = settings.value("fiberCollections/lineWidth", 3.0).toDouble();
+    options_.horizontal = settings.value("fiberCollections/showHorizontal", true).toBool();
+    options_.vertical = settings.value("fiberCollections/showVertical", true).toBool();
+    options_.rainbow = settings.value("fiberCollections/rainbowColors", false).toBool();
+    options_.showFibers = settings.value("fiberCollections/showFibers", true).toBool();
+    options_.showLinked = settings.value("fiberCollections/showLinked", false).toBool();
+    options_.sliceDistance = settings.value("fiberCollections/sliceDistance", 3.0).toDouble();
+    connect(state_, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        // Sync/lease status is not a data change. Pulled edits arrive through
+        // Committed events; status-only events must preserve warm views/selection.
+        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
+        if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
+            event.attachment != state_->storeFor("fiber")) return;
+        if (!event.touches({"fiber", "fiber_branch", "volume_transform", "volume_transform_choice"})) return;
+        projectChanged(event.kind == vc::objects::StoreSessionEvent::Kind::Committed);
     });
-    connect(visible_, &QCheckBox::toggled, this, [this]() { invalidate(); });
-    connect(minLength_, &QDoubleSpinBox::valueChanged, this, [this](double length) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue("fiberCollections/minLengthMm", length);
-        invalidate();
-        listPage(true);
-    });
-    auto updateFamilies = [this]() {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue("fiberCollections/showHorizontal", horizontal_->isChecked());
-        settings.setValue("fiberCollections/showVertical", vertical_->isChecked());
-        invalidate();
-        listPage(true);
-    };
-    connect(horizontal_, &QCheckBox::toggled, this, updateFamilies);
-    connect(vertical_, &QCheckBox::toggled, this, updateFamilies);
-    connect(maxDisplayed_, &QSpinBox::valueChanged, this, [this](int maximum) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue("fiberCollections/maxDisplayed", maximum);
-        invalidate();
-    });
-    connect(distance_, &QDoubleSpinBox::valueChanged, this, [this]() { invalidate(); });
-    connect(lineWidth_, &QDoubleSpinBox::valueChanged, this, [this](double width) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue("fiberCollections/lineWidth", width);
-        refreshAll();
-    });
-    connect(rainbow_, &QCheckBox::toggled, this, [this](bool checked) {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.setValue("fiberCollections/rainbowColors", checked);
-        refreshAll();
-    });
-    connect(next_, &QPushButton::clicked, this, [this]() { listPage(false); });
-    connect(list_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
-        const auto id = item->data(Qt::UserRole).toLongLong();
-        const bool open = lineAnnotationActive_ || annotationBusy_ || pendingAnnotation_;
-        selectFiber(id, !open, open);
-    });
-    connect(openAnnotation_, &QPushButton::clicked, this, [this]() {
-        if (selected_ > 0)
-            showInLineAnnotation(selected_);
-    });
-    connect(idInput_, &QLineEdit::returnPressed, this, [this]() {
-        bool ok = false;
-        const auto id = idInput_->text().toLongLong(&ok);
-        if (ok)
-            selectFiber(id, !lineAnnotationActive_, lineAnnotationActive_);
-    });
-    connect(along_, &QSlider::valueChanged, this, &FiberCollectionController::navigate);
-    connect(detach_, &QPushButton::clicked, this, [this]() {
-        const auto file = attachmentPath();
-        clear();
-        QFile::remove(file);
-    });
-    connect(state_, &CState::volumeChanged, this, [this]() { volumeChanged(); });
+    connect(state_, &CState::volumeChanged, this, [this]() { projectChanged(); });
+    connect(state_, &CState::storeRoutesChanged, this, [this]() { projectChanged(); });
     connect(state_, &CState::volumeClosing, this, [this]() { clear(); });
     bindToViewerManager(manager);
 }
 FiberCollectionController::~FiberCollectionController()
 {
     for (auto& [v, s] : views_)
-        if (s->cancelled)
-            s->cancelled->store(true);
+        if (s->region.cancelled)
+            s->region.cancelled->store(true);
+}
+void FiberCollectionController::setOptions(const FiberDisplayOptions& options)
+{
+    if (options == options_) return;
+    const auto previous = std::exchange(options_, options);
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue("fiberCollections/minLengthMm", options_.minLengthMm);
+    settings.setValue("fiberCollections/maxDisplayed", options_.maxDisplayed);
+    settings.setValue("fiberCollections/lineWidth", options_.lineWidth);
+    settings.setValue("fiberCollections/showHorizontal", options_.horizontal);
+    settings.setValue("fiberCollections/showVertical", options_.vertical);
+    settings.setValue("fiberCollections/rainbowColors", options_.rainbow);
+    settings.setValue("fiberCollections/showFibers", options_.showFibers);
+    settings.setValue("fiberCollections/showLinked", options_.showLinked);
+    settings.setValue("fiberCollections/sliceDistance", options_.sliceDistance);
+    const bool filters = previous.minLengthMm != options_.minLengthMm ||
+                         previous.horizontal != options_.horizontal || previous.vertical != options_.vertical;
+    if (filters || previous.maxDisplayed != options_.maxDisplayed || previous.sliceDistance != options_.sliceDistance ||
+        previous.showLinked != options_.showLinked || previous.showFibers != options_.showFibers)
+        invalidate();
+    else
+        refreshAll();
+    if (filters)
+        listPage(true);
 }
 void FiberCollectionController::setLineAnnotationActive(bool active)
 {
     lineAnnotationActive_ = active;
-    list_->setToolTip(active
-        ? tr("Click a fiber to open its flattened view in Line Annotation.")
-        : tr("Click a fiber to select it and focus the main views."));
-    openAnnotation_->setVisible(!active);
-    selectionSection_->setVisible(!active);
-    selectionSeparator_->setVisible(!active);
+}
+void FiberCollectionController::publishStatus(const QString& text)
+{
+    emit statusChanged(state_->storeFor("fiber").has_value(), text);
+}
+void FiberCollectionController::publishSelection(Selection selection)
+{
+    selection_ = std::move(selection);
+    emit selectionChanged(selection_);
 }
 void FiberCollectionController::clear()
 {
@@ -367,263 +332,221 @@ void FiberCollectionController::clear()
     for (const auto& connection : annotationRenderConnections_)
         disconnect(connection);
     annotationRenderConnections_.clear();
-    annotationStatus_->clear();
-    annotationStatus_->hide();
     press_.reset();
     click_.reset();
     enabled_ = false;
-    detach_->setEnabled(false);
-    openAnnotation_->setEnabled(false);
     selected_ = 0;
+    selectedPin_.reset();
+    selectedBound_ = false;
     pendingAnnotation_ = 0;
-    path_.clear();
-    attachment_.clear();
-    uuid_.clear();
-    coordinateSpace_.clear();
+    catalogCursor_.reset();
     for (auto& [v, s] : views_) {
-        if (s->cancelled)
-            s->cancelled->store(true);
-        s->blocks.clear();
+        s->region.reset();
+        s->runs.clear();
+        s->controls.clear();
+        s->rings.clear();
+        s->linkGroups.clear();
+        s->chains.clear();
+        s->chainBox.reset();
         s->hits.clear();
-        s->requested.reset();
+        s->controlHits.clear();
         s->displayed.reset();
-        s->coverage.reset();
-        s->coverageSlice.reset();
-        s->pendingBounds.reset();
-        s->reader.reset();
         s->dirty = true;
     }
     catalogPending_ = false;
     pendingIndex_.reset();
-    list_->clear();
-    along_->setEnabled(false);
-    status_->setText(tr("No Automated Fiber Volume open."));
-    selection_->clear();
+    emit catalogChanged({}, false);
+    emit annotationStatusChanged({});
+    publishSelection({});
+    publishStatus(tr("No object store attached."));
     refreshAll();
 }
-QString FiberCollectionController::attachmentPath() const
+void FiberCollectionController::projectChanged(bool preserveSelection)
 {
-    const auto path = state_->vpkg() ? QString::fromStdString(state_->vpkg()->path().string()) : QString{};
-    if (path.isEmpty())
-        return {};
-    return QFileInfo(path).isDir() ? path + "/fiber-collection.json" : path + ".fiber-collection.json";
-}
-void FiberCollectionController::projectChanged()
-{
-    const auto attached = attachmentPath();
-    clear();
-    QFile file(attached);
-    if (file.open(QIODevice::ReadOnly)) {
-        try {
-            const auto data = Json::parse(file.readAll().toStdString());
-            if (data.at("version").get<int>() != 1)
-                throw std::runtime_error("Unsupported Automated Fiber Volume attachment version");
-            const auto storedPath = QString::fromStdString(data.at("path").get<std::string>());
-            // Preserve absolute network paths (including Windows UNC shares).
-            // Only relative attachments are resolved against the project folder.
-            const auto path = QDir::isAbsolutePath(storedPath)
-                ? storedPath : QFileInfo(attached).dir().absoluteFilePath(storedPath);
-            openCollection(path, false, data.at("uuid").get<std::string>());
-        } catch (const std::exception& e) {
-            status_->setText(QString::fromUtf8(e.what()));
-        }
+    if (!preserveSelection) clear();
+    else ++revision_;
+    const auto connection = state_->objectStoreSession();
+    const auto attachment = state_->storeFor("fiber");
+    const auto volume = state_->currentVolume();
+    if (!attachment || !annotations_) return;
+    catalogCursor_.reset();
+    if (preserveSelection) {
+        // A commit revises the views in place: each keeps drawing what it has
+        // until the replacement lands, so an edit never blanks the overlay.
+        refreshRegions();
+    } else {
+        enabled_ = false;
+        invalidate();
+        publishStatus(tr("Reading fiber catalog metadata…"));
+        nativeVoxelMm_ = volume ? volume->voxelSize()/1000. : 1.;
     }
-}
-void FiberCollectionController::volumeChanged()
-{
-    // Another volume of the same scan keeps the open collection, its selection
-    // and caches; only the native-to-viewer factor may differ.
-    if (enabled_ && state_->currentVolume() && state_->vpkg() && attachment_ == attachmentPath()) {
-        const auto identity = vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId());
-        if (identity && identity->coordinateSpace == coordinateSpace_ && identity->sourceOriginalResolution == sourceResolution_) {
-            const double factor = 1.0 / double(identity->sourceCoordinateScaleFactor);
-            if (factor != nativeToViewer_) {
-                nativeToViewer_ = factor;
-                invalidate();
-            }
-            return;
-        }
-    }
-    projectChanged();
-}
-void FiberCollectionController::openCollection(const QString& path, bool persist, const std::string& expectedUuid)
-{
-    clear();
-    // Restoring the project's attachment leaves the dock as the user left it.
-    if (persist)
-        dock_->show();
-    if (!state_->currentVolume() || !state_->vpkg()) {
-        status_->setText(tr("Open the CT volume first."));
-        return;
-    }
-    const auto identity = vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId());
-    if (!identity) {
-        status_->setText(tr("This volume has no verified coordinate identity. Attach a volume with coordinate metadata first."));
-        return;
-    }
-    path_ = QFileInfo(path).absoluteFilePath();
-    const auto file = path_.toStdString();
     const auto rev = revision_;
-    status_->setText(tr("Opening volume…"));
-    background<Json>(
-        this,
-        [file, identity, expectedUuid]() {
-            FiberCollection c(file);
-            Json info;
-            for (const auto* k : {"uuid", "frame", "fiber_count", "point_count"})
-                info[k] = Json::parse(c.metadata(k));
-            const auto uuid = info.at("uuid").get<std::string>();
-            if (!expectedUuid.empty() && expectedUuid != uuid)
-                throw std::runtime_error(
-                    "The Automated Fiber Volume has been replaced (UUID mismatch). Open the new file explicitly.");
-            if (uuid.empty() || info.at("fiber_count").get<int64_t>() < 0)
-                throw std::runtime_error("Invalid Automated Fiber Volume metadata");
-            const auto& frame = info.at("frame");
-            if (frame.at("vc_open_data_coordinate_space").get<std::string>() != identity->coordinateSpace ||
-                frame.value("vc_open_data_source_coordinate_level", 0) != 0 || frame.value("vc_open_data_source_coordinate_scale_factor", 1) != 1)
-                throw std::runtime_error("Automated Fiber Volume and CT coordinate frames do not match.");
-            return info;
+    background<int64_t>(this,
+        [connection, attachment=*attachment] {
+            int64_t count = 0;
+            connection->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                count = db.objectCount(txn, "fiber");
+            });
+            return count;
         },
-        [this, rev, identity, persist](const Outcome<Json>& result) {
-            if (rev != revision_)
-                return;
-            if (!result.error.isEmpty()) {
-                status_->setText(result.error);
-                return;
-            }
-            nativeToViewer_ = 1.0 / double(identity->sourceCoordinateScaleFactor);
-            // Collection lengths are L0 voxels; the identity resolution is in
-            // micrometres, independent of the displayed pyramid/zoom level.
-            nativeVoxelMm_ = identity->sourceOriginalResolution / 1000.0;
-            coordinateSpace_ = identity->coordinateSpace;
-            sourceResolution_ = identity->sourceOriginalResolution;
-            attachment_ = attachmentPath();
-            uuid_ = result.value.at("uuid").get<std::string>();
-            totalFibers_ = result.value.at("fiber_count").get<int64_t>();
-            enabled_ = true;
-            detach_->setEnabled(true);
-            status_->setToolTip(path_ + "\n" + QString::fromStdString(uuid_));
-            status_->setText(tr("%1 fibers · native geometry · read only").arg(result.value.at("fiber_count").get<int64_t>()));
-            if (persist && !attachmentPath().isEmpty()) {
-                const auto base = std::filesystem::path(attachmentPath().toStdString()).parent_path();
-                std::error_code ec;
-                auto relative = std::filesystem::relative(path_.toStdString(), base, ec);
-                Json attachment = {{"version", 1}, {"path", ec ? path_.toStdString() : relative.string()}, {"uuid", uuid_}};
-                QSaveFile out(attachmentPath());
-                if (!out.open(QIODevice::WriteOnly) || out.write(attachment.dump().c_str()) < 0 || !out.commit())
-                    status_->setText(tr("Volume opened; its attachment to the project could not be saved."));
-            }
+        [this, rev, preserveSelection](Outcome<int64_t> result) {
+            if (rev != revision_) return;
+            if (!result.error.isEmpty()) { publishStatus(result.error); return; }
+            totalFibers_ = result.value;
+            const bool wasEnabled = std::exchange(enabled_, true);
             listPage(true);
-            invalidate();
+            if (wasEnabled) publishCount();
+            else invalidate();
+            if (preserveSelection && selected_ > 0) selectFiber(selected_, false, false);
         });
+}
+void FiberCollectionController::publishCount()
+{
+    publishStatus(options_.maxDisplayed
+        ? tr("%1 fibers in store · up to %2 visible per view").arg(totalFibers_).arg(options_.maxDisplayed)
+        : tr("%1 fibers in store · all visible fibers").arg(totalFibers_));
 }
 void FiberCollectionController::invalidate()
 {
     if (enabled_)
-        status_->setText(maxDisplayed_->value()
-            ? tr("%1 fibers in volume · up to %2 visible per view").arg(totalFibers_).arg(maxDisplayed_->value())
-            : tr("%1 fibers in volume · all visible fibers").arg(totalFibers_));
+        publishCount();
     for (auto& [v, s] : views_) {
-        if (s->cancelled)
-            s->cancelled->store(true);
-        s->requested.reset();
+        s->region.reset();
         s->displayed.reset();
-        s->coverage.reset();
-        s->coverageSlice.reset();
-        s->pendingBounds.reset();
-        s->blocks.clear();
+        s->runs.clear();
+        s->controls.clear();
+        s->rings.clear();
+        s->linkGroups.clear();
+        s->chains.clear();
+        s->chainBox.reset();
         s->hits.clear();
+        s->controlHits.clear();
+        s->dirty = true;
+    }
+    clearPointChainProjectionCache();
+    refreshAll();
+}
+void FiberCollectionController::refreshRegions()
+{
+    for (auto& [v, s] : views_) {
+        s->region.refresh();
+        s->chainBox.reset();
         s->dirty = true;
     }
     refreshAll();
 }
-vc::fibers::FamilyFilter FiberCollectionController::familyFilter() const
+std::optional<std::string> FiberCollectionController::familyFilter() const
 {
-    using vc::fibers::FamilyFilter;
-    if (horizontal_->isChecked() && vertical_->isChecked()) return FamilyFilter::All;
-    if (horizontal_->isChecked()) return FamilyFilter::Horizontal;
-    if (vertical_->isChecked()) return FamilyFilter::Vertical;
-    return FamilyFilter::None;
+    if (options_.horizontal && !options_.vertical) return std::string{"H"};
+    if (options_.vertical && !options_.horizontal) return std::string{"V"};
+    return std::nullopt;
+}
+bool FiberCollectionController::noFamilies() const
+{
+    return !options_.horizontal && !options_.vertical;
+}
+void FiberCollectionController::firstPage()
+{
+    listPage(true);
+}
+void FiberCollectionController::nextPage()
+{
+    listPage(false);
 }
 void FiberCollectionController::listPage(bool reset)
 {
-    if (!enabled_)
-        return;
-    if (reset) {
-        lastRow_ = 0;
-        lastLength_ = std::numeric_limits<double>::infinity();
-        list_->clear();
-    }
-    if (catalogBusy_) {
-        catalogPending_ = true;
-        return;
-    }
-    const auto after = lastRow_;
-    const auto beforeLength = lastLength_;
+    if (!enabled_) return;
+    if (reset) catalogCursor_.reset();
+    if (catalogBusy_) { catalogPending_ = true; catalogPendingReset_ = catalogPendingReset_ || reset; return; }
     const auto rev = revision_;
-    const double minMm = minLength_->value();
-    const double min = minMm / nativeVoxelMm_;
-    const auto family = familyFilter();
-    const auto path = path_.toStdString();
+    const auto volume = state_->currentVolume();
+    // Longest first in the active volume's voxels, then fibers not bound to it.
+    vc::objects::ObjectSelection selection;
+    selection.kind = "fiber";
+    selection.orderBy = "length_desc";
+    selection.limit = kCatalogPageSize;
+    selection.family = familyFilter();
+    if (options_.minLengthMm > 0) selection.minLength = options_.minLengthMm / nativeVoxelMm_;
+    if (volume) {
+        // In the open volume's voxels: its store volume at its scale.
+        const auto& target = *state_->annotationVolume();
+        selection.volume = target.volume;
+        selection.targetScale = target.scale;
+        selection.includeUnbound = true;
+    }
+    if (catalogCursor_) {
+        selection.afterUuid = catalogCursor_->uuid;
+        selection.afterLength = catalogCursor_->length;
+    }
+    const auto filters = std::tuple{options_.minLengthMm, options_.horizontal, options_.vertical};
     catalogBusy_ = true;
-    next_->setEnabled(false);
-    background<std::vector<vc::fibers::Summary>>(
-        this,
-        [path, after, beforeLength, min, family]() { return FiberCollection(path).catalogByLength(beforeLength, after, 200, min, family); },
-        [this, rev, minMm, after, beforeLength, family](const Outcome<std::vector<vc::fibers::Summary>>& result) {
+    background<std::vector<CatalogRow>>(this,
+        [connection=state_->objectStoreSession(), attachment=*state_->storeFor("fiber"),
+         selection, none=noFamilies()]() {
+            std::vector<CatalogRow> rows;
+            if (none) return rows;
+            connection->read(attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
+                std::vector<std::string> uuids;
+                const auto transforms = db.volumeTransforms(txn);
+                for (auto& record : db.selectObjects(txn, selection, std::vector<std::string>{"name", "tags", "fiber", "meta"})) {
+                    CatalogRow row;
+                    if (selection.volume)
+                        row.mapping = transforms.toVolume(Json::parse(record.meta), *selection.volume, selection.targetScale);
+                    uuids.push_back(record.uuid);
+                    row.record = std::move(record);
+                    rows.push_back(std::move(row));
+                }
+                if (rows.empty()) return;
+                std::map<std::string, CatalogRow*> byUuid;
+                for (auto& row : rows) byUuid[row.record.uuid] = &row;
+                vc::objects::EdgeSelection edges;
+                edges.kind = "fiber_branch";
+                edges.endpointUuids = uuids;
+                for (const auto& edge : db.selectEdges(txn, edges, std::vector<std::string>{"approval_state"})) {
+                    for (const auto& endpoint : {edge.aUuid, edge.bUuid}) {
+                        const auto found = byUuid.find(endpoint);
+                        if (found == byUuid.end()) continue;
+                        ++found->second->links;
+                        if (edge.approvalState != "approved") ++found->second->pendingLinks;
+                    }
+                }
+                for (auto& row : rows)
+                    if (row.links > 0)
+                        row.componentSize = int(db.componentOf(txn, row.record.uuid, {"fiber_branch"}, &cancelled).size());
+            });
+            return rows;
+        },
+        [this, rev, filters, volume=bool(volume)](Outcome<std::vector<CatalogRow>> result) {
             catalogBusy_ = false;
             if (catalogPending_) {
                 catalogPending_ = false;
-                listPage(false);
+                listPage(std::exchange(catalogPendingReset_, false));
                 return;
             }
-            if (rev != revision_ || minMm != minLength_->value() || family != familyFilter() || after != lastRow_ || beforeLength != lastLength_)
-                return;
-            if (!result.error.isEmpty()) {
-                status_->setText(result.error);
-                return;
+            if (rev != revision_ || filters != std::tuple{options_.minLengthMm, options_.horizontal, options_.vertical}) return;
+            if (!result.error.isEmpty()) { publishStatus(result.error); return; }
+            auto& rows = result.value;
+            if (!rows.empty()) {
+                // A bound row resumes by the volume length the store ordered it by;
+                // an unbound one by UUID alone.
+                const auto& last = rows.back();
+                const double stored = last.record.fiber ? last.record.fiber->length : 0.0;
+                catalogCursor_ = CatalogCursor{last.record.uuid, !volume ? std::optional(stored) : last.record.volumeLength};
             }
-            list_->clear();
-            for (const auto& s : result.value) {
-                auto* row =
-                    new QListWidgetItem(tr("%1 mm · #%2 · %3").arg(s.length * nativeVoxelMm_, 0, 'f', 2).arg(s.id).arg(QString::fromStdString(s.family)), list_);
-                row->setData(Qt::UserRole, qlonglong(s.id));
-                row->setToolTip(tr("%1 points").arg(s.pointCount));
-                lastRow_ = s.id;
-                lastLength_ = s.length;
-            }
-            highlightListFiber(selected_);
-            next_->setEnabled(result.value.size() == 200);
+            const bool more = rows.size() == size_t(kCatalogPageSize);
+            emit catalogChanged(std::move(rows), more);
         });
 }
-bool FiberCollectionController::highlightListFiber(int64_t id)
+void FiberCollectionController::activateFiber(int64_t id)
 {
-    for (int i = 0; i < list_->count(); ++i) {
-        auto* row = list_->item(i);
-        if (row->data(Qt::UserRole).toLongLong() != id)
-            continue;
-        // Programmatic selection must never open an annotation.
-        const QSignalBlocker block(list_);
-        list_->setCurrentItem(row);
-        list_->scrollToItem(row);
-        return true;
-    }
-    return false;
-}
-void FiberCollectionController::revealListFiber(const vc::fibers::Summary& summary)
-{
-    if (highlightListFiber(summary.id) && !catalogBusy_ && !catalogPending_)
-        return;
-    // Seek directly to this fiber in the length-sorted catalog. The first
-    // row is inclusive; Next page continues from the actual final row.
-    lastLength_ = summary.length;
-    lastRow_ = summary.id - 1;
-    listPage(false);
+    selectFiber(id, !lineAnnotationActive_, false);
 }
 void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool openAnnotation)
 {
-    if (!enabled_ || id <= 0)
+    const auto uuid = annotations_ ? annotations_->fiberUuidForId(uint64_t(id)) : std::string{};
+    if (!enabled_ || id <= 0 || uuid.empty())
         return;
+    const std::optional<int> previousIndex = selected_ == id && !focusView ? std::optional(selection_.index) : std::nullopt;
     selected_ = id;
     ++navigationRevision_;
     pendingIndex_.reset();
@@ -632,64 +555,90 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
     for (const auto& connection : annotationRenderConnections_)
         disconnect(connection);
     annotationRenderConnections_.clear();
-    annotationStatus_->setVisible(openAnnotation);
-    if (openAnnotation)
-        annotationStatus_->setText(tr("Loading fiber #%1…").arg(id));
-    highlightListFiber(id);
+    emit annotationStatusChanged(openAnnotation ? tr("Loading fiber #%1…").arg(id) : QString());
     const auto token = ++selectionRevision_;
     const auto rev = revision_;
-    along_->setEnabled(false);
-    openAnnotation_->setEnabled(false);
-    selection_->setText(tr("Loading fiber #%1…").arg(id));
-    const auto path = path_.toStdString();
-    background<vc::fibers::Summary>(
+    publishSelection({id, tr("Loading fiber #%1…").arg(id), {}, 0, 0, false});
+    const vc::objects::VolumeVoxels volume = state_->annotationVolume().value_or(vc::project::AnnotationVolume{});
+    background<SelectedFiber>(
         this,
-        [path, id]() { return FiberCollection(path).summary(id); },
-        [this, token, rev, focusView, openAnnotation](const Outcome<vc::fibers::Summary>& result) {
-            if (rev != revision_ || token != selectionRevision_)
-                return;
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),uuid,volume]() {
+            SelectedFiber selected;
+            connection->read(attachment,[&](const auto& db,const auto& txn,const auto&) {
+                const auto revision=db.currentObjectRevision(txn,uuid);
+                if (!revision || revision->record.retired || !revision->record.fiber)
+                    throw std::runtime_error("Fiber is no longer available");
+                auto& row=selected.row;
+                selected.pin={attachment,{attachment.storeUuid,uuid},revision->uuid,revision->geometryRevision};
+                row.record=revision->record;
+                if (!volume.volume.empty())
+                    row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volume.volume, volume.scale);
+                if (row.mapping) selected.volumeLength = db.geometryLengthInVolume(txn, uuid, volume.volume, volume.scale);
+                const auto& fiber=*row.record.fiber;
+                selected.pointCount=fiber.linePointCount ? fiber.linePointCount : fiber.controlPointCount;
+            });
+            return selected;
+        },
+        [this, id, token, rev, focusView, openAnnotation, previousIndex](const Outcome<SelectedFiber>& result) {
+            if (rev != revision_ || token != selectionRevision_) return;
             if (!result.error.isEmpty()) {
-                selection_->setText(result.error);
-                if (openAnnotation) annotationStatus_->setText(result.error);
+                publishSelection({id, result.error, {}, 0, 0, false});
+                if (openAnnotation) emit annotationStatusChanged(result.error);
                 return;
             }
-            const auto& s = result.value;
-            revealListFiber(s);
-            selection_->setToolTip(QString::fromStdString(s.name));
-            selection_->setText(
-                tr("#%1 · %2 points · %3 mm\nFollow the complete stored fiber with the slider.").arg(s.id).arg(s.pointCount).arg(s.length * nativeVoxelMm_, 0, 'f', 2));
-            const QSignalBlocker block(along_);
-            along_->setRange(0, int(std::min<int64_t>(s.pointCount - 1, std::numeric_limits<int>::max())));
-            const int centerIndex = along_->maximum() / 2;
-            along_->setValue(centerIndex);
-            along_->setEnabled(true);
-            openAnnotation_->setEnabled(annotations_ != nullptr);
-            openAnnotation_->setToolTip(tr("Open fiber #%1 in Line Annotation.").arg(s.id));
-            invalidate();
+            const auto& row = result.value.row;
+            // Region queries rank the selected fiber first; re-selecting the
+            // same fiber (after a commit) leaves them as they are.
+            const bool reselected = selectedPin_ && selectedPin_->object == result.value.pin.object;
+            selectedPin_ = result.value.pin;
+            selectedBound_ = row.mapping.has_value();
+            emit fiberRevealed(row);
+            const auto pointCount = result.value.pointCount;
+            const double length = result.value.volumeLength.value_or(-1.0);
+            Selection selection;
+            selection.id = id;
+            selection.toolTip = QString::fromStdString(row.record.name);
+            selection.text = length < 0 ? tr("#%1 · %2 points · coordinate binding required").arg(id).arg(pointCount)
+                : tr("#%1 · %2 points · %3 mm\nFollow the complete stored fiber with the slider.").arg(id).arg(pointCount).arg(length * nativeVoxelMm_, 0, 'f', 2);
+            selection.pointCount = pointCount;
+            const int last = int(std::min<int64_t>(pointCount - 1, std::numeric_limits<int>::max()));
+            selection.index = previousIndex ? std::clamp(*previousIndex, 0, std::max(last, 0)) : std::max(last, 0) / 2;
+            selection.openable = annotations_ != nullptr;
+            publishSelection(selection);
+            if (!reselected) refreshRegions();
             if (focusView)
-                navigate(centerIndex);
-            refreshAll();
+                navigate(selection.index);
             if (openAnnotation)
-                showInLineAnnotation(s.id);
+                showInLineAnnotation(id);
         });
 }
 void FiberCollectionController::navigate(int index)
 {
-    if (!selected_ || !enabled_)
-        return;
+    if (!selected_ || !enabled_ || !selectedPin_) return;
+    selection_.index = index;
+    if (!selectedBound_) selectedBound_ = annotations_->ensureFiberInVolume(uint64_t(selected_), true);
+    if (!selectedBound_) return;
     ++navigationRevision_;
     pendingIndex_ = index;
     if (navigationBusy_)
         return;
     navigationBusy_ = true;
     pendingIndex_.reset();
-    const auto id = selected_;
     const auto rev = revision_;
     const auto token = navigationRevision_;
-    const auto path = path_.toStdString();
     background<Point>(
         this,
-        [path, id, index]() { return FiberCollection(path).point(id, index); },
+        [connection=state_->objectStoreSession(),pin=*selectedPin_,index,
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{}))]() {
+            Point point{};
+            connection->read(pin.attachment,[&](const auto& db,const auto& txn,const auto&) {
+                // The fiber's point in the volume's voxels, through the store's mapping.
+                const auto fiber=vc::objects::GeometrySnapshot(db,txn).fiber(pin.object.objectUuid);
+                const auto shown=fiber.viewTransformedAt(volume.volume,volume.scale);
+                const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
+                point=shown.points(name,index,1).front();
+            });return point;
+        },
         [this, rev, token](const Outcome<Point>& result) {
             navigationBusy_ = false;
             if (pendingIndex_) {
@@ -701,47 +650,21 @@ void FiberCollectionController::navigate(int index)
             if (rev != revision_ || token != navigationRevision_)
                 return;
             if (!result.error.isEmpty()) {
-                selection_->setText(result.error);
+                auto selection = selection_;
+                selection.text = result.error;
+                publishSelection(selection);
                 return;
             }
-            manager_->centerFocusAt(cvpoint(result.value, nativeToViewer_), {0, 0, 1}, "fiber-collection");
+            manager_->centerFocusAt(cvpoint(result.value), {0, 0, 1}, "fiber-collection");
         });
 }
 std::optional<FiberCollectionController::Slice> FiberCollectionController::slice(VolumeViewerBase* viewer) const
 {
-    if (!dynamic_cast<PlaneSurface*>(viewer->currentSurface()))
-        return std::nullopt;
-    const auto rect = visibleSceneRect(viewer);
-    if (rect.isEmpty())
-        return std::nullopt;
-    Slice s;
-    s.origin = point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_);
-    const auto x = point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_);
-    const auto y = point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_);
-    try {
-        s.u = normalized(sub(x, s.origin));
-        s.v = normalized(sub(y, s.origin));
-        s.n = normalized({s.u[1] * s.v[2] - s.u[2] * s.v[1], s.u[2] * s.v[0] - s.u[0] * s.v[2], s.u[0] * s.v[1] - s.u[1] * s.v[0]});
-    } catch (...) {
-        return std::nullopt;
-    }
-    const double d = distance_->value();
-    s.local = {{0, 0, -d}, {std::sqrt(dot(sub(x, s.origin), sub(x, s.origin))), std::sqrt(dot(sub(y, s.origin), sub(y, s.origin))), d}};
-    s.box.lower.fill(std::numeric_limits<double>::infinity());
-    s.box.upper.fill(-std::numeric_limits<double>::infinity());
-    for (double a : {0.0, s.local.upper[0]})
-        for (double b : {0.0, s.local.upper[1]})
-            for (double c : {-d, d})
-                for (int i = 0; i < 3; ++i) {
-                    const double p = s.origin[i] + a * s.u[i] + b * s.v[i] + c * s.n[i];
-                    s.box.lower[i] = std::min(s.box.lower[i], p);
-                    s.box.upper[i] = std::max(s.box.upper[i], p);
-                }
-    return s;
+    return planeViewRegion(viewer, options_.sliceDistance);
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return viewer && enabled_ && visible_->isChecked();
+    return viewer && enabled_ && options_.showFibers;
 }
 bool FiberCollectionController::needsOverlayRebuild(VolumeViewerBase* viewer) const
 {
@@ -749,8 +672,9 @@ bool FiberCollectionController::needsOverlayRebuild(VolumeViewerBase* viewer) co
     if (found == views_.end()) return true;
     const auto& v = *found->second;
     const auto current = slice(viewer);
+    if (!current) return true;
     return v.dirty || v.displayed != current || v.displayedRect != visibleSceneRect(viewer) ||
-        v.displayedWidth != lineWidth_->value() || v.displayedRainbow != rainbow_->isChecked() ||
+        v.displayedOptions != options_ ||
         v.displayedDpr != viewer->graphicsView()->viewport()->devicePixelRatioF();
 }
 void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s)
@@ -760,69 +684,115 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         ptr = std::make_unique<View>();
         viewer->graphicsView()->viewport()->installEventFilter(this);
     }
-    auto& v = *ptr;
-    const bool limited = maxDisplayed_->value() > 0;
-    if (!limited && v.complete && v.coverageSlice) {
-        // A complete region already contains all segments needed for a zoom
-        // or pan inside its prism; AABB containment is unsafe for oblique views.
-        if (v.coverageSlice->contains(s)) {
-            if (v.busy && v.cancelled) v.cancelled->store(true);
-            return;
-        }
-    }
-    if (v.requested && *v.requested == s)
-        return;
-    if (v.busy) {
-        // Let a query covering the new layer finish instead of restarting it.
-        if (v.cancelled && (limited || !v.pendingBounds || !contains(*v.pendingBounds, s.box)))
-            v.cancelled->store(true);
-        return;
-    }
-    v.busy = true;
-    v.dirty = true;
-    v.requested = s;
-    v.error.clear();
-    auto cancel = std::make_shared<std::atomic_bool>(false);
-    v.cancelled = cancel;
-    const auto rev = revision_;
-    const auto path = path_.toStdString();
-    const double min = minLength_->value() / nativeVoxelMm_;
+    const double min = options_.minLengthMm / nativeVoxelMm_;
     const auto family = familyFilter();
-    const auto maximum = maxDisplayed_->value();
-    const auto selected = selected_;
-    if (!v.reader) v.reader = std::make_shared<View::Reader>();
-    const auto reader = v.reader;
-    v.pendingBounds = s.box;
-    background<RegionResult>(
-        this,
-        [path, reader, s, min, cancel, maximum, selected, family]() {
-            if (!reader->collection)
-                reader->collection = std::make_unique<FiberCollection>(path, 32 * 1024 * 1024);
-            return RegionResult{reader->collection->viewRegion(s, 2, size_t(maximum), selected,
-                8 * 1024 * 1024, cancel.get(), min, family), s.box};
+    const auto maximum = options_.maxDisplayed;
+    const bool linked = options_.showLinked;
+    const bool started = vc3d::store::requestRegion<RegionResult>(this, ptr->region, s,
+        [this, viewer]() -> View* {
+            const auto found = views_.find(viewer);
+            return found == views_.end() ? nullptr : found->second.get();
         },
-        [this, viewer, rev, cancel, s](Outcome<RegionResult> result) {
-            auto found = views_.find(viewer);
-            if (found == views_.end() || found->second->cancelled != cancel)
-                return;
-            auto& v = *found->second;
-            v.busy = false;
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})),
+         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{},min,maximum,family,linked,
+         none=noFamilies()](const Slice& query, const std::atomic_bool& cancel) {
+            RegionResult result;
+            if (none || volume.volume.empty()) return result;
+            connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
+                const auto slice = vc3d::store::regionSlice(query);
+                vc::objects::RegionOptions options;
+                options.kind="fiber"; options.volume=volume.volume; options.targetScale=volume.scale; options.maximumObjects=maximum; options.minLength=min;
+                if (!selectedUuid.empty()) options.selected=selectedUuid;
+                options.family=family;
+                auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel.load() || cancelled.load(); });
+                result.complete = region.complete();
+                result.limited = region.stop == vc::objects::RegionStop::ObjectLimit;
+                // Runs arrive in volume voxels, merged in UUID order with the selected fiber first.
+                std::map<std::string, std::optional<std::string>> drawn;
+                for (auto& run : region.runs) {
+                    auto& sampledRevision = drawn[run.objectUuid];
+                    // Control points are annotation markers only on fibers drawn from a sampled line.
+                    if (run.arrayName == "line_points") sampledRevision = run.revisionUuid;
+                }
+                result.runs = std::move(region.runs);
+                if (drawn.empty()) return;
+                const auto mappings = volumeMappings(db, txn, drawn, volume);
+                std::vector<std::string> revisions, owners;
+                std::vector<vc::objects::VolumeAffine> ownerMappings;
+                for (const auto& [uuid, sampledRevision] : drawn)
+                    if (sampledRevision && mappings.contains(uuid)) {
+                        revisions.push_back(*sampledRevision);
+                        owners.push_back(uuid);
+                        ownerMappings.push_back(mappings.at(uuid));
+                    }
+                if (!revisions.empty()) {
+                    const auto controls = controlsInVolume(db, txn, revisions, ownerMappings);
+                    for (size_t i = 0; i < owners.size(); ++i)
+                        for (size_t k = 0; k < controls[i].size(); ++k) result.controls.push_back({owners[i], int(k), controls[i][k]});
+                }
+                if (!linked) return;
+                vc::objects::EdgeSelection edges;
+                edges.kind = "fiber_branch";
+                edges.endpointUuids.emplace();
+                for (const auto& [uuid, fiber] : drawn) edges.endpointUuids->push_back(uuid);
+                std::set<std::string> linkedUuids;
+                const auto links = db.selectEdges(txn, edges);
+                const auto sameFamily = sameFamilyTest(db, txn, links);
+                // One mark per linked control point, over every link on it.
+                std::map<std::pair<std::string, Point>, LinkMark> marks;
+                for (const auto& edge : links) {
+                    const bool sameHv = sameFamily(edge);
+                    for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
+                        // Anchors are in the fiber's stored frame.
+                        const auto mapping = mappings.find(endpoint);
+                        if (mapping == mappings.end()) continue;
+                        linkedUuids.insert(endpoint);
+                        if (!anchor.position) continue;
+                        marks[{endpoint, mapping->second.apply(*anchor.position)}].add(edge, sameHv);
+                    }
+                }
+                for (const auto& [key, mark] : marks) result.rings.push_back({key.second, mark});
+                std::set<std::string> drawnUuids;
+                for (const auto& [uuid, fiber] : drawn) drawnUuids.insert(uuid);
+                result.linkGroups = linkGroupsOf(db, txn, linkedUuids, drawnUuids, cancelled);
+            });
+            return result;
+        },
+        [this, viewer](View& v, RegionResult* result) {
             v.dirty = true;
-            v.pendingBounds.reset();
-            if (rev != revision_ || cancel->load()) {
-                v.requested.reset();
-                refreshViewer(viewer);
-                return;
-            }
-            v.error = result.error;
-            if (result.error.isEmpty()) {
-                v.blocks = std::move(result.value.page.blocks);
-                v.complete = result.value.page.complete;
-                v.coverage = result.value.coverage;
-                v.coverageSlice = s;
+            if (result) {
+                auto& region = *result;
+                v.controls.clear();
+                for (const auto& control : region.controls)
+                    v.controls.push_back({annotations_->fiberIdForUuid(control.uuid), control.index, control.position});
+                v.linkGroups.clear();
+                for (const auto& [uuid, group] : region.linkGroups)
+                    v.linkGroups[annotations_->fiberIdForUuid(uuid)] = annotations_->fiberIdForUuid(group);
+                v.rings = std::move(region.rings);
+                v.runs.clear();
+                for (auto& run : region.runs) v.runs.push_back({annotations_->fiberIdForUuid(run.objectUuid), std::move(run)});
+                v.limited = region.limited;
             }
             refreshViewer(viewer);
         });
+    if (started) ptr->dirty = true;
+}
+// A linked control point: a circle, or a triangle for an adjacent link.
+void FiberCollectionController::addLinkMark(OverlayBuilder& builder, const QPointF& center,
+                                            const OverlayStyle& style, bool adjacent)
+{
+    constexpr qreal radius = 6.25;
+    if (!adjacent) {
+        builder.addPoint(center, radius, style);
+        return;
+    }
+    QPainterPath triangle;
+    triangle.moveTo(center.x(), center.y() - radius);
+    triangle.lineTo(center.x() + radius * 0.8660254, center.y() + radius * 0.5);
+    triangle.lineTo(center.x() - radius * 0.8660254, center.y() + radius * 0.5);
+    triangle.closeSubpath();
+    builder.addPainterPath(triangle, style);
 }
 void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
@@ -834,7 +804,9 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
             found->second->displayed.reset();
             found->second->dirty = true;
             found->second->hits.clear();
+            found->second->controlHits.clear();
         }
+        collectChainPrimitives(viewer, builder);
         return;
     }
     request(viewer, *current);
@@ -842,40 +814,52 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     v.dirty = false;
     v.displayed = *current;
     v.displayedRect = visibleSceneRect(viewer);
-    v.displayedWidth = lineWidth_->value();
     v.displayedDpr = viewer->graphicsView()->viewport()->devicePixelRatioF();
-    v.displayedRainbow = rainbow_->isChecked();
+    v.displayedOptions = options_;
     v.hits.clear();
+    v.controlHits.clear();
     OverlayStyle info;
     info.penColor = QColor(255, 210, 100);
     info.z = 60;
     const auto rect = visibleSceneRect(viewer);
-    if (!v.error.isEmpty()) {
-        builder.addText(rect.topLeft() + QPointF(8, 20), v.error, QFont{}, info);
-        if (!v.coverage)
-            return;
-    }
-    if (!v.coverage) {
-        builder.addText(rect.topLeft() + QPointF(8, 20), tr("Loading fiber region…"), QFont{}, info);
+    if (!v.region.error.isEmpty())
+        builder.addText(rect.topLeft() + QPointF(8, 20), v.region.error, QFont{}, info);
+    if (!v.region.loaded)
         return;
-    }
     // Reclip cached geometry to the current slice while replacement data is
     // fetched. Do not replace the whole overlay with a blank/loading frame.
     v.displayed = *current;
     using Runs = std::vector<QPolygonF>;
     Runs horizontal, vertical, other, selected;
     std::array<Runs, 32> rainbowPaths;
-    const bool useRainbow = rainbow_->isChecked();
+    std::map<uint64_t, Runs> linkedPaths;
+    const bool useRainbow = options_.rainbow;
+    const auto linkGroup = [&](int64_t fiber) -> std::optional<uint64_t> {
+        if (!options_.showLinked) return std::nullopt;
+        const auto found = v.linkGroups.find(uint64_t(fiber));
+        return found == v.linkGroups.end() ? std::nullopt : std::optional(found->second);
+    };
+    std::unordered_map<int64_t, QColor> colors;
     std::unordered_set<int64_t> visibleIds;
-    for (const auto& b : v.blocks) {
+    for (const auto& entry : v.runs) {
+        const auto& b = entry.run;
+        const auto fiberId = int64_t(entry.fiber);
         // Hash the logical fiber ID, not its storage block or catalog row, so
         // every block of a fiber keeps its color across region/filter changes.
-        const auto colorIndex = ((uint64_t(b.fiberId) * 0x9e3779b97f4a7c15ULL) >> 32) % rainbowPaths.size();
-        auto& path = b.fiberId == selected_ ? selected
+        const auto colorIndex = ((uint64_t(fiberId) * 0x9e3779b97f4a7c15ULL) >> 32) % rainbowPaths.size();
+        const auto group = linkGroup(fiberId);
+        auto& path = fiberId == selected_ ? selected
+                     : group                ? linkedPaths[*group]
                      : useRainbow           ? rainbowPaths[colorIndex]
                      : b.family == "H"      ? horizontal
                      : b.family == "V"      ? vertical
                                             : other;
+        colors.emplace(fiberId, fiberId == selected_ ? QColor("#ffff66")
+                                  : group                ? groupColor(*group)
+                                  : useRainbow           ? QColor::fromHsvF(double(colorIndex) / rainbowPaths.size(), 0.7, 1.0)
+                                  : b.family == "H"      ? QColor("#40a5ff")
+                                  : b.family == "V"      ? QColor("#ffad43")
+                                                         : QColor("#bbbbbb"));
         if (b.points.empty()) continue;
         QPolygonF run;
         auto flush = [&]() {
@@ -896,15 +880,15 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
                 p[j] = b.points[i - 1][j] + lo * d;
                 q[j] = b.points[i - 1][j] + hi * d;
             }
-            const auto pa = viewer->volumeToScene(cvpoint(p, nativeToViewer_)), pb = viewer->volumeToScene(cvpoint(q, nativeToViewer_));
+            const auto pa = viewer->volumeToScene(cvpoint(p)), pb = viewer->volumeToScene(cvpoint(q));
             // Stroke contiguous segments together. Independent round caps on
             // every tiny segment make Qt's compound-path rasterizer expensive
             // in dense views. Keep every vertex and every actual slice break.
             if (!run.isEmpty() && run.back() != pa) flush();
             if (run.isEmpty()) run.push_back(pa);
             run.push_back(pb);
-            v.hits.push_back({pa, pb, b.fiberId});
-            visibleIds.insert(b.fiberId);
+            v.hits.push_back({pa, pb, fiberId});
+            visibleIds.insert(fiberId);
         }
         flush();
     }
@@ -944,7 +928,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         }
         builder.addPainterPath(path, style);
     };
-    const qreal width = lineWidth_->value();
+    const qreal width = options_.lineWidth;
     if (useRainbow) {
         for (size_t i = 0; i < rainbowPaths.size(); ++i)
             draw(rainbowPaths[i], QColor::fromHsvF(double(i) / rainbowPaths.size(), 0.7, 1.0), width);
@@ -953,19 +937,224 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         draw(vertical, QColor("#ffad43"), width);
         draw(other, QColor("#bbbbbb"), width);
     }
+    for (const auto& [group, runs] : linkedPaths)
+        draw(runs, groupColor(group), width);
     draw(selected, QColor("#ffff66"), width + 2);
     if (painter.isActive()) {
         painter.end();
         builder.addImage(raster, QPixmap::fromImage(raster), rect.topLeft(), 1, 1, 1, 45);
     }
-    const QString count = maxDisplayed_->value()
-        ? tr("%1 visible fibers · max %2").arg(visibleIds.size()).arg(maxDisplayed_->value())
-        : tr("%1 visible fibers").arg(visibleIds.size());
-    builder.addText(rect.topLeft() + QPointF(8, 40), count, QFont{}, info);
-    if (v.busy && (!v.requested || *v.requested != *current || maxDisplayed_->value() || !contains(*v.coverage, current->box)))
-        builder.addText(rect.topLeft() + QPointF(8, 20), tr("Updating fiber region…"), QFont{}, info);
-    else if (!v.complete)
+    // Control points inside the slab, then the linked ones' rings on top.
+    for (const auto& control : v.controls) {
+        // Only fibers drawn in this view, not ones crossing just the margin.
+        if (!visibleIds.contains(int64_t(control.fiber)) ||
+            !inside(current->project(control.position), current->local)) continue;
+        const auto scene = viewer->volumeToScene(cvpoint(control.position));
+        const auto color = colors.find(int64_t(control.fiber));
+        OverlayStyle style;
+        style.penColor = color == colors.end() ? QColor("#bbbbbb") : color->second;
+        style.brushColor = style.penColor;
+        style.penWidth = 1.0;
+        style.z = 94;
+        builder.addPoint(scene, 3.0, style);
+        v.controlHits.push_back({scene, control.fiber, control.index});
+    }
+    if (options_.showLinked) {
+        for (const auto& ring : v.rings) {
+            if (!inside(current->project(ring.position), current->local)) continue;
+            addLinkMark(builder, viewer->volumeToScene(cvpoint(ring.position)), linkMarkStyle(ring.mark, 1.0f), ring.mark.adjacent);
+        }
+    }
+    // Status only when fibers are missing from the view: the display limit
+    // was reached, or a store budget cut the region short.
+    if (v.limited)
+        builder.addText(rect.topLeft() + QPointF(8, 20),
+                        tr("Showing the maximum of %1 fibers · the view may contain more")
+                            .arg(options_.maxDisplayed),
+                        QFont{}, info);
+    else if (!v.region.complete)
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Partial fiber view · zoom in or increase minimum length"), QFont{}, info);
+}
+void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const std::array<double, 6>& box)
+{
+    auto& ptr = views_[viewer];
+    if (!ptr) {
+        ptr = std::make_unique<View>();
+        viewer->graphicsView()->viewport()->installEventFilter(this);
+    }
+    auto& v = *ptr;
+    if (v.chainBox == box)
+        return;
+    // Chains share the viewer's one query in flight with its regions.
+    auto& region = v.region;
+    if (region.busy) {
+        if (region.cancelled) region.cancelled->store(true);
+        return;
+    }
+    region.busy = true;
+    v.chainBox = box;
+    region.error.clear();
+    auto cancel = std::make_shared<std::atomic_bool>(false);
+    region.cancelled = cancel;
+    const auto rev = revision_;
+    background<ChainResult>(
+        this,
+        [connection=state_->objectStoreSession(),attachment=*state_->storeFor("fiber"),
+         volume=vc::objects::VolumeVoxels(state_->annotationVolume().value_or(vc::project::AnnotationVolume{})), box, cancel,
+         min=options_.minLengthMm / nativeVoxelMm_, family=familyFilter(), maximum=options_.maxDisplayed,
+         linked=options_.showLinked, none=noFamilies()]() {
+            ChainResult result;
+            if (none || volume.volume.empty()) return result;
+            connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
+                // Fibers drawn from a sampled line carry annotation controls.
+                vc::objects::ObjectSelection selection;
+                selection.kind = "fiber";
+                selection.volume = volume.volume;
+                selection.targetScale = volume.scale;
+                selection.bbox = box;
+                if (min > 0) selection.minLength = min;
+                selection.family = family;
+                if (maximum > 0) selection.limit = maximum;
+                std::vector<std::string> uuids, revisions;
+                std::vector<vc::objects::VolumeAffine> mappings;
+                const auto transforms = db.volumeTransforms(txn);
+                for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber", "meta"})) {
+                    if (cancel->load() || cancelled.load()) return;
+                    if (!object.fiber || object.fiber->linePointCount == 0) continue;
+                    // Fibers bound by scale or through a registration, in volume voxels.
+                    const auto mapping = transforms.toVolume(Json::parse(object.meta), volume.volume, volume.scale);
+                    const auto head = db.currentGeometry(txn, object.uuid);
+                    if (!mapping || !head) continue;
+                    uuids.push_back(object.uuid);
+                    revisions.push_back(head->uuid);
+                    mappings.push_back(*mapping);
+                }
+                if (revisions.empty()) return;
+                const auto controls = controlsInVolume(db, txn, revisions, mappings);
+                const auto ids = db.readGeometryArrays(txn, revisions, "control_point_ids");
+                if (ids.dtype != "<i8") throw std::runtime_error("fiber control point IDs must be int64");
+                std::map<std::string, std::pair<size_t, std::unordered_map<int64_t, size_t>>> controlIndex;
+                for (size_t i = 0; i < uuids.size(); ++i) {
+                    ChainResult::Chain chain;
+                    chain.uuid = uuids[i];
+                    auto& index = controlIndex[uuids[i]];
+                    index.first = result.chains.size();
+                    for (const auto& position : controls[i]) chain.points.push_back(cvpoint(position));
+                    const auto controlIds = vc::objects::scalarsFromBytes<int64_t>(vc::objects::packedItem(ids, i));
+                    for (size_t k = 0; k < controlIds.size(); ++k) index.second[controlIds[k]] = k;
+                    chain.linkMarks.assign(chain.points.size(), LinkMark{});
+                    result.chains.push_back(std::move(chain));
+                }
+                if (!linked) return;
+                vc::objects::EdgeSelection edges;
+                edges.kind = "fiber_branch";
+                edges.endpointUuids = uuids;
+                std::set<std::string> linkedUuids;
+                const auto links = db.selectEdges(txn, edges);
+                const auto sameFamily = sameFamilyTest(db, txn, links);
+                for (const auto& edge : links) {
+                    const bool sameHv = sameFamily(edge);
+                    for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
+                        const auto chain = controlIndex.find(endpoint);
+                        if (chain == controlIndex.end()) continue;
+                        linkedUuids.insert(endpoint);
+                        auto& marks = result.chains[chain->second.first].linkMarks;
+                        for (const auto& reference : anchor.points) {
+                            if (reference.array != "control_point_ids" || reference.index.empty()) continue;
+                            const auto control = chain->second.second.find(reference.index.front());
+                            if (control == chain->second.second.end()) continue;
+                            marks[control->second].add(edge, sameHv);
+                        }
+                    }
+                }
+                result.linkGroups = linkGroupsOf(db, txn, linkedUuids, std::set<std::string>(uuids.begin(), uuids.end()), cancelled);
+            });
+            return result;
+        },
+        [this, viewer, rev, cancel](Outcome<ChainResult> result) {
+            auto found = views_.find(viewer);
+            if (found == views_.end() || found->second->region.cancelled != cancel)
+                return;
+            auto& v = *found->second;
+            v.region.busy = false;
+            if (rev != revision_ || cancel->load()) {
+                v.chainBox.reset();
+                refreshViewer(viewer);
+                return;
+            }
+            v.region.error = result.error;
+            if (result.error.isEmpty()) {
+                v.chains.clear();
+                for (auto& chain : result.value.chains)
+                    v.chains.push_back({annotations_->fiberIdForUuid(chain.uuid), std::move(chain.points), std::move(chain.linkMarks)});
+                v.linkGroups.clear();
+                for (const auto& [uuid, group] : result.value.linkGroups)
+                    v.linkGroups[annotations_->fiberIdForUuid(uuid)] = annotations_->fiberIdForUuid(group);
+                clearPointChainProjectionCache();
+            }
+            refreshViewer(viewer);
+        });
+}
+void FiberCollectionController::collectChainPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
+{
+    auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+    if (!surface)
+        return;
+    const auto bounds = surface->bbox();
+    const double d = options_.sliceDistance;
+    requestChains(viewer, {bounds.low[0] - d, bounds.low[1] - d, bounds.low[2] - d,
+                           bounds.high[0] + d, bounds.high[1] + d, bounds.high[2] + d});
+    auto& v = *views_.at(viewer);
+    v.controlHits.clear();
+    v.displayedOptions = options_;
+    v.dirty = false;
+    struct Ring {
+        QPointF position;
+        LinkMark mark;
+        float opacity;
+    };
+    std::vector<Ring> rings;
+    for (const auto& chain : v.chains) {
+        const auto group = options_.showLinked ? v.linkGroups.find(chain.fiber) : v.linkGroups.end();
+        const QColor color = groupColor(group != v.linkGroups.end() ? group->second : chain.fiber);
+        PointChainStyle style;
+        style.color = color;
+        style.pointBorderColor = color;
+        style.lineOpacity = 0.75f;
+        style.distanceTolerance = float(options_.sliceDistance);
+        FilteredPoints filtered;
+        std::vector<float> opacities;
+        renderPointChain(viewer, builder, chain.points, style, std::nullopt, &filtered, &opacities);
+        for (size_t i = 0; i < filtered.scenePoints.size() && i < filtered.sourceIndices.size(); ++i) {
+            const float opacity = i < opacities.size() ? opacities[i] : 1.0f;
+            // Boundary projections are line vertices only, without a dot.
+            if (opacity <= 0.0f) continue;
+            const size_t source = filtered.sourceIndices[i];
+            v.controlHits.push_back({filtered.scenePoints[i], chain.fiber, int(source)});
+            if (options_.showLinked && source < chain.linkMarks.size() && chain.linkMarks[source].linked)
+                rings.push_back({filtered.scenePoints[i], chain.linkMarks[source], opacity});
+        }
+    }
+    // Rings paint after every chain.
+    for (const auto& ring : rings)
+        addLinkMark(builder, ring.position, linkMarkStyle(ring.mark, ring.opacity), ring.mark.adjacent);
+}
+std::optional<FiberCollectionController::ControlPointHit> FiberCollectionController::hitTestControlPoint(
+    VolumeViewerBase* viewer, const QPointF& scenePoint, qreal maxDistancePx) const
+{
+    const auto found = views_.find(viewer);
+    if (!isOverlayEnabledFor(viewer) || found == views_.end()) return std::nullopt;
+    std::optional<ControlPointHit> best;
+    qreal bestDistanceSq = maxDistancePx * maxDistancePx;
+    for (const auto& hit : found->second->controlHits) {
+        const QPointF delta = hit.position - scenePoint;
+        const qreal distanceSq = delta.x() * delta.x() + delta.y() * delta.y();
+        if (distanceSq < bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            best = ControlPointHit{hit.fiber, hit.index};
+        }
+    }
+    return best;
 }
 bool FiberCollectionController::eventFilter(QObject* obj, QEvent* event)
 {
@@ -991,7 +1180,7 @@ bool FiberCollectionController::handleVolumeClick(Qt::MouseButton button, Qt::Ke
 {
     const auto clicked = std::exchange(click_, std::nullopt);
     if (button != Qt::LeftButton || modifiers != Qt::NoModifier || !clicked || !clicked->viewport || !enabled_ ||
-        !visible_->isChecked())
+        !options_.showFibers)
         return false;
     for (auto& [viewer, v] : views_) {
         if (viewer->graphicsView()->viewport() != clicked->viewport)
@@ -1020,8 +1209,7 @@ bool FiberCollectionController::handleVolumeClick(Qt::MouseButton button, Qt::Ke
         if (!id)
             return false;
         selectFiber(id, false);
-        dock_->show();
-        dock_->raise();
+        emit panelRequested();
         return true;
     }
     return false;
@@ -1035,86 +1223,20 @@ void FiberCollectionController::showInLineAnnotation(int64_t id)
     for (const auto& connection : annotationRenderConnections_)
         disconnect(connection);
     annotationRenderConnections_.clear();
-    annotationStatus_->setText(tr("Loading fiber #%1…").arg(id));
-    annotationStatus_->show();
+    emit annotationStatusChanged(tr("Loading fiber #%1…").arg(id));
     // Paint the requested ID before the native importer/view construction runs.
     QTimer::singleShot(0, this, &FiberCollectionController::startPendingAnnotation);
 }
 void FiberCollectionController::startPendingAnnotation()
 {
-    if (annotationBusy_ || !pendingAnnotation_ || !enabled_)
-        return;
-    const auto id = std::exchange(pendingAnnotation_, 0);
-    const auto token = annotationRevision_;
-    const auto digest = QCryptographicHash::hash(QByteArray::fromStdString(uuid_), QCryptographicHash::Sha256).toHex().left(32);
-    // Identifies the source fiber for its read-only view (reopening it reuses the open view).
-    const auto key = QString("collection_%1_%2.json").arg(QString::fromLatin1(digest)).arg(id);
-    annotationBusy_ = true;
-    const auto path = path_.toStdString();
-    const auto rev = revision_;
-    background<Json>(this, [path, id]() {
-        FiberCollection collection(path);
-        auto entry = Json::parse(collection.annotation(id));
-        const auto summary = collection.summary(id);
-        auto points = Json::array();
-        int64_t next = 0;
-        while (next < summary.pointCount-1) {
-            auto blocks = collection.fiberBlocks(id, next);
-            if (blocks.empty())
-                throw std::runtime_error("Incomplete fiber geometry");
-            for (const auto& b : blocks) {
-                if (b.firstSegment != next)
-                    throw std::runtime_error("Non-contiguous fiber geometry");
-                for (size_t i = next ? 1 : 0; i < b.points.size(); ++i)
-                    points.push_back(b.points[i]);
-                next += int64_t(b.points.size())-1;
-            }
-        }
-        if (points.size() != size_t(summary.pointCount))
-            throw std::runtime_error("Incomplete fiber geometry");
-        entry["line_points"] = std::move(points);
-        // Coordinate metadata may live at collection level, in frame or root.
-        // Native annotation files must be self-contained because they outlive
-        // this attachment.
-        const auto frame = Json::parse(collection.metadata("frame"));
-        const auto root = Json::parse(collection.metadata("root"));
-        for (const auto* key : {"coordinate_base_shape_zyx", "vc_open_data_coordinate_space", "vc_open_data_source_path",
-             "vc_open_data_source_coordinate_level", "vc_open_data_source_coordinate_scale_factor", "vc_open_data_source_original_resolution"}) {
-            if (frame.contains(key) && root.contains(key) && frame.at(key) != root.at(key))
-                throw std::runtime_error(std::string("Conflicting ") + key + " in the volume metadata");
-            if (entry.contains(key))
-                continue;
-            if (frame.contains(key))
-                entry[key] = frame.at(key);
-            else if (root.contains(key))
-                entry[key] = root.at(key);
-        }
-        if (!entry.contains("control_points"))
-            entry["control_points"] = Json::array({entry["line_points"].front(), entry["line_points"].back()});
-        return entry;
-    }, [this, rev, token, key, id](const Outcome<Json>& result) {
-        // Keep the guard through native open too: saving an old annotation can
-        // run a nested event loop. New clicks replace pending work, never recurse.
-        const auto finish = qScopeGuard([this]() { finishAnnotationRequest(); });
-        if (rev != revision_ || token != annotationRevision_)
-            return;
-        if (!result.error.isEmpty()) {
-            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(result.error));
-            return;
-        }
-        annotationStatus_->setText(tr("Building flattened views for fiber #%1…").arg(id));
-        // Read-only: the fiber is shown without entering the package's
-        // editable annotations; nothing is written or optimized.
-        QString error;
-        auto* dialog = annotations_->openFiberReadOnly(result.value, key.toStdString(), &error);
-        if (rev != revision_ || token != annotationRevision_)
-            return;
-        if (!dialog) {
-            annotationStatus_->setText(tr("Fiber #%1: %2").arg(id).arg(error.isEmpty() ? tr("could not open it") : error));
-            return;
-        }
-        watchAnnotationRender(dialog, id, token);
-    });
+    if(annotationBusy_ || !pendingAnnotation_ || !enabled_) return;
+    const auto id=std::exchange(pendingAnnotation_,0);
+    annotationBusy_=true;
+    const auto finish=qScopeGuard([this] { finishAnnotationRequest(); });
+    QString error;
+    auto* dialog=annotations_->openCollectionFiber(uint64_t(id),&error);
+    if(dialog) watchAnnotationRender(dialog,id,annotationRevision_);
+    else emit annotationStatusChanged(error);
 }
 void FiberCollectionController::finishAnnotationRequest()
 {
@@ -1124,7 +1246,7 @@ void FiberCollectionController::finishAnnotationRequest()
 }
 void FiberCollectionController::watchAnnotationRender(LineAnnotationDialog* dialog, int64_t id, uint64_t token)
 {
-    annotationStatus_->setText(tr("Loading CT for fiber #%1…").arg(id));
+    emit annotationStatusChanged(tr("Loading CT for fiber #%1…").arg(id));
     auto waiting = std::make_shared<std::unordered_set<CChunkedVolumeViewer*>>();
     for (const auto& pane : dialog->panes()) {
         const QString name = QString::fromStdString(pane.surfaceName);
@@ -1139,7 +1261,7 @@ void FiberCollectionController::watchAnnotationRender(LineAnnotationDialog* dial
             return;
         waiting->erase(viewer);
         if (waiting->empty()) {
-            annotationStatus_->setText(tr("Fiber #%1 displayed.").arg(id));
+            emit annotationStatusChanged(tr("Fiber #%1 displayed.").arg(id));
             for (const auto& connection : annotationRenderConnections_)
                 disconnect(connection);
             annotationRenderConnections_.clear();
@@ -1153,17 +1275,15 @@ void FiberCollectionController::watchAnnotationRender(LineAnnotationDialog* dial
     for (auto* viewer : strips)
         ready(viewer);
     annotationRenderConnections_.push_back(connect(dialog, &QObject::destroyed, this, [this, token]() {
-        if (token == annotationRevision_) {
-            annotationStatus_->clear();
-            annotationStatus_->hide();
-        }
+        if (token == annotationRevision_)
+            emit annotationStatusChanged({});
     }));
 }
 void FiberCollectionController::detachViewer(VolumeViewerBase* viewer)
 {
     if (auto it = views_.find(viewer); it != views_.end()) {
-        if (it->second->cancelled)
-            it->second->cancelled->store(true);
+        if (it->second->region.cancelled)
+            it->second->region.cancelled->store(true);
         views_.erase(it);
     }
     ViewerOverlayControllerBase::detachViewer(viewer);

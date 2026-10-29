@@ -14,7 +14,7 @@ requires-python = ">=3.14"
 dependencies = [
     "numpy",
     "numcodecs>=0.15.1,<0.17",
-    "vc-delta3d>=0.1.0,<0.2",
+    "vc-delta3d>=0.2.0,<0.3",
 ]
 license = { file = "LICENSE" }
 
@@ -32,6 +32,25 @@ wheel.packages = []
 VC_BUILD_PYTHON = "ON"
 VC_BUILD_APPS = "OFF"
 VC_BUILD_FIBERLETS = "ON"
-VC_BUILD_UI_TRACER = "OFF"
 VC_BUILD_FLATBOI = "OFF"
 VC_TESTING = "OFF"
+
+# Editable installs copy the compiled modules and Python files once; rebuild them on
+# `uv sync` whenever the sources of the Python build change (including the object
+# store core it compiles in).
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/**" },
+    { file = "core/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
+    { file = "utils/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
+    { file = "libs/**/*.{c,cpp,h,hpp,cu,cuh,in,txt}" },
+    { file = "apps/CMakeLists.txt" },
+    { file = "apps/src/**" },
+    { file = "python/**/*.{cpp,hpp,py,txt}" },
+    { file = "../vc_object_store/CMakeLists.txt" },
+    { file = "../vc_object_store/cmake/**" },
+    { file = "../vc_object_store/include/**" },
+    { file = "../vc_object_store/src/**" },
+]

@@ -781,7 +781,8 @@ std::size_t FiberletPrefixChunkPayload::residentBytes() const noexcept
 {
     return sizeof(*this) +
         prefixes.capacity() * sizeof(FiberletStoredPrefix) +
-        incidentOrder_.capacity() * sizeof(std::uint32_t);
+        incidentOrder_.capacity() * sizeof(std::uint32_t) +
+        (endpoints ? endpoints->residentBytes() : 0);
 }
 
 const FiberletStoredPrefix* FiberletPrefixChunkPayload::find(
@@ -2161,8 +2162,16 @@ std::optional<FiberletChunkDataset::MaterializedChunk> FiberletChunkDataset::rea
                 std::move(decoded.ownedAnchorPayload), std::move(payload), true};
         }
         if (kind == FiberletStorageChunkKind::FiberletPrefix) {
-            auto payload = std::make_shared<const FiberletPrefixChunkPayload>(
+            auto payload = std::make_shared<FiberletPrefixChunkPayload>(
                 std::move(decoded.prefixes));
+            auto endpoints = std::move(decoded.ownedAnchors);
+            endpoints.anchors.insert(endpoints.anchors.end(),
+                decoded.referencedAnchors.anchors.begin(),
+                decoded.referencedAnchors.anchors.end());
+            std::sort(endpoints.anchors.begin(), endpoints.anchors.end(),
+                [](const auto& a, const auto& b) { return a.key < b.key; });
+            payload->endpoints = std::make_shared<const FiberletAnchorChunkPayload>(
+                std::move(endpoints));
             materializationDecodes_[1].fetch_add(
                 1, std::memory_order_relaxed);
             return MaterializedChunk{

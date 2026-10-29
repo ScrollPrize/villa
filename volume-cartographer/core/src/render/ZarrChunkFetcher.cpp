@@ -2,6 +2,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
+#include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <utils/http_fetch.hpp>
@@ -106,11 +107,29 @@ public:
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
         : baseUrl_(stripTrailingSlash(std::move(baseUrl)))
         , client_(makeClient(std::move(auth)))
+        , metadataCacheable_(vc::core::util::RemoteMetadataCache::cacheable(baseUrl_))
     {
     }
 
     bool exists(const std::string& key) const override
     {
+        if (cachesMetadata(key)) {
+            auto& cache = vc::core::util::remoteMetadataCache();
+            if (const auto answer = cache.lookup(makeUrl(key)))
+                return answer->has_value();
+            // A metadata object is tiny, so a GET costs what a HEAD does and
+            // answers the read that usually follows. Statuses other than
+            // 200/404 fall through to the HEAD classification below.
+            auto response = client_.get(makeUrl(key));
+            if (response.ok()) {
+                cache.record(makeUrl(key), std::move(response.body));
+                return true;
+            }
+            if (response.not_found()) {
+                cache.record(makeUrl(key), std::nullopt);
+                return false;
+            }
+        }
         auto response = client_.head(makeUrl(key));
         if (response.ok())
             return true;
@@ -135,13 +154,26 @@ public:
 
     std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const override
     {
+        const bool cacheMetadata = cachesMetadata(key);
+        if (cacheMetadata) {
+            if (auto answer = vc::core::util::remoteMetadataCache().lookup(makeUrl(key))) {
+                if (*answer)
+                    rememberMetadata(key, **answer);
+                return std::move(*answer);
+            }
+        }
         auto response = client_.get(makeUrl(key));
         if (response.ok()) {
             rememberMetadata(key, response.body);
+            if (cacheMetadata)
+                vc::core::util::remoteMetadataCache().record(makeUrl(key), response.body);
             return std::move(response.body);
         }
-        if (response.not_found())
+        if (response.not_found()) {
+            if (cacheMetadata)
+                vc::core::util::remoteMetadataCache().record(makeUrl(key), std::nullopt);
             return std::nullopt;
+        }
         if (!utils::is_sftp_url(baseUrl_) && isOptionalRemoteMetadataMiss(
                 response.status_code, key, response.body_string())) {
             sawForbiddenMetadataMiss_.store(true, std::memory_order_relaxed);
@@ -224,6 +256,11 @@ private:
         return utils::HttpClient(std::move(config));
     }
 
+    bool cachesMetadata(std::string_view key) const
+    {
+        return metadataCacheable_ && isZarrMetadataKey(key);
+    }
+
     void rememberMetadata(const std::string& key,
                           const std::vector<std::byte>& bytes) const
     {
@@ -235,6 +272,7 @@ private:
 
     std::string baseUrl_;
     utils::HttpClient client_;
+    bool metadataCacheable_ = false;
     mutable std::atomic<bool> sawForbiddenMetadataMiss_{false};
     mutable std::mutex metadataMutex_;
     mutable std::unordered_map<std::string, std::vector<std::byte>> metadata_;
@@ -300,10 +338,12 @@ private:
     ChunkFetchResult fetchEncodedImpl(const ChunkKey& key)
     {
         ChunkFetchResult result;
-        const std::array<std::size_t, 3> indices{
+        std::vector<std::size_t> indices{
             static_cast<std::size_t>(key.iz),
             static_cast<std::size_t>(key.iy),
             static_cast<std::size_t>(key.ix)};
+        if (array_->metadata().shape.size() == 4)
+            indices.insert(indices.begin(), 0);
 
         try {
             auto encoded = array_->read_chunk_encoded(indices);
@@ -1271,8 +1311,20 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     std::vector<std::size_t> chunkShape = meta.chunks;
     if (meta.shard_config)
         chunkShape = meta.shard_config->sub_chunks;
+    auto logicalShape = meta.shape;
+    if (meta.shape.size() == 4) {
+        if (chunkShape.size() != 4 || chunkShape[0] != meta.shape[0] || meta.shape[0] == 0)
+            throw std::runtime_error("packed Zarr requires full-channel CZYX chunks");
+        const auto channels = logicalShape[0];
+        logicalShape.erase(logicalShape.begin());
+        chunkShape.erase(chunkShape.begin());
+        // Internal physical cache geometry only: flatten C into the chunk's Z
+        // dimension so the ordinary byte budget counts the entire payload.
+        logicalShape[0] = ((logicalShape[0] + chunkShape[0] - 1) / chunkShape[0]) * chunkShape[0] * channels;
+        chunkShape[0] *= channels;
+    }
     std::vector<ChunkCache::LevelInfo> levels{
-        {toArray3(meta.shape, "shape"),
+        {toArray3(logicalShape, "shape"),
          toArray3(chunkShape, "chunk shape"),
          IChunkedArray::LevelTransform{}}};
     std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
@@ -1280,6 +1332,54 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     return processChunkCacheService()->acquireSource(
         std::move(sourceIdentity), std::move(levels), std::move(fetchers),
         meta.fill_value.value_or(0.0), dtype, std::move(options));
+}
+
+namespace {
+class ZarrChannelView final : public IChunkedArray {
+    std::shared_ptr<ChunkCache> source_;
+    std::array<int, 3> shape_, chunks_;
+    std::size_t offset_;
+    ChunkResult view(ChunkResult result) const {
+        result.shape = chunks_;
+        result.byteOffset = offset_;
+        return result;
+    }
+public:
+    ZarrChannelView(std::shared_ptr<ChunkCache> source, const utils::ZarrMetadata& meta, std::size_t channel)
+        : source_(std::move(source)),
+          shape_(toArray3({meta.shape[1], meta.shape[2], meta.shape[3]}, "shape")),
+          chunks_(toArray3({meta.chunks[1], meta.chunks[2], meta.chunks[3]}, "chunks")),
+          offset_(channel * meta.chunks[1] * meta.chunks[2] * meta.chunks[3] * (meta.dtype == utils::ZarrDtype::float32 ? 4 : 1)) {}
+    int numLevels() const override { return 1; }
+    std::array<int,3> shape(int) const override { return shape_; }
+    std::array<int,3> chunkShape(int) const override { return chunks_; }
+    ChunkDtype dtype() const override { return source_->dtype(); }
+    double fillValue() const override { return source_->fillValue(); }
+    LevelTransform levelTransform(int level) const override { return source_->levelTransform(level); }
+    ChunkResult tryGetChunk(int l,int z,int y,int x) override { return view(source_->tryGetChunk(l,z,y,x)); }
+    ChunkResult tryGetChunk(int l,int z,int y,int x,const ChunkRequestContext& r) override { return view(source_->tryGetChunk(l,z,y,x,r)); }
+    ChunkResult getChunkIfCached(int l,int z,int y,int x) override { return view(source_->getChunkIfCached(l,z,y,x)); }
+    ChunkResult getChunkBlocking(int l,int z,int y,int x) override { return view(source_->getChunkBlocking(l,z,y,x)); }
+    ChunkResult getChunkBlocking(int l,int z,int y,int x,const ChunkRequestContext& r) override { return view(source_->getChunkBlocking(l,z,y,x,r)); }
+    void prefetchChunks(const std::vector<ChunkKey>& k,bool wait,int priority) override { source_->prefetchChunks(k,wait,priority); }
+    void prefetchChunks(const std::vector<ChunkKey>& k,bool wait,int priority,const ChunkRequestContext& r) override { source_->prefetchChunks(k,wait,priority,r); }
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override { return source_->addChunkReadyListener(std::move(cb)); }
+    void removeChunkReadyListener(ChunkReadyCallbackId id) override { source_->removeChunkReadyListener(id); }
+};
+}
+
+std::shared_ptr<IChunkedArray> acquireProcessZarrChannel(
+    std::string identity, std::shared_ptr<utils::ZarrArray> array,
+    std::size_t channel, ChunkCache::Options options)
+{
+    const auto& meta = array->metadata();
+    if (meta.shape.size() == 3)
+        return acquireProcessChunkCache(std::move(identity), std::move(array), std::move(options));
+    if (meta.shape.size() != 4 || channel >= meta.shape[0] ||
+        (meta.dtype != utils::ZarrDtype::uint8 && meta.dtype != utils::ZarrDtype::float32))
+        throw std::invalid_argument("invalid packed Zarr channel");
+    auto source = acquireProcessChunkCache(std::move(identity), array, std::move(options));
+    return std::make_shared<ZarrChannelView>(std::move(source), meta, channel);
 }
 
 } // namespace vc::render

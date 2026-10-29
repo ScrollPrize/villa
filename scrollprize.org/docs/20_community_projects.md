@@ -62,7 +62,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
+- [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/deprecated/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
 
@@ -158,10 +158,10 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [segmata](https://github.com/sgoutteb/segmata) by Stephane Gouttebroze:
     - Improve the segmentation process by sharpening the layers rendering, this is based on optimizing the layer 32, a further objective is to link this optimization on a inference loop (optimizing on the detected ink instead of only layers)
 
-- [Synthetic instance labels and volume generation](https://lcparker/synthetic-pages) by lcparker
+- [Synthetic instance labels and volume generation](https://github.com/lcparker/synthetic-pages) by lcparker
     - Generate artificial 3D volumes with corresponding instance labels for use in pretraining instance segmentation networks
 
-- [Mask3D for instance segmentation on scroll volumes](https://lcparker/Mask3D) by lcparker
+- [Mask3D for instance segmentation on scroll volumes](https://github.com/lcparker/Mask3D) by lcparker
     - SOTA instance segmentation network, configured to work with scroll volumes
     - [Effects of pretraining on synthetically generated data](https://github.com/lcparker/pretraining-advantage), plus pretrained and finetuned weights for the Mask3D network
 - [Affinity Prediction with Unet](https://discordapp.com/channels/1079907749569237093/1407379961417039953) by Ayush Mishra
@@ -264,7 +264,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
  
 - [Neuroglancer Mini](https://github.com/tomhsiao1260/neuroglancer-mini) A trimmed-down version of the Neuroglancer source code. By Yao Hsiao
 
-- [Scroll Viewer](https://github.com/lukeboi/scroll-viewer) by Luke Farritor. A lightweight, extensible tool for viewing volumetric data, which runs in the browser, and is very fast.
+- [Scroll Viewer](https://web.archive.org/web/20241230173950/https://github.com/lukeboi/scroll-viewer) by Luke Farritor. A lightweight, extensible tool for viewing volumetric data, which runs in the browser, and is very fast.
 
 - [Scroll Sleuth](https://github.com/Paul-G2/ScrollSleuth) by Paul Geiger. A web app that supports visual ink-searching in segment volumes via multiple display modes and segmentation tools.
 
@@ -326,7 +326,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Omit](https://onedrive.live.com/?authkey=%21ALfVTOHQOkbecQ0&id=D6F698278C30CB3E%212310&cid=D6F698278C30CB3E) is a pipeline that tries to detect ink with classical approaches (not deep learning) by Timo Meireman
 
 - First Letters winning models, October 2023
-    - [Ink detection model](https://github.com/lukeboi/scroll-first-letters) by Luke Farritor
+    - [Ink detection model](https://web.archive.org/web/20241225210819/https://github.com/lukeboi/scroll-first-letters) by Luke Farritor
     - [Ink detection model, 2nd place but more accurate](https://github.com/younader/Vesuvius-First-Letters) by Youssef Nader
 
 - [Crackle Viewer](https://github.com/schillij95/Crackle-Viewer) is a tool to browse and annotate surface volumes of rendered segments, by Julian Schilliger
@@ -338,6 +338,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [pre-trained DINOv2 models](https://github.com/SergeyPnev/dinov2-vesuvius) by Sergei Pnev. Self-supervised model pre-trained on scrolls 1-5 with predictions.
 
 - [Ink detection validation harness](https://github.com/khj1222/vesuvius-challenge) by khj1222. The ink-detection tutorial trains with no held-out data, so improvements cannot be told apart from noise. This generates a `_validation_mask` for a labeled segment by holding out whole annotated regions (splitting by pixels cuts letters in half), scores predictions inside it (threshold sweep, DRD / pseudo-F-measure, per-region breakdown), sweeps checkpoints, and runs k-fold. Also includes a native-Windows walkthrough of the tutorial.
+
+- [first-letters-survey](https://github.com/Bullo27/first-letters-survey) by Matteo Bulloni. `fls.py` goes from a First Letters scroll to `ink_9um` maps on a freshly grown patch in one command (a seed on the m7 surface prediction inside the scan mask, the tracer and parameters of VC3D's GrowPatch, a native-resolution render, both depth directions), streaming from the open-data bucket. Includes a survey of the 21 scrolls on the First Letters list without catalog segments (65 patches, 971 cm², no letters found) and a calibration, planned before inference, on PHerc0841, a scroll the models never saw: the ink shows only at blob level on the team's surfaces and automatically grown patches leave the text-bearing sheet, so a null from this pipeline says little.
 
 #### 📦 Materials
 

@@ -21,15 +21,12 @@ class _ReviewFilter(TypedDict, total=False):
 
 @mcp.tool()
 async def vc3d_review_segments(
-    only_loaded: bool = False,
     filter: Optional[_ReviewFilter] = None,
 ) -> dict[str, Any]:
     """List segments together with their review-tag state, with optional
     server-side filtering (the programmatic equivalent of the surface panel's
     review filter checkboxes).
 
-    only_loaded: same meaning as vc3d_list_segments -- restrict to currently
-    loaded surfaces.
     filter: an object of optional bools, ANDed together (an absent or false key
     contributes nothing, same as an unchecked checkbox):
       - unreviewed: keep only segments WITHOUT the "reviewed" tag.
@@ -40,10 +37,9 @@ async def vc3d_review_segments(
       - inspect: keep only segments WITH the "inspect" tag.
       - partialReview: keep only segments WITH the "partial_review" tag.
 
-    Returns {"segments": [{"id", "path", "loaded", "active", "tags", "reviewState"}],
-    "total": int, "returned": int} -- "total" is the onlyLoaded-scoped candidate
-    count, "returned" is the count after "filter" is applied.
+    Returns {"segments": [vc3d_list_segments entries plus "review" (the review
+    tag flags) and "reviewState"], "total": int, "returned": int, "loading":
+    bool} -- "total" counts the listed surfaces, "returned" those that pass
+    "filter".
     """
-    return await _call(
-        "segments.review", _strip_none({"onlyLoaded": only_loaded, "filter": filter})
-    )
+    return await _call("segments.review", _strip_none({"filter": filter}))
