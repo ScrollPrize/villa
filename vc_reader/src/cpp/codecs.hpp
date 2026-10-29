@@ -1,9 +1,11 @@
-// Chunk codecs implemented in C++: raw, blosc, zstd, zlib/gzip, LZW, vc-delta3d and volcomp.
+// Chunk codecs implemented in C++: raw, blosc, zstd, zlib/gzip, LZ4, LZW, vc-delta3d and volcomp.
+// Every codec but LZW also encodes (Zarr writes and disk caches).
 #pragma once
 
 #include "lzw.hpp"
 
 #include <blosc.h>
+#include <lz4.h>
 #include <volcomp_lib.h>
 #include <zlib.h>
 #include <zstd.h>
@@ -22,7 +24,7 @@
 
 namespace vcr {
 
-enum class Codec { Raw, Blosc, Zstd, Zlib, Gzip, Lzw, Delta3d, Volcomp };
+enum class Codec { Raw, Blosc, Zstd, Zlib, Gzip, Lz4, Lzw, Delta3d, Volcomp };
 
 inline Codec parse_codec(const std::string& id)
 {
@@ -36,6 +38,8 @@ inline Codec parse_codec(const std::string& id)
         return Codec::Zlib;
     if (id == "gzip")
         return Codec::Gzip;
+    if (id == "lz4")
+        return Codec::Lz4;
     if (id == "lzw" || id == "imagecodecs_lzw")
         return Codec::Lzw;
     if (id == "vc-delta3d")
@@ -112,6 +116,21 @@ inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uin
     case Codec::Gzip:
         inflate_exact(src, n, dst, dst_n);
         return;
+    case Codec::Lz4: {  // numcodecs LZ4: little-endian uint32 decoded size, then one LZ4 block
+        if (n < 4)
+            throw std::runtime_error("lz4 chunk too short");
+        std::uint32_t size = 0;
+        for (int i = 0; i < 4; ++i)
+            size |= std::uint32_t(src[i]) << (8 * i);
+        if (size != dst_n || n - 4 > std::size_t(INT32_MAX) || dst_n > std::size_t(INT32_MAX))
+            throw std::runtime_error("lz4 chunk decodes to " + std::to_string(size) + " bytes, expected " +
+                                     std::to_string(dst_n));
+        const int got = LZ4_decompress_safe(reinterpret_cast<const char*>(src + 4), reinterpret_cast<char*>(dst),
+                                            int(n - 4), int(dst_n));
+        if (got != int(dst_n))
+            throw std::runtime_error("lz4 decode failed");
+        return;
+    }
     case Codec::Lzw:
         decode_lzw(src, n, dst, dst_n);
         return;
@@ -145,6 +164,99 @@ inline std::vector<std::uint8_t> encode_delta3d(const std::uint8_t* src, std::si
     std::vector<std::uint8_t> bytes(out.size());
     std::memcpy(bytes.data(), out.data(), out.size());
     return bytes;
+}
+
+// Settings of an encoder, from a numcodecs compressor config.
+struct EncodeOptions {
+    std::string cname = "lz4";  // blosc
+    int level = -1;             // blosc clevel; zstd/zlib/gzip level; lz4 acceleration (-1: codec default)
+    int shuffle = 1;            // blosc
+    int blocksize = 0;          // blosc
+    float q = 8.0f;             // volcomp quantiser step (0: lossless)
+};
+
+// Encodes one decoded chunk of `itemsize`-byte elements and C-order `shape`.
+inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, const std::uint8_t* src, std::size_t n,
+                                        std::size_t itemsize, const std::vector<std::int64_t>& shape)
+{
+    std::vector<std::uint8_t> out;
+    switch (codec) {
+    case Codec::Raw:
+        out.assign(src, src + n);
+        return out;
+    case Codec::Blosc: {
+        out.resize(n + BLOSC_MAX_OVERHEAD);
+        const int written = blosc_compress_ctx(o.level < 0 ? 5 : o.level, o.shuffle, itemsize, n, src, out.data(),
+                                               out.size(), o.cname.c_str(), std::size_t(o.blocksize), 1);
+        if (written <= 0)
+            throw std::runtime_error("blosc encode failed (" + std::to_string(written) + ")");
+        out.resize(std::size_t(written));
+        return out;
+    }
+    case Codec::Zstd: {
+        out.resize(ZSTD_compressBound(n));
+        const auto written = ZSTD_compress(out.data(), out.size(), src, n, o.level < 0 ? 3 : o.level);
+        if (ZSTD_isError(written))
+            throw std::runtime_error(std::string("zstd encode failed: ") + ZSTD_getErrorName(written));
+        out.resize(written);
+        return out;
+    }
+    case Codec::Zlib:
+    case Codec::Gzip: {
+        z_stream z{};
+        if (deflateInit2(&z, o.level < 0 ? Z_DEFAULT_COMPRESSION : o.level, Z_DEFLATED,
+                         codec == Codec::Gzip ? 15 + 16 : 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+            throw std::runtime_error("zlib init failed");
+        if (n > UINT32_MAX) {
+            deflateEnd(&z);
+            throw std::runtime_error("zlib chunks are limited to 4 GiB");
+        }
+        out.resize(deflateBound(&z, uLong(n)));
+        z.next_in = const_cast<Bytef*>(src);
+        z.avail_in = uInt(n);
+        z.next_out = out.data();
+        z.avail_out = uInt(out.size());
+        const int status = deflate(&z, Z_FINISH);
+        out.resize(z.total_out);
+        deflateEnd(&z);
+        if (status != Z_STREAM_END)
+            throw std::runtime_error("zlib encode failed");
+        return out;
+    }
+    case Codec::Lz4: {
+        if (n > std::size_t(LZ4_MAX_INPUT_SIZE))
+            throw std::runtime_error("lz4 chunks are limited to " + std::to_string(LZ4_MAX_INPUT_SIZE) + " bytes");
+        const int bound = LZ4_compressBound(int(n));
+        out.resize(4 + std::size_t(bound));
+        for (int i = 0; i < 4; ++i)
+            out[std::size_t(i)] = std::uint8_t(std::uint32_t(n) >> (8 * i));
+        const int written = LZ4_compress_fast(reinterpret_cast<const char*>(src), reinterpret_cast<char*>(out.data() + 4),
+                                              int(n), bound, std::max(o.level, 1));
+        if (written <= 0)
+            throw std::runtime_error("lz4 encode failed");
+        out.resize(4 + std::size_t(written));
+        return out;
+    }
+    case Codec::Lzw:
+        throw std::invalid_argument("LZW chunks can be read, not written");
+    case Codec::Delta3d:
+        if (shape.size() != 3 || (itemsize != 1 && itemsize != 2))
+            throw std::invalid_argument("vc-delta3d stores 3-D uint8 or uint16 chunks");
+        return encode_delta3d(src, n, {int(shape[0]), int(shape[1]), int(shape[2])}, itemsize);
+    case Codec::Volcomp: {
+        if (n != VOLCOMP_LIB_CHUNK_BYTES || itemsize != 1)
+            throw std::invalid_argument("volcomp stores 128^3 uint8 chunks");
+        out.resize(volcomp_lib_encode_bound());
+        std::size_t written = 0;
+        const int status = volcomp_lib_encode(src, o.q, out.data(), out.size(), &written);
+        if (status != VOLCOMP_LIB_OK)
+            throw std::runtime_error(std::string("volcomp encode failed: ") + volcomp_lib_status_string(status));
+        out.resize(written);
+        out.shrink_to_fit();  // the bound is ~14 MiB; chunks are usually 20-200 KiB
+        return out;
+    }
+    }
+    throw std::invalid_argument("unknown codec");
 }
 
 }  // namespace vcr

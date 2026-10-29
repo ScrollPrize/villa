@@ -227,4 +227,57 @@ private:
     std::optional<std::optional<Json>> consolidated_;
 };
 
+// ---- writing --------------------------------------------------------------------------
+
+struct CreateOptions {
+    Index shape, chunks;
+    std::string dtype = "|u1";       // numpy typestr: |u1, <u2, <f4, ...
+    std::string compressor = "blosc";  // "" or "none", blosc, zstd, zlib, gzip, lz4, vc-delta3d, volcomp
+    // blosc clevel, zstd/zlib/gzip level, lz4 acceleration; volcomp's quantiser step q
+    // (0 lossless). Values <= 0 choose the codec default (blosc 3, zstd 3, volcomp q 8).
+    int level = -1;
+    std::string separator = ".";
+    Json fillValue = 0;
+};
+
+// A local Zarr v2 array opened for writing. Chunk files are replaced atomically,
+// so concurrent writers of different chunks need no coordination, and readers
+// never see a partial chunk. Thread-safe for distinct chunks.
+class Writer {
+public:
+    // Writes <path>/.zarray (replacing any metadata there) and the parent's .zgroup when absent.
+    static Writer create(const std::filesystem::path& path, const CreateOptions& options);
+    // An existing local v2 array.
+    static Writer open(const std::filesystem::path& path);
+    Writer(Writer&&) noexcept;
+    Writer& operator=(Writer&&) noexcept;
+    ~Writer();
+
+    const ArrayMeta& meta() const;
+    const std::filesystem::path& path() const;
+    // Reads the stored array (no memory cache: always what is on disk).
+    Array& reader();
+
+    std::filesystem::path chunkPath(const Index& chunk) const;
+    bool chunkExists(const Index& chunk) const;
+    // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.
+    void writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size);
+    // Skips a chunk that is entirely the fill value, removing any stored one.
+    // Returns whether the chunk was written.
+    bool writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, std::size_t size);
+    bool removeChunk(const Index& chunk);
+    // Writes a C-order region; chunks it covers partially are read, patched and
+    // rewritten. The region must lie inside the array.
+    void writeRegion(const Index& start, const Index& shape, const std::uint8_t* data);
+
+private:
+    struct Impl;
+    explicit Writer(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+// .zattrs of a local group or array (an empty object when absent), and writing it.
+Json readAttributes(const std::filesystem::path& node);
+void writeAttributes(const std::filesystem::path& node, const Json& attributes);
+
 }  // namespace vcr::zarr

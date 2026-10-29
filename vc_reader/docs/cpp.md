@@ -22,8 +22,8 @@ For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 auto-detection when the option is omitted. The toolkit supplies CUDA Runtime
 and cuFFT. No Python development files are needed when Python is disabled.
 
-Reader dependencies are libcurl, c-blosc, zstd, zlib, SQLite, nlohmann-json,
-and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
+Reader dependencies are libcurl, c-blosc, zstd, zlib, LZ4, SQLite,
+nlohmann-json, and VC-Delta3D. The volcomp codec is vendored under `third_party/volcomp`. CMake uses an installed VC-Delta3D package or fetches its pinned
 revision. A transforms-only build uses `VC_READER_BUILD_READER=OFF` and needs
 none of these reader dependencies.
 
@@ -50,6 +50,8 @@ already link them. The Python extensions link those same CUDA libraries.
 | Header | API | CPU and CUDA coverage |
 | --- | --- | --- |
 | `vc_reader/reader.hpp` | `vcr::CtReader`: open a CT array or pyramid level, read regions, sample sheet normals; Zarr metadata normalization | Convenience methods use CPU; `array()` exposes the same array to general and CUDA sampling |
+| `vc_reader/zarr.hpp` | `vcr::zarr`: parse array metadata, resolve access (anonymous, basic, signed S3), open arrays and OME-Zarr groups with decoded/VC3D disk caches online or offline, write local v2 arrays (`Writer`) and attributes | CPU readers; connect an opened array to `reader_cuda::Reader` for CUDA |
+| `vc_reader/sftp.hpp` | `vcr::sftp`: SFTP sessions, the pooled `Fetcher` behind `sftp://` reads, directory listing | Transport only |
 | `vc_reader/array.hpp` | `vcr::Array`, `ArraySpec`, `MemoryCache`, `DiskCache`, HTTP/auth options, region reads, point reads, nearest/linear sampling, affine reads | Full existing CPU reader; connect the same array to `reader_cuda::Reader` for CUDA |
 | `vc_reader/sampling.hpp` | `aligned::Plan` and `PointPlan`, `surface::Plan`, `geometry::Curves` and `Voxels`, sheet-normal kernels | Existing CPU algorithms and CUDA launch APIs, including surfaces, curves and voxel membership |
 | `vc_reader/transforms.hpp` | All `transforms::Op` alternatives, parameter types, `Pipeline`, `Sample`, `Plan`, `save_plan`, `load_plan` | Full transform catalog; `cpu`, `cuda` and `auto` pipeline backends |
@@ -82,6 +84,34 @@ mounted. `vc_reader/sftp.hpp` exposes the session, the pooled `Fetcher` the
 reader uses (at most 8 sessions per host, transport failures retried, a missing
 file reads as not stored) and directory listing. Without an
 `sftp::setAuthenticator` callback, ssh runs in batch mode and never prompts.
+
+## Opening and writing Zarr arrays
+
+```cpp
+#include <vc_reader/zarr.hpp>
+
+namespace zarr = vcr::zarr;
+zarr::OpenOptions options;
+options.access = zarr::resolveAccess("s3://bucket/scan.zarr");  // anonymous for public channels
+options.cacheDirs = {"/data/cache", "vc3d"};                    // reuse decoded and VC3D caches
+auto group = zarr::Group::open("s3://bucket/scan.zarr", options);
+auto level2 = group.array(group.levels().at(2));
+std::vector<std::uint8_t> crop(64 * 64 * 64 * level2.meta.itemsize());
+level2.array->read_many({{0, 0, 0}}, {{64, 64, 64}}, {crop.data()});
+
+zarr::CreateOptions create;
+create.shape = {1024, 1024, 1024};
+create.chunks = {128, 128, 128};
+create.compressor = "zstd";
+auto out = zarr::Writer::create("/data/out.zarr/0", create);
+out.writeRegion({0, 0, 0}, {64, 64, 64}, crop.data());
+```
+
+The opener and the Python reader share one implementation, including cache
+discovery, VC3D leases and offline metadata. `OpenOptions::metadata` replaces
+metadata requests (for example with a caller's metadata cache), and
+`vc3dVolumeDir` names a VC3D cache directory directly. Writers encode every
+supported codec except LZW and replace chunk files atomically.
 
 ## Transform pipelines and replay
 

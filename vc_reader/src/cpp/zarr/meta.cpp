@@ -14,7 +14,7 @@ namespace {
 const std::map<std::string, std::string>& supportedCompressors()
 {
     static const std::map<std::string, std::string> ids{
-        {"blosc", "blosc"}, {"zstd", "zstd"}, {"zlib", "zlib"}, {"gzip", "gzip"}, {"lzw", "lzw"},
+        {"blosc", "blosc"}, {"zstd", "zstd"}, {"zlib", "zlib"}, {"gzip", "gzip"}, {"lz4", "lz4"}, {"lzw", "lzw"},
         {"imagecodecs_lzw", "lzw"}, {"vc-delta3d", "vc-delta3d"}, {"volcomp", "volcomp"}};
     return ids;
 }

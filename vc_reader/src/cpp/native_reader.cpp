@@ -81,7 +81,7 @@ std::string normalizeZarrMetadata(const std::string& text)
     }
     // v3 compressor names -> v2 compressor ids.
     const std::map<std::string, std::string> compressors{
-        {"blosc", "blosc"}, {"zstd", "zstd"}, {"gzip", "gzip"}, {"numcodecs.zlib", "zlib"},
+        {"blosc", "blosc"}, {"zstd", "zstd"}, {"gzip", "gzip"}, {"numcodecs.zlib", "zlib"}, {"numcodecs.lz4", "lz4"},
         {"volcomp", "volcomp"}};
     if (codecs.empty() || codecs.size() > 2 || codecs[0].at("name") != "bytes" ||
         (codecs.size() == 2 && !compressors.contains(codecs[1].at("name").get<std::string>()))) {

@@ -183,9 +183,9 @@ preserves explicitly shared cache ownership.
 
 The shared `ZarrReader` and `ZarrGroup` support v2 and the v3 layouts used by the
 published ink labels and CT exports: regular grids, default/v2 chunk keys, bytes
-serialization, optional Blosc, Zstd, gzip, zlib (`numcodecs.zlib`) or volcomp
-compression, and `sharding_indexed`. Zarr v2 arrays additionally accept LZW and
-vc-delta3d compressors. volcomp chunks are 128³ uint8. Unsupported codec
+serialization, optional Blosc, Zstd, gzip, zlib (`numcodecs.zlib`), LZ4
+(`numcodecs.lz4`) or volcomp compression, and `sharding_indexed`. Zarr v2
+arrays additionally accept LZW and vc-delta3d compressors. volcomp chunks are 128³ uint8. Unsupported codec
 pipelines/storage transformers fail explicitly. Shard indexes support
 little-endian bytes with optional CRC32C and either index location, following the
 [Zarr sharding specification](https://zarr-specs.readthedocs.io/en/latest/v3/codecs/sharding-indexed/index.html).

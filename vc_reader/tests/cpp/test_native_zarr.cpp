@@ -140,7 +140,7 @@ void metadata()
     require(v3.type.load(v3.fill.data()) == 1.0 && v3.codec() == "gzip", "v3 hex fill and codec");
 
     auto unsupported = vcr::zarr::parseArrayMeta(Json::parse(
-        R"({"zarr_format":2,"shape":[2],"chunks":[2],"dtype":"|u1","compressor":{"id":"lz4"},"filters":null,"fill_value":0,"order":"C"})"));
+        R"({"zarr_format":2,"shape":[2],"chunks":[2],"dtype":"|u1","compressor":{"id":"bz2"},"filters":null,"fill_value":0,"order":"C"})"));
     must_fail([&] { (void)unsupported.codec(); }, "unsupported compressor must be refused when decoding");
     must_fail([] { vcr::zarr::parseArrayMeta(Json::parse(R"({"zarr_format":2,"shape":[2],"chunks":[2],"dtype":"|O","fill_value":0})")); },
               "object dtype");
