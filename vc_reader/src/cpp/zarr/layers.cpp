@@ -16,6 +16,7 @@
 // take that lock exclusively.
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
+#include "files.hpp"
 
 #include <cmath>
 #include <fstream>
@@ -350,6 +351,11 @@ std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std
 
 void atomicWrite(const fs::path& path, const std::string& data)
 {
+    detail::atomicWriteFile(path, [&](std::ostream& out) { out.write(data.data(), std::streamsize(data.size())); });
+}
+
+void detail::atomicWriteFile(const fs::path& path, const std::function<void(std::ostream&)>& write)
+{
     fs::create_directories(path.parent_path());
     std::ostringstream suffix;
     suffix << ".tmp." << getpid() << "." << std::this_thread::get_id();
@@ -357,7 +363,8 @@ void atomicWrite(const fs::path& path, const std::string& data)
     try {
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            out.write(data.data(), std::streamsize(data.size()));
+            write(out);
+            out.close();
             if (!out)
                 throw std::runtime_error("cannot write " + tmp);
         }

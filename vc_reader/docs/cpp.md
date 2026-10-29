@@ -123,6 +123,24 @@ Zarr format in place. Chunk data uses the byte order declared by `dtype`.
 `setFillValue` updates absent-chunk fill without rewriting stored chunks;
 independently opened arrays must be reopened after metadata changes.
 
+For indexed shards, set `version = 3` and `shardShape` to the outer shape in
+elements, for example `{256, 256, 256}` with `{64, 64, 64}` chunks. Each shard
+dimension must be a positive multiple of its chunk dimension. `chunks` and
+chunk coordinates still describe the inner chunks. Indexes default to CRC32C
+at the end; `shardIndexCrc` and `shardIndexEnd` select the other supported layouts.
+`chunkPath` returns the containing shard file, while `chunkExists` checks the
+individual index entry. Removing its last stored chunk removes the shard.
+
+Shard updates copy unchanged encoded payloads and stream an atomic replacement;
+they do not decode or allocate the entire shard. Each chunk update rewrites its
+containing shard. Distinct chunk updates sharing a shard are serialized within
+the process, including updates through separately opened writers. Separate
+processes writing the same shard, or partial writes to the same chunk, must
+coordinate externally. Local reads keep one file snapshot for the index and
+payload. Remote arrays are treated as immutable. Writer-owned readers see local
+changes; callers using a separate memory cache or chunk service must invalidate
+their cached chunks after writes.
+
 ## Transform pipelines and replay
 
 ```cpp

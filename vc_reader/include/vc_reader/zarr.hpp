@@ -239,11 +239,14 @@ struct CreateOptions {
     std::string separator = ".";
     Json fillValue = 0;
     int version = 2;               // Zarr format 2 or 3
+    Index shardShape;               // v3 outer shape in elements; empty: unsharded
+    bool shardIndexEnd = true, shardIndexCrc = true;
 };
 
 // A local Zarr v2/v3 array opened for writing. Chunk files are replaced atomically,
-// so concurrent writers of different chunks need no coordination, and readers
-// never see a partial chunk. Thread-safe for distinct chunks.
+// so readers never see a partial chunk. Thread-safe for distinct chunks in one
+// process, including chunks sharing a shard. Separate processes must coordinate
+// updates to the same shard. Partial writes to the same chunk require coordination.
 class Writer {
 public:
     // Writes array metadata and a matching parent group marker when absent.
@@ -265,6 +268,8 @@ public:
     // opened arrays must be reopened. Call only with no concurrent writer users.
     void setFillValue(const Json& value);
 
+    // The containing file (a shard for sharded arrays). chunkExists tests the
+    // individual chunk's index entry, not merely the presence of this file.
     std::filesystem::path chunkPath(const Index& chunk) const;
     bool chunkExists(const Index& chunk) const;
     // `data` is one decoded chunk, exactly meta().chunkBytes() bytes in C order.

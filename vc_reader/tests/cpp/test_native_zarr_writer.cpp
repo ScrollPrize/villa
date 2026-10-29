@@ -4,6 +4,8 @@
 #include "vc_reader/slice.hpp"
 
 #include <algorithm>
+#include <barrier>
+#include <future>
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -45,7 +47,7 @@ std::vector<uint8_t> read(vcr::Array& array, const vcr::Index& start, const vcr:
     return out;
 }
 
-void codecs(const fs::path& root, int version)
+void codecs(const fs::path& root, int version, bool sharded = false)
 {
     struct Case {
         std::string compressor, dtype;
@@ -61,6 +63,7 @@ void codecs(const fs::path& root, int version)
         options.version = version;
         options.chunks = c.chunks;
         options.shape = {c.chunks[0], c.chunks[1], 2 * c.chunks[2]};
+        if (sharded) options.shardShape = options.shape;
         options.dtype = c.dtype;
         options.compressor = c.compressor;
         options.level = c.compressor == "volcomp" ? 0 : -1;  // volcomp q 0: lossless
@@ -211,12 +214,13 @@ void v3Metadata(const fs::path& root)
     require(read(checksum.reader(), {0, 0}, {2, 2}, 2) == chunk, "checksummed zstd readback");
 }
 
-void mutableChunks(const fs::path& root, int version)
+void mutableChunks(const fs::path& root, int version, bool sharded = false)
 {
     for (const auto* codec : {"none", "gzip"}) {
         vcr::zarr::CreateOptions options;
         options.version = version;
         options.shape = {3, 3, 3};
+        if (sharded) options.shardShape = {4, 4, 4};
         options.chunks = {2, 2, 2};
         options.dtype = "<u2";
         options.compressor = codec;
@@ -287,6 +291,105 @@ void mutableChunks(const fs::path& root, int version)
                 "failed fill update leaves metadata unchanged");
     }
 }
+
+std::string fileBytes(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+void shardEditing(const fs::path& root)
+{
+    for (bool end : {false, true}) for (bool crc : {false, true}) for (auto sep : {".", "/"}) {
+        vcr::zarr::CreateOptions o;
+        o.version = 3;
+        o.shape = {5, 7, 9}; o.chunks = {2, 3, 4}; o.shardShape = {4, 6, 8};
+        o.shardIndexEnd = end; o.shardIndexCrc = crc; o.separator = sep;
+        o.compressor = "gzip"; o.fillValue = 3;
+        const auto path = root / (std::string("edit-") + (end ? "end" : "start") +
+                                 (crc ? "-crc" : "") + (sep[0] == '.' ? "-dot" : "-slash"));
+        auto w = vcr::zarr::Writer::create(path, o);
+        require(w.meta().chunks == o.chunks && w.meta().v3->shards == vcr::Index{2, 2, 2}, "logical and shard geometry");
+        std::vector<uint8_t> expected(5 * 7 * 9);
+        for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i % 251);
+        w.writeRegion({0, 0, 0}, o.shape, expected.data());
+        std::vector<uint8_t> patch(3 * 3 * 4, 253);
+        w.writeRegion({1, 2, 3}, {3, 3, 4}, patch.data());
+        for (int z = 1; z < 4; ++z) for (int y = 2; y < 5; ++y) for (int x = 3; x < 7; ++x)
+            expected[(z * 7 + y) * 9 + x] = 253;
+        require(read(w.reader(), {0, 0, 0}, o.shape, 1) == expected, "region patch crosses chunks and shards");
+        require(w.chunkPath({0, 0, 0}) == w.chunkPath({1, 1, 1}), "chunks share physical shard path");
+        const auto& v3 = *w.meta().v3;
+        const vcr::ShardLayout layout(v3.shards, v3.indexEnd, v3.indexCrc, w.meta().chunkBytes());
+        std::vector<uint8_t> before, after;
+        require(vcr::LocalShard(w.chunkPath({0, 0, 1}), layout).readEntry(1, before), "encoded neighbor exists");
+        std::vector<uint8_t> fill(w.meta().chunkBytes(), 3);
+        require(!w.writeChunkSkipEmpty({0, 0, 0}, fill.data(), fill.size()), "fill chunk omitted within shard");
+        require(!w.chunkExists({0, 0, 0}) && w.chunkExists({0, 0, 1}), "chunk existence uses index");
+        require(vcr::LocalShard(w.chunkPath({0, 0, 1}), layout).readEntry(1, after) && after == before,
+                "neighbor's encoded bytes survive editing unchanged");
+        require(read(w.reader(), {0, 0, 0}, o.chunks, 1) == fill, "removed entry reads fill");
+        require(!w.removeChunk({0, 0, 0}), "absent entry removal is a no-op");
+
+        // Corrupt input cannot be silently overwritten or damage other chunks.
+        const auto file = w.chunkPath({0, 0, 1});
+        const auto valid = fileBytes(file);
+        auto broken = valid;
+        if (crc) broken[end ? broken.size() - 1 : layout.indexBytes - 1] ^= 1;
+        else {
+            const size_t indexStart = end ? broken.size() - layout.indexBytes : 0;
+            // A present entry with an impossible offset.
+            std::fill_n(broken.begin() + indexStart + 16, 8, char(255));
+        }
+        vcr::zarr::atomicWrite(file, broken);
+        must_fail([&] { w.writeChunk({0, 0, 0}, fill.data(), fill.size()); }, "corrupt shard update refused");
+        require(fileBytes(file) == broken, "failed update preserves original shard");
+        must_fail([&] { w.removeChunk({0, 0, 1}); }, "corrupt shard deletion refused");
+        vcr::zarr::atomicWrite(file, valid);
+        for (int z = 0; z < 3; ++z) for (int y = 0; y < 3; ++y) for (int x = 0; x < 3; ++x)
+            w.removeChunk({z, y, x});
+        require(!fs::exists(file), "last chunk removal deletes shard");
+        require(read(w.reader(), {0, 0, 0}, o.shape, 1) == std::vector<uint8_t>(expected.size(), 3), "all removed shards read fill");
+        for (const auto& entry : fs::recursive_directory_iterator(path))
+            require(entry.path().filename().string().find(".tmp.") == std::string::npos, "no temporary shard files left");
+    }
+    vcr::zarr::CreateOptions bad;
+    bad.version = 3; bad.shape = {5, 5, 5}; bad.chunks = {2, 2, 2};
+    for (const auto& shards : {vcr::Index{4, 4}, vcr::Index{4, 4, 5}, vcr::Index{0, 4, 4},
+                              vcr::Index{INT64_MAX - 1, 4, 4}}) {
+        bad.shardShape = shards;
+        must_fail([&] { vcr::zarr::Writer::create(root / "bad-shards", bad); }, "invalid shard geometry refused");
+        require(!fs::exists(root / "bad-shards"), "invalid geometry writes no files");
+    }
+    bad.version = 2; bad.shardShape = {4, 4, 4};
+    must_fail([&] { vcr::zarr::Writer::create(root / "bad-shards", bad); }, "v2 shards refused");
+}
+
+void concurrentShards(const fs::path& root)
+{
+    vcr::zarr::CreateOptions o;
+    o.version = 3; o.shape = {4, 4, 4}; o.chunks = {2, 2, 2}; o.shardShape = o.shape;
+    o.compressor = "gzip";
+    auto w = vcr::zarr::Writer::create(root / "concurrent", o);
+    std::barrier ready(8);
+    std::vector<std::future<void>> workers;
+    for (int t = 0; t < 8; ++t) workers.push_back(std::async(std::launch::async, [&, t] {
+        auto writer = vcr::zarr::Writer::open(t % 2 ? fs::relative(w.path()) : w.path());
+        const vcr::Index key{t / 4, (t / 2) % 2, t % 2};
+        std::vector<uint8_t> chunk(8);
+        ready.arrive_and_wait();
+        for (int repeat = 0; repeat < 20; ++repeat) {
+            std::fill(chunk.begin(), chunk.end(), uint8_t(1 + t + 8 * repeat));
+            writer.writeChunk(key, chunk.data(), chunk.size());
+        }
+    }));
+    for (auto& worker : workers) worker.get();
+    for (int t = 0; t < 8; ++t) {
+        std::vector<uint8_t> chunk(8);
+        require(w.reader().read_chunk({t / 4, (t / 2) % 2, t % 2}, chunk.data(), chunk.size()) &&
+                chunk == std::vector<uint8_t>(8, uint8_t(1 + t + 8 * 19)), "concurrent distinct chunks retain every update");
+    }
+}
 }  // namespace
 
 int main()
@@ -310,6 +413,10 @@ int main()
             mutableChunks(dir, version);
         }
         v3Metadata(root);
+        codecs(root / "sharded-codecs", 3, true);
+        mutableChunks(root / "sharded-mutable", 3, true);
+        shardEditing(root);
+        concurrentShards(root);
         std::cout << "every codec round-trips; skip-empty, regions, attributes and validation passed\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

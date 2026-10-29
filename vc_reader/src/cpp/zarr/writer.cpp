@@ -2,6 +2,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/codecs.hpp"
 #include "format.hpp"
+#include "files.hpp"
 
 #include <cstring>
 #include <fstream>
@@ -54,7 +55,7 @@ Json compressorConfig(const CreateOptions& options)
     throw std::invalid_argument("cannot write Zarr chunks compressed with '" + id + "'");
 }
 
-Json v3Metadata(const ArrayMeta& meta)
+Json v3Metadata(const ArrayMeta& meta, const CreateOptions& options)
 {
     std::string dtype;
     for (const auto& [name, typestr] : detail::v3Types)
@@ -82,8 +83,16 @@ Json v3Metadata(const ArrayMeta& meta)
             throw std::invalid_argument("unsupported Zarr v3 compressor " + id);
         codecs.push_back({{"name", name}, {"configuration", config}});
     }
+    if (!options.shardShape.empty()) {
+        Json indexCodecs = Json::array({{{"name", "bytes"}, {"configuration", {{"endian", "little"}}}}});
+        if (options.shardIndexCrc) indexCodecs.push_back({{"name", "crc32c"}});
+        codecs = Json::array({{{"name", "sharding_indexed"},
+                              {"configuration", {{"chunk_shape", meta.chunks}, {"codecs", codecs},
+                                                  {"index_codecs", indexCodecs},
+                                                  {"index_location", options.shardIndexEnd ? "end" : "start"}}}}});
+    }
     return {{"zarr_format", 3}, {"node_type", "array"}, {"shape", meta.shape}, {"data_type", dtype},
-            {"chunk_grid", {{"name", "regular"}, {"configuration", {{"chunk_shape", meta.chunks}}}}},
+            {"chunk_grid", {{"name", "regular"}, {"configuration", {{"chunk_shape", options.shardShape.empty() ? meta.chunks : options.shardShape}}}}},
             {"chunk_key_encoding", {{"name", "default"}, {"configuration", {{"separator", meta.separator}}}}},
             {"fill_value", meta.raw.at("fill_value")}, {"codecs", codecs}, {"attributes", Json::object()}};
 }
@@ -97,6 +106,19 @@ fs::path metadataPath(const fs::path& path, const ArrayMeta& meta)
 {
     return path / (meta.v3 ? "zarr.json" : ".zarray");
 }
+
+// Bounded lock table shared by all Writer instances. Canonical array paths make
+// relative paths and symlinks to the same shard use the same lock.
+std::mutex& shardMutex(const fs::path& path)
+{
+    static std::array<std::mutex, 256> locks;
+    return locks[std::hash<std::string>{}(path.string()) % locks.size()];
+}
+
+void putLittle(std::uint8_t* out, std::uint64_t value, int bytes)
+{
+    for (int i = 0; i < bytes; ++i) out[i] = std::uint8_t(value >> (8 * i));
+}
 }  // namespace
 
 struct Writer::Impl {
@@ -105,6 +127,56 @@ struct Writer::Impl {
     Codec codec = Codec::Raw;
     EncodeOptions encode;
     std::unique_ptr<Array> reader;
+    std::unique_ptr<ShardLayout> shards;
+    fs::path canonicalPath;
+
+    // Keep encoded neighbors intact and bound scratch memory to one payload
+    // and the index. A failed copy never replaces the existing shard.
+    bool updateShard(const fs::path& file, std::size_t target, const std::vector<std::uint8_t>* replacement)
+    {
+        const auto& layout = *shards;
+        std::lock_guard lock(shardMutex(canonicalPath / file.lexically_relative(path)));
+        LocalShard previous(file, layout);
+        bool existed = false;
+        std::size_t remaining = 0;
+        if (!previous.index.empty()) {
+            for (std::size_t i = 0; i < layout.indexBytes / 16; ++i) {
+                const bool present = layout.entry(previous.index, i, previous.total).has_value();
+                if (i == target) existed = present;
+                else remaining += present;
+            }
+        }
+        if (!replacement && !existed) return false;
+        if (!replacement && !remaining) {
+            fs::remove(file);
+            return true;
+        }
+        detail::atomicWriteFile(file, [&](std::ostream& out) {
+            std::vector<std::uint8_t> index(layout.indexBytes, 255), buffer;
+            if (!layout.indexEnd)
+                out.write(reinterpret_cast<const char*>(index.data()), std::streamsize(index.size()));
+            for (std::size_t i = 0; i < layout.indexBytes / 16; ++i) {
+                const std::vector<std::uint8_t>* payload = replacement;
+                if (i == target) {
+                    if (!replacement) continue;
+                } else {
+                    if (!previous.readEntry(i, buffer)) continue;
+                    payload = &buffer;
+                }
+                const auto offset = out.tellp();
+                if (offset < 0) throw std::runtime_error("cannot seek shard output");
+                putLittle(index.data() + 16 * i, std::uint64_t(offset), 8);
+                putLittle(index.data() + 16 * i + 8, payload->size(), 8);
+                out.write(reinterpret_cast<const char*>(payload->data()), std::streamsize(payload->size()));
+                if (!out) throw std::runtime_error("cannot write shard payload");
+            }
+            if (layout.indexCrc)
+                putLittle(index.data() + index.size() - 4, crc32c(index.data(), index.size() - 4), 4);
+            if (!layout.indexEnd) out.seekp(0);
+            out.write(reinterpret_cast<const char*>(index.data()), std::streamsize(index.size()));
+        });
+        return existed;
+    }
 };
 
 Writer::Writer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -116,6 +188,8 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options)
 {
     if (options.version != 2 && options.version != 3)
         throw std::invalid_argument("Zarr version must be 2 or 3");
+    if (options.version != 3 && !options.shardShape.empty())
+        throw std::invalid_argument("indexed shards require Zarr v3");
     if (fs::exists(path / ".zgroup") ||
         (options.version == 3 && fs::exists(path / ".zarray")) ||
         (options.version == 2 && fs::exists(path / "zarr.json")))
@@ -141,7 +215,7 @@ Writer Writer::create(const fs::path& path, const CreateOptions& options)
     if (codec == Codec::Delta3d && (meta.chunks.size() != 3 || meta.type.kind != 'u' || meta.itemsize() > 2))
         throw std::invalid_argument("vc-delta3d requires 3-D uint8 or uint16 chunks");
     if (options.version == 3) {
-        zarray = v3Metadata(meta);
+        zarray = v3Metadata(meta, options);
         meta = parseArrayMeta(zarray);
     }
     fs::create_directories(path);
@@ -165,8 +239,11 @@ Writer Writer::open(const fs::path& path)
     auto impl = std::make_unique<Impl>();
     impl->path = path;
     impl->meta = parseArrayMeta(Json::parse(in));
-    if (impl->meta.v3 && !impl->meta.v3->shards.empty())
-        throw std::invalid_argument("writing indexed shards is not supported");
+    if (impl->meta.v3 && !impl->meta.v3->shards.empty()) {
+        const auto& v3 = *impl->meta.v3;
+        impl->shards = std::make_unique<ShardLayout>(v3.shards, v3.indexEnd, v3.indexCrc, impl->meta.chunkBytes());
+        impl->canonicalPath = fs::canonical(path);
+    }
     impl->codec = parse_codec(impl->meta.codec());
     impl->encode = encodeOptions(impl->meta.compressor);
     OpenOptions options;
@@ -209,20 +286,26 @@ fs::path Writer::chunkPath(const Index& chunk) const
         throw std::invalid_argument("chunk index rank does not match the array");
     std::string key = meta.v3 ? meta.v3->prefix : "";
     for (std::size_t i = 0; i < chunk.size(); ++i) {
-        const auto grid = (meta.shape[i] + meta.chunks[i] - 1) / meta.chunks[i];
+        const auto grid = meta.shape[i] / meta.chunks[i] + (meta.shape[i] % meta.chunks[i] != 0);
         if (chunk[i] < 0 || chunk[i] >= std::max<std::int64_t>(grid, 1))
             throw std::out_of_range("chunk index outside the array");
         if (i)
             key += meta.separator;
-        key += std::to_string(chunk[i]);
+        key += std::to_string(impl_->shards ? chunk[i] / impl_->shards->ratios[i] : chunk[i]);
     }
     return impl_->path / key;
 }
 
 bool Writer::chunkExists(const Index& chunk) const
 {
+    const auto file = chunkPath(chunk);
+    if (impl_->shards) {
+        LocalShard shard(file, *impl_->shards);
+        return !shard.index.empty() &&
+               impl_->shards->entry(shard.index, impl_->shards->locate(chunk).second, shard.total).has_value();
+    }
     std::error_code ec;
-    return fs::exists(chunkPath(chunk), ec);
+    return fs::exists(file, ec);
 }
 
 void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_t size)
@@ -233,6 +316,10 @@ void Writer::writeChunk(const Index& chunk, const std::uint8_t* data, std::size_
                                     std::to_string(meta.chunkBytes()));
     const auto path = chunkPath(chunk);
     const auto bytes = encode(impl_->codec, impl_->encode, data, size, meta.itemsize(), meta.chunks);
+    if (impl_->shards) {
+        impl_->updateShard(path, impl_->shards->locate(chunk).second, &bytes);
+        return;
+    }
     atomicWrite(path, std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 }
 
@@ -254,8 +341,11 @@ bool Writer::writeChunkSkipEmpty(const Index& chunk, const std::uint8_t* data, s
 
 bool Writer::removeChunk(const Index& chunk)
 {
+    const auto file = chunkPath(chunk);
+    if (impl_->shards)
+        return impl_->updateShard(file, impl_->shards->locate(chunk).second, nullptr);
     std::error_code ec;
-    const bool removed = fs::remove(chunkPath(chunk), ec);
+    const bool removed = fs::remove(file, ec);
     if (ec)
         throw std::system_error(ec, "removing " + chunkPath(chunk).string());
     return removed;
