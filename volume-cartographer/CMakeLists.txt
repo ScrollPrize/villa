@@ -705,7 +705,6 @@ endif()
 include_directories(core/include)
 
 add_subdirectory(libs/c3d)
-add_subdirectory(libs/volcomp)
 # flatboi (SLIM) needs igl::core; fetch it here, before the sanitizer flags below.
 if(VC_BUILD_FLATBOI)
     include(cmake/FetchLibigl.cmake)
@@ -739,7 +738,7 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs core utils libs/c3d libs/volcomp)
+set(_vc_install_dirs core utils libs/c3d)
 if(VC_BUILD_APPS)
     list(APPEND _vc_install_dirs apps apps/VC3D)
 endif()

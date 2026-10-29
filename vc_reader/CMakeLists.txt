@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(vc_reader_extensions LANGUAGES CXX)
+project(vc_reader_extensions LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,7 @@ endif()
 
 
 include(cmake/NativeTargets.cmake)
+add_subdirectory(third_party/volcomp)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
