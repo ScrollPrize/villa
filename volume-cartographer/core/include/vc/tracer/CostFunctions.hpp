@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/core/types/ChunkedTensor.hpp"
+#include "vc/tracer/DirectionField.hpp"
 #include <iostream>
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
@@ -349,8 +350,8 @@ struct SpaceLineLossAcc {
 };
 
 struct FiberDirectionLoss {
-    FiberDirectionLoss(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
-        _fiber_dirs(fiber_dirs), _maybe_weights(maybe_weights), _w(w) {};
+    FiberDirectionLoss(const DirectionField &field, float w) :
+        _field(field), _w(w) {};
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, E* residual) const {
 
@@ -358,7 +359,8 @@ struct FiberDirectionLoss {
 
         // Note this does *not* sample the direction volume differentiably. This makes sense for now since the volume
         // is piecewise constant, and interpolating it is non-trivial anyway (since its values live in RP2)
-        cv::Vec3f fiber_dir_zyx_vec = _fiber_dirs(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]));
+        const auto target = sampleDirectionConstraint(_field, {unjet(l_base[0]), unjet(l_base[1]), unjet(l_base[2])});
+        const auto& fiber_dir_zyx_vec = target.directionZYX;
         E fiber_dir_zyx[3] = {E(fiber_dir_zyx_vec[0]), E(fiber_dir_zyx_vec[1]), E(fiber_dir_zyx_vec[2])};
 
         E const patch_u_disp_zyx[3] {
@@ -380,7 +382,7 @@ struct FiberDirectionLoss {
                               + patch_u_disp_zyx[1] * fiber_dir_zyx[1]
                               + patch_u_disp_zyx[2] * fiber_dir_zyx[2]) / patch_u_dist;
 
-        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
+        E const weight_at_point = E(target.confidence);
 
         residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
 
@@ -391,27 +393,27 @@ struct FiberDirectionLoss {
     template<typename JetT> static double unjet(const JetT& v) { return v.a; }
 
     float _w;
-    Chunked3dVec3fFromUint8 &_fiber_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
+    const DirectionField &_field;
 
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &fiber_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
+    static ceres::CostFunction* Create(const DirectionField &field, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(fiber_dirs, maybe_weights, w));
+        return new ceres::AutoDiffCostFunction<FiberDirectionLoss, 1, 3, 3>(new FiberDirectionLoss(field, w));
     }
 };
 
 struct NormalDirectionLoss {
-    NormalDirectionLoss(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w) :
-        _normal_dirs(normal_dirs), _maybe_weights(maybe_weights), _w(w) {};
+    NormalDirectionLoss(const DirectionField &field, float w) :
+        _field(field), _w(w) {};
     template <typename E>
     bool operator()(const E* const l_base, const E* const l_u_off, const E* const l_v_off, E* residual) const {
 
-        // All l_* are indexed xyz, while fiber_field zarr _normal_dirs is indexed zyx (and contains zyx-ordered vectors)
+        // All l_* are indexed xyz, while decoded direction vectors are indexed zyx
 
         // Note this does *not* sample the direction volume differentiably, i.e. there is a gradient moving the points to
         // be more-normal, but not moving the surface to be in a region where the normal field better matches the current
         // surface orientation
-        cv::Vec3f target_normal_zyx_vec = _normal_dirs(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]));
+        const auto target = sampleDirectionConstraint(_field, {unjet(l_base[0]), unjet(l_base[1]), unjet(l_base[2])});
+        const auto& target_normal_zyx_vec = target.directionZYX;
         E target_normal_zyx[3] = {E(target_normal_zyx_vec[0]), E(target_normal_zyx_vec[1]), E(target_normal_zyx_vec[2])};
 
         E const patch_u_disp_zyx[3] {
@@ -440,7 +442,7 @@ struct NormalDirectionLoss {
         using std::abs;
         E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
 
-        E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);
+        E const weight_at_point = E(target.confidence);
 
         residual[0] = E(_w) * (E(1) - abs_dot) * weight_at_point;
 
@@ -451,12 +453,11 @@ struct NormalDirectionLoss {
     template<typename JetT> static double unjet(const JetT& v) { return v.a; }
 
     float _w;
-    Chunked3dVec3fFromUint8 &_normal_dirs;
-    Chunked3dFloatFromUint8 *_maybe_weights;
+    const DirectionField &_field;
 
-    static ceres::CostFunction* Create(Chunked3dVec3fFromUint8 &normal_dirs, Chunked3dFloatFromUint8 *maybe_weights, float w = 1.0)
+    static ceres::CostFunction* Create(const DirectionField &field, float w = 1.0)
     {
-        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(normal_dirs, maybe_weights, w));
+        return new ceres::AutoDiffCostFunction<NormalDirectionLoss, 1, 3, 3, 3>(new NormalDirectionLoss(field, w));
     }
 };
 

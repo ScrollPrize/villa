@@ -730,7 +730,8 @@ vc_add_test(NAME test_quadsurface_cache_concurrency)
 vc_add_test(NAME test_quadsurface_save_paths)
 
 
-vc_add_test(NAME test_chunked_tensor_meta LIBS doctest::doctest vc_tracer)
+vc_add_test(NAME test_chunked_tensor LIBS doctest::doctest vc_tracer)
+vc_add_test(NAME test_direction_field LIBS doctest::doctest vc_tracer)
 
 vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer

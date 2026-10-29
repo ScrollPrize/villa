@@ -16,7 +16,6 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
 
 #include <omp.h>
@@ -150,7 +149,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
     return false;
 }
 
-static auto load_direction_fields(Json const&params, std::filesystem::path const &cache_root)
+static auto load_direction_fields(Json const&params)
 {
     std::vector<DirectionField> direction_fields;
     if (params.contains("direction_fields")) {
@@ -165,21 +164,9 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
                 continue;
             }
             int const ome_scale = direction_field["scale"].get_int();
-            float scale_factor = std::pow(2, -ome_scale);
-            std::filesystem::path dirs_group_path(zarr_path);
-            std::vector<std::unique_ptr<vc::VcDataset>> direction_dss;
-            for (auto dim : std::string("xyz")) {
-                std::filesystem::path dim_ds_path = dirs_group_path / std::string(&dim, 1) / std::to_string(ome_scale);
-                direction_dss.push_back(std::make_unique<vc::VcDataset>(dim_ds_path));
-            }
-            std::cout << "direction field dataset shape " << direction_dss.front()->shape() << std::endl;
-            std::unique_ptr<vc::VcDataset> maybe_weight_ds;
-            if (direction_field.contains("weight_zarr")) {
-                std::string const weight_zarr_path = direction_field["weight_zarr"].get_string();
-                std::filesystem::path weight_ds_path = std::filesystem::path(weight_zarr_path) / std::to_string(ome_scale);
-                maybe_weight_ds = std::make_unique<vc::VcDataset>(weight_ds_path);
-            }
-            std::string const unique_id = std::to_string(std::hash<std::string>{}(dirs_group_path.string() + std::to_string(ome_scale)));
+            std::optional<std::filesystem::path> confidenceRoot;
+            if (direction_field.contains("weight_zarr"))
+                confidenceRoot = direction_field["weight_zarr"].get_string();
             float weight = 1.0f;
             if (direction_field.contains("weight")) {
                 try {
@@ -189,11 +176,9 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
                 }
             }
 
-            direction_fields.emplace_back(
-                direction,
-                std::make_unique<Chunked3dVec3fFromUint8>(std::move(direction_dss), scale_factor, cache_root, unique_id),
-                maybe_weight_ds ? std::make_unique<Chunked3dFloatFromUint8>(std::move(maybe_weight_ds), scale_factor, cache_root, unique_id + "_conf") : std::unique_ptr<Chunked3dFloatFromUint8>(),
-                weight);
+            direction_fields.emplace_back(direction, zarr_path, ome_scale, weight, confidenceRoot);
+            const auto& shape = direction_fields.back().native->arrays[0]->meta.shape;
+            std::cout << "direction field dataset shape [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
         }
     }
     return direction_fields;
@@ -497,7 +482,7 @@ static int run_main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    auto direction_fields = load_direction_fields(params, cache_root);
+    auto direction_fields = load_direction_fields(params);
 
     std::unordered_map<std::string,QuadSurface*> surfs;
     std::vector<QuadSurface*> surfs_v;
@@ -1607,7 +1592,7 @@ static int run_main(int argc, char *argv[])
         std::unique_ptr<QuadSurface> refined;
         try {
             refined.reset(tracer(*volume, 1.0, 0, {0, 0, 0}, refine, cache_root.string(), voxelsize,
-                                 load_direction_fields(refine, cache_root), out_surf.get(),
+                                 load_direction_fields(refine), out_surf.get(),
                                  store ? std::filesystem::path() : out_dir, refine_meta, corrections, nullptr));
         } catch (const std::exception& e) {
             std::cerr << "ERROR: vc_grow_seg_from_seed: neighbor refinement failed: " << e.what() << std::endl;

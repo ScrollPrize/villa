@@ -21,7 +21,6 @@
 #include "vc/tracer/CostFunctions.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
-#include "vc/core/types/VcDataset.hpp"
 
 #include "edt.hpp"
 
@@ -46,20 +45,6 @@
 #include "vc/tracer/Tracer.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
-
-DirectionField::DirectionField(std::string dir,
-                               std::unique_ptr<Chunked3dVec3fFromUint8> field,
-                               std::unique_ptr<Chunked3dFloatFromUint8> weight_dataset,
-                               float weight)
-    : direction(std::move(dir))
-    , field_ptr(std::move(field))
-    , weight_ptr(std::move(weight_dataset))
-    , weight(weight)
-{
-}
-DirectionField::~DirectionField() = default;
-DirectionField::DirectionField(DirectionField&&) noexcept = default;
-DirectionField& DirectionField::operator=(DirectionField&&) noexcept = default;
 
 #define LOSS_STRAIGHT 1
 #define LOSS_DIST 2
@@ -1473,15 +1458,15 @@ int gen_direction_loss(ceres::Problem &problem,
         if (field.direction == "horizontal") {
             if (!loc_valid(state(p_off_horz)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0]);
         } else if (field.direction == "vertical") {
             if (!loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(FiberDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(FiberDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_vert)[0]);
         } else if (field.direction == "normal") {
             if (!loc_valid(state(p_off_horz)) || !loc_valid(state(p_off_vert)))
                 continue;
-            problem.AddResidualBlock(NormalDirectionLoss::Create(*field.field_ptr, field.weight_ptr.get(), totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
+            problem.AddResidualBlock(NormalDirectionLoss::Create(field, totalWeight), nullptr, &loc(p)[0], &loc(p_off_horz)[0], &loc(p_off_vert)[0]);
         } else {
             assert(false);
         }

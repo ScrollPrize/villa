@@ -1,14 +1,12 @@
 #pragma once
 
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Volume.hpp"
 
 #include <opencv2/core/mat.hpp>
 
-#include "vc/core/types/VcDataset.hpp"
 
 #include <array>
 #include <cstdlib>
@@ -23,12 +21,6 @@
 #include <cerrno>
 #include <cstring>
 #include <sstream>
-
-// Helpers to keep nlohmann/json.hpp out of this header.
-// Reads meta.json in |dir|, returns canonical "dataset_source_path" or empty.
-std::filesystem::path read_cache_meta_dataset_path(const std::filesystem::path& meta_json_path);
-// Writes meta.json into |dir| with the given canonical dataset path.
-void write_cache_meta_json(const std::filesystem::path& dir, const std::filesystem::path& dataset_path);
 
 #ifndef CCI_TLS_MAX // Max number for ChunkedCachedInterpolator
 #define CCI_TLS_MAX 256
@@ -57,27 +49,6 @@ static uint64_t chunk_compute_total = 0;
 
 template <typename T, typename C> class Chunked3dAccessor;
 
-inline std::unique_ptr<vc::render::ChunkCache> openChunkedArrayCache(
-    const std::filesystem::path& zarrPath,
-    std::size_t capacityBytes)
-{
-    auto opened = vc::render::openLocalZarrPyramid(zarrPath);
-    std::vector<vc::render::ChunkCache::LevelInfo> levels;
-    levels.reserve(opened.shapes.size());
-    for (std::size_t i = 0; i < opened.shapes.size(); ++i) {
-        levels.push_back({opened.shapes[i], opened.chunkShapes[i], opened.transforms[i]});
-    }
-
-    vc::render::ChunkCacheService::Options serviceOptions;
-    serviceOptions.decodedByteCapacity = capacityBytes;
-    return std::make_unique<vc::render::ChunkCache>(
-        std::move(levels),
-        std::move(opened.fetchers),
-        opened.fillValue,
-        opened.dtype,
-        vc::render::ChunkCache::Options{}, std::move(serviceOptions));
-}
-
 static std::string tmp_name_proc_thread()
 {
     std::stringstream ss;
@@ -91,13 +62,7 @@ class Chunked3d {
 public:
     using CHUNKT = Array3D<T>;
 
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
-    {
-        _border = compute_f.BORDER;
-        if (_ds)
-            _shape = {static_cast<int>(_ds->shape()[0]), static_cast<int>(_ds->shape()[1]), static_cast<int>(_ds->shape()[2])};
-    };
-    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _ds(nullptr), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
         _shape = {shape[0], shape[1], shape[2]};
@@ -125,91 +90,14 @@ public:
         }
         _chunks.clear();
 
-        if (!_persistent) {
+        if (!_cache_dir.empty()) {
             // Best effort in a noexcept destructor. Mapping cleanup above
             // makes the normal Windows removal path succeed.
             std::error_code ec;
             std::filesystem::remove_all(_cache_dir, ec);
         }
     };
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
-    {
-        _border = compute_f.BORDER;
-        
-        if (_ds)
-            _shape = {static_cast<int>(_ds->shape()[0]), static_cast<int>(_ds->shape()[1]), static_cast<int>(_ds->shape()[2])};
-        
-        if (cache_root.empty())
-            return;
-
-        if (!_compute_f.UNIQUE_ID_STRING.size())
-            throw std::runtime_error("requested fs cache for compute function without identifier");        
-        
-        std::filesystem::path root = cache_root/_compute_f.UNIQUE_ID_STRING;
-        
-        std::filesystem::create_directories(root);
-        
-        if (!_ds)
-            _persistent = false;
-        
-        //create cache dir while others are competing to do the same
-        for(int r=0;r<1000 && _cache_dir.empty();r++) {
-            std::set<std::string> paths;
-            if (_persistent) {
-                for (auto const& entry : std::filesystem::directory_iterator(root))
-                    if (std::filesystem::is_directory(entry) && std::filesystem::exists(entry.path()/"meta.json") && std::filesystem::is_regular_file(entry.path()/"meta.json")) {
-                        paths.insert(entry.path().string());
-                        auto src = read_cache_meta_dataset_path(entry.path()/"meta.json");
-                        if (src.empty())
-                            continue;
-                        if (!std::filesystem::exists(ds->path()))
-                            continue;
-                        try {
-                            if (src == std::filesystem::canonical(ds->path())) {
-                                _cache_dir = entry.path();
-                                break;
-                            }
-                        } catch (const std::exception&) {
-                            continue;
-                        }
-                    }
-                
-                if (!_cache_dir.empty())
-                    continue;
-            }
-            
-            //try generating our own cache dir atomically
-            std::filesystem::path tmp_dir = cache_root/tmp_name_proc_thread();
-            std::filesystem::create_directories(tmp_dir);
-            
-            if (_persistent) {
-                write_cache_meta_json(tmp_dir, std::filesystem::canonical(ds->path()));
-
-                std::filesystem::path tgt_path;
-                for(int i=0;i<1000;i++) {
-                    tgt_path = root/std::to_string(i);
-                    if (paths.count(tgt_path.string()))
-                        continue;
-                    try {
-                        std::filesystem::rename(tmp_dir, tgt_path);
-                    }
-                    catch (std::filesystem::filesystem_error&){
-                        continue;
-                    }
-                    _cache_dir = tgt_path;
-                    break;
-                }
-            }
-            else {
-                _cache_dir = tmp_dir;
-            }
-        }
-        
-        if (_cache_dir.empty())
-            throw std::runtime_error("could not create cache dir - maybe too many caches in cache root (max 1000!)");
-        
-    };
-    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(nullptr), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, const std::array<int, 3>& shape, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
         _shape = {shape[0], shape[1], shape[2]};
@@ -220,7 +108,6 @@ public:
         if (!_compute_f.UNIQUE_ID_STRING.size())
             throw std::runtime_error("requested fs cache for compute function without identifier");
 
-        _persistent = false;
         std::filesystem::path root = cache_root/_compute_f.UNIQUE_ID_STRING;
         std::filesystem::create_directories(root);
         _cache_dir = root/tmp_name_proc_thread();
@@ -445,7 +332,6 @@ public:
     }
 
     std::unordered_map<cv::Vec3i,T*,vec3i_hash> _chunks;
-    vc::VcDataset *_ds;
     vc::render::IChunkedArray *_cache;
     int _level;
     size_t _border;
@@ -453,7 +339,6 @@ public:
     std::shared_mutex _mutex;
     uint64_t _tmp_counter = 0;
     std::filesystem::path _cache_dir;
-    bool _persistent = true;
     std::vector<int> _shape;
 };
 
@@ -669,76 +554,4 @@ private:
 
     ArRef               _ar;
     std::vector<int>    _shape;
-};
-
-struct Chunked3dFloatFromUint8
-{
-    Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
-        _passthrough{unique_id},
-        _ownedCache(openChunkedArrayCache(ds->path(), 128ULL << 20)),
-        _x(_passthrough, ds.get(), _ownedCache.get(), 0, cache_root),
-        _scale(scale),
-        _ds(std::move(ds))
-    {
-    }
-
-    float operator()(cv::Vec3d p)
-    {
-        // p has zyx ordering!
-        p *= _scale;
-        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
-        uint8_t x = _x.safe_at(i);
-        return static_cast<float>(x) / 255.f;
-    }
-
-    float operator()(double z, double y, double x)
-    {
-        return operator()({z,y,x});
-    }
-
-    passTroughComputor _passthrough;
-    std::unique_ptr<vc::render::IChunkedArray> _ownedCache;
-    Chunked3d<uint8_t, passTroughComputor> _x;
-    float _scale;
-    std::unique_ptr<vc::VcDataset> _ds;
-};
-
-struct Chunked3dVec3fFromUint8
-{
-    Chunked3dVec3fFromUint8(std::vector<std::unique_ptr<vc::VcDataset>> &&dss, float scale, std::filesystem::path const &cache_root, std::string const &unique_id) :
-        _passthrough_x{unique_id + "_x"},
-        _passthrough_y{unique_id + "_y"},
-        _passthrough_z{unique_id + "_z"},
-        _cacheX(openChunkedArrayCache(dss[0]->path(), 128ULL << 20)),
-        _cacheY(openChunkedArrayCache(dss[1]->path(), 128ULL << 20)),
-        _cacheZ(openChunkedArrayCache(dss[2]->path(), 128ULL << 20)),
-        _x(_passthrough_x, dss[0].get(), _cacheX.get(), 0, cache_root),
-        _y(_passthrough_y, dss[1].get(), _cacheY.get(), 0, cache_root),
-        _z(_passthrough_z, dss[2].get(), _cacheZ.get(), 0, cache_root),
-        _scale(scale),
-        _dss(std::move(dss))
-    {
-    }
-
-    cv::Vec3f operator()(cv::Vec3d p)
-    {
-        // Both p and returned vector have zyx ordering!
-        p *= _scale;
-        cv::Vec3i i{static_cast<int>(lround(p[0])), static_cast<int>(lround(p[1])), static_cast<int>(lround(p[2]))};
-        uint8_t x = _x.safe_at(i);
-        uint8_t y = _y.safe_at(i);
-        uint8_t z = _z.safe_at(i);
-        return (cv::Vec3f{static_cast<float>(z), static_cast<float>(y), static_cast<float>(x)} - cv::Vec3f{128.f, 128.f, 128.f}) / 127.f;
-    }
-
-    cv::Vec3f operator()(double z, double y, double x)
-    {
-        return operator()({z,y,x});
-    }
-
-    passTroughComputor _passthrough_x, _passthrough_y, _passthrough_z;
-    std::unique_ptr<vc::render::IChunkedArray> _cacheX, _cacheY, _cacheZ;
-    Chunked3d<uint8_t, passTroughComputor> _x, _y, _z;
-    float _scale;
-    std::vector<std::unique_ptr<vc::VcDataset>> _dss;
 };

@@ -14,7 +14,6 @@
 #include <QLoggingCategory>
 #include <QString>
 
-#include "vc/core/types/VcDataset.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -70,7 +69,6 @@ QString directionToString(SegmentationGrowthDirection direction)
 }
 
 bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          const QString& cacheRoot,
                           std::vector<DirectionField>& out,
                           QString& error)
 {
@@ -96,26 +94,9 @@ bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
     try {
         const int scaleLevel = std::clamp(config.scale, 0, 5);
 
-        std::vector<std::unique_ptr<vc::VcDataset>> datasets;
-        datasets.reserve(3);
-        for (char axis : std::string("xyz")) {
-            auto dsPath = std::filesystem::path(zarrPath) / std::string(1, axis) / std::to_string(scaleLevel);
-            datasets.push_back(std::make_unique<vc::VcDataset>(dsPath));
-        }
-
-        const float scaleFactor = std::pow(2.0f, -static_cast<float>(scaleLevel));
-        const std::string uniqueId = std::to_string(std::hash<std::string>{}(zarrPath + std::to_string(scaleLevel)));
-        const std::string cacheRootStr = cacheRoot.toStdString();
-
         const float weight = static_cast<float>(std::clamp(config.weight, 0.0, 10.0));
-
         out.emplace_back(segmentationDirectionFieldOrientationKey(config.orientation).toStdString(),
-                         std::make_unique<Chunked3dVec3fFromUint8>(std::move(datasets),
-                                                                   scaleFactor,
-                                                                   cacheRootStr,
-                                                                   uniqueId),
-                         std::unique_ptr<Chunked3dFloatFromUint8>(),
-                         weight);
+                         zarrPath, scaleLevel, weight);
     } catch (const std::exception& ex) {
         error = QStringLiteral("Failed to load direction field at %1: %2").arg(path, QString::fromStdString(ex.what()));
         return false;
@@ -397,7 +378,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         }
 
         QString loadError;
-        if (!appendDirectionField(config, context.cacheRoot, directionFields, loadError)) {
+        if (!appendDirectionField(config, directionFields, loadError)) {
             result.error = loadError;
             return result;
         }

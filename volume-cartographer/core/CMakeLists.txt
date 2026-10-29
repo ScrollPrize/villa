@@ -243,6 +243,7 @@ if(VC_TESTING)
 endif()
 
 add_library(vc_tracer
+    src/DirectionField.cpp
     src/GrowPatch.cpp
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
