@@ -10,8 +10,9 @@ from typing import Any, Mapping
 import numpy as np
 
 #: Compressors the C++ reader decodes, by numcodecs id (None: uncompressed).
-SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "zstd": "zstd", "lzw": "lzw",
-                         "imagecodecs_lzw": "lzw", "vc-delta3d": "vc-delta3d"}
+SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "zstd": "zstd", "zlib": "zlib", "gzip": "gzip",
+                         "lzw": "lzw", "imagecodecs_lzw": "lzw", "vc-delta3d": "vc-delta3d",
+                         "volcomp": "volcomp"}
 
 
 @dataclass(frozen=True)

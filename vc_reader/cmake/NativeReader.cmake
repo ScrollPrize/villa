@@ -5,6 +5,7 @@ pkg_check_modules(BLOSC REQUIRED IMPORTED_TARGET blosc)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 find_package(SQLite3 3.24 REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 if(NOT TARGET vc_delta3d::vc_delta3d)
     find_package(vc_delta3d CONFIG QUIET)
 endif()
@@ -36,7 +37,8 @@ target_include_directories(vc_reader_native PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/../include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(vc_reader_native PUBLIC vc_reader::headers CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD
-    SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads nlohmann_json::nlohmann_json PRIVATE vc_reader::catalog)
+    SQLite::SQLite3 vc_delta3d::vc_delta3d ZLIB::ZLIB vc_reader::volcomp Threads::Threads nlohmann_json::nlohmann_json
+    PRIVATE vc_reader::catalog)
 
 
 if(VC_READER_ENABLE_CUDA)

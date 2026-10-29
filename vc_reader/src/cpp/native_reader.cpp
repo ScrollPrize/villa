@@ -78,8 +78,12 @@ std::string normalizeZarrMetadata(const std::string& text)
         if (shape[i] < 0 || chunks[i] <= 0)
             throw std::invalid_argument("invalid Zarr dimensions");
     }
+    // v3 compressor names -> v2 compressor ids.
+    const std::map<std::string, std::string> compressors{
+        {"blosc", "blosc"}, {"zstd", "zstd"}, {"gzip", "gzip"}, {"numcodecs.zlib", "zlib"},
+        {"volcomp", "volcomp"}};
     if (codecs.empty() || codecs.size() > 2 || codecs[0].at("name") != "bytes" ||
-        (codecs.size() == 2 && codecs[1].at("name") != "blosc" && codecs[1].at("name") != "zstd")) {
+        (codecs.size() == 2 && !compressors.contains(codecs[1].at("name").get<std::string>()))) {
         throw std::invalid_argument("unsupported Zarr v3 codec pipeline");
     }
     if (dtype.back() != '1') {
@@ -91,7 +95,7 @@ std::string normalizeZarrMetadata(const std::string& text)
     Json compressor = nullptr;
     if (codecs.size() == 2) {
         compressor = codecs[1].value("configuration", Json::object());
-        compressor["id"] = codecs[1].at("name");
+        compressor["id"] = compressors.at(codecs[1].at("name").get<std::string>());
     }
     return Json{
         {"zarr_format", 2}, {"shape", shape}, {"chunks", chunks}, {"dtype", dtype},
