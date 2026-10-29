@@ -425,6 +425,68 @@ public:
         else throw std::invalid_argument("order must be 0 or 1");
     }
 
+    // The chunk at a chunk-grid index, decoded: nullptr when it is not stored (it
+    // reads as fill). Consults the memory cache, queued cache writes, the disk layers
+    // and the remote like region reads, and caches what it fetches. Offline arrays
+    // raise CacheMiss for a chunk in no layer.
+    ChunkPtr chunk(const Index& idx)
+    {
+        check_chunk_index(idx);
+        const std::string k = key(idx);
+        const std::string ck = spec_.identity + "|" + k;
+        if (cache_) {
+            auto [found, chunk] = cache_->get(ck);
+            if (found) {
+                ++stats_.memory_hits;
+                return chunk;
+            }
+        }
+        if (writes_) {
+            auto [found, chunk] = writes_->pending(k);
+            if (found) {
+                ++stats_.pending_hits;
+                return chunk;
+            }
+        }
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (auto chunk = read_layer_chunk(li, k)) {
+                ++stats_.disk_hits;
+                if (cache_)
+                    cache_->put(ck, *chunk);
+                return *chunk;
+            }
+        }
+        if (spec_.offline)
+            throw CacheMiss("chunk " + k + " of " + spec_.identity + " is not in the disk cache (offline)");
+        if (!http_ && !source_)
+            return nullptr;
+        ChunkPtr chunk = fetch(k);
+        if (cache_)
+            cache_->put(ck, chunk);
+        return chunk;
+    }
+
+    // Whether the chunk's decoded bytes are already in memory (the memory cache or a
+    // queued cache write), without any I/O: (true, chunk or nullptr) when they are.
+    std::pair<bool, ChunkPtr> cached_chunk(const Index& idx)
+    {
+        check_chunk_index(idx);
+        const std::string k = key(idx);
+        if (cache_) {
+            auto found = cache_->get(spec_.identity + "|" + k);
+            if (found.first)
+                return found;
+        }
+        if (writes_)
+            return writes_->pending(k);
+        return {false, nullptr};
+    }
+
+    // Whether fetching chunks may touch the network (a remote source that is not offline).
+    bool remote() const noexcept { return http_ != nullptr; }
+    const Index& chunk_grid() const noexcept { return grid_; }
+    std::size_t chunk_bytes() const noexcept { return chunk_bytes_; }
+
     const Stats& stats() const noexcept { return stats_; }
     std::string last_write_error()
     {
@@ -1056,6 +1118,15 @@ private:
     }
 
     enum class Found { Copied, Missing, NotCached };
+
+    void check_chunk_index(const Index& idx) const
+    {
+        if (idx.size() != grid_.size())
+            throw std::invalid_argument("chunk index rank does not match the array");
+        for (std::size_t i = 0; i < idx.size(); ++i)
+            if (idx[i] < 0 || idx[i] >= grid_[i])
+                throw std::out_of_range("chunk index outside the array");
+    }
 
     std::string key(const Index& idx) const
     {
