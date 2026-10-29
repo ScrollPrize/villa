@@ -1,4 +1,5 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
+#include "SamplingWaitProfile.hpp"
 #include "vc/core/render/LocalChunkCache.hpp"
 #include "vc/core/render/PinnedChunkRegion.hpp"
 
@@ -2587,6 +2588,10 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     const size_t covered = validPoints * arrays.size() * 8;
     stats.coveredPixels = static_cast<int>(std::min<size_t>(
         covered, static_cast<size_t>(std::numeric_limits<int>::max())));
+    detail::recordSamplingWait(6, stats.cornerPrepareSeconds + stats.cornerLayoutSeconds);
+    detail::recordSamplingWait(7, stats.cornerPinSeconds);
+    detail::recordSamplingWait(8, stats.cornerGatherSeconds);
+    detail::flushSamplingWaits();
     return stats;
 }
 

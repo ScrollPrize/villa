@@ -2009,7 +2009,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					tmp_dir=td,
 				)
 		self.assertEqual(output.written, [(0, 0, 0)])
-		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
+		# Clearing belongs to the flush task, never the coordinator's band objects.
+		self.assertEqual(clear_calls, [])
 
 	def test_shared_runner_supports_global_crop_beyond_local_ring_at_sd4(self):
 		product = OutputProductSpec(

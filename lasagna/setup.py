@@ -130,6 +130,7 @@ setup(
     cmdclass={"build_ext": build_ext},
     extras_require={
         "test": ["pytest>=7"],
+        "qualzz": ["dynamic-network-architectures"],
     },
     entry_points={
         "console_scripts": [
