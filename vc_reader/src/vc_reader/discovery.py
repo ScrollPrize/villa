@@ -179,7 +179,7 @@ class RelationshipIndex:
                 axes = ("z", "y", "x")
                 g = artifact.grid_level
                 registration = VolumeRegistration(
-                    sample.id, owner.id, affine=Affine.scale(2**g) if g is not None else None,
+                    sample.id, owner.id, affine=Affine.block_reduced(2**g) if g is not None else None,
                     declared_grid=Selection(level=0), origin="catalog-fallback",
                     volume_spacing_um=((owner.pixel_size_um,) * 3 if owner.pixel_size_um is not None else None),
                 )

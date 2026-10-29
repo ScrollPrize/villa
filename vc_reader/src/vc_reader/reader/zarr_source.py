@@ -7,7 +7,7 @@ from ..errors import CacheMissError
 from ..sources import Selection, VolumeRegistration
 from .image_files import FileInfo, _axes
 from .source_resolution import (ResolvedSource, axes_metadata, resolve_registration,
-                                spatial_selection, storage_transform, matches_reference)
+                                spatial_selection, storage_transform, matches_reference, block_reduced)
 from .zarr_group import ZarrGroup
 from .zarr_reader import ZarrReader
 
@@ -117,8 +117,11 @@ class ZarrSource:
         array_transforms = attrs.get('coordinateTransformations')
         if dataset_transforms and array_transforms and dataset_transforms != array_transforms:
             raise ValueError('array and multiscale dataset declare conflicting transformations for the same grid')
+        level_transforms = array_transforms or dataset_transforms
+        if dataset:
+            level_transforms = block_reduced(level_transforms, self.datasets[0].get('coordinateTransformations'))
         transform, transform_units = storage_transform(axes, units, [
-            array_transforms or dataset_transforms, self.series.get('coordinateTransformations')])
+            level_transforms, self.series.get('coordinateTransformations')])
         result = axes, units, transform, transform_units
         self._grids[path] = result
         return result
@@ -167,7 +170,7 @@ class ZarrSource:
                 old_level = int(old_path) if old_path is not None and str(old_path).isdigit() else None
                 level = int(path) if path is not None and str(path).isdigit() else None
             if old_level is not None and level is not None:
-                relative = Affine.scale(2**(level-old_level))
+                relative = Affine.block_reduced(2**(level-old_level))
         return resolve_registration(source, canonical, transform, units, old_transform, old_units, relative)
 
     def _corresponding(self, selection):

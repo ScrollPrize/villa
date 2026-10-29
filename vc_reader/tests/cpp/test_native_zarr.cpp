@@ -3,6 +3,7 @@
 #include "vc_reader/zarr.hpp"
 #include "sftp_fixture.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -280,6 +281,75 @@ void sparseLevels(const fs::path& root)
     require(vcr::zarr::openPyramidLevel(writer.path().string(), 0, {}).meta.v3.has_value(), "v3 root array");
 }
 
+void expect_placement(const vcr::zarr::LevelPlacement& p, std::array<double, 3> scale, std::array<double, 3> offset,
+                      const std::string& what)
+{
+    for (int a = 0; a < 3; ++a)
+        if (std::abs(p.scale[a] - scale[a]) > 1e-12 || std::abs(p.offset[a] - offset[a]) > 1e-12)
+            throw std::runtime_error(what + ": axis " + std::to_string(a) + " is scale " + std::to_string(p.scale[a]) +
+                                     " offset " + std::to_string(p.offset[a]));
+}
+
+// Pyramid levels are placed in level-0 voxels. Scale-only levels are block-reduced
+// (centred at (s - 1) / 2, as every Open Data 2x2x2-mean pyramid is); a declared
+// translation wins.
+void levelPlacement(const fs::path& root)
+{
+    const auto path = root / "placement.zarr";
+    write_text(path / ".zgroup", R"({"zarr_format":2})");
+    for (const char* level : {"0", "1", "3"})
+        write_text(path / level / ".zarray", kZarray);
+    auto placed = [&](const std::string& attrs, const std::string& level) {
+        write_text(path / ".zattrs", attrs);
+        return vcr::zarr::Group::open(path.string(), {}).placement(level);
+    };
+
+    // Numbered levels without OME metadata.
+    write_text(path / ".zattrs", "{}");
+    expect_placement(vcr::zarr::openPyramidLevel(path.string(), 1, {}).placement, {2, 2, 2}, {.5, .5, .5}, "numbered L1");
+    expect_placement(vcr::zarr::openPyramidLevel(path.string(), 3, {}).placement, {8, 8, 8}, {3.5, 3.5, 3.5}, "numbered L3");
+    expect_placement(vcr::zarr::openPyramidLevel(path.string(), 0, {}).placement, {1, 1, 1}, {0, 0, 0}, "numbered L0");
+    expect_placement(vcr::zarr::openArray((path / "1").string(), {}).placement, {1, 1, 1}, {0, 0, 0},
+                     "a directly opened array is not a pyramid level");
+
+    // Scale only, in micrometres, as the Scroll 1 metadata declares.
+    const std::string scaleOnly = R"({"multiscales":[{"axes":[{"name":"z","type":"space"},{"name":"y","type":"space"},)"
+        R"({"name":"x","type":"space"}],"datasets":[)"
+        R"({"path":"0","coordinateTransformations":[{"type":"scale","scale":[2.4,2.4,2.4]}]},)"
+        R"({"path":"1","coordinateTransformations":[{"type":"scale","scale":[4.8,4.8,4.8]}]},)"
+        R"({"path":"3","coordinateTransformations":[{"type":"scale","scale":[19.2,19.2,9.6]}]}]}]})";
+    expect_placement(placed(scaleOnly, "1"), {2, 2, 2}, {.5, .5, .5}, "scale-only L1");
+    expect_placement(placed(scaleOnly, "3"), {8, 8, 4}, {3.5, 3.5, 1.5}, "anisotropic scale-only L3");
+    expect_placement(vcr::zarr::Group::open(path.string(), {}).array("3").placement, {8, 8, 4}, {3.5, 3.5, 1.5},
+                     "Group::array places its level");
+    expect_placement(placed(scaleOnly, "0"), {1, 1, 1}, {0, 0, 0}, "scale-only L0");
+
+    // A declared translation is honoured, relative to level 0's.
+    const std::string translated = R"({"multiscales":[{"axes":["z","y","x"],"datasets":[)"
+        R"({"path":"0","coordinateTransformations":[{"type":"scale","scale":[2,2,2]},{"type":"translation","translation":[10,20,30]}]},)"
+        R"({"path":"1","coordinateTransformations":[{"type":"scale","scale":[4,4,4]},{"type":"translation","translation":[10,20,30]}]},)"
+        R"({"path":"3","coordinateTransformations":[{"type":"scale","scale":[16,16,16]}]}]}]})";
+    expect_placement(placed(translated, "1"), {2, 2, 2}, {0, 0, 0}, "explicit zero relative translation");
+    expect_placement(placed(translated, "3"), {8, 8, 8}, {3.5, 3.5, 3.5}, "missing translation follows level 0's");
+
+    // Non-spatial leading axes, and OME before 0.4 without transformations.
+    const std::string channels = R"({"multiscales":[{"axes":[{"name":"c","type":"channel"},"z","y","x"],"datasets":[)"
+        R"({"path":"0","coordinateTransformations":[{"type":"scale","scale":[1,1,1,1]}]},)"
+        R"({"path":"1","coordinateTransformations":[{"type":"scale","scale":[1,2,2,2]}]}]}]})";
+    expect_placement(placed(channels, "1"), {2, 2, 2}, {.5, .5, .5}, "channel axis skipped");
+    const std::string legacy = R"({"multiscales":[{"datasets":[{"path":"0"},{"path":"1"},{"path":"3"}]}]})";
+    expect_placement(placed(legacy, "3"), {4, 4, 4}, {1.5, 1.5, 1.5}, "untransformed datasets halve in order");
+    expect_placement(placed(legacy, "missing"), {1, 1, 1}, {0, 0, 0}, "not a level");
+
+    must_fail([&] { placed(R"({"multiscales":[{"datasets":[{"path":"0","coordinateTransformations":[{"type":"path","path":"t"}]},)"
+                           R"({"path":"1"}]}]})", "1"); }, "unsupported transformation refused");
+    must_fail([&] { placed(R"({"multiscales":[{"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1,0,1]}]},)"
+                           R"({"path":"1"}]}]})", "1"); }, "nonpositive scale refused");
+
+    const auto p = placed(scaleOnly, "1");
+    require(p.toLevel0(0, 3) == 6.5 && p.fromLevel0(0, 6.5) == 3, "placement maps both ways");
+}
+
 void remote(const fs::path& root, const std::vector<uint16_t>& v)
 {
     const auto group = root / "remote.zarr";
@@ -430,6 +500,7 @@ int main(int argc, char** argv)
         localShards(root);
         local(root, v);
         sparseLevels(root);
+        levelPlacement(root);
         if (!sftp_fixture::install(root)) {
             std::cout << "metadata and local groups passed; no OpenSSH sftp-server for remote cases\n";
             return 0;

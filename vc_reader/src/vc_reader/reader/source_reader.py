@@ -240,7 +240,7 @@ class SourceReader:
             if isinstance(source.registration, VolumeRegistration) and source.registration.origin == 'catalog-fallback' and (
                     first.storage_from_array is None and old_transform is None and original is not None and
                     original.level is not None and current.level is not None):
-                relative = Affine.scale(2**(current.level-original.level))
+                relative = Affine.block_reduced(2**(current.level-original.level))
             self.registration = resolve_registration(placement_source, current, first.storage_from_array, first.storage_units,
                                                        old_transform, old_units, relative)
             self.resolved = ResolvedSource(self._locations[0], current, self.axes, self.shape, str(self.dtype),
@@ -298,7 +298,7 @@ class SourceReader:
             if image.storage_from_array is None and old.storage_from_array is None:
                 if reg.origin != 'catalog-fallback' or original.level is None:
                     continue
-                relative = Affine.scale(2**(level-original.level))
+                relative = Affine.block_reduced(2**(level-original.level))
             placement = resolve_registration(self.source, selected, image.storage_from_array, image.storage_units,
                                                old.storage_from_array, old.storage_units, relative)
             if matches_reference(self.source, placement, request.reference, image.info.axes):

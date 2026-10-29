@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -180,12 +181,26 @@ struct OpenOptions {
     MetadataReader metadata;        // replaces direct metadata requests (e.g. a caller's metadata cache)
 };
 
+// Where a pyramid level's voxels sit in level-0 voxel coordinates, per spatial axis
+// in array order (ZYX): level0 = scale * index + offset. OME dataset scale and
+// translation define it relative to the first (finest) dataset. A level declaring
+// no translation is taken as block-reduced from it (every Open Data CT pyramid is a
+// 2x2x2 mean), so its voxels are centred at offset = (scale - 1) / 2. Numbered
+// levels without OME metadata are level n of a 2x block-reduced pyramid. Arrays not
+// opened as pyramid levels have the identity placement.
+struct LevelPlacement {
+    std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
+    double toLevel0(int axis, double index) const { return scale[axis] * index + offset[axis]; }
+    double fromLevel0(int axis, double level0) const { return (level0 - offset[axis]) / scale[axis]; }
+};
+
 struct OpenedArray {
     std::string location;
     ArrayMeta meta;
     Json attributes;  // v3 attributes (with _ARRAY_DIMENSIONS); v2 arrays: their .zattrs when read
     std::vector<CacheLayer> layers;
     int writer = -1;
+    LevelPlacement placement;  // set by Group::array and openPyramidLevel
     std::unique_ptr<Array> array;
 };
 
@@ -218,6 +233,9 @@ public:
     // groups without an index stop at the first absent level unless probeLevels
     // is positive, in which case all levels [0, probeLevels) are checked.
     std::vector<std::string> levels(int probeLevels = 0);
+    // The placement of the level at a path (see LevelPlacement); the identity for
+    // paths that are not pyramid levels.
+    LevelPlacement placement(const std::string& path) const;
 
     enum class NodeKind { Array, Group };
     // The child at a path, its metadata when it is an array; nullopt when absent.

@@ -1,6 +1,7 @@
 """Flattened pair indexing, stored grids, exact categories, and worker lifetime."""
 from dataclasses import replace
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -113,7 +114,7 @@ class PairedTests(unittest.TestCase):
         valid = np.zeros((1, 8, 10), dtype='bool')
         for y in range(8):
             for x in range(10):
-                sy, sx = round((y+1)/2), round((x-1)/2)
+                sy, sx = math.floor((y+1)/2 + .5), math.floor((x-1)/2 + .5)  # spatial ties round up
                 if 0 <= sy < 8 and 0 <= sx < 10:
                     expected[0, y, x], valid[0, y, x] = labels[sy, sx], True
         for backend in self.backends():
@@ -165,11 +166,13 @@ class PairedTests(unittest.TestCase):
                 np.testing.assert_array_equal(host(result['image'].data), image[None, :, ::2, ::2])
                 np.testing.assert_array_equal(host(result['label'].data), labels[None, ::2, ::2])
                 np.testing.assert_array_equal(host(result['label'].masks['validation']), 255)
-        # With no matching stored label level, resample categorical base values.
+        # With no matching stored label level, resample categorical base values. The
+        # scale-only render level 1 is block-reduced, so its voxel j is centred at base
+        # 2j + .5 and the half tie rounds up to base voxel 2j + 1.
         label2 = self.source('labels2', labels, 'label')
         asset = self.pair(render, label2)
         with asset.open_paired(level=1) as reader:
-            np.testing.assert_array_equal(reader[:, :]['label'].data, labels[None, ::2, ::2])
+            np.testing.assert_array_equal(reader[:, :]['label'].data, labels[None, 1::2, 1::2])
         with self.assertRaises((ValueError, FileNotFoundError)):
             asset.open_paired(level=3)
 

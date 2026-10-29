@@ -99,6 +99,9 @@ auto group = zarr::Group::open("s3://bucket/scan.zarr", options);
 auto level2 = group.array(group.levels().at(2));
 std::vector<std::uint8_t> crop(64 * 64 * 64 * level2.meta.itemsize());
 level2.array->read_many({{0, 0, 0}}, {{64, 64, 64}}, {crop.data()});
+// Level-0 voxel coordinate of level-2 voxel z = 10: 4 * 10 + 1.5 for a scale-only
+// (block-reduced) level; use fromLevel0 to sample level 2 at level-0 coordinates.
+const double z0 = level2.placement.toLevel0(0, 10);
 
 zarr::CreateOptions create;
 create.shape = {1024, 1024, 1024};

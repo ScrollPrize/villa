@@ -37,9 +37,19 @@ class Affine:
 
     @classmethod
     def scale(cls, s: float) -> Affine:
-        """Uniform scale, e.g. ``Affine.scale(2**level)`` maps level ``level`` voxels to level 0."""
+        """Uniform scale about the origin. Pyramid levels use ``block_reduced``."""
         s = float(s)
         return cls(((s, 0.0, 0.0, 0.0), (0.0, s, 0.0, 0.0), (0.0, 0.0, s, 0.0)))
+
+    @classmethod
+    def block_reduced(cls, s: float) -> Affine:
+        """Voxels of a pyramid level ``s`` times coarser than a reference, block-reduced
+        from it (as Open Data 2x2x2-mean pyramids are): voxel ``i`` is centred at
+        ``s * i + (s - 1) / 2`` reference voxels. ``Affine.block_reduced(2**level)``
+        maps level ``level`` voxels to level 0."""
+        s = float(s)
+        t = (s - 1.0) / 2.0
+        return cls(((s, 0.0, 0.0, t), (0.0, s, 0.0, t), (0.0, 0.0, s, t)))
 
     @property
     def linear(self) -> tuple[tuple[float, float, float], ...]:

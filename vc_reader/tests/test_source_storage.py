@@ -262,12 +262,15 @@ class StorageTests(FixtureCase):
         reg = VolumeRegistration('s', 'v', affine=Affine.scale(128), origin='catalog-fallback',
                                  declared_grid=Selection(level=0), volume_spacing_um=(2.,)*3)
         source = Source('pyramid', Storage(str(path), 'zarr', pyramid=True, grid_level=7), registration=reg)
+        # Scale-only levels are block-reduced: 8 um voxel j is centred at dataset-0
+        # (4 um) voxel 2j + .5, i.e. 8j + 2 um, volume (2 um) voxel 4j + 1.
+        level1 = Affine.from_rows(((4, 0, 0, 1), (0, 4, 0, 1), (0, 0, 4, 1)))
         with source.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, Affine.scale(4))
+            self.assertEqual(reader.registration.affine, level1)
         request = source.with_selection(corresponding=LevelRequest(Frame('s', 'v', 2), -5))
         with request.open() as reader:
             self.assertEqual(reader.resolved.selection.array_path, '1')
-            self.assertEqual(reader.registration.affine, Affine.scale(4))
+            self.assertEqual(reader.registration.affine, level1)
         with self.assertRaisesRegex(ValueError, 'reference level 0'):
             source.with_selection(corresponding=LevelRequest(Frame('s', 'v', 0), -7)).open()
         with self.assertRaisesRegex(ValueError, 'source level 8'):
@@ -287,13 +290,13 @@ class StorageTests(FixtureCase):
         with source.open() as reader:
             self.assertEqual(reader.registration.affine, affine)
         with source.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, affine @ Affine.scale(2))
-            self.assertEqual(reader.registration.affine.translation[0], 2**26+.25)
+            self.assertEqual(reader.registration.affine, affine @ Affine.block_reduced(2))
+            self.assertEqual(reader.registration.affine.translation[0], 2**26+1.25)
         self.assertNotEqual(np.float32(2**26+.25).item(), 2**26+.25)
         placed = replace(source, registration=VolumeRegistration('s', 'v', affine=Affine.scale(3),
                           mode='storage', storage_frame='physical', storage_units='micrometer'))
         with placed.with_selection(level=1).open() as reader:
-            self.assertEqual(reader.registration.affine, Affine.scale(6))
+            self.assertEqual(reader.registration.affine, Affine.scale(3) @ Affine.block_reduced(2))
         with self.assertRaisesRegex(ValueError, 'storage_units'):
             replace(placed, registration=replace(placed.registration, storage_units=None)).open()
         attrs = json.loads((path / '.zattrs').read_text())

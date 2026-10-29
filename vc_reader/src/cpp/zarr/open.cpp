@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -68,6 +69,79 @@ std::optional<Json> readJsonNode(const MetadataReader& read, const std::string& 
     if (!text)
         return std::nullopt;
     return Json::parse(*text);
+}
+
+// x -> a * x + b on each spatial axis, composed from one OME dataset's transformations.
+struct AxisMap {
+    std::array<double, 3> a{1, 1, 1}, b{0, 0, 0};
+    bool scaled = false, translated = false;
+};
+
+// The three spatial axes, as indices into the OME axes (or the last three of `rank`
+// when axes are not declared).
+std::array<std::size_t, 3> spatialAxes(const Json& multiscale, std::size_t rank)
+{
+    std::vector<std::size_t> axes;
+    const auto list = multiscale.value("axes", Json::array());
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const auto& e = list[i];
+        const auto name = e.is_string() ? e.get<std::string>() : e.value("name", std::string());
+        const auto type = e.is_object() ? e.value("type", std::string()) : std::string();
+        if (type == "space" || (type.empty() && (name == "z" || name == "y" || name == "x")))
+            axes.push_back(i);
+    }
+    if (list.empty() && rank >= 3)
+        for (std::size_t i = rank - 3; i < rank; ++i)
+            axes.push_back(i);
+    if (axes.size() != 3)
+        throw std::invalid_argument("OME multiscales need exactly three spatial axes to place pyramid levels");
+    return {axes[0], axes[1], axes[2]};
+}
+
+AxisMap datasetMap(const Json& dataset, const std::array<std::size_t, 3>& axes)
+{
+    AxisMap m;
+    for (const auto& t : dataset.value("coordinateTransformations", Json::array())) {
+        const auto type = t.value("type", std::string());
+        if (type == "identity")
+            continue;
+        if (type != "scale" && type != "translation")
+            throw std::invalid_argument("unsupported OME dataset transformation '" + type + "'");
+        const auto& v = t.at(type);
+        for (int k = 0; k < 3; ++k) {
+            if (!v.is_array() || axes[k] >= v.size() || !v[axes[k]].is_number())
+                throw std::invalid_argument("OME " + type + " does not cover the spatial axes");
+            const double x = v[axes[k]].get<double>();
+            if (!std::isfinite(x) || (type == "scale" && !(x > 0)))
+                throw std::invalid_argument("OME " + type + " values must be finite (and scales positive)");
+            if (type == "scale") {
+                m.a[k] *= x;
+                m.b[k] *= x;
+            } else {
+                m.b[k] += x;
+            }
+        }
+        (type == "scale" ? m.scaled : m.translated) = true;
+    }
+    return m;
+}
+
+// Level n of a pyramid whose levels each 2x2x2-reduce the one below.
+LevelPlacement blockReduced(int n)
+{
+    if (n > 62)
+        throw std::invalid_argument("pyramid level is too deep to place");
+    const double s = std::ldexp(1.0, n);
+    LevelPlacement p;
+    p.scale = {s, s, s};
+    p.offset = {(s - 1) / 2, (s - 1) / 2, (s - 1) / 2};
+    return p;
+}
+
+std::string datasetPath(const Json& dataset)
+{
+    const auto& path = dataset.at("path");
+    return path.is_string() ? path.get<std::string>() : path.dump();
 }
 }  // namespace
 
@@ -340,6 +414,36 @@ std::vector<std::string> Group::levels(int probeLevels)
     return out;
 }
 
+LevelPlacement Group::placement(const std::string& path) const
+{
+    const auto ms = multiscales();
+    if (ms.empty())
+        return digits(path) ? blockReduced(levelNumber(path)) : LevelPlacement{};
+    const auto datasets = ms.at(0).value("datasets", Json::array());
+    std::size_t index = datasets.size();
+    for (std::size_t i = 0; i < datasets.size(); ++i)
+        if (datasetPath(datasets[i]) == path)
+            index = i;
+    if (index == datasets.size())
+        return {};
+    std::size_t rank = 3;
+    for (const auto& t : datasets[0].value("coordinateTransformations", Json::array()))
+        if (const auto type = t.value("type", std::string()); t.contains(type) && t.at(type).is_array())
+            rank = t.at(type).size();
+    const auto axes = spatialAxes(ms.at(0), rank);
+    const auto ref = datasetMap(datasets[0], axes), level = datasetMap(datasets[index], axes);
+    // OME before 0.4 declared no transformations: each dataset halves the previous.
+    if (!ref.scaled && !level.scaled && !ref.translated && !level.translated)
+        return blockReduced(int(index));
+    LevelPlacement p;
+    for (int k = 0; k < 3; ++k) {
+        const double b = level.translated ? level.b[k] : ref.b[k] + (level.a[k] - ref.a[k]) / 2;
+        p.scale[k] = level.a[k] / ref.a[k];
+        p.offset[k] = (b - ref.b[k]) / ref.a[k];
+    }
+    return p;
+}
+
 OpenedArray openPyramidLevel(const std::string& input, int level, const OpenOptions& options,
                              int probeLevels)
 {
@@ -459,6 +563,7 @@ OpenedArray Group::array(const std::string& key)
     hints.levelKey = key;
     hints.metadata = n->second;
     auto out = openArray(location_ + "/" + key, options_, std::move(hints));
+    out.placement = placement(key);
     if (const auto meta = consolidated(); meta && meta->contains(key + "/.zattrs"))
         out.attributes = meta->at(key + "/.zattrs");
     return out;

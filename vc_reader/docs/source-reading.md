@@ -129,6 +129,14 @@ placement. Explicit array placement keeps its crop origin and does not acquire
 an extra scale on the same grid. Corresponding-level requests require one exact
 resolution match, including a published cross-volume transform when applicable.
 
+Pyramid levels are block-reduced unless their metadata says otherwise: a level
+that declares a scale but no translation is centred `(s - s0) / 2` beyond the
+finest dataset's origin, because every Open Data CT pyramid is a 2x2x2 mean (level
+L voxel `j` covers level-0 voxels `2^L j .. 2^L (j+1) - 1`). A declared translation
+is honoured. Catalog and TIFF level fallbacks without transformations use
+`Affine.block_reduced(2**level)`. Native `vcr::zarr::Group::placement` and
+`OpenedArray::placement` apply the same rule for C++ consumers.
+
 Small affine compositions use the existing Python floating-point matrices.
 The regression with origin `2**26 + .25` demonstrates why float32 would lose a
 required subvoxel origin. Label IDs and shard offsets use exact integers; no

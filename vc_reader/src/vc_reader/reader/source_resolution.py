@@ -43,6 +43,26 @@ def axes_metadata(value):
     return names, units
 
 
+def block_reduced(transforms, finest):
+    """A pyramid level's transformations, placing scale-only levels as block-reduced.
+
+    A level declaring a scale but no translation is taken as block-reduced from
+    the finest dataset (every Open Data CT pyramid is a 2x2x2 mean), so its voxel
+    centres lie (s - s0) / 2 beyond the finest grid's origin. A declared
+    translation is kept. Native ``vcr::zarr::Group::placement`` applies the same rule.
+    """
+    transforms = list(transforms or ())
+    if any(t.get('type') == 'translation' for t in transforms):
+        return transforms
+    scale = next((t.get('scale') for t in transforms if t.get('type') == 'scale'), None)
+    finest = list(finest or ())
+    base = next((t.get('scale') for t in finest if t.get('type') == 'scale'), None)
+    if scale is None or base is None or len(scale) != len(base):
+        return transforms
+    origin = next((t.get('translation') for t in finest if t.get('type') == 'translation'), [0.] * len(scale))
+    return transforms + [{'type': 'translation', 'translation': [o + (s - b) / 2 for o, s, b in zip(origin, scale, base)]}]
+
+
 def storage_transform(axes, units, groups):
     """NGFF transformations in application order, then conversion to um."""
     transforms = [t for group in groups for t in (group or ())]
