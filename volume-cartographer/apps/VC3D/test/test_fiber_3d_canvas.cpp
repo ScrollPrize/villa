@@ -49,6 +49,10 @@ private slots:
         settings.colorMode = ColorMode::Custom;
         settings.custom = QColor(240, 40, 40);
         settings.highlightSelection = false;
+        // Test the palette on fully covered interior pixels. A one-pixel line
+        // can consist only of antialias samples blended with the gray ribbon
+        // at DPR 1, while the same logical line has a solid core at DPR 2.
+        settings.lineWidth = 4.f;
         canvas.setDisplaySettings(settings);
         auto scene = line("annotation");
         canvas.setScene(scene);
@@ -68,13 +72,14 @@ private slots:
         const auto with = canvas.grabFramebuffer();
         QVERIFY(grayPixels(with) > grayPixels(without) + 1000);
         int red = 0, yellow = 0;
-        for (int y = 60; y < with.height() - 30; ++y)
+        const double ratio = with.devicePixelRatio();
+        for (int y = int(60 * ratio); y < with.height() - int(30 * ratio); ++y)
             for (int x = 0; x < with.width(); ++x) {
                 auto c = with.pixelColor(x, y);
                 red += c.red() > 120 && c.green() < 80 && c.blue() < 80;
                 yellow += c.red() > 200 && c.green() > 200 && c.blue() < 160;
             }
-        QVERIFY(red > 20);
+        QVERIFY2(red > 20, qPrintable(QStringLiteral("Only %1 fully red pixels at DPR %2").arg(red).arg(ratio)));
         QCOMPARE(yellow, 0);
         canvas.setSelectedKey({});
         QCOMPARE(grayPixels(canvas.grabFramebuffer()), grayPixels(without));
