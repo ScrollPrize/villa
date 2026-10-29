@@ -311,6 +311,9 @@ private:
 
     void emitPendingChanges();
     void refreshOverlay();
+    // Redraws an in-progress edit: the viewer it is made in, plus every viewer
+    // showing the segmentation, which only the edited region invalidates.
+    void refreshEditedRegion(VolumeViewerBase* editViewer);
     void updateCorrectionsWidget();
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     void clearActiveCorrectionCollection();

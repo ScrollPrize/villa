@@ -37,10 +37,8 @@ bool otherScanCopy(const VolumeTransforms& transforms, const nlohmann::json& met
     });
 }
 
-// The rows of `requested` (all when nullopt) in the volume, a surface from the
-// first source holding it.
-Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed,
-             const std::optional<AttachmentIdentity>& user, const std::string& volume,
+// The rows of `requested` (all when nullopt) in the volume.
+Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>& listed, const std::string& volume,
              const std::optional<std::vector<std::string>>& requested, const std::atomic_bool& cancel)
 {
     Listing listing;
@@ -67,16 +65,15 @@ Listing list(ObjectStoreSession& session, const std::vector<AttachmentIdentity>&
         row.mapping = mapping->toVolume(meta, volume);
         row.record = std::move(record);
         row.source = attachment;
-        row.catalog = attachment != user;
         listing.rows.push_back(std::move(row));
     }
     return listing;
 }
 }
 
-bool SurfaceCatalog::Row::imported() const
+bool SurfaceCatalog::Row::fromCatalog() const
 {
-    return !catalog && catalogReference(record).has_value();
+    return catalogReference(record).has_value();
 }
 
 SurfaceCatalog::SurfaceCatalog(std::shared_ptr<ObjectStoreSession> session, QObject* parent)
@@ -97,18 +94,11 @@ void SurfaceCatalog::setSource(const std::optional<AttachmentIdentity>& attachme
     restart();
 }
 
-void SurfaceCatalog::setCatalogSources(std::vector<AttachmentIdentity> sources)
-{
-    if (catalogSources_ == sources) return;
-    catalogSources_ = std::move(sources);
-    restart();
-}
-
 void SurfaceCatalog::readNow(const std::vector<std::string>& uuids)
 {
     if (!volume_) return;
     const std::atomic_bool notCancelled{false};
-    auto listing = list(*session_, sources(), attachment_, volume_->id(), uuids, notCancelled);
+    auto listing = list(*session_, sources(), volume_->id(), uuids, notCancelled);
     for (const auto& uuid : uuids) rows_.erase(uuid);
     for (auto& row : listing.rows) rows_[row.record.uuid] = std::move(row);
     emit rowsChanged();
@@ -119,7 +109,6 @@ std::vector<AttachmentIdentity> SurfaceCatalog::sources() const
     std::vector<AttachmentIdentity> sources;
     if (!volume_) return sources;
     if (attachment_) sources.push_back(*attachment_);
-    sources.insert(sources.end(), catalogSources_.begin(), catalogSources_.end());
     return sources;
 }
 
@@ -188,8 +177,8 @@ void SurfaceCatalog::schedule()
     busy_ = true;
     cancelled_ = std::make_shared<std::atomic_bool>(false);
     vc3d::store::background<Listing>(this,
-        [session = session_, listed, user = attachment_, volume = volume_->id(), requested, cancel = cancelled_]() {
-            return list(*session, listed, user, volume, requested, *cancel);
+        [session = session_, listed, volume = volume_->id(), requested, cancel = cancelled_]() {
+            return list(*session, listed, volume, requested, *cancel);
         },
         [this, generation = generation_, requested](vc3d::store::Outcome<Listing> result) {
             if (generation != generation_) return;
@@ -265,25 +254,6 @@ SurfaceCatalog::ToolStore SurfaceCatalog::toolStore() const
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first.");
     if (!session_->writable(*attachment_)) throw std::runtime_error("The object store is read-only.");
     return {session_->path(*attachment_), volume_->id()};
-}
-
-SurfaceCatalog::Opened SurfaceCatalog::importCatalogSurface(const Opened& opened)
-{
-    const auto uuid = opened.surface->id;
-    const auto* listed = row(uuid);
-    if (!listed || !listed->catalog) throw std::runtime_error("not a catalog surface: " + uuid);
-    if (!attachment_ || !session_->writable(*attachment_))
-        throw std::runtime_error("Attach a writable object store to edit catalog surfaces");
-    session_->importObject(listed->source, *attachment_, uuid);
-    readNow({uuid});
-    if (const auto* imported = row(uuid); !imported || imported->catalog || !imported->bound())
-        throw std::runtime_error("Your object store does not place the surface in this volume");
-    auto reopened = open(uuid);
-    if (reopened.view.mapping != opened.view.mapping)
-        throw std::runtime_error("your object store places the surface differently in this volume; reopen it");
-    reopened.surface = opened.surface;
-    reopened.surface->setChannelLoader(store_channel_loader(session_, reopened.pin.attachment, *reopened.pin.geometryRevision));
-    return reopened;
 }
 
 std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const SurfaceProvenance& provenance,

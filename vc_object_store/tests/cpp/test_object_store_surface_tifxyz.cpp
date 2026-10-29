@@ -4,6 +4,8 @@
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/objects/GeometryExport.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -158,6 +160,48 @@ int main() try
         txn.commit();
     }
     require(vc::object_links::linkSurfaceOverlaps(db, params).edgesCreated == 0, "masked vertices do not link");
+
+    // A folder of surfaces ingests into a session attachment one surface at a
+    // time: a broken one is reported and the rest are stored.
+    const auto folder = directory.path / "folder";
+    for (const auto* name : {"b", "a", "broken"}) {
+        const auto surfaceDir = folder / name;
+        fs::create_directories(surfaceDir);
+        writeTiff(surfaceDir / "x.tif", x); writeTiff(surfaceDir / "y.tif", y);
+        if (std::string(name) != "broken") writeTiff(surfaceDir / "z.tif", z);
+        std::ofstream(surfaceDir / "meta.json") << nlohmann::json{{"uuid", util::newUuid()}, {"scale", {1, 1}},
+            {"format", "tifxyz"}, {"type", "seg"}, {"tags", {"reviewed"}}}.dump();
+    }
+    fs::create_directory(folder / "notes");
+    const auto sessionPath = directory.path / "session.vcobj";
+    ObjectStore::create(sessionPath, options);
+    ObjectStoreSession session;
+    auto attachment = session.attach(sessionPath, options);
+    session.takeEvents();
+    std::vector<std::string> progressed;
+    const auto folderReport = ingestGeometrySource(session, attachment, "surface", folder,
+        [&](const auto& update) { if (!update.detail.empty()) progressed.emplace_back(update.detail); },
+        "{}", {"folder", "reviewed"});
+    require(folderReport.ingested == 2 && folderReport.problems.size() == 1 &&
+            folderReport.problems[0].find("broken") != std::string::npos, "a folder ingests each surface on its own");
+    require(progressed == std::vector<std::string>{"a", "b", "broken"}, "surfaces ingest in name order");
+    bool surfacesCommitted = false;
+    for (const auto& event : session.takeEvents())
+        surfacesCommitted |= event.kind == StoreSessionEvent::Kind::Committed && event.touches({"surface"});
+    require(surfacesCommitted, "session observers see the ingested surfaces");
+    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+        const auto surfaces = store.objectsByKind(txn, "surface");
+        require(surfaces.size() == 2, "the session store holds both surfaces");
+        for (auto object : surfaces) {
+            std::sort(object.tags.begin(), object.tags.end());
+            require(object.tags == std::vector<std::string>{"folder", "reviewed"}, "import tags join the source's own");
+        }
+    });
+    require(!ingestGeometrySource(session, attachment, "surface", folder / "notes").problems.empty(),
+            "a folder without surfaces is reported");
+    auto readOnly = options; readOnly.readOnly = true;
+    attachment = session.replace(attachment, sessionPath, readOnly);
+    mustFail([&] { ingestGeometrySource(session, attachment, "surface", folder / "a"); });
     std::cout << "surface tifxyz workflow passed\n";
     return 0;
 } catch (const std::exception& error) {

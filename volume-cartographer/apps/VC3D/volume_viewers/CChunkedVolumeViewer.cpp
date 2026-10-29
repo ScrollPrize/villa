@@ -1830,6 +1830,7 @@ struct CChunkedVolumeViewer::RenderContext {
     std::string profileCaller;
     bool debugDownloadQueue = false;
     bool preferSurfaceTileFills = false;
+    bool annotationView = false;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -2379,13 +2380,15 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     // withholds the unused demand; a frame that falls back to raw sampling
     // (band exit, no cache yet) publishes it as before.
     // Apply the workspace preference per channel, only after resolving whether
-    // its cache can serve this frame. Direct sampling needs all fallback levels.
+    // its cache can serve this frame. Uncached surfaces need all fallback levels;
+    // neighboring plane views retain the workspace cap so they cannot flood the
+    // shared interactive queue ahead of background surface fills.
     options.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
         options.queuedFallbackLevels, ctx.preferSurfaceTileFills,
-        baseCacheUsableForPrepass);
+        baseCacheUsableForPrepass, planeView, ctx.annotationView);
     overlayOptions.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
         overlayOptions.queuedFallbackLevels, ctx.preferSurfaceTileFills,
-        overlayCacheUsableForPrepass);
+        overlayCacheUsableForPrepass, planeView, ctx.annotationView);
 
     const bool skipBaseViewDemand =
         ctx.preferSurfaceTileFills && !planeView && baseCacheUsableForPrepass;
@@ -3296,6 +3299,7 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.profileCaller = job.profileCaller;
     ctx.debugDownloadQueue = _state && _state->debugDownloadQueueEnabled();
     ctx.preferSurfaceTileFills = _preferSurfaceTileFills;
+    ctx.annotationView = property("vc_viewer_role").toString() == QStringLiteral("annotation");
     _genCacheDirty = false;
 
     QPointer<CChunkedVolumeViewer> guard(this);

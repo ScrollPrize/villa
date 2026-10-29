@@ -32,6 +32,8 @@ set(srcs
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
     FiberMapWorkspace.hpp
+    ProjectWorkspace.cpp
+    ProjectWorkspace.hpp
     FiberMapRuler.cpp
     FiberMapRuler.hpp
     FiberMapRulerMath.hpp
@@ -101,6 +103,7 @@ set(srcs
     elements/ViewerStatsBar.hpp
     elements/DownloadQueueStats.cpp
     elements/DownloadQueueStats.hpp
+    elements/GrowOnlyLabel.hpp
     elements/DownloadQueueDebugOverlay.cpp
     elements/DownloadQueueDebugOverlay.hpp
     elements/ViewerSplitGrid.cpp

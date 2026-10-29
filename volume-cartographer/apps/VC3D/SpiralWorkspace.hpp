@@ -84,17 +84,25 @@ public:
     // offers to create or attach.
     [[nodiscard]] QString lineAnnotationDraftUnavailableReason() const;
     void startLineAnnotationDraft();
+    // The object kinds Spiral fits, reads and edits. They share one store:
+    // a hub replica of the service's, or the store a local service binds.
+    static const std::vector<std::string>& inputKinds();
 
 signals:
     void spiralSessionActiveChanged(bool active);
     void patchEditorRequested(const QString& id, const QString& path);
-    // Clone a hub (the Spiral service's) to a local replica and attach it.
+    // Clone a hub (the Spiral service's) to a local replica, attach it and
+    // route inputKinds() to it.
     void hubReplicaRequested(const QString& hubAddress);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
+    // The store the project routes every input kind to; none when the
+    // routes differ or are unset.
+    std::optional<vc::objects::AttachmentIdentity> inputStore() const;
+    void bindInputStore();
     struct PreviewComponent {
         int rowBegin = 0;
         int rowEnd = 0;

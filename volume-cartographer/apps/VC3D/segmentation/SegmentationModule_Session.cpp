@@ -73,7 +73,12 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     if (_state) {
         _state->setActiveSurfaceEditing(true);
-        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        // The preview is the base surface itself, unchanged. Re-announcing the
+        // surface already on screen as an edit would drop every flattened-view
+        // tile and flash the pane black until they refill.
+        if (_state->surface("segmentation") != _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
     }
 
     if (_overlay) {
@@ -113,18 +118,8 @@ void SegmentationModule::endEditingSession()
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     refreshOverlay();
-    auto baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
-    auto previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
-
-    if (_state && previewSurface) {
-        auto currentSurface = _state->surface("segmentation");
-        if (currentSurface.get() == previewSurface.get()) {
-            const bool previousGuard = _ignoreSegSurfaceChange;
-            _ignoreSegSurfaceChange = true;
-            _state->setSurface("segmentation", baseSurface, false, true);
-            _ignoreSegSurfaceChange = previousGuard;
-        }
-    }
+    // Edits land in the base surface in place (the preview is the base), so the
+    // surface on screen stays as it is: nothing to restore or re-announce.
 
     // Save any pending corrections immediately and clear auto-save state
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {

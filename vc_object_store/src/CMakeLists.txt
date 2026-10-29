@@ -48,6 +48,7 @@ add_library(vc_objects ${_vc_store_library_type}
     Database.cpp
     VolumeTransforms.cpp
     ObjectStoreSession.cpp
+    Project.cpp
     FetchQueue.cpp
     Transactions.cpp
     History.cpp

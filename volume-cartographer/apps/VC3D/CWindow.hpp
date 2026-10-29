@@ -60,7 +60,6 @@ class QStandardItemModel;
 #define MAX_RECENT_VOLPKG 10
 
 // Project JSON schema version required by this app.
-static constexpr int VOLPKG_MIN_VERSION = 1;
 
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
@@ -90,6 +89,7 @@ class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
+class ProjectWorkspace;
 class FiberMapWorkspace;
 
 class CWindow : public QMainWindow
@@ -102,7 +102,8 @@ class CWindow : public QMainWindow
     friend class AgentBridgeServer;
 
 public:
-    void attachObjectStore(const QString& path);
+    // Attach a store beside the open project (reported in the status bar on failure).
+    void attachStore(const QString& path);
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
@@ -305,6 +306,7 @@ private:
     QMainWindow* _spiralWorkspaceWindow{nullptr};
     SpiralWorkspace* _spiralWorkspace{nullptr};
     FiberMapWorkspace* _fiberMapWorkspace{nullptr};
+    ProjectWorkspace* _projectWorkspace{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
     QDockWidget* _transformsDock{nullptr};
     QMdiArea *mdiArea;

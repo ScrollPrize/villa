@@ -58,6 +58,7 @@ bool finite(const cv::Vec3f& v) { return std::isfinite(v[0]) && std::isfinite(v[
 StoreSurfaceOverlayController::StoreSurfaceOverlayController(CState* state, ViewerManager* manager, QObject* parent)
     : ViewerOverlayControllerBase("store-surfaces", parent), _state(state)
 {
+    connect(_state, &CState::storeRoutesChanged, this, [this]() { invalidate(); });
     connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         using Kind = vc::objects::StoreSessionEvent::Kind;
         if (event.kind == Kind::Hub) return;

@@ -121,6 +121,7 @@ void AgentBridgeServer::registerLasagnaHandlers()
                     {
                         QStringLiteral("main"),
                         QStringLiteral("lasagna"),
+                        QStringLiteral("project"),
                     }),
             },
             .errors = {-32602, -32000},

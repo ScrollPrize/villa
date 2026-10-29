@@ -8,6 +8,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "support/TestProject.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
@@ -63,12 +64,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     // Reproduce the URL-derived identity mismatch before the catalog names the volume.
     CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, untagged->id()).has_value());
 
-    struct TemporaryProject {
-        std::filesystem::path path = std::filesystem::temp_directory_path() /
-            ("vc-catalog-id-" + vc::objects::util::newUuid() + ".volpkg.json");
-        ~TemporaryProject() { std::error_code ec; std::filesystem::remove(path, ec); }
-    } temporaryProject;
-    const auto& projectPath = temporaryProject.path;
+    const auto store = vc::test::createTestProject();
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
     deferred.failOnRemoteError = true;
@@ -78,11 +74,10 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         "data": [{"type": "zarr", "origins": [{"path": "PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr",
           "access_roots": [{"type": "https", "url": "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/",
                             "usage": "public-read"}]}]}]}}}}})"));
-    auto project = VolumePkg::newDetached(deferred);
+    auto project = store.open(deferred);
     REQUIRE(project->addVolumeEntry(url, {"vc-remote-auth:anonymous"}));
     REQUIRE(project->addVolumeEntry(url + "#vc-base-scale=2", {"vc-remote-auth:anonymous"}));
-    project->save(projectPath);
-    project = VolumePkg::load(projectPath, deferred);
+    project = store.open(deferred);
     project->resolveDeferredEntries();
     const auto volume = project->volume("20260102150214");
     REQUIRE(volume);

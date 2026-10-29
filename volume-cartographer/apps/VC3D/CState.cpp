@@ -1,4 +1,5 @@
 #include "CState.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "PointCollectionSync.hpp"
 
 #include "OpenDataManifest.hpp"
@@ -233,10 +234,14 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
     _objectStoreOwner = objectStoreOwner;
     _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
                                           : std::make_shared<vc::objects::ObjectStoreSession>();
+    // Open Data surfaces are fetched from the catalog on the first read reaching them.
+    if (!objectStoreOwner)
+        _objectStoreSession->setGeometryFetcher(vc::objects::kCatalogMetaKey, vc::objects::fetchCatalogSurface);
     qRegisterMetaType<vc::objects::StoreSessionEvent>();
     if(objectStoreOwner) {
         connect(objectStoreOwner, &CState::objectStoreChanged, this, &CState::objectStoreChanged);
         connect(objectStoreOwner, &CState::objectStoreObservationFailed, this, &CState::objectStoreObservationFailed);
+        connect(objectStoreOwner, &CState::storeRoutesChanged, this, &CState::storeRoutesChanged);
     } else {
         auto* journalTimer = new QTimer(this);
         journalTimer->setInterval(250);
@@ -264,36 +269,213 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
 
 CState::~CState()
 {
-    if (!_objectStoreOwner && _objectStoreAttachment) {
-        try { _objectStoreSession->detach(*_objectStoreAttachment); } catch (...) {}
-    }
-    if (!_objectStoreOwner) {
-        for (const auto& [sample, attachment] : _catalogAttachments) {
-            try { _objectStoreSession->detach(attachment); } catch (...) {}
-        }
+    if (_objectStoreOwner) return;
+    for (const auto& attachment : _attachedStores) {
+        try { _objectStoreSession->detach(attachment); } catch (...) {}
     }
 }
 
-vc::objects::AttachmentIdentity CState::catalogAttachment(const vcr::catalog::OpenDataSample& sample)
+QString CState::storeAuthor()
 {
-    if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(sample);
-    const auto found = _catalogAttachments.find(sample.id);
-    if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
-    auto options = viewerOpenOptions();
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     auto author = settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
     if (author.isEmpty() || author == QStringLiteral("anon"))
         author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
-    options.author = author.toStdString();
-    const auto attachment = vc::objects::attachCatalog(*_objectStoreSession, sample, vc3d::remoteCachePathFs(), options);
-    _catalogAttachments[sample.id] = attachment;
-    pollObjectStoreChanges();
-    return attachment;
+    return author;
 }
 
-std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() const
+vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
 {
-    return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
+    auto options = viewerOpenOptions();
+    options.author = author.toStdString();
+    options.readOnly = readOnly;
+    return options;
+}
+
+std::optional<vc::objects::AttachmentIdentity> CState::storeReference(const std::string& id) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeReference(id);
+    const auto found = _storeReferences.find(id);
+    return found == _storeReferences.end() ? std::nullopt : std::optional(found->second);
+}
+std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->sampleStore();
+    if (!_vpkg || !_vpkg->document().data().contains("open_data")) return std::nullopt;
+    return storeReference(_vpkg->document().data().at("open_data").at("store"));
+}
+std::optional<vc::objects::AttachmentIdentity> CState::attachedAt(const std::filesystem::path& path) const
+{
+    for (const auto& attachment : _objectStoreSession->attachments()) {
+        std::error_code error;
+        if (std::filesystem::equivalent(_objectStoreSession->path(attachment), path, error)) return attachment;
+    }
+    return std::nullopt;
+}
+vc::objects::AttachmentIdentity CState::prepareStore(const std::filesystem::path& path, const QString& author, bool readOnly)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->prepareStore(path, author, readOnly);
+    if (const auto existing = attachedAt(path)) return *existing;
+    return _objectStoreSession->attach(path, storeOpenOptions(author, readOnly));
+}
+void CState::releasePreparedStore(const vc::objects::AttachmentIdentity& attachment)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->releasePreparedStore(attachment); return; }
+    if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) == _attachedStores.end())
+        _objectStoreSession->detach(attachment);
+}
+void CState::closeProject() { setVpkg(nullptr); }
+std::vector<vc::objects::AttachmentIdentity> CState::attachedStores() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->attachedStores() : _attachedStores;
+}
+vc::objects::AttachmentIdentity CState::attachStore(const std::filesystem::path& path, const QString& author, bool readOnly)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->attachStore(path, author, readOnly);
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    if (const auto existing = attachedAt(path)) {
+        if (std::find(_attachedStores.begin(), _attachedStores.end(), *existing) != _attachedStores.end()) return *existing;
+    }
+    const auto attachment = prepareStore(path, author, readOnly);
+    const auto id = vc::objects::util::newUuid();
+    auto data = _vpkg->document().data();
+    data["stores"].push_back({{"id", id}, {"location", _vpkg->document().location(path)}, {"read_only", readOnly}});
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { releasePreparedStore(attachment); throw; }
+    _attachedStores.push_back(attachment);
+    _storeReferences.emplace(id, attachment);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    return attachment;
+}
+void CState::detachStore(const vc::objects::AttachmentIdentity& attachment)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->detachStore(attachment); return; }
+    for (const auto& [id, store] : _storeReferences)
+        if (store == attachment) { const auto copy = id; detachStoreReference(copy); return; }
+}
+void CState::detachStoreReference(const std::string& id)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->detachStoreReference(id); return; }
+    if (!_vpkg) return;
+    auto data = _vpkg->document().data();
+    auto& stores = data["stores"];
+    if (stores.size() <= 1) throw std::runtime_error("A project must reference at least one store");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
+    stores.erase(std::remove_if(stores.begin(), stores.end(), [&](const auto& entry) { return entry.at("id") == id; }), stores.end());
+    for (auto& selection : data["selections"]) if (selection == id) selection = nullptr;
+    if (data.contains("open_data") && data["open_data"]["store"] == id) data.erase("open_data");
+    _vpkg->document().replace(std::move(data));
+    if (const auto attachment = storeReference(id)) {
+        _objectStoreSession->detach(*attachment);
+        std::erase(_attachedStores, *attachment);
+    }
+    _storeReferences.erase(id);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+std::string CState::closeStore(const vc::objects::AttachmentIdentity& attachment)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->closeStore(attachment);
+    const auto reference = std::find_if(_storeReferences.begin(), _storeReferences.end(),
+        [&](const auto& entry) { return entry.second == attachment; });
+    if (reference == _storeReferences.end()) throw std::invalid_argument("Store is not attached to this project");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
+    const auto id = reference->first;
+    _objectStoreSession->detach(attachment);
+    std::erase(_attachedStores, attachment);
+    _storeReferences.erase(reference);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+    return id;
+}
+void CState::replaceStoreReference(const std::string& id, const std::filesystem::path& path)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->replaceStoreReference(id, path); return; }
+    if (!_vpkg) return;
+    auto data = _vpkg->document().data();
+    auto entry = std::find_if(data["stores"].begin(), data["stores"].end(), [&](const auto& e) { return e.at("id") == id; });
+    if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
+    const auto existing = attachedAt(path);
+    if (existing && existing != storeReference(id)) throw std::invalid_argument("Store is already attached");
+    const auto replacement = prepareStore(path, storeAuthor(), entry->value("read_only", false));
+    (*entry)["location"] = _vpkg->document().location(path);
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { releasePreparedStore(replacement); throw; }
+    if (const auto old = storeReference(id); old && old != replacement) {
+        _objectStoreSession->detach(*old);
+        std::erase(_attachedStores, *old);
+    }
+    if (std::find(_attachedStores.begin(), _attachedStores.end(), replacement) == _attachedStores.end()) _attachedStores.push_back(replacement);
+    _storeReferences.insert_or_assign(id, replacement);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+const std::vector<std::string>& CState::routableKinds() { return vc::project::ProjectDocument::kinds(); }
+std::optional<vc::objects::AttachmentIdentity> CState::storeFor(std::string_view kind) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeFor(kind);
+    if (!_vpkg) return std::nullopt;
+    const auto& selections = _vpkg->document().data().at("selections");
+    const auto found = selections.find(std::string(kind));
+    return found == selections.end() || found->is_null() ? std::nullopt : storeReference(found->get<std::string>());
+}
+std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const
+{
+    if (const auto store = storeFor("surface"); store && _currentVolume) return {*store};
+    return {};
+}
+void CState::setStoreFor(const std::string& kind, const std::optional<vc::objects::AttachmentIdentity>& store)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->setStoreFor(kind, store); return; }
+    if (!store) { setStoreSelection(kind, {}); return; }
+    for (const auto& [id, attachment] : _storeReferences)
+        if (attachment == store) { setStoreSelection(kind, id); return; }
+    throw std::invalid_argument("Store is not attached to this project");
+}
+void CState::setStoreSelection(const std::string& kind, const std::string& id)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->setStoreSelection(kind, id); return; }
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    auto data = _vpkg->document().data();
+    if (!data["selections"].contains(kind)) throw std::invalid_argument("Unknown object kind");
+    const nlohmann::json selected = id.empty() ? nlohmann::json(nullptr) : nlohmann::json(id);
+    if (data["selections"][kind] == selected) return;
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw std::runtime_error("Store switch cancelled: pending edits could not be saved");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
+    data["selections"][kind] = selected;
+    _vpkg->document().replace(std::move(data));
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+void CState::restoreStoreRoutes()
+{
+    if (!_vpkg) return;
+    QStringList failures;
+    for (const auto& entry : _vpkg->document().data().at("stores")) {
+        try {
+            const auto path = _vpkg->document().resolve(entry.at("location"));
+            const auto attachment = prepareStore(path, storeAuthor(), entry.value("read_only", false));
+            if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) != _attachedStores.end())
+                throw std::runtime_error("Store is referenced more than once");
+            _attachedStores.push_back(attachment);
+            _storeReferences.emplace(entry.at("id").get<std::string>(), attachment);
+        } catch (const std::exception& error) {
+            failures << QString::fromStdString(entry.at("location").get<std::string>()) + ": " + QString::fromUtf8(error.what());
+        }
+    }
+    if (!failures.empty()) emit objectStoreObservationFailed(tr("Unavailable project stores:\n%1").arg(failures.join('\n')));
 }
 
 std::shared_ptr<vc::objects::SurfaceTileCache> CState::surfaceGeometryCache()
@@ -305,40 +487,6 @@ std::shared_ptr<vc::objects::SurfaceTileCache> CState::surfaceGeometryCache()
 void CState::applySurfaceGeometryCacheSettings()
 {
     surfaceGeometryCache()->setCapacity(surfaceGeometryCacheBytes());
-}
-
-std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const
-{
-    const CState& owner = _objectStoreOwner ? *_objectStoreOwner : *this;
-    std::vector<vc::objects::AttachmentIdentity> sources;
-    if (!_currentVolume) return sources;
-    if (owner._objectStoreAttachment) sources.push_back(*owner._objectStoreAttachment);
-    if (const auto view = _vpkg ? _vpkg->catalogView(currentVolumeId()) : std::nullopt)
-        if (const auto found = owner._catalogAttachments.find(view->sampleId); found != owner._catalogAttachments.end())
-            sources.push_back(found->second);
-    return sources;
-}
-
-void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
-{
-    if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
-    _pointCollectionSync->flush();
-    auto options = viewerOpenOptions();
-    options.author = author.toStdString();
-    options.readOnly = readOnly;
-    _objectStoreAttachment = _objectStoreAttachment
-        ? _objectStoreSession->replace(*_objectStoreAttachment, path.toStdString(), options)
-        : _objectStoreSession->attach(path.toStdString(), options);
-    pollObjectStoreChanges();
-}
-
-void CState::detachObjectStore()
-{
-    if (_objectStoreOwner) { _objectStoreOwner->detachObjectStore(); return; }
-    _pointCollectionSync->flush();
-    if (_objectStoreAttachment) _objectStoreSession->detach(*_objectStoreAttachment);
-    _objectStoreAttachment.reset();
-    pollObjectStoreChanges();
 }
 
 void CState::pollObjectStoreChanges()
@@ -362,7 +510,19 @@ std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
     const bool changed = _vpkg != pkg;
+    if (changed && !_objectStoreOwner) {
+        if (_pointCollectionSync && !_pointCollectionSync->flush())
+            throw std::runtime_error("Pending point-collection edits could not be saved");
+        for (const auto& store : _attachedStores) _objectStoreSession->detach(store);
+        _attachedStores.clear();
+        _storeReferences.clear();
+    }
     _vpkg = std::move(pkg);
+    if (changed && !_objectStoreOwner) {
+        restoreStoreRoutes();
+        pollObjectStoreChanges();
+        emit storeRoutesChanged();
+    }
     updateAnnotationVolume();
     if (changed) {
         // Restore without invoking setters: switching projects must not persist
@@ -375,12 +535,9 @@ void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
     emit vpkgChanged(_vpkg);
 }
 
-QString CState::vpkgPath() const
+QString CState::projectDirectory() const
 {
-    if (_vpkg) {
-        return QString::fromStdString(_vpkg->getVolpkgDirectory());
-    }
-    return {};
+    return _vpkg ? QString::fromStdString(_vpkg->directory().string()) : QString();
 }
 
 bool CState::hasVpkg() const { return _vpkg != nullptr; }
@@ -399,6 +556,10 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     }
     _currentVolume = std::move(vol);
     updateAnnotationVolume();
+    // Reopening the project returns to it.
+    if (_vpkg && _currentVolume && !_objectStoreOwner) {
+        try { _vpkg->setCurrentVolumeId(_currentVolume->id()); } catch (const std::exception&) {}
+    }
     // The open surface's draft is declared in the volume's voxels.
     draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surface("segmentation")));
     const auto volumeId = currentVolumeId();
@@ -445,8 +606,8 @@ void CState::setFocusBounds(const Rect3D& bounds)
         _focusBounds->high == normalized.high) {
         return;
     }
+    if (_vpkg) _vpkg->setFocusBounds(normalized, _focusBoundsEnabled);
     _focusBounds = normalized;
-    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -456,8 +617,8 @@ void CState::setFocusBoundsEnabled(bool enabled)
     if (_focusBoundsEnabled == enabled) {
         return;
     }
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, enabled);
     _focusBoundsEnabled = enabled;
-    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -467,9 +628,9 @@ void CState::clearFocusBounds()
     if (!_focusBounds && !_focusBoundsEnabled) {
         return;
     }
+    if (_vpkg) _vpkg->setFocusBounds(std::nullopt, false);
     _focusBounds.reset();
     _focusBoundsEnabled = false;
-    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, false);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -510,12 +671,14 @@ VCCollection* CState::pointCollection() const { return _pointCollection; }
 
 void CState::savePointCollections()
 {
-    if (_pointCollectionSync) _pointCollectionSync->flush();
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
     emit pointCollectionsSaveRequested();
 }
 
 void CState::closeAll()
 {
+    savePointCollections();
     emit volumeClosing();
 
     clearActiveSurface();

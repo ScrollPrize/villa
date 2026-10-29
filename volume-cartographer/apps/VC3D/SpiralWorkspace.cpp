@@ -13,6 +13,7 @@
 #include "SurfaceOverlayColors.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "elements/ViewerSplitGrid.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -287,13 +288,16 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
-            if (_service)
-                _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
-        } else {
+            bindInputStore();
+        } else if (event.attachment == inputStore()) {
             if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub && _service)
                 _service->refreshLocalHub();
             noteStoreChanges(event);
         }
+    });
+    connect(_state,&CState::storeRoutesChanged,this,[this]() {
+        bindInputStore();
+        cancelLineAnnotationDraft();
     });
     // Drafts are synced before anything else hears of a surface change.
     connect(_state, &CState::surfaceChanged, this,
@@ -403,7 +407,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         settings.setValue(QStringLiteral("spiral/split_y"), _grid->splitY());
     };
 
-    auto* cacheStatsLabel = new QLabel(this);
+    auto* cacheStatsLabel = new GrowOnlyLabel(this);
     cacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     cacheStatsLabel->setText(tr("RAM --  disk --  net --"));
     statusBar()->addPermanentWidget(cacheStatsLabel);
@@ -413,9 +417,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
 
     _service = new SpiralServiceManager(this);
-    // A local service is launched bound to the attached store, and any
-    // service's inputs are displayed only from the same store.
-    _service->setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
+    bindInputStore();
 
     _pythonOutputDialog = new QDialog(this, Qt::Window);
     _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));
@@ -960,11 +962,32 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
     return {};
 }
 
+const std::vector<std::string>& SpiralWorkspace::inputKinds()
+{
+    static const std::vector<std::string> kinds{"surface", "fiber", "point_collection"};
+    return kinds;
+}
+
+std::optional<vc::objects::AttachmentIdentity> SpiralWorkspace::inputStore() const
+{
+    const auto store = _state->storeFor(inputKinds().front());
+    for (const auto& kind : inputKinds())
+        if (_state->storeFor(kind) != store) return std::nullopt;
+    return store;
+}
+
+void SpiralWorkspace::bindInputStore()
+{
+    // A local service is launched bound to this store, and any service's
+    // inputs are displayed only from the same store.
+    if (_service) _service->setObjectStore(_state->objectStoreSession(), inputStore());
+}
+
 void SpiralWorkspace::startLineAnnotationDraft()
 {
     QString reason = lineAnnotationDraftUnavailableReason();
-    if (reason.isEmpty() && !_state->objectStoreAttachment())
-        reason = tr("Attach an object store before creating fibers");
+    if (reason.isEmpty() && !inputStore())
+        reason = tr("Route surfaces, fibers and point collections to one store before creating fibers");
     if (!reason.isEmpty()) {
         statusBar()->showMessage(reason, 10000);
         return;
@@ -1320,11 +1343,11 @@ void SpiralWorkspace::submitReadyDrafts(bool updateAfter)
     // A saved edit is a checked revision of the attached store, pushed to its
     // hub by the session's worker. The fit sees it at its next input update.
     const auto session = _state->objectStoreSession();
-    const auto attachment = _state->objectStoreAttachment();
+    const auto attachment = inputStore();
     QString problem;
     std::optional<double> scale;
     if (!attachment || !session->writable(*attachment))
-        problem = tr("Attach a writable object store to save Spiral drawings");
+        problem = tr("Route surfaces, fibers and point collections to one writable store to save Spiral drawings");
     else if (!_fitInputs || _fitInputs->volumeUuid.empty())
         problem = tr("Spiral drawings are saved in the fit's volume: wait until the fit's inputs are shown");
     else
@@ -2129,12 +2152,13 @@ void SpiralWorkspace::loadFitInputs()
     const auto& binding = _service->storeBinding();
     _fitInputBinding = binding.identity();
     const auto session = _state->objectStoreSession();
-    const auto attachment = _state->objectStoreAttachment();
+    const auto attachment = inputStore();
     if (!binding.matches() || !session || !attachment) {
         // Never substitute another store's objects, or current heads, for
         // the fitted inputs.
         clearFitInputs(binding.localUuid.isEmpty()
-            ? tr("Fit inputs are not displayed: no object store is attached")
+            ? tr("Fit inputs are not displayed: surfaces, fibers and point collections are not "
+                 "routed to one store")
             : tr("Fit inputs are not displayed: the service read store %1, not the attached %2")
                   .arg(binding.serviceUuid, binding.localUuid));
         return;
@@ -2286,7 +2310,7 @@ void SpiralWorkspace::loadFitInputChanges()
         return;
     if (_pendingObjectChanges.empty() && _pendingLinkChanges.empty()) return;
     const auto session = _state->objectStoreSession();
-    const auto attachment = _state->objectStoreAttachment();
+    const auto attachment = inputStore();
     if (!session || !attachment) return;
     _fitChangesReading = true;
     const quint64 generation = _fitInputGeneration;

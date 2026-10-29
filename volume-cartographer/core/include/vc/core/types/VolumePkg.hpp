@@ -15,6 +15,8 @@
 #include "utils/Json.hpp"
 #include "vc/core/util/Rect3D.hpp"
 
+#include "vc/core/types/ProjectDocument.hpp"
+
 class Volume;
 
 namespace vc::project {
@@ -26,6 +28,7 @@ inline constexpr std::string_view kAnonymousRemoteAuthTag =
 struct Entry {
     std::string location;
     std::vector<std::string> tags;
+    bool operator==(const Entry&) const = default;
 };
 
 [[nodiscard]] bool hasEntryTag(const Entry& entry, std::string_view tag);
@@ -36,6 +39,7 @@ enum class Category { Volumes, NormalGrids };
 
 struct LoadOptions {
     bool failOnRemoteError = false;
+    // Leave entries unresolved until resolveDeferredEntries().
     bool deferResolution = false;
     // The Open Data catalog: remote entries that show a catalog volume take
     // their id, voxel size and name from it (vcr::catalog::OpenDataManifest::volumeAt).
@@ -70,6 +74,7 @@ struct AnnotationVolume {
 
 }
 
+// Resources opened from a standalone .vcproj workspace document.
 class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
@@ -89,29 +94,23 @@ public:
         std::shared_ptr<Volume> volume;
     };
 
-    static std::shared_ptr<VolumePkg> newEmpty();
-    static std::shared_ptr<VolumePkg> newEmpty(
-        const vc::project::LoadOptions& opts);
-    // Build a package without updating the session autosave or implicitly
-    // persisting later mutations. Call save() when the package is complete.
-    static std::shared_ptr<VolumePkg> newDetached(
-        const vc::project::LoadOptions& opts = {});
-    static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
+    static std::shared_ptr<VolumePkg> open(const std::filesystem::path& path,
                                            const vc::project::LoadOptions& opts = {});
-
-    static void setAutosaveRoot(const std::filesystem::path& dir);
-    static std::filesystem::path autosaveRoot();
-    static std::filesystem::path autosaveFile();
+    vc::project::ProjectDocument& document() { return document_; }
+    const vc::project::ProjectDocument& document() const { return document_; }
 
     ~VolumePkg();
 
-    void save(const std::filesystem::path& target);
-    void saveAutosave();
-    [[nodiscard]] std::filesystem::path path() const;
+    [[nodiscard]] std::filesystem::path path() const { return path_; }
+    [[nodiscard]] std::filesystem::path directory() const { return path_.parent_path(); }
+    [[nodiscard]] bool writable() const;
 
+    // The project document's name.
     [[nodiscard]] std::string name() const;
     void setName(const std::string& v);
-    [[nodiscard]] int version() const;
+
+    // Reload the project file, resolving added resources and dropping removed ones.
+    bool reload();
 
     [[nodiscard]] const std::vector<vc::project::Entry>& volumeEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
@@ -121,9 +120,11 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& allLasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
+    // Resources belong to the project file; returns empty (no per-author ownership).
+    [[nodiscard]] std::string entryOwner(const std::string& location) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
-    // Persist an already-loaded volume and its tags as one project mutation.
+    // Record an already-loaded volume and its tags as one project change.
     // `volume` must have been loaded from `location`.
     AttachVolumeResult attachPreparedVolume(
         const std::string& location,
@@ -137,8 +138,7 @@ public:
         std::vector<std::string> manifestTags,
         bool fiberInference,
         const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-        bool updateSelection = true,
-        bool persistChanges = true);
+        bool updateSelection = true);
     bool removeEntry(const std::string& location);
 
     [[nodiscard]] std::string selectedLasagnaDataset() const;
@@ -153,6 +153,9 @@ public:
     [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
     // Bounds are source annotation-frame XYZ, never current-volume voxel units.
     void setFocusBounds(std::optional<Rect3D> bounds, bool enabled);
+    // The last viewed volume (empty when none).
+    [[nodiscard]] std::string currentVolumeId() const { return currentVolumeId_; }
+    void setCurrentVolumeId(const std::string& id);
 
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
@@ -181,19 +184,16 @@ public:
 
     [[nodiscard]] bool isRemote() const;
 
-    // Completes a deferred load. Ordinary load() callers remain eager.
+    // Completes a deferred load. Ordinary open() callers remain eager.
     void resolveDeferredEntries();
-
-    [[nodiscard]] std::string getVolpkgDirectory() const;
 
 private:
     VolumePkg();
 
+    vc::project::ProjectDocument document_;
     std::filesystem::path path_;
-    std::string name_ = "Untitled";
-    int version_ = 1;
+    std::string name_;
     vc::project::LoadOptions opts_;
-    bool automaticPersistence_ = true;
 
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> normalGrids_;
@@ -202,6 +202,7 @@ private:
     std::optional<std::string> selectedFiberInferenceDataset_;
     std::optional<Rect3D> focusBounds_;
     bool focusBoundsEnabled_ = false;
+    std::string currentVolumeId_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;
@@ -211,11 +212,15 @@ private:
     void resolveVolumeEntry(const vc::project::Entry& e);
     void resolveNormalGridEntry(const vc::project::Entry& e);
 
-    void persistProjectState();
-    void writeJsonTo(const std::filesystem::path& target) const;
-    void readJsonFrom(const std::filesystem::path& source);
-    [[nodiscard]] utils::Json toJson() const;
-    void fromJson(const utils::Json& j);
+    // Read resources and view state from the document.
+    void readDocument();
+    // Write one resource; false when it is already there, unchanged.
+    bool writeEntry(const char* kind, const vc::project::Entry& entry);
+    void writeView();
+    nlohmann::json viewJson() const;
+    // Drop loaded volumes no entry backs any more and resolve the entries
+    // that are not in `previous`.
+    void followEntries(const std::vector<vc::project::Entry>& previous);
 };
 
 namespace vc::project {

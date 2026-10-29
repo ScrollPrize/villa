@@ -144,6 +144,7 @@
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
@@ -153,6 +154,7 @@
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
+#include "ProjectWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -895,7 +897,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
         shell->deleteLater();
         connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
         connect(_spiralWorkspace, &SpiralWorkspace::hubReplicaRequested, this, [this](const QString& hub) {
-            if (_menuController) _menuController->cloneHostedStore(hub);
+            if (_menuController) _menuController->cloneHostedStore(false, hub, SpiralWorkspace::inputKinds());
         });
         connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
                 [this](const QString& id, const QString& path) {
@@ -1005,7 +1007,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _lineAnnotationLengthLabel->hide();
     statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
 
-    _sharedCacheStatsLabel = new QLabel(this);
+    _sharedCacheStatsLabel = new GrowOnlyLabel(this);
     _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
     _sharedCacheStatsLabel->setToolTip(
         tr("Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
@@ -1023,6 +1025,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
     _hubStatusLabel->hide();
     statusBar()->addPermanentWidget(_hubStatusLabel);
+    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHubStatus);
     connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
         using Kind = vc::objects::StoreSessionEvent::Kind;
         if (event.kind != Kind::Committed && event.kind != Kind::Draft) updateHubStatus();
@@ -1168,6 +1171,44 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
             this, [this](bool) {
                 updateVolumePackageEmptyState();
             });
+
+    // The Project tab drives the File menu's project actions.
+    _state->prepareStoreSwitch = [this]() {
+        try { _state->savePointCollections(); }
+        catch (const std::exception&) { return false; }
+        if (_segmentationModule) {
+            if (_segmentationModule->growthInProgress()) return false;
+            const auto status = _segmentationModule->autosaveStatus();
+            if (status.pending || status.saveInProgress || status.dirtyAfterSave) {
+                const auto active = _state->activeSurface().lock();
+                if (!active || !_segmentationModule->saveSurface(active.get())) return false;
+            }
+        }
+        return !_lineAnnotationController || _lineAnnotationController->prepareForPackageSwitch();
+    };
+    _projectWorkspace = new ProjectWorkspace(_state, _menuController.get(), this);
+    _projectWorkspace->setProperty("workspaceId", QStringLiteral("project"));
+    const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
+    connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
+    connect(_projectWorkspace, &ProjectWorkspace::hubSyncRequested, this, &CWindow::promptHubConflicts);
+    connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
+        const auto vpkg = _state->vpkg();
+        std::shared_ptr<Volume> volume;
+        try {
+            volume = vpkg ? vpkg->volume(volumeId.toStdString()) : nullptr;
+        } catch (const std::out_of_range&) {
+        }
+        if (!volume) {
+            QMessageBox::warning(this, tr("Error"), tr("Could not load volume."));
+            return;
+        }
+        if (_state->currentVolumeId() != volumeId.toStdString()) {
+            setVolume(volume);
+            syncVolumeSelectionControls(volumeId);
+        }
+        switchToMainWorkspace();
+    });
     connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
         if (_menuController) {
             _menuController->showOpenDataCatalog();
@@ -1405,6 +1446,7 @@ CWindow::CWindow(size_t cacheSizeGB, bool debugDownloadQueue) :
     if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::project::RECENT).toStringList();
+        files.removeIf([](const QString& path) { return !path.endsWith(".vcproj", Qt::CaseInsensitive); });
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
@@ -1795,7 +1837,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             connect(spiralLineAction, &QAction::triggered, this,
                                     [this]() {
                                         if (_spiralWorkspace && _menuController &&
-                                            _menuController->requireObjectStore(tr("Creating a fiber")))
+                                            _menuController->requireProject(tr("Creating a fiber")))
                                             _spiralWorkspace->startLineAnnotationDraft();
                                     });
                             menu.addSeparator();
@@ -2021,7 +2063,7 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                                              selected == modelLineAnnotationAction) &&
                                             selected->isEnabled() && _lineAnnotationController &&
                                             _menuController &&
-                                            _menuController->requireObjectStore(tr("Creating a fiber"));
+                                            _menuController->requireProject(tr("Creating a fiber"));
                         if (launch) {
                             _lineAnnotationController->launchFromViewerAtPoint(
                                 viewer, scenePoint, true, selected == modelLineAnnotationAction);
@@ -2412,25 +2454,28 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
     }
 
     if (_segmentationWidget) {
-        _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
+        _segmentationWidget->setVolumePackagePath(_state->projectDirectory());
     }
 
     updateNormalGridAvailability();
 
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
-        Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
+        Logger()->info("Opened volpkg '{}' with no volumes", _state->projectDirectory().toStdString());
         showStatusBarMessage(tr("Opened volume package with no volumes."), 5000);
     }
 
     if (_volumeOverlay) {
-        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
+        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->projectDirectory());
     }
 
     if (_surfacePanel) {
         _surfacePanel->refreshPointSetFilterOptions();
     }
 
+    if (_projectWorkspace) {
+        _projectWorkspace->refresh();
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -2596,22 +2641,6 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
     }
 }
 
-void CWindow::updateCatalogSurfaceSources()
-{
-    // An Open Data volume shows its sample's catalog surfaces, through the
-    // catalog's registrations (its pyramid levels among them).
-    std::vector<vc::objects::AttachmentIdentity> sources;
-    const auto pkg = _state->vpkg();
-    if (const auto view = pkg ? pkg->catalogView(_state->currentVolumeId()) : std::nullopt) {
-        try {
-            sources.push_back(_state->catalogAttachment(*pkg->catalog()->findSample(view->sampleId)));
-        } catch (const std::exception& error) {
-            showStatusBarMessage(tr("Cannot open the Open Data surface store: %1").arg(QString::fromUtf8(error.what())), 8000);
-        }
-    }
-    _surfaceCatalog->setCatalogSources(std::move(sources));
-}
-
 void CWindow::loadLasagnaResults(Surface* surface)
 {
     std::optional<nlohmann::json> corr;
@@ -2718,15 +2747,14 @@ void CWindow::CreateWidgets(void)
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
     treeWidgetSurfaces->setSelectionMode(QAbstractItemView::ExtendedSelection);
 
-    // The surface list reads the user's store for the current volume.
+    // The surface list reads the surfaces' store for the current volume.
     _surfaceCatalog = std::make_unique<SurfaceCatalog>(_state->objectStoreSession(), this);
     if (_inkDetectionOverlay) {
         _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
     }
     auto updateSurfaceSource = [this]() {
-        _surfaceCatalog->setSource(_state->objectStoreAttachment(), _state->currentVolume());
-        updateCatalogSurfaceSources();
-        LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
+        _surfaceCatalog->setSource(_state->storeFor("surface"), _state->currentVolume());
+        LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->storeFor("surface"));
     };
     connect(_state, &CState::objectStoreChanged, _surfaceCatalog.get(),
             [this, updateSurfaceSource](const vc::objects::StoreSessionEvent& event) {
@@ -2735,6 +2763,7 @@ void CWindow::CreateWidgets(void)
                 else _surfaceCatalog->handle(event);
             });
     connect(_state, &CState::volumeChanged, _surfaceCatalog.get(), [updateSurfaceSource]() { updateSurfaceSource(); });
+    connect(_state, &CState::storeRoutesChanged, _surfaceCatalog.get(), [updateSurfaceSource]() { updateSurfaceSource(); });
 
     SurfacePanelController::UiRefs surfaceUi{
         .treeWidget = treeWidgetSurfaces,
@@ -3404,11 +3433,13 @@ void CWindow::CreateWidgets(void)
                         collection->setOptions(options);
                         withFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
                     });
+            // The widget's store buttons choose where fibers are kept.
             connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
-                if (_menuController) _menuController->attachObjectStore();
+                if (_menuController) _menuController->attachStore(false, "fiber");
             });
             connect(widget, &CFiberWidget::detachStoreRequested, this, [this]() {
-                if (_menuController) _menuController->detachObjectStore();
+                try { _state->setStoreFor("fiber", std::nullopt); }
+                catch (const std::exception& error) { showStatusBarMessage(QString::fromUtf8(error.what()), 8000); }
             });
             connect(widget, &CFiberWidget::firstPageRequested, collection, &FiberCollectionController::firstPage);
             connect(widget, &CFiberWidget::nextPageRequested, collection, &FiberCollectionController::nextPage);
@@ -3963,9 +3994,6 @@ void CWindow::closeEvent(QCloseEvent* event)
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
     }
-    if (_state && _state->vpkg()) {
-        try { _state->vpkg()->saveAutosave(); } catch (...) {}
-    }
     saveWindowState();
     event->accept();
 }
@@ -4162,12 +4190,7 @@ void CWindow::updateSharedStatusLabel()
         items << tr("Z sens: %1")
             .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
     }
-    const QString text = items.join(QStringLiteral("  "));
-    _sharedCacheStatsLabel->setText(text);
-    const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
-    _sharedCacheStatsLabel->setMinimumWidth(
-        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
-        margins.left() + margins.right());
+    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
 }
 
 // Open volume package
@@ -4198,7 +4221,7 @@ bool CWindow::OpenVolume(const QString& path,
         }
         aVpkgPath = QFileDialog::getOpenFileName(
             this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-            tr("Project (*.volpkg.json);;All files (*.*)"),
+            tr("Project (*.vcproj)"),
             nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         if (aVpkgPath.isEmpty()) {
             Logger()->info("Open project canceled");
@@ -4206,17 +4229,22 @@ bool CWindow::OpenVolume(const QString& path,
         }
     }
 
+    // Projects are written as the user; a headless open uses the settings' name.
+    const QString author = interactive && _menuController ? _menuController->objectStoreAuthor()
+                                                          : CState::storeAuthor();
+    if (author.isEmpty()) {
+        return false;
+    }
     std::shared_ptr<VolumePkg> package;
     QString loadError;
     try {
         vc::project::LoadOptions options;
         options.catalog = vc3d::opendata::cachedCatalog();
-        package = VolumePkg::load(aVpkgPath.toStdString(), options);
+        package = VolumePkg::open(aVpkgPath.toStdString(), options);
     } catch (const std::exception& e) {
-        Logger()->error("Failed to initialize volpkg: {}", e.what());
+        Logger()->error("Failed to open project: {}", e.what());
         loadError = QString::fromUtf8(e.what());
     }
-
     if (!package) {
         Logger()->error("Cannot open project: {}", aVpkgPath.toStdString());
         const QString message = loadError.isEmpty()
@@ -4230,25 +4258,6 @@ bool CWindow::OpenVolume(const QString& path,
         }
         if (interactive) {
             QMessageBox::warning(this, tr("Error"), message);
-        }
-        return false;
-    }
-
-    // Check version number
-    if (package->version() < VOLPKG_MIN_VERSION) {
-        const auto msg = "Volume package is version " +
-                         std::to_string(package->version()) +
-                         " but this program requires version " +
-                         std::to_string(VOLPKG_MIN_VERSION) + "+.";
-        Logger()->error(msg);
-        if (errorMessage) {
-            *errorMessage = QString::fromStdString(msg);
-        }
-        if (interactive) {
-            QMessageBox::warning(this, tr("ERROR"), QString::fromStdString(msg));
-        }
-        if (openError) {
-            *openError = VolumeOpenError::PackageLoadFailed;
         }
         return false;
     }
@@ -4284,11 +4293,10 @@ bool CWindow::OpenVolume(const QString& path,
     // close path would save into the new package. A refusal (a running
     // optimization, a failed finalization) aborts the switch with the
     // workspace intact.
-    if (_lineAnnotationController &&
-        !_lineAnnotationController->prepareForPackageSwitch()) {
+    if (_state->prepareStoreSwitch && !_state->prepareStoreSwitch()) {
         if (errorMessage) {
-            *errorMessage = tr("Open line annotation sessions could not be "
-                               "closed; the project was not switched.");
+            *errorMessage = tr("Pending edits could not be saved; "
+                               "the project was not switched.");
         }
         if (openError) {
             *openError = VolumeOpenError::PackageLoadFailed;
@@ -4297,8 +4305,13 @@ bool CWindow::OpenVolume(const QString& path,
     }
 
     CloseVolume();
+    // Without a choice, the volume the user last viewed in the project.
+    const auto ids = package->volumeIDs();
+    const auto remembered = QString::fromStdString(package->currentVolumeId());
+    const QString volumeId = !preferredVolumeId.isEmpty() ? preferredVolumeId
+        : std::find(ids.begin(), ids.end(), remembered.toStdString()) != ids.end() ? remembered : QString();
     _state->setVpkg(std::move(package));
-    refreshCurrentVolumePackageUi(preferredVolumeId);
+    refreshCurrentVolumePackageUi(volumeId);
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
@@ -4309,14 +4322,13 @@ bool CWindow::OpenVolume(const QString& path,
     return true;
 }
 
-void CWindow::attachObjectStore(const QString& path)
+void CWindow::attachStore(const QString& path)
 {
-    const auto author = _menuController ? _menuController->objectStoreAuthor() : QString();
-    if (author.isEmpty()) return;
     try {
-        _state->attachObjectStore(path, author);
+        if (!_state->hasVpkg()) throw std::runtime_error("no project is open");
+        _state->attachStore(path.toStdString(), CState::storeAuthor());
     } catch (const std::exception& error) {
-        const auto message = tr("Cannot attach object store %1: %2").arg(path, QString::fromUtf8(error.what()));
+        const auto message = tr("Cannot attach store %1: %2").arg(path, QString::fromUtf8(error.what()));
         qWarning().noquote() << message;
         statusBar()->showMessage(message, 10000);
     }
@@ -4434,7 +4446,7 @@ std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const std:
     // The store's resolution (catalog registrations, its own and its route
     // choices); without a store, the cached catalog's registrations.
     vc::objects::VolumeTransforms transforms;
-    if (const auto attachment = _state->objectStoreAttachment()) {
+    if (const auto attachment = _state->storeFor("volume_transform")) {
         _state->objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
             transforms = db.volumeTransforms(txn);
         });
@@ -5536,33 +5548,36 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::Poi
     showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
 }
 
+namespace {
+// The project's store, then the stores beside it.
+std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
+{
+    std::vector<vc::objects::AttachmentIdentity> stores;
+    for (const auto& attached : state.attachedStores()) stores.push_back(attached);
+    return stores;
+}
+}
+
 void CWindow::updateHubStatus()
 {
-    const auto attachment = _state->objectStoreAttachment();
-    const auto status = attachment ? _state->objectStoreSession()->hubStatus(*attachment) : std::nullopt;
-    if (!status) {
+    const auto session = _state->objectStoreSession();
+    QStringList texts;
+    std::vector<std::string> conflicts;
+    for (const auto& attachment : openStores(*_state)) {
+        const auto status = session->hubStatus(attachment);
+        if (!status) continue;
+        texts << tr("%1 Hub: %2").arg(QString::fromStdString(session->path(attachment).stem().string()),
+                                       hubStatusSummary(*status));
+        for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
+    }
+    if (texts.isEmpty()) {
         _hubStatusLabel->hide();
         _hubPromptedConflicts.clear();
         return;
     }
-    QString text;
-    if (!status->conflicts.empty()) {
-        text = tr("Hub: %n conflict(s)", nullptr, int(status->conflicts.size()));
-    } else if (!status->error.empty()) {
-        text = tr("Hub: offline (%1)").arg(QString::fromStdString(status->error));
-    } else if (!status->pending.empty()) {
-        text = tr("Hub: %n pending", nullptr, int(status->pending.size()));
-    } else if (status->syncedAtUs) {
-        text = tr("Hub: synced %1").arg(QDateTime::fromMSecsSinceEpoch(*status->syncedAtUs / 1000)
-            .toString(QStringLiteral("HH:mm:ss")));
-    } else {
-        text = tr("Hub: connecting");
-    }
-    _hubStatusLabel->setText(text);
+    _hubStatusLabel->setText(texts.join(QStringLiteral("  ")));
     _hubStatusLabel->show();
     // Ask about a set of conflicts once; Sync Now asks again.
-    std::vector<std::string> conflicts;
-    for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
     if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
     _hubPromptedConflicts = conflicts;
     promptHubConflicts();
@@ -5571,21 +5586,23 @@ void CWindow::updateHubStatus()
 void CWindow::promptHubConflicts()
 {
     const auto session = _state->objectStoreSession();
-    const auto attachment = _state->objectStoreAttachment();
-    const auto status = attachment ? session->hubStatus(*attachment) : std::nullopt;
-    if (!status || status->conflicts.empty()) return;
-    QStringList uuids;
-    for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
-    QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
-        tr("%n record(s) changed both here and on the hub:", nullptr, int(uuids.size())) +
-            QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
-            (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
-            tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
-        QMessageBox::NoButton, this);
-    auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
-    auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
-    box.addButton(tr("Later"), QMessageBox::RejectRole);
-    box.exec();
-    if (box.clickedButton() == useHub) session->resolveHubConflicts(*attachment, "hub");
-    else if (box.clickedButton() == keepMine) session->resolveHubConflicts(*attachment, "local");
+    for (const auto& attachment : openStores(*_state)) {
+        const auto status = session->hubStatus(attachment);
+        if (!status || status->conflicts.empty()) continue;
+        QStringList uuids;
+        for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
+        QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
+            tr("%n record(s) of %1 changed both here and on the hub:", nullptr, int(uuids.size()))
+                .arg(QString::fromStdString(session->path(attachment).filename().string())) +
+                QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
+                (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
+                tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
+            QMessageBox::NoButton, this);
+        auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
+        auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
+        box.addButton(tr("Later"), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == useHub) session->resolveHubConflicts(attachment, "hub");
+        else if (box.clickedButton() == keepMine) session->resolveHubConflicts(attachment, "local");
+    }
 }

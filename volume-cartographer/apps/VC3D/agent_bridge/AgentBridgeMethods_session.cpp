@@ -151,9 +151,11 @@ void AgentBridgeServer::registerSessionHandlers()
                     QStringLiteral("tags"),
                     AgentBridgeParamType::String),
                 Params::optionalBoolean(QStringLiteral("overwrite"), false),
+                Params::optionalString(QStringLiteral("store")),
+                Params::optionalString(QStringLiteral("newStore")),
             },
             .errors = {-32602, -32007, -32005, -32010},
-            .mcp = mcp(QStringLiteral("vc3d_create_project")),
+            .mcp = mcp(QStringLiteral("vc3d_create_project"), true),
         },
         [this](const QJsonValue& p) { return handleProjectCreate(p); });
 

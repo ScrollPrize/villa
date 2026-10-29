@@ -322,8 +322,9 @@ void SpiralServiceManager::startLocalProcess()
     // is launched bound to the one attached here.
     if (_localStorePath.isEmpty()) {
         const QString message = tr("The local Spiral service reads its patches, point "
-                                   "collections and fibers from an object store. "
-                                   "Attach one (File > Object store) and connect again.");
+                                   "collections and fibers from one object store. Route "
+                                   "all three to one of the project's stores (File > Stores) "
+                                   "and connect again.");
         setConnectionState(ConnectionState::Failed, message);
         emit errorOccurred(message);
         return;
@@ -582,8 +583,8 @@ void SpiralServiceManager::updateStoreBinding()
     if (_storeBinding.advertised() && !_storeBinding.matches())
         emit logMessage(
             _storeBinding.localUuid.isEmpty()
-                ? tr("The Spiral service reads object store %1, and none is attached here: "
-                     "its fit inputs cannot be displayed")
+                ? tr("The Spiral service reads object store %1, and the project routes Spiral's "
+                     "inputs to no one store here: its fit inputs cannot be displayed")
                       .arg(_storeBinding.serviceUuid)
             : _storeBinding.serviceUuid == _storeBinding.localUuid
                 ? tr("The Spiral service fits positions of hub %1 (%2); the attached store is "
@@ -811,8 +812,8 @@ void SpiralServiceManager::updateFitInputs(QJsonObject request)
             update.error = tr("The hub could not be reached: %1").arg(exception.isEmpty() ? tr("no hub") : exception);
         } else if (!status->conflicts.empty()) {
             update.conflicts = true;
-            update.error = tr("Hub conflicts block the update: resolve them (File > Object store > "
-                              "Sync Hosted Object Store Now), then update again");
+            update.error = tr("Hub conflicts block the update: resolve them (File > Stores > "
+                              "Sync Hosted Stores Now), then update again");
             for (const auto& conflict : status->conflicts)
                 update.problems << QString::fromStdString(conflict.uuid);
         } else if (!status->error.empty()) {

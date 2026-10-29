@@ -1,21 +1,24 @@
+# Open Data samples as projects
+
+A project is an object store (`.vcobj`). **Open Sample** opens the sample's own
+project, `open_data/<sample>.vcobj` in VC3D's projects directory, creating it on
+first use: its catalog surfaces (fetched when first viewed), volumes, normal
+grids and Lasagna datasets. It is an ordinary project: surfaces are edited in
+place, and you can import surfaces and fibers and attach more volumes. Opening
+the sample again brings back your work. **Refresh from Open Data** (with the
+sample's project open) follows the published catalog, leaving locally edited
+surfaces alone; a surface's context menu offers **Reset to Open Data Version**,
+and **File → Stores → Reset Project to Open Data...** recreates the whole
+project from the catalog, discarding every change.
+
 # Selective catalog projects
 
 Select a sample in Open Data Catalog and choose **Create Project...** beside
 **Open Sample**. Everything starts unchecked. Select source volumes, individual
 derived representations (grouped by type). Group checkboxes and Select all/Select
-none also work. Segments are not chosen here: they are surfaces of the sample's
-store (*Catalog surfaces*). Set the project name and destination
-`.volpkg.json`, then choose **Create and Open**. Existing files require confirmation;
-the currently open project cannot be overwritten through this action.
-
-Fibers and the user's own surfaces live in an explicitly attached object store
-(`.vcobj`). Project creation does not create one. Use File → Object Store →
-Attach Object Store..., then the explicit fiber import command for current-format
-transfer JSON.
-
-An empty selection creates an empty project. Open Sample still uses the existing
-full-sample workflow. The selective path never loads the cached full-sample project.
-Saved projects reopen through ordinary project loading and use the global cache.
+none also work. Segments are not chosen here: the project gets the sample's
+catalog surfaces. Set the project name and a new `.vcobj` file, then choose
+**Create and Open**. An empty selection creates a project without volumes.
 
 A remote volume the catalog publishes is named by the catalog when opened,
 including from existing saved projects (`vcr::catalog::OpenDataManifest::volumeAt`).

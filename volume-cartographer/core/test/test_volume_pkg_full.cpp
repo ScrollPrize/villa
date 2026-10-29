@@ -8,6 +8,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
+#include "support/TestProject.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
@@ -29,25 +30,13 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-struct TestAutosaveRoot {
-    TestAutosaveRoot()
-        : previous(VolumePkg::autosaveRoot())
-        , root(tmpDir("autosave_root"))
-    {
-        VolumePkg::setAutosaveRoot(root);
-    }
-
-    ~TestAutosaveRoot()
-    {
-        VolumePkg::setAutosaveRoot(previous);
-        fs::remove_all(root);
-    }
-
-    fs::path previous;
-    fs::path root;
-};
-
-TestAutosaveRoot testAutosaveRoot;
+// The project at `path`, opened in a session of its own (as another process would).
+std::shared_ptr<VolumePkg> openElsewhere(const fs::path& path, bool readOnly = false,
+                                         const vc::project::LoadOptions& opts = {})
+{
+    if (readOnly) fs::permissions(path, fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read);
+    return VolumePkg::open(path, opts);
+}
 
 // Build a small local zarr volume in `root/volumes/<id>/`. Returns the
 // volume path.
@@ -72,7 +61,7 @@ TEST_CASE("VolumePkg::addVolumeEntry auto-loads vol1 from the volumes dir")
 {
     auto d = tmpDir("addvol");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
     // resolveVolumeEntry already loaded vol1; addSingleVolume returns false
     // for an already-present id. Either way, vol1 must be reachable.
@@ -88,7 +77,7 @@ TEST_CASE("VolumePkg::removeSingleVolume drops a volume by id")
 {
     auto d = tmpDir("rmvol");
     makeLocalVolume(d);
-    auto p = VolumePkg::newEmpty();
+    auto p = vc::test::emptyProject();
     p->addVolumeEntry((d / "volumes").string());
     REQUIRE(p->volume("vol1") != nullptr);
     CHECK(p->removeSingleVolume("vol1"));
@@ -104,10 +93,9 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
     const auto firstPath = makeLocalVolume(d, "vol1");
     const auto secondRoot = d / "second";
     const auto secondPath = makeLocalVolume(secondRoot, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = store.open();
     auto first = Volume::New(firstPath);
     REQUIRE(first);
     CHECK(
@@ -137,9 +125,9 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto reloaded = VolumePkg::load(project, deferred);
+    auto reloaded = store.open(deferred);
     REQUIRE(reloaded->volumeEntries().size() == 1);
-    CHECK(reloaded->volumeEntries().front().location == firstPath.string());
+    CHECK(vc::project::resolveLocalPath(reloaded->volumeEntries().front().location, reloaded->directory()) == firstPath);
     CHECK(reloaded->volumeEntries().front().tags ==
           std::vector<std::string>{"overlay"});
     fs::remove_all(d);
@@ -149,16 +137,14 @@ TEST_CASE("VolumePkg::attachPreparedVolume recognizes a loaded relative entry")
 {
     auto d = tmpDir("attach_relative");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
-    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes/vol1", {"original"}));
 
-    const auto relativeProject = fs::relative(project, fs::current_path());
-    auto package = VolumePkg::load(relativeProject);
+    // Relative entries resolve against the project's directory.
+    auto package = openElsewhere(fs::relative(store.path, fs::current_path()));
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -193,13 +179,11 @@ TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
 {
     auto d = tmpDir("attach_symlink");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
-    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes/vol1", {"original"}));
 
     const auto alias = aliasFor(d);
     if (alias.empty()) {
@@ -208,7 +192,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume sees through a directory symlink")
     }
 
     // Package opened through the alias, volume attached through the real path.
-    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -225,14 +209,12 @@ TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a s
 {
     auto d = tmpDir("attach_container_symlink");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto detached = VolumePkg::newDetached(deferred);
     // "volumes" is a collection entry: it holds zarr volumes but is not one.
-    REQUIRE(detached->addVolumeEntry("volumes", {"collection"}));
-    detached->save(project);
+    REQUIRE(store.open(deferred)->addVolumeEntry("volumes", {"collection"}));
 
     const auto alias = aliasFor(d);
     if (alias.empty()) {
@@ -240,7 +222,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume matches a container entry through a s
         return;
     }
 
-    auto package = VolumePkg::load(alias / "project.volpkg.json");
+    auto package = openElsewhere(alias / "project.vcproj");
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK(
@@ -257,10 +239,7 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists a directly loaded volume")
 {
     auto d = tmpDir("attach_loaded_only");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
-
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = vc::test::emptyProject();
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
 
@@ -282,10 +261,7 @@ TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
     const auto stagedChild = makeLocalVolume(d / "staging", "child");
     const auto childPath = parentPath / "child";
     fs::rename(stagedChild, childPath);
-    const auto project = d / "project.volpkg.json";
-
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
+    auto package = vc::test::emptyProject();
     REQUIRE(package->addVolumeEntry(parentPath.string()));
     CHECK_FALSE(package->matchingVolumeEntry(childPath.string()));
 
@@ -302,7 +278,7 @@ TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
 {
     vc::project::LoadOptions deferred;
     deferred.deferResolution = true;
-    auto package = VolumePkg::newDetached(deferred);
+    auto package = vc::test::emptyProject(deferred);
     const std::string legacy = "s3://example-bucket/path/volume.zarr";
     REQUIRE(package->addVolumeEntry(
         legacy, {"vc-open-data-voxel-size-um:7.91"}));
@@ -315,28 +291,20 @@ TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
           std::vector<std::string>{"vc-open-data-voxel-size-um:7.91"});
 }
 
-TEST_CASE("VolumePkg::attachPreparedVolume restores autosave after write failure")
+TEST_CASE("VolumePkg::attachPreparedVolume leaves the project as it was when the write fails")
 {
     auto d = tmpDir("attach_rollback");
     const auto volumePath = makeLocalVolume(d, "vol1");
-    const auto project = d / "project.volpkg.json";
+    const auto store = vc::test::createTestProject(d / "project.vcobj");
 
-    auto package = VolumePkg::newEmpty();
-    package->save(project);
-    fs::remove(project);
-    fs::create_directory(project);
-
+    auto package = openElsewhere(store.path, /*readOnly=*/true);
     auto prepared = Volume::New(volumePath);
     REQUIRE(prepared);
     CHECK_THROWS(
         package->attachPreparedVolume(volumePath.string(), {}, prepared));
     CHECK(package->volumeEntries().empty());
     CHECK(package->volume("vol1") == nullptr);
-
-    vc::project::LoadOptions deferred;
-    deferred.deferResolution = true;
-    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
-    CHECK(autosave->volumeEntries().empty());
+    CHECK(store.open()->volumeEntries().empty());
 
     fs::remove_all(d);
 }

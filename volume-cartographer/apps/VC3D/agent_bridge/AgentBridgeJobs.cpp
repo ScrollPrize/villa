@@ -71,7 +71,7 @@ void AgentBridgeServer::completeCatalogOpenJob(
     QString vpkgPath;
     if (outcome.success) {
         CState* state = _window ? _window->_state : nullptr;
-        vpkgPath = (state && state->hasVpkg()) ? state->vpkgPath() : QString();
+        vpkgPath = (state && state->hasVpkg()) ? state->projectDirectory() : QString();
 
         QJsonObject body;
         body["opened"] = true;

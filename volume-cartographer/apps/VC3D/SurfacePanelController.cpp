@@ -6,6 +6,7 @@
 #include "CState.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
 #include "ObjectStoreRegions.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
@@ -265,7 +266,7 @@ void SurfacePanelController::activate(const std::string& id, bool preserveEditin
         surface = _opened->surface;
     } catch (const SurfaceCatalog::NoGeometry&) {
         const auto* row = _catalog->row(id);
-        if (row && row->catalog) {
+        if (row && row->fromCatalog()) {
             fetchThenActivate(id, preserveEditing);
             return;
         }
@@ -404,11 +405,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     // supports sample stores through their views; external tools read stored
     // coordinates, so they take user surfaces stored in this volume's voxels.
     const bool storeWritable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
-    const bool writable = storeWritable &&
-        std::none_of(targets.begin(), targets.end(), [this](const QString& id) {
-            const auto* row = _catalog->row(id.toStdString());
-            return row && row->catalog;
-        });
+    const bool writable = storeWritable;
     auto bound = [this](const QString& id) {
         const auto* row = _catalog->row(id.toStdString());
         return row && row->bound();
@@ -433,8 +430,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         QAction* historyAction = contextMenu.addAction(tr("History..."));
         connect(historyAction, &QAction::triggered, this, [this, segmentIdStd]() { showHistory(segmentIdStd); });
         const auto* row = _catalog->row(segmentIdStd);
-        if (row && row->imported()) {
-            // Its first revision in your store is the catalog version.
+        if (row && row->fromCatalog()) {
             QAction* resetAction = contextMenu.addAction(tr("Reset to Open Data Version"));
             resetAction->setEnabled(storeWritable);
             connect(resetAction, &QAction::triggered, this, [this, segmentIdStd]() {
@@ -739,12 +735,12 @@ bool SurfacePanelController::restoreRevision(const std::string& id, const std::s
 bool SurfacePanelController::resetToCatalogVersion(const std::string& id, QString* errorMessage)
 {
     const auto* row = _catalog->row(id);
-    if (!row || !row->imported()) {
+    if (!row || !row->fromCatalog()) {
         if (errorMessage) *errorMessage = tr("The surface has no catalog version");
         return false;
     }
     try {
-        _catalog->session()->restoreImported(row->source, id);
+        vc::objects::restoreCatalogVersion(*_catalog->session(), row->source, id);
     } catch (const std::exception& error) {
         if (errorMessage) *errorMessage = QString::fromUtf8(error.what());
         return false;
@@ -1011,7 +1007,7 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
         try {
             opened = _catalog->open(surfaceId);
         } catch (const SurfaceCatalog::NoGeometry&) {
-            if (!_catalog->row(surfaceId)->catalog) throw;
+            if (!_catalog->row(surfaceId)->fromCatalog()) throw;
             // Headless callers wait for a catalog surface to be fetched.
             _catalog->session()->ensureGeometry(_catalog->row(surfaceId)->source, surfaceId);
             opened = _catalog->open(surfaceId);
@@ -1899,7 +1895,7 @@ void SurfacePanelController::updateTagCheckboxStates(const SurfaceCatalog::Row* 
     }
 
     const bool writable = _catalog && _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
-    setTagCheckboxEnabled(row != nullptr && !row->catalog && writable);
+    setTagCheckboxEnabled(row != nullptr && writable);
     if (row) {
         for (const auto& [box, name] : std::vector<std::pair<QCheckBox*, const char*>>{
                  {_tags.approved, "approved"}, {_tags.defective, "defective"},

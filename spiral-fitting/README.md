@@ -830,12 +830,16 @@ displayed locally. It is assumed to correspond to the dataset root the
 service advertises, which is the prefix service paths are translated from;
 without it that overlay is simply marked unavailable.
 
-The fit's patches, point collections and fibers are displayed from the
-object store attached in VC3D, never from service files. A local profile launches its
-service with `--object-store` set to the attached store; for a remote profile,
-attach a replica of the store the service was started with. The panel's
-*Object store* row compares the store UUIDs: when they differ, or no store is
-attached, the fit's inputs are not displayed. When they match, VC3D downloads
+The fit's patches, point collections and fibers are displayed from an
+object store attached to the VC3D project, never from service files: the
+store the project routes surfaces, fibers and point collections to (*File >
+Stores > Show Surfaces From*, and so on). Spiral needs all three routed to
+one store; when the routes differ or are unset it has none. A local profile
+launches its service with `--object-store` set to that store; for a remote
+profile, attach a replica of the store the service was started with and
+route the three kinds to it. The panel's *Object store* row compares the
+store UUIDs: when they differ, or there is no such store, the fit's inputs
+are not displayed. When they match, VC3D downloads
 the session's input manifest and shows each fitted surface, collection and
 fiber as the attached store holds it now: the store is edited live, and a
 commit that touches a fitted input or link updates just that input's overlay
@@ -849,13 +853,14 @@ changes a rebuild's selection may include; *Rebuild Fit* reads them.
 within the point view tolerance of the slice.
 
 With a hub-bound service the profile works through a replica of the
-service's hub: a local profile whose attached store is a replica launches its
+service's hub: a local profile whose store is a replica launches its
 service with its own replica of the same hub (under the output root), and
-*File > Object store > Host Object Store Locally* turns an ordinary attached
-store into a local hub with its path as the replica. For a remote profile,
-attach a replica of the service's hub; *Clone the Service's Hub* (shown when
-the attached store is not one) prefills the hub address, through the SSH
-destination for an SSH profile, or the profile's saved hub address. The
+*File > Stores > Host Store Locally* turns an ordinary attached store into a
+local hub with its path as the replica, keeping its place in the project.
+For a remote profile, attach a replica of the service's hub; *Clone the
+Service's Hub* (shown when Spiral's store is not one) prefills the hub
+address, through the SSH destination for an SSH profile, or the profile's
+saved hub address, and routes the three kinds to the replica. The
 *Object store* row then compares hub identities and positions as well as
 store UUIDs.
 

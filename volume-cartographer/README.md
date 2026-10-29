@@ -207,8 +207,9 @@ Your folder structure should resemble this:
     └── config.json - REQUIRED!
 ```
 
-Surfaces (segments) are not files of the volpkg: they live in an object store
-(`.vcobj`) that VC3D attaches with `File -> Object Store -> Attach Object Store...`.
+A VC3D project is an object store (`.vcobj`, `File -> New Project...`): it
+references the volumes above and holds the surfaces (segments), fibers and
+point collections.
 
 ### Working on remote volumes from the command line
 
@@ -311,9 +312,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   segment's `meta.json` keeps the selector in `target_volume`.
 
 ### Opening a volume package and navigating the UI
-First, click `File -> Open Project...` and select the project you wish to work with, then attach its object store with `File -> Object Store -> Attach Object Store...`
+First, click `File -> Open Project...` and select the project (`.vcobj`) you wish to work with.
 
-On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the surface list, which lists the surfaces of the attached object store (plus the read-only Open Data catalog surfaces of an Open Data volume) and selects the currently displayed segment. Selecting a surface in the list should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
+On the left side of the UI, you have a few dock widgets. The first being the Volume Package / Surface List. The most important things to note here are the `Volume` dropdown list, which selects the currently displayed volume, and the surface list, which lists the surfaces of the project (an Open Data sample's project includes its catalog surfaces) and selects the currently displayed segment. Selecting a surface in the list should populate the `Surface` volume view in the top left, and initialize the rest the volume viewers.
 
 There are a number of widgets, each with their own purpose. From top to bottom, and left to right : 
 

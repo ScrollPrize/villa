@@ -2,8 +2,9 @@
 
 ## Storage and coordinates
 
-Attach an existing `.vcobj` database with **File → Object Store → Attach Object Store**.
-**Attach Read-only Object Store** supports browsing without permitting writes.
+Fibers live in the open project's store (`.vcobj`), or in a store attached beside
+it and chosen for fibers (**File → Stores**). **Attach Read-only Store** supports
+browsing without permitting writes.
 VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
 objects and retire the original in that transaction. VC3D retains pinned working

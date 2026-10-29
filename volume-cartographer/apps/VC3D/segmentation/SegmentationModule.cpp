@@ -1889,21 +1889,40 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
     _drag.lastWorld = worldPos;
     _drag.moved = true;
 
-    if (_drag.viewer) {
-        if (const auto touched = _editManager->recentTouchedBounds()) {
-            const cv::Rect changedCells(touched->x - 1,
-                                        touched->y - 1,
-                                        touched->width + 2,
-                                        touched->height + 2);
-            _drag.viewer->invalidateVisRegion("segmentation", changedCells);
-        } else {
-            _drag.viewer->invalidateVis();
-        }
-        _drag.viewer->requestRender();
-    }
+    if (_drag.viewer)
+        refreshEditedRegion(_drag.viewer);
 
     refreshOverlay();
     emitPendingChanges();
+}
+
+void SegmentationModule::refreshEditedRegion(VolumeViewerBase* editViewer)
+{
+    if (!_editManager)
+        return;
+    std::optional<cv::Rect> changedCells;
+    if (const auto touched = _editManager->recentTouchedBounds()) {
+        changedCells = cv::Rect(touched->x - 1, touched->y - 1,
+                                touched->width + 2, touched->height + 2);
+    }
+    const auto refresh = [&](VolumeViewerBase* viewer) {
+        if (changedCells)
+            viewer->invalidateVisRegion("segmentation", *changedCells);
+        else
+            viewer->invalidateVis();
+        viewer->requestRender("segmentation edit refresh");
+    };
+    if (editViewer)
+        refresh(editViewer);
+    // An edit made on a slice's intersection also moves the flattened view's
+    // geometry. Left out here, that view learns of the edit only from the
+    // final surface update, which drops its whole tile cache: a black flash.
+    if (_viewerManager) {
+        _viewerManager->forEachBaseViewer([&](VolumeViewerBase* viewer) {
+            if (viewer && viewer != editViewer && viewer->surfName() == "segmentation")
+                refresh(viewer);
+        });
+    }
 }
 
 void SegmentationModule::finishDrag()

@@ -361,7 +361,8 @@ int main(int argc, char** argv)
                     record.kind = "surface";
                     record.storageKind = "file";
                     record.storageRef = uuid;
-                    record.meta = nlohmann::json{{"coordinates", volumeCoordinates(volume->id(), 1)}}.dump();
+                    record.meta = nlohmann::json{{"coordinates", volumeCoordinates(volume->id(), 1)},
+                                                 {"published", true}}.dump();
                     record.surface.emplace();
                     record.surface->bbox = std::array<double, 6>{0, 0, 1, 2, 2, 1};
                     db.upsertObject(txn, record);
@@ -371,7 +372,7 @@ int main(int argc, char** argv)
             // The session owns the fetch thread; destroy it before its captures.
             std::atomic_int fetchCount{0};
             ObjectStoreSession remoteSession;
-            const auto remote = remoteSession.attachFetched(remotePath, options,
+            remoteSession.setGeometryFetcher("published",
                 [&](ObjectStore& store, const std::string& uuid, const ObjectStoreSession::FetchWrite& write) {
                     if (uuid == ids[2]) throw std::runtime_error("test fetch failure");
                     const auto revision = store.currentObjectRevision(store.read(), uuid)->uuid;
@@ -380,6 +381,7 @@ int main(int argc, char** argv)
                         db.putGeometry(txn, uuid, quad_surface_geometry(grid));
                     });
                 });
+            const auto remote = remoteSession.attach(remotePath, options);
             RegionSlice slice;
             slice.origin = {0, 1, 0};
             slice.u = {1, 0, 0};

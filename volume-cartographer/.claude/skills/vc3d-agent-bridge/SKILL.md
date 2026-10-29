@@ -99,21 +99,22 @@ used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
 which cost real debugging time before anyone noticed. If you hit this, switch
 to the right tab/workspace (or activate that pane) before capturing.
 
-## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a writable object store and a local `seed.json` — even on a remote volume
+## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a writable surface store and a local `seed.json` — even on a remote volume
 
 `seeding.run`/`seeding.expand` spawn `vc_grow_seg_from_seed` once per source
 point / expansion iteration in store mode, same underlying tool as
 `vc3d_grow_surface_from_seed`. Two things that will bite you, both about the
 config VC3D resolves, not the points you commit:
 
-- **New surfaces go to the attached object store, and `seed.json` (or
-  `expand.json`) is read from the project directory** (the directory holding
-  the project's `.volpkg.json`). Without a writable attached store, or without
-  that file, you get a clean error — not a crash, but also not something
-  `catalog.open_sample` sets up for you. For a remote-only project, attach a
-  store and write `seed.json` (schema: `{"cache_root", "thread_limit",
-  "normal_grid_path", "min_area_cm", "generations"}`) next to the project file
-  yourself.
+- **New surfaces go to the surfaces' store (the project's `.vcobj`, unless
+  another store is chosen for surfaces: `state.get` → `routes.surface`), and
+  `seed.json` (or `expand.json`) is read from the project directory** (the
+  directory holding the project's `.vcobj`). Without a writable store, or
+  without that file, you get a clean error — not a crash, but also not
+  something `catalog.open_sample` sets up for you (a sample's project lives in
+  VC3D's projects directory, `open_data/<sample>.vcobj`). Write `seed.json`
+  (schema: `{"cache_root", "thread_limit", "normal_grid_path", "min_area_cm",
+  "generations"}`) next to the project file yourself.
 - **`normal_grid_path` inside that file is a static local path, with no
   awareness of remote/streaming normal-grid stores** — this is a real,
   currently-open gap (unlike `vc3d_grow_surface_from_seed`, which resolves

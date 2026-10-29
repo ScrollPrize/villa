@@ -7,6 +7,21 @@
 #include <vc_object_store/objects/AttachedDocument.hpp>
 #include "support/TestZarrVolume.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
+namespace {
+// Open a store as the state's project, as VC3D opens one.
+void openStoreAsProject(CState& state, const QString& path, const QString& author, bool readOnly = false)
+{
+    auto projectPath = std::filesystem::path(path.toStdString());
+    projectPath.replace_extension(".vcproj");
+    if (!std::filesystem::exists(projectPath))
+        vc::project::ProjectDocument::create(projectPath, "test", path.toStdString(), readOnly);
+    auto document = vc::project::ProjectDocument::load(projectPath);
+    auto data = document.data();
+    data["stores"][0]["read_only"] = readOnly;
+    document.replace(std::move(data));
+    state.setVpkg(VolumePkg::open(projectPath));
+}
+}
 int runObjectStoreControllerTests()
 {
     using Controller = LineAnnotationController;
@@ -29,7 +44,7 @@ int runObjectStoreControllerTests()
         for (int i = 0; i < 20; ++i) {
             QElapsedTimer timer; timer.start();
             state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
-                *state.objectStoreAttachment(), 0, {}});
+                *state.storeFor("fiber"), 0, {}});
             QApplication::processEvents();
             while (!catalogReady() && timer.elapsed() < 10000) {
                 QApplication::processEvents(); QThread::msleep(1);
@@ -64,7 +79,7 @@ int runObjectStoreControllerTests()
             QObject::connect(&heartbeat, &QTimer::timeout, [&] { ++heartbeats; });
             heartbeat.start();
             QElapsedTimer timer; timer.start();
-            state.attachObjectStore(QString::fromUtf8(source), {}, true);
+            openStoreAsProject(state, QString::fromUtf8(source), {}, true);
             const auto attachedMs = timer.elapsed();
             while (page.empty() && timer.elapsed() < 60000) {
                 QApplication::processEvents(); QThread::msleep(1);
@@ -83,7 +98,7 @@ int runObjectStoreControllerTests()
             require(!controller.fiberSnapshotsForSideStripQuery({*selected}).empty(), "warm real fiber snapshot");
             collection.selectFiber(id, false, false);
             checkHubStatus(state, controller, collection, [&] { return !page.empty(); });
-            state.detachObjectStore();
+            state.closeProject();
             require(controller.fiberUuidForId(id).empty() && !controller.readStoredFiber(id), "detach clears runtime identities");
             return 0;
         }
@@ -107,12 +122,12 @@ int runObjectStoreControllerTests()
             { auto db = ObjectStore::create(storePath, umbilicusOptions); }
             CState state;
             Controller controller(&state,nullptr,nullptr,nullptr);
-            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-umbilicus-test");
+            openStoreAsProject(state, QString::fromStdString(storePath.string()), "vc3d-umbilicus-test");
             state.setCurrentVolume(volume);
             int changed = 0, fibersChanged = 0;
             QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
             QObject::connect(&controller, &Controller::fibersChanged, [&] { ++fibersChanged; });
-            const auto attachment = *state.objectStoreAttachment();
+            const auto attachment = *state.storeFor("fiber");
             require(!vc::objects::volumeUmbilicus(*state.objectStoreSession(), attachment, volume->id()) &&
                         !controller.umbilicusStatus().available,
                     "a volume without a stored umbilicus has none");
@@ -143,7 +158,7 @@ int runObjectStoreControllerTests()
             require(controller.umbilicusStatus().text.contains("several") &&
                     controller.umbilicusFingerprint() != token,
                     "several umbilici bound to one volume are refused");
-            state.detachObjectStore();
+            state.closeProject();
         }
         {
             // A volume's point collections live in the store: edits reach it in a
@@ -162,7 +177,7 @@ int runObjectStoreControllerTests()
                 return done();
             };
             CState state;
-            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+            openStoreAsProject(state, QString::fromStdString(storePath.string()), "vc3d-points-test");
             state.setCurrentVolume(volume);
             auto* points = state.pointCollection();
             const auto first = points->addPoint("seeds", {1, 2, 3});
@@ -170,7 +185,7 @@ int runObjectStoreControllerTests()
             const auto anchored = points->addCollection("correction");
             points->setCollectionAnchor2d(anchored, cv::Vec2f(1, 1));
             points->addPoint("correction", {7, 7, 7});
-            const auto attachment = *state.objectStoreAttachment();
+            const auto attachment = *state.storeFor("fiber");
             auto stored = [&] { return vc::objects::volumeCollections(*state.objectStoreSession(), attachment, volume->id()); };
             require(settle([&] { return stored().size() == 1 && stored()[0].points.points.size() == 2; }),
                     "an edited collection reaches the store after the debounce");
@@ -182,12 +197,12 @@ int runObjectStoreControllerTests()
                     "a moved point is written back keeping its id");
             {
                 CState other;
-                other.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-points-test");
+                openStoreAsProject(other, QString::fromStdString(storePath.string()), "vc3d-points-test");
                 other.setCurrentVolume(volume);
                 const auto& loaded = other.pointCollection()->getAllCollections();
                 require(loaded.size() == 1 && loaded.begin()->second.name == "seeds" && loaded.begin()->second.points.size() == 2,
                         "a new session loads the volume's collections");
-                other.detachObjectStore();
+                other.closeProject();
             }
             auto edited = stored()[0];
             edited.points.points[1] = {3, 3, 3};
@@ -201,7 +216,7 @@ int runObjectStoreControllerTests()
             require(points->getCollectionId("correction").has_value(), "a reload keeps the corrections");
             points->clearCollection(*points->getCollectionId("seeds"));
             require(settle([&] { return stored().empty(); }), "a removed collection is retired");
-            state.detachObjectStore();
+            state.closeProject();
         }
         {
             // Fibers bound by scale or through a registration are read and edited
@@ -235,7 +250,7 @@ int runObjectStoreControllerTests()
             CState state;
             Controller controller(&state,nullptr,nullptr,nullptr);
             controller._errorDialogsSuppressed = true;
-            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-frame-test");
+            openStoreAsProject(state, QString::fromStdString(storePath.string()), "vc3d-frame-test");
             state.setCurrentVolume(volume);
             auto read = [&](const std::string& uuid) {
                 auto fibers = controller.readStoredFibers(std::vector<std::string>{uuid}, true);
@@ -244,7 +259,7 @@ int runObjectStoreControllerTests()
             };
             auto stored = [&](const std::string& uuid) {
                 vc::geometry::Fiber fiber;
-                state.objectStoreSession()->read(*state.objectStoreAttachment(), [&](const auto& db, const auto& txn, const auto&) {
+                state.objectStoreSession()->read(*state.storeFor("fiber"), [&](const auto& db, const auto& txn, const auto&) {
                     fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
                 });
                 return fiber;
@@ -286,14 +301,14 @@ int runObjectStoreControllerTests()
                 require(after.linePoints == before.linePoints && after.controlPoints == before.controlPoints,
                         "a record-only edit keeps the stored geometry");
             }
-            state.detachObjectStore();
+            state.closeProject();
         }
         OpenOptions options; options.author = "vc3d-controller-test";
         { auto db = ObjectStore::create(path,options); }
         CState state;
         Controller controller(&state,nullptr,nullptr,nullptr);
         controller._errorDialogsSuppressed = true;
-        state.attachObjectStore(QString::fromStdString(path.string()),"vc3d-controller-test");
+        openStoreAsProject(state, QString::fromStdString(path.string()),"vc3d-controller-test");
         auto transferJson = [&](const Controller::StoredFiber& fiber) {
             nlohmann::json result;
             state.objectStoreSession()->read(fiber.storePin->attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -368,7 +383,7 @@ int runObjectStoreControllerTests()
                 [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
             QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
             const auto connection = state.objectStoreSession();
-            const auto attachment = *state.objectStoreAttachment();
+            const auto attachment = *state.storeFor("fiber");
             const auto unrelated = vc::objects::util::newUuid();
             connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
@@ -413,7 +428,7 @@ int runObjectStoreControllerTests()
             CState destination;
             Controller imported(&destination, nullptr, nullptr, nullptr);
             imported._errorDialogsSuppressed = true;
-            destination.attachObjectStore(QString::fromStdString(target.string()), "roundtrip-test");
+            openStoreAsProject(destination, QString::fromStdString(target.string()), "roundtrip-test");
             int count = 0;
             if (!imported.importFibersFromPath(bundle, &error, &count)) throw std::runtime_error(error.toStdString());
             const auto importedFibers = imported.readStoredFibers(std::nullopt);
@@ -457,7 +472,7 @@ int runObjectStoreControllerTests()
             CState destination;
             Controller imported(&destination, nullptr, nullptr, nullptr);
             imported._errorDialogsSuppressed = true;
-            destination.attachObjectStore(QString::fromStdString(target.string()), "service-import-test");
+            openStoreAsProject(destination, QString::fromStdString(target.string()), "service-import-test");
             QString error;
             if (!imported.importFibersFromPath(transferPaths.at(a.uuid), &error))
                 throw std::runtime_error(error.toStdString());
@@ -649,8 +664,8 @@ int runObjectStoreControllerTests()
             CState child(nullptr,false,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
-        require(state.objectStoreAttachment().has_value(),"secondary destruction keeps main attachment");
-        state.detachObjectStore();
+        require(state.storeFor("fiber").has_value(),"secondary destruction keeps main attachment");
+        state.closeProject();
         require(controller.readStoredFibers(std::nullopt).empty() && controller.fiberUuidForId(merged.id).empty(),
                 "detach leaves nothing to read and no identities");
         {
@@ -664,7 +679,7 @@ int runObjectStoreControllerTests()
             txn.commit();
             ObjectRecord missing; missing.uuid = vc::objects::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
             { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
-            state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
+            openStoreAsProject(state, QString::fromStdString(path.string()), {}, true);
             const auto everything = controller.readStoredFibers(std::nullopt);
             const auto unavailable = std::find_if(everything.begin(),everything.end(),[&](const auto& fiber) { return fiber.uuid == missing.uuid; });
             require(unavailable != everything.end() && !unavailable->editorError.empty(), "unavailable geometry stays listed without blocking other fibers");
@@ -682,7 +697,7 @@ int runObjectStoreControllerTests()
             CState destination;
             Controller imported(&destination, nullptr, nullptr, nullptr);
             imported._errorDialogsSuppressed = true;
-            destination.attachObjectStore(QString::fromStdString(target.string()), "control-only-roundtrip");
+            openStoreAsProject(destination, QString::fromStdString(target.string()), "control-only-roundtrip");
             QString importError; int importedCount = 0;
             if (!imported.importFibersFromPath(transferPath, &importError, &importedCount))
                 throw std::runtime_error(importError.toStdString());
@@ -697,10 +712,10 @@ int runObjectStoreControllerTests()
             auto transfer = transferJson(controlsOnly); transfer["version"] = 2;
             rejected = false; try { (void)vc::objects::decodeFiberJson(transfer.dump()); } catch (...) { rejected = true; }
             require(rejected, "unsupported fiber version is rejected");
-            state.detachObjectStore();
+            state.closeProject();
         }
         if(const char* smoke=std::getenv("VC3D_OBJECT_STORE_SMOKE_DB")) {
-            state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            openStoreAsProject(state, QString::fromUtf8(smoke),"vc3d-real-smoke");
             const auto everything=controller.readStoredFibers(std::nullopt);
             require(!everything.empty(),"real database catalog reads");
             const size_t count=everything.size();
@@ -748,7 +763,7 @@ int runObjectStoreControllerTests()
             const auto originalPin=fiber.storePin;
             fiber.tags.push_back("vc3d_smoke");
             controller.commitFibers({&fiber});
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            state.closeProject();openStoreAsProject(state, QString::fromUtf8(smoke),"vc3d-real-smoke");
             require(controller.readStoredFibers(std::nullopt).size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
@@ -779,14 +794,14 @@ int runObjectStoreControllerTests()
             }});
             const auto realMergeResult=controller.commitStructuralEdit(std::move(realRequest),&committed);
             if(!realMergeResult.ok) throw std::runtime_error("real merge: "+realMergeResult.error);
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            state.closeProject();openStoreAsProject(state, QString::fromUtf8(smoke),"vc3d-real-smoke");
             const auto roundtrip=resolve(realMerge->merged.uuid);
             require(roundtrip.controlPoints.size()==restored.controlPoints.size(),"real split/merge control count");
             require(roundtrip.linePoints==realMerge->merged.linePoints,"real split/merge preserves planner numerical geometry");
             require(roundtrip.branches.size()==restored.branches.size(),"real split/merge preserves external branches");
             std::cerr << "real-data smoke: " << count << " fibers; edit, shared link, split/merge and reopen; "
                       << roundtrip.controlPoints.size() << " controls and " << roundtrip.linePoints.size() << " planned line points preserved\n";
-            state.detachObjectStore();
+            state.closeProject();
         }
         std::cerr << "vc3d object store controller tests passed\n";
     } catch(const std::exception& error) { std::cerr << "vc3d object store test: " << error.what() << '\n'; return 1; }

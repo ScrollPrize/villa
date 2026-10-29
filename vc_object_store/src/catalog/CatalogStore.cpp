@@ -13,13 +13,6 @@ namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
 
-OpenOptions builderOptions()
-{
-    OpenOptions options;
-    options.author = "vc-open-data";
-    return options;
-}
-
 // Provenance of a catalog surface: how the catalog says it was made.
 Json provenance(const vcr::catalog::OpenDataSegment& segment, const vcr::catalog::OpenDataSurface& surface)
 {
@@ -77,16 +70,13 @@ bool sameCatalogRecord(const ObjectRecord& a, const ObjectRecord& b)
 {
     const auto bounds = [](const ObjectRecord& r) { return r.surface ? r.surface->bbox : std::nullopt; };
     auto left = Json::parse(a.meta), right = Json::parse(b.meta);
-    left.erase("catalog_geometry_revision");
-    right.erase("catalog_geometry_revision");
+    for (const auto* key : {"catalog_geometry_revision", "catalog_write"}) {
+        left.erase(key);
+        right.erase(key);
+    }
     return a.name == b.name && left == right && bounds(a) == bounds(b);
 }
 } // namespace
-
-fs::path catalogSampleStorePath(const fs::path& cacheRoot, const std::string& sampleId)
-{
-    return cacheRoot / "open_data" / "stores" / (vcr::catalog::safePathComponent(sampleId) + ".vcobj");
-}
 
 std::string catalogSurfaceUuid(const vcr::catalog::OpenDataSurface& surface)
 {
@@ -166,7 +156,12 @@ CatalogStoreReport updateCatalogRecords(ObjectStoreSession& session, const Attac
     });
     if (!changed.empty())
         session.fetchWrite(attachment, expected, [&](ObjectStore& db, WriteTxn& txn) {
-            for (const auto& record : changed) db.upsertObject(txn, record);
+            for (auto record : changed) {
+                auto meta = Json::parse(record.meta);
+                meta["catalog_write"] = util::newUuid();
+                record.meta = meta.dump();
+                db.upsertObject(txn, record);
+            }
         });
     return report;
 }
@@ -185,6 +180,8 @@ void downloadFile(const std::string& url, const fs::path& path)
     }
     fs::rename(partial, path);
 }
+
+} // namespace detail
 
 void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectStoreSession::FetchWrite& write)
 {
@@ -226,37 +223,38 @@ void fetchCatalogSurface(ObjectStore& db, const std::string& uuid, const ObjectS
         store.upsertObject(txn, updated);
         const auto fetched = store.putGeometry(txn, uuid, prepared.geometry, geometry);
         store.setMeta(txn, uuid, "catalog_geometry_revision", Json(fetched).dump());
+        store.setMeta(txn, uuid, "catalog_write", Json(util::newUuid()).dump());
     });
 }
 
-} // namespace detail
-
-AttachmentIdentity attachCatalog(ObjectStoreSession& session, const vcr::catalog::OpenDataSample& sample,
-                                 const fs::path& cacheRoot, const OpenOptions& options,
-                                 const std::optional<std::vector<std::string>>& segmentIds, CatalogStoreReport* report)
+CatalogStoreReport addCatalogSample(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                                    const vcr::catalog::OpenDataSample& sample,
+                                    const std::optional<std::vector<std::string>>& segmentIds)
 {
-    const auto path = catalogSampleStorePath(cacheRoot, sample.id);
-    std::optional<AttachmentIdentity> attachment;
-    for (const auto& candidate : session.attachments()) {
-        std::error_code error;
-        if (fs::equivalent(session.path(candidate), path, error)) attachment = candidate;
-    }
-    if (!attachment) {
-        auto opened = options;
-        if (opened.author.empty()) opened.author = "vc-open-data";
-        fs::create_directories(path.parent_path());
-        if (!fs::exists(path)) {
-            auto created = opened;
-            created.remoteGeometryReached = {};
-            created.readOnly = false;
-            auto store = ObjectStore::create(path, created);
-        }
-        attachment = session.attachFetched(path, opened, detail::fetchCatalogSurface);
-    }
     std::vector<std::string> stale;
-    const auto added = detail::updateCatalogRecords(session, *attachment, sample, false, segmentIds, stale);
-    if (report) *report = added;
-    return *attachment;
+    return detail::updateCatalogRecords(session, attachment, sample, false, segmentIds, stale);
+}
+
+void restoreCatalogVersion(ObjectStoreSession& session, const AttachmentIdentity& attachment,
+                           const std::string& objectUuid)
+{
+    const auto uuid = util::canonicalUuid(objectUuid);
+    std::optional<std::string> revision;
+    session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+        const auto record = store.objectByUuid(txn, uuid);
+        if (!record || !catalogReference(*record)) throw std::runtime_error("not a catalog surface: " + uuid);
+        const auto meta = Json::parse(record->meta);
+        if (!meta.contains("catalog_geometry_revision"))
+            throw std::runtime_error("the catalog version of " + uuid + " was never fetched");
+        // The catalog's last write (a fetch or refresh) minted this token; the
+        // user's later revisions carry it forward.
+        const auto token = meta.value("catalog_write", std::string());
+        for (const auto& version : store.objectHistory(txn, uuid))
+            if (!revision && Json::parse(version.record.meta).value("catalog_write", std::string()) == token)
+                revision = version.uuid;
+    });
+    if (!revision) throw std::runtime_error("the catalog version of " + uuid + " is not in its history");
+    session.editCurrent(attachment, {uuid}, [&](auto& store, auto& txn, const auto&) { store.restoreObject(txn, uuid, *revision); });
 }
 
 CatalogStoreReport refreshCatalog(ObjectStoreSession& session, const AttachmentIdentity& attachment,
