@@ -140,7 +140,8 @@ ctest --test-dir /tmp/vc-hub-lock-build --output-on-failure
 command with real OpenSSH `sftp-server`, `flock` and `timeout`; it needs no sshd
 or credentials. It covers concurrent sessions, legacy-client exclusion,
 client death during a spilled write, lost replies without reconnect, server
-deadlines, journal recovery and 250 ms reply delays. The process-lock fixture
+deadlines, journal recovery, cache reuse across operations, cache invalidation
+after another writer, and sync/push/pull with 250 ms reply delays. The process-lock fixture
 requires Linux; client portability does not depend on those utilities locally.
 To repeat the recovery and two-replica sync checks on real fiber data, supply
 an ordinary store in the current schema. The fixture snapshots it without
