@@ -337,29 +337,34 @@ vc_add_test(NAME test_merge_grid_resolve
     SOURCES test_merge_grid_resolve.cpp ${PROJECT_SOURCE_DIR}/apps/src/vc_merge_tifxyz_grid.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/src)
 
-# Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
-vc_add_test(NAME test_grow_seg_store_mode)
-add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
-set_tests_properties(test_grow_seg_store_mode PROPERTIES
-    ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
-
 vc_add_test(NAME test_surface_meshing)
 
-# Outputs of the mesh tools (OBJ export, OBJ rasterization)
-# on small fixed inputs.
-vc_add_test(NAME test_mesh_tool_outputs)
-add_dependencies(test_mesh_tool_outputs vc_tifxyz2obj vc_obj2tifxyz vc_obj2tifxyz_legacy)
-set_tests_properties(test_mesh_tool_outputs PROPERTIES
-    ENVIRONMENT "VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
+# These spawn the built command-line tools, so they only exist in
+# configurations that build the apps -- the test shards configure with
+# VC_BUILD_APPS=OFF and apps/ returns before the tool targets are created.
+if(VC_BUILD_APPS)
+    # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
+    vc_add_test(NAME test_grow_seg_store_mode)
+    add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
+    set_tests_properties(test_grow_seg_store_mode PROPERTIES
+        ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
 
-# Store modes of the command-line tools, compared with their tifxyz modes.
-vc_add_test(NAME test_tool_store_modes)
-if(TARGET flatboi)
-    add_dependencies(test_tool_store_modes flatboi)
+    # Outputs of the mesh tools (OBJ export, OBJ rasterization)
+    # on small fixed inputs.
+    vc_add_test(NAME test_mesh_tool_outputs)
+    add_dependencies(test_mesh_tool_outputs vc_tifxyz2obj vc_obj2tifxyz vc_obj2tifxyz_legacy)
+    set_tests_properties(test_mesh_tool_outputs PROPERTIES
+        ENVIRONMENT "VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
+
+    # Store modes of the command-line tools, compared with their tifxyz modes.
+    vc_add_test(NAME test_tool_store_modes)
+    if(TARGET flatboi)
+        add_dependencies(test_tool_store_modes flatboi)
+    endif()
+    add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_tifxyz2zarr_sparse vc_grow_seg_from_segments)
+    set_tests_properties(test_tool_store_modes PROPERTIES
+        ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 endif()
-add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz vc_obj2tifxyz vc_obj2tifxyz_legacy vc_merge_patch vc_merge_tifxyz vc_objrefine vc_straighten vc_tifxyz2zarr_sparse vc_grow_seg_from_segments)
-set_tests_properties(test_tool_store_modes PROPERTIES
-    ENVIRONMENT "$<$<TARGET_EXISTS:flatboi>:VC_FLATBOI_BIN=$<TARGET_FILE:flatboi>;>VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>;VC_OBJ2TIFXYZ_BIN=$<TARGET_FILE:vc_obj2tifxyz>;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>;VC_MERGE_PATCH_BIN=$<TARGET_FILE:vc_merge_patch>;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>;VC_OBJREFINE_BIN=$<TARGET_FILE:vc_objrefine>;VC_STRAIGHTEN_BIN=$<TARGET_FILE:vc_straighten>;VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>;VC_GROW_SEG_FROM_SEGMENTS_BIN=$<TARGET_FILE:vc_grow_seg_from_segments>")
 
 add_executable(bench_render_synthetic bench_render_synthetic.cpp)
 target_link_libraries(bench_render_synthetic PRIVATE vc_core)
