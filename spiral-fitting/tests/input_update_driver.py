@@ -39,6 +39,7 @@ import vc_object_store as vos  # noqa: E402
 from vc_object_store import ObjectStore  # noqa: E402
 
 import spiral_service  # noqa: E402
+from service_project import with_project  # noqa: E402
 from fit_session import resolve_dataset_root  # noqa: E402
 
 store, dataset, work = sys.argv[1:4]
@@ -152,7 +153,7 @@ def identical(a, b):
 
 try:
     state.lease().claim("acceptance", "claim")
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     status = settle("initialize")
     if status["state"] != "Idle":
         raise RuntimeError(status["error"])
@@ -259,7 +260,7 @@ try:
     failed = status["input_preparation_error"]
     step("failure after release", state=status["state"], phase=failed and failed["phase"],
          recovery_required=failed and failed["recovery_required"], error=status.get("error"))
-    state.rebuild({**REQUEST, "paths": {"checkpoint": saved}})
+    state.rebuild(with_project({**REQUEST, "paths": {"checkpoint": saved}}))
     status = settle("recovery")
     step("recovered from the checkpoint", state=status["state"],
          position=status["input_position"], digest_matches=status["input_digest"] == updated_digest,

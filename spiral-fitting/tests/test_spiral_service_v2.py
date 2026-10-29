@@ -8,6 +8,7 @@ faked; these tests exercise the service plumbing only.
 
 import argparse
 import copy
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
@@ -50,9 +51,10 @@ from lasagna_publish import (PreviewPublication, PublishedPreview,
 from fit_session import (API_VERSION, AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA, SCROLL_SPEC_OWNED_RUN_KEYS,
                          AutosaveError, SessionState, SpiralInputPaths,
-                         resolve_dataset_root, select_startup_autosave,
+                         SpiralProject, resolve_dataset_root, select_startup_autosave,
                          validate_autosave, write_autosave_metadata)
 from config import Config
+from service_project import UMBILICUS, VOLUME, project, with_project
 
 
 class FakeSession:
@@ -197,8 +199,22 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
         "paths": state.session_paths.manifest(),
         "run": {"config": Config().as_dict()},
     }
+    state._session_project = SpiralProject.from_mapping(project())
     state.session_revision += 1
     return state.session
+
+
+def _publish_request(state, request):
+    """Make ``request`` the live session request, as a build publishes it:
+    prepared, then resolved for the project's volume."""
+    paths, run, preview, scroll = state._prepare_session_request(with_project(request))
+    paths, spec = state._resolve_session_scroll(scroll, VOLUME, paths)
+    state.session_paths = paths
+    state.session_request = {
+        "paths": paths.manifest(), "run": run.manifest(),
+        "preview": preview.manifest(), "project": scroll.project.record(VOLUME),
+        "scroll": spec.manifest()}
+    state._session_project = scroll.project
 
 
 class ProgressStatusTests(unittest.TestCase):
@@ -849,7 +865,9 @@ class DatasetOwnershipTests(unittest.TestCase):
     def test_dataset_endpoint_advertises_resolution(self):
         response = self.state.dataset()
         self.assertEqual(response["root"], str(self.root))
-        self.assertIn("umbilicus", response["resolved"])
+        # The project supplies the umbilicus, not the dataset.
+        self.assertNotIn("umbilicus", response["resolved"])
+        self.assertEqual(response["scroll_spec"]["name"], "s1")
         # The startup-bound deployment roots are part of the advertisement.
         self.assertEqual(response["resolved"]["output_directory"],
                          str(self.output))
@@ -879,35 +897,32 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_initialize_rejects_client_base_input_paths(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.initialize({"paths": {"umbilicus": "/attacker/umbilicus.json"},
-                                   "run": {"z_begin": 0, "z_end": 10}})
+            self.state.initialize(with_project({"paths": {"umbilicus": "/attacker/umbilicus.json"},
+                                   "run": {"z_begin": 0, "z_end": 10}}))
         self.assertEqual(caught.exception.status, 400)
         fields = {detail["field"] for detail in caught.exception.details}
         self.assertEqual(fields, {"umbilicus"})
 
     def test_initialize_rejects_unadvertised_checkpoint(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.initialize({"paths": {"checkpoint": "/attacker/model.ckpt"},
-                                   "run": {"z_begin": 0, "z_end": 10}})
+            self.state.initialize(with_project({"paths": {"checkpoint": "/attacker/model.ckpt"},
+                                   "run": {"z_begin": 0, "z_end": 10}}))
         self.assertEqual(caught.exception.status, 400)
 
     def _attach_session_for_request(self, config=None):
         """Attach a fake session whose canonical request the service produced."""
         session = _attach_fake_session(self.state, self.output, self.root)
-        request = {"run": {"z_begin": 0, "z_end": 10,
-                           "config": {**_NO_DENSE_LOSSES, **(config or {})}}}
-        paths, run, preview, _ = self.state._prepare_session_request(request)
-        self.state.session_paths = paths
-        self.state.session_request = {
-            "paths": paths.manifest(), "run": run.manifest(),
-            "preview": preview.manifest()}
+        _publish_request(self.state, {"run": {
+            "z_begin": 0, "z_end": 10,
+            "config": {**_NO_DENSE_LOSSES, **(config or {})}}})
         return session
 
     def _stage_for(self, request):
-        paths, run, preview, _ = self.state._prepare_session_request(request)
+        paths, run, preview, scroll = self.state._prepare_session_request(
+            with_project(request))
         with self.state.lock:
             return self.state._rebuild_stage_locked(
-                paths, run, preview, SessionState.Idle)
+                paths, run, preview, scroll, SessionState.Idle)
 
     def _base_request(self, config=None, **run):
         return {"run": {"z_begin": 0, "z_end": 10,
@@ -958,37 +973,39 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.state.session_paths = live
         self.state.session_request["paths"] = live.manifest()
         run = self._base_request({"shell_num_theta_bins": 360})["run"]
-        _, run_config, preview, _ = self.state._prepare_session_request(
-            {"run": run})
+        _, run_config, preview, scroll = self.state._prepare_session_request(with_project(
+            {"run": run}))
+        # As the request validates them: the project supplies the umbilicus.
+        requested = dataclasses.replace(live, umbilicus="")
         with self.state.lock:
             self.assertEqual(
                 self.state._rebuild_stage_locked(
-                    live, run_config, preview, SessionState.Idle),
+                    requested, run_config, preview, scroll, SessionState.Idle),
                 "all")
             # Other shell loss settings still keep the loaded inputs.
-            _, other_run, _, _ = self.state._prepare_session_request(
+            _, other_run, _, _ = self.state._prepare_session_request(with_project(
                 {"run": self._base_request(
-                    {"shell_huber_delta": 8.0})["run"]})
+                    {"shell_huber_delta": 8.0})["run"]}))
             self.assertEqual(
                 self.state._rebuild_stage_locked(
-                    live, other_run, preview, SessionState.Idle),
+                    requested, other_run, preview, scroll, SessionState.Idle),
                 "model")
 
     def test_a_session_that_is_not_idle_has_nothing_to_rebuild_around(self):
         self._attach_session_for_request()
-        paths, run, preview, _ = self.state._prepare_session_request(
-            self._base_request({"model_linear_z_resolution": 24}))
+        paths, run, preview, scroll = self.state._prepare_session_request(with_project(
+            self._base_request({"model_linear_z_resolution": 24})))
         with self.state.lock:
             self.assertEqual(
                 self.state._rebuild_stage_locked(
-                    paths, run, preview, SessionState.Error),
+                    paths, run, preview, scroll, SessionState.Error),
                 "all")
 
     def test_a_model_stage_rebuild_keeps_the_session_and_its_inputs(self):
         session = self._attach_session_for_request()
         generation = self.state.session_generation
-        response = self.state.rebuild(
-            self._base_request({"model_linear_z_resolution": 24}))
+        response = self.state.rebuild(with_project(
+            self._base_request({"model_linear_z_resolution": 24})))
         self.assertEqual(response["stage"], "model")
         deadline = time.monotonic() + 5.0
         while self.state._building and time.monotonic() < deadline:
@@ -1041,7 +1058,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertNotIn("dense_spacing_mode", config)
         request = {"run": {"z_begin": 0, "z_end": 10, "config": config}}
 
-        paths, run, _, _ = self.state._prepare_session_request(request)
+        paths, run, _, _ = self.state._prepare_session_request(with_project(request))
 
         self.assertEqual(paths.winding_inference, str(winding))
         self.assertEqual(run.config, config)
@@ -1049,7 +1066,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         # Missing default-mode inputs must fail preflight, before GPU work.
         self.state.dataset_resolution.resolved["winding_inference"] = ""
         with self.assertRaises(ApiError) as caught:
-            self.state._prepare_session_request(request)
+            self.state._prepare_session_request(with_project(request))
         self.assertIn("winding_inference",
                       {detail["field"] for detail in caught.exception.details})
 
@@ -1085,10 +1102,10 @@ class DatasetOwnershipTests(unittest.TestCase):
 
         # Preflight validates against the same checkpoint-derived selection
         # config while preserving an empty override object for the runtime.
-        paths, run, _, _ = self.state._prepare_session_request({
+        paths, run, _, _ = self.state._prepare_session_request(with_project({
             "paths": {"checkpoint": str(checkpoint)},
             "run": {"z_begin": 0, "z_end": 10, "config": {}},
-        })
+        }))
         self.assertEqual(paths.winding_inference, str(winding))
         self.assertEqual(run.config, {})
         self.assertEqual((run.z_begin, run.z_end), (0, 10))
@@ -1098,10 +1115,10 @@ class DatasetOwnershipTests(unittest.TestCase):
         # explicit dock edits alone.
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            response = self.state.initialize({
+            response = self.state.initialize(with_project({
                 "paths": {"checkpoint": str(checkpoint)},
                 "run": {"z_begin": 0, "z_end": 10, "config": {}},
-            })
+            }))
             _await_build(self.state)
         attached_run = response["session_request"]["run"]
         self.assertEqual(
@@ -1129,7 +1146,7 @@ class DatasetOwnershipTests(unittest.TestCase):
             # Initialization is accepted immediately; the runtime is constructed
             # off the request thread (the fake finishes instantly, so the
             # accepted response may already report Idle rather than Loading).
-            response = self.state.initialize(request)
+            response = self.state.initialize(with_project(request))
             self.assertTrue(response["initializing"])
             self.assertIn(response["state"],
                           {SessionState.Loading, SessionState.Idle})
@@ -1146,14 +1163,25 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(attached["run"]["config"], config)
         self.assertEqual(attached["preview"],
                          {"first_winding": 12, "variant": "raw"})
+        # The project's umbilicus, written where the fit reads it, and the
+        # scroll: the project's name with the dataset's specification.
+        self.assertEqual(attached["project"]["volume"], VOLUME)
+        self.assertEqual(attached["project"]["umbilicus"]["revision"],
+                         UMBILICUS["revision"])
+        umbilicus = json.loads(Path(attached["paths"]["umbilicus"]).read_text())
+        self.assertEqual([[p["z"], p["y"], p["x"]] for p in umbilicus["control_points"]],
+                         UMBILICUS["points_zyx"])
+        self.assertEqual(attached["scroll"]["name"], "s1")
+        self.assertEqual(attached["scroll"]["voxel_size_um"], 9.6)
+        self.assertEqual(attached["scroll"]["umbilicus_coordinate_scale"], 1.0)
 
     def test_initialization_refuses_run_keys_the_scroll_spec_owns(self):
         for key, value in (("scroll_name", "renamed"), ("voxel_size_um", 4.0),
                            ("lasagna_group", "8"), ("lasagna_scale", 2)):
             with self.subTest(key=key):
                 with self.assertRaises(ApiError) as caught:
-                    self.state.initialize({"run": {"z_begin": 100, "z_end": 900,
-                                                   key: value}})
+                    self.state.initialize(with_project({"run": {"z_begin": 100, "z_end": 900,
+                                                   key: value}}))
                 self.assertEqual(caught.exception.status, 400)
                 self.assertEqual([detail["field"] for detail
                                   in caught.exception.details],
@@ -1161,10 +1189,10 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_initialization_refuses_z_range_in_advanced_config(self):
         with self.assertRaises(ApiError) as caught:
-            self.state.initialize({
+            self.state.initialize(with_project({
                 "run": {"z_begin": 100, "z_end": 900,
                         "config": {"z_begin": 200, "z_end": 800}},
-            })
+            }))
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual(
             [detail["field"] for detail in caught.exception.details],
@@ -1185,7 +1213,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         }
         with mock.patch("spiral_runtime.create_session",
                         side_effect=RuntimeError("startup failed")):
-            self.state.initialize(request)
+            self.state.initialize(with_project(request))
             status = _await_build(self.state)
         # A build that fails is Error with the cause, not a service that has
         # quietly stopped having a session.
@@ -1198,7 +1226,7 @@ class DatasetOwnershipTests(unittest.TestCase):
         # Rebuild with defaults is the documented recovery.
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            self.state.rebuild({"defaults": True})
+            self.state.rebuild(with_project({"defaults": True}))
             status = _await_build(self.state)
         self.assertEqual(status["state"], SessionState.Idle)
         self.assertIsNone(status["error"])
@@ -1482,13 +1510,9 @@ class DatasetOwnershipTests(unittest.TestCase):
         session.applied_config = dict(live)
         # A live session request carrying an advanced profile, as a client
         # that had been editing configuration would leave it.
-        paths, run, preview, _ = self.state._prepare_session_request({
+        _publish_request(self.state, {
             "run": {"z_begin": 0, "z_end": 10,
                     "config": {**_NO_DENSE_LOSSES, "model_num_flow_stages": 9}}})
-        self.state.session_paths = paths
-        self.state.session_request = {
-            "paths": paths.manifest(), "run": run.manifest(),
-            "preview": preview.manifest()}
         checkpoint = self._write_checkpoint("resume.ckpt", dict(live))
 
         rebuilds = []
@@ -1529,7 +1553,7 @@ class DatasetOwnershipTests(unittest.TestCase):
                                "model_flow_bounds_radius": 128}},
         }
         with self.assertRaises(ApiError) as caught:
-            self.state.rebuild(request)
+            self.state.rebuild(with_project(request))
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual([detail["field"] for detail in caught.exception.details],
                          ["run.config.model_flow_bounds_radius"])
@@ -1779,7 +1803,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
             return FakeSession()
 
         with mock.patch("spiral_runtime.create_session", slow_create):
-            self.state.initialize(self.state.startup_session_request())
+            self.state.initialize(with_project(self.state.startup_session_request()))
             self.assertTrue(blocked.wait(10))
             # The HTTP surface is fully responsive while CUDA and the model
             # are being built.
@@ -1793,7 +1817,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
     def test_every_read_endpoint_answers_while_the_session_is_in_error(self):
         with mock.patch("spiral_runtime.create_session",
                         side_effect=RuntimeError("no CUDA device")):
-            self.state.initialize(self.state.startup_session_request())
+            self.state.initialize(with_project(self.state.startup_session_request()))
             status = _await_build(self.state)
         self.assertEqual(status["state"], SessionState.Error)
         self.assertIn("no CUDA device", status["error"])
@@ -1808,7 +1832,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
                         namespace=self.output, dataset_root=self.dataset)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
-            self.state.initialize(self.state.startup_session_request())
+            self.state.initialize(with_project(self.state.startup_session_request()))
             _await_build(self.state)
         self.assertEqual(create.call_args.args[0].checkpoint, "")
         self.assertNotIn("autosave_selection", self.state.status())
@@ -1819,7 +1843,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
                         corrupt=True)
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()) as create:
-            self.state.initialize(self.state.startup_session_request())
+            self.state.initialize(with_project(self.state.startup_session_request()))
             status = _await_build(self.state)
         self.assertEqual(status["state"], SessionState.Idle)
         self.assertEqual(create.call_count, 1)
@@ -1831,7 +1855,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
             status, payload, _ = self.request(
                 "POST", "/session/initialize",
                 body={"command_id": "initialize-1",
-                      **self.state.startup_session_request()})
+                      **with_project(self.state.startup_session_request())})
             self.assertEqual(status, 200, payload)
             _await_build(self.state)
         status = json.loads(self.request("GET", "/session/status")[1])
@@ -1861,7 +1885,7 @@ class ExplicitInitializationTests(HttpServiceFixture):
     def test_only_a_rebuild_may_replace_the_model_domain(self):
         with mock.patch("spiral_runtime.create_session",
                         return_value=FakeSession()):
-            self.state.initialize(self.state.startup_session_request())
+            self.state.initialize(with_project(self.state.startup_session_request()))
             _await_build(self.state)
 
             # A run that changes a new-fit configuration key is refused: the
@@ -1882,8 +1906,8 @@ class ExplicitInitializationTests(HttpServiceFixture):
 
             # The same change through a rebuild is accepted; it is the one
             # path that tears the model down and builds a new domain.
-            self.state.rebuild({"run": {"z_begin": 0, "z_end": 10,
-                                        "config": configuration}})
+            self.state.rebuild(with_project({"run": {"z_begin": 0, "z_end": 10,
+                                        "config": configuration}}))
             _await_build(self.state)
         applied = self.state.status()["session_request"]["run"]["config"]
         self.assertEqual(applied["model_num_flow_stages"], 3)
@@ -2849,14 +2873,16 @@ class ServiceProcessTests(unittest.TestCase):
                 process.terminate()
                 process.wait(10)
 
-    def test_dataset_service_refuses_to_start_when_entries_are_missing(self):
+    def test_dataset_service_refuses_to_start_with_an_invalid_scroll_spec(self):
         with tempfile.TemporaryDirectory() as temporary:
             key_file = Path(temporary) / "key"
-            empty = Path(temporary) / "empty-dataset"
-            empty.mkdir()
+            invalid = Path(temporary) / "invalid-dataset"
+            invalid.mkdir()
+            # The specification is optional, but one that is there must parse.
+            (invalid / "spiral-scroll.json").write_text("{")
             output_root = Path(temporary) / "output"
             process = self._launch(["--port", "0", "--api-key-file", str(key_file),
-                                    "--dataset", str(empty),
+                                    "--dataset", str(invalid),
                                     "--object-store", self._make_store(temporary),
                                     "--output", str(output_root)], temporary)
             output, _ = process.communicate(timeout=30)

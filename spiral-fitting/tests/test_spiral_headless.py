@@ -14,8 +14,10 @@ import torch
 
 from fit_session import (AUTOSAVE_CHECKPOINT_NAME, AUTOSAVE_METADATA_NAME,
                          AUTOSAVE_METADATA_SCHEMA,
-                         ScrollSpecError, SessionState, SpiralInputPaths,
-                         load_scroll_spec, resolve_dataset_root,
+                         ScrollSpecError, SessionScroll, SessionState,
+                         SpiralInputPaths, SpiralProject,
+                         load_dataset_scroll_fields, load_scroll_spec,
+                         resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
 import spiral_runtime
 from spiral_progress import NullProgressReporter
@@ -126,23 +128,78 @@ class ScrollSpecTests(unittest.TestCase):
             self.assertEqual(spec.path_override("tracks_dbm"),
                              "/elsewhere/tracks.dbm")
 
-    def test_dataset_resolution_requires_and_honors_the_spec(self):
+    def test_dataset_resolution_takes_an_optional_spec_and_honors_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "annotations").mkdir()
-            (root / "annotations" / "umbilicus.json").write_text("{}")
-            (root / "verified_patches").mkdir()
-            missing = resolve_dataset_root(root)
-            self.assertIn("scroll_spec", missing.missing_required)
+            (root / "normals").mkdir()
+            # The project supplies the facts it knows: without a specification
+            # the dataset still resolves, stating none.
+            bare = resolve_dataset_root(root)
+            self.assertTrue(bare.ok)
+            self.assertEqual(bare.scroll_spec, {"path_overrides": {}})
+            (root / "spiral-scroll.json").write_text("{")
+            invalid = resolve_dataset_root(root)
+            self.assertIn("scroll_spec", invalid.missing_required)
             self.assertTrue(any("spiral-scroll.json" in warning
-                                for warning in missing.warnings))
-            write_scroll_spec(
-                root, paths={"umbilicus": "annotations/umbilicus.json"})
+                                for warning in invalid.warnings))
+            write_scroll_spec(root, paths={"outer_shell": "normals"})
             result = resolve_dataset_root(root)
             self.assertTrue(result.ok)
             self.assertEqual(result.scroll_spec["name"], "s1")
-            self.assertEqual(result.resolved["umbilicus"],
-                             str(root.resolve() / "annotations" / "umbilicus.json"))
+            self.assertEqual(result.resolved["outer_shell"], str(root.resolve() / "normals"))
+            # The project supplies the umbilicus, never the dataset.
+            self.assertNotIn("umbilicus", result.resolved)
+
+
+class ProjectScrollTests(unittest.TestCase):
+    UMBILICUS = {"uuid": "u", "revision": "r", "points_zyx": [[0, 1, 2], [10, 1, 2]]}
+
+    def scroll(self, spec=None, **facts):
+        with tempfile.TemporaryDirectory() as temporary:
+            if spec is not None:
+                (Path(temporary) / "spiral-scroll.json").write_text(
+                    json.dumps({"schema_version": 1, **spec}))
+            fields, source = load_dataset_scroll_fields(temporary)
+        project = SpiralProject.from_mapping({"name": "p", "volumes": {
+            "v": {**facts, "umbilicus": self.UMBILICUS}}})
+        return SessionScroll(project, fields, source)
+
+    def test_the_project_round_trips_and_rejects_malformed_blocks(self):
+        project = SpiralProject.from_mapping({"name": "p", "volumes": {
+            "v": {"voxel_size_um": 2.0, "umbilicus": self.UMBILICUS}}})
+        self.assertEqual(SpiralProject.from_mapping(project.to_mapping()), project)
+        for block, message in (
+                ({"volumes": {}}, "project.name"),
+                ({"name": "p", "volumes": []}, "keyed by volume"),
+                ({"name": "p", "volumes": {"v": {"voxel_size_um": -1}}}, "positive"),
+                ({"name": "p", "volumes": {"v": {"umbilicus": {
+                    **self.UMBILICUS, "points_zyx": [[0, 1, 2]]}}}}, "two or more")):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ScrollSpecError, message):
+                    SpiralProject.from_mapping(block)
+
+    def test_the_project_completes_a_partial_specification(self):
+        # The specification states only what the project does not know.
+        scroll = self.scroll({"spiral_outward_sense": "ACW", "lasagna_scale": 2},
+                             voxel_size_um=3.0).resolve("v")
+        self.assertEqual((scroll.name, scroll.voxel_size_um, scroll.spiral_outward_sense,
+                          scroll.lasagna_scale, scroll.umbilicus_coordinate_scale),
+                         ("p", 3.0, "ACW", 2, 1.0))
+        # Agreeing statements are fine; differing ones are refused.
+        self.scroll({"voxel_size_um": 3.0, "spiral_outward_sense": "CW"},
+                    voxel_size_um=3.0).resolve("v")
+        with self.assertRaisesRegex(ScrollSpecError, "states voxel_size_um"):
+            self.scroll({"voxel_size_um": 4.0, "spiral_outward_sense": "CW"},
+                        voxel_size_um=3.0).resolve("v")
+        # The project's catalog orientation decides the sense, against an
+        # explicit one too.
+        with self.assertRaisesRegex(ScrollSpecError, "contradicts the catalog"):
+            self.scroll({"spiral_outward_sense": "CW"}, voxel_size_um=3.0,
+                        z_direction_is_top_to_bottom=True,
+                        left_handed_coordinates=False).resolve("v")
+        # What neither knows is missing.
+        with self.assertRaisesRegex(ScrollSpecError, "spiral_outward_sense"):
+            self.scroll(voxel_size_um=3.0).resolve("v")
 
 
 class DatasetResolverTests(unittest.TestCase):

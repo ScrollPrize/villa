@@ -103,7 +103,10 @@ and [Apple file cloning support](https://developer.apple.com/documentation/found
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
-This is not covered by scrollprize.org/tutorial_spiral. Required keys:
+This is not covered by scrollprize.org/tutorial_spiral. (A service session
+takes these facts from the VC3D project instead, so there the file is
+optional; see [The VC3D project's inputs](#the-vc3d-projects-inputs).)
+Required keys:
 
 - `schema_version` — must equal `1`.
 - `name`, `voxel_size_um` — required, no validation beyond presence.
@@ -539,15 +542,51 @@ authenticated HTTP protocol:
   tunnels are ever required.
 
 In every mode the service — not the client — owns the inputs: it is launched
-with `--dataset` (umbilicus, scroll specification, tracks, Lasagna volumes and
-the outer shell), `--object-store` (patches, point collections, fibers and
-their links; see [Object-store inputs](#object-store-inputs)) and `--output`
-(all generated state), resolves them once at startup, and advertises the
-result through `/dataset`. `--output` must resolve outside the dataset root;
+with `--dataset` (tracks, Lasagna volumes, fiber directions, winding inference,
+the outer shell and an optional scroll specification), `--object-store`
+(patches, point collections, fibers and their links; see
+[Object-store inputs](#object-store-inputs)) and `--output` (all generated
+state), resolves them once at startup, and advertises the result through
+`/dataset`. The scroll's facts and the umbilicus come from the client's
+project with each session request (below). `--output` must resolve outside the dataset root;
 the optional `--cache` (derived host caches) defaults to the documented user
 cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
 run parameters but cannot repoint the session at other host paths or another
 object store.
+
+### The VC3D project's inputs
+
+A service session fits the VC3D project that asks for it. The project file
+is VC3D's and need not be readable on the service's host, so every initialize
+and rebuild carries a `project` block (`fit_session.SpiralProject`): the
+project's name and, for each store volume its volumes' annotations are kept in
+(a catalog volume once, whatever its working level), the facts the project
+knows exactly (`voxel_size_um`; a catalog volume's
+`z_direction_is_top_to_bottom`, `left_handed_coordinates` and full-resolution
+`base_shape_zyx`) and the volume's umbilicus from the project's umbilicus
+store (`uuid`, `revision`, `points_zyx` in the volume's own voxels).
+
+Once the build has linked and pinned its inputs it knows the fit volume they
+name (a checkpoint resume: the one its inputs were read in), and fits that
+project volume:
+
+- **Scroll.** The project's facts, completed by the dataset's
+  `spiral-scroll.json` where the project does not know one (a non-catalog
+  volume's orientation, say); a file stating a fact differently is refused,
+  not overruled. The name is the project's. The file's Lasagna layout
+  (`normal_zarr_group`, `lasagna_scale`), path overrides and `num_windings`
+  apply as before.
+- **Umbilicus.** The project's, written under the output directory
+  (`project-inputs/umbilicus-<revision>.json`) as the file the fit reads, at
+  coordinate scale 1. The dataset's `umbilicus.json` is not read.
+
+A fit volume that is not a project volume, or has no umbilicus, fails the
+preparation and leaves any resident fit as it was. The session's
+`session_request` records `project` (name, volume, its facts, the umbilicus's
+identity) and the resolved `scroll`. A rebuild after the project's volume
+changed (another umbilicus revision, a renamed project) rereads everything.
+The command-line fit is unchanged: it reads `spiral-scroll.json` and the
+dataset's `umbilicus.json`.
 
 ### Object store, positions and input updates
 

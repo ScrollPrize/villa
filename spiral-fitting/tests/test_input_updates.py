@@ -20,6 +20,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import spiral_runtime  # noqa: E402
 from object_store_fixture import put_patch  # noqa: E402
+from service_project import with_project  # noqa: E402
 from test_runtime_object_store import (  # noqa: E402,F401
     RUN, cpu, device_stubs, settle, stub_device_stages, write_dataset)
 from test_object_store_startup import store_path  # noqa: E402,F401
@@ -46,7 +47,7 @@ def _add_patch(path, y=120.0, name='added'):
 
 def test_an_update_replaces_the_inputs_and_keeps_the_iteration(state, hub, device_stubs,
                                                                 no_theta_topology):
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     before = settle(state)
     session = state.session
     patches = session._context.num_verified_patches
@@ -71,7 +72,7 @@ def test_the_old_device_state_is_released_before_the_new_is_built(state, hub, de
                                                                    no_theta_topology, monkeypatch):
     import weakref
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     session = state.session
     context = session._context
@@ -95,7 +96,7 @@ def test_the_old_device_state_is_released_before_the_new_is_built(state, hub, de
 def test_a_refused_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
                                          monkeypatch):
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     before = settle(state)
     session = state.session
     inputs = session._context.object_store_inputs
@@ -116,7 +117,7 @@ def test_a_refused_update_leaves_the_fit(state, hub, device_stubs, no_theta_topo
 def test_a_failure_after_release_fails_the_session(state, hub, device_stubs, no_theta_topology,
                                                    monkeypatch):
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     session = state.session
     position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
@@ -136,7 +137,7 @@ def test_an_update_of_a_busy_session_is_refused_without_a_command(state, hub, de
                                                                     no_theta_topology):
     # A run admitted first: the update refuses before admission, and queues
     # no discard (a stray command would break the running step's barrier).
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     session = state.session
     position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
@@ -273,7 +274,7 @@ def _rank_update(rank, world_size, rendezvous, root, store, config, position, re
 
 def test_two_ranks_install_the_same_inputs(state, hub, device_stubs, tmp_path):
     import torch.multiprocessing as mp
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     first = settle(state)['input_position']['sequence']
     position = _pinned_at_new_position(state, hub, _add_patch(hub['editor']))
     # Each rank builds at the session's first position (read as pinned: the
@@ -308,7 +309,7 @@ def _settled_update(state, timeout=60):
 def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_stubs,
                                                              no_theta_topology):
     import spiral_service
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     before = settle(state)
     assert state.dataset()['capabilities']['input_updates'] is True
     assert state.dataset()['capabilities']['inputs_frozen'] is False
@@ -333,8 +334,8 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     assert position['sequence'] >= reached and position['input_generation'] == 1
     assert status['input_preparation_error'] is None
     # A model-only rebuild afterwards keeps the updated position.
-    response = state.rebuild({'run': {**REQUEST['run'], 'config': {
-        **REQUEST['run']['config'], 'model_num_flow_stages': 3}}})
+    response = state.rebuild(with_project({'run': {**REQUEST['run'], 'config': {
+        **REQUEST['run']['config'], 'model_num_flow_stages': 3}}}))
     assert response['stage'] == 'model'
     rebuilt = settle(state)
     assert rebuilt['input_position']['sequence'] == position['sequence']
@@ -343,15 +344,16 @@ def test_the_service_updates_the_resident_fit_at_a_position(state, hub, device_s
     # A model-only rebuild resumes from the session's checkpoint, whose inputs
     # the update replaced: a session that names one rebuilds in full.
     import dataclasses
-    paths, run, preview, _ = state._prepare_session_request({'run': {
-        **REQUEST['run'], 'config': {**REQUEST['run']['config'], 'model_num_flow_stages': 3}}})
+    paths, run, preview, scroll = state._prepare_session_request(with_project({'run': {
+        **REQUEST['run'], 'config': {**REQUEST['run']['config'], 'model_num_flow_stages': 3}}}))
     with state.lock:
         live_request = state.session_request
-        assert state._rebuild_stage_locked(paths, run, preview, 'Idle') == 'model'
+        assert state._rebuild_stage_locked(paths, run, preview, scroll, 'Idle') == 'model'
         resumed = dataclasses.replace(paths, checkpoint='before-update.ckpt')
         state.session_request = {**live_request, 'paths': resumed.manifest()}
         try:
-            assert state._rebuild_stage_locked(resumed, run, preview, 'Idle') == 'all'
+            assert state._rebuild_stage_locked(resumed, run, preview, scroll,
+                                               'Idle') == 'all'
         finally:
             state.session_request = live_request
 
@@ -361,7 +363,7 @@ def test_an_update_with_identical_inputs_republishes_the_manifest(state, hub, de
     # A commit the adapter does not read moves the position, not the digest:
     # the published manifest must still name the fitted position.
     from test_service_hub_positions import _edit, _names
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     before = settle(state)
 
     def published():
@@ -389,7 +391,7 @@ def test_an_update_with_identical_inputs_republishes_the_manifest(state, hub, de
 def test_a_refused_service_update_leaves_the_fit(state, hub, device_stubs, no_theta_topology,
                                                  monkeypatch):
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     before = settle(state)
 
     def refuse(self, inputs):
@@ -417,7 +419,7 @@ def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_s
                                                             no_theta_topology, monkeypatch):
     import threading
     import spiral_service
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     linking, release = threading.Event(), threading.Event()
     prepare = state._prepare_position
@@ -431,7 +433,7 @@ def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_s
     assert linking.wait(30)
     try:
         for verb in (lambda: state.run({'iterations': 1}),
-                     lambda: state.rebuild({'inputs': 'reload'}),
+                     lambda: state.rebuild(with_project({'inputs': 'reload'})),
                      lambda: state.load_checkpoint({'path': 'absent.ckpt'})):
             with pytest.raises(spiral_service.ApiError, match='input update in progress') as busy:
                 verb()
@@ -455,7 +457,7 @@ def test_a_shared_plain_store_updates_in_place(store_path, tmp_path, device_stub
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
         assert state.dataset()['capabilities']['input_updates'] is True
-        state.initialize(REQUEST)
+        state.initialize(with_project(REQUEST))
         before = settle(state)
         identity = state.object_store.positions
         assert before['input_position']['hub'] == identity

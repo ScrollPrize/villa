@@ -1288,6 +1288,46 @@ store (no `--object-store-hub`) now shares it in place:
 Limits: the store must be on a local disk (WAL); detector transactions and
 VC3D saves serialize on SQLite's writer lock (5 s busy timeout).
 
+### The VC3D project's inputs (2026-10-29)
+
+A service binds to the VC3D project that uses it; the command-line fit keeps
+its ad-hoc dataset paths. The project file is not readable on the service's
+host, so VC3D sends what the fit reads of it with every initialize and
+rebuild (API 40, `fit_session.SpiralProject`): the project's name and, per
+store volume of its volumes (`vc::project::annotationVolume`), the facts it
+knows exactly (voxel size; a catalog volume's orientation and
+full-resolution shape) and that volume's umbilicus from the project's
+umbilicus store.
+
+- Moved to the project: the scroll's physical facts and the umbilicus. The
+  build picks the project volume its inputs name: after preparing a
+  position (`object_store_inputs.fit_volume_at`, read_snapshot's inference
+  at the pinned position) or from a checkpoint's recorded inputs. The
+  resolved `ScrollSpec` (`SessionScroll.resolve`) takes the project's facts
+  and the dataset's `spiral-scroll.json` for the rest; a file stating one
+  differently is refused, never overruled. The umbilicus is written under
+  the output directory as the control-point JSON the fit already reads, at
+  coordinate scale 1, so the fit and its checkpoints are unchanged.
+- Kept in the dataset for now: the packed Lasagna normals and gradient
+  magnitude (their sidecars and `normal_zarr_group`/`lasagna_scale`), fiber
+  directions, winding inference, the outer shell and tracks.
+  `spiral-scroll.json` is optional in a service dataset and states only what
+  the project does not know.
+- Not pinned: the fit volume is inferred by the fit as by the CLI (pinning
+  it in the configuration changed the manifest's `volume_source`, so the CLI
+  and the service no longer froze the same digest); an input update that
+  would read another volume is refused as before
+  (`InputReplacementRefused`).
+- Rebuilds: a request whose project differs for the session's volume
+  (another umbilicus revision, a renamed project) rebuilds everything; a
+  model-only rebuild keeps the session's umbilicus file. Recovery onto a
+  checkpoint resends the session's project.
+
+Later: the packed Lasagna inputs from the project's selected Lasagna
+dataset, fiber directions from its fiber-inference dataset, the outer shell
+as a store surface (patch selection must then skip it) and tracks through the
+adapter (the CLI plan's deferred track migration).
+
 ## Implementation and validation workflow
 
 Keep service and VC3D changes in reviewable patches, with their protocol changes

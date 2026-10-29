@@ -20,6 +20,8 @@ from config import Config  # noqa: E402
 from fit_session import (SessionState, SpiralInputPaths,  # noqa: E402
                          SpiralRunConfig, resolve_dataset_root)
 from service_http import ApiError  # noqa: E402
+from service_project import UMBILICUS, project, with_project  # noqa: E402
+from object_store_fixture import VOLUME  # noqa: E402
 from test_object_store_startup import store_path  # noqa: E402,F401
 
 # The dataset has no Lasagna stores or shell, so runs turn off the losses
@@ -41,7 +43,6 @@ def dataset(tmp_path):
     (root / 'spiral-scroll.json').write_text(json.dumps({
         'schema_version': 1, 'name': 's1', 'voxel_size_um': 9.6,
         'spiral_outward_sense': 'CW'}))
-    (root / 'umbilicus.json').write_text('{}')
     output = tmp_path / 'output'
     output.mkdir()
     resolution = spiral_service.bind_service_paths(
@@ -125,9 +126,9 @@ def test_session_requests_refuse_client_bindings_and_receive_the_service_one(
     state = service(dataset, store)
     for key in spiral_service.SERVICE_OWNED_CONFIG_KEYS:
         with pytest.raises(ApiError) as raised:
-            state._prepare_session_request(
+            state._prepare_session_request(with_project(
                 {'run': {'z_begin': 0, 'z_end': 10,
-                         'config': {**NO_DENSE, key: 'chosen'}}})
+                         'config': {**NO_DENSE, key: 'chosen'}}}))
         assert raised.value.status == 400
         assert raised.value.details == [{
             'field': f'run.config.{key}',
@@ -138,7 +139,7 @@ def test_session_requests_refuse_client_bindings_and_receive_the_service_one(
               'object_store_author': 'spiral-test'}
     for request in (state.startup_session_request(),
                     {'run': {'z_begin': 0, 'z_end': 10, 'config': echoed}}):
-        _, run, _, _ = state._prepare_session_request(request)
+        _, run, _, _ = state._prepare_session_request(with_project(request))
         assert run.config['object_store_path'] == state.object_store.path
         assert run.config['object_store_author'] == 'spiral-test'
 
@@ -168,7 +169,7 @@ def test_the_binding_wins_over_a_resumed_checkpoints_store(dataset, store,
     state = service(dataset, store)
     checkpoint = dataset.output / 'resume.ckpt'
     checkpoint.write_bytes(b'PK\x03\x04')
-    _, run, _, _ = state._prepare_session_request(state.startup_session_request())
+    _, run, _, _ = state._prepare_session_request(with_project(state.startup_session_request()))
     # The checkpoint's model-shaping keys are untouched: the binding is no
     # contradiction to refuse.
     state._reject_overrides_the_checkpoint_contradicts(str(checkpoint), run.config)
@@ -268,7 +269,7 @@ def http(dataset, store, monkeypatch):
 
 
 def initialize_body():
-    return {'run': {'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)}}
+    return with_project({'run': {'z_begin': 0, 'z_end': 10, 'config': dict(NO_DENSE)}})
 
 
 def test_one_client_holds_the_lease_and_gates_mutations(http):
@@ -484,7 +485,7 @@ def test_discovery_follows_store_changes_and_reports_refusals(dataset, filled_st
 def test_validation_requires_no_patch_fiber_or_pcl_files(dataset, store):
     state = service(dataset, store)
     assert not (dataset.root / 'verified_patches').exists()
-    paths, run, _, _ = state._prepare_session_request(state.startup_session_request())
+    paths, run, _, _ = state._prepare_session_request(with_project(state.startup_session_request()))
     assert not {'verified_patches', 'fibers', 'pcls'} & set(paths.manifest())
 
 
@@ -527,3 +528,90 @@ sys.exit(spiral_service.main(sys.argv[1:]))
         text=True, timeout=120, env=dict(os.environ))
     line = next(line for line in result.stderr.splitlines() if line.startswith('RESULT'))
     assert json.loads(line[len('RESULT '):]) == {'torch': False, 'ok': True}
+
+
+# ---------------------------------------------------------------------------
+# The VC3D project's inputs
+# ---------------------------------------------------------------------------
+
+def _built(state, request, timeout=60):
+    """Initialize with ``request``, capturing what the build is given
+    instead of building: ``(paths, scroll)``, or the preparation error."""
+    import time
+    built = []
+    state._build = lambda session_id, previous, paths, run, preview, scroll: (
+        built.append((paths, scroll)))
+    state.initialize(request)
+    deadline = time.monotonic() + timeout
+    while state._building and not built:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    return built[0] if built else state.status()['input_preparation_error']
+
+
+def test_a_request_must_carry_its_project(dataset, store):
+    state = service(dataset, store)
+    with pytest.raises(ApiError) as refused:
+        state.initialize(initialize_body() | {'project': None})
+    assert refused.value.status == 400
+    assert [detail['field'] for detail in refused.value.details] == ['project']
+
+
+def test_the_build_reads_the_project_of_its_fit_volume(dataset, store):
+    state = service(dataset, store)
+    paths, scroll = _built(state, initialize_body())
+    # The fit volume the store's inputs name selects the project's volume:
+    # its umbilicus, written where the fit reads it, and the scroll.
+    from umbilicus import json_umbilicus_z_to_yx
+    assert Path(paths.umbilicus).parent == dataset.output / 'project-inputs'
+    assert json_umbilicus_z_to_yx(paths.umbilicus)(32.0).tolist() == [32.0, 32.0]
+    assert scroll.name == 's1' and scroll.voxel_size_um == 9.6
+    request = state.session_request
+    assert request['project'] == {
+        'name': 's1', 'volume': VOLUME,
+        'umbilicus': {'uuid': UMBILICUS['uuid'], 'revision': UMBILICUS['revision'],
+                      'points': 2}}
+    assert request['scroll']['umbilicus_coordinate_scale'] == 1.0
+
+
+def test_project_facts_complete_the_dataset_and_may_not_contradict_it(dataset, store):
+    # Without a specification the project's facts make the scroll: the
+    # catalog orientation gives the outward sense.
+    (dataset.root / 'spiral-scroll.json').unlink()
+    facts = {'voxel_size_um': 7.91, 'base_shape_zyx': [100, 64, 64],
+             'z_direction_is_top_to_bottom': True, 'left_handed_coordinates': False}
+    _, scroll = _built(service(dataset, store),
+                       initialize_body() | {'project': project(name='PHerc', **facts)})
+    assert (scroll.name, scroll.voxel_size_um, scroll.base_shape_zyx,
+            scroll.spiral_outward_sense) == ('PHerc', 7.91, (100, 64, 64), 'ACW')
+    # A specification stating a fact differently is refused, not overruled.
+    (dataset.root / 'spiral-scroll.json').write_text(json.dumps({
+        'schema_version': 1, 'voxel_size_um': 9.6}))
+    failure = _built(service(dataset, store),
+                     initialize_body() | {'project': project(**facts)})
+    assert 'states voxel_size_um 9.6' in failure['message']
+
+
+def test_the_fit_volume_must_be_a_project_volume_with_an_umbilicus(dataset, store):
+    failure = _built(service(dataset, store),
+                     initialize_body() | {'project': project(volume='other-volume')})
+    assert f'the fit volume {VOLUME} is not a volume of the project' in failure['message']
+    failure = _built(service(dataset, store),
+                     initialize_body() | {'project': project(umbilicus=None)})
+    assert 'has no umbilicus for the fit volume' in failure['message']
+
+
+def test_a_changed_project_volume_rebuilds_everything(dataset, store):
+    state = service(dataset, store)
+    _built(state, initialize_body())
+    state.session = SimpleNamespace(status=lambda: {'state': SessionState.Idle,
+                                                    'input_generation': 0})
+    changed = {**UMBILICUS, 'revision': 'b8e6d4f1-2c3d-4e5f-9a01-1b2c3d4e5f60'}
+    for request, stage in ((initialize_body(), 'model'),
+                           (initialize_body() | {'project': project(umbilicus=changed)}, 'all'),
+                           (initialize_body() | {'project': project(name='renamed')}, 'all')):
+        request['run']['config']['model_num_flow_stages'] = 3
+        paths, run, preview, scroll = state._prepare_session_request(request)
+        with state.lock:
+            assert state._rebuild_stage_locked(paths, run, preview, scroll,
+                                               SessionState.Idle) == stage

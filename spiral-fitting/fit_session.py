@@ -12,6 +12,7 @@ import datetime
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -157,7 +158,16 @@ from surface_orientation import spiral_outward_sense_for
 # input_positions and input_updates, and initialize, full-input rebuilds and
 # update-inputs link and pin positions of the store as for a hub. Positions'
 # "hub" names their owner (a hub, or the store).
-API_VERSION = 39
+# 40: the client's project. Every session request (initialize, rebuild,
+# including a defaults rebuild) carries "project": {"name", "volumes": {store
+# volume: {voxel_size_um, base_shape_zyx, z_direction_is_top_to_bottom,
+# left_handed_coordinates, umbilicus: {uuid, revision, points_zyx}}}}, each
+# fact only where the project knows it. The build fits the volume its inputs
+# name with that volume's umbilicus and facts; spiral-scroll.json becomes
+# optional, may state only what the project does not know, and must not
+# contradict it. /dataset no longer resolves an umbilicus; session_request
+# gains "project" (name, volume, facts, umbilicus identity) and "scroll".
+API_VERSION = 40
 
 
 class SessionState(str, Enum):
@@ -469,9 +479,10 @@ class SpiralDatasetResolution:
     ambiguities: dict[str, list[str]] = field(default_factory=dict)
     detected_checkpoints: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    # Parsed spiral-scroll.json manifest (see ScrollSpec.manifest()); None when
-    # the specification is missing or invalid, which is a missing_required
-    # condition ("scroll_spec").
+    # The fields spiral-scroll.json states (load_dataset_scroll_fields; path
+    # overrides as a mapping), {} without one; None when it is invalid, which
+    # is a missing_required condition ("scroll_spec"). The session's scroll
+    # completes them with the project's facts (SessionScroll).
     scroll_spec: dict[str, Any] | None = None
 
     @property
@@ -553,9 +564,35 @@ class ScrollSpec:
         return result
 
 
-def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
-                      *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
-    """Validate known spiral-scroll.json fields and freeze them.
+def _checked_voxel_size(value: Any, source: str) -> float:
+    try:
+        voxel_size_um = float(value)
+    except (TypeError, ValueError):
+        raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
+    if not voxel_size_um > 0:
+        raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
+    return voxel_size_um
+
+
+def _checked_base_shape(value: Any, source: str) -> tuple[int, int, int]:
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(type(item) is not int or item <= 0 for item in value)):
+        raise ScrollSpecError(
+            f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
+    return tuple(value)
+
+
+def _checked_flag(value: Any, key: str, source: str) -> bool:
+    if type(value) is not bool:
+        raise ScrollSpecError(f"{source}: {key} must be true or false")
+    return value
+
+
+def _scroll_spec_fields(document: Any, dataset_root: str | os.PathLike[str],
+                        source: str) -> dict[str, Any]:
+    """The ScrollSpec fields a spiral-scroll.json states, validated but none
+    required (``_scroll_spec_from_fields`` requires them): what a project's
+    facts complete in a service session (``SessionScroll``).
 
     Unknown top-level keys are ignored for forward compatibility,
     schema_version is required, and path overrides are resolved relative to
@@ -569,52 +606,20 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         raise ScrollSpecError(
             f"{source}: unsupported schema_version {document['schema_version']!r} "
             f"(this build supports {SCROLL_SPEC_SCHEMA_VERSION})")
-    catalog = {}
+    fields: dict[str, Any] = {}
     for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
-        value = document.get(key)
-        if value is not None and type(value) is not bool:
-            raise ScrollSpecError(f"{source}: {key} must be true or false")
-        catalog[key] = value
-    catalog_sense = (
-        spiral_outward_sense_for(**catalog)
-        if None not in catalog.values() else None)
-    required = ["name", "voxel_size_um"]
-    if catalog_sense is None:
-        required.append("spiral_outward_sense")
-    missing = sorted(key for key in required if key not in document)
-    if missing:
-        raise ScrollSpecError(f"{source}: missing required keys: {missing}")
-
-    name = str(document["name"]).strip()
-    if not name:
-        raise ScrollSpecError(f"{source}: name must be a non-empty string")
-    try:
-        voxel_size_um = float(document["voxel_size_um"])
-    except (TypeError, ValueError):
-        raise ScrollSpecError(f"{source}: voxel_size_um must be a number") from None
-    if not voxel_size_um > 0:
-        raise ScrollSpecError(f"{source}: voxel_size_um must be positive")
-    base_shape_raw = document.get("base_shape_zyx")
-    base_shape_zyx = None
-    if base_shape_raw is not None:
-        if (not isinstance(base_shape_raw, (list, tuple))
-                or len(base_shape_raw) != 3
-                or any(type(value) is not int or value <= 0
-                       for value in base_shape_raw)):
-            raise ScrollSpecError(
-                f"{source}: base_shape_zyx must be a ZYX list of three positive integers")
-        base_shape_zyx = tuple(base_shape_raw)
-    sense = str(document.get("spiral_outward_sense", catalog_sense)).upper()
-    if sense not in ("CW", "ACW"):
-        raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
-    if catalog_sense is not None and sense != catalog_sense:
-        raise ScrollSpecError(
-            f"{source}: spiral_outward_sense {sense} contradicts the catalog "
-            f"properties (z_direction_is_top_to_bottom="
-            f"{str(catalog['z_direction_is_top_to_bottom']).lower()}, "
-            f"left_handed_coordinates="
-            f"{str(catalog['left_handed_coordinates']).lower()} give "
-            f"{catalog_sense})")
+        if document.get(key) is not None:
+            fields[key] = _checked_flag(document[key], key, source)
+    if "name" in document:
+        fields["name"] = str(document["name"]).strip()
+        if not fields["name"]:
+            raise ScrollSpecError(f"{source}: name must be a non-empty string")
+    if "voxel_size_um" in document:
+        fields["voxel_size_um"] = _checked_voxel_size(document["voxel_size_um"], source)
+    if document.get("base_shape_zyx") is not None:
+        fields["base_shape_zyx"] = _checked_base_shape(document["base_shape_zyx"], source)
+    if "spiral_outward_sense" in document:
+        fields["spiral_outward_sense"] = str(document["spiral_outward_sense"]).upper()
 
     umbilicus = document.get("umbilicus", {})
     if not isinstance(umbilicus, Mapping):
@@ -622,19 +627,26 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
     unknown = sorted(set(umbilicus) - {"coordinate_scale"})
     if unknown:
         raise ScrollSpecError(f"{source}: unknown umbilicus keys: {unknown}")
-    try:
-        coordinate_scale = float(umbilicus.get("coordinate_scale", 1.0))
-    except (TypeError, ValueError):
-        raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
+    if "coordinate_scale" in umbilicus:
+        try:
+            fields["umbilicus_coordinate_scale"] = float(umbilicus["coordinate_scale"])
+        except (TypeError, ValueError):
+            raise ScrollSpecError(f"{source}: umbilicus coordinate_scale must be a number") from None
 
-    lasagna_scale = document.get("lasagna_scale", 4)
-    if type(lasagna_scale) is not int or lasagna_scale <= 0:
-        raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
+    if "normal_zarr_group" in document:
+        fields["normal_zarr_group"] = str(document["normal_zarr_group"])
+    if "lasagna_scale" in document:
+        lasagna_scale = document["lasagna_scale"]
+        if type(lasagna_scale) is not int or lasagna_scale <= 0:
+            raise ScrollSpecError(f"{source}: lasagna_scale must be a positive integer")
+        fields["lasagna_scale"] = lasagna_scale
 
     num_windings = document.get("num_windings")
     # Same floor as shell_outer_winding_idx, which this value becomes.
-    if num_windings is not None and (type(num_windings) is not int or num_windings < 2):
-        raise ScrollSpecError(f"{source}: num_windings must be an integer >= 2")
+    if num_windings is not None:
+        if type(num_windings) is not int or num_windings < 2:
+            raise ScrollSpecError(f"{source}: num_windings must be an integer >= 2")
+        fields["num_windings"] = num_windings
 
     paths = document.get("paths", {})
     if not isinstance(paths, Mapping):
@@ -653,20 +665,66 @@ def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
         if not isinstance(value, str) or not value.strip():
             raise ScrollSpecError(f"{source}: path override {key!r} must be a non-empty string")
         overrides.append((key, _normalise_path(value, base=root)))
+    if overrides:
+        fields["path_overrides"] = tuple(overrides)
+    return fields
 
+
+def _scroll_spec_from_fields(fields: Mapping[str, Any], source: str) -> ScrollSpec:
+    """Require the physical facts in ``fields`` and freeze them: the outward
+    sense is the catalog properties' when both are known (an explicit one must
+    agree), else it must be given."""
+    catalog = {key: fields.get(key)
+               for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates")}
+    catalog_sense = (
+        spiral_outward_sense_for(**catalog)
+        if None not in catalog.values() else None)
+    required = ["name", "voxel_size_um"]
+    if catalog_sense is None:
+        required.append("spiral_outward_sense")
+    missing = sorted(key for key in required if key not in fields)
+    if missing:
+        raise ScrollSpecError(f"{source}: missing required keys: {missing}")
+    sense = fields.get("spiral_outward_sense", catalog_sense)
+    if sense not in ("CW", "ACW"):
+        raise ScrollSpecError(f"{source}: spiral_outward_sense must be CW or ACW")
+    if catalog_sense is not None and sense != catalog_sense:
+        raise ScrollSpecError(
+            f"{source}: spiral_outward_sense {sense} contradicts the catalog "
+            f"properties (z_direction_is_top_to_bottom="
+            f"{str(catalog['z_direction_is_top_to_bottom']).lower()}, "
+            f"left_handed_coordinates="
+            f"{str(catalog['left_handed_coordinates']).lower()} give "
+            f"{catalog_sense})")
     return ScrollSpec(
-        name=name,
-        voxel_size_um=voxel_size_um,
+        name=fields["name"],
+        voxel_size_um=fields["voxel_size_um"],
         spiral_outward_sense=sense,
         z_direction_is_top_to_bottom=catalog["z_direction_is_top_to_bottom"],
         left_handed_coordinates=catalog["left_handed_coordinates"],
-        base_shape_zyx=base_shape_zyx,
-        umbilicus_coordinate_scale=coordinate_scale,
-        normal_zarr_group=str(document.get("normal_zarr_group", "4")),
-        lasagna_scale=lasagna_scale,
-        num_windings=num_windings,
-        path_overrides=tuple(overrides),
+        base_shape_zyx=fields.get("base_shape_zyx"),
+        umbilicus_coordinate_scale=fields.get("umbilicus_coordinate_scale", 1.0),
+        normal_zarr_group=fields.get("normal_zarr_group", "4"),
+        lasagna_scale=fields.get("lasagna_scale", 4),
+        num_windings=fields.get("num_windings"),
+        path_overrides=fields.get("path_overrides", ()),
     )
+
+
+def parse_scroll_spec(document: Any, dataset_root: str | os.PathLike[str],
+                      *, source: str = SCROLL_SPEC_FILENAME) -> ScrollSpec:
+    """Validate known spiral-scroll.json fields and freeze them; the file
+    must state every physical fact (``_scroll_spec_from_fields``)."""
+    return _scroll_spec_from_fields(
+        _scroll_spec_fields(document, dataset_root, source), source)
+
+
+def _read_scroll_spec_document(path: Path) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ScrollSpecError(f"{path}: invalid scroll specification: {exc}") from exc
 
 
 def load_scroll_spec(dataset_root: str | os.PathLike[str],
@@ -693,14 +751,239 @@ def load_scroll_spec(dataset_root: str | os.PathLike[str],
             "either the volume's catalog properties z_direction_is_top_to_bottom "
             "and left_handed_coordinates or spiral_outward_sense (plus any "
             "non-conventional path overrides).")
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            document = json.load(stream)
-    except (OSError, ValueError) as exc:
-        raise ScrollSpecError(f"{path}: invalid scroll specification: {exc}") from exc
-    return parse_scroll_spec(document, root if root is not None else path.parent,
+    return parse_scroll_spec(_read_scroll_spec_document(path),
+                             root if root is not None else path.parent,
                              source=str(path))
 
+
+def load_dataset_scroll_fields(dataset_root: str | os.PathLike[str]) -> tuple[dict[str, Any], str]:
+    """A service dataset's spiral-scroll.json fields and the file, or ``({},
+    "")`` when it has none: in a service session the project supplies the
+    physical facts it can (``SessionScroll``), so the file is optional and may
+    state only the rest. An invalid file raises ScrollSpecError."""
+    root = Path(_normalise_path(dataset_root))
+    path = root / SCROLL_SPEC_FILENAME
+    if not path.is_file():
+        return {}, ""
+    return _scroll_spec_fields(_read_scroll_spec_document(path), root, str(path)), str(path)
+
+
+# ---------------------------------------------------------------------------
+# The VC3D project a service session fits (the request's "project" block)
+# ---------------------------------------------------------------------------
+
+# Physical scroll facts a project volume may state, by ScrollSpec field. VC3D
+# sends each only when it knows it exactly (a catalog volume's orientation and
+# full-resolution shape, say).
+PROJECT_VOLUME_FACTS = ("voxel_size_um", "base_shape_zyx",
+                        "z_direction_is_top_to_bottom", "left_handed_coordinates")
+# Fit inputs a service session reads from the project instead of the dataset.
+PROJECT_INPUT_KEYS = ("umbilicus",)
+
+
+@dataclass(frozen=True)
+class ProjectUmbilicus:
+    """A volume's umbilicus in the project's umbilicus store: its object, the
+    revision VC3D read and its points in the volume's own voxels (ZYX)."""
+
+    uuid: str
+    revision: str
+    points_zyx: tuple[tuple[float, float, float], ...]
+
+    def manifest(self) -> dict[str, Any]:
+        return {"uuid": self.uuid, "revision": self.revision,
+                "points": len(self.points_zyx)}
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {"uuid": self.uuid, "revision": self.revision,
+                "points_zyx": [list(point) for point in self.points_zyx]}
+
+
+@dataclass(frozen=True)
+class ProjectVolume:
+    """What the project knows of one volume; None where it does not know it
+    exactly."""
+
+    voxel_size_um: float | None = None
+    base_shape_zyx: tuple[int, int, int] | None = None
+    z_direction_is_top_to_bottom: bool | None = None
+    left_handed_coordinates: bool | None = None
+    umbilicus: ProjectUmbilicus | None = None
+
+    def manifest(self) -> dict[str, Any]:
+        result = {key: getattr(self, key) for key in PROJECT_VOLUME_FACTS
+                  if getattr(self, key) is not None}
+        if self.umbilicus is not None:
+            result["umbilicus"] = self.umbilicus.manifest()
+        return result
+
+    def to_mapping(self) -> dict[str, Any]:
+        result = {key: getattr(self, key) for key in PROJECT_VOLUME_FACTS
+                  if getattr(self, key) is not None}
+        if self.umbilicus is not None:
+            result["umbilicus"] = self.umbilicus.to_mapping()
+        return result
+
+
+@dataclass(frozen=True)
+class SpiralProject:
+    """The VC3D project a service session fits. Its file is VC3D's and need
+    not be readable by the service, so VC3D sends what the fit reads of it:
+    the project's name and, per volume (keyed by the store volume its
+    annotations are kept in, vc::project::AnnotationVolume), the facts it knows
+    and its umbilicus."""
+
+    name: str
+    volumes: Mapping[str, ProjectVolume]
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "SpiralProject":
+        if not isinstance(value, Mapping):
+            raise ScrollSpecError("project must be an object")
+        name = str(value.get("name") or "").strip()
+        if not name:
+            raise ScrollSpecError("project.name must be a non-empty string")
+        entries = value.get("volumes", {})
+        if not isinstance(entries, Mapping):
+            raise ScrollSpecError("project.volumes must be an object keyed by volume")
+        volumes = {}
+        for uuid, entry in entries.items():
+            source = f"project volume {uuid}"
+            if not isinstance(entry, Mapping):
+                raise ScrollSpecError(f"{source} must be an object")
+            facts = {}
+            if entry.get("voxel_size_um") is not None:
+                facts["voxel_size_um"] = _checked_voxel_size(entry["voxel_size_um"], source)
+            if entry.get("base_shape_zyx") is not None:
+                facts["base_shape_zyx"] = _checked_base_shape(entry["base_shape_zyx"], source)
+            for key in ("z_direction_is_top_to_bottom", "left_handed_coordinates"):
+                if entry.get(key) is not None:
+                    facts[key] = _checked_flag(entry[key], key, source)
+            umbilicus = entry.get("umbilicus")
+            if umbilicus is not None:
+                facts["umbilicus"] = _checked_umbilicus(umbilicus, source)
+            volumes[str(uuid)] = ProjectVolume(**facts)
+        return cls(name=name, volumes=volumes)
+
+    def to_mapping(self) -> dict[str, Any]:
+        """The request block ``from_mapping`` reads."""
+        return {"name": self.name,
+                "volumes": {uuid: volume.to_mapping()
+                            for uuid, volume in sorted(self.volumes.items())}}
+
+    def record(self, volume_uuid: str) -> dict[str, Any]:
+        """What a session fitting ``volume_uuid`` records of the project."""
+        return {"name": self.name, "volume": volume_uuid,
+                **self.volumes[volume_uuid].manifest()}
+
+
+def _checked_umbilicus(value: Any, source: str) -> ProjectUmbilicus:
+    if not isinstance(value, Mapping):
+        raise ScrollSpecError(f"{source}: umbilicus must be an object")
+    uuid = str(value.get("uuid") or "").strip()
+    revision = str(value.get("revision") or "").strip()
+    if not uuid or not revision:
+        raise ScrollSpecError(f"{source}: umbilicus needs its uuid and revision")
+    points = value.get("points_zyx")
+    try:
+        points = tuple(tuple(float(coordinate) for coordinate in point) for point in points)
+    except (TypeError, ValueError):
+        points = ()
+    # The fit interpolates z -> yx between control points: two at least.
+    if len(points) < 2 or any(len(point) != 3 or not all(map(math.isfinite, point))
+                              for point in points):
+        raise ScrollSpecError(
+            f"{source}: umbilicus points_zyx must be two or more finite ZYX points")
+    return ProjectUmbilicus(uuid=uuid, revision=revision, points_zyx=points)
+
+
+def _same_fact(stated: Any, known: Any) -> bool:
+    if isinstance(known, float):
+        return math.isclose(float(stated), known, rel_tol=1e-6)
+    return stated == known
+
+
+@dataclass(frozen=True)
+class SessionScroll:
+    """A service session's scroll before its fit volume is known: the
+    project's facts and the dataset's optional spiral-scroll.json fields.
+    ``resolve`` completes it once the inputs name the fit volume."""
+
+    project: SpiralProject
+    spec_fields: Mapping[str, Any] = field(default_factory=dict)
+    spec_source: str = ""
+
+    # The packed Lasagna inputs remain the dataset's, so their layout is the
+    # dataset's specification's (or the default).
+    @property
+    def normal_zarr_group(self) -> str:
+        return str(self.spec_fields.get("normal_zarr_group", "4"))
+
+    @property
+    def lasagna_scale(self) -> int:
+        return int(self.spec_fields.get("lasagna_scale", 4))
+
+    def volume(self, volume_uuid: str) -> ProjectVolume:
+        try:
+            return self.project.volumes[volume_uuid]
+        except KeyError:
+            raise ScrollSpecError(
+                f"the fit volume {volume_uuid} is not a volume of the project "
+                f"{self.project.name!r}: attach it to the project") from None
+
+    def resolve(self, volume_uuid: str) -> ScrollSpec:
+        """The scroll of a fit of ``volume_uuid``: the project volume's facts,
+        the specification's where the project does not know them (a
+        specification stating one differently is refused, not overruled),
+        and the project's name. The umbilicus is the project's, in the fit
+        volume's own voxels."""
+        volume = self.volume(volume_uuid)
+        fields = dict(self.spec_fields)
+        for key in PROJECT_VOLUME_FACTS:
+            known = getattr(volume, key)
+            if known is None:
+                continue
+            stated = fields.get(key)
+            if stated is not None and not _same_fact(stated, known):
+                raise ScrollSpecError(
+                    f"{self.spec_source} states {key} {stated!r}, but the project's "
+                    f"volume {volume_uuid} has {known!r}; remove it from "
+                    f"{SCROLL_SPEC_FILENAME}")
+            fields[key] = known
+        fields["name"] = self.project.name
+        fields["umbilicus_coordinate_scale"] = 1.0
+        source = f"project {self.project.name!r} (volume {volume_uuid})"
+        if self.spec_source:
+            source += f" with {self.spec_source}"
+        return _scroll_spec_from_fields(fields, source)
+
+    def umbilicus(self, volume_uuid: str) -> ProjectUmbilicus:
+        umbilicus = self.volume(volume_uuid).umbilicus
+        if umbilicus is None:
+            raise ScrollSpecError(
+                f"the project {self.project.name!r} has no umbilicus for the fit "
+                f"volume {volume_uuid}: import one (File > Import Umbilicus)")
+        return umbilicus
+
+
+def write_project_umbilicus(directory: str | os.PathLike[str], volume_uuid: str,
+                            umbilicus: ProjectUmbilicus) -> str:
+    """Write ``umbilicus`` under ``directory`` as the control-point JSON the
+    fit reads (umbilicus.json_umbilicus_z_to_yx), in the fit volume's voxels;
+    returns its path. Named by its revision: a session reads the revision it
+    was built with."""
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / f"umbilicus-{umbilicus.revision}.json"
+    document = {
+        "control_points": [{"z": z, "y": y, "x": x} for z, y, x in umbilicus.points_zyx],
+        "source": {"volume_uuid": volume_uuid, "object_uuid": umbilicus.uuid,
+                   "revision": umbilicus.revision},
+    }
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(document), encoding="utf-8")
+    temporary.replace(path)
+    return str(path)
 
 
 def scroll_spec_config_defaults(spec: ScrollSpec | Mapping[str, Any] | None,
@@ -1076,22 +1359,26 @@ def resolve_dataset_root(
         result.warnings.append(f"Dataset root is not a readable directory: {root}")
         return result
 
-    # The scroll specification is the dataset's one required source of
-    # physical facts; a dataset without it does not resolve.
+    # A service session's project supplies the physical facts it knows
+    # (SessionScroll), so the scroll specification is optional and may state
+    # only the rest; an invalid one does not resolve.
+    overrides = {}
     try:
-        spec = load_scroll_spec(root)
+        fields, _ = load_dataset_scroll_fields(root)
     except ScrollSpecError as exc:
-        spec = None
         result.missing_required.append("scroll_spec")
         result.warnings.append(str(exc))
     else:
-        result.scroll_spec = spec.manifest()
+        overrides = dict(fields.get("path_overrides", ()))
+        result.scroll_spec = {**fields, "path_overrides": overrides}
 
     for input_spec in FIT_INPUT_CATALOG:
-        # DBM inputs need backing-file probing (below).
-        if input_spec.kind == "dbm" or not input_spec.conventional_relative:
+        # DBM inputs need backing-file probing (below); the project supplies
+        # PROJECT_INPUT_KEYS.
+        if (input_spec.kind == "dbm" or not input_spec.conventional_relative
+                or input_spec.key in PROJECT_INPUT_KEYS):
             continue
-        override = spec.path_override(input_spec.key) if spec is not None else ""
+        override = overrides.get(input_spec.key, "")
         candidate = Path(override) if override \
             else root / input_spec.conventional_relative
         found = candidate.is_file() if input_spec.kind == "file" \
@@ -1103,7 +1390,7 @@ def resolve_dataset_root(
         else:
             result.missing_optional.append(input_spec.key)
 
-    tracks_override = spec.path_override("tracks_dbm") if spec is not None else ""
+    tracks_override = overrides.get("tracks_dbm", "")
     preferred = Path(tracks_override) if tracks_override \
         else root / "tracks" / "2um_ds2_ps256_surf_v2.dbm"
     preferred_logical = resolve_logical_dbm(preferred)
@@ -1142,8 +1429,15 @@ def _validate_json_file(path: Path, label: str, errors: list[dict[str, str]]) ->
 def validate_session_request(
     paths: SpiralInputPaths,
     run: SpiralRunConfig,
+    *,
+    supplied: Iterable[str] = (),
 ) -> list[dict[str, str]]:
-    """Perform cheap, aggregate validation before any GPU allocation."""
+    """Perform cheap, aggregate validation before any GPU allocation.
+
+    ``supplied`` names inputs another source provides once the fit volume is
+    known (a service session's PROJECT_INPUT_KEYS); they are not checked here.
+    """
+    supplied = frozenset(supplied)
     errors: list[dict[str, str]] = []
 
     def require_file(value: str, field_name: str, *, json_file: bool = False) -> None:
@@ -1166,7 +1460,7 @@ def validate_session_request(
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
     def check_catalog_input(spec: FitInputSpec) -> None:
-        if not spec.enabled(run.config):
+        if not spec.enabled(run.config) or spec.key in supplied:
             return
         if spec.kind == "file":
             require_file(getattr(paths, spec.key), spec.key,

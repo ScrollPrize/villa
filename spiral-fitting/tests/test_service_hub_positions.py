@@ -18,6 +18,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 
 import object_store_inputs as osi  # noqa: E402
 import spiral_service  # noqa: E402
+from service_project import with_project  # noqa: E402
 from fit_session import resolve_dataset_root  # noqa: E402
 from test_object_store_startup import store_path  # noqa: E402,F401
 from test_runtime_object_store import (  # noqa: E402,F401
@@ -169,7 +170,7 @@ def test_initialize_links_and_pins_the_requested_position(state, hub, device_stu
     assert advertised['object_store']['hub']['identity'] == state.object_store.hub_identity
     walk = _names(hub['editor'])['walk']
     edited = _edit(hub['editor'], walk, 'sampling_group', 'reviewed')
-    response = state.initialize({**REQUEST, 'inputs_position': edited})
+    response = state.initialize(with_project({**REQUEST, 'inputs_position': edited}))
     assert response['build_id']
     status = settle(state)
     assert status['state'] == 'Idle', status['error']
@@ -204,13 +205,13 @@ def test_initialize_links_and_pins_the_requested_position(state, hub, device_stu
         assert len(db.edges_by_kind('point-surface')) == 3
     # A later edit is not part of the fit; a model rebuild keeps the position.
     _edit(hub['editor'], walk, 'sampling_group', 'later')
-    response = state.rebuild({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'model_num_flow_stages': 3}}})
+    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+        **RUN, 'model_num_flow_stages': 3}}}))
     assert response['stage'] == 'model'
     assert settle(state)['input_position'] == position
     assert state.session._context.config['object_store_input_position'] == position['sequence']
     # A reload rebuild links and pins a new position including it.
-    response = state.rebuild({**REQUEST, 'inputs': 'reload'})
+    response = state.rebuild(with_project({**REQUEST, 'inputs': 'reload'}))
     assert response['inputs'] == 'reload'
     reloaded = settle(state)
     assert reloaded['input_position']['sequence'] > position['sequence']
@@ -221,7 +222,7 @@ def test_initialize_links_and_pins_the_requested_position(state, hub, device_stu
 
 def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
                                                       monkeypatch):
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     first = settle(state)
     session_id, context = state.session_id, state.session._context
 
@@ -229,7 +230,7 @@ def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
         raise osi.PositionError(['inputs kept changing: no hub position could be '
                                  'linked in 4 attempts; retry'])
     monkeypatch.setattr(osi, 'prepare_position', refuse)
-    response = state.rebuild({**REQUEST, 'inputs': 'reload'})
+    response = state.rebuild(with_project({**REQUEST, 'inputs': 'reload'}))
     deadline = time.monotonic() + 30
     while state._building:
         assert time.monotonic() < deadline
@@ -248,7 +249,8 @@ def test_a_failed_preparation_keeps_the_resident_fit(state, hub, device_stubs,
     state.lease().claim('client-token', 'claim-1')
     with pytest.raises(spiral_service.ApiError, match='could not be prepared'):
         state.lease_lifecycle('client-token', 'session_rebuild',
-                              {**REQUEST, 'inputs': 'reload', 'command_id': 'c-1'},
+                              with_project({**REQUEST, 'inputs': 'reload',
+                                            'command_id': 'c-1'}),
                               state.rebuild)
     assert state.session_id == session_id
 
@@ -266,7 +268,7 @@ def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
     other = _checkpoint(tmp_path / 'other.ckpt', {}, {
         'object_store': {'position': {**position, 'hub': 'another-hub'}}})
     assert state._checkpoint_position(other) is None
-    paths, run, preview, scroll = state._prepare_session_request(REQUEST)
+    paths, run, preview, scroll = state._prepare_session_request(with_project(REQUEST))
     paths = paths.__class__(**{**paths.manifest(), 'checkpoint': path})
     deadline = time.monotonic() + 30
     state._begin_build(paths, run, preview, scroll)
@@ -288,8 +290,8 @@ def test_a_shared_store_has_positions_of_its_own(store_path, tmp_path):
             state._inputs_position(-1)
         # A client cannot pin a position through the configuration.
         with pytest.raises(spiral_service.ApiError, match='must not carry'):
-            state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-                **RUN, 'object_store_input_position': 3}}})
+            state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+                **RUN, 'object_store_input_position': 3}}}))
     finally:
         state.close()
 
@@ -322,7 +324,7 @@ def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stu
     import numpy as np
     import fit_spiral
     from object_store_fixture import put_patch
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     context = state.session._context
     before = {name: getattr(context, name) for name in context._INPUT_HOST_ATTRIBUTES}
@@ -360,7 +362,7 @@ def test_prepared_inputs_leave_the_resident_fit_untouched(state, hub, device_stu
 def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device_stubs):
     import copy
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     context = state.session._context
     inputs = copy.copy(context.object_store_inputs)
@@ -375,7 +377,7 @@ def test_inputs_that_would_change_the_model_frame_are_refused(state, hub, device
 
 def test_a_failure_after_release_needs_recovery(state, hub, device_stubs, monkeypatch):
     import fit_spiral
-    state.initialize(REQUEST)
+    state.initialize(with_project(REQUEST))
     settle(state)
     context = state.session._context
     candidate = context.prepare_input_replacement(context.object_store_inputs)

@@ -29,6 +29,7 @@ import spiral_runtime
 import spiral_service
 from config import Config
 from fit_session import SessionState, resolve_dataset_root
+from service_project import with_project
 
 
 class FakeRuntime:
@@ -204,7 +205,7 @@ def record(out):
             client.call("GET", "/dataset")
             client.call("POST", _claim_route(), {"command_id": "claim-1"},
                         label="POST claim")
-            client.command("/session/initialize", {"run": _RUN})
+            client.command("/session/initialize", with_project({"run": _RUN}))
             client.wait_state(SessionState.Idle)
             client.call("GET", "/session/status")
             revision = client.get_status()["session_revision"]

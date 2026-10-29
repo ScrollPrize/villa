@@ -77,15 +77,16 @@ from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fit_session import (API_VERSION, FIT_INPUT_CATALOG,
+from fit_session import (API_VERSION, FIT_INPUT_CATALOG, PROJECT_INPUT_KEYS,
                          SESSION_BUSY_STATES, SCROLL_SPEC_FILENAME,
                          SCROLL_SPEC_OWNED_RUN_KEYS,
-                         ScrollSpecError, SessionState,
-                         default_user_cache_dir, input_source_enabled,
-                         winding_inference_enabled, load_scroll_spec,
+                         ScrollSpecError, SessionScroll, SessionState,
+                         SpiralProject, default_user_cache_dir,
+                         input_source_enabled, load_dataset_scroll_fields,
+                         winding_inference_enabled,
                          scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
-                         validate_session_request)
+                         validate_session_request, write_project_umbilicus)
 from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
@@ -696,6 +697,9 @@ class ServiceState:
         self._input_preparation_error = None
         self._input_position = None
         self._session_scroll = None
+        # The project the session was built from (fit_session.SpiralProject):
+        # what a rebuild the service starts itself sends again.
+        self._session_project = None
         # An input update of the resident session in flight (its build ID).
         self._input_update = None
         self.startup_run = dict(startup_run or {})
@@ -1085,7 +1089,9 @@ class ServiceState:
 
     @property
     def scroll_spec(self):
-        """The parsed spiral-scroll.json manifest, or None if it is invalid."""
+        """The fields the dataset's spiral-scroll.json states ({} without
+        one), or None if it is invalid. A session's scroll completes them with
+        its project's facts (session_request["scroll"])."""
         if self.dataset_resolution is None:
             return None
         return self.dataset_resolution.scroll_spec
@@ -1229,6 +1235,7 @@ class ServiceState:
                                   f"{SCROLL_SPEC_OWNED_RUN_KEYS[key]!r}")}
                      for key in scroll_owned])
             request = self._bind_service_owned_config(request)
+            project = self._request_project(request)
             if self.dataset_resolution is not None:
                 request, input_config = self._dataset_session_request(
                     request, include_input_config=True)
@@ -1257,18 +1264,53 @@ class ServiceState:
         validation_run = (
             dataclasses.replace(run, config=input_config)
             if input_config is not None else run)
-        errors = validate_session_request(paths, validation_run)
-        # The scroll specification is resolved from the dataset root; it
-        # carries the physical scroll facts (including the outward sense,
-        # which is not part of the session request).
+        # The project supplies its inputs once the fit volume is known.
+        errors = validate_session_request(paths, validation_run,
+                                          supplied=PROJECT_INPUT_KEYS)
+        # The project's facts and the dataset's optional specification make
+        # the scroll, resolved for the fit volume when the build knows it
+        # (_resolve_session_scroll).
         scroll = None
         try:
-            scroll = load_scroll_spec(paths.dataset_root)
+            fields, source = load_dataset_scroll_fields(paths.dataset_root)
         except ScrollSpecError as exc:
             errors.append({"field": "scroll_spec", "message": str(exc)})
+        else:
+            scroll = SessionScroll(project, fields, source)
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         return paths, run, preview, scroll
+
+    @staticmethod
+    def _request_project(request):
+        """The request's ``project`` block (fit_session.SpiralProject): the
+        VC3D project whose inputs the session fits. Every session request
+        carries it; the service cannot read the project file itself."""
+        value = request.get("project")
+        if value is None:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "The request carries no project: this service fits the inputs "
+                "of the VC3D project that asks for the session",
+                [{"field": "project", "message": "Required"}])
+        try:
+            return SpiralProject.from_mapping(value)
+        except ScrollSpecError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"Invalid project: {exc}",
+                           [{"field": "project", "message": str(exc)}]) from exc
+
+    def _resolve_session_scroll(self, scroll, volume, paths):
+        """Complete a build's SessionScroll for its fit volume: the scroll it
+        fits and its umbilicus (the project's, written under the output
+        directory as the file the fit reads). The fit infers the same volume
+        from the same inputs, and an input update that would read another is
+        refused (InputReplacementRefused). Returns ``(paths, ScrollSpec)``;
+        raises ScrollSpecError."""
+        spec = scroll.resolve(volume)
+        umbilicus = write_project_umbilicus(
+            Path(paths.output_directory) / "project-inputs", volume,
+            scroll.umbilicus(volume))
+        return dataclasses.replace(paths, umbilicus=umbilicus), spec
 
     def _bind_service_owned_config(self, request):
         """Refuse client values for SERVICE_OWNED_CONFIG_KEYS, then set them
@@ -1388,11 +1430,13 @@ class ServiceState:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "defaults must be true or false")
         if defaults:
+            # The project is the client's to send, as with any session request.
+            project = request.pop("project", None)
             if set(request):
                 raise ApiError(
                     HTTPStatus.BAD_REQUEST,
-                    "A defaults rebuild takes no other request fields")
-            request = self.startup_session_request()
+                    "A defaults rebuild takes no other request fields than the project")
+            request = {**self.startup_session_request(), "project": project}
         paths, run, preview, scroll = self._prepare_session_request(request)
         if paths.checkpoint and run.config:
             self._reject_overrides_the_checkpoint_contradicts(
@@ -1417,14 +1461,18 @@ class ServiceState:
             # Rereading the inputs is the whole build: a model-only rebuild
             # keeps the frozen inputs it loaded.
             stage = ("all" if defaults or inputs == "reload"
-                     else self._rebuild_stage_locked(paths, run, preview, state))
-            live_position = ((self.session_request or {}).get("run") or {}).get(
-                "config", {}).get("object_store_input_position")
+                     else self._rebuild_stage_locked(paths, run, preview, scroll, state))
+            live_request = self.session_request or {}
+            live_config = (live_request.get("run") or {}).get("config", {})
+            live_paths = self.session_paths
         build_id = None
         if stage == "model":
-            # The model stage keeps the frozen inputs, at their position.
+            # The model stage keeps the frozen inputs, at their position, and
+            # the project's umbilicus.
             run = dataclasses.replace(run, config={
-                **run.config, "object_store_input_position": live_position})
+                **run.config,
+                "object_store_input_position": live_config.get("object_store_input_position")})
+            paths = dataclasses.replace(paths, umbilicus=live_paths.umbilicus)
             self._begin_model_rebuild(paths, run, preview)
         else:
             build_id = self._begin_build(paths, run, preview, scroll,
@@ -1581,7 +1629,7 @@ class ServiceState:
             f"(input generation {result.get('input_generation')})",
             source="service", operation="updating_inputs")
 
-    def _rebuild_stage_locked(self, paths, run, preview, state):
+    def _rebuild_stage_locked(self, paths, run, preview, scroll, state):
         """How much of the resident session this request has to replace.
 
         Everything outside ``run.config`` is ``all``. Paths name host inputs
@@ -1609,8 +1657,18 @@ class ServiceState:
             # resident inputs, and the refusal would come after the model was
             # released. The full rebuild reads the checkpoint's position.
             return "all"
-        if (paths.manifest() != current.get("paths")
+        # The project supplies the umbilicus once the build knows the fit
+        # volume; it and the scroll change with the project's facts of that
+        # volume.
+        live_paths = dict(current.get("paths") or {})
+        live_paths["umbilicus"] = ""
+        if (paths.manifest() != live_paths
                 or preview.manifest() != current.get("preview")):
+            return "all"
+        live_project = current.get("project") or {}
+        volume = live_project.get("volume")
+        if (volume not in scroll.project.volumes
+                or scroll.project.record(volume) != live_project):
             return "all"
         live_run = dict(current.get("run") or {})
         new_run = run.manifest()
@@ -1646,6 +1704,7 @@ class ServiceState:
             self._building = True
             self.session_paths = paths
             self.session_request = {
+                **self.session_request,
                 "paths": paths.manifest(),
                 "run": run.manifest(),
                 "preview": preview.manifest(),
@@ -1693,13 +1752,21 @@ class ServiceState:
             record = {"hub": self.object_store.positions,
                       "sequence": position, "requested": None, "head": None,
                       "attempts": 0, "source": "checkpoint"}
+        # The checkpoint's inputs name the fit volume.
+        project = scroll.project
+        try:
+            volume = self._unprepared_volume(paths, scroll)
+            paths, scroll = self._resolve_session_scroll(scroll, volume, paths)
+        except ScrollSpecError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, f"Session validation failed: {exc}",
+                           [{"field": "project", "message": str(exc)}]) from exc
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
                                "A session build is already in progress")
             self._building = True
             build_id, session_id, previous = self._publish_build_locked(
-                paths, run, preview, record, scroll)
+                paths, run, preview, record, scroll, project, volume)
         self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run, preview, scroll),
@@ -1710,6 +1777,23 @@ class ServiceState:
     def _pin_run(run, position):
         return dataclasses.replace(run, config={
             **run.config, "object_store_input_position": int(position)})
+
+    def _unprepared_volume(self, paths, scroll):
+        """The fit volume of a build that prepares no position: the one its
+        checkpoint's inputs were read in. A build without one (on a service
+        without an object store, which only tests construct) fits the
+        project's only volume."""
+        if paths.checkpoint:
+            *_, manifest = self._checkpoint_durable_cfg(paths.checkpoint)
+            volume = ((manifest or {}).get("object_store") or {}).get("volume_uuid")
+            if volume:
+                return str(volume)
+        volumes = sorted(scroll.project.volumes)
+        if len(volumes) != 1:
+            raise ScrollSpecError(
+                "the build reads no fit volume from its inputs, so it must be the "
+                f"project's only volume (it has {len(volumes)})")
+        return volumes[0]
 
     def _checkpoint_position(self, path):
         """The position on this service's hub a checkpoint's inputs were
@@ -1752,13 +1836,16 @@ class ServiceState:
         config, _, overrides = merge_session_config(
             paths.checkpoint, run, warn=lambda warning: None)
         config.update(overrides)
-        return self._prepare_position(config, paths, scroll, minimum)
+        return self._prepare_position(config, paths, scroll, minimum, volume=True)
 
-    def _prepare_position(self, config, paths, scroll, minimum):
-        """Link and pin a position for ``config`` on the bound store."""
+    def _prepare_position(self, config, paths, scroll, minimum, *, volume=False):
+        """Link and pin a position for ``config`` on the bound store; with
+        ``volume``, also the fit volume pinned there (``(prepared,
+        volume)``)."""
         from vc_object_store import ObjectStore
         from fit_session import lasagna_normal_inputs
-        from object_store_inputs import prepare_position, request_from_config
+        from object_store_inputs import (fit_volume_at, prepare_position,
+                                         request_from_config)
         lasagna = lasagna_normal_inputs(
             paths.normal_x, paths.normal_y, scroll.normal_zarr_group,
             int(scroll.lasagna_scale))
@@ -1768,15 +1855,21 @@ class ServiceState:
         def log(line):
             self.events.append("log", line, source="service",
                                operation="preparing_inputs")
+        request = request_from_config(config)
         with ObjectStore.open(self.object_store.path,
                               author=self.object_store.author) as store:
-            return prepare_position(
-                store, config, request_from_config(config), lasagna=lasagna,
+            prepared = prepare_position(
+                store, config, request, lasagna=lasagna,
                 minimum=minimum, cache_directory=cache, log=log)
+            if not volume:
+                return prepared
+            return prepared, fit_volume_at(store, request, prepared)
 
     def _prepare_then_build(self, build_id, paths, run, preview, scroll, minimum):
         try:
-            prepared = self._prepare_inputs(paths, run, scroll, minimum)
+            prepared, volume = self._prepare_inputs(paths, run, scroll, minimum)
+            project = scroll.project
+            paths, scroll = self._resolve_session_scroll(scroll, volume, paths)
         except BaseException as exc:
             cause = _cause(exc)
             with self.lock:
@@ -1802,13 +1895,16 @@ class ServiceState:
         with self.lock:
             self._input_preparation = None
             _, session_id, previous = self._publish_build_locked(
-                paths, run, preview, record, scroll, build_id=build_id)
+                paths, run, preview, record, scroll, project, volume,
+                build_id=build_id)
         self._build(session_id, previous, paths, run, preview, scroll)
 
-    def _publish_build_locked(self, paths, run, preview, input_position, scroll, *,
-                              build_id=None):
-        """Retire the resident session and publish ``Loading`` for a new one.
-        Call with the lock held and ``_building`` claimed."""
+    def _publish_build_locked(self, paths, run, preview, input_position, scroll,
+                              project, volume, *, build_id=None):
+        """Retire the resident session and publish ``Loading`` for a new one,
+        fitting ``scroll`` (_resolve_session_scroll's ScrollSpec) of the
+        ``project`` (a SpiralProject) in the fit volume ``volume``. Call with
+        the lock held and ``_building`` claimed."""
         if build_id is None:
             self._build_serial += 1
             build_id = self._build_serial
@@ -1823,7 +1919,10 @@ class ServiceState:
             "paths": paths.manifest(),
             "run": run.manifest(),
             "preview": preview.manifest(),
+            "project": project.record(volume),
+            "scroll": scroll.manifest(),
         }
+        self._session_project = project
         self.session_revision += 1
         self._reset_session_scope()
         self._input_position = input_position
@@ -2920,9 +3019,13 @@ class ServiceState:
         """
         with self.lock:
             current = copy.deepcopy(self.session_request or {})
-        if not current:
+            project = self._session_project
+        if not current or project is None:
             raise ApiError(HTTPStatus.CONFLICT,
                            "There is no session request to rebuild from")
+        # The live request records the project; the rebuild sends it whole.
+        current.pop("scroll", None)
+        current["project"] = project.to_mapping()
         paths = dict(current.get("paths") or {})
         if self.dataset_resolution is not None:
             # ``session_request`` is the canonical manifest the service built,
@@ -3008,9 +3111,9 @@ class ServiceState:
         """
         with self.lock:
             output_directory = self.session_paths.output_directory
-        # The physical resolution of the preview is the scroll's own, read from
-        # the specification the dataset root carries.
-        voxel_size_um = (self.scroll_spec or {}).get("voxel_size_um")
+            # The physical resolution of the preview is the session's scroll's.
+            voxel_size_um = (self._session_scroll.voxel_size_um
+                             if self._session_scroll is not None else None)
 
         def attach_process(process):
             with self.lock:

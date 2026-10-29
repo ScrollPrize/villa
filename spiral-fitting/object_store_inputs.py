@@ -1672,6 +1672,14 @@ class PreparedPosition:
     lines: list
 
 
+def fit_volume_at(store, request, prepared):
+    """The fit volume of a prepared position: the volume ``read_snapshot``
+    infers (or checks a configured one against) for the selection pinned
+    there, so it is the one the fit will read."""
+    pinned = dataclasses.replace(request, position=prepared.position)
+    return read_snapshot(store, pinned, prepared.uuids).volume_uuid
+
+
 def _discard_unpublished(store):
     """Restore the hub's relationships over this replica's unpublished
     detector output (and any relationship conflicts): it was computed for

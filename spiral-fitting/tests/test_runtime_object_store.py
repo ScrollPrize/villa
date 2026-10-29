@@ -19,6 +19,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 import spiral_service  # noqa: E402
+from service_project import with_project  # noqa: E402
 from fit_session import SessionState, resolve_dataset_root  # noqa: E402
 from test_object_store_startup import _edges, store_path  # noqa: E402,F401
 
@@ -96,7 +97,7 @@ def settle(state, timeout=120):
 
 def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
                                                           device_stubs):
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
     status = settle(state)
     assert status['state'] == 'Idle', status['error']
     context = state.session._context
@@ -126,7 +127,7 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
 
 def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
     from fit_session import read_autosave_metadata
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
     status = settle(state)
     inputs = state.session._context.object_store_inputs
     assert status['input_digest'] == inputs.digest
@@ -138,7 +139,8 @@ def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
     manifest = status['input_manifest']
     assert manifest['object_store_digest'] == inputs.digest
     assert not {'verified_patches', 'fibers', 'pcls'} & set(manifest)
-    assert manifest['umbilicus'].endswith('umbilicus.json')
+    # The project's umbilicus, written where the fit reads it.
+    assert '/project-inputs/umbilicus-' in manifest['umbilicus']
     assert not {'same_winding_artifact', 'relative_winding_artifact'} & set(status)
     # The whole manifest is an immutable artifact.
     deadline = time.monotonic() + 30
@@ -167,13 +169,13 @@ def test_status_and_artifacts_carry_the_input_provenance(state, device_stubs):
 
 
 def test_a_model_rebuild_keeps_the_frozen_inputs(state, store_path, device_stubs):
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
     settle(state)
     context = state.session._context
     inputs = context.object_store_inputs
     edges = _edges(store_path)
-    response = state.rebuild({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'model_num_flow_stages': 3}}})
+    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+        **RUN, 'model_num_flow_stages': 3}}}))
     assert response['stage'] == 'model'
     assert settle(state)['state'] == 'Idle'
     assert state.session._context is context
@@ -186,8 +188,8 @@ def test_a_model_rebuild_keeps_the_frozen_inputs(state, store_path, device_stubs
 
 def test_input_refusals_reach_status_and_events(state, store_path, device_stubs):
     # Linking a position fails before any build: nothing is torn down.
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'pcl_link_window_min_points': 5}}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+        **RUN, 'pcl_link_window_min_points': 5}}}))
     deadline = time.monotonic() + 60
     while state._building:
         assert time.monotonic() < deadline
@@ -280,7 +282,7 @@ def test_a_refresh_failure_stops_both_ranks_before_either_starts(store_path, tmp
 def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
         state, store_path, device_stubs):
     request = {'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}
-    state.initialize(request)
+    state.initialize(with_project(request))
     first = settle(state)['input_digest']
     walk = next(entry['uuid'] for entry in state.dataset()['inputs']['objects']
                 if entry['name'] == 'walk')
@@ -288,18 +290,18 @@ def test_a_reload_rebuild_rereads_the_store_under_an_unchanged_config(
         db.set_meta(walk, 'sampling_group', 'reviewed')
     # The same configuration is a model-stage rebuild, which keeps the
     # frozen inputs: it neither rereads the store nor sees the edit.
-    response = state.rebuild(request)
+    response = state.rebuild(with_project(request))
     assert (response['stage'], response['inputs']) == ('model', 'keep')
     assert settle(state)['input_digest'] == first
     assert device_stubs == [True]
-    response = state.rebuild({**request, 'inputs': 'reload'})
+    response = state.rebuild(with_project({**request, 'inputs': 'reload'}))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
     reloaded = settle(state)
     assert reloaded['state'] == 'Idle'
     assert reloaded['input_digest'] != first
     assert len(device_stubs) == 2
     with pytest.raises(spiral_service.ApiError, match='inputs must be'):
-        state.rebuild({**request, 'inputs': 'refresh'})
+        state.rebuild(with_project({**request, 'inputs': 'refresh'}))
 
 
 def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs):
@@ -309,7 +311,7 @@ def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs)
                                             'patch_loss_z_margin']
     for key in keys:
         assert rebuild_stage({key}) == 'all', key
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
     status = settle(state)
     configuration = {**Config().as_dict(), **status['applied_config'],
                      'pcl_link_window_points': 9}
@@ -317,8 +319,8 @@ def test_settings_that_shape_the_inputs_need_a_full_rebuild(state, device_stubs)
         state.run({'iterations': 1, 'configuration': configuration,
                    'expected_session_revision': state.session_revision,
                    'dt_loss_schedule': {'enabled': False, 'last_fraction': 0.0}})
-    response = state.rebuild({'run': {'z_begin': 0, 'z_end': 64, 'config': {
-        **RUN, 'pcl_link_window_points': 9}}})
+    response = state.rebuild(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': {
+        **RUN, 'pcl_link_window_points': 9}}}))
     assert (response['stage'], response['inputs']) == ('all', 'reload')
     assert settle(state)['applied_config']['pcl_link_window_points'] == 9
     assert len(device_stubs) == 2
@@ -331,7 +333,7 @@ def _checkpoint(path, cfg, input_manifest):
 
 
 def test_checkpoint_refusals_name_the_input_remedies(state, tmp_path, device_stubs):
-    state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}})
+    state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': dict(RUN)}}))
     status = settle(state)
     live = status['applied_config']
     with open(status['input_manifest_path']) as stream:
@@ -452,7 +454,7 @@ def test_the_cli_and_the_service_freeze_the_same_inputs(varied_store, tmp_path,
         object_store=spiral_service.bind_object_store(varied_store, 'svc'))
     config = {**RUN, 'object_store_refresh_links': False, **selection}
     try:
-        state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': config}})
+        state.initialize(with_project({'run': {'z_begin': 0, 'z_end': 64, 'config': config}}))
         assert settle(state)['state'] == 'Idle', state.status()['error']
         served = state.session._context
         cli = _cli_inputs(varied_store, tmp_path, {
