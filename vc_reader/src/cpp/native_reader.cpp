@@ -1,8 +1,8 @@
 #include "vc_reader/reader.hpp"
 #include "vc_reader/catalog.hpp"
-#include "vc_reader/sftp.hpp"
-#include "array.hpp"
-#include "sheet_normal/normal.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/native/array.hpp"
+#include "vc_reader/native/sheet_normal/normal.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -106,38 +106,8 @@ std::string normalizeZarrMetadata(const std::string& text)
             {"shard_chunks", ratios}, {"index_end", indexEnd}, {"index_crc", indexCrc}}}}.dump();
 }
 
-namespace {
-bool remote(const std::string& location)
-{
-    return location.starts_with("http://") || location.starts_with("https://") || sftp::isSftpUrl(location);
-}
-
-std::optional<Json> metadata(const std::string& location, const std::string& name)
-{
-    if (remote(location)) {
-        HttpClient http(HttpOptions{});
-        std::vector<uint8_t> bytes;
-        if (!http.get(location + "/" + name, bytes)) return {};
-        return Json::parse(bytes);
-    }
-    std::ifstream in(std::filesystem::path(location) / name);
-    if (!in) return {};
-    return Json::parse(in);
-}
-
-std::optional<Json> arrayMetadata(const std::string& location)
-{
-    auto result = metadata(location, ".zarray");
-    if (!result) {
-        result = metadata(location, "zarr.json");
-        if (result && result->value("node_type", "") != "array") return {};
-    }
-    return result;
-}
-} // namespace
-
 struct CtReader::Impl {
-    std::unique_ptr<Array> array;
+    zarr::OpenedArray opened;
     std::array<int64_t, 3> shape;
 };
 
@@ -149,69 +119,33 @@ CtReader::CtReader(const std::string& input, int level, size_t cacheBytes)
     while (location.size() > 1 && location.back() == '/') location.pop_back();
     if (location.empty()) throw std::invalid_argument("empty CT location");
     location = catalog::resolveOpenDataUrl(location);
-    auto raw = arrayMetadata(location);
-    if (raw && level != 0) throw std::invalid_argument("array source has only level zero");
-    if (!raw) {
-        std::string relative = std::to_string(level);
-        auto attrs = metadata(location, ".zattrs");
-        if (!attrs) {
-            const auto group = metadata(location, "zarr.json");
-            if (group) attrs = group->value("attributes", Json::object());
-        }
-        if (attrs && attrs->contains("multiscales")) {
-            const auto& datasets = attrs->at("multiscales").at(0).at("datasets");
-            if (size_t(level) >= datasets.size()) throw std::invalid_argument("CT level missing");
-            relative = datasets.at(level).at("path").get<std::string>();
-        }
-        location += "/" + relative;
-        raw = arrayMetadata(location);
-    }
-    if (!raw) throw std::runtime_error("CT array metadata missing: " + location);
-    const auto d = Json::parse(normalizeZarrMetadata(raw->dump()));
-    if (d.value("zarr_format", 0) != 2 || d.value("order", std::string("C")) != "C" ||
-        !d.value("filters", Json()).empty()) {
-        throw std::invalid_argument("unsupported CT array encoding");
-    }
-    const auto dtype = d.at("dtype").get<std::string>();
-    if (dtype != "|u1" && dtype != "<u1" && dtype != "u1")
-        throw std::invalid_argument("CT normals require uint8 CT");
-    ArraySpec spec;
-    spec.shape = d.at("shape").get<Index>();
-    spec.chunks = d.at("chunks").get<Index>();
-    if (spec.shape.size() != 3 || spec.chunks.size() != 3)
-        throw std::invalid_argument("CT must be three dimensional");
-    for (int axis = 0; axis < 3; ++axis) {
-        if (spec.shape[axis] < 0 || spec.chunks[axis] <= 0)
-            throw std::invalid_argument("invalid CT dimensions");
-        impl_->shape[axis] = spec.shape[axis];
-    }
-    const auto fill = d.at("fill_value");
-    if (!fill.is_null() && (!fill.is_number_integer() || fill.get<int64_t>() < 0 || fill.get<int64_t>() > 255))
-        throw std::invalid_argument("CT fill value must be uint8");
-    spec.fill = {fill.is_null() ? uint8_t(0) : fill.get<uint8_t>()};
-    spec.identity = location;
-    spec.separator = d.value("dimension_separator", std::string("."));
-    if (spec.separator != "." && spec.separator != "/")
-        throw std::invalid_argument("invalid CT chunk separator");
-    const auto compression = d.value("compressor", Json());
-    const std::string codec = compression.is_null() ? "" : compression.at("id").get<std::string>();
-    parse_codec(codec);
-    if (d.contains("_vc_reader_v3")) {
-        const auto& v = d.at("_vc_reader_v3");
-        spec.source_root = location;
-        spec.source_prefix = v.at("prefix");
-        spec.shard_chunks = v.at("shard_chunks").get<Index>();
-        spec.shard_index_end = v.at("index_end");
-        spec.shard_index_crc = v.at("index_crc");
-        spec.remote_codec = codec;
-        if (remote(location)) spec.remote_url = location;
-    } else if (remote(location)) {
-        spec.remote_url = location;
-        spec.remote_codec = codec;
+    zarr::OpenOptions options;
+    options.memoryCache = std::make_shared<MemoryCache>(cacheBytes);
+    options.metadata = zarr::metadataReader(options.access);
+    const bool array = options.metadata(location, ".zarray") ||
+                       [&] {
+                           const auto node = options.metadata(location, "zarr.json");
+                           return node && Json::parse(*node).value("node_type", "") == "array";
+                       }();
+    if (array) {
+        if (level != 0) throw std::invalid_argument("array source has only level zero");
+        impl_->opened = zarr::openArray(location, options);
     } else {
-        spec.layers.push_back({"array", location, codec, "", false});
+        auto group = zarr::Group::open(location, options);
+        std::string key = std::to_string(level);
+        if (!group.multiscales().empty()) {
+            const auto levels = group.levels();
+            if (size_t(level) >= levels.size()) throw std::invalid_argument("CT level missing");
+            key = levels[size_t(level)];
+        }
+        impl_->opened = group.array(key);
     }
-    impl_->array = std::make_unique<Array>(std::move(spec), std::make_shared<MemoryCache>(cacheBytes));
+    const auto& meta = impl_->opened.meta;
+    if (meta.type.kind != 'u' || meta.itemsize() != 1)
+        throw std::invalid_argument("CT normals require uint8 CT");
+    if (meta.shape.size() != 3)
+        throw std::invalid_argument("CT must be three dimensional");
+    for (int axis = 0; axis < 3; ++axis) impl_->shape[axis] = meta.shape[axis];
 }
 
 CtReader::~CtReader() = default;
@@ -219,7 +153,7 @@ CtReader::CtReader(CtReader&&) noexcept = default;
 CtReader& CtReader::operator=(CtReader&&) noexcept = default;
 
 std::array<int64_t, 3> CtReader::shape() const { return impl_->shape; }
-Array& CtReader::array() { return *impl_->array; }
+Array& CtReader::array() { return *impl_->opened.array; }
 
 void CtReader::readRegion(std::array<int64_t, 3> start, std::array<int64_t, 3> shape,
                           std::span<uint8_t> out)
@@ -232,7 +166,7 @@ void CtReader::readRegion(std::array<int64_t, 3> start, std::array<int64_t, 3> s
         count *= size;
     }
     if (out.size() != count) throw std::invalid_argument("CT buffer size mismatch");
-    impl_->array->read_many({Index(start.begin(), start.end())},
+    impl_->opened.array->read_many({Index(start.begin(), start.end())},
                            {Index(shape.begin(), shape.end())}, {out.data()});
 }
 
@@ -296,7 +230,7 @@ std::vector<std::array<float, 4>> CtReader::sheetNormals(std::span<const std::ar
                 buffers.push_back(patches.data() + i * patchSize);
             }
         }
-        if (!starts.empty()) impl_->array->read_many(starts, sizes, buffers);
+        if (!starts.empty()) impl_->opened.array->read_many(starts, sizes, buffers);
         sheetNormalsCpu(patches, centers, std::span(out).subspan(base, count));
     }
     return out;
