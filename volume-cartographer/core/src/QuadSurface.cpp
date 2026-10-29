@@ -313,10 +313,9 @@ void moveSubdirectoriesBack(const std::vector<std::filesystem::path>& names,
 }
 
 // A segment directory can hold subfolders that are not part of the tifxyz
-// data, such as the ink-detections/ folder VC3D downloads for catalog
-// segments, or label zarrs. writeDataToDirectory() does not recreate them, so
-// move each one into the new generation before the old directory is replaced
-// and deleted. Both paths share a parent, so each move is a rename. Returns
+// data, such as label zarrs or an ink map folder. writeDataToDirectory() does
+// not recreate them, so move each one into the new generation before the old
+// directory is replaced and deleted. Both paths share a parent, so each move is a rename. Returns
 // the moved names; on failure it moves them back and throws before anything
 // has been deleted.
 std::vector<std::filesystem::path> keepSubdirectories(

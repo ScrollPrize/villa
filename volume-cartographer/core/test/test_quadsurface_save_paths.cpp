@@ -141,13 +141,13 @@ TEST_CASE("saving over a segment keeps its subfolders")
     auto segDir = root / "seg";
     QuadSurface(grid(), cv::Vec2f(1.f, 1.f)).save(segDir);
 
-    // What VC3D keeps inside a catalog segment, and a label zarr.
+    // An ink map folder and a label zarr kept inside a segment folder.
     fs::create_directories(segDir / "ink-detections");
     std::ofstream(segDir / "ink-detections" / "ink_detection.png") << "png";
     fs::create_directories(segDir / "seg_inklabels.zarr" / "0");
     std::ofstream(segDir / "seg_inklabels.zarr" / "0" / ".zarray") << "{}";
 
-    SUBCASE("saveOverwrite (VC3D edits and autosave)")
+    SUBCASE("saveOverwrite (vc_merge_patch)")
     {
         QuadSurface loaded(segDir);
         loaded.ensureLoaded();
