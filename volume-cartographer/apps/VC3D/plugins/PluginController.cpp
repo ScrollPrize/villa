@@ -2,14 +2,12 @@
 
 #include "CState.hpp"
 #include "CommandLineToolRunner.hpp"
-#include "OpenDataSegmentCache.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 
 #include "vc/core/PointCollections.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Umbilicus.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 #include <QAction>
@@ -53,10 +51,8 @@ QString kindDescription(ResultKind kind)
     switch (kind) {
         case ResultKind::None: return QObject::tr("nothing is loaded");
         case ResultKind::File: return QObject::tr("VC3D shows the file it writes");
-        case ResultKind::Segment: return QObject::tr("the segment it writes is attached to the project");
-        case ResultKind::InkOverlay: return QObject::tr("the image it writes is added to the active segment's ink detections");
+        case ResultKind::InkOverlay: return QObject::tr("the image it writes is shown as the active segment's ink overlay");
         case ResultKind::Points: return QObject::tr("the point collections it writes are added");
-        case ResultKind::Umbilicus: return QObject::tr("the umbilicus it writes becomes the project's umbilicus");
     }
     return {};
 }
@@ -149,9 +145,8 @@ PluginContext PluginController::gatherContext() const
             ctx.segmentId = QString::fromStdString(state->activeSurfaceId());
         }
     }
-    if (auto pkg = state->vpkg()) {
-        ctx.project = QString::fromStdString(pkg->getVolpkgDirectory());
-        ctx.umbilicus = QString::fromStdString(pkg->umbilicusPath().string());
+    if (state->hasVpkg()) {
+        ctx.project = state->projectDirectory();
     }
     if (POI* focus = state->poi("focus")) {
         ctx.point = std::array<double, 3>{focus->p[0], focus->p[1], focus->p[2]};
@@ -214,7 +209,7 @@ bool PluginController::run(const QString& pluginId)
 
     if (!QDir().mkpath(outputDir)) return warn(tr("Cannot create the output folder %1").arg(outputDir));
 
-    Run run{manifest, program, expansion.args, outputDir, expansion.resultPath, ctx.segment, ctx.segmentId};
+    Run run{manifest, program, expansion.args, outputDir, expansion.resultPath, ctx.segmentId};
     writeRecord(run, QStringLiteral("started"));
 
     QPointer<PluginController> guard(this);
@@ -296,31 +291,21 @@ QString PluginController::loadResult(const Run& run)
         case ResultKind::File:
             return tr("%1 wrote %2").arg(m.name, run.resultPath);
 
-        case ResultKind::Segment: {
-            auto pkg = state ? state->vpkg() : nullptr;
-            if (!pkg) throw std::runtime_error("no project is open");
-            const auto error = vc::project::validateLocation(vc::project::Category::Segments, path);
-            if (!error.empty()) throw std::runtime_error("not a segment: " + error);
-            pkg->addSegmentsEntry(path);
-            if (_host.refreshProject) _host.refreshProject();
-            return tr("%1 attached segment %2").arg(m.name, run.resultPath);
-        }
-
         case ResultKind::InkOverlay: {
-            if (run.segmentDir.isEmpty()) {
+            if (run.segmentId.isEmpty()) {
                 throw std::runtime_error("no segment was active when the plugin started");
             }
-            vc3d::opendata::OpenDataInkDetectionEntry entry;
-            entry.label = QStringLiteral("%1 %2").arg(m.name, QFileInfo(run.outputDir).fileName()).toStdString();
-            entry.segmentId = run.segmentId.toStdString();
-            entry.artifactType = ("plugin:" + m.id).toStdString();
-            entry.localPath = std::filesystem::path(path);
-            vc3d::opendata::appendInkDetectionForSegmentDirectory(run.segmentDir.toStdString(), entry);
-            if (_host.inkOverlay) {
-                _host.inkOverlay->refreshAvailableDetections();
-                _host.inkOverlay->setSelectedPath(entry.localPath);
+            if (!state || state->activeSurfaceId() != run.segmentId.toStdString()) {
+                throw std::runtime_error("the active segment changed while the plugin ran");
             }
-            return tr("%1 added an ink detection to %2").arg(m.name, run.segmentId);
+            if (!_host.inkOverlay) throw std::runtime_error("the ink detection overlay is not available");
+            // Published detections come from the surface catalog; a plugin's
+            // image is shown for this session without being published.
+            _host.inkOverlay->setSelectedPath(std::filesystem::path(path));
+            if (!_host.inkOverlay->hasLoadedSelection()) {
+                throw std::runtime_error("the image could not be shown on the active segment");
+            }
+            return tr("%1 showed an ink overlay on %2").arg(m.name, run.segmentId);
         }
 
         case ResultKind::Points: {
@@ -360,27 +345,6 @@ QString PluginController::loadResult(const Run& run)
             return tr("%1 added %2 point(s) in %3 collection(s)").arg(m.name).arg(points).arg(collections);
         }
 
-        case ResultKind::Umbilicus: {
-            auto pkg = state ? state->vpkg() : nullptr;
-            if (!pkg) throw std::runtime_error("no project is open");
-            const auto info = vc::core::util::Umbilicus::LoadFileInfo(std::filesystem::path(path));
-            if (!info.metadataErrors.empty()) {
-                throw std::runtime_error("malformed umbilicus metadata: " + info.metadataErrors.front());
-            }
-            const auto current = pkg->umbilicusPath();
-            if (!current.empty() && current != std::filesystem::path(path)) {
-                const auto answer = QMessageBox::question(
-                    _host.parent, m.name,
-                    tr("Replace the attached umbilicus %1 with %2?")
-                        .arg(QString::fromStdString(current.string()), run.resultPath));
-                if (answer != QMessageBox::Yes) {
-                    return tr("%1 wrote %2; the attached umbilicus was kept").arg(m.name, run.resultPath);
-                }
-            }
-            pkg->setUmbilicus(path);
-            state->notifyUmbilicusChanged();
-            return tr("%1 attached umbilicus %2").arg(m.name, run.resultPath);
-        }
     }
     return {};
 }

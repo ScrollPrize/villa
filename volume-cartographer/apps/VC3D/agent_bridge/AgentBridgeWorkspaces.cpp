@@ -74,8 +74,6 @@ bool AgentBridgeServer::setCurrentWorkspace(const QString& id)
         _window->switchToMainWorkspace();
     else if (id == QLatin1String("lasagna"))
         _window->switchToLasagnaWorkspace();
-    else if (id == QLatin1String("fiber-slice"))
-        _window->switchToFiberSliceWorkspace();
     else
         _window->_workspaceTabs->setCurrentWidget(page);
     return true;

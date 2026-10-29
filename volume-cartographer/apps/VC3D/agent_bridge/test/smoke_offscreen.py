@@ -24,11 +24,9 @@ block forever.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
-import shutil
 import socket
 import sys
 import tempfile
@@ -75,16 +73,24 @@ def unique_name(tag: str) -> str:
 def launch(
     binary: str,
     name: str,
-    volpkg: str | None = None,
+    project: str | None = None,
     config_home: str | None = None,
 ) -> VC3DProcess:
     args = ["--agent-bridge", "--agent-bridge-name", name]
-    if volpkg is not None:
-        args.extend(["--volpkg", volpkg])
+    if project is not None:
+        args.extend(["--project", project])
     env = dict(OFFSCREEN_ENV)
     if config_home is not None:
+        config = Path(config_home)
+        config.mkdir(parents=True, exist_ok=True)
+        settings = config / "VC3D.ini"
+        if not settings.exists():
+            settings.write_text(
+                "[viewer]\nusername=bridge-smoke\nremote_cache_dir=" + str(config / "cache") +
+                "\n[project]\nshow_open_data_catalog_on_startup=false\nauto_open=0\n")
         env["XDG_CONFIG_HOME"] = config_home
         env["VC3D_CONFIG_DIR"] = config_home
+        env["XDG_DATA_HOME"] = str(config / "data")
     return VC3DProcess(
         binary,
         args,
@@ -159,27 +165,26 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
     return volume
 
 
-def create_test_segment(segment: Path, segment_id: str) -> Path:
-    segment.mkdir(parents=True)
-    (segment / "meta.json").write_text(json.dumps({
-        "type": "seg",
-        "uuid": segment_id,
-        "name": segment_id,
-        "format": "tifxyz",
-    }))
-    return segment
+def project_volumes(project: Path) -> list[dict]:
+    entries = json.loads(project.read_text())["volumes"]
+    for entry in entries:
+        if "://" not in entry["location"]:
+            entry["location"] = str((project.parent / entry["location"]).resolve())
+    return entries
 
 
-def create_test_project(root: Path) -> Path:
-    create_test_volume(root / "volumes" / "vol1", "vol1")
+def project_name(project: Path) -> str | None:
+    return json.loads(project.read_text())["name"]
 
-    volpkg = root / "smoke.volpkg.json"
-    volpkg.write_text(json.dumps({
-        "name": "smoke",
-        "version": 1,
-        "volumes": ["volumes"],
-    }))
-    return volpkg
+
+def create_test_project(client: BridgeClient, root: Path) -> Path:
+    """The smoke project: one local volume, made and opened through the bridge."""
+    volume = root / "volumes" / "vol1"
+    create_test_volume(volume, "vol1")
+    project = root / "smoke.vcproj"
+    client.call("project.create", {"path": str(project), "volume": str(volume)}, timeout=RPC_TIMEOUT)
+    client.call("volume.open", {"path": str(project)}, timeout=RPC_TIMEOUT)
+    return project
 
 
 def wait_for_job(
@@ -215,23 +220,6 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
         return True, f"code=-32602 param={got!r}"
     except Exception as e:  # noqa: BLE001
         return False, f"unexpected {type(e).__name__}: {e}"
-
-
-def expect_prevalidation_accepts(
-    client: BridgeClient,
-    method: str,
-    params: object,
-) -> tuple[bool, str]:
-    try:
-        client.call(method, params, timeout=RPC_TIMEOUT)
-        return True, "request passed descriptor validation"
-    except BridgeError as error:
-        return (
-            error.code != -32602,
-            f"request reached handler precondition code={error.code}",
-        )
-    except Exception as error:  # noqa: BLE001
-        return False, f"unexpected {type(error).__name__}: {error}"
 
 
 def check_rpc_describe(
@@ -302,10 +290,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 141
-            and coverage.get("registered") == 141
+            and coverage.get("described") == 112
+            and coverage.get("registered") == 112
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 141
+            and len(snapshot["methods"]) == 112
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -358,13 +346,6 @@ def check_rpc_describe(
     )
     results.record("render_scale_float_range", ok, detail)
 
-    ok, detail = expect_prevalidation_accepts(
-        client,
-        "atlas.search_start",
-        {"requiredTags": None, "excludedTags": None},
-    )
-    results.record("atlas_null_tag_filters", ok, detail)
-
 
 def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
     failures: list[str] = []
@@ -386,11 +367,9 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
                 "intersectionOpacity": 7.5,
                 "intersectionThickness": -7.5,
                 "overlayOpacity": -7.5,
-                "intersectionMaxSurfaces": -7,
                 "volumeWindow": {"low": 10, "high": 5},
                 "normalArrowLengthScale": 7.5,
                 "normalMaxArrows": 107,
-                "samplingStride": -7,
                 "zScrollSensitivity": 107,
             },
             timeout=RPC_TIMEOUT,
@@ -399,12 +378,10 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
             "intersectionOpacity": 1,
             "intersectionThickness": 0,
             "overlayOpacity": 0,
-            "intersectionMaxSurfaces": 0,
             "volumeWindow.low": 10,
             "volumeWindow.high": 11,
             "normalArrowLengthScale": 2,
             "normalMaxArrows": 100,
-            "samplingStride": 1,
             "zScrollSensitivity": 100,
         }.items():
             expect(render, path, expected)
@@ -680,8 +657,8 @@ def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -
         stop.set()
         pinger.join(timeout=RPC_TIMEOUT)
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        if after.get("vpkg") != before.get("vpkg"):
-            failures.append(f"project changed: {after.get('vpkg')}")
+        if after.get("project") != before.get("project"):
+            failures.append(f"project changed: {after.get('project')}")
         if not pings or any(p != "ok" for p in pings):
             failures.append(f"pings={pings[-3:]}")
         detail = f"dismissed={[(e.get('class'), e.get('answer')) for e in opened]} pings={len(pings)}"
@@ -965,17 +942,15 @@ def check_screenshot_targets(client: BridgeClient, results: Results) -> None:
 WORKSPACE_IDS = (
     "main",
     "lasagna",
-    "atlas",
-    "fiber-slice",
-    "intersections",
     "spiral",
     "fiber-map",
+    "project",
 )
 
 
 def check_workspaces(client: BridgeClient, results: Results) -> None:
-    """workspace.switch reaches every tab, each id is present in this build,
-    and the original fiber_slice spelling still works."""
+    """workspace.switch reaches every tab and each id is present in this
+    build."""
     failures: list[str] = []
     try:
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -997,10 +972,6 @@ def check_workspaces(client: BridgeClient, results: Results) -> None:
             if previous is not None and result.get("previous") != previous:
                 failures.append(f"{workspace_id}: previous={result.get('previous')}")
             previous = workspace_id
-        legacy, _ = client.call(
-            "workspace.switch", {"name": "fiber_slice"}, timeout=RPC_TIMEOUT)
-        if legacy.get("workspace") != "fiber-slice":
-            failures.append(f"fiber_slice alias -> {legacy}")
         client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
     except Exception as error:  # noqa: BLE001
         failures.append(f"{type(error).__name__}: {error}")
@@ -1036,7 +1007,7 @@ def check_project_create(
 ) -> None:
     volume = root / "volumes" / "vol1"
     requested = root / "created" / "agent-project"
-    created = requested.with_suffix(".volpkg.json")
+    created = requested.with_suffix(".vcproj")
 
     try:
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -1050,30 +1021,25 @@ def check_project_create(
             timeout=RPC_TIMEOUT,
         )
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        document = json.loads(created.read_text())
-        volume_entry = document.get("volumes", [{}])[0]
         valid = (
             result == {
                 "path": str(created),
                 "name": "agent-project",
+                "store": str(created.with_suffix(".vcobj")),
                 "volume": str(volume),
             }
-            and document.get("name") == "agent-project"
-            and document.get("version") == 1
-            and volume_entry == {
+            and project_name(created) == "agent-project"
+            and project_volumes(created) == [{
                 "location": str(volume),
                 "tags": ["source:smoke"],
-            }
-            and document.get("segments") == []
-            and document.get("normal_grids") == []
-            and document.get("lasagna_datasets") == []
-            and after.get("vpkg") == before.get("vpkg")
+            }]
+            and after.get("project") == before.get("project")
         )
         results.record(
             "project_create",
             valid,
             f"path={result.get('path')} session_unchanged="
-            f"{after.get('vpkg') == before.get('vpkg')}",
+            f"{after.get('project') == before.get('project')}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(
@@ -1127,7 +1093,7 @@ def check_project_create(
                 error.code == -32007
                 and error.data.get("kind") == "volume"
                 and expected_detail in detail
-                and not output.with_suffix(".volpkg.json").exists(),
+                and not output.with_suffix(".vcproj").exists(),
                 f"returned code={error.code} detail={detail!r}",
             )
         except Exception as error:  # noqa: BLE001
@@ -1186,11 +1152,31 @@ def check_project_create(
         )
 
 
+def check_project_workspace(client: BridgeClient, results: Results, root: Path) -> None:
+    """The Project tab opens over the open project (its stores, volumes and
+    caches are read when it is shown) and main is reachable again."""
+    shot = root / "project-tab.png"
+    try:
+        switched, _ = client.call("workspace.switch", {"name": "project"}, timeout=RPC_TIMEOUT)
+        client.call("screenshot.capture", {"target": "window", "filePath": str(shot)}, timeout=RPC_TIMEOUT)
+        back, _ = client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        results.record(
+            "project_workspace",
+            switched.get("workspace") == "project"
+            and back.get("workspace") == "main"
+            and back.get("previous") == "project"
+            and shot.is_file() and shot.stat().st_size > 0,
+            f"switched={switched} back={back} shot={shot.is_file()}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("project_workspace", False, f"{type(error).__name__}: {error}")
+
+
 def check_volume_attach(
     client: BridgeClient,
     results: Results,
     root: Path,
-    volpkg: Path,
+    project: Path,
 ) -> None:
     overlay = create_test_volume(root / "overlays" / "vol2", "vol2")
     conflict = create_test_volume(root / "conflicts" / "vol2", "vol2")
@@ -1202,19 +1188,18 @@ def check_volume_attach(
             timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
-        document = json.loads(volpkg.read_text())
         result = terminal.get("result") or {}
         results.record(
-            "volume_attach_existing_relative_entry",
+            "volume_attach_existing_entry",
             terminal.get("state") == "succeeded"
             and result.get("attached") is False
             and result.get("alreadyAttached") is True
-            and document.get("volumes") == ["volumes"],
+            and project_volumes(project) == [{"location": str(root / "volumes" / "vol1"), "tags": []}],
             f"state={terminal.get('state')} result={result}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(
-            "volume_attach_existing_relative_entry",
+            "volume_attach_existing_entry",
             False,
             f"{type(error).__name__}: {error}",
         )
@@ -1261,8 +1246,7 @@ def check_volume_attach(
             f"render_opacity={render_result.get('overlayOpacity')} "
             f"overlay_opacity={overlay_after_render.get('opacity')}",
         )
-        document = json.loads(volpkg.read_text())
-        entries = document.get("volumes", [])
+        entries = project_volumes(project)
         attached_entry = next(
             (
                 entry
@@ -1317,7 +1301,7 @@ def check_volume_attach(
         )
         client.call(
             "volume.open",
-            {"path": str(volpkg)},
+            {"path": str(project)},
             timeout=RPC_TIMEOUT,
         )
         restored_overlay, _ = client.call(
@@ -1341,10 +1325,9 @@ def check_volume_attach(
             timeout=RPC_TIMEOUT,
         )
         terminal = wait_for_job(client, retry["jobId"])
-        document = json.loads(volpkg.read_text())
         matching = [
             entry
-            for entry in document.get("volumes", [])
+            for entry in project_volumes(project)
             if isinstance(entry, dict) and entry.get("location") == str(overlay)
         ]
         result = terminal.get("result") or {}
@@ -1374,10 +1357,9 @@ def check_volume_attach(
         )
         terminal = wait_for_job(client, started["jobId"])
         volumes, _ = client.call("volume.list", {}, timeout=RPC_TIMEOUT)
-        document = json.loads(volpkg.read_text())
         persisted = [
             entry
-            for entry in document.get("volumes", [])
+            for entry in project_volumes(project)
             if isinstance(entry, dict) and entry.get("location") == str(conflict)
         ]
         results.record(
@@ -1430,278 +1412,6 @@ def check_volume_attach(
     results.record("volume_attach_absolute_path", ok, detail)
 
 
-def check_segments_attach(
-    client: BridgeClient,
-    results: Results,
-    root: Path,
-    volpkg: Path,
-) -> None:
-    initial = root / "initial-segments"
-    create_test_segment(initial / "initial-segment", "initial-segment")
-    source = root / "user-segments"
-    segment_id = "20241113080880"
-    shutil.copytree(
-        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
-        source / segment_id,
-    )
-
-    try:
-        initial_result, _ = client.call(
-            "segments.attach",
-            {"location": str(initial) + os.sep},
-            timeout=RPC_TIMEOUT,
-        )
-        result, _ = client.call(
-            "segments.attach",
-            {
-                "location": str(source),
-                "tags": ["source:smoke", "status:working"],
-            },
-            timeout=RPC_TIMEOUT,
-        )
-        listed, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
-        document = json.loads(volpkg.read_text())
-        initial_locations = {
-            entry.get("location") if isinstance(entry, dict) else entry
-            for entry in document.get("segments", [])
-        }
-        matching = [
-            entry
-            for entry in document.get("segments", [])
-            if isinstance(entry, dict) and entry.get("location") == str(source)
-        ]
-        ids = {segment.get("id") for segment in listed.get("segments", [])}
-        valid = (
-            initial_result.get("location") == str(initial)
-            and str(initial) in initial_locations
-            and result == {
-                "attached": True,
-                "alreadyAttached": False,
-                "location": str(source),
-                "projectPath": str(volpkg),
-                "selected": True,
-            }
-            and segment_id in ids
-            and matching == [{
-                "location": str(source),
-                "tags": ["source:smoke", "status:working"],
-            }]
-        )
-        results.record(
-            "segments_attach_local_source",
-            valid,
-            f"initial={initial_result} initial_locations={initial_locations} "
-            f"result={result} ids={sorted(value for value in ids if value)}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_local_source",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-        return
-
-    try:
-        retry, _ = client.call(
-            "segments.attach",
-            {"location": str(source) + os.sep},
-            timeout=RPC_TIMEOUT,
-        )
-        document = json.loads(volpkg.read_text())
-        matching = [
-            entry
-            for entry in document.get("segments", [])
-            if isinstance(entry, dict) and entry.get("location") == str(source)
-        ]
-        results.record(
-            "segments_attach_idempotent",
-            retry.get("attached") is False
-            and retry.get("alreadyAttached") is True
-            and retry.get("selected") is True
-            and matching == [{
-                "location": str(source),
-                "tags": ["source:smoke", "status:working"],
-            }],
-            f"result={retry}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_idempotent",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-
-    try:
-        client.call(
-            "volume.open",
-            {"path": str(volpkg)},
-            timeout=RPC_TIMEOUT,
-        )
-        reopened, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
-        retry, _ = client.call(
-            "segments.attach",
-            {"location": str(source)},
-            timeout=RPC_TIMEOUT,
-        )
-        document = json.loads(volpkg.read_text())
-        matching = [
-            entry
-            for entry in document.get("segments", [])
-            if isinstance(entry, dict) and entry.get("location") == str(source)
-        ]
-        ids = {
-            segment.get("id")
-            for segment in reopened.get("segments", [])
-        }
-        results.record(
-            "segments_attach_reopen",
-            segment_id in ids
-            and retry.get("alreadyAttached") is True
-            and retry.get("selected") is True
-            and matching == [{
-                "location": str(source),
-                "tags": ["source:smoke", "status:working"],
-            }],
-            f"ids={sorted(value for value in ids if value)} retry={retry}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_reopen",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-
-    editing_enabled = False
-    try:
-        client.call(
-            "segments.activate",
-            {"segmentId": segment_id},
-            timeout=RPC_TIMEOUT,
-        )
-        client.call(
-            "segmentation.enable_editing",
-            {"enabled": True},
-            timeout=RPC_TIMEOUT,
-        )
-        editing_enabled = True
-        blocked = root / "blocked-segments"
-        create_test_segment(blocked / "blocked-segment", "blocked-segment")
-        before = json.loads(volpkg.read_text())
-        try:
-            client.call(
-                "segments.attach",
-                {"location": str(blocked), "select": False},
-                timeout=RPC_TIMEOUT,
-            )
-            results.record(
-                "segments_attach_editing_guard",
-                False,
-                "expected an error, got a result",
-            )
-        except BridgeError as error:
-            after = json.loads(volpkg.read_text())
-            results.record(
-                "segments_attach_editing_guard",
-                error.code == -32004 and after == before,
-                f"returned code={error.code} project_unchanged={after == before}",
-            )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_editing_guard",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-    finally:
-        if editing_enabled:
-            try:
-                client.call(
-                    "segmentation.enable_editing",
-                    {"enabled": False},
-                    timeout=RPC_TIMEOUT,
-                )
-            except Exception as error:  # noqa: BLE001
-                results.record(
-                    "segments_attach_editing_cleanup",
-                    False,
-                    f"{type(error).__name__}: {error}",
-                )
-
-    conflicting = root / "other" / source.name.upper()
-    create_test_segment(
-        conflicting / "conflicting-segment", "conflicting-segment")
-    before = json.loads(volpkg.read_text())
-    try:
-        client.call(
-            "segments.attach",
-            {"location": str(conflicting)},
-            timeout=RPC_TIMEOUT,
-        )
-        results.record(
-            "segments_attach_source_name_conflict",
-            False,
-            "expected an error, got a result",
-        )
-    except BridgeError as error:
-        after = json.loads(volpkg.read_text())
-        results.record(
-            "segments_attach_source_name_conflict",
-            error.code == -32010
-            and error.data.get("sourceName") == source.name.upper()
-            and after == before,
-            f"returned code={error.code} project_unchanged={after == before}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_source_name_conflict",
-            False,
-            f"unexpected {type(error).__name__}: {error}",
-        )
-
-    ok, detail = expect_param_error(
-        client,
-        "segments.attach",
-        {"location": "relative/segments"},
-        "location",
-    )
-    results.record("segments_attach_absolute_path", ok, detail)
-
-    try:
-        client.call(
-            "segments.attach",
-            {"location": str(root / "missing-segments")},
-            timeout=RPC_TIMEOUT,
-        )
-        results.record(
-            "segments_attach_invalid_layout",
-            False,
-            "expected an error, got a result",
-        )
-    except BridgeError as error:
-        results.record(
-            "segments_attach_invalid_layout",
-            error.code == -32007,
-            f"returned code={error.code}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segments_attach_invalid_layout",
-            False,
-            f"unexpected {type(error).__name__}: {error}",
-        )
-
-
-SMOKE_SEGMENT_ID = "20241113080880"
-
-
-def smoke_segment_dir(root: Path) -> Path:
-    """The tifxyz fixture check_segments_attach copies into the project."""
-    return root / "user-segments" / SMOKE_SEGMENT_ID
-
-
-def file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def expect_bridge_error(
     client: BridgeClient,
     method: str,
@@ -1716,385 +1426,6 @@ def expect_bridge_error(
         return error.code == code, f"code={error.code} message={error.message}"
     except Exception as error:  # noqa: BLE001
         return False, f"unexpected {type(error).__name__}: {error}"
-
-
-def check_segment_transform(client: BridgeClient, results: Results, root: Path) -> None:
-    ok, detail = expect_param_error(
-        client,
-        "segment.transform",
-        {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_w"},
-        "op",
-    )
-    results.record("segment_transform_rejects_unknown_op", ok, detail)
-    ok, detail = expect_bridge_error(
-        client,
-        "segment.transform",
-        {"segmentId": "no-such-segment", "op": "flip_u"},
-        -32007,
-    )
-    results.record("segment_transform_unknown_segment", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segment.transform",
-        {"segmentId": SMOKE_SEGMENT_ID, "op": "rotate90"},
-        "confirm",
-    )
-    results.record("segment_transform_rotate_requires_confirm", ok, detail)
-
-    # The first save may re-encode the fixture's TIFFs, so compare saved
-    # states: four flips give A, B, A, B with A != B.
-    x_tif = smoke_segment_dir(root) / "x.tif"
-    try:
-        digests = []
-        replies = []
-        for _ in range(4):
-            reply, _ = client.call(
-                "segment.transform",
-                {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
-                timeout=RPC_TIMEOUT,
-            )
-            replies.append(reply)
-            digests.append(file_digest(x_tif))
-        ok = (
-            all(
-                reply == {
-                    "transformed": True,
-                    "segmentId": SMOKE_SEGMENT_ID,
-                    "op": "flip_u",
-                }
-                for reply in replies
-            )
-            and digests[0] == digests[2]
-            and digests[1] == digests[3]
-            and digests[0] != digests[1]
-        )
-        results.record(
-            "segment_transform_flip_roundtrip",
-            ok,
-            f"replies={replies[0]} digests={[d[:12] for d in digests]}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "segment_transform_flip_roundtrip",
-            False,
-            f"{type(error).__name__}: {error}",
-        )
-
-
-def check_segment_export(client: BridgeClient, results: Results, root: Path) -> None:
-    ok, detail = expect_param_error(
-        client,
-        "segment.export_obj",
-        {"segmentId": SMOKE_SEGMENT_ID, "outputPath": "relative/seg.obj"},
-        "outputPath",
-    )
-    results.record("segment_export_obj_requires_absolute_obj_path", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segment.rasterize",
-        {"segmentIds": [SMOKE_SEGMENT_ID], "zMin": 10, "zMax": 10},
-        "zMax",
-    )
-    results.record("segment_rasterize_rejects_empty_z_range", ok, detail)
-    ok, detail = expect_bridge_error(
-        client,
-        "segment.rasterize",
-        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
-        -32007,
-    )
-    results.record("segment_rasterize_unknown_segment", ok, detail)
-
-    obj_path = root / "exports" / f"{SMOKE_SEGMENT_ID}.obj"
-    params = {"segmentId": SMOKE_SEGMENT_ID, "outputPath": str(obj_path)}
-    try:
-        result, _ = client.call("segment.export_obj", params, timeout=RPC_TIMEOUT)
-        status = wait_for_job(client, result["jobId"], timeout=120.0)
-        ok = (
-            result.get("outputPath") == str(obj_path)
-            and status.get("state") == "succeeded"
-            and status.get("outputPath") == str(obj_path)
-            and obj_path.is_file()
-        )
-        results.record("segment_export_obj_job", ok, f"result={result} status={status}")
-    except BridgeError as error:
-        # A build without vc_tifxyz2obj reports the missing tool explicitly.
-        results.record("segment_export_obj_job", error.code == -32006,
-                       f"code={error.code} message={error.message}")
-        return
-    except Exception as error:  # noqa: BLE001
-        results.record("segment_export_obj_job", False,
-                       f"{type(error).__name__}: {error}")
-        return
-    if obj_path.is_file():
-        ok, detail = expect_bridge_error(client, "segment.export_obj", params, -32005)
-        results.record("segment_export_obj_refuses_existing_file", ok, detail)
-
-
-def check_segment_tool_operations(client: BridgeClient, results: Results) -> None:
-    ok, detail = expect_bridge_error(
-        client,
-        "segment.neighbor_copy",
-        {"segmentId": SMOKE_SEGMENT_ID, "direction": "out",
-         "volumeId": "no-such-volume"},
-        -32007,
-    )
-    results.record("segment_neighbor_copy_unknown_volume", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segments.merge",
-        {"segmentIds": [SMOKE_SEGMENT_ID]},
-        "segmentIds",
-    )
-    results.record("segments_merge_needs_two_segments", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segments.merge",
-        {"grid": [[SMOKE_SEGMENT_ID, "initial-segment"]],
-         "ransacMinThresh": 10, "ransacMaxThresh": 5},
-        "ransacMinThresh",
-    )
-    results.record("segments_merge_rejects_inverted_thresholds", ok, detail)
-    ok, detail = expect_bridge_error(
-        client,
-        "segments.merge",
-        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
-        -32007,
-    )
-    results.record("segments_merge_unknown_segment", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segments.patch",
-        {"segmentIds": [SMOKE_SEGMENT_ID, SMOKE_SEGMENT_ID], "confirm": True},
-        "segmentIds",
-    )
-    results.record("segments_patch_needs_two_distinct_segments", ok, detail)
-    ok, detail = expect_param_error(
-        client,
-        "segments.patch",
-        {"segmentIds": [SMOKE_SEGMENT_ID, "initial-segment"]},
-        "confirm",
-    )
-    results.record("segments_patch_requires_confirm", ok, detail)
-
-
-def check_segment_backups(client: BridgeClient, results: Results, root: Path) -> None:
-    """Seeds backup slot 0 by hand, changes the segment, then restores it."""
-    segment = smoke_segment_dir(root)
-    backups = root / "backups" / segment.name
-    slot = backups / "0"
-    try:
-        slot.mkdir(parents=True, exist_ok=True)
-        for item in segment.iterdir():
-            if item.is_file():
-                shutil.copy2(item, slot / item.name)
-        backup_digest = file_digest(slot / "x.tif")
-        client.call(
-            "segment.transform",
-            {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
-            timeout=RPC_TIMEOUT,
-        )
-        changed_digest = file_digest(segment / "x.tif")
-    except Exception as error:  # noqa: BLE001
-        results.record("segment_restore_backup_roundtrip", False,
-                       f"setup {type(error).__name__}: {error}")
-        return
-
-    try:
-        client.call(
-            "segment.restore_backup",
-            {"segmentId": SMOKE_SEGMENT_ID, "index": 0},
-            timeout=RPC_TIMEOUT,
-        )
-        results.record("segment_restore_backup_lists_without_confirm", False,
-                       "restore ran without confirm")
-    except BridgeError as error:
-        available = error.data.get("available") or []
-        ok = (
-            error.code == -32602
-            and error.data.get("param") == "confirm"
-            and [entry.get("index") for entry in available] == [0]
-            and file_digest(segment / "x.tif") == changed_digest
-        )
-        results.record("segment_restore_backup_lists_without_confirm", ok,
-                       f"code={error.code} available={available}")
-    ok, detail = expect_bridge_error(
-        client,
-        "segment.restore_backup",
-        {"segmentId": SMOKE_SEGMENT_ID, "index": 9, "confirm": True},
-        -32007,
-    )
-    results.record("segment_restore_backup_unknown_index", ok, detail)
-
-    try:
-        restored, _ = client.call(
-            "segment.restore_backup",
-            {"segmentId": SMOKE_SEGMENT_ID, "index": 0, "confirm": True},
-            timeout=RPC_TIMEOUT,
-        )
-        listed = [entry.get("index") for entry in restored.get("backups", [])]
-        snapshot = backups / "1" / "x.tif"
-        ok = (
-            restored.get("restored") is True
-            and changed_digest != backup_digest
-            and file_digest(segment / "x.tif") == backup_digest
-            and listed == [0, 1]
-            and snapshot.is_file()
-            and file_digest(snapshot) == changed_digest
-        )
-        results.record(
-            "segment_restore_backup_roundtrip",
-            ok,
-            f"restored={restored} digests backup={backup_digest[:12]} "
-            f"changed={changed_digest[:12]} now={file_digest(segment / 'x.tif')[:12]}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record("segment_restore_backup_roundtrip", False,
-                       f"{type(error).__name__}: {error}")
-
-    ok, detail = expect_bridge_error(
-        client,
-        "segments.move_to_paths",
-        {"segmentId": SMOKE_SEGMENT_ID, "confirm": True},
-        -32009,
-    )
-    results.record("segments_move_to_paths_needs_traces_directory", ok, detail)
-
-
-def project_document(path: Path) -> dict:
-    return json.loads(path.read_text())
-
-
-def entry_locations(document: dict, key: str) -> list[str]:
-    return [
-        entry.get("location") if isinstance(entry, dict) else entry
-        for entry in document.get(key, [])
-    ]
-
-
-def check_project_attachments(
-    client: BridgeClient,
-    results: Results,
-    root: Path,
-    volpkg: Path,
-) -> None:
-    umbilicus = root / "umbilicus.json"
-    umbilicus.write_text(json.dumps(
-        [{"z": z, "y": 8.0, "x": 8.0} for z in (0.0, 8.0, 15.0)]))
-    grid = root / "grids" / "ng"
-    for plane in ("xy", "xz", "yz"):
-        (grid / plane).mkdir(parents=True, exist_ok=True)
-    (grid / "metadata.json").write_text(json.dumps({}))
-
-    def attach(kind: str, location: str) -> dict:
-        reply, _ = client.call(
-            "project.attach", {"kind": kind, "location": location},
-            timeout=RPC_TIMEOUT)
-        return reply
-
-    ok, detail = expect_param_error(
-        client, "project.attach",
-        {"kind": "normal_grid", "location": "relative/grids"}, "location")
-    results.record("project_attach_requires_absolute_path", ok, detail)
-    ok, detail = expect_bridge_error(
-        client, "project.attach",
-        {"kind": "normal_grid", "location": "S3://bucket/grids"}, -32007)
-    results.record("project_attach_refuses_remote_normal_grid", ok, detail)
-
-    try:
-        first = attach("umbilicus", str(umbilicus))
-        again = attach("umbilicus", str(root / "grids" / ".." / "umbilicus.json"))
-        grid_first = attach("normal_grid", str(grid))
-        grid_again = attach("normal_grid", str(grid) + os.sep)
-        document = project_document(volpkg)
-        ok = (
-            first.get("attached") is True
-            and again.get("alreadyAttached") is True
-            and again.get("location") == first.get("location")
-            and document.get("umbilicus") == str(umbilicus)
-            and grid_first.get("attached") is True
-            and grid_again.get("alreadyAttached") is True
-            and entry_locations(document, "normal_grids").count(str(grid)) == 1
-        )
-        results.record(
-            "project_attach_idempotent_across_spellings", ok,
-            f"umbilicus={first}/{again} grid={grid_first}/{grid_again}")
-    except Exception as error:  # noqa: BLE001
-        results.record("project_attach_idempotent_across_spellings", False,
-                       f"{type(error).__name__}: {error}")
-
-    # Reopen: the attachments come back from the project file.
-    try:
-        client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
-        umbilicus_reopened = attach("umbilicus", str(umbilicus))
-        grid_reopened = attach("normal_grid", str(grid))
-        ok = (
-            umbilicus_reopened.get("alreadyAttached") is True
-            and grid_reopened.get("alreadyAttached") is True
-        )
-        results.record("project_attachments_survive_reopen", ok,
-                       f"umbilicus={umbilicus_reopened} grid={grid_reopened}")
-    except Exception as error:  # noqa: BLE001
-        results.record("project_attachments_survive_reopen", False,
-                       f"{type(error).__name__}: {error}")
-
-    ok, detail = expect_param_error(
-        client, "project.detach", {"kind": "umbilicus"}, "confirm")
-    results.record("project_detach_requires_confirm", ok, detail)
-    ok, detail = expect_bridge_error(
-        client, "project.detach",
-        {"kind": "normal_grid", "location": str(root / "missing"), "confirm": True},
-        -32007)
-    results.record("project_detach_unknown_entry", ok, detail)
-    try:
-        grid_detached, _ = client.call(
-            "project.detach",
-            {"kind": "normal_grid", "location": str(grid) + os.sep, "confirm": True},
-            timeout=RPC_TIMEOUT)
-        umbilicus_detached, _ = client.call(
-            "project.detach", {"kind": "umbilicus", "confirm": True},
-            timeout=RPC_TIMEOUT)
-        document = project_document(volpkg)
-        ok = (
-            grid_detached.get("detached") is True
-            and grid_detached.get("location") == str(grid)
-            and str(grid) not in entry_locations(document, "normal_grids")
-            and umbilicus_detached.get("detached") is True
-            and not document.get("umbilicus")
-            and grid.is_dir()
-            and umbilicus.is_file()
-        )
-        results.record("project_detach_by_any_spelling", ok,
-                       f"grid={grid_detached} umbilicus={umbilicus_detached}")
-    except Exception as error:  # noqa: BLE001
-        results.record("project_detach_by_any_spelling", False,
-                       f"{type(error).__name__}: {error}")
-
-    # Save As continues the session on the copy, like the File menu.
-    copy = root / "copy.volpkg.json"
-    try:
-        saved, _ = client.call("project.save_as", {"path": str(copy)},
-                               timeout=RPC_TIMEOUT)
-        ok, detail = expect_bridge_error(
-            client, "project.save_as", {"path": str(copy)}, -32005)
-        attach("umbilicus", str(umbilicus))
-        ok = (
-            ok
-            and saved.get("saved") is True
-            and saved.get("path") == str(copy)
-            and project_document(copy).get("umbilicus") == str(umbilicus)
-            and not project_document(volpkg).get("umbilicus")
-        )
-        results.record("project_save_as_switches_to_copy", ok,
-                       f"saved={saved} {detail}")
-    except Exception as error:  # noqa: BLE001
-        results.record("project_save_as_switches_to_copy", False,
-                       f"{type(error).__name__}: {error}")
-    finally:
-        try:
-            client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
-        except Exception as error:  # noqa: BLE001
-            results.record("project_reopen_original", False,
-                           f"{type(error).__name__}: {error}")
 
 
 def check_ink_overlay(client: BridgeClient, results: Results) -> None:
@@ -2253,12 +1584,10 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         settings, _ = client.call("segmentation.get_settings", {}, timeout=RPC_TIMEOUT)
         z_range = settings.get("zRange", {})
         ok = (
-            {"drag", "line", "pushPull", "growthMethod", "patchTracer",
-             "approvalMask"} <= set(settings)
-            and "umbilicus_path" not in settings.get("patchTracer", {})
+            {"drag", "pushPull", "growthMethod", "directionFields"} <= set(settings)
+            and not {"line", "patchTracer", "approvalMask"} & set(settings)
             and {"enabled", "min", "max"} <= set(z_range)
-            and settings.get("growthMethod") != "manual_add"
-            and 0.0 <= settings.get("approvalMask", {}).get("opacity", -1) <= 1.0
+            and settings.get("growthMethod") in ("tracer", "corrections")
         )
         results.record("segmentation_get_settings", ok, f"keys={sorted(settings)}")
     except Exception as error:  # noqa: BLE001
@@ -2307,9 +1636,8 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         results.record("segmentation_set_settings_round_trip", False,
                        f"{type(error).__name__}: {error}")
     ok, detail = expect_param_error(
-        client, "segmentation.set_settings",
-        {"patchTracer": {"no_such_parameter": 1}}, "patchTracer")
-    results.record("segmentation_set_settings_unknown_patch_key", ok, detail)
+        client, "segmentation.set_settings", {"growthMethod": "patch_tracer"}, "growthMethod")
+    results.record("segmentation_set_settings_growth_method_enum", ok, detail)
     ok, detail = expect_bridge_error(
         client, "segmentation.set_settings",
         {"growthVolumeId": "no-such-volume"}, -32007)
@@ -2318,247 +1646,41 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         client, "segmentation.set_settings",
         {"zRange": {"enabled": True, "min": 10, "max": 2}}, "zRange")
     results.record("segmentation_set_settings_z_range_order", ok, detail)
-    ok, detail = expect_bridge_error(
-        client, "segmentation.approval_mask.undo", {}, -32009)
-    results.record("approval_mask_undo_requires_mode", ok, detail)
 
 
-def check_open_data_editable_copy(
-    client: BridgeClient,
-    results: Results,
-    root: Path,
-    volpkg: Path,
-) -> None:
-    catalog_root = root / "catalog-segments"
-    catalog_folder = catalog_root / "published-L0"
-    segment_id = "20241113090990"
-    catalog_segment = catalog_folder / segment_id
-    shutil.copytree(
-        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
-        catalog_segment,
-    )
-    (catalog_segment / "catalog-origin.json").write_text("{}")
-    renamed_path = catalog_folder / "must-not-rename"
-
-    try:
-        project = json.loads(volpkg.read_text())
-        project.setdefault("segments", []).append({
-            "location": str(catalog_root),
-            "tags": [
-                "open-data",
-                "immutable",
-                "vc-open-data-segment-aggregate",
-                "vc-open-data-target-volume-id:vol1",
-            ],
-        })
-        project["output_segments"] = str(catalog_root)
-        volpkg.write_text(json.dumps(project))
-        client.call(
-            "volume.open",
-            {"path": str(volpkg)},
-            timeout=RPC_TIMEOUT,
-        )
-        client.call(
-            "segments.activate",
-            {"segmentId": segment_id},
-            timeout=RPC_TIMEOUT,
-        )
-
-        try:
-            client.call(
-                "segments.rename",
-                {"segmentId": segment_id, "newName": renamed_path.name},
-                timeout=RPC_TIMEOUT,
-            )
-            results.record(
-                "catalog_segment_rename_guard",
-                False,
-                "expected an immutable-cache error, got a result",
-            )
-        except BridgeError as error:
-            results.record(
-                "catalog_segment_rename_guard",
-                error.code == -32009
-                and error.data.get("action") == "segments.create_editable_copy"
-                and catalog_segment.is_dir()
-                and not renamed_path.exists(),
-                f"returned code={error.code} action={error.data.get('action')}",
-            )
-
-        started = time.monotonic()
-        try:
-            client.call(
-                "segmentation.enable_editing",
-                {"enabled": True},
-                timeout=RPC_TIMEOUT,
-            )
-            results.record(
-                "catalog_segment_editing_fails_fast",
-                False,
-                "expected an immutable-cache error, got a result",
-            )
-        except BridgeError as error:
-            elapsed = time.monotonic() - started
-            results.record(
-                "catalog_segment_editing_fails_fast",
-                error.code == -32009
-                and error.data.get("action") == "segments.create_editable_copy"
-                and elapsed < RPC_TIMEOUT,
-                f"returned code={error.code} action={error.data.get('action')} "
-                f"elapsed={elapsed:.3f}s",
-            )
-
-        copied, _ = client.call(
-            "segments.create_editable_copy",
-            {"segmentId": segment_id},
-            timeout=RPC_TIMEOUT,
-        )
-        editable_segment = Path(copied.get("path", ""))
-        editable_root = editable_segment.parent
-        project = json.loads(volpkg.read_text())
-        editable_entries = [
-            entry
-            for entry in project.get("segments", [])
-            if isinstance(entry, dict) and entry.get("location") == str(editable_root)
-        ]
-        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        active = state.get("activeSurface") or {}
-        listed, _ = client.call("segments.list", {}, timeout=RPC_TIMEOUT)
-        listed_active = next(
-            (segment for segment in listed.get("segments", []) if segment.get("active")),
-            {},
-        )
-        results.record(
-            "catalog_segment_create_editable_copy",
-            copied.get("created") is True
-            and copied.get("alreadyExisted") is False
-            and copied.get("activated") is True
-            and copied.get("sourcePath") == str(catalog_segment)
-            and editable_segment.is_dir()
-            and not (editable_segment / "catalog-origin.json").exists()
-            and (editable_segment / "x.tif").is_file()
-            and (editable_segment / "y.tif").is_file()
-            and (editable_segment / "z.tif").is_file()
-            and editable_entries == [{
-                "location": str(editable_root),
-                "tags": [
-                    "open-data-editable",
-                    "vc-open-data-target-volume-id:vol1",
-                ],
-            }]
-            and project.get("output_segments") == str(editable_root)
-            and active.get("id") == segment_id
-            and listed_active.get("id") == segment_id
-            and listed_active.get("path") == str(editable_segment),
-            f"result={copied} active={active} listed_active={listed_active} "
-            f"output_segments={project.get('output_segments')} "
-            f"entries={editable_entries}",
-        )
-
-        retried, _ = client.call(
-            "segments.create_editable_copy",
-            {"segmentId": segment_id},
-            timeout=RPC_TIMEOUT,
-        )
-        project_after_retry = json.loads(volpkg.read_text())
-        editable_entries_after_retry = [
-            entry
-            for entry in project_after_retry.get("segments", [])
-            if isinstance(entry, dict) and entry.get("location") == str(editable_root)
-        ]
-        listed_after_retry, _ = client.call(
-            "segments.list", {}, timeout=RPC_TIMEOUT
-        )
-        listed_active_after_retry = next(
-            (
-                segment
-                for segment in listed_after_retry.get("segments", [])
-                if segment.get("active")
-            ),
-            {},
-        )
-        results.record(
-            "catalog_segment_create_editable_copy_retry",
-            retried.get("created") is False
-            and retried.get("alreadyExisted") is True
-            and retried.get("activated") is True
-            and retried.get("sourcePath") == str(catalog_segment)
-            and retried.get("path") == str(editable_segment)
-            and editable_entries_after_retry == editable_entries
-            and project_after_retry.get("output_segments") == str(editable_root)
-            and listed_active_after_retry.get("id") == segment_id
-            and listed_active_after_retry.get("path") == str(editable_segment),
-            f"result={retried} listed_active={listed_active_after_retry} "
-            f"output_segments={project_after_retry.get('output_segments')} "
-            f"entries={editable_entries_after_retry}",
-        )
-
-        enabled, _ = client.call(
-            "segmentation.enable_editing",
-            {"enabled": True},
-            timeout=RPC_TIMEOUT,
-        )
-        results.record(
-            "editable_copy_can_enable_editing",
-            enabled.get("enabled") is True,
-            f"result={enabled}",
-        )
-        client.call(
-            "segmentation.enable_editing",
-            {"enabled": False},
-            timeout=RPC_TIMEOUT,
-        )
-
-        reopened, _ = client.call(
-            "volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT
-        )
-        listed_after_reopen, _ = client.call(
-            "segments.list", {}, timeout=RPC_TIMEOUT
-        )
-        reopened_segment = next(
-            (
-                segment
-                for segment in listed_after_reopen.get("segments", [])
-                if segment.get("id") == segment_id
-            ),
-            {},
-        )
-        client.call(
-            "segments.activate",
-            {"segmentId": segment_id},
-            timeout=RPC_TIMEOUT,
-        )
-        enabled_after_reopen, _ = client.call(
-            "segmentation.enable_editing",
-            {"enabled": True},
-            timeout=RPC_TIMEOUT,
-        )
-        project_after_reopen = json.loads(volpkg.read_text())
-        results.record(
-            "editable_copy_survives_reopen",
-            reopened.get("opened") is True
-            and reopened_segment.get("path") == str(editable_segment)
-            and project_after_reopen.get("output_segments") == str(editable_root)
-            and enabled_after_reopen.get("enabled") is True,
-            f"reopened={reopened} segment={reopened_segment} "
-            f"output_segments={project_after_reopen.get('output_segments')} "
-            f"editing={enabled_after_reopen}",
-        )
-        client.call(
-            "segmentation.enable_editing",
-            {"enabled": False},
-            timeout=RPC_TIMEOUT,
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "catalog_segment_editable_copy_workflow",
-            False,
-            f"unexpected {type(error).__name__}: {error}",
-        )
+def check_segment_operations(client: BridgeClient, results: Results) -> None:
+    """Validation of the segment operations that needs no segment in the
+    store: unknown ids, malformed requests and missing confirmations are
+    refused before any tool starts."""
+    missing = "no-such-segment"
+    ok, detail = expect_param_error(
+        client, "segment.transform", {"segmentId": missing, "op": "flip_w"}, "op")
+    results.record("segment_transform_rejects_unknown_op", ok, detail)
+    for method, params, name in (
+        ("segment.transform", {"segmentId": missing, "op": "flip_u"},
+         "segment_transform_unknown_segment"),
+        ("segment.export_obj", {"segmentId": missing},
+         "segment_export_obj_unknown_segment"),
+        ("segment.rasterize", {"segmentIds": [missing]},
+         "segment_rasterize_unknown_segment"),
+        ("segment.neighbor_copy", {"segmentId": missing, "direction": "out"},
+         "segment_neighbor_copy_unknown_segment"),
+    ):
+        ok, detail = expect_bridge_error(client, method, params, -32007)
+        results.record(name, ok, detail)
+    ok, detail = expect_param_error(
+        client, "segments.merge", {"segmentIds": [missing]}, "segmentIds")
+    results.record("segments_merge_needs_two_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client, "segments.patch",
+        {"segmentIds": [missing, missing], "confirm": True}, "segmentIds")
+    results.record("segments_patch_needs_two_distinct_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client, "segments.patch", {"segmentIds": [missing, "other-segment"]}, "confirm")
+    results.record("segments_patch_requires_confirm", ok, detail)
 
 
-def check_c4(client: BridgeClient, results: Results, volpkg: str,
-             broken_fiber_volpkg: str) -> None:
+def check_c4(client: BridgeClient, results: Results, project: str) -> None:
     # Liveness / dispatch sanity.
     try:
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
@@ -2652,7 +1774,7 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         client.call(
             "volume.open",
-            {"path": "/vc3d-smoke/does-not-exist.volpkg.json"},
+            {"path": "/vc3d-smoke/does-not-exist.vcproj"},
             timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_failure_is_headless", False,
@@ -2666,9 +1788,9 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
 
     try:
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        preserved = before is not None and after.get("project") == before.get("project")
         results.record("volume_open_failure_preserves_project", preserved,
-                       f"vpkg unchanged={preserved}")
+                       f"project unchanged={preserved}")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_failure_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
@@ -2676,56 +1798,20 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     try:
         client.call(
             "volume.open",
-            {"path": volpkg, "volumeId": "missing-volume"},
+            {"path": project, "volumeId": "missing-volume"},
             timeout=RPC_TIMEOUT,
         )
         results.record("volume_open_unknown_id_preserves_project", False,
                        "expected a bridge error, got a result")
     except BridgeError as e:
         after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        preserved = before is not None and after.get("vpkg") == before.get("vpkg")
+        preserved = before is not None and after.get("project") == before.get("project")
         results.record("volume_open_unknown_id_preserves_project",
                        e.code == -32007 and preserved,
-                       f"code={e.code} vpkg unchanged={preserved}")
+                       f"code={e.code} project unchanged={preserved}")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_unknown_id_preserves_project", False,
                        f"unexpected {type(e).__name__}: {e}")
-
-    try:
-        opened, _ = client.call(
-            "volume.open", {"path": broken_fiber_volpkg}, timeout=RPC_TIMEOUT)
-        results.record(
-            "volume_open_broken_fibers_is_headless",
-            opened.get("opened") is True,
-            "project fiber files are not loaded or repaired",
-        )
-    except Exception as e:  # noqa: BLE001
-        results.record("volume_open_broken_fibers_is_headless", False,
-                       f"unexpected {type(e).__name__}: {e}")
-
-    try:
-        client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        results.record("fiber_save_requires_attachment", False, "unexpected success without a store")
-    except BridgeError as error:
-        results.record("fiber_save_requires_attachment", error.code == -32000, str(error))
-
-
-def check_project_fiber_files_untouched(client: BridgeClient, results: Results,
-                                       fiber_volpkg: str, fiber_file: Path) -> None:
-    """Opening a project must neither load nor rewrite former fiber sources."""
-    try:
-        original = fiber_file.read_bytes()
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        try:
-            client.call("fiber.list", {}, timeout=RPC_TIMEOUT)
-            results.record("fiber_list_requires_attachment", False, "unexpected success without a store")
-        except BridgeError as error:
-            results.record("fiber_list_requires_attachment", error.code == -32000, str(error))
-        client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        results.record("project_fiber_files_untouched", fiber_file.read_bytes() == original,
-                       "project open/reopen preserves native source bytes")
-    except Exception as error:
-        results.record("project_fiber_files_untouched", False, str(error))
 
 
 def check_c2_oversized(sock_path: str, results: Results) -> None:
@@ -2930,55 +2016,15 @@ def main() -> int:
     results = Results()
     with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
         tmp_path = Path(tmp_dir)
-        volpkg = create_test_project(tmp_path)
-        broken_volpkg = tmp_path / "broken.volpkg.json"
-        broken_volpkg.write_text(json.dumps({"name": "broken", "version": 1}))
-        fiber_dir = Path(tmp_dir) / "fibers" / broken_volpkg.name
-        fiber_dir.mkdir(parents=True)
-        (fiber_dir / "fiber_smoke.json").write_text(json.dumps({
-            "type": "vc3d_fiber",
-            "version": 1,
-            "username": "smoke",
-            "started_at": "2026-01-01T00:00:00Z",
-            "sequence": 1,
-            "generation": 1,
-            "control_points": [[0.0, 0.0, 0.0]],
-            "line_points": [],
-            "branches": [{}],
-        }))
-        # Use a separate clean project: broken-link fixtures deliberately
-        # defer all load-time repair writes, including UUID backfills.
-        legacy_fiber_volpkg = tmp_path / "legacy-fiber.volpkg.json"
-        legacy_fiber_volpkg.write_text(json.dumps({
-            "name": "legacy-fiber",
-            "version": 1,
-            "volumes": ["volumes"],
-        }))
-        legacy_fiber_dir = tmp_path / "fibers" / legacy_fiber_volpkg.name
-        legacy_fiber_dir.mkdir(parents=True)
-        legacy_fiber = legacy_fiber_dir / "fiber_legacy.json"
-        # Both fields are intentionally absent: package fibers load before
-        # volume activation, which must complete the deferred metadata save.
-        legacy_fiber.write_text(json.dumps({
-            "type": "vc3d_fiber",
-            "version": 1,
-            "username": "smoke",
-            "started_at": "2026-01-01T00:00:00Z",
-            "sequence": 2,
-            "generation": 1,
-            "control_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 20.0]],
-            "line_points": [[10.0, 10.0, 10.0], [10.0, 10.0, 15.0],
-                            [10.0, 10.0, 20.0]],
-            "branches": [],
-        }))
         name = unique_name("main")
         config_home = tmp_path / "config-main"
-        proc = launch(binary, name, str(volpkg), str(config_home))
+        proc = launch(binary, name, None, str(config_home))
         client = None
         try:
             sock_path = proc.wait_for_handshake(timeout=60.0)
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+            project = create_test_project(client, tmp_path)
 
             check_rpc_describe(
                 client,
@@ -2996,20 +2042,14 @@ def main() -> int:
             check_ui_inspect(client, results)
             check_screenshot_targets(client, results)
 
-            check_volume_attach(client, results, tmp_path, volpkg)
-            check_segments_attach(client, results, tmp_path, volpkg)
-            check_segment_transform(client, results, tmp_path)
-            check_segment_export(client, results, tmp_path)
-            check_segment_tool_operations(client, results)
-            check_segment_backups(client, results, tmp_path)
-            check_project_attachments(client, results, tmp_path, volpkg)
+            check_volume_attach(client, results, tmp_path, project)
+            check_project_workspace(client, results, tmp_path)
+            require_running(proc, results, "project workspace")
+            check_segment_operations(client, results)
             check_ink_overlay(client, results)
             check_viewer_display_settings(client, results)
             check_segmentation_settings(client, results)
-            check_open_data_editable_copy(client, results, tmp_path, volpkg)
-            check_c4(client, results, str(volpkg), str(broken_volpkg))
-            check_project_fiber_files_untouched(client, results, str(legacy_fiber_volpkg),
-                                    legacy_fiber)
+            check_c4(client, results, str(project))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)

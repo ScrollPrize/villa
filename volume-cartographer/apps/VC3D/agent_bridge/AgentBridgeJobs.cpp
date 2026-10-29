@@ -39,7 +39,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -55,7 +55,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -72,7 +71,7 @@ void AgentBridgeServer::completeCatalogOpenJob(
     QString vpkgPath;
     if (outcome.success) {
         CState* state = _window ? _window->_state : nullptr;
-        vpkgPath = (state && state->hasVpkg()) ? state->vpkgPath() : QString();
+        vpkgPath = (state && state->hasVpkg()) ? state->projectDirectory() : QString();
 
         QJsonObject body;
         body["opened"] = true;
@@ -88,7 +87,6 @@ void AgentBridgeServer::completeCatalogOpenJob(
 
         QJsonObject attached;
         attached["volumes"] = outcome.result.attachedVolumeEntries;
-        attached["segments"] = outcome.result.attachedSegmentEntries;
         attached["normalGrids"] = outcome.result.attachedNormalGrids;
         attached["lasagnaDatasets"] = outcome.result.attachedLasagnaDatasets;
         body["attached"] = attached;
@@ -175,7 +173,7 @@ void AgentBridgeServer::subscribeJobSignals()
     }
 
     // Flattening lifecycle -> source:"flatten" jobs. Emitted by
-    // the SlimJob / ABFJob / StraightenJob classes from BOTH the interactive
+    // the SLIM and straighten jobs from BOTH the interactive
     // slots and the headless start* launchers, so human-initiated flattens are
     // registered as external jobs too.
     if (_window->_segmentationCommandHandler) {
@@ -210,37 +208,22 @@ void AgentBridgeServer::subscribeJobSignals()
                                       step, totalSteps, loss, overallProgress);
             });
     connect(lasagna, &LasagnaServiceManager::optimizationFinished, this,
-            [this](const QString& outputDir) {
-                handleLasagnaFinished(true, QStringLiteral("Optimization finished"), outputDir);
+            [this](const QStringList& surfaceUuids) {
+                handleLasagnaFinished(true, QStringLiteral("Optimization finished"),
+                                      surfaceUuids.join(QStringLiteral(",")));
             });
     connect(lasagna, &LasagnaServiceManager::optimizationError, this,
             [this](const QString& message) {
                 handleLasagnaFinished(false, message, QString());
             });
     connect(lasagna, &LasagnaServiceManager::jobFinished, this,
-            [this](const QString& /*jobId*/, const QString& outputDir) {
-                handleLasagnaFinished(true, QStringLiteral("Job finished"), outputDir);
+            [this](const QString& /*jobId*/, const QStringList& surfaceUuids) {
+                handleLasagnaFinished(true, QStringLiteral("Job finished"), surfaceUuids.join(QStringLiteral(",")));
             });
     connect(lasagna, &LasagnaServiceManager::jobError, this,
             [this](const QString& /*jobId*/, const QString& message) {
                 handleLasagnaFinished(false, message, QString());
             });
-    connect(lasagna, &LasagnaServiceManager::resultsPlaced, this,
-            [this](const QString& outputDir, const QStringList& segmentNames) {
-                handleLasagnaResultsPlaced(outputDir, segmentNames);
-            });
-
-    // Atlas fiber-search lifecycle -> source:"atlas" jobs.
-    if (_window) {
-        connect(_window, &CWindow::atlasSearchProgressChanged, this,
-                [this](int phase, double fraction) {
-                    handleAtlasSearchProgress(phase, fraction);
-                });
-        connect(_window, &CWindow::atlasSearchFinished, this,
-                [this](bool success, int resultCount) {
-                    handleAtlasSearchFinished(success, resultCount);
-                });
-    }
 
     // Batch seeding lifecycle -> source:"seeding" jobs. Emitted from
     // the SeedingWidget QProcess finished callbacks (run/expand). Only
@@ -270,11 +253,6 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
             return true;
         if (source == QLatin1String("growth") &&
             _window->_segmentationGrower && _window->_segmentationGrower->running())
-            return true;
-        // Lifecycle authority for atlas searches: the cancel flag is created
-        // when a search launches and reset in its finished handler, so a
-        // non-null flag means a search (bridge- or human-initiated) is live.
-        if (source == QLatin1String("atlas") && _window->_atlasSearchCancelFlag)
             return true;
         // Lifecycle authority for seeding batches: seedingBatchActive() is true
         // only while a run/expand batch is draining (not a neural trace, which
@@ -551,10 +529,10 @@ void AgentBridgeServer::handleFlattenStarted(const QString& kind, const QString&
 {
     auto it = _activeJobs.find(QStringLiteral("flatten"));
     if (it == _activeJobs.end()) {
-        // A flatten launched outside the bridge (a human ran SLIM/ABF/Straighten
+        // A flatten launched outside the bridge (a human ran SLIM/Straighten
         // from the context menu): register it as an externally-initiated job so
         // -32004 / state.get reflect true app state. The kind carries the
-        // real flatten type (flatten.slim / flatten.abf / flatten.straighten).
+        // real flatten type (flatten.slim / flatten.straighten).
         beginJob(QStringLiteral("flatten"), kind,
                  label.isEmpty() ? QStringLiteral("Flatten") : label,
                  /*broadcastStart=*/true);
@@ -660,74 +638,13 @@ void AgentBridgeServer::handleLasagnaFinished(bool success, const QString& messa
         finishJob(QStringLiteral("lasagna"), success, message, outputPath);
 }
 
-
-void AgentBridgeServer::handleLasagnaResultsPlaced(const QString& outputDir,
-                                                   const QStringList& segmentNames)
-{
-    auto it = _activeJobs.find(QStringLiteral("lasagna"));
-    if (it == _activeJobs.end())
-        return;
-    JobRecord& job = it.value();
-    if (!outputDir.isEmpty())
-        job.outputPath = outputDir;
-    const QString label = segmentNames.isEmpty()
-        ? QStringLiteral("Results placed: %1").arg(outputDir)
-        : QStringLiteral("Results placed: %1 (%2)")
-              .arg(outputDir, segmentNames.join(QStringLiteral(", ")));
-    job.message = label;
-    broadcastJobProgress(job, QStringLiteral("output"), label);
-}
-
-
-// --- Atlas fiber-search lifecycle ---
-
-void AgentBridgeServer::handleAtlasSearchProgress(int phase, double fraction)
-{
-    // Only bridge-initiated searches are tracked: do NOT
-    // auto-register an external job here — FinishResults progress also fires
-    // on pure UI re-population (group-by-fiber checkbox), which would leak a
-    // job that never finishes.
-    auto it = _activeJobs.find(QStringLiteral("atlas"));
-    if (it == _activeJobs.end())
-        return;
-    JobRecord& job = it.value();
-
-    const double clamped = std::clamp(fraction, 0.0, 1.0);
-    const QString label = QStringLiteral("phase %1/5 (%2%)")
-                              .arg(phase)
-                              .arg(qRound(clamped * 100.0));
-    job.message = label;
-
-    // Rate-limit job.progress "output" to <=10/sec.
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now - _lastConsoleBroadcastMs < 100)
-        return;
-    _lastConsoleBroadcastMs = now;
-    broadcastJobProgress(job, QStringLiteral("output"), label);
-}
-
-
-void AgentBridgeServer::handleAtlasSearchFinished(bool success, int resultCount)
-{
-    // finishJob is a no-op when no atlas job is active (e.g. a human-initiated
-    // search, or an early-return failure before the bridge registered a job).
-    if (!_activeJobs.contains(QStringLiteral("atlas")))
-        return;
-    finishJob(QStringLiteral("atlas"), success,
-              success
-                  ? QStringLiteral("Atlas fiber search finished: %1 result(s)").arg(resultCount)
-                  : QStringLiteral("Atlas fiber search canceled or failed"),
-              QString());
-}
-
-
 // --- Batch seeding lifecycle ---
 
 void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int completed,
                                                    int total)
 {
-    // Only bridge-initiated batches are tracked (mirroring the atlas search): a
-    // human-clicked Run/Expand is deliberately NOT auto-registered as a job.
+    // Only bridge-initiated batches are tracked: a human-clicked Run/Expand is
+    // deliberately NOT auto-registered as a job.
     auto it = _activeJobs.find(QStringLiteral("seeding"));
     if (it == _activeJobs.end())
         return;
@@ -825,15 +742,9 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
     const QString outSource = rec->source;
     const QString outKind = rec->kind;
     const QString externalId = rec->externalId;
-    const QString closingOperation = rec->closingOperation;
 
     // Dispatch on the job's source to its per-source cancel authority.
-    if (outSource == QLatin1String("atlas")) {
-        if (!_window)
-            throw AgentBridgeError{-32010, "Window unavailable", {}};
-        // Dialog-free: sets cancel flags; the job terminates via atlasSearchFinished.
-        _window->cancelAtlasFiberIntersectionSearch();
-    } else if (outSource == QLatin1String("seeding")) {
+    if (outSource == QLatin1String("seeding")) {
         SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
         if (!widget) {
             QJsonObject data;
@@ -853,18 +764,6 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
             mgr.stopOptimization();
         else
             mgr.cancelJob(externalId);
-    } else if (outSource == QLatin1String("tool") &&
-               closingOperation == QLatin1String("neighbor_copy")) {
-        // A neighbor copy also has a window between its two passes in which no
-        // process runs; its own cancel covers both and ends the job through
-        // segmentOperationFinished.
-        SegmentationCommandHandler* sch =
-            _window ? _window->_segmentationCommandHandler.get() : nullptr;
-        if (!sch || !sch->cancelNeighborCopy()) {
-            QJsonObject data;
-            data["detail"] = "no running neighbor copy to cancel";
-            throw AgentBridgeError{-32005, "Neighbor copy not running", data};
-        }
     } else if (outSource == QLatin1String("tool")) {
         // grow/trace/render tools run as CommandLineToolRunner child QProcesses:
         // terminate cleanly; toolFinished then resolves the job via finishJob.

@@ -182,7 +182,7 @@ SegmentationDirectionFieldPanel::SegmentationDirectionFieldPanel(const QString& 
         if (_restoringSettings) {
             return;
         }
-        writeSetting(QStringLiteral("group_direction_field_expanded"), expanded);
+        writeSetting(vc3d::settings::segmentation::GROUP_DIRECTION_FIELD_EXPANDED, expanded);
     });
 }
 
@@ -442,7 +442,7 @@ void SegmentationDirectionFieldPanel::persistDirectionFields()
         map.insert(QStringLiteral("weight"), std::clamp(config.weight, 0.0, 10.0));
         serialized.push_back(map);
     }
-    writeSetting(QStringLiteral("direction_fields"), serialized);
+    writeSetting(vc3d::settings::segmentation::DIRECTION_FIELDS, serialized);
 }
 
 void SegmentationDirectionFieldPanel::restoreSettings(QSettings& settings)

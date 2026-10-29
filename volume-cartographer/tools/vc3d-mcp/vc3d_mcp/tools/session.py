@@ -30,9 +30,10 @@ async def vc3d_ping() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_get_state() -> dict[str, Any]:
-    """Snapshot of VC3D: open volume package, current volume, active segment,
-    viewers (ids/names, each with its workspace and visibility), the current
-    and available workspaces, editing mode, running job. Call this first.
+    """Snapshot of VC3D: open project and its stores, current volume, active
+    segment, viewers (ids/names, each with its workspace and visibility), the
+    current and available workspaces, editing mode, running job. Call this
+    first.
 
     "revision" increases whenever the project, volume, active segment,
     editing modes, viewers, workspace, overlay or jobs change, including
@@ -168,25 +169,16 @@ async def vc3d_inspect_ui(
 
 @mcp.tool()
 async def vc3d_switch_workspace(
-    name: Literal[
-        "main",
-        "lasagna",
-        "atlas",
-        "fiber-slice",
-        "intersections",
-        "spiral",
-        "fiber-map",
-        "fiber_slice",
-    ],
+    name: Literal["main", "lasagna", "spiral", "fiber-map", "project"],
     observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Switch VC3D's active workspace tab, exactly as clicking the tab does.
-    Requires a volume package to be open.
+    Every workspace but "project" requires a project to be open.
 
     name: a workspace id, in tab order: "main" (segmentation and navigation;
-    v1-v4 live here), "lasagna", "atlas", "fiber-slice", "intersections",
-    "spiral", "fiber-map". "fiber_slice" is the older spelling of
-    "fiber-slice" and is still accepted.
+    v1-v4 live here), "lasagna", "spiral", "fiber-map", "project" (the
+    project overview: stores, routes, volumes, caches; no viewers, so
+    capture it with vc3d_screenshot of the whole window).
 
     Viewers from every workspace (including Spiral's own panes) appear in
     vc3d_get_state's viewers list with a "workspace" field and a "visible"
@@ -206,7 +198,7 @@ async def vc3d_switch_workspace(
     fields. For a picture, call vc3d_observe next.
 
     Returns {"workspace": id, "previous": id or null}. Errors: -32602 (unknown
-    name), -32000 (no volume package loaded), -32007 (that workspace is not
+    name), -32000 (no project loaded), -32007 (that workspace is not
     present in this build).
     """
     return await _observed_call("workspace.switch", {"name": name}, observe)

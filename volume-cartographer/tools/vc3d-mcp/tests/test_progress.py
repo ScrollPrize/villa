@@ -17,7 +17,6 @@ from vc3d_mcp.bridge_client import (
     BridgeClientConfig,
     BridgeConnectionError,
 )
-from vc3d_mcp.tools.atlas import vc3d_atlas_search_start
 from vc3d_mcp.tools.jobs import vc3d_wait_job
 from vc3d_mcp.tools.segmentation import (
     vc3d_grow_segment,
@@ -226,16 +225,6 @@ class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "succeeded")
         self.assertIn("consoleTail", result)
 
-    async def test_atlas_search_no_wait_returns_job_id(self) -> None:
-        result = await vc3d_atlas_search_start(wait=False)
-        self.assertEqual(result["jobId"], "job-6")
-        self.assertNotIn("state", result)
-
-    async def test_atlas_search_wait_returns_terminal_status(self) -> None:
-        result = await vc3d_atlas_search_start(wait=True)
-        self.assertEqual(result["jobId"], "job-6")
-        self.assertEqual(result["state"], "succeeded")
-
     async def test_wait_reads_authoritative_job_status(self) -> None:
         result = await vc3d_run_trace("seg-1", wait=True)
         self.assertEqual(result["state"], "succeeded")
@@ -403,7 +392,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
 
     # Assert the exact registered count so schema drift (added/removed tools) is caught.
-    EXPECTED_TOOL_COUNT = 142
+    EXPECTED_TOOL_COUNT = 113
 
     async def test_tool_surface_and_schemas(self) -> None:
         tools = await core.mcp.list_tools()
@@ -415,32 +404,18 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
             props = schema.get("properties") or {}
             self.assertNotIn("ctx", props, f"{name} leaked ctx into its schema")
 
-        # Both formerly-missing wait params are present.
+        # The formerly-missing wait param is present.
         self.assertIn("wait", by_name["vc3d_run_trace"]["properties"])
-        self.assertIn("wait", by_name["vc3d_atlas_search_start"]["properties"])
 
         # A sampling of required enum schemas are emitted as JSON-schema enums.
         grow = by_name["vc3d_grow_segment"]["properties"]
-        self.assertEqual(grow["method"]["enum"], ["tracer", "corrections", "patch_tracer"])
+        self.assertEqual(grow["method"]["enum"], ["tracer", "corrections"])
         self.assertEqual(
             grow["direction"]["enum"], ["all", "up", "down", "left", "right", "fill"]
         )
         self.assertEqual(
             by_name["vc3d_switch_workspace"]["properties"]["name"]["enum"],
-            [
-                "main",
-                "lasagna",
-                "atlas",
-                "fiber-slice",
-                "intersections",
-                "spiral",
-                "fiber-map",
-                "fiber_slice",
-            ],
-        )
-        self.assertEqual(
-            by_name["vc3d_atlas_search_start"]["properties"]["mode"]["enum"],
-            ["atlas_to_non_atlas", "non_atlas_only"],
+            ["main", "lasagna", "spiral", "fiber-map", "project"],
         )
         self.assertEqual(
             by_name["vc3d_render_tifxyz"]["properties"]["output_format"]["enum"],

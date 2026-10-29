@@ -1,4 +1,5 @@
 #include "VolumeAttachmentController.hpp"
+#include "OpenDataManifest.hpp"
 
 #include <QFutureWatcher>
 #include <QSettings>
@@ -194,12 +195,11 @@ bool VolumeAttachmentController::start(
                     result.volume = Volume::NewFromUrl(
                         location,
                         anonymous ? vc::HttpAuth{} : request.auth,
-                        vc::project::volumeMetadataFromEntryTags(request.tags),
+                        vc::project::catalogVolumeMetadata(
+                            vc3d::opendata::cachedCatalog().get(), location),
                         !anonymous);
                 } else {
-                    result.volume = Volume::New(
-                        std::filesystem::path(location),
-                        vc::project::volumeMetadataFromEntryTags(request.tags));
+                    result.volume = Volume::New(std::filesystem::path(location), utils::Json::object());
                 }
             } catch (const std::exception& error) {
                 result.error = QString::fromUtf8(error.what());

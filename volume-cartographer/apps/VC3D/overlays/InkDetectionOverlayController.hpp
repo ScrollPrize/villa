@@ -15,6 +15,7 @@
 
 class CState;
 class QuadSurface;
+class SurfaceCatalog;
 class VolumeViewerBase;
 
 class InkDetectionOverlayController : public ViewerOverlayControllerBase
@@ -22,15 +23,17 @@ class InkDetectionOverlayController : public ViewerOverlayControllerBase
     Q_OBJECT
 
 public:
+    // A published ink detection image of the active surface: its file in the
+    // surface's artifact directory (downloaded when first selected).
     struct Option {
         QString label;
-        std::string sampleId;
-        std::string segmentId;
-        std::string segmentLongId;
+        std::string name;  // the published file (vc::objects::CatalogFile::name)
         std::filesystem::path localPath;
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);
+    // The catalog the active surface's ink detections are read from.
+    void setSurfaceCatalog(SurfaceCatalog* catalog);
 
     [[nodiscard]] const std::vector<Option>& options() const { return _options; }
     [[nodiscard]] const std::filesystem::path& selectedPath() const { return _selectedPath; }
@@ -82,12 +85,13 @@ private:
                                     const std::string& colormapId) const;
     void refreshOptionsForActiveSurface();
     std::string activeSegmentKey() const;
-    bool optionMatchesSegment(const Option& option, const std::string& segmentKey) const;
     bool imageMatchesSurface(const QuadSurface& surface) const;
 
     CState* _state{nullptr};
-    std::vector<Option> _allOptions;
+    SurfaceCatalog* _catalog{nullptr};
     std::vector<Option> _options;
+    // The image being downloaded (its file), if any.
+    std::filesystem::path _fetchingPath;
     std::filesystem::path _selectedPath;
     std::string _selectedSegmentKey;
     std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;

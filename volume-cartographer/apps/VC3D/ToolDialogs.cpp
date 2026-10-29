@@ -66,8 +66,9 @@ static void ensureDialogWidthForEdits(QDialog* dlg, const QList<QLineEdit*>& edi
 
 // ================= RenderParamsDialog =================
 RenderParamsDialog::RenderParamsDialog(QWidget* parent,
-                                       const QString& volumePath,
-                                       const QString& segmentPath,
+                                       const QVector<VolumeSelector::VolumeOption>& volumes,
+                                       const QString& volumeId,
+                                       const QString& surfaceName,
                                        const QString& outputPattern,
                                        double scale,
                                        int groupIdx,
@@ -82,8 +83,9 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     auto basic = new QFormLayout(basicBox);
     basicBox->setLayout(basic);
 
-    QWidget* volPick = pathPicker(this, edtVolume_, "Select OME-Zarr volume", true);
-    edtSegment_ = new QLineEdit(this);
+    volume_ = new VolumeSelector(this);
+    volume_->setLabelVisible(false);
+    volume_->setVolumes(volumes, volumeId);
     QWidget* outPick = pathPicker(this, edtOutput_, "Select output (.zarr or tif pattern)", false);
     spScale_ = new QDoubleSpinBox(this); spScale_->setDecimals(3); spScale_->setRange(0.0001, 10000.0);
     spGroup_ = new QSpinBox(this); spGroup_->setRange(0, 10);
@@ -91,15 +93,13 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     edtThreads_ = new QLineEdit(this); edtThreads_->setPlaceholderText("optional");
     edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
 
-    edtVolume_->setText(volumePath);
-    edtSegment_->setText(segmentPath);
     edtOutput_->setText(outputPattern);
     spScale_->setValue(scale);
     spGroup_->setValue(groupIdx);
     spSlices_->setValue(numSlices);
 
-    basic->addRow("Volume:", volPick);
-    basic->addRow("Segmentation (tifxyz dir):", edtSegment_);
+    basic->addRow("Volume:", volume_);
+    basic->addRow("Surface:", new QLabel(surfaceName, this));
     chkIncludeTifs_ = new QCheckBox("Also write TIFF slices (Zarr)", this);
     chkIncludeTifs_->setChecked(false);
 
@@ -121,9 +121,6 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     spCropY_ = new QSpinBox(this); spCropY_->setRange(0, 1000000);
     spCropW_ = new QSpinBox(this); spCropW_->setRange(0, 1000000); spCropW_->setValue(0);
     spCropH_ = new QSpinBox(this); spCropH_->setRange(0, 1000000); spCropH_->setValue(0);
-    QWidget* affPick = pathPicker(this, edtAffine_, "Select affine JSON", false);
-    chkInvert_ = new QCheckBox("Invert affine", this);
-    spScaleSeg_ = new QDoubleSpinBox(this); spScaleSeg_->setDecimals(3); spScaleSeg_->setRange(0.0001, 1000.0); spScaleSeg_->setValue(1.0);
     spRotate_ = new QDoubleSpinBox(this); spRotate_->setDecimals(2); spRotate_->setRange(-360.0, 360.0); spRotate_->setValue(0.0);
     cmbFlip_ = new QComboBox(this);
     cmbFlip_->addItem("None", -1);
@@ -135,29 +132,8 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     adv->addRow("Crop Y:", spCropY_);
     adv->addRow("Crop Width:", spCropW_);
     adv->addRow("Crop Height:", spCropH_);
-    adv->addRow("Affine transform:", affPick);
-    adv->addRow("Invert affine:", chkInvert_);
-    adv->addRow("Scale segmentation:", spScaleSeg_);
     adv->addRow("Rotate (deg):", spRotate_);
     adv->addRow("Flip:", cmbFlip_);
-
-    // ABF++ flattening options
-    chkFlatten_ = new QCheckBox("Enable ABF++ flattening", this);
-    chkFlatten_->setToolTip("Apply ABF++ mesh flattening before rendering to reduce texture distortion");
-    spFlattenIters_ = new QSpinBox(this);
-    spFlattenIters_->setRange(1, 100);
-    spFlattenIters_->setValue(10);
-    spFlattenIters_->setEnabled(false);
-    spFlattenDownsample_ = new QSpinBox(this);
-    spFlattenDownsample_->setRange(1, 8);
-    spFlattenDownsample_->setValue(1);
-    spFlattenDownsample_->setEnabled(false);
-    spFlattenDownsample_->setToolTip("Downsample factor for ABF++ (1=full, 2=half, 4=quarter). Higher = faster but lower quality");
-    connect(chkFlatten_, &QCheckBox::toggled, spFlattenIters_, &QSpinBox::setEnabled);
-    connect(chkFlatten_, &QCheckBox::toggled, spFlattenDownsample_, &QSpinBox::setEnabled);
-    adv->addRow("Flatten:", chkFlatten_);
-    adv->addRow("Flatten iterations:", spFlattenIters_);
-    adv->addRow("Flatten downsample:", spFlattenDownsample_);
 
     // Buttons
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -180,7 +156,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     updateIncludeTifsEnabled();
     connect(edtOutput_, &QLineEdit::textChanged, this, [updateIncludeTifsEnabled](const QString&){ updateIncludeTifsEnabled(); });
 
-    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtSegment_, edtOutput_, edtAffine_ });
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtOutput_ });
 
     // Apply saved defaults to optional controls, then session overrides
     applySavedDefaults();
@@ -196,8 +172,7 @@ RenderParamsDialog::RenderParamsDialog(QWidget* parent,
     connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
 }
 
-QString RenderParamsDialog::volumePath() const { return edtVolume_->text(); }
-QString RenderParamsDialog::segmentPath() const { return edtSegment_->text(); }
+QString RenderParamsDialog::volumeId() const { return volume_->selectedVolumeId(); }
 QString RenderParamsDialog::outputPattern() const { return edtOutput_->text(); }
 double RenderParamsDialog::scale() const { return spScale_->value(); }
 int RenderParamsDialog::groupIdx() const { return spGroup_->value(); }
@@ -211,15 +186,9 @@ int RenderParamsDialog::cropX() const { return spCropX_->value(); }
 int RenderParamsDialog::cropY() const { return spCropY_->value(); }
 int RenderParamsDialog::cropWidth() const { return spCropW_->value(); }
 int RenderParamsDialog::cropHeight() const { return spCropH_->value(); }
-QString RenderParamsDialog::affinePath() const { return edtAffine_->text(); }
-bool RenderParamsDialog::invertAffine() const { return chkInvert_->isChecked(); }
-double RenderParamsDialog::scaleSegmentation() const { return spScaleSeg_->value(); }
 double RenderParamsDialog::rotateDegrees() const { return spRotate_->value(); }
 int RenderParamsDialog::flipAxis() const { return cmbFlip_->currentData().toInt(); }
 bool RenderParamsDialog::includeTifs() const { return chkIncludeTifs_->isChecked(); }
-bool RenderParamsDialog::flatten() const { return chkFlatten_->isChecked(); }
-int RenderParamsDialog::flattenIterations() const { return spFlattenIters_->value(); }
-int RenderParamsDialog::flattenDownsample() const { return spFlattenDownsample_->value(); }
 
 // ---- RenderParamsDialog: defaults + session helpers ----
 bool RenderParamsDialog::s_haveSession = false;
@@ -228,14 +197,9 @@ int  RenderParamsDialog::s_cropX = 0;
 int  RenderParamsDialog::s_cropY = 0;
 int  RenderParamsDialog::s_cropW = 0;
 int  RenderParamsDialog::s_cropH = 0;
-bool RenderParamsDialog::s_invertAffine = false;
-double RenderParamsDialog::s_scaleSeg = 1.0;
 double RenderParamsDialog::s_rotateDeg = 0.0;
 int  RenderParamsDialog::s_flipAxis = -1;
 int  RenderParamsDialog::s_ompThreads = -1;
-bool RenderParamsDialog::s_flatten = false;
-int  RenderParamsDialog::s_flattenIters = 10;
-int  RenderParamsDialog::s_flattenDownsample = 1;
 
 void RenderParamsDialog::applyCodeDefaults() {
     chkIncludeTifs_->setChecked(false);
@@ -243,17 +207,12 @@ void RenderParamsDialog::applyCodeDefaults() {
     spCropY_->setValue(0);
     spCropW_->setValue(0);
     spCropH_->setValue(0);
-    chkInvert_->setChecked(false);
-    spScaleSeg_->setValue(1.0);
     spRotate_->setValue(0.0);
     // Flip index: 0 None, 1 Vertical, 2 Horizontal, 3 Both; but we stored data -1/0/1/2
     // Set by data match
     int idx = cmbFlip_->findData(-1);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText("");
-    chkFlatten_->setChecked(false);
-    spFlattenIters_->setValue(10);
-    spFlattenDownsample_->setValue(1);
 }
 
 void RenderParamsDialog::applySavedDefaults() {
@@ -264,8 +223,6 @@ void RenderParamsDialog::applySavedDefaults() {
     spCropY_->setValue(s.value("crop_y", spCropY_->value()).toInt());
     spCropW_->setValue(s.value("crop_w", spCropW_->value()).toInt());
     spCropH_->setValue(s.value("crop_h", spCropH_->value()).toInt());
-    chkInvert_->setChecked(s.value("invert_affine", chkInvert_->isChecked()).toBool());
-    spScaleSeg_->setValue(s.value("scale_segmentation", spScaleSeg_->value()).toDouble());
     spRotate_->setValue(s.value("rotate_deg", spRotate_->value()).toDouble());
     // flip axis stored as int data
     const int flip = s.value("flip_axis", cmbFlip_->currentData().toInt()).toInt();
@@ -273,9 +230,6 @@ void RenderParamsDialog::applySavedDefaults() {
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
-    chkFlatten_->setChecked(s.value("flatten", chkFlatten_->isChecked()).toBool());
-    spFlattenIters_->setValue(s.value("flatten_iterations", spFlattenIters_->value()).toInt());
-    spFlattenDownsample_->setValue(s.value("flatten_downsample", spFlattenDownsample_->value()).toInt());
     s.endGroup();
 }
 
@@ -286,15 +240,10 @@ void RenderParamsDialog::applySessionDefaults() {
     spCropY_->setValue(s_cropY);
     spCropW_->setValue(s_cropW);
     spCropH_->setValue(s_cropH);
-    chkInvert_->setChecked(s_invertAffine);
-    spScaleSeg_->setValue(s_scaleSeg);
     spRotate_->setValue(s_rotateDeg);
     int idx = cmbFlip_->findData(s_flipAxis);
     if (idx >= 0) cmbFlip_->setCurrentIndex(idx);
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
-    chkFlatten_->setChecked(s_flatten);
-    spFlattenIters_->setValue(s_flattenIters);
-    spFlattenDownsample_->setValue(s_flattenDownsample);
 }
 
 void RenderParamsDialog::saveDefaults() const {
@@ -305,14 +254,9 @@ void RenderParamsDialog::saveDefaults() const {
     s.setValue("crop_y", spCropY_->value());
     s.setValue("crop_w", spCropW_->value());
     s.setValue("crop_h", spCropH_->value());
-    s.setValue("invert_affine", chkInvert_->isChecked());
-    s.setValue("scale_segmentation", spScaleSeg_->value());
     s.setValue("rotate_deg", spRotate_->value());
     s.setValue("flip_axis", cmbFlip_->currentData().toInt());
     s.setValue("omp_threads", ompThreads());
-    s.setValue("flatten", chkFlatten_->isChecked());
-    s.setValue("flatten_iterations", spFlattenIters_->value());
-    s.setValue("flatten_downsample", spFlattenDownsample_->value());
     s.endGroup();
 }
 
@@ -323,23 +267,18 @@ void RenderParamsDialog::updateSessionFromUI() {
     s_cropY = spCropY_->value();
     s_cropW = spCropW_->value();
     s_cropH = spCropH_->value();
-    s_invertAffine = chkInvert_->isChecked();
-    s_scaleSeg = spScaleSeg_->value();
     s_rotateDeg = spRotate_->value();
     s_flipAxis = cmbFlip_->currentData().toInt();
     s_ompThreads = ompThreads();
-    s_flatten = chkFlatten_->isChecked();
-    s_flattenIters = spFlattenIters_->value();
-    s_flattenDownsample = spFlattenDownsample_->value();
 }
 
 // ================= TraceParamsDialog =================
 TraceParamsDialog::TraceParamsDialog(QWidget* parent,
                                      const QString& volumePath,
-                                     const QString& srcDir,
-                                     const QString& tgtDir,
+                                     const QString& sourceTag,
+                                     const QString& outputTag,
                                      const QString& jsonParams,
-                                     const QString& srcSegment)
+                                     const QString& srcSurfaceName)
     : QDialog(parent)
 {
     setWindowTitle("Run Trace Parameters");
@@ -351,24 +290,22 @@ TraceParamsDialog::TraceParamsDialog(QWidget* parent,
     pathsBox->setLayout(paths);
 
     QWidget* volPick = pathPicker(this, edtVolume_, "Select OME-Zarr volume", true);
-    QWidget* srcPick = pathPicker(this, edtSrcDir_, "Select source directory (paths)", true);
-    QWidget* tgtPick = pathPicker(this, edtTgtDir_, "Select target directory (traces)", true);
+    edtSourceTag_ = new QLineEdit(sourceTag, this);
+    edtSourceTag_->setToolTip("The trace grows along the surfaces with this tag.");
+    edtOutputTag_ = new QLineEdit(outputTag, this);
+    edtOutputTag_->setToolTip("Tag for the traced surface.");
     QWidget* jsonPick = pathPicker(this, edtJson_, "Select trace params JSON", false);
-    QWidget* segPick = pathPicker(this, edtSrcSegment_, "Select source segment (tifxyz dir)", true);
     edtThreads_ = new QLineEdit(this); edtThreads_->setPlaceholderText("optional");
     edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
 
     edtVolume_->setText(volumePath);
-    edtSrcDir_->setText(srcDir);
-    edtTgtDir_->setText(tgtDir);
     edtJson_->setText(jsonParams);
-    edtSrcSegment_->setText(srcSegment);
 
     paths->addRow("Volume:", volPick);
-    paths->addRow("Source dir:", srcPick);
-    paths->addRow("Target dir:", tgtPick);
+    paths->addRow("Source tag:", edtSourceTag_);
+    paths->addRow("Output tag:", edtOutputTag_);
     paths->addRow("JSON params:", jsonPick);
-    paths->addRow("Source segment:", segPick);
+    paths->addRow("Source surface:", new QLabel(srcSurfaceName, this));
     paths->addRow("OMP threads:", edtThreads_);
 
     // Advanced params
@@ -484,14 +421,13 @@ TraceParamsDialog::TraceParamsDialog(QWidget* parent,
     main->addWidget(advBox);
     main->addWidget(btns);
 
-    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtSrcDir_, edtTgtDir_, edtJson_, edtSrcSegment_ });
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtVolume_, edtJson_ });
 }
 
 QString TraceParamsDialog::volumePath() const { return edtVolume_->text(); }
-QString TraceParamsDialog::srcDir() const { return edtSrcDir_->text(); }
-QString TraceParamsDialog::tgtDir() const { return edtTgtDir_->text(); }
+QString TraceParamsDialog::sourceTag() const { return edtSourceTag_->text().trimmed(); }
+QString TraceParamsDialog::outputTag() const { return edtOutputTag_->text().trimmed(); }
 QString TraceParamsDialog::jsonParams() const { return edtJson_->text(); }
-QString TraceParamsDialog::srcSegment() const { return edtSrcSegment_->text(); }
 int TraceParamsDialog::ompThreads() const {
     const QString t = edtThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
@@ -680,41 +616,28 @@ void TraceParamsDialog::saveDefaults() const {
 bool   ConvertToObjDialog::s_haveSession = false;
 bool   ConvertToObjDialog::s_normUV = false;
 bool   ConvertToObjDialog::s_alignGrid = false;
-int    ConvertToObjDialog::s_decimate = 0;
-bool   ConvertToObjDialog::s_clean = false;
-double ConvertToObjDialog::s_cleanK = 5.0;
 int    ConvertToObjDialog::s_ompThreads = -1;
 
 ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
-                                       const QString& tifxyzPath,
-                                       const QString& objOutPath)
+                                       const QString& surfaceName,
+                                       const QString& defaultObjName)
     : QDialog(parent)
 {
     setWindowTitle("Convert to OBJ");
     auto main = new QVBoxLayout(this);
     auto form = new QFormLayout();
 
-    QWidget* tifPick = pathPicker(this, edtTifxyz_, "Select TIFXYZ directory", true);
-    QWidget* objPick = pathPicker(this, edtObj_, "Select output OBJ file", false);
+    edtObj_ = new QLineEdit(defaultObjName, this);
+    edtObj_->setToolTip("File name in the surface's artifact directory.");
     chkNormalize_ = new QCheckBox("Normalize UV to [0,1]", this);
     chkAlign_ = new QCheckBox("Align grid (flatten Z per row)", this);
-    spDecimate_ = new QSpinBox(this); spDecimate_->setRange(0, 10); spDecimate_->setValue(0);
-    chkClean_ = new QCheckBox("Clean surface outliers", this);
-    spCleanK_ = new QDoubleSpinBox(this); spCleanK_->setRange(0.0, 1000.0); spCleanK_->setDecimals(2); spCleanK_->setSingleStep(0.25); spCleanK_->setValue(5.0);
-    spCleanK_->setEnabled(false);
     edtThreads_ = new QLineEdit(this); edtThreads_->setPlaceholderText("optional");
     edtThreads_->setValidator(new QRegularExpressionValidator(QRegularExpression("^\\s*\\d*\\s*$"), this));
 
-    edtTifxyz_->setText(tifxyzPath);
-    edtObj_->setText(objOutPath);
-
-    form->addRow("TIFXYZ dir:", tifPick);
-    form->addRow("OBJ file:", objPick);
-    form->addRow("Decimate iters:", spDecimate_);
+    form->addRow("Surface:", new QLabel(surfaceName, this));
+    form->addRow("OBJ name:", edtObj_);
     form->addRow("", chkNormalize_);
     form->addRow("", chkAlign_);
-    form->addRow("", chkClean_);
-    form->addRow("Clean K (sigma):", spCleanK_);
     form->addRow("OMP threads:", edtThreads_);
 
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -729,10 +652,9 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
     main->addLayout(form);
     main->addWidget(btns);
 
-    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtTifxyz_, edtObj_ });
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtObj_ });
 
     // Enable/disable K based on clean checkbox
-    connect(chkClean_, &QCheckBox::toggled, spCleanK_, &QWidget::setEnabled);
 
     // Apply saved defaults, then session overrides
     applySavedDefaults();
@@ -749,13 +671,9 @@ ConvertToObjDialog::ConvertToObjDialog(QWidget* parent,
     connect(btnSave, &QPushButton::clicked, this, [this]() { saveDefaults(); });
 }
 
-QString ConvertToObjDialog::tifxyzPath() const { return edtTifxyz_->text(); }
-QString ConvertToObjDialog::objPath() const { return edtObj_->text(); }
+QString ConvertToObjDialog::objName() const { return edtObj_->text().trimmed(); }
 bool ConvertToObjDialog::normalizeUV() const { return chkNormalize_->isChecked(); }
 bool ConvertToObjDialog::alignGrid() const { return chkAlign_->isChecked(); }
-int ConvertToObjDialog::decimateIterations() const { return spDecimate_->value(); }
-bool ConvertToObjDialog::cleanSurface() const { return chkClean_->isChecked(); }
-double ConvertToObjDialog::cleanK() const { return spCleanK_->value(); }
 int ConvertToObjDialog::ompThreads() const {
     const QString t = edtThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
@@ -765,10 +683,6 @@ int ConvertToObjDialog::ompThreads() const {
 void ConvertToObjDialog::applyCodeDefaults() {
     chkNormalize_->setChecked(false);
     chkAlign_->setChecked(false);
-    spDecimate_->setValue(0);
-    chkClean_->setChecked(false);
-    spCleanK_->setValue(5.0);
-    spCleanK_->setEnabled(chkClean_->isChecked());
     edtThreads_->setText("");
 }
 
@@ -777,10 +691,6 @@ void ConvertToObjDialog::applySavedDefaults() {
     s.beginGroup("toobj/defaults");
     chkNormalize_->setChecked(s.value("normalize_uv", chkNormalize_->isChecked()).toBool());
     chkAlign_->setChecked(s.value("align_grid", chkAlign_->isChecked()).toBool());
-    spDecimate_->setValue(s.value("decimate_iters", spDecimate_->value()).toInt());
-    chkClean_->setChecked(s.value("clean_surface", chkClean_->isChecked()).toBool());
-    spCleanK_->setValue(s.value("clean_k", spCleanK_->value()).toDouble());
-    spCleanK_->setEnabled(chkClean_->isChecked());
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
     s.endGroup();
@@ -790,10 +700,6 @@ void ConvertToObjDialog::applySessionDefaults() {
     if (!s_haveSession) return;
     chkNormalize_->setChecked(s_normUV);
     chkAlign_->setChecked(s_alignGrid);
-    spDecimate_->setValue(s_decimate);
-    chkClean_->setChecked(s_clean);
-    spCleanK_->setValue(s_cleanK);
-    spCleanK_->setEnabled(chkClean_->isChecked());
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
 }
 
@@ -802,9 +708,6 @@ void ConvertToObjDialog::saveDefaults() const {
     s.beginGroup("toobj/defaults");
     s.setValue("normalize_uv", chkNormalize_->isChecked());
     s.setValue("align_grid", chkAlign_->isChecked());
-    s.setValue("decimate_iters", spDecimate_->value());
-    s.setValue("clean_surface", chkClean_->isChecked());
-    s.setValue("clean_k", spCleanK_->value());
     const int th = ompThreads();
     s.setValue("omp_threads", th);
     s.endGroup();
@@ -814,9 +717,6 @@ void ConvertToObjDialog::updateSessionFromUI() {
     s_haveSession = true;
     s_normUV = chkNormalize_->isChecked();
     s_alignGrid = chkAlign_->isChecked();
-    s_decimate = spDecimate_->value();
-    s_clean = chkClean_->isChecked();
-    s_cleanK = spCleanK_->value();
     s_ompThreads = ompThreads();
 }
 
@@ -832,13 +732,14 @@ double AlphaCompRefineDialog::s_readerScale = 0.5;
 QString AlphaCompRefineDialog::s_scaleGroup = QStringLiteral("1");
 bool AlphaCompRefineDialog::s_refine = true;
 bool AlphaCompRefineDialog::s_vertexColor = false;
-bool AlphaCompRefineDialog::s_overwrite = true;
+bool AlphaCompRefineDialog::s_inPlace = false;
 int AlphaCompRefineDialog::s_ompThreads = -1;
 
 AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
-                                             const QString& volumePath,
-                                             const QString& srcSurfacePath,
-                                             const QString& dstSurfacePath)
+                                             const QVector<VolumeSelector::VolumeOption>& volumes,
+                                             const QString& volumeId,
+                                             const QString& srcSurfaceName,
+                                             const QString& defaultOutputName)
     : QDialog(parent)
 {
     setWindowTitle(tr("Alpha-Composite Refinement"));
@@ -848,17 +749,15 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
     auto paths = new QFormLayout(pathsBox);
     pathsBox->setLayout(paths);
 
-    QWidget* volPick = pathPicker(this, edtVolume_, tr("Select OME-Zarr volume"), true);
-    QWidget* srcPick = pathPicker(this, edtSrc_, tr("Select source surface"), true);
-    QWidget* dstPick = pathPicker(this, edtDst_, tr("Select output surface"), true);
+    volume_ = new VolumeSelector(this);
+    volume_->setLabelVisible(false);
+    volume_->setVolumes(volumes, volumeId);
+    edtDst_ = new QLineEdit(defaultOutputName, this);
+    edtDst_->setToolTip(tr("Name of the refined surface."));
 
-    edtVolume_->setText(volumePath);
-    edtSrc_->setText(srcSurfacePath);
-    edtDst_->setText(dstSurfacePath);
-
-    paths->addRow(tr("Volume:"), volPick);
-    paths->addRow(tr("Source:"), srcPick);
-    paths->addRow(tr("Output:"), dstPick);
+    paths->addRow(tr("Volume:"), volume_);
+    paths->addRow(tr("Source:"), new QLabel(srcSurfaceName, this));
+    paths->addRow(tr("Output name:"), edtDst_);
 
     main->addWidget(pathsBox);
 
@@ -880,8 +779,8 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
     edtScaleGroup_ = new QLineEdit(this); edtScaleGroup_->setText(QStringLiteral("1"));
 
     chkVertexColor_ = new QCheckBox(tr("Generate vertex color (OBJ only)"), this);
-    chkOverwrite_ = new QCheckBox(tr("Overwrite if output exists"), this);
-    chkOverwrite_->setChecked(true);
+    chkInPlace_ = new QCheckBox(tr("Refine in place (edit the source surface)"), this);
+    connect(chkInPlace_, &QCheckBox::toggled, edtDst_, &QWidget::setDisabled);
 
     edtThreads_ = new QLineEdit(this);
     edtThreads_->setPlaceholderText(tr("optional"));
@@ -898,7 +797,7 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
     params->addRow(tr("Reader scale:"), spReaderScale_);
     params->addRow(tr("Scale group:"), edtScaleGroup_);
     params->addRow(chkVertexColor_);
-    params->addRow(chkOverwrite_);
+    params->addRow(chkInPlace_);
     params->addRow(tr("OMP threads:"), edtThreads_);
 
     main->addWidget(paramsBox);
@@ -915,9 +814,9 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
 AlphaCompRefineRequest AlphaCompRefineDialog::request() const
 {
     AlphaCompRefineRequest result;
-    result.volumePath = edtVolume_->text().trimmed();
-    result.sourcePath = edtSrc_->text().trimmed();
-    result.outputDir = edtDst_->text().trimmed();
+    result.volumeId = volume_->selectedVolumeId();
+    result.outputName = edtDst_->text().trimmed();
+    result.inPlace = chkInPlace_->isChecked();
     result.refine = chkRefine_->isChecked();
     result.start = spStart_->value();
     result.stop = spStop_->value();
@@ -927,7 +826,6 @@ AlphaCompRefineRequest AlphaCompRefineDialog::request() const
     result.borderOff = spBorder_->value();
     result.radius = spRadius_->value();
     result.genVertexColor = chkVertexColor_->isChecked();
-    result.overwrite = chkOverwrite_->isChecked();
     result.readerScale = spReaderScale_->value();
     result.scaleGroup = edtScaleGroup_->text().trimmed();
     if (result.scaleGroup.isEmpty()) {
@@ -967,7 +865,7 @@ void AlphaCompRefineDialog::applySavedDefaults()
     spReaderScale_->setValue(s.value("reader_scale", spReaderScale_->value()).toDouble());
     edtScaleGroup_->setText(s.value("scale_group", edtScaleGroup_->text()).toString());
     chkVertexColor_->setChecked(s.value("vertex_color", chkVertexColor_->isChecked()).toBool());
-    chkOverwrite_->setChecked(s.value("overwrite", chkOverwrite_->isChecked()).toBool());
+    chkInPlace_->setChecked(s.value("in_place", chkInPlace_->isChecked()).toBool());
     const int th = s.value("omp_threads", -1).toInt();
     edtThreads_->setText(th > 0 ? QString::number(th) : "");
     s.endGroup();
@@ -987,7 +885,7 @@ void AlphaCompRefineDialog::applySessionDefaults()
     spReaderScale_->setValue(s_readerScale);
     edtScaleGroup_->setText(s_scaleGroup);
     chkVertexColor_->setChecked(s_vertexColor);
-    chkOverwrite_->setChecked(s_overwrite);
+    chkInPlace_->setChecked(s_inPlace);
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : "");
 }
 
@@ -1006,7 +904,7 @@ void AlphaCompRefineDialog::saveDefaults() const
     s.setValue("reader_scale", spReaderScale_->value());
     s.setValue("scale_group", edtScaleGroup_->text().trimmed().isEmpty() ? QStringLiteral("1") : edtScaleGroup_->text().trimmed());
     s.setValue("vertex_color", chkVertexColor_->isChecked());
-    s.setValue("overwrite", chkOverwrite_->isChecked());
+    s.setValue("in_place", chkInPlace_->isChecked());
     s.setValue("omp_threads", ompThreads());
     s.endGroup();
 }
@@ -1026,16 +924,16 @@ void AlphaCompRefineDialog::updateSessionFromUI()
     const QString sg = edtScaleGroup_->text().trimmed();
     s_scaleGroup = sg.isEmpty() ? QStringLiteral("1") : sg;
     s_vertexColor = chkVertexColor_->isChecked();
-    s_overwrite = chkOverwrite_->isChecked();
+    s_inPlace = chkInPlace_->isChecked();
     s_ompThreads = ompThreads();
 }
 
 // ================= NeighborCopyDialog =================
 NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
-                                       const QString& surfacePath,
+                                       const QString& surfaceName,
                                        const QVector<NeighborCopyVolumeOption>& volumes,
                                        const QString& defaultVolumeId,
-                                       const QString& defaultOutputPath)
+                                       const QString& defaultOutputTag)
     : QDialog(parent)
 {
     setWindowTitle(tr("Copy Neighbor"));
@@ -1043,7 +941,7 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     auto form = new QFormLayout();
     main->addLayout(form);
 
-    edtSurface_ = new QLineEdit(surfacePath, this);
+    edtSurface_ = new QLineEdit(surfaceName, this);
     edtSurface_->setReadOnly(true);
     form->addRow(tr("Target surface:"), edtSurface_);
 
@@ -1052,9 +950,9 @@ NeighborCopyDialog::NeighborCopyDialog(QWidget* parent,
     populateVolumeOptions(volumes, defaultVolumeId);
     form->addRow(tr("Target volume:"), volumeSelector_);
 
-    QWidget* outPick = pathPicker(this, edtOutput_, tr("Select output directory"), true);
-    edtOutput_->setText(defaultOutputPath);
-    form->addRow(tr("Output path:"), outPick);
+    edtOutput_ = new QLineEdit(defaultOutputTag, this);
+    edtOutput_->setToolTip(tr("Tag for the copied surfaces."));
+    form->addRow(tr("Output tag:"), edtOutput_);
 
     // First pass parameters (collapsible, collapsed by default)
     auto pass1Group = new QGroupBox(tr("First pass parameters (advanced)"), this);
@@ -1221,10 +1119,6 @@ void NeighborCopyDialog::populateVolumeOptions(const QVector<NeighborCopyVolumeO
     volumeSelector_->setVolumes(options, defaultVolumeId);
 }
 
-QString NeighborCopyDialog::surfacePath() const
-{
-    return edtSurface_ ? edtSurface_->text().trimmed() : QString();
-}
 
 QString NeighborCopyDialog::selectedVolumeId() const
 {
@@ -1242,7 +1136,7 @@ QString NeighborCopyDialog::selectedVolumePath() const
     return volumeSelector_->selectedVolumePath();
 }
 
-QString NeighborCopyDialog::outputPath() const
+QString NeighborCopyDialog::outputTag() const
 {
     return edtOutput_ ? edtOutput_->text().trimmed() : QString();
 }
@@ -1316,162 +1210,6 @@ int NeighborCopyDialog::neighborSpikeWindow() const
     return spSpikeWindow_ ? spSpikeWindow_->value() : 2;
 }
 
-// ================= ExportChunksDialog =================
-ExportChunksDialog::ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale)
-    : QDialog(parent)
-{
-    setWindowTitle(tr("Export Width Chunks"));
-    auto main = new QVBoxLayout(this);
-
-    // Info label about the surface
-    const int realWidth = scale > 0 ? static_cast<int>(surfaceWidth / scale) : surfaceWidth;
-    auto infoLabel = new QLabel(tr("Surface width: %1 px (real)").arg(realWidth), this);
-    main->addWidget(infoLabel);
-
-    auto form = new QFormLayout();
-    main->addLayout(form);
-
-    // Load defaults from settings
-    using namespace vc3d::settings;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const int defaultChunkWidth = settings.value(export_::CHUNK_WIDTH_PX, export_::CHUNK_WIDTH_PX_DEFAULT).toInt();
-    const int defaultOverlap = settings.value(export_::CHUNK_OVERLAP_PX, export_::CHUNK_OVERLAP_PX_DEFAULT).toInt();
-    const bool defaultOverwrite = settings.value(export_::OVERWRITE, export_::OVERWRITE_DEFAULT).toBool();
-
-    spChunkWidth_ = new QSpinBox(this);
-    spChunkWidth_->setRange(100, 1000000);
-    spChunkWidth_->setSingleStep(1000);
-    spChunkWidth_->setValue(defaultChunkWidth);
-    spChunkWidth_->setSuffix(tr(" px"));
-    spChunkWidth_->setToolTip(tr("Width of each exported chunk in real (output) pixels"));
-    form->addRow(tr("Chunk width:"), spChunkWidth_);
-
-    spOverlap_ = new QSpinBox(this);
-    spOverlap_->setRange(0, 100000);
-    spOverlap_->setSingleStep(500);
-    spOverlap_->setValue(defaultOverlap);
-    spOverlap_->setSuffix(tr(" px"));
-    spOverlap_->setToolTip(tr("Overlap per side in real pixels.\n"
-                              "Each chunk extends this far into adjacent chunks.\n"
-                              "First chunk has no left overlap, last has no right overlap."));
-    form->addRow(tr("Overlap (per side):"), spOverlap_);
-
-    chkOverwrite_ = new QCheckBox(tr("Overwrite existing exports"), this);
-    chkOverwrite_->setChecked(defaultOverwrite);
-    form->addRow(chkOverwrite_);
-
-    // Preview info that updates when values change
-    auto previewLabel = new QLabel(this);
-    auto updatePreview = [this, previewLabel, realWidth, scale]() {
-        const int chunkW = spChunkWidth_->value();
-        const int overlap = spOverlap_->value();
-        // Step is chunk width (so overlap extends beyond)
-        const int step = chunkW;
-        int nChunks = 0;
-        if (step > 0 && realWidth > 0) {
-            // Each chunk covers [i*step - overlap, i*step + chunkW + overlap]
-            // But first starts at 0 and last ends at realWidth
-            nChunks = (realWidth + step - 1) / step;
-        }
-        previewLabel->setText(tr("Estimated chunks: %1").arg(nChunks));
-    };
-    connect(spChunkWidth_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
-    connect(spOverlap_, QOverload<int>::of(&QSpinBox::valueChanged), this, updatePreview);
-    updatePreview();
-    main->addWidget(previewLabel);
-
-    auto buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(buttons, &QDialogButtonBox::accepted, this, [this, &settings]() {
-        // Save settings for next time
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        s.setValue("export/chunk_width_px", spChunkWidth_->value());
-        s.setValue("export/chunk_overlap_px", spOverlap_->value());
-        s.setValue("export/overwrite", chkOverwrite_->isChecked());
-        accept();
-    });
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    main->addWidget(buttons);
-}
-
-int ExportChunksDialog::chunkWidth() const
-{
-    return spChunkWidth_ ? spChunkWidth_->value() : 40000;
-}
-
-int ExportChunksDialog::overlapPerSide() const
-{
-    return spOverlap_ ? spOverlap_->value() : 0;
-}
-
-bool ExportChunksDialog::overwrite() const
-{
-    return chkOverwrite_ ? chkOverwrite_->isChecked() : true;
-}
-
-// ================= ABFFlattenDialog =================
-bool ABFFlattenDialog::s_haveSession = false;
-int ABFFlattenDialog::s_iterations = 10;
-int ABFFlattenDialog::s_downsample = 1;
-
-ABFFlattenDialog::ABFFlattenDialog(QWidget* parent)
-    : QDialog(parent)
-{
-    setWindowTitle(tr("ABF++ Flatten"));
-    auto main = new QVBoxLayout(this);
-
-    auto form = new QFormLayout();
-    main->addLayout(form);
-
-    spIterations_ = new QSpinBox(this);
-    spIterations_->setRange(1, 100);
-    spIterations_->setValue(10);
-    spIterations_->setToolTip(tr("Maximum number of ABF++ optimization iterations"));
-    form->addRow(tr("Iterations:"), spIterations_);
-
-    spDownsample_ = new QSpinBox(this);
-    spDownsample_->setRange(1, 8);
-    spDownsample_->setValue(1);
-    spDownsample_->setToolTip(tr("Downsample factor for faster computation (1=full, 2=half, 4=quarter).\n"
-                                  "Higher values are faster but may reduce quality."));
-    form->addRow(tr("Downsample factor:"), spDownsample_);
-
-    // Buttons
-    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
-    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    main->addWidget(btns);
-
-    // Apply session defaults
-    applySessionDefaults();
-
-    // Save session on accept
-    connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
-}
-
-void ABFFlattenDialog::applySessionDefaults()
-{
-    if (!s_haveSession) return;
-    spIterations_->setValue(s_iterations);
-    spDownsample_->setValue(s_downsample);
-}
-
-void ABFFlattenDialog::updateSessionFromUI()
-{
-    s_haveSession = true;
-    s_iterations = spIterations_->value();
-    s_downsample = spDownsample_->value();
-}
-
-int ABFFlattenDialog::iterations() const
-{
-    return spIterations_ ? spIterations_->value() : 10;
-}
-
-int ABFFlattenDialog::downsampleFactor() const
-{
-    return spDownsample_ ? spDownsample_->value() : 1;
-}
-
 // ================= SlimFlattenDialog =================
 bool SlimFlattenDialog::s_haveSession = false;
 int SlimFlattenDialog::s_iterations = 50;
@@ -1480,9 +1218,9 @@ QString SlimFlattenDialog::s_energy = QStringLiteral("symmetric_dirichlet");
 double SlimFlattenDialog::s_keepPercent = 1.5;
 bool SlimFlattenDialog::s_inpaintHoles = false;
 
-SlimFlattenDialog::SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath)
+SlimFlattenDialog::SlimFlattenDialog(QWidget* parent, const QString& defaultOutputName)
     : QDialog(parent)
-    , defaultOutput_(defaultOutputPath)
+    , defaultOutput_(defaultOutputName)
 {
     setWindowTitle(tr("SLIM Flatten"));
     auto main = new QVBoxLayout(this);
@@ -1540,30 +1278,11 @@ SlimFlattenDialog::SlimFlattenDialog(QWidget* parent, const QString& defaultOutp
         "if you see flatten failures attributable to interior holes."));
     form->addRow(QString(), cbInpaint_);
 
-    auto outputRow = new QHBoxLayout();
     edtOutput_ = new QLineEdit(this);
     edtOutput_->setText(defaultOutput_);
-    edtOutput_->setToolTip(tr("Output tifxyz directory. Defaults to <segment>_flatboi next to the input."));
-    auto btnBrowse = new QPushButton(tr("Browse..."), this);
-    auto btnReset = new QPushButton(tr("Default"), this);
-    outputRow->addWidget(edtOutput_, /*stretch=*/1);
-    outputRow->addWidget(btnBrowse);
-    outputRow->addWidget(btnReset);
-    form->addRow(tr("Output:"), outputRow);
+    edtOutput_->setToolTip(tr("Name of the new flattened surface."));
+    form->addRow(tr("Output name:"), edtOutput_);
 
-    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
-        const QString start = edtOutput_->text().isEmpty()
-            ? QFileInfo(defaultOutput_).absolutePath()
-            : edtOutput_->text();
-        const QString chosen = QFileDialog::getSaveFileName(
-            this, tr("Choose output tifxyz directory"), start,
-            /*filter=*/QString(), /*selectedFilter=*/nullptr,
-            QFileDialog::DontConfirmOverwrite);
-        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
-    });
-    connect(btnReset, &QPushButton::clicked, this, [this]() {
-        edtOutput_->setText(defaultOutput_);
-    });
 
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -1605,7 +1324,7 @@ QString SlimFlattenDialog::energyType() const
     return cbEnergy_ ? cbEnergy_->currentData().toString() : QStringLiteral("symmetric_dirichlet");
 }
 
-QString SlimFlattenDialog::outputPath() const
+QString SlimFlattenDialog::outputName() const
 {
     if (edtOutput_) {
         const QString t = edtOutput_->text().trimmed();
@@ -1623,9 +1342,9 @@ bool StraightenDialog::s_orthogonalize = true;
 bool StraightenDialog::s_trim = true;
 double StraightenDialog::s_trimMaxEdge = 100.0;
 
-StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutputPath)
+StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutputName)
     : QDialog(parent)
-    , defaultOutput_(defaultOutputPath)
+    , defaultOutput_(defaultOutputName)
 {
     setWindowTitle(tr("Straighten"));
     auto main = new QVBoxLayout(this);
@@ -1679,16 +1398,10 @@ StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutput
     spTrimMaxEdge_->setToolTip(tr("Max 3D neighbor-step (voxels) before a cell is trimmed. Nominal step is 1/scale (~20 at scale 0.05)."));
     form->addRow(tr("Trim max edge:"), spTrimMaxEdge_);
 
-    auto outputRow = new QHBoxLayout();
     edtOutput_ = new QLineEdit(this);
     edtOutput_->setText(defaultOutput_);
-    edtOutput_->setToolTip(tr("Output tifxyz directory (must not exist). Defaults to <segment>_straightened next to the input."));
-    auto btnBrowse = new QPushButton(tr("Browse..."), this);
-    auto btnReset = new QPushButton(tr("Default"), this);
-    outputRow->addWidget(edtOutput_, /*stretch=*/1);
-    outputRow->addWidget(btnBrowse);
-    outputRow->addWidget(btnReset);
-    form->addRow(tr("Output:"), outputRow);
+    edtOutput_->setToolTip(tr("Name of the new straightened surface."));
+    form->addRow(tr("Output name:"), edtOutput_);
 
     auto syncEnabled = [this]() {
         if (spUnbendSmooth_) spUnbendSmooth_->setEnabled(cbUnbend_->isChecked());
@@ -1698,19 +1411,6 @@ StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutput
     connect(cbTrim_,   &QCheckBox::toggled, this, [syncEnabled]() { syncEnabled(); });
     syncEnabled();
 
-    connect(btnBrowse, &QPushButton::clicked, this, [this]() {
-        const QString start = edtOutput_->text().isEmpty()
-            ? QFileInfo(defaultOutput_).absolutePath()
-            : edtOutput_->text();
-        const QString chosen = QFileDialog::getSaveFileName(
-            this, tr("Choose output tifxyz directory"), start,
-            /*filter=*/QString(), /*selectedFilter=*/nullptr,
-            QFileDialog::DontConfirmOverwrite);
-        if (!chosen.isEmpty()) edtOutput_->setText(chosen);
-    });
-    connect(btnReset, &QPushButton::clicked, this, [this]() {
-        edtOutput_->setText(defaultOutput_);
-    });
 
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -1728,36 +1428,18 @@ StraightenDialog::StraightenDialog(QWidget* parent, const QString& defaultOutput
     });
 }
 
-QString StraightenDialog::outputPath() const
+StraightenRequest StraightenDialog::request() const
 {
-    if (edtOutput_) {
-        const QString t = edtOutput_->text().trimmed();
-        if (!t.isEmpty()) return t;
-    }
-    return defaultOutput_;
-}
-
-QStringList StraightenDialog::toArgs() const
-{
-    QStringList a;
-    if (cbUnbend_ && cbUnbend_->isChecked()) {
-        a << QStringLiteral("--unbend");
-        if (spUnbendSmooth_)
-            a << QStringLiteral("--unbend-smooth-cols")
-              << QString::number(spUnbendSmooth_->value(), 'f', 0);
-    }
-    // Always explicit so vc_straighten never falls back to its implicit
-    // "no stage flags = full default pipeline" behavior.
-    a << QStringLiteral("--overlap-pairs")
-      << QString::number(spOverlap_ ? spOverlap_->value() : 2);
-    if (cbOrtho_ && cbOrtho_->isChecked()) a << QStringLiteral("--orthogonalize");
-    if (cbTrim_ && cbTrim_->isChecked()) {
-        a << QStringLiteral("--trim");
-        if (spTrimMaxEdge_)
-            a << QStringLiteral("--trim-max-edge")
-              << QString::number(spTrimMaxEdge_->value(), 'f', 0);
-    }
-    return a;
+    StraightenRequest request;
+    request.unbend = cbUnbend_ && cbUnbend_->isChecked();
+    if (spUnbendSmooth_) request.unbendSmoothCols = spUnbendSmooth_->value();
+    if (spOverlap_) request.overlapPasses = spOverlap_->value();
+    request.orthogonalize = cbOrtho_ && cbOrtho_->isChecked();
+    request.trim = cbTrim_ && cbTrim_->isChecked();
+    if (spTrimMaxEdge_) request.trimMaxEdge = spTrimMaxEdge_->value();
+    const QString name = edtOutput_ ? edtOutput_->text().trimmed() : QString();
+    request.outputName = name.isEmpty() ? defaultOutput_ : name;
+    return request;
 }
 
 // ================= VisLasagnaObjDialog =================
@@ -1906,12 +1588,11 @@ void VisLasagnaObjDialog::updateSessionFromUI()
 }
 
 // ============================================================================
-// MergeTifxyzDialog
+// MergeSurfacesDialog
 //
-// Edits a 2D grid of tifxyz directory names plus the RANSAC tunables for
-// vc_merge_tifxyz, writes a merge.json into <volpkg>/, and exposes the
-// path + tunables to the caller. Each cell holds a name resolved against
-// <volpkg>/<paths_dir>/. Empty cells are allowed; adjacency in the grid
+// Edits a 2D grid of stored surfaces plus the RANSAC tunables for
+// vc_merge_tifxyz and exposes its merge.json + tunables to the caller. Each
+// cell holds a surface UUID. Empty cells are allowed; adjacency in the grid
 // drives RANSAC alignment.
 // ============================================================================
 
@@ -1924,17 +1605,17 @@ void VisLasagnaObjDialog::updateSessionFromUI()
 #include <algorithm>
 #include <fstream>
 
-bool   MergeTifxyzDialog::s_haveSession = false;
-int    MergeTifxyzDialog::s_iters       = 3000;
-double MergeTifxyzDialog::s_min         = 5.0;
-double MergeTifxyzDialog::s_max         = 10.0;
-double MergeTifxyzDialog::s_madK        = 3.0;
-int    MergeTifxyzDialog::s_seed        = 0;
-int    MergeTifxyzDialog::s_anchorCap   = 0;
-int    MergeTifxyzDialog::s_stripCols   = 0;
-int    MergeTifxyzDialog::s_lastRows    = 0;
-int    MergeTifxyzDialog::s_lastCols    = 0;
-int    MergeTifxyzDialog::s_ompThreads  = -1;
+bool   MergeSurfacesDialog::s_haveSession = false;
+int    MergeSurfacesDialog::s_iters       = 3000;
+double MergeSurfacesDialog::s_min         = 5.0;
+double MergeSurfacesDialog::s_max         = 10.0;
+double MergeSurfacesDialog::s_madK        = 3.0;
+int    MergeSurfacesDialog::s_seed        = 0;
+int    MergeSurfacesDialog::s_anchorCap   = 0;
+int    MergeSurfacesDialog::s_stripCols   = 0;
+int    MergeSurfacesDialog::s_lastRows    = 0;
+int    MergeSurfacesDialog::s_lastCols    = 0;
+int    MergeSurfacesDialog::s_ompThreads  = -1;
 
 namespace {
 
@@ -1951,15 +1632,11 @@ QPair<int, int> defaultGridShape(int n)
 
 }
 
-MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
+MergeSurfacesDialog::MergeSurfacesDialog(QWidget* parent,
                                      const QStringList& seedSegmentIds,
-                                     const QStringList& availableSegments,
-                                     const QString& volpkgDir,
-                                     const QString& pathsDir)
+                                     const QMap<QString, QString>& availableSurfaces)
     : QDialog(parent),
-      _availableSegments(availableSegments),
-      _volpkgDir(volpkgDir),
-      _pathsDir(pathsDir)
+      _availableSurfaces(availableSurfaces)
 {
     setWindowTitle("Merge TIFXYZ Surfaces");
     auto main = new QVBoxLayout(this);
@@ -2102,7 +1779,7 @@ MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
     resize(720, 600);
 }
 
-void MergeTifxyzDialog::applyCodeDefaults()
+void MergeSurfacesDialog::applyCodeDefaults()
 {
     spIters_->setValue(3000);
     spMin_->setValue(5.0);
@@ -2114,7 +1791,7 @@ void MergeTifxyzDialog::applyCodeDefaults()
     edtThreads_->setText(QString());
 }
 
-void MergeTifxyzDialog::applySessionDefaults()
+void MergeSurfacesDialog::applySessionDefaults()
 {
     if (!s_haveSession) return;
     spIters_->setValue(s_iters);
@@ -2127,7 +1804,7 @@ void MergeTifxyzDialog::applySessionDefaults()
     edtThreads_->setText(s_ompThreads > 0 ? QString::number(s_ompThreads) : QString());
 }
 
-void MergeTifxyzDialog::updateSessionFromUI()
+void MergeSurfacesDialog::updateSessionFromUI()
 {
     s_haveSession = true;
     s_iters       = spIters_->value();
@@ -2142,7 +1819,7 @@ void MergeTifxyzDialog::updateSessionFromUI()
     s_ompThreads  = ompThreads();
 }
 
-void MergeTifxyzDialog::resizeGrid(int newRows, int newCols)
+void MergeSurfacesDialog::resizeGrid(int newRows, int newCols)
 {
     newRows = std::max(1, newRows);
     newCols = std::max(1, newCols);
@@ -2159,7 +1836,7 @@ void MergeTifxyzDialog::resizeGrid(int newRows, int newCols)
     updateRefCombo();
 }
 
-void MergeTifxyzDialog::seedGrid(const QStringList& seedSegmentIds)
+void MergeSurfacesDialog::seedGrid(const QStringList& seedSegmentIds)
 {
     QStringList seeds;
     for (const auto& s : seedSegmentIds) if (!s.isEmpty()) seeds << s;
@@ -2188,7 +1865,7 @@ void MergeTifxyzDialog::seedGrid(const QStringList& seedSegmentIds)
     updateRefCombo();
 }
 
-void MergeTifxyzDialog::promptAddSegments()
+void MergeSurfacesDialog::promptAddSegments()
 {
     // Open a small modal that lists every available segment; chosen
     // names are appended into the first empty cells (row-major).
@@ -2204,16 +1881,18 @@ void MergeTifxyzDialog::promptAddSegments()
     list->setSelectionMode(QAbstractItemView::ExtendedSelection);
     QSet<QString> alreadyInGrid;
     for (const auto& n : collectGridNames()) if (!n.isEmpty()) alreadyInGrid.insert(n);
-    for (const auto& s : _availableSegments) {
+    for (auto it = _availableSurfaces.cbegin(); it != _availableSurfaces.cend(); ++it) {
+        const QString& s = it.key();
         auto* item = new QListWidgetItem(list);
         item->setData(Qt::UserRole, s);
+        const QString label = QStringLiteral("%1  (%2)").arg(it.value(), s);
         if (alreadyInGrid.contains(s)) {
-            item->setText(s + tr("  (already in grid)"));
+            item->setText(label + tr("  (already in grid)"));
             QFont f = item->font();
             f.setItalic(true);
             item->setFont(f);
         } else {
-            item->setText(s);
+            item->setText(label);
         }
     }
     auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -2254,7 +1933,7 @@ void MergeTifxyzDialog::promptAddSegments()
     updateRefCombo();
 }
 
-QStringList MergeTifxyzDialog::collectGridNames() const
+QStringList MergeSurfacesDialog::collectGridNames() const
 {
     QStringList out;
     for (int r = 0; r < tblGrid_->rowCount(); ++r) {
@@ -2266,9 +1945,9 @@ QStringList MergeTifxyzDialog::collectGridNames() const
     return out;
 }
 
-vc3d::merge_tifxyz::Grid MergeTifxyzDialog::collectGridRows() const
+QVector<QStringList> MergeSurfacesDialog::collectGridRows() const
 {
-    vc3d::merge_tifxyz::Grid rows;
+    QVector<QStringList> rows;
     for (int r = 0; r < tblGrid_->rowCount(); ++r) {
         QStringList row;
         for (int c = 0; c < tblGrid_->columnCount(); ++c) {
@@ -2280,29 +1959,26 @@ vc3d::merge_tifxyz::Grid MergeTifxyzDialog::collectGridRows() const
     return rows;
 }
 
-QString MergeTifxyzDialog::buildMergeJsonText() const
+QString MergeSurfacesDialog::mergeJsonText() const
 {
     return vc3d::merge_tifxyz::gridJsonText(collectGridRows());
 }
 
-void MergeTifxyzDialog::rebuildPreview()
+void MergeSurfacesDialog::rebuildPreview()
 {
-    lblPreview_->setText(buildMergeJsonText());
-    QStringList names = collectGridNames();
-    QString af = vc3d::merge_tifxyz::alphaFirst(names);
-    if (af.isEmpty()) {
-        lblOutName_->setText(tr("(grid is empty)"));
-    } else {
-        const QString base = af + QStringLiteral("_merged");
-        const QString name = vc3d::merge_tifxyz::resolveOutputName(_volpkgDir, base);
-        lblOutName_->setText(QStringLiteral("%1/paths/%2/")
-            .arg(_volpkgDir, name));
+    lblPreview_->setText(mergeJsonText());
+    // vc_merge_tifxyz names the merge after the grid's first surface.
+    QString first;
+    for (const auto& n : collectGridNames()) {
+        if (!n.isEmpty()) { first = n; break; }
     }
+    lblOutName_->setText(first.isEmpty() ? tr("(grid is empty)")
+        : tr("new surface %1_merged").arg(_availableSurfaces.value(first, first)));
 }
 
-void MergeTifxyzDialog::updateRefCombo()
+void MergeSurfacesDialog::updateRefCombo()
 {
-    QString prev = cmbRef_->currentText();
+    QString prev = cmbRef_->currentData().toString();
     QStringList names = collectGridNames();
     QStringList unique;
     for (const auto& n : names) {
@@ -2311,7 +1987,7 @@ void MergeTifxyzDialog::updateRefCombo()
     cmbRef_->blockSignals(true);
     cmbRef_->clear();
     cmbRef_->addItem(tr("<auto: largest valid-cell count>"), QString());
-    for (const auto& n : unique) cmbRef_->addItem(n, n);
+    for (const auto& n : unique) cmbRef_->addItem(_availableSurfaces.value(n, n), n);
     if (!prev.isEmpty()) {
         const int idx = cmbRef_->findData(prev);
         if (idx >= 0) cmbRef_->setCurrentIndex(idx);
@@ -2319,39 +1995,29 @@ void MergeTifxyzDialog::updateRefCombo()
     cmbRef_->blockSignals(false);
 }
 
-QString MergeTifxyzDialog::mergeJsonPath() const { return _mergeJsonPath; }
-QString MergeTifxyzDialog::refSurface()    const { return cmbRef_->currentData().toString(); }
-int     MergeTifxyzDialog::ransacIters()   const { return spIters_->value(); }
-double  MergeTifxyzDialog::ransacMinThresh() const { return spMin_->value(); }
-double  MergeTifxyzDialog::ransacMaxThresh() const { return spMax_->value(); }
-double  MergeTifxyzDialog::ransacMadK()    const { return spMadK_->value(); }
-int     MergeTifxyzDialog::ransacSeed()    const { return spSeed_->value(); }
-int     MergeTifxyzDialog::anchorCap()     const { return spAnchorCap_->value(); }
-int     MergeTifxyzDialog::stripCols()     const { return spStripCols_->value(); }
-int     MergeTifxyzDialog::ompThreads() const {
+QString MergeSurfacesDialog::refSurface()    const { return cmbRef_->currentData().toString(); }
+int     MergeSurfacesDialog::ransacIters()   const { return spIters_->value(); }
+double  MergeSurfacesDialog::ransacMinThresh() const { return spMin_->value(); }
+double  MergeSurfacesDialog::ransacMaxThresh() const { return spMax_->value(); }
+double  MergeSurfacesDialog::ransacMadK()    const { return spMadK_->value(); }
+int     MergeSurfacesDialog::ransacSeed()    const { return spSeed_->value(); }
+int     MergeSurfacesDialog::anchorCap()     const { return spAnchorCap_->value(); }
+int     MergeSurfacesDialog::stripCols()     const { return spStripCols_->value(); }
+int     MergeSurfacesDialog::ompThreads() const {
     const QString t = edtThreads_->text().trimmed();
     if (t.isEmpty()) return -1;
     bool ok = false; int v = t.toInt(&ok); return (ok && v > 0) ? v : -1;
 }
 
-void MergeTifxyzDialog::accept()
+void MergeSurfacesDialog::accept()
 {
-    const vc3d::merge_tifxyz::Grid rows = collectGridRows();
     const QString invalid = vc3d::merge_tifxyz::validate(
-        rows, _availableSegments, _pathsDir, refSurface(),
+        collectGridRows(), _availableSurfaces.keys(), refSurface(),
         spMin_->value(), spMax_->value());
     if (!invalid.isEmpty()) {
         QMessageBox::warning(this, tr("Merge TIFXYZ"), invalid);
         return;
     }
-
-    QString error;
-    const QString mergeJsonPath = vc3d::merge_tifxyz::writeMergeJson(_volpkgDir, rows, &error);
-    if (mergeJsonPath.isEmpty()) {
-        QMessageBox::critical(this, tr("Merge TIFXYZ"), error);
-        return;
-    }
-    _mergeJsonPath = mergeJsonPath;
 
     updateSessionFromUI();
     QDialog::accept();
@@ -2360,14 +2026,10 @@ void MergeTifxyzDialog::accept()
 // ============================================================================
 // MergePatchDialog
 //
-// Two-input front-end for vc_merge_patch. Picks a parent + child tifxyz from
-// the volpkg, exposes the binary's tunables, and previews the auto-detected
-// parent/child role assignment (cheap: countValidPoints() against the
-// already-loaded VolumePkg surface cache).
+// Two-input front-end for vc_merge_patch. Picks a parent + child stored
+// surface, exposes the binary's tunables, and previews the auto-detected
+// parent/child role assignment from the surfaces' recorded areas.
 // ============================================================================
-
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/QuadSurface.hpp"
 
 #include <QComboBox>
 
@@ -2385,17 +2047,11 @@ int    MergePatchDialog::ms_ompThreads   = -1;
 
 MergePatchDialog::MergePatchDialog(QWidget* parent,
                                    const QStringList& seedSegmentIds,
-                                   const QStringList& availableSegments,
-                                   std::shared_ptr<VolumePkg> volpkg,
-                                   const QString& volpkgDir,
-                                   const QString& pathsDir)
+                                   const QMap<QString, Choice>& availableSurfaces)
     : QDialog(parent),
-      _availableSegments(availableSegments),
-      _volpkg(std::move(volpkg)),
-      _volpkgDir(volpkgDir),
-      _pathsDir(pathsDir)
+      _availableSurfaces(availableSurfaces)
 {
-    setWindowTitle(tr("Patch tifxyz"));
+    setWindowTitle(tr("Patch Surface"));
     auto main = new QVBoxLayout(this);
 
     // --- Surface pickers -------------------------------------------------
@@ -2404,7 +2060,8 @@ MergePatchDialog::MergePatchDialog(QWidget* parent,
 
     auto fillCombo = [&](QComboBox* cmb) {
         cmb->setEditable(false);
-        for (const auto& id : _availableSegments) cmb->addItem(id);
+        for (auto it = _availableSurfaces.cbegin(); it != _availableSurfaces.cend(); ++it)
+            cmb->addItem(it.value().name, it.key());
     };
     cmbA_ = new QComboBox(grpInputs);
     cmbB_ = new QComboBox(grpInputs);
@@ -2417,14 +2074,14 @@ MergePatchDialog::MergePatchDialog(QWidget* parent,
     auto pickSeed = [&](QComboBox* cmb, int index) {
         if (index < 0 || index >= seedSegmentIds.size()) return;
         const QString id = seedSegmentIds.at(index);
-        const int idx = cmb->findText(id);
+        const int idx = cmb->findData(id);
         if (idx >= 0) cmb->setCurrentIndex(idx);
     };
     pickSeed(cmbA_, 0);
     pickSeed(cmbB_, 1);
     // If only one seed was passed, leave B at index 0 (different from A
     // by happenstance — user has to pick the other side).
-    if (seedSegmentIds.size() < 2 && _availableSegments.size() >= 2 &&
+    if (seedSegmentIds.size() < 2 && _availableSurfaces.size() >= 2 &&
         cmbA_->currentIndex() == cmbB_->currentIndex())
     {
         cmbB_->setCurrentIndex(cmbA_->currentIndex() == 0 ? 1 : 0);
@@ -2596,18 +2253,13 @@ void MergePatchDialog::updateSessionFromUI()
     ms_ompThreads  = ompThreads();
 }
 
-int MergePatchDialog::validCellCountFor(const QString& segId) const
-{
-    if (!_volpkg) return -1;
-    auto surf = _volpkg->getSurface(segId.toStdString());
-    if (!surf || !surf->isLoaded()) return -1;
-    return surf->countValidPoints();
-}
+QString MergePatchDialog::surfaceA() const { return cmbA_->currentData().toString(); }
+QString MergePatchDialog::surfaceB() const { return cmbB_->currentData().toString(); }
 
 void MergePatchDialog::recomputeRoleHint()
 {
-    const QString idA = cmbA_->currentText();
-    const QString idB = cmbB_->currentText();
+    const QString idA = surfaceA();
+    const QString idB = surfaceB();
 
     if (idA.isEmpty() || idB.isEmpty()) {
         lblRoleHint_->setText(tr("(pick two surfaces)"));
@@ -2622,8 +2274,10 @@ void MergePatchDialog::recomputeRoleHint()
         return;
     }
 
-    const int vA = validCellCountFor(idA);
-    const int vB = validCellCountFor(idB);
+    // vc_merge_patch picks the surface with more valid cells as the parent;
+    // the area is the hint's stand-in for that count.
+    const double vA = _availableSurfaces.value(idA).area;
+    const double vB = _availableSurfaces.value(idB).area;
 
     // Auto-detect parent if the user hasn't swapped; otherwise keep
     // whichever side the user pinned.
@@ -2637,18 +2291,18 @@ void MergePatchDialog::recomputeRoleHint()
         }
     }
 
-    const QString parentId = _aIsParent ? idA : idB;
-    const QString childId  = _aIsParent ? idB : idA;
-    const int     vParent  = _aIsParent ? vA  : vB;
-    const int     vChild   = _aIsParent ? vB  : vA;
+    const QString parentId = _availableSurfaces.value(_aIsParent ? idA : idB).name;
+    const QString childId  = _availableSurfaces.value(_aIsParent ? idB : idA).name;
+    const double  vParent  = _aIsParent ? vA  : vB;
+    const double  vChild   = _aIsParent ? vB  : vA;
 
-    auto fmt = [](int v) {
-        return v < 0 ? QString("?") : QString::number(v);
+    auto fmt = [](double v) {
+        return v < 0 ? QString("?") : QString::number(v, 'f', 0);
     };
     QString tag = _userSwapped ? tr(" (swapped — explicit)") :
                                  tr(" (auto-detect)");
     lblRoleHint_->setText(
-        tr("Parent: %1 (valid=%2)<br/>Child: %3 (valid=%4)%5")
+        tr("Parent: %1 (area=%2 vx²)<br/>Child: %3 (area=%4 vx²)%5")
             .arg(parentId, fmt(vParent), childId, fmt(vChild), tag));
 
     if (vParent >= 0 && vChild > 0 && vParent < 2 * vChild) {
@@ -2656,7 +2310,7 @@ void MergePatchDialog::recomputeRoleHint()
             QString::fromLatin1("<br/><span style='color:#c08040;'>%1</span>")
                 .arg(tr("warning: parent only %1× larger than child — "
                         "verify roles")
-                         .arg((double)vParent / std::max(1, vChild), 0, 'f', 1)));
+                         .arg(vParent / std::max(1.0, vChild), 0, 'f', 1)));
     }
 
     refreshOverwriteBanner();
@@ -2664,27 +2318,23 @@ void MergePatchDialog::recomputeRoleHint()
 
 void MergePatchDialog::refreshOverwriteBanner()
 {
-    const QString idA = cmbA_->currentText();
-    const QString idB = cmbB_->currentText();
+    const QString idA = surfaceA();
+    const QString idB = surfaceB();
     QString parentId;
     if (!idA.isEmpty() && !idB.isEmpty() && idA != idB) {
-        parentId = _aIsParent ? idA : idB;
+        parentId = _availableSurfaces.value(_aIsParent ? idA : idB).name;
     }
     if (parentId.isEmpty()) {
         lblBanner_->setText(tr("Pick two distinct surfaces before continuing."));
         return;
     }
     lblBanner_->setText(
-        tr("Parent <b>%1</b> will be overwritten in place. "
-           "x/y/z/mask/meta are replaced atomically; aux files "
-           "(approval.tif, generations.tif, ...) are preserved. "
-           "The pre-patch state is snapshotted to a "
-           "<code>backups/%1/{0..7}/</code> folder beside the volpkg "
-           "file.").arg(parentId));
+        tr("Parent <b>%1</b> is edited in place; its revision history keeps "
+           "the pre-patch state.").arg(parentId));
 }
 
-QString MergePatchDialog::parentPath() const { return _parentPath; }
-QString MergePatchDialog::childPath()  const { return _childPath;  }
+QString MergePatchDialog::parentSurface() const { return _parentSurface; }
+QString MergePatchDialog::childSurface()  const { return _childSurface;  }
 bool    MergePatchDialog::explicitRoles() const { return _explicitRoles; }
 int     MergePatchDialog::borderCells() const { return spBorderCells_->value(); }
 int     MergePatchDialog::blendCells()  const { return spBlendCells_->value();  }
@@ -2705,47 +2355,26 @@ int     MergePatchDialog::ompThreads()  const {
 
 void MergePatchDialog::accept()
 {
-    const QString idA = cmbA_->currentText();
-    const QString idB = cmbB_->currentText();
+    const QString idA = surfaceA();
+    const QString idB = surfaceB();
     if (idA.isEmpty() || idB.isEmpty()) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("Pick two surfaces before proceeding."));
         return;
     }
     if (idA == idB) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("Parent and child must be different surfaces."));
         return;
     }
     if (spMin_->value() >= spMax_->value()) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
+        QMessageBox::warning(this, tr("Patch Surface"),
             tr("RANSAC min threshold must be strictly less than max."));
         return;
     }
 
-    QSet<QString> avail(_availableSegments.begin(), _availableSegments.end());
-    if (!avail.contains(idA) || !avail.contains(idB)) {
-        QMessageBox::warning(this, tr("Patch tifxyz"),
-            tr("One of the picked surfaces is not present under %1.")
-                .arg(_pathsDir));
-        return;
-    }
-
-    const QString parentId = _aIsParent ? idA : idB;
-    const QString childId  = _aIsParent ? idB : idA;
-
-    namespace fs = std::filesystem;
-    const fs::path pathsRoot = fs::path(_pathsDir.toStdString());
-    const fs::path parentDir = pathsRoot / parentId.toStdString();
-    const fs::path childDir  = pathsRoot / childId.toStdString();
-    if (!fs::is_directory(parentDir) || !fs::is_directory(childDir)) {
-        QMessageBox::critical(this, tr("Patch tifxyz"),
-            tr("Surface directories not found under %1.").arg(_pathsDir));
-        return;
-    }
-
-    _parentPath     = QString::fromStdString(parentDir.string());
-    _childPath      = QString::fromStdString(childDir.string());
+    _parentSurface = _aIsParent ? idA : idB;
+    _childSurface  = _aIsParent ? idB : idA;
     _explicitRoles  = _userSwapped;
 
     updateSessionFromUI();
@@ -2773,9 +2402,6 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
 
     QWidget* wTracks = pathPicker(this, edtTracks_, tr("Select packed .vctracks directory"), true);
     QWidget* wCross = pathPicker(this, edtCrossings_, tr("Select crossings .npz file"), false);
-    // For output directory we allow typing a non-existing path; the picker
-    // browses an existing parent, but the text field is freely editable.
-    QWidget* wOut = pathPicker(this, edtOutput_, tr("Select output directory"), true);
     // venv picker: python binary inside venv
     QWidget* wVenv = pathPicker(this, edtVenv_, tr("Select venv Python"), false);
     // Enhance venv button to also allow directory selection (venv root)
@@ -2809,12 +2435,10 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
 
     edtTracks_->setPlaceholderText(tr("/path/to/tracks.vctracks  (directory with metadata.json)"));
     edtCrossings_->setPlaceholderText(tr("/path/to/crossings.npz  (uncompressed)"));
-    edtOutput_->setPlaceholderText(tr("/path/to/output  (parent directory for .tifxyz patches)"));
     edtVenv_->setPlaceholderText(tr("/path/to/venv/bin/python  or  /path/to/venv"));
 
     ioForm->addRow(tr("Tracks (.vctracks dir):"), wTracks);
     ioForm->addRow(tr("Crossings (.npz):"), wCross);
-    ioForm->addRow(tr("Output dir:"), wOut);
     ioForm->addRow(tr("Venv Python:"), wVenv);
     main->addWidget(ioBox);
 
@@ -2987,12 +2611,11 @@ GrowTrackPatchesDialog::GrowTrackPatchesDialog(QWidget* parent)
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     main->addWidget(buttons);
 
-    ensureDialogWidthForEdits(this, {edtTracks_, edtCrossings_, edtOutput_, edtVenv_, edtSeeds_});
+    ensureDialogWidthForEdits(this, {edtTracks_, edtCrossings_, edtVenv_, edtSeeds_});
 }
 
 QString GrowTrackPatchesDialog::tracksPath() const { return edtTracks_->text().trimmed(); }
 QString GrowTrackPatchesDialog::crossingsPath() const { return edtCrossings_->text().trimmed(); }
-QString GrowTrackPatchesDialog::outputPath() const { return edtOutput_->text().trimmed(); }
 QString GrowTrackPatchesDialog::venvPath() const { return edtVenv_->text().trimmed(); }
 
 QString GrowTrackPatchesDialog::resolvedPython() const
@@ -3032,7 +2655,7 @@ QString GrowTrackPatchesDialog::scriptPath() const
 QStringList GrowTrackPatchesDialog::buildArgs() const
 {
     QStringList args;
-    args << tracksPath() << crossingsPath() << outputPath();
+    args << tracksPath() << crossingsPath();
 
     if (rbSeeds_->isChecked()) {
         const QString txt = edtSeeds_->text().trimmed();
@@ -3097,7 +2720,6 @@ void GrowTrackPatchesDialog::accept()
 {
     const QString tracks = tracksPath();
     const QString crossings = crossingsPath();
-    const QString out = outputPath();
     const QString venv = venvPath();
 
     if (tracks.isEmpty()) {
@@ -3106,10 +2728,6 @@ void GrowTrackPatchesDialog::accept()
     }
     if (crossings.isEmpty()) {
         QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select a crossings .npz file."));
-        return;
-    }
-    if (out.isEmpty()) {
-        QMessageBox::warning(this, tr("Grow Track Patches"), tr("Select an output directory."));
         return;
     }
     if (venv.isEmpty()) {

@@ -14,8 +14,8 @@
 
 // Workspace ids in tab order, as stored in each tab page's "workspaceId"
 // property by CWindow (the setProperty calls next to the addTab calls in
-// CWindow's constructor, plus the Spiral and Fiber Map pages it creates
-// later). workspace.switch's descriptor enum is built from this list, and the
+// CWindow's constructor, plus the Spiral, Fiber Map and Project pages it
+// creates later). workspace.switch's descriptor enum is built from this list, and the
 // offscreen smoke test checks it against the live tab bar, so a tab added to
 // CWindow must be added here.
 inline QStringList agentBridgeWorkspaceIds()
@@ -23,20 +23,15 @@ inline QStringList agentBridgeWorkspaceIds()
     return {
         QStringLiteral("main"),
         QStringLiteral("lasagna"),
-        QStringLiteral("atlas"),
-        QStringLiteral("fiber-slice"),
-        QStringLiteral("intersections"),
         QStringLiteral("spiral"),
         QStringLiteral("fiber-map"),
+        QStringLiteral("project"),
     };
 }
 
-// workspace.switch keeps accepting the protocol's original "fiber_slice"
-// spelling; every other accepted name is already a workspace id.
+// Every name workspace.switch accepts is already a workspace id.
 inline QString canonicalWorkspaceId(const QString& name)
 {
-    if (name == QLatin1String("fiber_slice"))
-        return QStringLiteral("fiber-slice");
     return name;
 }
 

@@ -85,7 +85,7 @@ bool isTemporaryCollection(const std::string& name)
 
 // The part of the collections a recovery copy keeps, or null when that has
 // no points. Segment correction points (anchored collections) are left out,
-// since their segment's corrections.json already keeps them, and so are the
+// since the object store keeps them with their surface, and so are the
 // seeding panel's temporary previews.
 std::shared_ptr<const PointCollections> recoverablePoints(const PointCollections& live,
                                                           int* collections,
@@ -204,9 +204,8 @@ bool SessionRecovery::LeftoverSession::hasPoints() const
 
 const QStringList& SessionRecovery::temporaryCollections()
 {
-    // SeedingWidget's ray, peak and radius previews: recomputed on demand.
-    static const QStringList names{QStringLiteral("ray_preview"), QStringLiteral("seeding_peaks"),
-                                   QStringLiteral("seeding_preview")};
+    // SeedingWidget's path peaks: recomputed on demand.
+    static const QStringList names{QStringLiteral("seeding_peaks")};
     return names;
 }
 

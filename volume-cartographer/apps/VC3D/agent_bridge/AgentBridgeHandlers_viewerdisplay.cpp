@@ -11,9 +11,9 @@
 #include <string>
 
 #include "CWindow.hpp"
-#include "VolumeViewerCmaps.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
+#include "vc/core/render/Colormaps.hpp"
 
 // ===========================================================================
 // Viewer display state beyond the shared render settings: the ink detection
@@ -38,7 +38,7 @@ InkDetectionOverlayController* requireInkOverlay(InkDetectionOverlayController* 
 QStringList inkColormapIds()
 {
     QStringList ids{QString()};
-    for (const auto& entry : volume_viewer_cmaps::entries(volume_viewer_cmaps::EntryScope::SharedOnly))
+    for (const auto& entry : vc::entries(vc::EntryScope::SharedOnly))
         ids.append(QString::fromStdString(entry.id));
     return ids;
 }
@@ -60,9 +60,7 @@ QJsonObject AgentBridgeServer::inkOverlayJson() const
         available.append(QJsonObject{
             {"label", option.label},
             {"path", QString::fromStdString(option.localPath.string())},
-            {"sampleId", QString::fromStdString(option.sampleId)},
-            {"segmentId", QString::fromStdString(option.segmentId)},
-            {"segmentLongId", QString::fromStdString(option.segmentLongId)},
+            {"name", QString::fromStdString(option.name)},
         });
     }
     const QString selected = QString::fromStdString(overlay->selectedPath().string());

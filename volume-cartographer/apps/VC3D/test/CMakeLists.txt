@@ -1,12 +1,5 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
-add_executable(test_surface_transform_name test_surface_transform_name.cpp)
-target_include_directories(test_surface_transform_name PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_surface_transform_name PRIVATE Qt6::Core)
-add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
-vc_register_test_target(test_surface_transform_name)
-vc_register_ctest(surface_transform_name test_surface_transform_name)
-
 add_executable(test_plugin_manifest test_plugin_manifest.cpp
     ../plugins/PluginManifest.cpp ../plugins/PluginManifest.hpp)
 target_include_directories(test_plugin_manifest PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -41,34 +34,16 @@ add_executable(test_catalog_project_dialog
     ../OpenDataManifest.cpp
     ../OpenDataSampleProject.cpp
     ../OpenDataLasagna.cpp
-    ../OpenDataNormalGrids.cpp
-    ../OpenDataSegmentCache.cpp
-    ../OpenDataSegmentCacheIO.cpp)
+    ../OpenDataNormalGrids.cpp)
 set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 target_link_libraries(test_catalog_project_dialog PRIVATE
-    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna)
+    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry)
 add_test(NAME catalog_project_dialog COMMAND test_catalog_project_dialog)
 vc_register_test_target(test_catalog_project_dialog)
 vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
 set_tests_properties(catalog_project_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
-
-add_executable(test_intersection_layer_item
-    test_intersection_layer_item.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.hpp)
-set_target_properties(test_intersection_layer_item PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_intersection_layer_item PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_intersection_layer_item PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
-add_test(NAME intersection_layer_item COMMAND test_intersection_layer_item)
-vc_register_test_target(test_intersection_layer_item)
-vc_register_ctest(intersection_layer_item test_intersection_layer_item)
-set_tests_properties(intersection_layer_item PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_status_message_history
     test_status_message_history.cpp
@@ -131,8 +106,7 @@ target_include_directories(test_surface_rotation_transform PRIVATE
 
 target_link_libraries(test_surface_rotation_transform PRIVATE
     Qt6::Core
-    Qt6::Test
-    TIFF::TIFF)
+    Qt6::Test)
 
 set_target_properties(test_surface_rotation_transform PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -472,6 +446,9 @@ add_executable(test_command_line_tool_runner
     test_command_line_tool_runner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolExecutable.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolProcess.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ToolProcess.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.hpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/ProgressUtil.cpp
@@ -488,32 +465,14 @@ target_compile_definitions(test_command_line_tool_runner PRIVATE VC_TESTING)
 target_link_libraries(test_command_line_tool_runner PRIVATE
     Qt6::Core
     Qt6::Test
-    Qt6::Widgets)
+    Qt6::Widgets
+    vc_core)
 
 add_test(NAME command_line_tool_runner COMMAND test_command_line_tool_runner)
 vc_register_test_target(test_command_line_tool_runner)
 vc_register_ctest(command_line_tool_runner test_command_line_tool_runner)
 set_tests_properties(command_line_tool_runner PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
-
-add_executable(test_annotation_frame
-    test_annotation_frame.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/AnnotationFrame.hpp)
-
-set_target_properties(test_annotation_frame PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-
-target_include_directories(test_annotation_frame PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-target_link_libraries(test_annotation_frame PRIVATE
-    vc_core
-    Qt6::Core
-    Qt6::Test)
-
-add_test(NAME annotation_frame COMMAND test_annotation_frame)
-vc_register_test_target(test_annotation_frame)
-vc_register_ctest(annotation_frame test_annotation_frame)
 
 add_executable(test_open_data_volume_orientation
     test_open_data_volume_orientation.cpp
@@ -539,8 +498,7 @@ vc_register_ctest(open_data_volume_orientation test_open_data_volume_orientation
 
 add_executable(test_fiber_map_staleness
     test_fiber_map_staleness.cpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapStaleness.hpp
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/AnnotationFrame.hpp)
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapStaleness.hpp)
 
 set_target_properties(test_fiber_map_staleness PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -794,28 +752,8 @@ add_test(NAME merge_tifxyz_inputs COMMAND test_merge_tifxyz_inputs)
 vc_register_test_target(test_merge_tifxyz_inputs)
 vc_register_ctest(merge_tifxyz_inputs test_merge_tifxyz_inputs)
 
-add_executable(test_segment_files
-    test_segment_files.cpp
-    ../SegmentFiles.cpp ../SegmentFiles.hpp)
-set_target_properties(test_segment_files PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_segment_files PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_segment_files PRIVATE Qt6::Core Qt6::Test utils)
-add_test(NAME segment_files COMMAND test_segment_files)
-vc_register_test_target(test_segment_files)
-vc_register_ctest(segment_files test_segment_files)
-
-add_executable(test_project_locations
-    test_project_locations.cpp
-    ../ProjectLocations.cpp ../ProjectLocations.hpp)
-set_target_properties(test_project_locations PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_project_locations PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_project_locations PRIVATE Qt6::Core Qt6::Test vc_core)
-add_test(NAME project_locations COMMAND test_project_locations)
-vc_register_test_target(test_project_locations)
-vc_register_ctest(project_locations test_project_locations)
-
 # Exercise the production controller publication paths after Qt/state cleanup.
-# The VC3D app target only exists with VC_BUILD_APPS; CI runs this test from
+# The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.
 if(TARGET VC3D)
     add_test(NAME object_store_vc3d_controller COMMAND VC3D --test-object-store)
@@ -823,4 +761,19 @@ if(TARGET VC3D)
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
     vc_register_test_target(VC3D)
     vc_register_ctest(object_store_vc3d_controller VC3D)
+    add_test(NAME surface_panel_store COMMAND VC3D --test-surface-panel)
+    set_tests_properties(surface_panel_store PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+    vc_register_ctest(surface_panel_store VC3D)
 endif()
+
+add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
+    ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
+    ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
+    ../OpenDataManifest.cpp ../VolumeRegistrations.cpp)
+set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
+target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)
+add_test(NAME surface_catalog COMMAND test_surface_catalog)
+vc_register_test_target(test_surface_catalog)
+vc_register_ctest(surface_catalog test_surface_catalog)

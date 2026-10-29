@@ -17,15 +17,17 @@
 #include "CState.hpp"
 #include "CommandLaunchError.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "SurfaceCatalog.hpp"
+#include "SurfacePanelController.hpp"
 #include "segmentation/SegmentationWidget.hpp"
 
 #include "vc/core/types/VolumePkg.hpp"
 
 // ===========================================================================
-// Segment file operations over SegmentationCommandHandler's dialog-free
-// cores. The context-menu and Actions-menu slots run the same cores with
-// their dialogs, so both callers share validation, persistence and UI
-// refresh.
+// Segment operations over SegmentationCommandHandler's dialog-free cores.
+// The context-menu and Actions-menu slots run the same cores with their
+// dialogs, so both callers share validation, store writes and UI refresh.
+// Segment ids are the object store's surface UUIDs.
 // ===========================================================================
 
 namespace {
@@ -37,12 +39,12 @@ CState* requireProject(CState* state)
     return state;
 }
 
-// Checks the package's segment ids without loading any surface; the operation
-// cores load what they need and report load failures themselves.
-void requireKnownSegment(CState* state, const QString& segmentId)
+// Checks that the surface catalog lists the surface without opening it; the
+// operation cores check what they need of it and report that themselves.
+void requireKnownSegment(SurfacePanelController* panel, const QString& segmentId)
 {
-    const std::vector<std::string> ids = state->vpkg()->segmentationIDs();
-    if (std::find(ids.begin(), ids.end(), segmentId.toStdString()) == ids.end()) {
+    SurfaceCatalog* catalog = panel ? panel->catalog() : nullptr;
+    if (!catalog || !catalog->row(segmentId.toStdString())) {
         throw AgentBridgeError{
             -32007, QStringLiteral("Segment not found: %1").arg(segmentId),
             QJsonObject{{"kind", "segment"}, {"id", segmentId}}};
@@ -83,9 +85,9 @@ void requireConfirm(const QJsonObject& p, const QString& reason)
 }  // namespace
 
 
-// Refuses an in-place rewrite of a segment's files while something else may
-// be reading or writing them: an editing session on that segment, a mask
-// render, or a command-line tool run.
+// Refuses an in-place rewrite of a surface while something else may be
+// reading or writing it: an editing session on that surface, or a
+// command-line tool run.
 void AgentBridgeServer::requireSegmentFilesIdle(const QString& segmentId,
                                                 const QString& operation) const
 {
@@ -96,11 +98,6 @@ void AgentBridgeServer::requireSegmentFilesIdle(const QString& segmentId,
         throw AgentBridgeError{
             -32004, QStringLiteral("Cannot %1 the segment being edited").arg(operation),
             QJsonObject{{"detail", "disable segmentation editing first"}}};
-    }
-    if (_window && _window->_maskRenderInProgress) {
-        throw AgentBridgeError{
-            -32004, "A mask render is in progress",
-            QJsonObject{{"detail", "a mask render is in progress"}}};
     }
     requireSourceIdle(QStringLiteral("tool"));
 }
@@ -118,7 +115,7 @@ QJsonObject AgentBridgeServer::handleSegmentTransform(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const QString segmentId = p.value("segmentId").toString();
-    requireKnownSegment(state, segmentId);
+    requireKnownSegment(_window->_surfacePanel.get(), segmentId);
 
     // The descriptor restricts op to these spellings.
     const QString op = p.value("op").toString();
@@ -195,20 +192,20 @@ QJsonObject AgentBridgeServer::handleSegmentExportObj(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const QString segmentId = p.value("segmentId").toString();
-    requireKnownSegment(state, segmentId);
+    requireKnownSegment(_window->_surfacePanel.get(), segmentId);
 
     SegmentationCommandHandler::ConvertToObjParams objParams;
-    if (p.contains("outputPath")) {
-        objParams.objPath = p.value("outputPath").toString().trimmed();
-        if (objParams.objPath.isEmpty() || QDir::isRelativePath(objParams.objPath) ||
-            !objParams.objPath.endsWith(QStringLiteral(".obj"), Qt::CaseInsensitive)) {
+    if (p.contains("objName")) {
+        // The tool writes into the surface's artifact directory.
+        objParams.objName = p.value("objName").toString().trimmed();
+        if (objParams.objName.isEmpty() || objParams.objName.contains(QLatin1Char('/')) ||
+            objParams.objName.contains(QLatin1Char('\\')) ||
+            !objParams.objName.endsWith(QStringLiteral(".obj"), Qt::CaseInsensitive)) {
             throw AgentBridgeError{
-                -32602, "outputPath must be an absolute path to a .obj file",
-                QJsonObject{{"param", "outputPath"}}};
+                -32602, "objName must be a .obj file name without directories",
+                QJsonObject{{"param", "objName"}}};
         }
-        objParams.objPath = QDir::cleanPath(objParams.objPath);
     }
-    objParams.overwrite = p.value("overwrite").toBool(false);
     objParams.normalizeUV = p.value("normalizeUv").toBool(objParams.normalizeUV);
     objParams.alignGrid = p.value("alignGrid").toBool(objParams.alignGrid);
     objParams.ompThreads = p.value("ompThreads").toInt(objParams.ompThreads);
@@ -216,15 +213,12 @@ QJsonObject AgentBridgeServer::handleSegmentExportObj(const QJsonValue& params)
     SegmentationCommandHandler* handler = requireCommandHandler(
         _window->_segmentationCommandHandler.get(), QStringLiteral("OBJ export"));
 
-    QString objPath;
+    // The OBJ's path arrives with the job's completion.
     const QString jobId = launchSegmentToolJob(
         QStringLiteral("segment.export_obj"), QStringLiteral("Convert segment to OBJ"),
         segmentId, QString(),
-        [&](CommandLaunchError* error, QString* outputPath) {
-            const bool ok = handler->startConvertToObj(segmentId.toStdString(), objParams,
-                                                       error, &objPath);
-            *outputPath = objPath;
-            return ok;
+        [&](CommandLaunchError* error, QString*) {
+            return handler->startConvertToObj(segmentId.toStdString(), objParams, error);
         });
 
     QJsonObject result;
@@ -232,7 +226,6 @@ QJsonObject AgentBridgeServer::handleSegmentExportObj(const QJsonValue& params)
     result["kind"] = "segment.export_obj";
     result["source"] = "tool";
     result["segmentId"] = segmentId;
-    result["outputPath"] = objPath;
     return result;
 }
 
@@ -244,7 +237,7 @@ QJsonObject AgentBridgeServer::handleSegmentExportObj(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleSegmentRasterize(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    CState* state = requireProject(_window ? _window->_state : nullptr);
+    requireProject(_window ? _window->_state : nullptr);
 
     QStringList segmentIds;
     for (const QJsonValue& value : p.value("segmentIds").toArray()) {
@@ -261,7 +254,7 @@ QJsonObject AgentBridgeServer::handleSegmentRasterize(const QJsonValue& params)
                                QJsonObject{{"param", "segmentIds"}}};
     }
     for (const QString& id : segmentIds)
-        requireKnownSegment(state, id);
+        requireKnownSegment(_window->_surfacePanel.get(), id);
 
     SegmentationCommandHandler::RasterizeParams rasterParams;
     rasterParams.chunkSize = p.value("chunkSize").toInt(rasterParams.chunkSize);
@@ -307,7 +300,7 @@ QJsonObject AgentBridgeServer::handleSegmentNeighborCopy(const QJsonValue& param
     CState* state = requireProject(_window ? _window->_state : nullptr);
 
     const QString segmentId = p.value("segmentId").toString();
-    requireKnownSegment(state, segmentId);
+    requireKnownSegment(_window->_surfacePanel.get(), segmentId);
     const bool copyOut = p.value("direction").toString() == QLatin1String("out");
 
     SegmentationCommandHandler::NeighborCopyParams copy;
@@ -320,7 +313,11 @@ QJsonObject AgentBridgeServer::handleSegmentNeighborCopy(const QJsonValue& param
                 QJsonObject{{"kind", "volume"}, {"id", copy.volumeId}}};
         }
     }
-    copy.outputDir = p.value("outputDir").toString();
+    copy.outputTag = p.value("outputTag").toString(copy.outputTag).trimmed();
+    if (copy.outputTag.isEmpty()) {
+        throw AgentBridgeError{-32602, "outputTag must not be empty",
+                               QJsonObject{{"param", "outputTag"}}};
+    }
     copy.neighborMaxDistance = p.value("neighborMaxDistance").toInt(copy.neighborMaxDistance);
     copy.neighborMinClearance = p.value("neighborMinClearance").toInt(copy.neighborMinClearance);
     copy.neighborFill = p.value("neighborFill").toBool(copy.neighborFill);
@@ -332,21 +329,20 @@ QJsonObject AgentBridgeServer::handleSegmentNeighborCopy(const QJsonValue& param
     copy.resumeLocalOptRadius = p.value("resumeLocalOptRadius").toInt(copy.resumeLocalOptStep * 2);
     copy.resumeLocalMaxIters = p.value("resumeLocalMaxIters").toInt(copy.resumeLocalMaxIters);
     copy.resumeLocalDenseQr = p.value("resumeLocalDenseQr").toBool(copy.resumeLocalDenseQr);
-    copy.pass2OmpThreads = p.value("pass2OmpThreads").toInt(copy.pass2OmpThreads);
-    copy.pass2ParamOverrides = p.value("pass2ParamOverrides").toObject();
+    copy.refineOmpThreads = p.value("refineOmpThreads").toInt(copy.refineOmpThreads);
+    copy.refineParamOverrides = p.value("refineParamOverrides").toObject();
 
     SegmentationCommandHandler* handler = requireCommandHandler(
         _window->_segmentationCommandHandler.get(), QStringLiteral("Neighbor copy"));
 
-    QString outputDir;
+    // One tool run projects and refines; the new surface's UUID arrives with
+    // the job's completion.
     const QString jobId = launchSegmentToolJob(
         QStringLiteral("segment.neighbor_copy"),
         copyOut ? QStringLiteral("Copy segment out") : QStringLiteral("Copy segment in"),
-        segmentId, QStringLiteral("neighbor_copy"),
-        [&](CommandLaunchError* error, QString* jobOutput) {
-            const bool ok = handler->startNeighborCopy(segmentId, copyOut, copy, error, &outputDir);
-            *jobOutput = outputDir;
-            return ok;
+        segmentId, QString(),
+        [&](CommandLaunchError* error, QString*) {
+            return handler->startNeighborCopy(segmentId, copyOut, copy, error);
         });
 
     QJsonObject result;
@@ -355,7 +351,7 @@ QJsonObject AgentBridgeServer::handleSegmentNeighborCopy(const QJsonValue& param
     result["source"] = "tool";
     result["segmentId"] = segmentId;
     result["direction"] = copyOut ? "out" : "in";
-    result["outputDir"] = outputDir;
+    result["outputTag"] = copy.outputTag;
     return result;
 }
 
@@ -397,7 +393,7 @@ QStringList requireSegmentIdList(const QJsonObject& p)
 QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    CState* state = requireProject(_window ? _window->_state : nullptr);
+    requireProject(_window ? _window->_state : nullptr);
 
     SegmentationCommandHandler::MergeTifxyzParams merge;
     if (p.contains("grid") == p.contains("segmentIds")) {
@@ -418,8 +414,8 @@ QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
         merge.grid.append(requireSegmentIdList(p));
     }
 
-    // The grid rules of the Merge tifxyz dialog, checked here so a bad grid is
-    // a parameter error and an unknown name a lookup error.
+    // The grid rules of the Merge Surfaces dialog, checked here so a bad grid
+    // is a parameter error and an unknown surface a lookup error.
     QStringList names;
     for (const QStringList& row : merge.grid) {
         for (const QString& name : row) {
@@ -435,7 +431,7 @@ QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
         if (name.contains(QRegularExpression(QStringLiteral("\\s")))) {
             throw AgentBridgeError{
                 -32602,
-                QStringLiteral("Segment name '%1' contains whitespace, which merge.json "
+                QStringLiteral("Segment id '%1' contains whitespace, which merge.json "
                                "cannot express").arg(name),
                 QJsonObject{{"param", param}}};
         }
@@ -445,20 +441,25 @@ QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
         throw AgentBridgeError{-32602, "refSegmentId must be one of the merged segments",
                                QJsonObject{{"param", "refSegmentId"}}};
     }
+    merge.outputTag = p.value("outputTag").toString(merge.outputTag).trimmed();
+    if (merge.outputTag.isEmpty()) {
+        throw AgentBridgeError{-32602, "outputTag must not be empty",
+                               QJsonObject{{"param", "outputTag"}}};
+    }
     merge.stripCols = p.value("stripCols").toInt(merge.stripCols);
     readRansacParams(p, merge);
     for (const QString& name : names)
-        requireKnownSegment(state, name);
+        requireKnownSegment(_window->_surfacePanel.get(), name);
 
     SegmentationCommandHandler* handler = requireCommandHandler(
         _window->_segmentationCommandHandler.get(), QStringLiteral("Merge"));
 
-    QString mergeJsonPath;
+    // The merged surface's UUID arrives with the job's completion.
     const QString jobId = launchSegmentToolJob(
-        QStringLiteral("segments.merge"), QStringLiteral("Merge tifxyz"),
-        names.front(), QStringLiteral("merge"),
+        QStringLiteral("segments.merge"), QStringLiteral("Merge surfaces"),
+        names.front(), QString(),
         [&](CommandLaunchError* error, QString*) {
-            return handler->startMergeTifxyz(merge, error, &mergeJsonPath);
+            return handler->startMergeTifxyz(merge, error);
         });
 
     QJsonObject result;
@@ -466,14 +467,14 @@ QJsonObject AgentBridgeServer::handleSegmentsMerge(const QJsonValue& params)
     result["kind"] = "segments.merge";
     result["source"] = "tool";
     result["segmentIds"] = toJsonArray(names);
-    result["mergeJsonPath"] = mergeJsonPath;
+    result["outputTag"] = merge.outputTag;
     return result;
 }
 
 QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    CState* state = requireProject(_window ? _window->_state : nullptr);
+    requireProject(_window ? _window->_state : nullptr);
 
     const QStringList segmentIds = requireSegmentIdList(p);
     if (segmentIds.size() != 2 || segmentIds[0] == segmentIds[1]) {
@@ -494,11 +495,11 @@ QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
     patch.blendCells = p.value("blendCells").toInt(patch.blendCells);
     patch.idwK = p.value("idwK").toInt(patch.idwK);
     readRansacParams(p, patch);
-    requireConfirm(p, QStringLiteral("patch overwrites the parent segment in place"));
+    requireConfirm(p, QStringLiteral("patch rewrites the parent segment in place"));
     for (const QString& id : segmentIds)
-        requireKnownSegment(state, id);
+        requireKnownSegment(_window->_surfacePanel.get(), id);
 
-    // Either segment may become the parent, which is rewritten on disk.
+    // Either segment may become the parent, which gets a new revision.
     for (const QString& id : segmentIds)
         requireSegmentFilesIdle(id, QStringLiteral("patch"));
 
@@ -506,8 +507,8 @@ QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
         _window->_segmentationCommandHandler.get(), QStringLiteral("Patch"));
 
     const QString jobId = launchSegmentToolJob(
-        QStringLiteral("segments.patch"), QStringLiteral("Patch tifxyz"),
-        patch.parentId, QStringLiteral("patch"),
+        QStringLiteral("segments.patch"), QStringLiteral("Patch surface"),
+        patch.parentId, QString(),
         [&](CommandLaunchError* error, QString*) {
             return handler->startMergePatch(patch, error);
         });
@@ -519,121 +520,5 @@ QJsonObject AgentBridgeServer::handleSegmentsPatch(const QJsonValue& params)
     result["segmentIds"] = toJsonArray(segmentIds);
     result["parentId"] = patch.explicitRoles ? QJsonValue(patch.parentId)
                                              : QJsonValue(QJsonValue::Null);
-    return result;
-}
-
-
-// ---------------------------------------------------------------------------
-// segment.restore_backup
-// ---------------------------------------------------------------------------
-
-namespace {
-
-QJsonArray backupsJson(const std::vector<vc3d::segment_files::Backup>& backups)
-{
-    QJsonArray out;
-    for (const auto& backup : backups) {
-        out.append(QJsonObject{{"index", backup.index},
-                               {"timestamp", backup.timestamp.isEmpty()
-                                                 ? QJsonValue(QJsonValue::Null)
-                                                 : QJsonValue(backup.timestamp)}});
-    }
-    return out;
-}
-
-}  // namespace
-
-QJsonObject AgentBridgeServer::handleSegmentRestoreBackup(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = requireProject(_window ? _window->_state : nullptr);
-    const QString segmentId = p.value("segmentId").toString();
-    const int index = p.value("index").toInt();
-    requireKnownSegment(state, segmentId);
-
-    SegmentationCommandHandler* handler = requireCommandHandler(
-        _window->_segmentationCommandHandler.get(), QStringLiteral("Restore"));
-
-    // The listing comes before the confirm check, so a call without confirm
-    // reports the backups and changes nothing.
-    const auto backups = handler->listSurfaceBackups(segmentId);
-    const QJsonArray available = backupsJson(backups);
-    const bool known = std::any_of(backups.begin(), backups.end(),
-                                   [index](const auto& backup) { return backup.index == index; });
-    if (!known) {
-        throw AgentBridgeError{
-            -32007, QStringLiteral("Backup %1 not found for %2").arg(index).arg(segmentId),
-            QJsonObject{{"kind", "backup"}, {"id", index}, {"available", available}}};
-    }
-    if (!p.value("confirm").toBool(false)) {
-        throw AgentBridgeError{
-            -32602, "confirm must be true (restoring a backup overwrites the segment)",
-            QJsonObject{{"param", "confirm"},
-                        {"reason", "destructive; pass confirm=true"},
-                        {"available", available}}};
-    }
-    requireSegmentFilesIdle(segmentId, QStringLiteral("restore"));
-
-    QString err;
-    int copiedFiles = 0;
-    if (!handler->restoreSurfaceFromBackup(segmentId, index, &err, &copiedFiles)) {
-        throw AgentBridgeError{-32005, "Restore failed", QJsonObject{{"detail", err}}};
-    }
-
-    QJsonObject result;
-    result["restored"] = true;
-    result["segmentId"] = segmentId;
-    result["index"] = index;
-    result["copiedFiles"] = copiedFiles;
-    // With backups on, the replaced state is now the newest backup.
-    result["backups"] = backupsJson(handler->listSurfaceBackups(segmentId));
-    return result;
-}
-
-
-// ---------------------------------------------------------------------------
-// segments.move_to_paths
-// ---------------------------------------------------------------------------
-
-QJsonObject AgentBridgeServer::handleSegmentsMoveToPaths(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = requireProject(_window ? _window->_state : nullptr);
-    const QString segmentId = p.value("segmentId").toString();
-    requireKnownSegment(state, segmentId);
-    if (state->vpkg()->getSegmentationDirectory() != "traces") {
-        throw AgentBridgeError{
-            -32009, "Only segments in the traces directory can move to paths",
-            QJsonObject{{"detail", QString::fromStdString(
-                                       state->vpkg()->getSegmentationDirectory())}}};
-    }
-    requireConfirm(p, QStringLiteral("moving unloads the segment and changes its folder"));
-    // Moving unloads the segment, which an editing session on any segment
-    // may still reference through the shared surface state.
-    requireSegmentFilesIdle(QString(), QStringLiteral("move"));
-
-    SegmentationCommandHandler* handler = requireCommandHandler(
-        _window->_segmentationCommandHandler.get(), QStringLiteral("Move"));
-
-    const bool replaceExisting = p.value("replaceExisting").toBool(false);
-    bool destinationExists = false;
-    QString err;
-    QString newPath;
-    if (!handler->moveSegmentToPaths(segmentId, replaceExisting, &err, &newPath,
-                                     &destinationExists)) {
-        if (destinationExists && !replaceExisting) {
-            throw AgentBridgeError{
-                -32602, "A segment of this name already exists in paths/",
-                QJsonObject{{"param", "replaceExisting"},
-                            {"detail", "pass replaceExisting=true to replace it"}}};
-        }
-        throw AgentBridgeError{-32005, "Move failed", QJsonObject{{"detail", err}}};
-    }
-
-    QJsonObject result;
-    result["moved"] = true;
-    result["segmentId"] = segmentId;
-    result["path"] = newPath;
-    result["replaced"] = destinationExists;
     return result;
 }

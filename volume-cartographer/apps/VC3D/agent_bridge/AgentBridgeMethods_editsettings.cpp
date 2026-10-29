@@ -35,7 +35,6 @@ void AgentBridgeServer::registerEditSettingsHandlers()
             .name = QStringLiteral("segmentation.set_settings"),
             .params = {
                 brush(QStringLiteral("drag")),
-                brush(QStringLiteral("line")),
                 brush(QStringLiteral("pushPull"), true),
                 Params::optionalNumber(QStringLiteral("editScale")),
                 Params::optionalNumber(QStringLiteral("smoothingStrength")),
@@ -46,7 +45,6 @@ void AgentBridgeServer::registerEditSettingsHandlers()
                     {
                         QStringLiteral("tracer"),
                         QStringLiteral("corrections"),
-                        QStringLiteral("patch_tracer"),
                     }),
                 Params::optionalInteger(QStringLiteral("growthSteps")),
                 Params::optionalInteger(QStringLiteral("growthScale")),
@@ -70,7 +68,6 @@ void AgentBridgeServer::registerEditSettingsHandlers()
                 // null, as get_settings reports when none is chosen, leaves
                 // the growth volume unchanged.
                 Params::nullable(Params::optionalString(QStringLiteral("growthVolumeId"))),
-                Params::optionalObject(QStringLiteral("patchTracer"), {}),
                 Params::optionalArray(
                     QStringLiteral("directionFields"),
                     Params::optionalObject(
@@ -87,53 +84,9 @@ void AgentBridgeServer::registerEditSettingsHandlers()
                             Params::optionalInteger(QStringLiteral("scale")),
                             Params::optionalNumber(QStringLiteral("weight")),
                         })),
-                Params::optionalObject(
-                    QStringLiteral("approvalMask"),
-                    {
-                        Params::optionalBoolean(QStringLiteral("show")),
-                        Params::optionalNumber(QStringLiteral("brushRadius")),
-                        Params::optionalNumber(QStringLiteral("brushDepth")),
-                        [] {
-                            AgentBridgeParam opacity =
-                                Params::optionalNumber(QStringLiteral("opacity"));
-                            opacity.minimum = 0.0;
-                            opacity.maximum = 1.0;
-                            return opacity;
-                        }(),
-                        Params::optionalBoolean(QStringLiteral("autoApprove")),
-                        Params::optionalNumber(QStringLiteral("autoApproveRadius")),
-                        Params::optionalNumber(QStringLiteral("autoApproveThreshold")),
-                        Params::optionalNumber(QStringLiteral("autoApproveMaxDistance")),
-                    }),
             },
             .errors = {-32602, -32007, -32009},
             .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_segmentation_settings")),
         },
         [this](const QJsonValue& p) { return handleSegmentationSetSettings(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segmentation.approval_mask.set_mode"),
-            .params = {
-                Params::requiredStringEnum(
-                    QStringLiteral("mode"),
-                    {
-                        QStringLiteral("off"),
-                        QStringLiteral("approve"),
-                        QStringLiteral("unapprove"),
-                    }),
-                Params::optionalBoolean(QStringLiteral("show")),
-            },
-            .errors = {-32602, -32007, -32009},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_approval_mask_mode")),
-        },
-        [this](const QJsonValue& p) { return handleApprovalMaskSetMode(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segmentation.approval_mask.undo"),
-            .errors = {-32009},
-            .mcp = {.tool = QStringLiteral("vc3d_undo_approval_stroke")},
-        },
-        [this](const QJsonValue& p) { return handleApprovalMaskUndo(p); });
 }

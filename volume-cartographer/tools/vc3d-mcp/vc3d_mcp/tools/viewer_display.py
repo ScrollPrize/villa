@@ -13,15 +13,15 @@ async def vc3d_get_ink_overlay(refresh: bool = False) -> dict[str, Any]:
     """Read the ink detection overlay drawn over the active segment's flattened
     view, the state behind the Ink Detection panel.
 
-    refresh: rescan the cached Open Data ink detections for the active segment
-    before reporting.
+    refresh: reread the ink detections the surface catalog publishes for the
+    active segment before reporting.
 
-    Returns {"available": [{"label", "path", "sampleId", "segmentId",
-    "segmentLongId"}], "path" (selected detection or null), "loaded",
-    "visible", "opacity" (0-1), "colormap" ("" is grayscale), "colormaps"
-    (accepted colormap ids), "singleChannel", "flipHorizontal",
-    "flipVertical"}. Only detections matching the active segment are
-    available.
+    Returns {"available": [{"label", "path", "name"}], "path" (selected
+    detection or null), "loaded", "visible", "opacity" (0-1), "colormap" (""
+    is grayscale), "colormaps" (accepted colormap ids), "singleChannel",
+    "flipHorizontal", "flipVertical"}. Only detections published for the
+    active segment are available; a published image is downloaded into the
+    surface's artifact folder when first selected.
     """
     return await _call("viewer.get_ink_overlay", {"refresh": refresh})
 

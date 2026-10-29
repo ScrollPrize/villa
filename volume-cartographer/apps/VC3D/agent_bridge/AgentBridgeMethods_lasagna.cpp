@@ -60,12 +60,9 @@ void AgentBridgeServer::registerLasagnaHandlers()
                         QStringLiteral("reoptimize"),
                         QStringLiteral("new_model"),
                         QStringLiteral("offset"),
-                        QStringLiteral("atlas"),
                     }),
                 Params::optionalString(QStringLiteral("configPath")),
                 optionalVec3(QStringLiteral("seed")),
-                Params::optionalString(QStringLiteral("atlasPath")),
-                Params::optionalString(QStringLiteral("initShellDir")),
             },
             .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
             .mcp = Mcp::snakeCase(
@@ -97,10 +94,10 @@ void AgentBridgeServer::registerLasagnaHandlers()
         {
             .name = QStringLiteral("lasagna.select_output_segment"),
             .params = {
-                Params::requiredString(QStringLiteral("name")),
+                Params::requiredString(QStringLiteral("segmentId")),
             },
             .errors = {-32602, -32000, -32007},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_lasagna_select_output")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_lasagna_select_output")),
         },
         [this](const QJsonValue& p) {
             return handleLasagnaSelectOutputSegment(p);
@@ -120,11 +117,10 @@ void AgentBridgeServer::registerLasagnaHandlers()
         {
             .name = QStringLiteral("workspace.switch"),
             .params = {
-                // Workspace ids in tab order, then the original
-                // "fiber_slice" spelling, still accepted.
+                // Workspace ids in tab order.
                 Params::requiredStringEnum(
                     QStringLiteral("name"),
-                    agentBridgeWorkspaceIds() << QStringLiteral("fiber_slice")),
+                    agentBridgeWorkspaceIds()),
             },
             .errors = {-32602, -32000, -32007},
             .mcp = Mcp::exact(

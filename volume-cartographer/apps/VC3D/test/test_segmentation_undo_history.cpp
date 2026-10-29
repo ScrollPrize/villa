@@ -60,8 +60,7 @@ public:
         grid.setTo(cv::Vec3f(value, value, value));
     }
 
-    // approvalSteps: whether the paired auto-approval could be stepped too.
-    bool step(bool redo, bool approvalSteps = true)
+    bool step(bool redo)
     {
         return history.step(
             redo, grid,
@@ -75,10 +74,6 @@ public:
                 }
                 entry.points.copyTo(grid);
                 return true;
-            },
-            [this, approvalSteps](std::uint64_t id) {
-                steppedApprovals.push_back(id);
-                return approvalSteps;
             });
     }
 
@@ -87,12 +82,11 @@ public:
 
     Grid grid;
     UndoHistory history;
-    std::vector<std::uint64_t> steppedApprovals;
 };
 
 std::size_t snapshotBytes(const Grid& grid)
 {
-    return UndoHistory::Entry{grid.clone(), {}, 0}.bytes();
+    return UndoHistory::Entry{grid.clone(), {}}.bytes();
 }
 
 QKeyEvent keyPress(Qt::Key key, Qt::KeyboardModifiers modifiers)
@@ -241,10 +235,10 @@ private slots:
         auto entry = history.takeUndo();
         QVERIFY(entry.has_value());
         QCOMPARE(entry->points(0, 0)[0], 2.0f);
-        history.pushReplaced(false, UndoHistory::Entry{makeGrid(8, 8, 3.0f), {}, 0});
+        history.pushReplaced(false, UndoHistory::Entry{makeGrid(8, 8, 3.0f), {}});
         QVERIFY(history.canRedo());
 
-        history.pushReplaced(true, UndoHistory::Entry{makeGrid(8, 8, 4.0f), {}, 0});
+        history.pushReplaced(true, UndoHistory::Entry{makeGrid(8, 8, 4.0f), {}});
         QVERIFY(history.canUndo());
         QVERIFY(!history.canRedo());
     }
@@ -328,54 +322,18 @@ private slots:
         QVERIFY(!editor.history.canRedo());
     }
 
-    void autoApprovalIdFollowsTheEditThroughUndoAndRedo()
+    void entryThatDoesNotApplyIsDropped()
     {
-        Editor editor(makeGrid(2, 2, 0.0f));
-        editor.move(0, 0, 1.0f);
-        editor.history.setLastAutoApprovalId(42);
-        editor.move(1, 1, 1.0f);
-
-        auto unpaired = editor.history.takeUndo();
-        QVERIFY(unpaired.has_value());
-        QCOMPARE(unpaired->autoApprovalId, std::uint64_t{0});
-        editor.history.pushReplaced(true, std::move(*unpaired));
-
-        QVERIFY(editor.undo());
-        QVERIFY(editor.undo());
-        // Only the paired edit steps an approval.
-        QCOMPARE(editor.steppedApprovals.size(), std::size_t{1});
-        QCOMPARE(editor.steppedApprovals.front(), std::uint64_t{42});
-        auto redoEntry = editor.history.takeRedo();
-        QVERIFY(redoEntry.has_value());
-        QCOMPARE(redoEntry->autoApprovalId, std::uint64_t{42});
-    }
-
-    void entryThatDoesNotApplyIsDroppedWithItsApproval()
-    {
-        // A snapshot of another grid size cannot be restored: step drops it
-        // without stepping its approval, and the steps behind it stay usable.
+        // A snapshot of another grid size cannot be restored: step drops it,
+        // and the steps behind it stay usable.
         Editor editor(makeGrid(2, 2, 0.0f));
         editor.move(0, 0, 1.0f);
         editor.history.capture(makeGrid(3, 3, 5.0f));
-        editor.history.setLastAutoApprovalId(9);
         QVERIFY(!editor.undo());
-        QVERIFY(editor.steppedApprovals.empty());
         QVERIFY(!editor.history.canRedo());
         QCOMPARE(editor.history.size(), std::size_t{1});
         QVERIFY(editor.undo());
         QCOMPARE(editor.grid(0, 0), cv::Vec3f(0.0f, 0.0f, 0.0f));
-    }
-
-    void autoApprovalIdIsDroppedWhenTheApprovalStepFails()
-    {
-        // inverseFor leaves the id out; only a successful approval step links it.
-        Editor editor(makeGrid(2, 2, 0.0f));
-        editor.move(0, 0, 1.0f);
-        editor.history.setLastAutoApprovalId(7);
-        QVERIFY(editor.step(false, false));
-        auto redoEntry = editor.history.takeRedo();
-        QVERIFY(redoEntry.has_value());
-        QCOMPARE(redoEntry->autoApprovalId, std::uint64_t{0});
     }
 
     void trimOldestKeepsTheNewest()

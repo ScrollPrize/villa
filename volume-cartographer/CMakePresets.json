@@ -76,12 +76,6 @@
         "VC_USE_CCACHE": "ON"
       }
     },
-    {
-      "name": "dev-profile-clang",
-      "displayName": "Compile-time profile (clang, -ftime-trace)",
-      "inherits": ["_dev-base", "_clang"],
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "VC_PROFILE_COMPILE": "ON" }
-    },
 
     { "name": "ci-debug-gcc",            "displayName": "CI Debug (gcc)",
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "OFF" } },
@@ -135,11 +129,6 @@
       "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
     { "name": "ci-strict-warnings-clang","displayName": "CI Strict warnings + -Werror (clang)",
       "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_WARNINGS": "ON", "VC_WERROR": "ON" } },
-
-    { "name": "ci-dead-code-gcc",        "displayName": "CI Dead-code report (gcc, Debug, no LTO)",
-      "inherits": ["_ci-base", "_gcc"],   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
-    { "name": "ci-dead-code-clang",      "displayName": "CI Dead-code report (clang, Debug, no LTO)",
-      "inherits": ["_ci-base", "_clang"], "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",          "VC_TESTING": "ON",   "VC_DEAD_CODE_REPORT": "ON" } },
 
     {
       "name": "ci-windows-mingw",
@@ -212,7 +201,6 @@
     { "name": "dev-clang",                "configurePreset": "dev-clang" },
     { "name": "dev-quickbuild-gcc",       "configurePreset": "dev-quickbuild-gcc" },
     { "name": "dev-quickbuild-clang",     "configurePreset": "dev-quickbuild-clang" },
-    { "name": "dev-profile-clang",        "configurePreset": "dev-profile-clang" },
 
     { "name": "ci-debug-gcc",             "configurePreset": "ci-debug-gcc" },
     { "name": "ci-debug-clang",           "configurePreset": "ci-debug-clang" },
@@ -235,8 +223,6 @@
     { "name": "ci-coverage-clang",        "configurePreset": "ci-coverage-clang" },
     { "name": "ci-strict-warnings-gcc",   "configurePreset": "ci-strict-warnings-gcc" },
     { "name": "ci-strict-warnings-clang", "configurePreset": "ci-strict-warnings-clang" },
-    { "name": "ci-dead-code-gcc",         "configurePreset": "ci-dead-code-gcc" },
-    { "name": "ci-dead-code-clang",       "configurePreset": "ci-dead-code-clang" },
     { "name": "ci-windows-mingw",         "configurePreset": "ci-windows-mingw" },
     { "name": "windows-msvc",             "configurePreset": "windows-msvc" }
   ],

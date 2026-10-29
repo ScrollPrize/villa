@@ -29,7 +29,6 @@ public:
         CState* state{nullptr};
         InkDetectionOverlayController* inkOverlay{nullptr};
         std::function<CommandLineToolRunner*()> runner;
-        std::function<void()> refreshProject;
         std::function<void(const QString&, int)> status;
     };
 
@@ -51,7 +50,6 @@ private:
         QStringList args;
         QString outputDir;
         QString resultPath;
-        QString segmentDir;
         QString segmentId;
     };
 

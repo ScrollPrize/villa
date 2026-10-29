@@ -279,18 +279,17 @@ async def vc3d_set_axis_aligned_slices(enabled: bool) -> dict[str, Any]:
 @mcp.tool()
 async def vc3d_get_render_settings() -> dict[str, Any]:
     """Read the global viewer render settings (surface-intersection overlays,
-    opacities, normals/direction hints, highlighted surfaces).
+    opacities, normals, highlighted surfaces).
 
     Use this to inspect the current rendering state before tweaking it with
     vc3d_set_render_settings, or to confirm a change took effect.
 
     Returns the full settings object: {"intersectionOpacity" (0..1),
     "intersectionThickness" (0..100), "overlayOpacity" (0..1),
-    "intersectionMaxSurfaces" (int >=0), "volumeWindow" ({"low","high"}),
-    "samplingStride" (int >=1), "zScrollSensitivity" (0.1..100),
+    "volumeWindow" ({"low","high"}), "zScrollSensitivity" (0.1..100),
     "segmentationCursorMirroring" (bool),
     "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
-    "showDirectionHints" (bool), "surfaceOverlayEnabled" (bool),
+    "surfaceOverlayEnabled" (bool),
     "normalArrowLengthScale" (float), "normalMaxArrows" (int),
     "highlightedSurfaceIds" ([str...]), "axisOverlays", "coordinateFrames",
     "rawPoints" (bool), "focusBounds" ({"enabled", "min", "max"}),
@@ -304,17 +303,14 @@ async def vc3d_set_render_settings(
     intersection_opacity: Optional[float] = None,
     intersection_thickness: Optional[float] = None,
     overlay_opacity: Optional[float] = None,
-    intersection_max_surfaces: Optional[int] = None,
     plane_intersection_lines_visible: Optional[bool] = None,
     show_surface_normals: Optional[bool] = None,
-    show_direction_hints: Optional[bool] = None,
     surface_overlay_enabled: Optional[bool] = None,
     highlighted_surface_ids: Optional[list[str]] = None,
     volume_window: Optional[_Window] = None,
     normal_arrow_length_scale: Optional[float] = None,
     normal_max_arrows: Optional[int] = None,
     segmentation_cursor_mirroring: Optional[bool] = None,
-    sampling_stride: Optional[int] = None,
     z_scroll_sensitivity: Optional[float] = None,
     axis_overlays: Optional[bool] = None,
     coordinate_frames: Optional[bool] = None,
@@ -330,10 +326,8 @@ async def vc3d_set_render_settings(
     intersection_opacity: surface-intersection overlay opacity, clamped 0..1.
     intersection_thickness: intersection line thickness, clamped 0..100.
     overlay_opacity: surface overlay opacity, clamped 0..1.
-    intersection_max_surfaces: cap on intersecting surfaces drawn, int >=0.
     plane_intersection_lines_visible: show plane/surface intersection lines.
     show_surface_normals: draw surface normal indicators.
-    show_direction_hints: draw growth direction hints.
     surface_overlay_enabled: master toggle for the surface overlay.
     highlighted_surface_ids: replace the set of highlighted surface ids.
     volume_window: {"low", "high"} base-volume display window, clamped 0..255.
@@ -343,7 +337,6 @@ async def vc3d_set_render_settings(
     clamped 4..100 (the GUI slider's range) and persisted like the slider.
     segmentation_cursor_mirroring: mirror the cursor position onto the
     segmentation viewer from other panes.
-    sampling_stride: surface-patch intersection sampling stride, floored to 1.
     z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
     0.1..100.
     axis_overlays: show the axis-aligned slice overlays (View dock).
@@ -365,14 +358,14 @@ async def vc3d_set_render_settings(
     result to see the applied values.
     volumetric: volumetric-mode {"gamma", "lighting" (0..1), "wScale"}.
 
-    The numeric/global fields (opacities, thickness, max-surfaces, volume
-    window, sampling stride, z-scroll sensitivity, cursor mirroring,
+    The numeric/global fields (opacities, thickness, volume window,
+    z-scroll sensitivity, cursor mirroring,
     normal-arrow length/count) are persisted (QSettings/ViewerManager) even
     with no viewer pane open. highlighted_surface_ids is retained by the
-    surface panel and applies when viewers become available. The four
+    surface panel and applies when viewers become available. The three
     per-viewer toggles (plane-intersection lines, show-normals,
-    show-direction-hints, surface-overlay) are no-ops with zero viewers; their
-    returned echo reports defaults until a viewer is open.
+    surface-overlay) are no-ops with zero viewers; their returned echo
+    reports defaults until a viewer is open.
 
     Returns the full resulting settings object (same shape as
     vc3d_get_render_settings) so you can confirm what was applied."""
@@ -383,17 +376,14 @@ async def vc3d_set_render_settings(
                 "intersectionOpacity": intersection_opacity,
                 "intersectionThickness": intersection_thickness,
                 "overlayOpacity": overlay_opacity,
-                "intersectionMaxSurfaces": intersection_max_surfaces,
                 "planeIntersectionLinesVisible": plane_intersection_lines_visible,
                 "showSurfaceNormals": show_surface_normals,
-                "showDirectionHints": show_direction_hints,
                 "surfaceOverlayEnabled": surface_overlay_enabled,
                 "highlightedSurfaceIds": highlighted_surface_ids,
                 "volumeWindow": volume_window,
                 "normalArrowLengthScale": normal_arrow_length_scale,
                 "normalMaxArrows": normal_max_arrows,
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
-                "samplingStride": sampling_stride,
                 "zScrollSensitivity": z_scroll_sensitivity,
                 "axisOverlays": axis_overlays,
                 "coordinateFrames": coordinate_frames,
@@ -598,11 +588,9 @@ async def vc3d_key(
     "Delete", "F5", "Left", "1", "%", or a combination such as "Shift+G".
     Bare modifier keys are "Shift", "Ctrl", "Alt", "Meta". VC3D's Help >
     Keybinds dialog lists every binding; among those without a typed tool are
-    S (line drawing, held), Q / E (push/pull radius), Space (toggle the
-    volume overlay), R (center focus on the cursor), X (recenter on focus),
-    and Shift+G / Shift+H (lower / raise the Z-scroll sensitivity). For
-    approval painting (B / N) use vc3d_set_approval_mask_mode and
-    vc3d_undo_approval_stroke instead.
+    Q / E (push/pull radius), Space (toggle the volume overlay), R (center
+    focus on the cursor), X (recenter on focus), and Shift+G / Shift+H
+    (lower / raise the Z-scroll sensitivity).
     viewer: viewer id ("v1") or surface-slot name; default "segmentation".
     It must be visible (switch to its workspace first). Keyboard focus moves
     to it for the call and then returns to where it was.

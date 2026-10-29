@@ -105,7 +105,7 @@ public:
     // Loads the leftover session's points into collection. Refused, with
     // nothing changed, while collection holds points or segment correction
     // collections: loading replaces them, and VC3D would then rewrite the
-    // active segment's corrections.json.
+    // active surface's stored corrections.
     static bool restorePoints(const LeftoverSession& session,
                               VCCollection* collection,
                               QString* error = nullptr);

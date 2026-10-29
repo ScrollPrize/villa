@@ -69,13 +69,12 @@ manifest, so a typo shows up in Plugin Folders instead of at run time.
 | --- | --- | --- |
 | `{volume}` | path of the current volume (its remote location for a remote volume) | an open volume |
 | `{volume_id}` | current volume id | an open volume |
-| `{segment}` | folder of the active segment (tifxyz) | an active segment |
+| `{segment}` | tifxyz folder of the active segment in the object store | an active segment |
 | `{segment_id}` | active segment id | an active segment |
 | `{point}` | focus point as `x,y,z` in full-resolution voxels; also `{point_x}`, `{point_y}`, `{point_z}` | a focus point |
 | `{region}` | enabled focus region as `x0,y0,z0,x1,y1,z1` | Focus bounds enabled |
 | `{ink_overlay}` | image of the selected ink detection overlay | a selected overlay |
-| `{umbilicus}` | the project's attached umbilicus file | an attached umbilicus |
-| `{project}` | project folder | a project on disk |
+| `{project}` | folder of the project file | an open project |
 | `{output}` | this run's fresh output folder | always |
 | `{plugin_dir}` | folder holding the manifest | always |
 | `{input:NAME}` | value typed for input `NAME` | the input |
@@ -93,10 +92,8 @@ VC3D only ever loads files the run itself wrote.
 | --- | --- |
 | `none` | Nothing; reports the run folder. |
 | `file` | Shows the path and offers to open it (a report, a mesh, an image). |
-| `segment` | Attaches the tifxyz folder to the project as a segments entry and reloads the surface list. |
-| `ink_overlay` | Adds the image to the active segment's `ink-detections.json` (keeping the records already there or in `catalog-origin.json`) and selects it in the Ink Detection panel. The image must be on the segment's surface grid, like a published ink prediction. |
+| `ink_overlay` | Shows the image as the ink detection overlay of the segment that was active when the run started, for this session; it is not published to the surface catalog. The image must be on the segment's surface grid, like a published ink prediction. |
 | `points` | Reads a VC3D point collection file (`vc_pointcollections_json_version` 1, the format **Save** in the Point Collections panel writes) and adds its collections. Existing collections are never replaced; a name that is taken gets a numbered suffix. |
-| `umbilicus` | Checks the file as **File > Attach Umbilicus** does and attaches it, asking first if another umbilicus is attached. |
 
 ## Running a plugin
 

@@ -1,5 +1,4 @@
-// QuadSurface: multi-component surface, unloadPoints/unloadCaches happy
-// paths, writeValidMask with non-empty image, save with bbox in meta.
+// QuadSurface: multi-component surface, writeValidMask with non-empty image, save with bbox in meta.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -102,40 +101,6 @@ TEST_CASE("components-meta with degenerate ranges is filtered out")
     fs::remove_all(root);
 }
 
-TEST_CASE("unloadPoints + ensureLoaded re-load round-trip")
-{
-    auto root = tmpDir("unload_rt");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(8, 8), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    qs.ensureLoaded();
-    CHECK(qs.rawPointsPtr() != nullptr);
-    qs.unloadPoints();
-    // After unload, isLoaded should be false until next access.
-    CHECK_FALSE(qs.isLoaded());
-    qs.ensureLoaded();
-    CHECK(qs.isLoaded());
-    fs::remove_all(root);
-}
-
-TEST_CASE("unloadPoints on already-unloaded surface is a no-op")
-{
-    auto root = tmpDir("unload_double");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(8, 8), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface qs(segDir);
-    // Not yet loaded.
-    qs.unloadPoints(); // returns early — _needsLoad already true
-    CHECK_FALSE(qs.isLoaded());
-    fs::remove_all(root);
-}
-
 TEST_CASE("writeValidMask with a non-empty image writes a multi-page TIFF")
 {
     auto root = tmpDir("vmask_multi");
@@ -205,18 +170,3 @@ TEST_CASE("bbox stored in meta is read back via (path, json) ctor")
     fs::remove_all(root);
 }
 
-TEST_CASE("canUnload reflects whether a backing path is set")
-{
-    QuadSurface in_mem(grid(4, 4), cv::Vec2f(1.f, 1.f));
-    CHECK_FALSE(in_mem.canUnload());
-
-    auto root = tmpDir("canunload");
-    auto segDir = root / "seg";
-    {
-        QuadSurface seed(grid(4, 4), cv::Vec2f(1.f, 1.f));
-        seed.save(segDir);
-    }
-    QuadSurface reloaded(segDir);
-    CHECK(reloaded.canUnload());
-    fs::remove_all(root);
-}

@@ -21,7 +21,6 @@ class SegmentationEditingPanel;
 class SegmentationGrowthPanel;
 class SegmentationCorrectionsPanel;
 class SegmentationCustomParamsPanel;
-class SegmentationApprovalMaskPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
@@ -38,8 +37,6 @@ public:
     [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] float dragRadius() const;
     [[nodiscard]] float dragSigma() const;
-    [[nodiscard]] float lineRadius() const;
-    [[nodiscard]] float lineSigma() const;
     [[nodiscard]] float pushPullRadius() const;
     [[nodiscard]] float pushPullSigma() const;
     [[nodiscard]] float pushPullStep() const;
@@ -58,9 +55,6 @@ public:
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] int growthScale() const;
-    [[nodiscard]] QString normal3dZarrPath() const;
-    [[nodiscard]] QString patchTracerSourcePath() const;
-    [[nodiscard]] utils::Json patchTracerParamsJson() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
@@ -70,11 +64,9 @@ public:
     [[nodiscard]] int neuralVolumeScale() const;
     [[nodiscard]] int neuralBatchSize() const;
     [[nodiscard]] NeuralTracerModelType neuralModelType() const;
-    [[nodiscard]] NeuralTracerOutputMode neuralOutputMode() const;
-    [[nodiscard]] DenseTtaMode denseTtaMode() const;
-    [[nodiscard]] QString denseTtaMergeMethod() const;
-    [[nodiscard]] double denseTtaOutlierDropThresh() const;
-    [[nodiscard]] QString denseCheckpointPath() const;
+    [[nodiscard]] TtaMode ttaMode() const;
+    [[nodiscard]] QString ttaMergeMethod() const;
+    [[nodiscard]] double ttaOutlierDropThresh() const;
     [[nodiscard]] QString copyCheckpointPath() const;
 
     void setPendingChanges(bool pending);
@@ -82,8 +74,6 @@ public:
     void setDrawMaskEnabled(bool enabled);
     void setDragRadius(float value);
     void setDragSigma(float value);
-    void setLineRadius(float value);
-    void setLineSigma(float value);
     void setPushPullRadius(float value);
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
@@ -94,7 +84,6 @@ public:
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
-    void setEraseBrushActive(bool active);
     void setManualAddActive(bool active);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
     // Route direct changes through the panel so manualAddConfigChanged reaches
@@ -106,7 +95,6 @@ public:
     void setNormalGridPathHint(const QString& hint);
     void setNormalGridPath(const QString& path);
 
-    void setNormal3dZarrCandidates(const QStringList& candidates, const QString& hint);
 
     void setVolumePackagePath(const QString& path);
     void setAvailableVolumes(const QVector<QPair<QString, QString>>& volumes,
@@ -120,7 +108,6 @@ public:
     void setGrowthScale(int scale);
     void setCorrectionsZRange(bool enabled, int zMin, int zMax);
     void setAllowedGrowthDirections(const std::vector<SegmentationGrowthDirection>& directions);
-    void setPatchTracerParams(const utils::Json& params);
     bool selectGrowthVolume(const QString& volumeId);
     void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
@@ -129,33 +116,8 @@ public:
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
 
-    // Approval mask getters — delegated to panel
-    [[nodiscard]] bool showApprovalMask() const;
-    [[nodiscard]] bool editApprovedMask() const;
-    [[nodiscard]] bool editUnapprovedMask() const;
-    [[nodiscard]] bool autoApprovalEnabled() const;
-    [[nodiscard]] float autoApprovalRadius() const;
-    [[nodiscard]] float autoApprovalThreshold() const;
-    [[nodiscard]] float autoApprovalMaxDistance() const;
-
-    [[nodiscard]] float approvalBrushRadius() const;
-    [[nodiscard]] float approvalBrushDepth() const;
-    [[nodiscard]] int approvalMaskOpacity() const;
-    [[nodiscard]] QColor approvalBrushColor() const;
-
-    // Approval mask setters
-    void setShowApprovalMask(bool enabled);
-    void setEditApprovedMask(bool enabled);
-    void setEditUnapprovedMask(bool enabled);
-    void setAutoApprovalEnabled(bool enabled);
-    void setAutoApprovalRadius(float radius);
-    void setAutoApprovalThreshold(float threshold);
-    void setAutoApprovalMaxDistance(float distance);
-
-    void setApprovalBrushRadius(float radius);
-    void setApprovalBrushDepth(float depth);
-    void setApprovalMaskOpacity(int opacity);
-    void setApprovalBrushColor(const QColor& color);
+    // "Draw mask" brush radius in voxels.
+    [[nodiscard]] float maskBrushRadius() const { return _maskBrushRadius; }
 
     // Neural tracer setters
     void setNeuralTracerEnabled(bool enabled);
@@ -164,11 +126,9 @@ public:
     void setNeuralVolumeScale(int scale);
     void setNeuralBatchSize(int size);
     void setNeuralModelType(NeuralTracerModelType type);
-    void setNeuralOutputMode(NeuralTracerOutputMode mode);
-    void setDenseTtaMode(DenseTtaMode mode);
-    void setDenseTtaMergeMethod(const QString& method);
-    void setDenseTtaOutlierDropThresh(double threshold);
-    void setDenseCheckpointPath(const QString& path);
+    void setTtaMode(TtaMode mode);
+    void setTtaMergeMethod(const QString& method);
+    void setTtaOutlierDropThresh(double threshold);
     void setCopyCheckpointPath(const QString& path);
 
     /**
@@ -203,8 +163,6 @@ signals:
     void drawMaskChanged(bool enabled);
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
-    void lineRadiusChanged(float value);
-    void lineSigmaChanged(float value);
     void pushPullRadiusChanged(float value);
     void pushPullSigmaChanged(float value);
     void growthMethodChanged(SegmentationGrowthMethod method);
@@ -226,19 +184,7 @@ signals:
     void correctionsCollectionSelectionCleared();
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
-    void showApprovalMaskChanged(bool enabled);
-    void editApprovedMaskChanged(bool enabled);
-    void editUnapprovedMaskChanged(bool enabled);
-    void autoApprovalEnabledChanged(bool enabled);
-    void autoApprovalRadiusChanged(float radius);
-    void autoApprovalThresholdChanged(float threshold);
-    void autoApprovalMaxDistanceChanged(float distance);
-
-    void approvalBrushRadiusChanged(float radius);
-    void approvalBrushDepthChanged(float depth);
-    void approvalMaskOpacityChanged(int opacity);
-    void approvalBrushColorChanged(QColor color);
-    void approvalStrokesUndoRequested();
+    void maskBrushRadiusChanged(float radius);
 
     // Neural tracer signals
     void neuralTracerEnabledChanged(bool enabled);
@@ -267,6 +213,7 @@ private:
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
+    float _maskBrushRadius{50.0f};
     bool _pending{false};
     bool _growthInProgress{false};
     bool _restoringSettings{false};
@@ -276,7 +223,6 @@ private:
     SegmentationEditingPanel* _editingPanel{nullptr};
     SegmentationCorrectionsPanel* _correctionsPanel{nullptr};
     SegmentationCustomParamsPanel* _customParamsPanel{nullptr};
-    SegmentationApprovalMaskPanel* _approvalMaskPanel{nullptr};
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};

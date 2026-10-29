@@ -1,3 +1,4 @@
+#include <vc_reader/catalog.hpp>
 #pragma once
 #include <set>
 #include <algorithm>
@@ -134,6 +135,7 @@ nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fiel
         if (include(key)) d[key] = value;
     });
     if (include("data_checksum")) d["data_checksum"] = r.dataChecksum;
+    if (r.volumeLength) d["volume_length"] = *r.volumeLength;
     vo::detail::objectDetails(r, [&](const char* key, const auto& detail) {
         if (!detail || !include(key)) return;
         nb::dict value;
@@ -206,6 +208,25 @@ std::vector<vo::GeometryArrayEdit> geometryEditsFromPy(const nb::list& input)
     return result;
 }
 
+vo::GeometryArray arrayFromPy(const nb::handle& item)
+{
+    const auto a = nb::cast<nb::dict>(item);
+    vo::GeometryArray array;
+    array.name = nb::cast<std::string>(a["name"]);
+    array.dtype = nb::cast<std::string>(a["dtype"]);
+    array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
+    const auto bytes = nb::cast<nb::bytes>(a["data"]);
+    const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
+    array.bytes.assign(begin, begin + bytes.size());
+    return array;
+}
+nb::dict arrayToPy(const vo::GeometryArray& array)
+{
+    nb::dict result;
+    result["name"] = array.name; result["dtype"] = array.dtype; result["shape"] = array.shape;
+    result["data"] = nb::bytes(reinterpret_cast<const char*>(array.bytes.data()), array.bytes.size());
+    return result;
+}
 vo::GeometryData geometryFromPy(const nb::dict& input)
 {
     vo::GeometryData result;
@@ -213,17 +234,7 @@ vo::GeometryData geometryFromPy(const nb::dict& input)
     if (input.contains("format_version")) result.formatVersion = nb::cast<int64_t>(input["format_version"]);
     if (input.contains("coordinate_system")) result.coordinateSystem = nb::cast<std::string>(input["coordinate_system"]);
     if (input.contains("attributes")) result.attributes = jsonDumps(input["attributes"]);
-    for (const auto item : nb::cast<nb::list>(input["arrays"])) {
-        const auto a = nb::cast<nb::dict>(item);
-        vo::GeometryArray array;
-        array.name = nb::cast<std::string>(a["name"]);
-        array.dtype = nb::cast<std::string>(a["dtype"]);
-        array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
-        const auto bytes = nb::cast<nb::bytes>(a["data"]);
-        const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
-        array.bytes.assign(begin, begin + bytes.size());
-        result.arrays.push_back(std::move(array));
-    }
+    for (const auto item : nb::cast<nb::list>(input["arrays"])) result.arrays.push_back(arrayFromPy(item));
     return result;
 }
 nb::dict geometryToPy(const vo::GeometryRevision& r)
@@ -239,7 +250,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     nb::list arrays;
     for (const auto& a : r.arrays) {
         nb::dict item; item["name"] = a.name; item["dtype"] = a.dtype;
-        if (r.kind == "patch") item["components"] = a.shape.size() == 3 ? a.shape[2] : 1;
+        if (r.kind == "surface") item["components"] = a.shape.size() == 3 ? a.shape[2] : 1;
         item["shape"] = a.shape; item["byte_length"] = a.byteLength; arrays.append(item);
     }
     result["arrays"] = arrays;
@@ -284,7 +295,7 @@ struct PyObjectStore {
 
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
-                                             size_t geometryCacheBytes, size_t spatialCacheBytes)
+                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
     {
         vo::OpenOptions o;
         o.author = author;
@@ -292,6 +303,12 @@ struct PyObjectStore {
         o.readerPoolSize = readerPoolSize;
         o.geometryCacheBytes = geometryCacheBytes;
         o.spatialCacheBytes = spatialCacheBytes;
+        if(!catalog.is_none()) {
+            auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+            const auto raw=nb::hasattr(catalog,"raw")?catalog.attr("raw"):catalog;
+            graph->addCatalog(vcr::catalog::parseOpenDataManifest(jsonDumps(raw)));
+            o.catalogTransforms=std::move(graph);
+        }
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::create(path, o));
         return self;
@@ -299,7 +316,7 @@ struct PyObjectStore {
 
     static PyObjectStore open(const std::string& path, const std::optional<std::string>& author,
                                            bool readOnly, const std::optional<std::string>& hostname,
-                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes)
+                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
     {
         vo::OpenOptions o;
         o.readOnly = readOnly;
@@ -308,6 +325,12 @@ struct PyObjectStore {
         o.readerPoolSize = readerPoolSize;
         o.geometryCacheBytes = geometryCacheBytes;
         o.spatialCacheBytes = spatialCacheBytes;
+        if(!catalog.is_none()) {
+            auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+            const auto raw=nb::hasattr(catalog,"raw")?catalog.attr("raw"):catalog;
+            graph->addCatalog(vcr::catalog::parseOpenDataManifest(jsonDumps(raw)));
+            o.catalogTransforms=std::move(graph);
+        }
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::open(path, o));
         return self;
@@ -420,6 +443,6 @@ vo::GeometrySurfaceResize surfaceResizeFromPy(const nb::dict& input) {
     vo::GeometrySurfaceResize resize;
     resize.row=nb::cast<int64_t>(input["row"]); resize.column=nb::cast<int64_t>(input["column"]);
     resize.rows=nb::cast<int64_t>(input["rows"]); resize.columns=nb::cast<int64_t>(input["columns"]);
-    nb::dict data; data["kind"]="patch"; data["arrays"]=input["fill"];
+    nb::dict data; data["kind"]="surface"; data["arrays"]=input["fill"];
     resize.fill=geometryFromPy(data).arrays; return resize;
 }

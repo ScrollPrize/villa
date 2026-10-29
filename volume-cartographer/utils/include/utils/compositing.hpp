@@ -1,9 +1,6 @@
 #pragma once
 #include <span>
-#include <vector>
 #include <cstddef>
-#include <cmath>
-#include <algorithm>
 #include <string_view>
 #include <cstdint>
 
@@ -21,28 +18,6 @@ enum class CompositingMethod : std::uint8_t {
     beer_lambert
 };
 
-// ---------------------------------------------------------------------------
-// Parameters
-// ---------------------------------------------------------------------------
-
-struct CompositeParams {
-    CompositingMethod method = CompositingMethod::mean;
-
-    // Alpha blending params
-    float alpha_min = 0.0f;       // values below this are fully transparent
-    float alpha_max = 1.0f;       // values above this are fully opaque
-    float alpha_opacity = 1.0f;   // per-layer opacity multiplier
-    float alpha_cutoff = 1.0f;    // accumulated alpha threshold for early termination
-
-    // Beer-Lambert params
-    float extinction = 1.5f;      // absorption coefficient (higher = more opaque)
-    float emission   = 1.5f;      // emission scale (higher = brighter)
-    float ambient    = 0.1f;      // ambient light (background illumination)
-
-    // Pre-processing
-    std::uint8_t iso_cutoff = 0;     // values below this are zeroed before compositing
-};
-
 /// Parse a compositing method name (e.g., "mean", "max", "alpha", "beerLambert").
 /// Returns CompositingMethod::mean for unrecognized strings.
 [[nodiscard]] constexpr CompositingMethod parse_compositing_method(
@@ -54,45 +29,6 @@ struct CompositeParams {
     if (name == "alpha")        return CompositingMethod::alpha;
     if (name == "beerLambert")  return CompositingMethod::beer_lambert;
     return CompositingMethod::mean;
-}
-
-// ---------------------------------------------------------------------------
-// Post-processing utilities
-// ---------------------------------------------------------------------------
-
-/// Clamp to [0, 1].
-[[nodiscard]] constexpr float saturate(float v) noexcept {
-    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-}
-
-/// Window / level linear remap.
-[[nodiscard]] constexpr float window_level(
-    float value, float window, float level) noexcept
-{
-    if (window == 0.0f) return 0.0f;
-    float lo = level - window * 0.5f;
-    return saturate((value - lo) / window);
-}
-
-/// Normalize span in-place to [0, 1].
-inline void value_stretch(std::span<float> data) noexcept {
-    if (data.empty()) return;
-
-    float lo = data[0];
-    float hi = data[0];
-    for (float v : data) {
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-    }
-    float range = hi - lo;
-    if (range == 0.0f) {
-        std::fill(data.begin(), data.end(), 0.0f);
-        return;
-    }
-    float inv = 1.0f / range;
-    for (float& v : data) {
-        v = (v - lo) * inv;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,77 +99,6 @@ inline void value_stretch(std::span<float> data) noexcept {
     }
 
     return value_acc;
-}
-
-/// Beer-Lambert volume rendering (front-to-back).
-///   T(d) = exp(-extinction * density)
-///   accumulated += emission * density * transmittance
-///   transmittance *= T
-///   result = accumulated + ambient * transmittance
-[[nodiscard]] constexpr float composite_beer_lambert(
-    std::span<const float> layers,
-    float extinction, float emission_coeff, float ambient) noexcept
-{
-    if (layers.empty()) return ambient;
-
-    float transmittance = 1.0f;
-    float accumulated   = 0.0f;
-
-    for (float density : layers) {
-        float T = std::exp(-extinction * density);
-        accumulated   += emission_coeff * density * transmittance;
-        transmittance *= T;
-
-        if (transmittance < 1e-6f) break;
-    }
-    return accumulated + ambient * transmittance;
-}
-
-// ---------------------------------------------------------------------------
-// Stack compositing (dispatch by method)
-// ---------------------------------------------------------------------------
-
-[[nodiscard]] inline float composite_stack(
-    std::span<const float> layers,
-    CompositingMethod method,
-    const CompositeParams& params = {}) noexcept
-{
-    switch (method) {
-        case CompositingMethod::mean:
-            return composite_mean(layers);
-        case CompositingMethod::max:
-            return composite_max(layers);
-        case CompositingMethod::min:
-            return composite_min(layers);
-        case CompositingMethod::alpha:
-            return composite_alpha(layers, params.alpha_min, params.alpha_max,
-                                   params.alpha_opacity, params.alpha_cutoff);
-        case CompositingMethod::beer_lambert:
-            return composite_beer_lambert(
-                layers, params.extinction, params.emission, params.ambient);
-    }
-    return 0.0f;
-}
-
-// ---------------------------------------------------------------------------
-// Batch image compositing
-// ---------------------------------------------------------------------------
-
-/// Composite a multi-layer image into a single-layer output.
-/// \p layers is a flat buffer laid out as [num_pixels][num_layers].
-/// \p output must have space for \p num_pixels elements.
-inline void composite_image(
-    std::span<const float> layers,
-    std::size_t num_pixels,
-    std::size_t num_layers,
-    std::span<float> output,
-    const CompositeParams& params)
-{
-    for (std::size_t px = 0; px < num_pixels; ++px) {
-        std::span<const float> stack =
-            layers.subspan(px * num_layers, num_layers);
-        output[px] = composite_stack(stack, params.method, params);
-    }
 }
 
 } // namespace utils

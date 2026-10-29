@@ -41,9 +41,10 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "ViewerManager.hpp"
@@ -57,7 +58,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -326,27 +326,15 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         throw AgentBridgeError{-32007, "No active segmentation surface", data};
     }
 
-    if (enabled) {
-        auto surface = std::dynamic_pointer_cast<QuadSurface>(
-            state->surface("segmentation"));
-        if (!surface) {
-            surface = state->activeSurface().lock();
-        }
-        if (surface && !surface->path.empty() &&
-            vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = QString::fromStdString(state->activeSurfaceId());
-            data["path"] = QString::fromStdString(surface->path.string());
-            data["action"] = "segments.create_editable_copy";
-            data["detail"] =
-                "catalog segments are immutable; create and activate an "
-                "editable copy first";
-            throw AgentBridgeError{
-                -32009,
-                "Cannot edit an immutable Open Data catalog segment",
-                data};
-        }
+    // Continue editing in the store the surface was opened from.
+    QString importError;
+    if (enabled && _window->_surfacePanel &&
+        !_window->_surfacePanel->prepareSurfaceEditing(state->activeSurfaceId(), &importError)) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = QString::fromStdString(state->activeSurfaceId());
+        data["detail"] = importError;
+        throw AgentBridgeError{-32009, "Cannot edit this surface", data};
     }
 
     widget->setEditingEnabled(enabled);
@@ -382,8 +370,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     // Manual-add is an interactive editing mode, not a grow invocation.
     // Feeding SegmentationGrowthMethod::ManualAdd through
     // onGrowSegmentationSurface from the bridge would bypass the mode's session
-    // state, so the RPC rejects it and points at the future manual_add RPCs.
-    // The C++ enum value itself is untouched (the in-app apply path still uses it).
+    // state, so the RPC rejects it and points at the segmentation.manual_add RPCs.
     if (methodStr == QLatin1String("manual_add")) {
         QJsonObject data;
         data["param"] = "method";
@@ -398,8 +385,6 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
         method = SegmentationGrowthMethod::Tracer;
     else if (methodStr == QLatin1String("corrections"))
         method = SegmentationGrowthMethod::Corrections;
-    else if (methodStr == QLatin1String("patch_tracer"))
-        method = SegmentationGrowthMethod::PatchTracer;
     else {
         QJsonObject data;
         data["param"] = "method";
@@ -575,14 +560,14 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
 
     gp.iterations = p.value("iterations").toInt(200);
     gp.minAreaCm = p.value("minAreaCm").toDouble(0.002);
-    gp.outputDir = p.value("outputDir").toString();
+    gp.outputTag = p.value("outputTag").toString(gp.outputTag);
 
     const QString effectiveVolumeId = gp.volumeId.isEmpty()
         ? QString::fromStdString(state->currentVolumeId())
         : gp.volumeId;
 
     const QString jobId = beginJob(QStringLiteral("tool"),
-                                   QStringLiteral("segmentation.grow_patch_from_seed"),
+                                   QStringLiteral("segmentation.grow_surface_from_seed"),
                                    QStringLiteral("GrowPatch from seed"),
                                    /*broadcastStart=*/false);
 
@@ -594,16 +579,13 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
                                 {}, "tool");
     }
 
-    const QString outputDir = handler->activeGrowPatchOutputDir();
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The new surface's UUID arrives with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
-    result["kind"] = "segmentation.grow_patch_from_seed";
-    result["outputDir"] = outputDir;
+    result["kind"] = "segmentation.grow_surface_from_seed";
     result["volumeId"] = effectiveVolumeId;
     return result;
 }

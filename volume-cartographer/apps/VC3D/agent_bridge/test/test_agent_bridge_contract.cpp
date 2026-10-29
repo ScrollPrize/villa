@@ -416,14 +416,12 @@ int main()
         CHECK(agentBridgeObservedFields().contains(QStringLiteral("overlay")));
     }
 
-    // Workspace ids: tab order, and the legacy workspace.switch spelling.
-    CHECK(agentBridgeWorkspaceIds().size() == 7);
+    // Workspace ids: tab order.
+    CHECK(agentBridgeWorkspaceIds().size() == 5);
     CHECK(agentBridgeWorkspaceIds().front() == QLatin1String("main"));
     CHECK(agentBridgeWorkspaceIds().contains(QStringLiteral("fiber-map")));
-    CHECK(canonicalWorkspaceId(QStringLiteral("fiber_slice")) ==
-          QLatin1String("fiber-slice"));
+    CHECK(agentBridgeWorkspaceIds().back() == QLatin1String("project"));
     CHECK(canonicalWorkspaceId(QStringLiteral("spiral")) == QLatin1String("spiral"));
-    CHECK(!agentBridgeWorkspaceIds().contains(QStringLiteral("fiber_slice")));
 
     // ui.inspect redaction: credential labels, matched as whole words.
     for (const char* label : {"Password", "API key", "apiKeyEdit", "AWSSecretKey",

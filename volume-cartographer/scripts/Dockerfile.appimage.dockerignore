@@ -3,6 +3,8 @@
 !volume-cartographer/**
 !spiral-fitting/
 !spiral-fitting/**
+!vc_object_store/
+!vc_object_store/**
 !vesuvius/
 !vesuvius/src/
 !vesuvius/src/vc3d_fiber_format/

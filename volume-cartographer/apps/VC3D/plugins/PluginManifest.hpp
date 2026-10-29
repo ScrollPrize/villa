@@ -27,10 +27,8 @@ inline constexpr char kSchema[] = "vc3d-plugin/1";
 enum class ResultKind {
     None,       // nothing to load; VC3D reports the run folder
     File,       // a report or image; VC3D shows the path and offers to open it
-    Segment,    // a tifxyz segment folder; attached to the project
-    InkOverlay, // an image on the active segment's grid; added to its ink detections
+    InkOverlay, // an image on the active segment's grid; shown as its ink overlay
     Points,     // a VC3D point collection JSON; its collections are added
-    Umbilicus,  // an umbilicus.json; set as the project's umbilicus
 };
 
 struct PluginInput {
@@ -65,7 +63,6 @@ struct PluginContext {
     QString segmentId;
     QString project;
     QString inkOverlay;
-    QString umbilicus;
     std::optional<std::array<double, 3>> point;
     std::optional<std::array<double, 6>> region;
     QString output;

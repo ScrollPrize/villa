@@ -373,25 +373,19 @@ private slots:
     void restoreNeverReplacesLoadedWork()
     {
         QTemporaryDir root;
-        QTemporaryDir segment;
         writeLeftover(root.path(), "session-crashed", QDateTime::currentDateTimeUtc(), true);
         SessionRecovery session(root.path());
         const auto leftovers = session.leftoverSessions();
         QCOMPARE(leftovers.size(), std::size_t{1});
 
-        // Loading the copy would drop the active segment's correction points,
-        // and VC3D's corrections autosave would then rewrite or delete its
-        // corrections.json.
+        // Loading the copy would drop the active surface's correction points,
+        // and VC3D's corrections autosave would then rewrite them in the store.
         VCCollection live;
         addCorrection(live, "segment corrections");
-        QVERIFY(live.saveToSegmentPath(segment.path().toStdString()));
         QString error;
         QVERIFY(!SessionRecovery::restorePoints(leftovers.front(), &live, &error));
         QVERIFY(error.contains("correction"));
-        QVERIFY(live.saveToSegmentPath(segment.path().toStdString()));  // the autosave
-        VCCollection onDisk;
-        QVERIFY(onDisk.loadFromSegmentPath(segment.path().toStdString()));
-        QCOMPARE(onDisk.getPoints("segment corrections").size(), std::size_t{1});
+        QCOMPARE(live.getPoints("segment corrections").size(), std::size_t{1});
 
         // Nor does it replace points placed in this session.
         VCCollection work;

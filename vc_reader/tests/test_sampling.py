@@ -4,7 +4,6 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 import json
-import os
 from pathlib import Path
 import pickle
 import subprocess
@@ -17,10 +16,8 @@ import numpy as np
 from PIL import Image
 import tifffile
 
-if os.environ.get('VC_READER_BUILD_DIR'):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from extension_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
+from build_support import load_build
+load_build()
 
 from vc_reader import (Affine, Catalog, Companion, Encoding, Frame, Plane, QueryContext, Selection,
                        Source, Storage, ValueFrame, VolumeRegistration)

@@ -28,7 +28,12 @@ QHash<QString, QByteArray> AgentBridgeServer::observedStateFingerprints(
     const QJsonObject& snapshot)
 {
     QHash<QString, QByteArray> fields;
-    fields["project"] = fingerprint(snapshot.value("vpkg"));
+    // The project file, its stores and which store each kind uses.
+    fields["project"] = fingerprint(QJsonObject{
+        {QStringLiteral("project"), snapshot.value("project")},
+        {QStringLiteral("stores"), snapshot.value("stores")},
+        {QStringLiteral("routes"), snapshot.value("routes")},
+    });
     fields["volume"] = fingerprint(snapshot.value("volume"));
     fields["activeSegment"] = fingerprint(snapshot.value("activeSurface"));
 

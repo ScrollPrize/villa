@@ -1,4 +1,4 @@
-"""Wire tests for the segmentation settings and approval-mask tools.
+"""Wire tests for the segmentation settings tools.
 
 Run:
     python3 -m unittest tests.tools.test_editing_settings -v
@@ -15,9 +15,7 @@ from tests.support import EchoBridgeServer
 from vc3d_mcp import core
 from vc3d_mcp.tools.editing_settings import (
     vc3d_get_segmentation_settings,
-    vc3d_set_approval_mask_mode,
     vc3d_set_segmentation_settings,
-    vc3d_undo_approval_stroke,
 )
 
 
@@ -38,12 +36,10 @@ class EditingSettingsToolsTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_set_segmentation_settings(
             drag={"radius": 8.0},
             push_pull={"step": 2.0},
-            growth_method="patch_tracer",
+            growth_method="corrections",
             growth_directions=["up", "left"],
             z_range={"enabled": True, "min": 100, "max": 200},
-            patch_tracer={"step": 12},
             direction_fields=[{"path": "/fields/a.zarr", "orientation": "vertical"}],
-            approval_mask={"show": True, "brushRadius": 30.0, "opacity": 0.4},
         )
         self.assertEqual(result["echoedMethod"], "segmentation.set_settings")
         self.assertEqual(
@@ -51,28 +47,18 @@ class EditingSettingsToolsTest(unittest.IsolatedAsyncioTestCase):
             {
                 "drag": {"radius": 8.0},
                 "pushPull": {"step": 2.0},
-                "growthMethod": "patch_tracer",
+                "growthMethod": "corrections",
                 "growthDirections": ["up", "left"],
                 "zRange": {"enabled": True, "min": 100, "max": 200},
-                "patchTracer": {"step": 12},
                 "directionFields": [
                     {"path": "/fields/a.zarr", "orientation": "vertical"}],
-                "approvalMask": {"show": True, "brushRadius": 30.0, "opacity": 0.4},
             },
         )
 
-    async def test_reads_and_undo_have_no_params(self) -> None:
-        for tool, method in (
-            (vc3d_get_segmentation_settings, "segmentation.get_settings"),
-            (vc3d_undo_approval_stroke, "segmentation.approval_mask.undo"),
-        ):
-            result = await tool()
-            self.assertEqual(result["echoedMethod"], method)
-            self.assertEqual(result["echoedParams"], {})
-
-    async def test_approval_mode_sends_show(self) -> None:
-        result = await vc3d_set_approval_mask_mode("approve", show=True)
-        self.assertEqual(result["echoedParams"], {"mode": "approve", "show": True})
+    async def test_get_settings_has_no_params(self) -> None:
+        result = await vc3d_get_segmentation_settings()
+        self.assertEqual(result["echoedMethod"], "segmentation.get_settings")
+        self.assertEqual(result["echoedParams"], {})
 
 
 if __name__ == "__main__":

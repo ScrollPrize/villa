@@ -21,9 +21,9 @@ const QStringList& contextPlaceholders()
         QStringLiteral("volume"),     QStringLiteral("volume_id"),
         QStringLiteral("segment"),    QStringLiteral("segment_id"),
         QStringLiteral("project"),    QStringLiteral("ink_overlay"),
-        QStringLiteral("umbilicus"),  QStringLiteral("point"),
-        QStringLiteral("point_x"),    QStringLiteral("point_y"),
-        QStringLiteral("point_z"),    QStringLiteral("region"),
+        QStringLiteral("point"),      QStringLiteral("point_x"),
+        QStringLiteral("point_y"),    QStringLiteral("point_z"),
+        QStringLiteral("region"),
         QStringLiteral("output"),     QStringLiteral("plugin_dir"),
     };
     return names;
@@ -108,10 +108,8 @@ std::optional<ResultKind> parseKind(const QString& name)
 {
     if (name == QLatin1String("none")) return ResultKind::None;
     if (name == QLatin1String("file")) return ResultKind::File;
-    if (name == QLatin1String("segment")) return ResultKind::Segment;
     if (name == QLatin1String("ink_overlay")) return ResultKind::InkOverlay;
     if (name == QLatin1String("points")) return ResultKind::Points;
-    if (name == QLatin1String("umbilicus")) return ResultKind::Umbilicus;
     return std::nullopt;
 }
 
@@ -124,7 +122,6 @@ QString valueFor(const QString& name, const PluginManifest& manifest, const Plug
     if (name == QLatin1String("segment_id")) return ctx.segmentId;
     if (name == QLatin1String("project")) return ctx.project;
     if (name == QLatin1String("ink_overlay")) return ctx.inkOverlay;
-    if (name == QLatin1String("umbilicus")) return ctx.umbilicus;
     if (name == QLatin1String("output")) return ctx.output;
     if (name == QLatin1String("plugin_dir")) return manifest.pluginDir;
     if (ctx.point) {
@@ -178,7 +175,6 @@ QString requirementFor(const QString& placeholder)
         return QStringLiteral("an active segment");
     if (placeholder == QLatin1String("project")) return QStringLiteral("a project saved on disk");
     if (placeholder == QLatin1String("ink_overlay")) return QStringLiteral("a selected ink detection overlay");
-    if (placeholder == QLatin1String("umbilicus")) return QStringLiteral("an attached umbilicus");
     if (placeholder.startsWith(QLatin1String("point"))) return QStringLiteral("a focus point");
     if (placeholder == QLatin1String("region")) return QStringLiteral("an enabled focus region");
     if (placeholder.startsWith(kInputPrefix))
@@ -191,10 +187,8 @@ QString resultKindName(ResultKind kind)
     switch (kind) {
         case ResultKind::None: return QStringLiteral("none");
         case ResultKind::File: return QStringLiteral("file");
-        case ResultKind::Segment: return QStringLiteral("segment");
         case ResultKind::InkOverlay: return QStringLiteral("ink_overlay");
         case ResultKind::Points: return QStringLiteral("points");
-        case ResultKind::Umbilicus: return QStringLiteral("umbilicus");
     }
     return QStringLiteral("none");
 }
@@ -295,7 +289,7 @@ ParseResult parseManifest(const QByteArray& json, const QString& manifestPath)
         const auto resultObj = resultValue.toObject();
         const auto kind = parseKind(resultObj.value(QStringLiteral("kind")).toString());
         if (!kind) {
-            return fail(QStringLiteral("\"result.kind\" must be none, file, segment, ink_overlay, points or umbilicus"));
+            return fail(QStringLiteral("\"result.kind\" must be none, file, ink_overlay or points"));
         }
         m.resultKind = *kind;
         m.resultPath = resultObj.value(QStringLiteral("path")).toString();

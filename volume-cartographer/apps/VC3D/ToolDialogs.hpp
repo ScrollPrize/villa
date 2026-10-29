@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDialog>
+#include <QMap>
 #include <QString>
 #include <QStringList>
 #include <QLineEdit>
@@ -18,24 +19,26 @@
 #include <optional>
 
 #include "AlphaCompRefineRequest.hpp"
+#include "StraightenRequest.hpp"
+#include "elements/VolumeSelector.hpp"
 
 class JsonProfileEditor;
-class VolumeSelector;
 class QGroupBox;
 
 class RenderParamsDialog : public QDialog {
     Q_OBJECT
 public:
+    // `volumes`: the open project's volumes, `volumeId` chosen first.
     RenderParamsDialog(QWidget* parent,
-                       const QString& volumePath,
-                       const QString& segmentPath,
+                       const QVector<VolumeSelector::VolumeOption>& volumes,
+                       const QString& volumeId,
+                       const QString& surfaceName,
                        const QString& outputPattern,
                        double scale,
                        int groupIdx,
                        int numSlices);
 
-    QString volumePath() const;
-    QString segmentPath() const;
+    QString volumeId() const;
     QString outputPattern() const;
     double scale() const;
     int groupIdx() const;
@@ -47,29 +50,18 @@ public:
     int cropY() const;
     int cropWidth() const;
     int cropHeight() const;
-    QString affinePath() const;
-    bool invertAffine() const;
-    double scaleSegmentation() const;
     double rotateDegrees() const;
     int flipAxis() const; // -1 none, 0 vertical, 1 horizontal, 2 both
     bool includeTifs() const; // when output is .zarr
-    bool flatten() const; // ABF++ flattening
-    int flattenIterations() const;
-    int flattenDownsample() const;
 
 private:
     // Session defaults (optional-only; exclude paths and output pattern)
     static bool s_haveSession;
     static bool s_includeTifs;
     static int  s_cropX, s_cropY, s_cropW, s_cropH;
-    static bool s_invertAffine;
-    static double s_scaleSeg;
     static double s_rotateDeg;
     static int  s_flipAxis;
     static int  s_ompThreads;
-    static bool s_flatten;
-    static int  s_flattenIters;
-    static int  s_flattenDownsample;
 
     void applyCodeDefaults();
     void applySavedDefaults();
@@ -77,8 +69,7 @@ private:
     void saveDefaults() const; // persist optional-only to VC.ini
     void updateSessionFromUI();
 
-    QLineEdit* edtVolume_{nullptr};
-    QLineEdit* edtSegment_{nullptr};
+    VolumeSelector* volume_{nullptr};
     QLineEdit* edtOutput_{nullptr};
     QDoubleSpinBox* spScale_{nullptr};
     QSpinBox* spGroup_{nullptr};
@@ -89,15 +80,9 @@ private:
     QSpinBox* spCropY_{nullptr};
     QSpinBox* spCropW_{nullptr};
     QSpinBox* spCropH_{nullptr};
-    QLineEdit* edtAffine_{nullptr};
-    QCheckBox* chkInvert_{nullptr};
-    QDoubleSpinBox* spScaleSeg_{nullptr};
     QDoubleSpinBox* spRotate_{nullptr};
     QComboBox* cmbFlip_{nullptr};
     QCheckBox* chkIncludeTifs_{nullptr};
-    QCheckBox* chkFlatten_{nullptr};
-    QSpinBox* spFlattenIters_{nullptr};
-    QSpinBox* spFlattenDownsample_{nullptr};
 };
 
 class TraceParamsDialog : public QDialog {
@@ -105,16 +90,15 @@ class TraceParamsDialog : public QDialog {
 public:
     TraceParamsDialog(QWidget* parent,
                       const QString& volumePath,
-                      const QString& srcDir,
-                      const QString& tgtDir,
+                      const QString& sourceTag,
+                      const QString& outputTag,
                       const QString& jsonParams,
-                      const QString& srcSegment);
+                      const QString& srcSurfaceName);
 
     QString volumePath() const;
-    QString srcDir() const;
-    QString tgtDir() const;
+    QString sourceTag() const;
+    QString outputTag() const;
     QString jsonParams() const;
-    QString srcSegment() const;
     
     // Build a params JSON object from UI controls (merged or standalone)
     QJsonObject makeParamsJson() const;
@@ -148,10 +132,9 @@ private:
     void updateSessionFromUI();
 
     QLineEdit* edtVolume_{nullptr};
-    QLineEdit* edtSrcDir_{nullptr};
-    QLineEdit* edtTgtDir_{nullptr};
+    QLineEdit* edtSourceTag_{nullptr};
+    QLineEdit* edtOutputTag_{nullptr};
     QLineEdit* edtJson_{nullptr};
-    QLineEdit* edtSrcSegment_{nullptr};
     QLineEdit* edtThreads_{nullptr};
 
     // Advanced tracing parameters (parsed from JSON; defaults reflect GrowSurface.cpp)
@@ -185,16 +168,13 @@ class ConvertToObjDialog : public QDialog {
     Q_OBJECT
 public:
     ConvertToObjDialog(QWidget* parent,
-                       const QString& tifxyzPath,
-                       const QString& objOutPath);
+                       const QString& surfaceName,
+                       const QString& defaultObjName);
 
-    QString tifxyzPath() const;
-    QString objPath() const;
+    // The OBJ's file name in the surface's artifact directory.
+    QString objName() const;
     bool normalizeUV() const;
     bool alignGrid() const;
-    int decimateIterations() const;
-    bool cleanSurface() const;
-    double cleanK() const;
     int ompThreads() const; // -1 if unset
 
 private:
@@ -202,9 +182,6 @@ private:
     static bool   s_haveSession;
     static bool   s_normUV;
     static bool   s_alignGrid;
-    static int    s_decimate;
-    static bool   s_clean;
-    static double s_cleanK;
     static int    s_ompThreads; // -1 if unset
 
     void applyCodeDefaults();
@@ -213,37 +190,32 @@ private:
     void saveDefaults() const; // persist optional-only to VC.ini
     void updateSessionFromUI();
 
-    QLineEdit* edtTifxyz_{nullptr};
     QLineEdit* edtObj_{nullptr};
     QLineEdit* edtThreads_{nullptr};
     QCheckBox* chkNormalize_{nullptr};
     QCheckBox* chkAlign_{nullptr};
-    QSpinBox* spDecimate_{nullptr};
-    QCheckBox* chkClean_{nullptr};
-    QDoubleSpinBox* spCleanK_{nullptr};
 };
 
 class QTableWidget;
 class QPushButton;
 class QLabel;
 
-// MergeTifxyzDialog
+// MergeSurfacesDialog
 //
-// Edits a 2D grid of tifxyz directory names and the RANSAC tunables for
-// vc_merge_tifxyz, then writes a merge.json into the volpkg root and
-// returns its path. The grid layout encodes the surface adjacency that
+// Edits a 2D grid of stored surfaces and the RANSAC tunables for
+// vc_merge_tifxyz and builds its merge.json. The grid layout encodes the surface adjacency that
 // the merge tool RANSAC-aligns; empty cells are allowed; selection in
 // the segment list is used as the seed but the user can edit / append.
-class MergeTifxyzDialog : public QDialog {
+class MergeSurfacesDialog : public QDialog {
     Q_OBJECT
 public:
-    MergeTifxyzDialog(QWidget* parent,
+    // The grid holds surface UUIDs; `availableSurfaces` maps UUID -> name.
+    MergeSurfacesDialog(QWidget* parent,
                       const QStringList& seedSegmentIds,
-                      const QStringList& availableSegments,
-                      const QString& volpkgDir,
-                      const QString& pathsDir);
+                      const QMap<QString, QString>& availableSurfaces);
 
-    QString mergeJsonPath() const;     // populated by accept() on success
+    // vc_merge_tifxyz's merge.json for the grid.
+    QString mergeJsonText() const;
     QString refSurface() const;        // empty -> auto (largest valid-cell count)
     int ransacIters() const;
     double ransacMinThresh() const;
@@ -260,7 +232,6 @@ protected:
 private:
     QStringList collectGridNames() const;          // row-major, empties as ""
     QVector<QStringList> collectGridRows() const;  // grid rows, empties as ""
-    QString buildMergeJsonText() const;            // pretty JSON for preview
     void rebuildPreview();
     void updateRefCombo();
     void resizeGrid(int newRows, int newCols);
@@ -271,10 +242,7 @@ private:
     void applySessionDefaults();
     void updateSessionFromUI();
 
-    QStringList _availableSegments;
-    QString _volpkgDir;
-    QString _pathsDir;
-    QString _mergeJsonPath;
+    QMap<QString, QString> _availableSurfaces;
 
     QTableWidget* tblGrid_{nullptr};
     QPushButton* btnAddRow_{nullptr};
@@ -313,32 +281,31 @@ class QSpinBox;
 class QLineEdit;
 class QLabel;
 class QCheckBox;
-class VolumePkg;
 
 // MergePatchDialog
 //
-// Two-input cousin of MergeTifxyzDialog: picks a parent + child tifxyz from
-// the volpkg, exposes vc_merge_patch's tunables (border-cells, blend-cells,
+// Two-input cousin of MergeSurfacesDialog: picks a parent + child stored
+// surface, exposes vc_merge_patch's tunables (border-cells, blend-cells,
 // idw-k, RANSAC set, anchor-cap, OMP threads), and surfaces the role
-// auto-detect / explicit-override the binary supports. The parent dir is
-// overwritten in place by the binary; the dialog shows a banner up front so
-// the user knows. Recovery is via the rotating backup ring
-// (<parent_dir>/backups/<parent_name>/{0..7}/) that the binary populates via
-// QuadSurface::saveOverwrite.
+// auto-detect / explicit-override the binary supports. The binary edits the
+// parent in place (a new geometry revision); the dialog shows a banner up
+// front so the user knows.
 class MergePatchDialog : public QDialog {
     Q_OBJECT
 public:
+    // A surface to pick: its name and area (voxels², -1 when unknown).
+    struct Choice {
+        QString name;
+        double area{-1};
+    };
+    // The combos pick surface UUIDs among `availableSurfaces`.
     MergePatchDialog(QWidget* parent,
                      const QStringList& seedSegmentIds,
-                     const QStringList& availableSegments,
-                     std::shared_ptr<VolumePkg> volpkg,
-                     const QString& volpkgDir,
-                     const QString& pathsDir);
+                     const QMap<QString, Choice>& availableSurfaces);
 
-    // Resolved paths (filesystem-ready). parentPath() is the dir that will
-    // be overwritten; childPath() is the dir whose data gets patched in.
-    QString parentPath() const;
-    QString childPath() const;
+    // The surface edited in place, and the one patched into it (UUIDs).
+    QString parentSurface() const;
+    QString childSurface() const;
     // Roles set explicitly by the user (via the Swap button or a manual
     // override) instead of auto-detected. Drives whether the runner passes
     // --parent/--child or positional args.
@@ -365,15 +332,11 @@ private:
     void applySessionDefaults();
     void updateSessionFromUI();
 
-    // Cheap valid-cell count for an already-loaded surface, via
-    // QuadSurface::countValidPoints (an in-memory scan, no I/O). Returns
-    // -1 if the surface isn't loaded in the volpkg cache.
-    int validCellCountFor(const QString& segId) const;
+    // The picked surfaces' UUIDs.
+    QString surfaceA() const;
+    QString surfaceB() const;
 
-    QStringList _availableSegments;
-    std::shared_ptr<VolumePkg> _volpkg;
-    QString _volpkgDir;
-    QString _pathsDir;
+    QMap<QString, Choice> _availableSurfaces;
 
     QComboBox* cmbA_{nullptr};
     QComboBox* cmbB_{nullptr};
@@ -394,8 +357,8 @@ private:
     QLineEdit* edtThreads_{nullptr};
 
     // Resolved on accept().
-    QString _parentPath;
-    QString _childPath;
+    QString _parentSurface;
+    QString _childSurface;
     bool    _explicitRoles{false};
 
     // Auto-detect bookkeeping: true means combo A is the parent. The Swap
@@ -422,9 +385,10 @@ class AlphaCompRefineDialog : public QDialog {
     Q_OBJECT
 public:
     AlphaCompRefineDialog(QWidget* parent,
-                          const QString& volumePath,
-                          const QString& srcSurfacePath,
-                          const QString& dstSurfacePath);
+                          const QVector<VolumeSelector::VolumeOption>& volumes,
+                          const QString& volumeId,
+                          const QString& srcSurfaceName,
+                          const QString& defaultOutputName);
 
     AlphaCompRefineRequest request() const;
 
@@ -450,11 +414,10 @@ private:
     static QString s_scaleGroup;
     static bool   s_refine;
     static bool   s_vertexColor;
-    static bool   s_overwrite;
+    static bool   s_inPlace;
     static int    s_ompThreads;
 
-    QLineEdit* edtVolume_{nullptr};
-    QLineEdit* edtSrc_{nullptr};
+    VolumeSelector* volume_{nullptr};
     QLineEdit* edtDst_{nullptr};
     QLineEdit* edtScaleGroup_{nullptr};
     QLineEdit* edtThreads_{nullptr};
@@ -468,7 +431,7 @@ private:
     QDoubleSpinBox* spReaderScale_{nullptr};
     QCheckBox* chkRefine_{nullptr};
     QCheckBox* chkVertexColor_{nullptr};
-    QCheckBox* chkOverwrite_{nullptr};
+    QCheckBox* chkInPlace_{nullptr};
 };
 
 struct NeighborCopyVolumeOption {
@@ -481,17 +444,16 @@ class NeighborCopyDialog : public QDialog {
     Q_OBJECT
 public:
     NeighborCopyDialog(QWidget* parent,
-                       const QString& surfacePath,
+                       const QString& surfaceName,
                        const QVector<NeighborCopyVolumeOption>& volumes,
                        const QString& defaultVolumeId,
-                       const QString& defaultOutputPath);
+                       const QString& defaultOutputTag);
 
     void accept() override;
 
-    QString surfacePath() const;
     QString selectedVolumeId() const;
     QString selectedVolumePath() const;
-    QString outputPath() const;
+    QString outputTag() const;
     int resumeLocalOptStep() const;
     int resumeLocalOptRadius() const;
     int resumeLocalMaxIters() const;
@@ -530,55 +492,19 @@ private:
     QSpinBox* spSpikeWindow_{nullptr};
 };
 
-class ExportChunksDialog : public QDialog {
-    Q_OBJECT
-public:
-    ExportChunksDialog(QWidget* parent, int surfaceWidth, double scale);
-
-    int chunkWidth() const;
-    int overlapPerSide() const;
-    bool overwrite() const;
-
-private:
-    QSpinBox* spChunkWidth_{nullptr};
-    QSpinBox* spOverlap_{nullptr};
-    QCheckBox* chkOverwrite_{nullptr};
-};
-
-class ABFFlattenDialog : public QDialog {
-    Q_OBJECT
-public:
-    ABFFlattenDialog(QWidget* parent);
-
-    int iterations() const;
-    int downsampleFactor() const;
-
-private:
-    // Session defaults (in-memory)
-    static bool s_haveSession;
-    static int s_iterations;
-    static int s_downsample;
-
-    void applySessionDefaults();
-    void updateSessionFromUI();
-
-    QSpinBox* spIterations_{nullptr};
-    QSpinBox* spDownsample_{nullptr};
-};
-
 class SlimFlattenDialog : public QDialog {
     Q_OBJECT
 public:
-    SlimFlattenDialog(QWidget* parent, const QString& defaultOutputPath);
+    SlimFlattenDialog(QWidget* parent, const QString& defaultOutputName);
 
     int maxIterations() const;
     double tolerance() const;   // 0.0 = disabled (run all iterations)
     QString energyType() const; // "symmetric_dirichlet" or "conformal"
-    QString outputPath() const;
+    QString outputName() const;
     // Target percentage of source grid points to flatten (1..100). 100 means
     // no decimation. Below 100 the SLIM step runs on a decimated mesh and
-    // the resulting UVs are lifted back to the full-resolution mesh via
-    // vc_obj_uv_lift. Default 1.5% picks stride~8, which is roughly what
+    // flatboi lifts the resulting UVs back to the full-resolution grid.
+    // Default 1.5% picks stride~8, which is roughly what
     // 2-iter stride-3 produced in earlier versions and matches the
     // configuration that converges on 2um Paris segments.
     double keepPercent() const;
@@ -607,13 +533,10 @@ private:
 class StraightenDialog : public QDialog {
     Q_OBJECT
 public:
-    StraightenDialog(QWidget* parent, const QString& defaultOutputPath);
+    StraightenDialog(QWidget* parent, const QString& defaultOutputName);
 
-    QString outputPath() const;
-    // CLI args (without input/output) derived from the dialog state. Always
-    // emits an explicit --overlap-pairs so the tool never falls back to its
-    // implicit "no flags = full pipeline" default.
-    QStringList toArgs() const;
+    // The run the dialog describes.
+    StraightenRequest request() const;
 
 private:
     static bool s_haveSession;
@@ -678,14 +601,13 @@ public:
 
     QString tracksPath() const;
     QString crossingsPath() const;
-    QString outputPath() const;
     QString venvPath() const;
     // Resolved python executable (handles venv dir -> bin/python)
     QString resolvedPython() const;
     // Absolute path to grow_track_graph.py (resolved at runtime)
     QString scriptPath() const;
     // Full argument list for the script invocation excluding the python
-    // executable and script path: [tracks, crossings, output, ...options]
+    // executable, the script path and the store arguments: [tracks, crossings, ...options]
     QStringList buildArgs() const;
     int ompThreads() const; // -1 if unset
 
@@ -698,7 +620,6 @@ private:
 
     QLineEdit* edtTracks_{nullptr};
     QLineEdit* edtCrossings_{nullptr};
-    QLineEdit* edtOutput_{nullptr};
     QLineEdit* edtVenv_{nullptr};
 
     QRadioButton* rbSeeds_{nullptr};

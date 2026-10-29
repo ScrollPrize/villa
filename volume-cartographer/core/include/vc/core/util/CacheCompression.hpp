@@ -67,13 +67,6 @@ inline std::vector<std::byte> cacheCompress(
     return vc_delta3d::compress(input, shapeZYX, elemSize, quantBinWidth);
 }
 
-inline void cacheQuantize(std::span<std::byte> data,
-                          std::size_t elemSize,
-                          int quantBinWidth)
-{
-    vc_delta3d::quantize(data, elemSize, quantBinWidth);
-}
-
 inline std::optional<int> cacheQuantBinWidth(
     std::span<const std::byte> input)
 {
@@ -82,15 +75,6 @@ inline std::optional<int> cacheQuantBinWidth(
         return header ? vc_delta3d::quantization(*header) : std::nullopt;
     }
     return vc_delta3d::quantization(input);
-}
-
-inline std::optional<int> cacheDeltaMask(std::span<const std::byte> input)
-{
-    if (detail::hasMagic(input, detail::kVcz1Magic)) {
-        const auto header = detail::translatedVcz1Header(input);
-        return header ? vc_delta3d::deltaMask(*header) : std::nullopt;
-    }
-    return vc_delta3d::deltaMask(input);
 }
 
 inline std::optional<std::vector<std::byte>> cacheDecompress(

@@ -149,7 +149,7 @@ void resultPathCannotEscapeThroughAnInput()
     const auto parsed = parseManifest(QByteArrayLiteral(R"({
         "schema": "vc3d-plugin/1", "id": "p", "name": "P", "program": "tool",
         "inputs": [{"name": "name"}],
-        "result": {"kind": "segment", "path": "{output}/{input:name}"}
+        "result": {"kind": "file", "path": "{output}/{input:name}"}
     })"), QStringLiteral("/opt/plugins/p.json"));
     CHECK(parsed.manifest.has_value());
     PluginContext ctx;

@@ -35,7 +35,6 @@
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/util/Rect3D.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 
 class CState;
 class CameraGizmoWidget;
@@ -116,13 +115,7 @@ public:
     // on it. Enforced in syncCameraTransform(), i.e. before any render is
     // submitted or repainted, so no frame is ever shown off the pinned row.
     void setPinnedSurfaceY(std::optional<float> surfaceY);
-    void applyCameraStateForReplayRepaint(const CameraState& state);
-    // Render-bench helpers: true when no render is running/queued/pending; count of
-    // remote chunk fetches still outstanding. Used by replay to settle each frame.
-    bool isRenderQuiescent() const;
-    std::size_t chunkFetchesInFlight() const;
     int datasetScaleIndex() const override { return _dsScaleIdx; }
-    float datasetScaleFactor() const override { return _dsScale; }
     Surface* currentSurface() const override;
     VCCollection* pointCollection() const override { return _pointCollection; }
 
@@ -137,14 +130,10 @@ public:
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled && !streamingCompositeUnsupported(); }
 
     void setVolumeWindow(float low, float high) override;
-    void setBaseColormap(const std::string& id) override { if (_closing) return; _baseColormapId = id; submitRender("setBaseColormap"); }
-    void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
-    bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
+    bool planeIntersectionLinesVisible() const override { return _planeIntersectionLinesVisible; }
 
-    void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
-    bool isShowDirectionHints() const override { return _showDirectionHints; }
     void setShowSurfaceNormals(bool on) override { if (_closing) return; _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     void setShowCoordinateFrame(bool show);
@@ -162,15 +151,10 @@ public:
     void setOverlayMaxDisplayedResolution(int level) override;
     void setOverlayComposite(const OverlayCompositeSettings& settings) override;
 
-    void setSegmentationEditActive(bool active) override { if (_closing) return; _segmentationEditActive = active; }
-    void setSegmentationIntersectionDeferral(bool active) override;
     void setSegmentationCursorMirroring(bool enabled) override;
-    const ActiveSegmentationHandle& activeSegmentationHandle() const override;
 
     std::optional<vc::PointRef> highlightedPoint() const override { return _highlightedPoint; }
     std::optional<vc::PointRef> selectedPoint() const override { return _selectedPoint; }
-    std::optional<uint64_t> selectedCollectionId() const override { return _selectedCollectionId; }
-    bool isPointDragActive() const override { return false; }
     bool isSameWrapAnnotationModeEnabled() const override { return _sameWrapAnnotation.enabled(); }
     double sameWrapAnnotationPolylineOpacity() const override { return _sameWrapAnnotationPolylineOpacity; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override;
@@ -182,7 +166,6 @@ public:
     // group in place instead of rebuilding it.
     bool translateOverlayGroup(const std::string& key, const QPointF& delta);
     void clearOverlayGroup(const std::string& key) override;
-    void clearAllOverlayGroups() override;
 
     std::vector<std::pair<QRectF, QColor>> selections() const override;
     std::optional<QRectF> activeBBoxSceneRect() const override;
@@ -190,24 +173,11 @@ public:
     QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) override;
     void clearSelections() override;
 
-    void renderIntersections(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) override;
-    void scheduleIntersectionRender(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) override;
-    void invalidateIntersect(const std::string& = "") override;
-    void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells) override;
+    const std::set<std::string>& intersects() const override { return _intersectTgts; }
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
-    int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
-    void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
-    std::vector<std::string> highlightedSurfaceIds() const {
-        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
-    }
-    void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
@@ -226,13 +196,6 @@ public:
         ++_surfaceOverlaysRevision;
         emit overlaysUpdated();
     }
-    void setSurfaceOverlapThreshold(float threshold) override
-    {
-        const float clamped = std::max(0.0f, threshold);
-        if (_closing || _surfaceOverlapThreshold == clamped) return;
-        _surfaceOverlapThreshold = clamped;
-        emit overlaysUpdated();
-    }
 
     std::optional<SurfaceProjection> projectVolumePoint(
         const cv::Vec3f& volPoint, float depthTolerance) const override;
@@ -248,7 +211,6 @@ public:
     QPointF lastScenePosition() const override { return _lastScenePos; }
     void setLineAnnotationPlacementPreviewEnabled(bool enabled);
     bool lineAnnotationPlacementPreviewEnabled() const { return _lineAnnotationPlacementPreviewEnabled; }
-    bool lineAnnotationPlacementMarkerVisible() const;
     bool measurementSupported() const;
     void startMeasurementMode();
     bool isMeasurementActive() const;
@@ -312,7 +274,6 @@ public slots:
     void onMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void onKeyRelease(int key, Qt::KeyboardModifiers modifiers);
-    void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onCollectionSelected(uint64_t collectionId);
     void clearCollectionSelection();
@@ -329,7 +290,6 @@ public slots:
     void clearSameWrapAnnotationPreview();
     bool commitSameWrapAnnotationPreview();
     bool undoSameWrapAnnotation();
-    void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
 
@@ -416,7 +376,6 @@ private:
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
-        std::string baseColormapId;
         std::shared_ptr<Surface> surf;
         std::string surfaceName;
         std::shared_ptr<vc::render::ChunkCache> chunkArray;
@@ -511,11 +470,6 @@ private:
     void updateFocusMarker(POI* poi = nullptr);
     void refreshSameWrapAnnotationOverlay();
     std::optional<std::pair<uint64_t, uint64_t>> pointAtScenePosition(const QPointF& scenePos);
-    void clearIntersectionItems();
-    void updateIntersectionPreviewTransform();
-    void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf,
-                                      const char* reason,
-                                      std::source_location caller);
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
@@ -534,26 +488,18 @@ private:
     QStringList _cachedSharedCacheItems;
     CameraGizmoWidget* _cameraGizmo = nullptr;
     // No per-viewer timers. ViewerManager's global clock only services
-    // intersection/status maintenance; render requests submit immediately.
+    // status maintenance; render requests submit immediately.
     bool _closing = false;
-    bool _intersectionPending = false;
     int  _statusRefreshTicks = 0;  // counts down to the periodic status refresh
     // A render was requested while this viewer was hidden (minimized MDI subwindow /
     // background tab). We skip the work and set this; showEvent re-renders so the
     // viewer catches up on whatever went stale while invisible.
     bool _renderStaleWhileHidden = false;
-    bool _segmentationEditActive = false;
-    bool _deferSegmentationIntersections = false;
-    bool _deferredSegmentationIntersectionsDirty = false;
     bool _suppressNextSurfaceEditRender = false;
     // An editing tool can invalidate all tiles or a precise region before it
     // emits a same-object surfaceChanged signal. Consume that fact at the
     // signal so regional invalidation is not widened to the whole surface.
     bool _surfaceEditInvalidationPending = false;
-    std::string _pendingRenderReason;
-    std::string _pendingRenderCaller;
-    std::string _pendingIntersectionReason;
-    std::string _pendingIntersectionCaller;
 
     bool _volumetricAzimuthInSurface = false;
     // Last-seen frame of a displayed PlaneSurface: when the plane is rotated
@@ -592,9 +538,9 @@ private:
     bool _haveChunkFocus = false;
     std::uint64_t _chunkContentEpoch = 0;
     std::uint64_t _surfaceGeometryEpoch = 0;
+    std::uint64_t _surfaceEditEpoch = 0;
     std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
-    cv::Mat_<uint8_t> _coverage;
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 
@@ -635,7 +581,6 @@ private:
 
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
-    std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
@@ -659,7 +604,6 @@ private:
     float _linkedCursorViewTolerance = 10.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     int _maxDisplayedResolution = 0;
-    bool _showDirectionHints = true;
     bool _showSurfaceNormals = false;
     bool _showCoordinateFrame = true;
     float _normalArrowLengthScale = 1.0f;
@@ -671,107 +615,7 @@ private:
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
     float _intersectionThickness = 0.0f;
-    int _surfacePatchSamplingStride = 2;
     std::set<std::string> _intersectTgts;
-    std::unordered_set<std::string> _highlightedSurfaceIds;
-
-    // Resolved intersection targets, cached across render ticks. With very
-    // large sessions (~100k visible surfaces) re-resolving every name via
-    // CState per renderIntersections call costs tens of milliseconds on the
-    // main thread even when the fingerprint would hit. Invalidated when the
-    // target names / highlight set change and (via CState::surfacesVersion)
-    // when the surface map itself changes.
-    struct ResolvedIntersectTargets {
-        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
-        std::size_t targetHash = 0;
-        QuadSurface* activeSeg = nullptr;
-        std::uint64_t surfacesVersion = 0;
-        bool valid = false;
-    };
-    ResolvedIntersectTargets _resolvedIntersectTargets;
-
-    std::vector<QGraphicsItem*> _intersectionItems;
-    float _intersectionItemsCamSurfX = 0.0f;
-    float _intersectionItemsCamSurfY = 0.0f;
-    float _intersectionItemsCamScale = 1.0f;
-    bool _intersectionItemsHaveCamera = false;
-    std::unordered_map<std::string, size_t> _surfaceColorAssignments;
-    size_t _nextColorIndex = 0;
-
-    struct IntersectFingerprint {
-        int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
-        std::array<int, 3> planeOriginQ{};
-        std::array<int, 3> planeNormalQ{};
-        std::array<int, 3> planeBasisXQ{};
-        std::array<int, 3> planeBasisYQ{};
-        int opacityQ = -1;
-        int thicknessQ = -1;
-        int indexSamplingStride = 0;
-        size_t patchCount = 0;
-        size_t surfaceCount = 0;
-        size_t targetHash = 0;
-        size_t targetGenerationHash = 0;
-        size_t activeSegHash = 0;
-        size_t highlightedSurfaceHash = 0;
-        int segNormalOffsetQ = 0;
-        // Slab bound offsets (quantized) when the flattened viewer composites;
-        // INT_MIN when compositing is off so the modes never alias.
-        int segSlabFrontQ = std::numeric_limits<int>::min();
-        int segSlabBehindQ = std::numeric_limits<int>::min();
-        bool segSlabVolumetric = false;
-        size_t flattenedPlanesHash = 0;
-        size_t cameraHash = 0;
-        bool valid = false;
-        bool operator==(const IntersectFingerprint&) const = default;
-    };
-    IntersectFingerprint _lastIntersectFp;
-
-    struct IntersectionGeometryCache {
-        cv::Rect roi;
-        std::array<int, 3> planeOriginQ{};
-        std::array<int, 3> planeNormalQ{};
-        std::array<int, 3> planeBasisXQ{};
-        std::array<int, 3> planeBasisYQ{};
-        int indexSamplingStride = 0;
-        size_t patchCount = 0;
-        size_t surfaceCount = 0;
-        size_t targetHash = 0;
-        size_t targetGenerationHash = 0;
-        bool valid = false;
-        std::unordered_map<SurfacePatchIndex::SurfacePtr,
-                           std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
-    };
-    IntersectionGeometryCache _intersectionGeometryCache;
-
-    // Async plane-intersection compute. The r-tree query + triangle clip is heavy
-    // (~12% of the GUI tick); on a geometry-cache miss it runs on a worker and the
-    // QGraphicsItems are built on the main thread when the result lands. _intersectGen
-    // rises on every input change; a result whose gen no longer matches is dropped.
-    // One compute at a time; the current scene items stand as the preview meanwhile.
-    std::uint64_t _intersectGen = 0;
-    bool _intersectComputeInFlight = false;
-    void finishPlaneIntersectionCompute(
-        std::uint64_t gen, cv::Rect cacheRoi, IntersectFingerprint fp,
-        std::shared_ptr<std::unordered_map<SurfacePatchIndex::SurfacePtr,
-            std::vector<SurfacePatchIndex::TriangleSegment>>> result);
-
-    struct FlattenedIntersectionLine {
-        int planeIndex = 0;
-        QPointF a;
-        QPointF b;
-    };
-
-    struct FlattenedIntersectionCache {
-        QuadSurface* surface = nullptr;
-        size_t planesHash = 0;
-        int indexSamplingStride = 0;
-        uint64_t generation = 0;
-        bool valid = false;
-        std::unordered_map<std::uint64_t, std::vector<FlattenedIntersectionLine>> cellLines;
-        std::unordered_map<std::uint64_t, std::vector<QGraphicsPathItem*>> tileItems;
-    };
-    FlattenedIntersectionCache _flattenedIntersectionCache;
-    std::optional<cv::Rect> _flattenedIntersectionDirtyCells;
 
     float _contentMinU = 0.0f;
     float _contentMaxU = 0.0f;
@@ -813,7 +657,6 @@ private:
     MeasurementState _measurement;
 
     std::optional<vc::PointRef> _highlightedPoint;
-    std::optional<uint64_t> _selectedCollectionId;
     std::optional<vc::PointRef> _selectedPoint;
 
     SameWrapAnnotationTool _sameWrapAnnotation;

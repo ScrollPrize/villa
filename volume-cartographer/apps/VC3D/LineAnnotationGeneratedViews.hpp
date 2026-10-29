@@ -120,7 +120,6 @@ struct GeneratedOverlay {
         // With isLinkCandidate: designated as an ADJACENT link candidate, a
         // green triangle rather than a green circle.
         bool isAdjacentLinkCandidate = false;
-        bool hasTracedSegmentToNext = false;
         std::string interpolationGoal = "global";
         char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
@@ -155,18 +154,6 @@ struct GeneratedOverlay {
         double displayedLinePosition = std::numeric_limits<double>::quiet_NaN();
     };
 
-    struct PredSnapMarker {
-        cv::Vec3f controlPoint{std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f snapPoint{std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN(),
-                            std::numeric_limits<float>::quiet_NaN()};
-        double linePosition = std::numeric_limits<double>::quiet_NaN();
-        size_t controlIndex = std::numeric_limits<size_t>::max();
-        bool manual = false;
-    };
-
     struct BranchLinkMarker {
         uint64_t linkedFiberId = 0;
         cv::Vec3f localControlPoint{std::numeric_limits<float>::quiet_NaN(),
@@ -178,9 +165,6 @@ struct GeneratedOverlay {
         cv::Vec3f localDirection{std::numeric_limits<float>::quiet_NaN(),
                                  std::numeric_limits<float>::quiet_NaN(),
                                  std::numeric_limits<float>::quiet_NaN()};
-        cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN()};
         cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN(),
                              std::numeric_limits<float>::quiet_NaN()};
@@ -232,7 +216,6 @@ struct GeneratedOverlay {
     int seedLineIndex = -1;
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
-    std::vector<PredSnapMarker> predSnapPoints;
     std::vector<BranchLinkMarker> branchLinks;
     std::vector<FiberIntersectionMarker> fiberIntersections;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
@@ -240,7 +223,6 @@ struct GeneratedOverlay {
         GeneratedCurrentLineMarkerState::Neutral;
     bool emphasizedPointMarker = false;
     bool useSurfaceCenterLine = false;
-    bool currentLineMarkerAsCross = false;
     // Present for strip overlays. Line positions above remain in original
     // LineModel point-index coordinates and are mapped only while projecting.
     vc::lasagna::LineStripPositionMap stripPositionMap;
@@ -286,29 +268,11 @@ struct GeneratedSpanAlignmentMetric {
     bool damaged = false;
 };
 
-// Positions cross from the stored fiber grid to the viewer grid together;
-// directions and line indices are independent of that uniform scale.
-inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
-                                          double localScale, double linkedScale)
-{
-    marker.localControlPoint *= static_cast<float>(localScale);
-    marker.linkedControlPoint *= static_cast<float>(linkedScale);
-    marker.planePoint *= static_cast<float>(linkedScale);
-}
-
-inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,
-                                          double scale)
-{
-    marker.controlPoint *= static_cast<float>(scale);
-    marker.snapPoint *= static_cast<float>(scale);
-}
-
 struct GeneratedViews {
     // Revision of the line these views were built from; 0 when unknown.
     uint64_t lineRevision = 0;
     double fiberWidth = 0.0; // Display-volume voxels, not persisted units.
     double fiberWidthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
-    double fiberBaseToVolumeScale = 1.0;
     bool hasManualDisplayNormals = false;
     std::vector<double> controlAngleOffsetsDegrees;
     std::string lineSurfaceName;
@@ -349,7 +313,6 @@ struct GeneratedViews {
     bool initialFitWholeLine = false;
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
-    std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks;
     std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
@@ -615,12 +578,9 @@ inline constexpr double kGeneratedSideCutHalfWrapAngle = 3.14159265358979323846;
 // the point to the center at that point's z (non-finite when unknown). A point
 // without a usable direction gets NaN and does not break the chain: the next
 // finite angle continues from the last finite one. No towardCenter: all NaN.
-// pointToCenterFrameScale maps all three query coordinates into the center
-// provider's grid (including z for a center that varies along the scroll).
 inline std::vector<double> unwrappedGeneratedWindingAngles(
     const std::vector<cv::Vec3f>& linePoints,
-    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter,
-    float pointToCenterFrameScale = 1.0f)
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& towardCenter)
 {
     constexpr double kTwoPi = 2.0 * kGeneratedSideCutHalfWrapAngle;
     std::vector<double> angles(linePoints.size(), std::numeric_limits<double>::quiet_NaN());
@@ -633,7 +593,7 @@ inline std::vector<double> unwrappedGeneratedWindingAngles(
         if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
             continue;
         }
-        const cv::Vec3f toCenter = towardCenter(point * pointToCenterFrameScale);
+        const cv::Vec3f toCenter = towardCenter(point);
         if (!std::isfinite(toCenter[0]) || !std::isfinite(toCenter[1])) {
             continue;
         }
@@ -1283,28 +1243,6 @@ inline std::optional<double> nextGeneratedControlPointLinePosition(
     return next;
 }
 
-inline std::optional<double> closestGeneratedControlPointLinePosition(
-    double currentLinePosition,
-    const std::vector<double>& controlLinePositions)
-{
-    if (!std::isfinite(currentLinePosition)) {
-        return std::nullopt;
-    }
-    std::optional<double> closest;
-    double closestDistance = std::numeric_limits<double>::infinity();
-    for (const double position : controlLinePositions) {
-        if (!std::isfinite(position)) {
-            continue;
-        }
-        const double distance = std::abs(position - currentLinePosition);
-        if (distance < closestDistance) {
-            closest = position;
-            closestDistance = distance;
-        }
-    }
-    return closest;
-}
-
 inline constexpr double kGeneratedParallaxGhostMinimumOpacity = 0.3;
 inline constexpr double kGeneratedParallaxGhostMaximumOpacity = 0.85;
 // Fraction of the visibility distance over which a ghost fades out at the far
@@ -1846,7 +1784,6 @@ inline GeneratedOverlay makeGeneratedStripOverlay(
     overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
     overlay.currentLineMarkerState = generatedBlockedLineMarkerState(
         views.controlPoints, overlay.gapLineRanges, currentLinePosition);
-    overlay.predSnapPoints = views.predSnapPoints;
     overlay.markerLinePositions = markerLinePositions;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
@@ -1863,7 +1800,6 @@ inline GeneratedOverlay makeGeneratedStaticStripOverlay(const GeneratedViews& vi
     overlay.controlPoints = views.controlPoints;
     overlay.gapLineRanges = generatedGapLineRanges(views.controlPoints);
     overlay.damagedLineRanges = generatedDamagedLineRanges(views.controlPoints);
-    overlay.predSnapPoints = views.predSnapPoints;
     overlay.stripPositionMap = views.stripPositionMap;
     return overlay;
 }
@@ -1933,12 +1869,6 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
         const float distance = pointDistance(control.point);
         if (std::isfinite(distance) && std::abs(distance) <= *controlDistanceThreshold) {
             overlay.controlPoints.push_back(control);
-            for (const auto& predSnap : views.predSnapPoints) {
-                if (predSnap.controlIndex == controlIndexValue &&
-                    finiteGeneratedPoint(predSnap.snapPoint)) {
-                    overlay.predSnapPoints.push_back(predSnap);
-                }
-            }
         }
     }
 
@@ -3430,5 +3360,33 @@ void clearGeneratedStripContextHover(CChunkedVolumeViewer* viewer,
                                      const std::string& surfaceName);
 GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     const GeneratedControlPointContextMenuOptions& options);
+
+// One pane, as the stale-view refresh sees it.
+struct GeneratedViewsPaneState {
+    bool hasSession = false;
+    // Sessions that suppress ordinary generated views (intersection sides)
+    // are rebuilt through the inspection, never through the pane walk.
+    bool suppressesGeneratedViews = false;
+    // Nothing materialized means nothing stale on screen — and the builder
+    // rejects an empty model, which during initial tracing turned a successful
+    // attach into a modal complaint about views the user never asked for.
+    bool hasGeneratedSurfaces = false;
+    bool hasLinePoints = false;
+    // The controller's orientation epoch when the views were built.
+    int orientationEpoch = -1;
+};
+
+// Whether the refresh pass rebuilds this pane's generated views.
+inline bool paneNeedsOrientationRefresh(const GeneratedViewsPaneState& pane,
+                                        int currentEpoch)
+{
+    if (!pane.hasSession || pane.suppressesGeneratedViews) {
+        return false;
+    }
+    if (!pane.hasGeneratedSurfaces || !pane.hasLinePoints) {
+        return false;
+    }
+    return pane.orientationEpoch != currentEpoch;
+}
 
 } // namespace vc3d::line_annotation

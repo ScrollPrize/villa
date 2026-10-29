@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -30,8 +31,8 @@
 #include "vc/core/util/HttpFetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/RemoteFileCache.hpp"
+#include "vc/core/util/RemoteMetadataCache.hpp"
 #include "vc/core/util/RemoteCacheSettings.hpp"
-#include "vc/core/util/PostProcess.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
@@ -102,7 +103,21 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
     };
 
     const auto loadUrl = [&](const std::string& url) -> std::optional<utils::Json> {
-        const auto body = vc::httpGetString(url, auth);
+        auto& cache = vc::core::util::remoteMetadataCache();
+        std::string body;
+        if (const auto answer = cache.lookup(url)) {
+            if (*answer)
+                body.assign(reinterpret_cast<const char*>((*answer)->data()), (*answer)->size());
+        } else {
+            body = vc::httpGetString(url, auth);
+            if (vc::core::util::RemoteMetadataCache::cacheable(url)) {
+                std::vector<std::byte> bytes(body.size());
+                std::memcpy(bytes.data(), body.data(), body.size());
+                cache.record(url, body.empty()
+                    ? vc::core::util::RemoteMetadataCache::Answer{}
+                    : vc::core::util::RemoteMetadataCache::Answer{std::move(bytes)});
+            }
+        }
         if (body.empty()) {
             return std::nullopt;
         }
@@ -157,9 +172,9 @@ std::string deriveLocalVolumeId(const std::filesystem::path& path)
     return out.str();
 }
 
-std::string deriveRebasedRemoteVolumeId(const std::string& descriptiveId,
-                                        const std::string& sourceUrl,
-                                        int baseScaleLevel)
+std::string deriveRebasedRemoteCacheId(const std::string& descriptiveId,
+                                       const std::string& sourceUrl,
+                                       int baseScaleLevel)
 {
     const std::string identity = sourceUrl + "#vc-base-scale=" +
                                  std::to_string(baseScaleLevel);
@@ -438,35 +453,6 @@ std::array<int, 3> xyzToZyx(const std::array<int, 3>& xyz)
     return {xyz[2], xyz[1], xyz[0]};
 }
 
-utils::ZarrDtype zarrDtypeFromChunkDtype(vc::render::ChunkDtype dtype)
-{
-    switch (dtype) {
-    case vc::render::ChunkDtype::UInt8:
-        return utils::ZarrDtype::uint8;
-    case vc::render::ChunkDtype::UInt16:
-        return utils::ZarrDtype::uint16;
-    }
-    throw std::runtime_error("unsupported Volume zarr dtype");
-}
-
-vc::render::ChunkDtype chunkDtypeFromZarr(utils::ZarrDtype dtype)
-{
-    if (dtype == utils::ZarrDtype::uint8)
-        return vc::render::ChunkDtype::UInt8;
-    if (dtype == utils::ZarrDtype::uint16)
-        return vc::render::ChunkDtype::UInt16;
-    throw std::runtime_error("Volume zarr writes only support uint8 and uint16");
-}
-
-template <typename T>
-vc::render::ChunkDtype chunkDtypeFor()
-{
-    if constexpr (std::is_same_v<T, uint8_t>)
-        return vc::render::ChunkDtype::UInt8;
-    else
-        return vc::render::ChunkDtype::UInt16;
-}
-
 template <typename T>
 T typedFillValue(double fill)
 {
@@ -476,92 +462,12 @@ T typedFillValue(double fill)
         return static_cast<uint16_t>(std::clamp(fill, 0.0, 65535.0));
 }
 
-utils::ZarrArray::Codec zarrCodecFor(const std::string& compressor, int level)
-{
-    if (compressor.empty() || compressor == "none")
-        return {};
-#if UTILS_HAS_COMPRESSION
-    return utils::make_zarr_codec(compressor, level);
-#else
-    throw std::runtime_error("zarr compression support is unavailable for compressor: " + compressor);
-#endif
-}
-
-utils::ZarrArray::CodecRegistry zarrCodecRegistry()
-{
-    utils::ZarrArray::CodecRegistry registry;
-#if UTILS_HAS_COMPRESSION
-    for (const char* name : {"blosc", "zstd", "gzip", "zlib", "lz4"}) {
-        try {
-            registry.emplace(name, utils::make_zarr_codec(name));
-        } catch (...) {
-        }
-    }
-#endif
-    return registry;
-}
-
-utils::ZarrArray openLocalZarrArrayForWrite(const std::filesystem::path& path)
-{
-    auto registry = zarrCodecRegistry();
-    if (!registry.empty())
-        return utils::ZarrArray::open(path, std::move(registry));
-
-    auto array = utils::ZarrArray::open(path);
-    const auto& meta = array.metadata();
-    if (!meta.compressor_id.empty() || !meta.codecs.empty())
-        throw std::runtime_error("cannot write compressed zarr without compression codec support: " + path.string());
-    return array;
-}
-
-// Read-side opener: uses the same codec registry that backs the chunked
-// read cache (ZarrChunkFetcher / VcDataset), so it works in builds where
-// `compression.hpp` is unavailable and `zarrCodecRegistry()` is empty.
+// Opens with the codec registry that backs the chunked read cache
+// (ZarrChunkFetcher / VcDataset).
 utils::ZarrArray openLocalZarrArrayForRead(const std::filesystem::path& path,
                                            int dtypeSize)
 {
     return utils::ZarrArray::open(path, vc::buildZarrCodecRegistry(dtypeSize));
-}
-
-std::vector<size_t> toVector(const std::array<size_t, 3>& value)
-{
-    return {value[0], value[1], value[2]};
-}
-
-void validatePyramidPolicy(const Volume::PyramidPolicy& policy)
-{
-    for (double scale : policy.downsampleZYX) {
-        if (!std::isfinite(scale) || scale < 1.0) {
-            throw std::runtime_error("Volume pyramid downsample values must be finite and >= 1.0");
-        }
-    }
-}
-
-size_t downsampledDim(size_t dim, double scale)
-{
-    if (scale <= 1.0)
-        return dim;
-    return std::max<size_t>(1, static_cast<size_t>(std::ceil(static_cast<double>(dim) / scale)));
-}
-
-std::array<size_t, 3> downsampledShape(const std::array<size_t, 3>& shape,
-                                       const Volume::PyramidPolicy& policy)
-{
-    return {
-        downsampledDim(shape[0], policy.downsampleZYX[0]),
-        downsampledDim(shape[1], policy.downsampleZYX[1]),
-        downsampledDim(shape[2], policy.downsampleZYX[2]),
-    };
-}
-
-std::array<size_t, 3> clampChunkShape(const std::array<size_t, 3>& chunkShape,
-                                      const std::array<size_t, 3>& shape)
-{
-    return {
-        std::max<size_t>(1, std::min(chunkShape[0], shape[0])),
-        std::max<size_t>(1, std::min(chunkShape[1], shape[1])),
-        std::max<size_t>(1, std::min(chunkShape[2], shape[2])),
-    };
 }
 
 template <typename T>
@@ -569,83 +475,6 @@ void fillRawChunk(std::vector<std::byte>& chunkBytes, T fill)
 {
     auto* typed = reinterpret_cast<T*>(chunkBytes.data());
     std::fill(typed, typed + chunkBytes.size() / sizeof(T), fill);
-}
-
-template <typename T>
-void readZarrRegionZYX(utils::ZarrArray& array,
-                       Array3D<T>& out,
-                       const std::array<size_t, 3>& offsetZYX)
-{
-    const auto& meta = array.metadata();
-    if (chunkDtypeFromZarr(meta.dtype) != chunkDtypeFor<T>())
-        throw std::runtime_error("Volume::read/write dtype does not match zarr dtype");
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3)
-        throw std::runtime_error("Volume zarr region I/O requires 3D arrays");
-
-    const auto outShape = out.shape();
-    if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0)
-        return;
-
-    const T fill = typedFillValue<T>(meta.fill_value.value_or(0.0));
-    out.fill(fill);
-
-    std::array<size_t, 3> shape{meta.shape[0], meta.shape[1], meta.shape[2]};
-    std::array<size_t, 3> chunks{meta.chunks[0], meta.chunks[1], meta.chunks[2]};
-    for (size_t d = 0; d < 3; ++d) {
-        if (offsetZYX[d] >= shape[d])
-            return;
-    }
-
-    const std::array<size_t, 3> endZYX{
-        std::min(shape[0], offsetZYX[0] + outShape[0]),
-        std::min(shape[1], offsetZYX[1] + outShape[1]),
-        std::min(shape[2], offsetZYX[2] + outShape[2]),
-    };
-    if (offsetZYX[0] >= endZYX[0] || offsetZYX[1] >= endZYX[1] || offsetZYX[2] >= endZYX[2])
-        return;
-
-    const size_t chunkBytes = chunks[0] * chunks[1] * chunks[2] * sizeof(T);
-    const size_t chunkStrideY = chunks[2];
-    const size_t chunkStrideZ = chunks[1] * chunkStrideY;
-
-    for (size_t cz = offsetZYX[0] / chunks[0]; cz <= (endZYX[0] - 1) / chunks[0]; ++cz) {
-        const size_t chunkBaseZ = cz * chunks[0];
-        for (size_t cy = offsetZYX[1] / chunks[1]; cy <= (endZYX[1] - 1) / chunks[1]; ++cy) {
-            const size_t chunkBaseY = cy * chunks[1];
-            for (size_t cx = offsetZYX[2] / chunks[2]; cx <= (endZYX[2] - 1) / chunks[2]; ++cx) {
-                const size_t chunkBaseX = cx * chunks[2];
-                const std::array<size_t, 3> indices{cz, cy, cx};
-                auto bytes = array.read_chunk(indices);
-                const T* src = nullptr;
-                if (bytes && bytes->size() >= chunkBytes)
-                    src = reinterpret_cast<const T*>(bytes->data());
-
-                const size_t z0 = std::max(chunkBaseZ, offsetZYX[0]);
-                const size_t y0 = std::max(chunkBaseY, offsetZYX[1]);
-                const size_t x0 = std::max(chunkBaseX, offsetZYX[2]);
-                const size_t z1 = std::min(chunkBaseZ + chunks[0], endZYX[0]);
-                const size_t y1 = std::min(chunkBaseY + chunks[1], endZYX[1]);
-                const size_t x1 = std::min(chunkBaseX + chunks[2], endZYX[2]);
-
-                for (size_t z = z0; z < z1; ++z) {
-                    for (size_t y = y0; y < y1; ++y) {
-                        for (size_t x = x0; x < x1; ++x) {
-                            const size_t dstZ = z - offsetZYX[0];
-                            const size_t dstY = y - offsetZYX[1];
-                            const size_t dstX = x - offsetZYX[2];
-                            if (src) {
-                                const size_t srcOff =
-                                    (z - chunkBaseZ) * chunkStrideZ +
-                                    (y - chunkBaseY) * chunkStrideY +
-                                    (x - chunkBaseX);
-                                out(dstZ, dstY, dstX) = src[srcOff];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 size_t zarrDtypeSize(const utils::ZarrArray& array)
@@ -672,298 +501,6 @@ std::vector<std::byte> filledChunkBytes(const utils::ZarrArray& array)
     return out;
 }
 
-bool chunkMatchesFill(const utils::ZarrArray& array, std::span<const std::byte> data)
-{
-    const auto fill = filledChunkBytes(array);
-    return data.size() == fill.size() &&
-           std::equal(data.begin(), data.end(), fill.begin());
-}
-
-template <typename T>
-void writeZarrRegionZYX(utils::ZarrArray& array,
-                        const Array3D<T>& data,
-                        const std::array<size_t, 3>& offsetZYX)
-{
-    const auto& meta = array.metadata();
-    if (chunkDtypeFromZarr(meta.dtype) != chunkDtypeFor<T>())
-        throw std::runtime_error("Volume::write dtype does not match zarr dtype");
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3)
-        throw std::runtime_error("Volume zarr writes require 3D arrays");
-
-    const auto regionShape = data.shape();
-    if (regionShape[0] == 0 || regionShape[1] == 0 || regionShape[2] == 0)
-        return;
-
-    std::array<size_t, 3> shape{meta.shape[0], meta.shape[1], meta.shape[2]};
-    std::array<size_t, 3> chunks{meta.chunks[0], meta.chunks[1], meta.chunks[2]};
-    for (size_t d = 0; d < 3; ++d) {
-        if (offsetZYX[d] > shape[d] || regionShape[d] > shape[d] - offsetZYX[d])
-            throw std::out_of_range("Volume::write region exceeds zarr bounds");
-        if (chunks[d] == 0)
-            throw std::runtime_error("Volume::write encountered invalid zarr chunk shape");
-    }
-
-    const T fill = typedFillValue<T>(meta.fill_value.value_or(0.0));
-    const size_t chunkElems = chunks[0] * chunks[1] * chunks[2];
-    const size_t chunkBytes = chunkElems * sizeof(T);
-    const size_t chunkStrideY = chunks[2];
-    const size_t chunkStrideZ = chunks[1] * chunkStrideY;
-    std::vector<std::byte> chunkBuf(chunkBytes);
-
-    const std::array<size_t, 3> endZYX{
-        offsetZYX[0] + regionShape[0],
-        offsetZYX[1] + regionShape[1],
-        offsetZYX[2] + regionShape[2],
-    };
-
-    for (size_t cz = offsetZYX[0] / chunks[0]; cz <= (endZYX[0] - 1) / chunks[0]; ++cz) {
-        const size_t chunkBaseZ = cz * chunks[0];
-        for (size_t cy = offsetZYX[1] / chunks[1]; cy <= (endZYX[1] - 1) / chunks[1]; ++cy) {
-            const size_t chunkBaseY = cy * chunks[1];
-            for (size_t cx = offsetZYX[2] / chunks[2]; cx <= (endZYX[2] - 1) / chunks[2]; ++cx) {
-                const size_t chunkBaseX = cx * chunks[2];
-                const std::array<size_t, 3> indices{cz, cy, cx};
-
-                const size_t z0 = std::max(chunkBaseZ, offsetZYX[0]);
-                const size_t y0 = std::max(chunkBaseY, offsetZYX[1]);
-                const size_t x0 = std::max(chunkBaseX, offsetZYX[2]);
-                const size_t z1 = std::min(chunkBaseZ + chunks[0], endZYX[0]);
-                const size_t y1 = std::min(chunkBaseY + chunks[1], endZYX[1]);
-                const size_t x1 = std::min(chunkBaseX + chunks[2], endZYX[2]);
-
-                const bool fullChunk =
-                    z0 == chunkBaseZ && y0 == chunkBaseY && x0 == chunkBaseX &&
-                    z1 == chunkBaseZ + chunks[0] &&
-                    y1 == chunkBaseY + chunks[1] &&
-                    x1 == chunkBaseX + chunks[2];
-
-                if (!fullChunk) {
-                    auto existing = array.read_chunk(indices);
-                    if (existing && existing->size() >= chunkBytes) {
-                        std::memcpy(chunkBuf.data(), existing->data(), chunkBytes);
-                    } else {
-                        fillRawChunk(chunkBuf, fill);
-                    }
-                } else {
-                    fillRawChunk(chunkBuf, fill);
-                }
-
-                auto* dst = reinterpret_cast<T*>(chunkBuf.data());
-                for (size_t z = z0; z < z1; ++z) {
-                    for (size_t y = y0; y < y1; ++y) {
-                        for (size_t x = x0; x < x1; ++x) {
-                            const size_t srcZ = z - offsetZYX[0];
-                            const size_t srcY = y - offsetZYX[1];
-                            const size_t srcX = x - offsetZYX[2];
-                            const size_t dstOff =
-                                (z - chunkBaseZ) * chunkStrideZ +
-                                (y - chunkBaseY) * chunkStrideY +
-                                (x - chunkBaseX);
-                            dst[dstOff] = data(srcZ, srcY, srcX);
-                        }
-                    }
-                }
-
-                array.write_chunk(indices, std::span<const std::byte>(chunkBuf.data(), chunkBuf.size()));
-            }
-        }
-    }
-}
-
-template <typename T>
-void downsampleZYX(Array3D<T>& out,
-                   const Array3D<T>& src,
-                   const std::array<size_t, 3>& srcOffsetZYX,
-                   const std::array<size_t, 3>& srcVolumeShapeZYX,
-                   const std::array<double, 3>& scaleZYX,
-                   Volume::PyramidPolicy::Reduction reduction)
-{
-    const auto outShape = out.shape();
-    const auto srcShape = src.shape();
-
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (std::int64_t z = 0; z < static_cast<std::int64_t>(outShape[0]); ++z) {
-        for (std::int64_t y = 0; y < static_cast<std::int64_t>(outShape[1]); ++y) {
-            for (std::size_t x = 0; x < outShape[2]; ++x) {
-                const std::array<size_t, 3> dstAbs{
-                    static_cast<size_t>(z),
-                    static_cast<size_t>(y),
-                    x,
-                };
-                std::array<size_t, 3> srcBegin{};
-                std::array<size_t, 3> srcEnd{};
-                for (size_t d = 0; d < 3; ++d) {
-                    const double begin = static_cast<double>(dstAbs[d]) * scaleZYX[d];
-                    const double end = static_cast<double>(dstAbs[d] + 1) * scaleZYX[d];
-                    srcBegin[d] = std::min(srcVolumeShapeZYX[d],
-                                           static_cast<size_t>(std::floor(begin)));
-                    srcEnd[d] = std::min(srcVolumeShapeZYX[d],
-                                         static_cast<size_t>(std::ceil(end)));
-                    if (srcEnd[d] <= srcBegin[d] && srcBegin[d] < srcVolumeShapeZYX[d])
-                        srcEnd[d] = srcBegin[d] + 1;
-                }
-
-                std::uint64_t sum = 0;
-                std::uint64_t count = 0;
-                T maxValue = T{};
-                for (size_t szAbs = srcBegin[0]; szAbs < srcEnd[0]; ++szAbs) {
-                    const size_t sz = szAbs - srcOffsetZYX[0];
-                    if (sz >= srcShape[0])
-                        continue;
-                    for (size_t syAbs = srcBegin[1]; syAbs < srcEnd[1]; ++syAbs) {
-                        const size_t sy = syAbs - srcOffsetZYX[1];
-                        if (sy >= srcShape[1])
-                            continue;
-                        for (size_t sxAbs = srcBegin[2]; sxAbs < srcEnd[2]; ++sxAbs) {
-                            const size_t sx = sxAbs - srcOffsetZYX[2];
-                            if (sx >= srcShape[2])
-                                continue;
-                            const T value = src(sz, sy, sx);
-                            sum += value;
-                            maxValue = std::max(maxValue, value);
-                            ++count;
-                        }
-                    }
-                }
-                T result = T{};
-                if (count != 0) {
-                    switch (reduction) {
-                    case Volume::PyramidPolicy::Reduction::Mean:
-                        result = static_cast<T>((sum + count / 2) / count);
-                        break;
-                    case Volume::PyramidPolicy::Reduction::Max:
-                        result = maxValue;
-                        break;
-                    case Volume::PyramidPolicy::Reduction::BinaryOr:
-                        result = maxValue == T{} ? T{} : T{1};
-                        break;
-                    }
-                }
-                out(static_cast<size_t>(z), static_cast<size_t>(y), x) = result;
-            }
-        }
-    }
-}
-
-void writeTextFile(const std::filesystem::path& path, const std::string& text)
-{
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::binary);
-    if (!out)
-        throw std::runtime_error("failed to open for write: " + path.string());
-    out << text;
-    if (!out)
-        throw std::runtime_error("failed to write: " + path.string());
-}
-
-void createLocalOmeZarr(const std::filesystem::path& path,
-                        const Volume::ZarrCreateOptions& options)
-{
-    if (options.shapeZYX[0] == 0 || options.shapeZYX[1] == 0 || options.shapeZYX[2] == 0)
-        throw std::runtime_error("Volume::New zarr creation requires a non-empty shapeZYX");
-    if (options.numLevels == 0)
-        throw std::runtime_error("Volume::New zarr creation requires at least one level");
-    validatePyramidPolicy(options.pyramid);
-
-    if (options.overwriteExisting) {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-        if (ec)
-            throw std::runtime_error("failed to remove existing zarr path: " + path.string());
-    }
-
-    std::filesystem::create_directories(path);
-    writeTextFile(path / ".zgroup", R"({"zarr_format": 2})" "\n");
-
-    const auto dtype = zarrDtypeFromChunkDtype(options.dtype);
-    std::array<size_t, 3> levelShape = options.shapeZYX;
-    for (size_t level = 0; level < options.numLevels; ++level) {
-        utils::ZarrMetadata meta;
-        meta.version = utils::ZarrVersion::v2;
-        meta.shape = toVector(levelShape);
-        meta.chunks = toVector(clampChunkShape(options.chunkShapeZYX, levelShape));
-        meta.dtype = dtype;
-        meta.fill_value = options.fillValue;
-        meta.dimension_separator = ".";
-        if (!options.compressor.empty() && options.compressor != "none") {
-            meta.compressor_id = options.compressor;
-            meta.compression_level = options.compressionLevel;
-        }
-        utils::ZarrArray::create(path / std::to_string(level),
-                                 std::move(meta),
-                                 zarrCodecFor(options.compressor, options.compressionLevel));
-        levelShape = downsampledShape(levelShape, options.pyramid);
-    }
-
-    const auto baseName = path.filename().string();
-    const std::string uuid = options.uuid.empty() ? baseName : options.uuid;
-    const std::string name = options.name.empty() ? baseName : options.name;
-
-    utils::Json metadata;
-    metadata["type"] = "vol";
-    metadata["uuid"] = uuid;
-    metadata["name"] = name;
-    metadata["format"] = "zarr";
-    metadata["width"] = static_cast<int>(options.shapeZYX[2]);
-    metadata["height"] = static_cast<int>(options.shapeZYX[1]);
-    metadata["slices"] = static_cast<int>(options.shapeZYX[0]);
-    metadata["voxelsize"] = options.voxelSize;
-    metadata["min"] = 0.0;
-    metadata["max"] = options.dtype == vc::render::ChunkDtype::UInt8 ? 255.0 : 65535.0;
-    writeTextFile(path / METADATA_FILE, metadata.dump(2) + "\n");
-
-    utils::Json attrs;
-    attrs["note_axes_order"] = "ZYX (slice, row, col)";
-    utils::Json multiscale;
-    multiscale["version"] = "0.4";
-    multiscale["name"] = name;
-    utils::Json axes = utils::Json::array();
-    for (const char* axisName : {"z", "y", "x"}) {
-        utils::Json axis{{"name", axisName}, {"type", "space"}};
-        if (!options.voxelUnit.empty())
-            axis["unit"] = options.voxelUnit;
-        axes.push_back(std::move(axis));
-    }
-    multiscale["axes"] = std::move(axes);
-    multiscale["datasets"] = utils::Json::array();
-    for (size_t level = 0; level < options.numLevels; ++level) {
-        double scaleZ = options.voxelSize;
-        double scaleY = options.voxelSize;
-        double scaleX = options.voxelSize;
-        for (size_t i = 0; i < level; ++i) {
-            scaleZ *= options.pyramid.downsampleZYX[0];
-            scaleY *= options.pyramid.downsampleZYX[1];
-            scaleX *= options.pyramid.downsampleZYX[2];
-        }
-        utils::Json scaleValues = utils::Json::array();
-        scaleValues.push_back(scaleZ);
-        scaleValues.push_back(scaleY);
-        scaleValues.push_back(scaleX);
-        utils::Json transforms = utils::Json::array();
-        transforms.push_back(utils::Json{{"type", "scale"}, {"scale", std::move(scaleValues)}});
-        multiscale["datasets"].push_back(utils::Json{
-            {"path", std::to_string(level)},
-            {"coordinateTransformations", std::move(transforms)}
-        });
-    }
-    const char* downsamplingMethod = "mean";
-    switch (options.pyramid.reduction) {
-    case Volume::PyramidPolicy::Reduction::Mean:
-        downsamplingMethod = "mean";
-        break;
-    case Volume::PyramidPolicy::Reduction::Max:
-        downsamplingMethod = "max";
-        break;
-    case Volume::PyramidPolicy::Reduction::BinaryOr:
-        downsamplingMethod = "binary_or";
-        break;
-    }
-    multiscale["metadata"] = utils::Json{{"downsampling_method", downsamplingMethod}};
-    attrs["multiscales"] = utils::Json::array();
-    attrs["multiscales"].push_back(std::move(multiscale));
-    writeTextFile(path / ".zattrs", attrs.dump(2) + "\n");
-}
-
 std::filesystem::path zarrArrayPathForLevel(const std::filesystem::path& root, int level)
 {
     const auto levelPath = root / std::to_string(level);
@@ -977,34 +514,6 @@ std::filesystem::path zarrArrayPathForLevel(const std::filesystem::path& root, i
         return root;
     }
     return levelPath;
-}
-
-bool hasAnyLocalZarrArray(const std::filesystem::path& path)
-{
-    if (std::filesystem::exists(path / ".zarray") ||
-        std::filesystem::exists(path / "zarr.json")) {
-        return true;
-    }
-    if (!std::filesystem::is_directory(path))
-        return false;
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-        if (!entry.is_directory())
-            continue;
-        if (std::filesystem::exists(entry.path() / ".zarray") ||
-            std::filesystem::exists(entry.path() / "zarr.json")) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Volume::PyramidPolicy::Reduction reductionFromMethod(const std::string& method)
-{
-    if (method == "max")
-        return Volume::PyramidPolicy::Reduction::Max;
-    if (method == "binary_or" || method == "or" || method == "nearest")
-        return Volume::PyramidPolicy::Reduction::BinaryOr;
-    return Volume::PyramidPolicy::Reduction::Mean;
 }
 
 } // namespace
@@ -1086,57 +595,6 @@ utils::Json Volume::rootAttributes() const
     return utils::Json::parse_file(attrsPath);
 }
 
-void Volume::writeRootAttributes(const utils::Json& attrs)
-{
-    if (isRemote())
-        throw std::runtime_error("Volume::writeRootAttributes is only supported for local zarr volumes");
-    if (!attrs.is_object())
-        throw std::runtime_error("Volume::writeRootAttributes requires a JSON object");
-    writeTextFile(path_ / ".zattrs", attrs.dump(2) + "\n");
-}
-
-void Volume::updateRootAttributes(const utils::Json& attrs)
-{
-    if (!attrs.is_object())
-        throw std::runtime_error("Volume::updateRootAttributes requires a JSON object");
-    auto merged = rootAttributes();
-    merged.update(attrs);
-    writeRootAttributes(merged);
-}
-
-void Volume::writeMetadata(const utils::Json& metadata)
-{
-    if (isRemote())
-        throw std::runtime_error("Volume::writeMetadata is only supported for local zarr volumes");
-    if (!metadata.is_object())
-        throw std::runtime_error("Volume::writeMetadata requires a JSON object");
-    writeTextFile(path_ / METADATA_FILE, metadata.dump(2) + "\n");
-    metadata_ = metadata;
-    if (metadata_.contains("width") && metadata_["width"].is_number())
-        _width = metadata_["width"].get_int();
-    if (metadata_.contains("height") && metadata_["height"].is_number())
-        _height = metadata_["height"].get_int();
-    if (metadata_.contains("slices") && metadata_["slices"].is_number())
-        _slices = metadata_["slices"].get_int();
-}
-
-void Volume::updateMetadata(const utils::Json& metadata)
-{
-    if (!metadata.is_object())
-        throw std::runtime_error("Volume::updateMetadata requires a JSON object");
-    auto merged = metadata_;
-    merged.update(metadata);
-    writeMetadata(merged);
-}
-
-bool Volume::checkDir(const std::filesystem::path& path)
-{
-    return std::filesystem::is_directory(path) &&
-           (std::filesystem::exists(path / METADATA_FILE) ||
-            std::filesystem::exists(path / METADATA_FILE_ALT) ||
-            hasAnyLocalZarrArray(path));
-}
-
 static int ceilDivPow2(int v, int level)
 {
     const int64_t denom = int64_t{1} << level;
@@ -1163,23 +621,6 @@ void Volume::zarrOpen()
     zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
     zarrDtype_ = opened.dtype;
     zarrFillValue_ = opened.fillValue;
-
-    try {
-        const auto attrs = rootAttributes();
-        if (attrs.contains("multiscales") && attrs["multiscales"].is_array() &&
-            attrs["multiscales"].size() > 0) {
-            const auto ms = attrs["multiscales"][0];
-            if (ms.contains("metadata") && ms["metadata"].is_object()) {
-                const auto meta = ms["metadata"];
-                if (meta.contains("downsampling_method") &&
-                    meta["downsampling_method"].is_string()) {
-                    pyramidReduction_ = reductionFromMethod(
-                        meta["downsampling_method"].get_string());
-                }
-            }
-        }
-    } catch (...) {
-    }
 
     if (metadataAutoGenerated_) {
         bool hasReference = false;
@@ -1285,17 +726,6 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
     return volume;
 }
 
-std::shared_ptr<Volume> Volume::New(std::filesystem::path path,
-                                    const ZarrCreateOptions& options)
-{
-    if (options.overwriteExisting || !hasAnyLocalZarrArray(path)) {
-        createLocalOmeZarr(path, options);
-    }
-    auto volume = std::make_shared<Volume>(std::move(path));
-    volume->pyramidReduction_ = options.pyramid.reduction;
-    return volume;
-}
-
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const vc::HttpAuth& authIn,
@@ -1378,10 +808,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     // Preserve the historical source cache name before project metadata can
     // replace the annotation UUID (for example, with an open-data catalog ID).
     // Upstream metadata UUIDs still name their existing caches; otherwise the
-    // name remains URL-derived. Rebased views keep their own cache namespace.
+    // name remains URL-derived. A working level keeps its own cache namespace
+    // (its chunk levels are renumbered), but not its own volume ID.
     vol->remoteCacheId_ = vol->id();
     if (spec.baseScaleLevel > 0) {
-        vol->remoteCacheId_ = deriveRebasedRemoteVolumeId(
+        vol->remoteCacheId_ = deriveRebasedRemoteCacheId(
             vol->remoteCacheId_, remoteUrl, spec.baseScaleLevel);
     }
 
@@ -1414,118 +845,9 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
                 "rebased remote volume requires a positive logical voxel-size override "
                 "or trustworthy native voxel size metadata");
         }
-
-        std::string descriptiveId = id;
-        if (vol->metadata_.contains("uuid") && vol->metadata_["uuid"].is_string() &&
-            !vol->metadata_["uuid"].get_string().empty()) {
-            descriptiveId = vol->metadata_["uuid"].get_string();
-        }
-        vol->metadata_["uuid"] = deriveRebasedRemoteVolumeId(
-            descriptiveId, remoteUrl, spec.baseScaleLevel);
     }
 
     return vol;
-}
-
-std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata)
-{
-    if (!sourceFactory)
-        throw std::invalid_argument("prepared 3D volume source factory is required");
-    auto opened = sourceFactory();
-    if (opened.fetchers.empty() || opened.shapes.empty() || opened.fetchers.size() != opened.shapes.size() ||
-        opened.chunkShapes.size() != opened.shapes.size() ||
-        opened.storageChunkShapes.size() != opened.shapes.size()) {
-        throw std::invalid_argument("prepared 3D volume source is incomplete");
-    }
-    if (opened.transforms.size() != opened.shapes.size()) {
-        opened.transforms.resize(opened.shapes.size());
-        for (std::size_t level = 0; level < opened.transforms.size(); ++level) {
-            const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << level);
-            opened.transforms[level].scaleFromLevel0 = {invScale, invScale, invScale};
-        }
-    }
-    int firstPresentLevel = -1;
-    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
-        const auto& shape = opened.shapes[level];
-        const auto& chunks = opened.chunkShapes[level];
-        const bool missingLevel = shape[0] == 0 && shape[1] == 0 && shape[2] == 0;
-        if (chunks[0] <= 0 || chunks[1] <= 0 || chunks[2] <= 0) {
-            throw std::invalid_argument("prepared 3D volume source has an invalid chunk shape");
-        }
-        if (missingLevel) {
-            if (opened.fetchers[level])
-                throw std::invalid_argument("prepared 3D volume source has a fetcher for a missing level");
-            continue;
-        }
-        if (!opened.fetchers[level] || shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0) {
-            throw std::invalid_argument("prepared 3D volume source has an invalid level");
-        }
-        if (firstPresentLevel < 0)
-            firstPresentLevel = static_cast<int>(level);
-    }
-    if (firstPresentLevel < 0)
-        throw std::invalid_argument("prepared 3D volume source has no present levels");
-    if (!metadata.is_object() || !metadata.contains("uuid") || !metadata["uuid"].is_string() || metadata["uuid"].get_string().empty()) {
-        throw std::invalid_argument("prepared 3D volume metadata requires a uuid");
-    }
-
-    auto volume = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
-    volume->metadata_ = metadata;
-    volume->metadata_["type"] = "vol";
-    volume->metadata_["format"] = "zarr";
-    const auto& first = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
-    const auto metadataPositiveInt = [&](const char* key) -> std::optional<int> {
-        if (!volume->metadata_.contains(key) || !volume->metadata_[key].is_number())
-            return std::nullopt;
-        const int value = volume->metadata_[key].get_int();
-        if (value <= 0)
-            return std::nullopt;
-        return value;
-    };
-    const auto metadataSlices = metadataPositiveInt("slices");
-    const auto metadataHeight = metadataPositiveInt("height");
-    const auto metadataWidth = metadataPositiveInt("width");
-    if (metadataSlices && metadataHeight && metadataWidth) {
-        volume->_slices = *metadataSlices;
-        volume->_height = *metadataHeight;
-        volume->_width = *metadataWidth;
-    } else {
-        const size_t scale = size_t{1} << firstPresentLevel;
-        volume->_slices = static_cast<int>(static_cast<size_t>(first[0]) * scale);
-        volume->_height = static_cast<int>(static_cast<size_t>(first[1]) * scale);
-        volume->_width = static_cast<int>(static_cast<size_t>(first[2]) * scale);
-    }
-    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
-        const auto& shape = opened.shapes[level];
-        if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
-            continue;
-        }
-        const auto& storageChunkShape = opened.storageChunkShapes[level];
-        const int levelInt = static_cast<int>(level);
-        const int expectedSlices = ceilDivPow2(volume->_slices, levelInt);
-        const int expectedHeight = ceilDivPow2(volume->_height, levelInt);
-        const int expectedWidth = ceilDivPow2(volume->_width, levelInt);
-        if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
-            !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
-            !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
-            throw std::runtime_error(
-                "prepared zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
-                + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
-                + ") does not match expected downscaled metadata dimensions (slices=" + std::to_string(expectedSlices)
-                + ", height=" + std::to_string(expectedHeight) + ", width=" + std::to_string(expectedWidth) + ")");
-        }
-    }
-    volume->metadata_["slices"] = volume->_slices;
-    volume->metadata_["height"] = volume->_height;
-    volume->metadata_["width"] = volume->_width;
-    volume->zarrLevelShapes_ = opened.shapes;
-    volume->zarrLevelChunkShapes_ = opened.chunkShapes;
-    volume->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
-    volume->zarrDtype_ = opened.dtype;
-    volume->zarrFillValue_ = opened.fillValue;
-    volume->remoteNumScales_ = opened.shapes.size();
-    volume->preparedSourceFactory_ = std::move(sourceFactory);
-    return volume;
 }
 
 std::filesystem::path Volume::remotePersistentCachePath() const
@@ -1699,9 +1021,7 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
     }
 
     vc::render::OpenedChunkedZarr opened;
-    if (preparedSourceFactory_) {
-        opened = preparedSourceFactory_();
-    } else if (isRemote_) {
+    if (isRemote_) {
         opened = baseScaleLevel_ > 0
             ? vc::render::openHttpZarrPyramid(
                   remoteUrl_, remoteAuth_, baseScaleLevel_)
@@ -1740,10 +1060,6 @@ std::string Volume::chunkCacheSourceIdentity() const
         }
         return identity;
     }
-    if (preparedSourceFactory_) {
-        return "prepared|" + id() + "|instance=" +
-               std::to_string(reinterpret_cast<std::uintptr_t>(this));
-    }
     std::error_code ec;
     auto sourcePath = std::filesystem::weakly_canonical(path_, ec);
     if (ec)
@@ -1769,14 +1085,6 @@ void Volume::invalidateCache()
 // ============================================================================
 // Sampling API
 // ============================================================================
-
-// Helper: apply optional post-processing from SampleParams in-place.
-static void applyOptionalPostProcess(cv::Mat_<uint8_t>& img,
-                                     const vc::SampleParams& params)
-{
-    if (!params.postProcess) return;
-    vc::applyPostProcess(img, *params.postProcess);
-}
 
 // Helper: scale level-0 coords to pyramid level coords.
 static const cv::Mat_<cv::Vec3f>& scaleCoords(const cv::Mat_<cv::Vec3f>& coords, int level)
@@ -1808,7 +1116,6 @@ void Volume::sample(cv::Mat_<uint8_t>& out,
     out.create(coords.size());
     const auto& scaled = scaleCoords(coords, params.level);
     readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
-    applyOptionalPostProcess(out, params);
 }
 
 void Volume::sample(cv::Mat_<uint16_t>& out,
@@ -1926,140 +1233,6 @@ bool Volume::readXYZ(Array3D<uint16_t>& out,
     return readZYX(out, xyzToZyx(offsetXYZ), level, missingPolicy);
 }
 
-template <typename T>
-static void writeVolumeZYX(Volume& volume,
-                           const Array3D<T>& data,
-                           const std::array<int, 3>& offsetZYX,
-                           int level)
-{
-    if (volume.isRemote())
-        throw std::runtime_error("Volume::write is only supported for local zarr volumes");
-    if (level < 0)
-        throw std::out_of_range("Volume::write level must be non-negative");
-    if (!volume.hasScaleLevel(level))
-        throw std::out_of_range("Volume::write requested missing zarr scale level " + std::to_string(level));
-    if (volume.dtype() != chunkDtypeFor<T>())
-        throw std::runtime_error("Volume::write dtype does not match volume dtype");
-
-    std::array<size_t, 3> writeOffset{};
-    for (size_t d = 0; d < 3; ++d) {
-        if (offsetZYX[d] < 0)
-            throw std::out_of_range("Volume::write offset must be non-negative");
-        writeOffset[d] = static_cast<size_t>(offsetZYX[d]);
-    }
-
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), level));
-    writeZarrRegionZYX(array, data, writeOffset);
-
-    std::array<size_t, 3> affectedOffset = writeOffset;
-    std::array<size_t, 3> affectedShape = data.shape();
-    for (int dstLevel = level + 1;
-         dstLevel < static_cast<int>(volume.numScales()) && volume.hasScaleLevel(dstLevel);
-         ++dstLevel) {
-        const int srcLevel = dstLevel - 1;
-        auto srcArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), srcLevel));
-        auto dstArray = openLocalZarrArrayForWrite(zarrArrayPathForLevel(volume.path(), dstLevel));
-        const auto srcVolumeShapeInt = volume.shape(srcLevel);
-        const auto dstVolumeShapeInt = volume.shape(dstLevel);
-        std::array<size_t, 3> srcVolumeShape{
-            static_cast<size_t>(srcVolumeShapeInt[0]),
-            static_cast<size_t>(srcVolumeShapeInt[1]),
-            static_cast<size_t>(srcVolumeShapeInt[2]),
-        };
-        std::array<size_t, 3> dstVolumeShape{
-            static_cast<size_t>(dstVolumeShapeInt[0]),
-            static_cast<size_t>(dstVolumeShapeInt[1]),
-            static_cast<size_t>(dstVolumeShapeInt[2]),
-        };
-        std::array<double, 3> scaleZYX{};
-        for (size_t d = 0; d < 3; ++d) {
-            scaleZYX[d] = static_cast<double>(srcVolumeShape[d]) /
-                          static_cast<double>(std::max<size_t>(1, dstVolumeShape[d]));
-            if (scaleZYX[d] < 1.0)
-                scaleZYX[d] = 1.0;
-        }
-
-        std::array<size_t, 3> dstOffset{};
-        std::array<size_t, 3> dstEnd{};
-        std::array<size_t, 3> dstShape{};
-        for (size_t d = 0; d < 3; ++d) {
-            const size_t srcEnd = affectedOffset[d] + affectedShape[d];
-            dstOffset[d] = std::min(
-                dstVolumeShape[d],
-                static_cast<size_t>(std::floor(static_cast<double>(affectedOffset[d]) / scaleZYX[d])));
-            dstEnd[d] = std::min(
-                dstVolumeShape[d],
-                static_cast<size_t>(std::ceil(static_cast<double>(srcEnd) / scaleZYX[d])));
-            dstShape[d] = dstEnd[d] > dstOffset[d] ? dstEnd[d] - dstOffset[d] : 0;
-        }
-        if (dstShape[0] == 0 || dstShape[1] == 0 || dstShape[2] == 0)
-            break;
-
-        std::array<size_t, 3> srcReadOffset{
-            std::min(srcVolumeShape[0], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[0]) * scaleZYX[0]))),
-            std::min(srcVolumeShape[1], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[1]) * scaleZYX[1]))),
-            std::min(srcVolumeShape[2], static_cast<size_t>(std::floor(static_cast<double>(dstOffset[2]) * scaleZYX[2]))),
-        };
-        std::array<size_t, 3> srcReadEnd{
-            std::min(srcVolumeShape[0], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[0]) * scaleZYX[0]))),
-            std::min(srcVolumeShape[1], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[1]) * scaleZYX[1]))),
-            std::min(srcVolumeShape[2], static_cast<size_t>(std::ceil(static_cast<double>(dstEnd[2]) * scaleZYX[2]))),
-        };
-        std::array<size_t, 3> srcReadShape{
-            srcReadEnd[0] > srcReadOffset[0] ? srcReadEnd[0] - srcReadOffset[0] : 0,
-            srcReadEnd[1] > srcReadOffset[1] ? srcReadEnd[1] - srcReadOffset[1] : 0,
-            srcReadEnd[2] > srcReadOffset[2] ? srcReadEnd[2] - srcReadOffset[2] : 0,
-        };
-        if (srcReadShape[0] == 0 || srcReadShape[1] == 0 || srcReadShape[2] == 0)
-            break;
-
-        Array3D<T> source(srcReadShape);
-        readZarrRegionZYX(srcArray, source, srcReadOffset);
-
-        Array3D<T> downsampled(dstShape);
-        downsampleZYX(downsampled,
-                      source,
-                      srcReadOffset,
-                      srcVolumeShape,
-                      scaleZYX,
-                      volume.pyramidReduction());
-        writeZarrRegionZYX(dstArray, downsampled, dstOffset);
-
-        affectedOffset = dstOffset;
-        affectedShape = dstShape;
-    }
-
-    volume.invalidateCache();
-}
-
-void Volume::writeZYX(const Array3D<uint8_t>& data,
-                      const std::array<int, 3>& offsetZYX,
-                      int level)
-{
-    writeVolumeZYX(*this, data, offsetZYX, level);
-}
-
-void Volume::writeZYX(const Array3D<uint16_t>& data,
-                      const std::array<int, 3>& offsetZYX,
-                      int level)
-{
-    writeVolumeZYX(*this, data, offsetZYX, level);
-}
-
-void Volume::writeXYZ(const Array3D<uint8_t>& data,
-                      const std::array<int, 3>& offsetXYZ,
-                      int level)
-{
-    writeZYX(data, xyzToZyx(offsetXYZ), level);
-}
-
-void Volume::writeXYZ(const Array3D<uint16_t>& data,
-                      const std::array<int, 3>& offsetXYZ,
-                      int level)
-{
-    writeZYX(data, xyzToZyx(offsetXYZ), level);
-}
-
 std::shared_ptr<utils::ZarrArray>
 Volume::cachedZarrArrayForRead(int level) const
 {
@@ -2142,66 +1315,3 @@ bool Volume::chunkExists(
     return arrayPtr->chunk_exists(chunkZYX);
 }
 
-void Volume::writeChunk(int level,
-                        const std::array<size_t, 3>& chunkZYX,
-                        std::span<const std::byte> data)
-{
-    writeChunk(level, chunkZYX, data, ChunkWriteOptions{});
-}
-
-void Volume::writeChunk(int level,
-                        const std::array<size_t, 3>& chunkZYX,
-                        std::span<const std::byte> data,
-                        ChunkWriteOptions options)
-{
-    if (isRemote())
-        throw std::runtime_error("Volume::writeChunk is only supported for local zarr volumes");
-    if (level < 0)
-        throw std::out_of_range("Volume::writeChunk level must be non-negative");
-    if (!hasScaleLevel(level))
-        throw std::out_of_range("Volume::writeChunk requested missing zarr scale level " + std::to_string(level));
-
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
-    const size_t expectedBytes = array.metadata().sub_chunk_byte_size();
-    if (data.size() != expectedBytes) {
-        throw std::runtime_error("Volume::writeChunk byte count does not match zarr chunk byte size");
-    }
-
-    if (!options.writeEmptyChunks && chunkMatchesFill(array, data)) {
-        removeChunk(level, chunkZYX);
-        return;
-    }
-
-    // write_chunk encodes with the array's codecs and, for a sharded array,
-    // stores the result as an inner chunk of its shard (either index location).
-    array.write_chunk(chunkZYX, data);
-    invalidateCache();
-}
-
-bool Volume::removeChunk(int level,
-                         const std::array<size_t, 3>& chunkZYX)
-{
-    if (isRemote())
-        throw std::runtime_error("Volume::removeChunk is only supported for local zarr volumes");
-    if (level < 0)
-        throw std::out_of_range("Volume::removeChunk level must be non-negative");
-    if (!hasScaleLevel(level))
-        throw std::out_of_range("Volume::removeChunk requested missing zarr scale level " + std::to_string(level));
-
-    auto array = openLocalZarrArrayForWrite(zarrArrayPathForLevel(path(), level));
-    if (array.is_sharded()) {
-        const bool existed = array.inner_chunk_exists(chunkZYX);
-        array.mark_inner_chunk_empty(chunkZYX);
-        invalidateCache();
-        return existed;
-    }
-
-    const auto chunkPath = array.chunk_path(chunkZYX);
-    std::error_code ec;
-    const bool removed = std::filesystem::remove(chunkPath, ec);
-    if (ec)
-        throw std::runtime_error("failed removing zarr chunk: " + chunkPath.string());
-    if (removed)
-        invalidateCache();
-    return removed;
-}

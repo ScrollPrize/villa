@@ -31,14 +31,10 @@ public:
     // and saves it. Invalid entries (no path) are dropped.
     void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
 
-    // Group accessor (for expand/collapse state persistence by coordinator)
-    CollapsibleSettingsGroup* directionFieldGroup() const { return _groupDirectionField; }
-
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled);
 
 signals:
-    void directionFieldConfigsChanged();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);

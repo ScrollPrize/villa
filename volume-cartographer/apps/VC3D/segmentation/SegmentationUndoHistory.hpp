@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
 #include <deque>
 #include <optional>
 #include <utility>
@@ -54,8 +53,8 @@ void trimOldest(Stack& stack, const UndoLimits& limits, BytesOf bytesOf)
 // Undo and redo stacks for segmentation edits.
 //
 // An entry holds the grid state that an edit, an undo or a redo replaced:
-// either the changed vertices (deltas) or a full copy of the grid (legacy
-// snapshots). The two stacks together are held to UndoLimits, because a
+// either the changed vertices (deltas) or a full copy of the grid
+// (snapshots). The two stacks together are held to UndoLimits, because a
 // snapshot costs as much as the whole surface while a delta costs a few bytes
 // per vertex. The newest entry is always kept, so the last edit, undo or redo
 // can always be reversed.
@@ -64,10 +63,8 @@ class UndoHistory
 public:
     struct Entry
     {
-        cv::Mat_<cv::Vec3f> points;        // Full snapshot (legacy, memory intensive)
+        cv::Mat_<cv::Vec3f> points;        // Full snapshot (memory intensive)
         std::vector<VertexDelta> deltas;   // Delta-based (memory efficient)
-        // Approval mask undo entry painted by the same edit (0 = none).
-        std::uint64_t autoApprovalId{0};
 
         [[nodiscard]] bool isDelta() const { return !deltas.empty(); }
         [[nodiscard]] bool isEmpty() const { return deltas.empty() && points.empty(); }
@@ -83,7 +80,7 @@ public:
     {
     }
 
-    // Capture full surface state (legacy method - memory intensive). Like any
+    // Capture full surface state (memory intensive). Like any
     // new edit, this drops everything that could be redone.
     bool capture(const cv::Mat_<cv::Vec3f>& points)
     {
@@ -134,14 +131,6 @@ public:
             _redo.push_back(std::move(entry));
         }
         _redoDroppedByCapture.clear();
-    }
-
-    // Link the approval mask entry painted by the edit just captured.
-    void setLastAutoApprovalId(std::uint64_t id)
-    {
-        if (!_undo.empty()) {
-            _undo.back().autoApprovalId = id;
-        }
     }
 
     // Remove and return the entry an undo or a redo should apply.
@@ -197,8 +186,7 @@ public:
 
     // The entry that reverses applying entry to grid, read before applying
     // it: the current positions of its vertices inside grid, or a copy of grid
-    // for a snapshot. The auto-approval id is not copied; the caller links it
-    // once the paired approval step has succeeded.
+    // for a snapshot.
     [[nodiscard]] static Entry inverseFor(const cv::Mat_<cv::Vec3f>& grid, const Entry& entry)
     {
         Entry inverse;
@@ -229,13 +217,11 @@ public:
     // address. Takes the next entry and reads the entry that reverses it from
     // grid (inverseFor) before apply(entry, inverse) writes the entry into
     // grid. apply returns whether it applied; an entry that does not apply is
-    // dropped, so it cannot block the steps behind it. When it applied and
-    // has a paired auto-approval, stepApproval(id) steps that too and says
-    // whether it could; only then is the reverse entry linked to it. The
-    // reverse entry goes on the opposite stack, so the step can be reversed.
-    // Returns whether a step was applied.
-    template <typename Apply, typename StepApproval>
-    bool step(bool redo, const cv::Mat_<cv::Vec3f>& grid, Apply&& apply, StepApproval&& stepApproval)
+    // dropped, so it cannot block the steps behind it. The reverse entry goes
+    // on the opposite stack, so the step can be reversed. Returns whether a
+    // step was applied.
+    template <typename Apply>
+    bool step(bool redo, const cv::Mat_<cv::Vec3f>& grid, Apply&& apply)
     {
         auto entry = redo ? takeRedo() : takeUndo();
         if (!entry) {
@@ -244,9 +230,6 @@ public:
         Entry inverse = inverseFor(grid, *entry);
         if (!apply(static_cast<const Entry&>(*entry), static_cast<const Entry&>(inverse))) {
             return false;
-        }
-        if (entry->autoApprovalId != 0 && stepApproval(entry->autoApprovalId)) {
-            inverse.autoApprovalId = entry->autoApprovalId;
         }
         pushReplaced(redo, std::move(inverse));
         return true;

@@ -131,10 +131,8 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalNumber(QStringLiteral("intersectionOpacity")),
                 Params::optionalNumber(QStringLiteral("intersectionThickness")),
                 Params::optionalNumber(QStringLiteral("overlayOpacity")),
-                Params::optionalInteger(QStringLiteral("intersectionMaxSurfaces")),
                 Params::optionalBoolean(QStringLiteral("planeIntersectionLinesVisible")),
                 Params::optionalBoolean(QStringLiteral("showSurfaceNormals")),
-                Params::optionalBoolean(QStringLiteral("showDirectionHints")),
                 Params::optionalBoolean(QStringLiteral("surfaceOverlayEnabled")),
                 Params::optionalArray(
                     QStringLiteral("highlightedSurfaceIds"),
@@ -143,7 +141,6 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalNumber(QStringLiteral("normalArrowLengthScale")),
                 Params::optionalInteger(QStringLiteral("normalMaxArrows")),
                 Params::optionalBoolean(QStringLiteral("segmentationCursorMirroring")),
-                Params::optionalInteger(QStringLiteral("samplingStride")),
                 Params::optionalNumber(QStringLiteral("zScrollSensitivity")),
                 Params::optionalBoolean(QStringLiteral("axisOverlays")),
                 Params::optionalBoolean(QStringLiteral("coordinateFrames")),

@@ -75,25 +75,7 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segments.attach"),
-            .params = {
-                Params::requiredString(QStringLiteral("location")),
-                Params::optionalArray(
-                    QStringLiteral("tags"),
-                    AgentBridgeParamType::String),
-                Params::optionalBoolean(QStringLiteral("select"), true),
-            },
-            .errors = {-32602, -32000, -32004, -32007, -32005, -32010},
-            .mcp = mcp(QStringLiteral("vc3d_attach_segments")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentsAttach(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("segments.list"),
-            .params = {
-                Params::optionalBoolean(QStringLiteral("onlyLoaded"), false),
-            },
             .errors = {-32602, -32000},
             .mcp = mcp(QStringLiteral("vc3d_list_segments"), true),
         },
@@ -106,39 +88,9 @@ void AgentBridgeServer::registerSessionHandlers()
                 Params::requiredString(QStringLiteral("segmentId")),
             },
             .errors = {-32602, -32000, -32010, -32004, -32007, -32005},
-            .mcp = mcp(
-                QStringLiteral("vc3d_activate_segment"),
-                true,
-                {QStringLiteral("auto_fetch")}),
+            .mcp = mcp(QStringLiteral("vc3d_activate_segment"), true),
         },
         [this](const QJsonValue& p) { return handleSegmentsActivate(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segments.fetch"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-            },
-            .errors = {-32602, -32000, -32010, -32004, -32007},
-            .mcp = mcp(
-                QStringLiteral("vc3d_fetch_segment"),
-                true,
-                {QStringLiteral("wait")}),
-        },
-        [this](const QJsonValue& p) { return handleSegmentsFetch(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segments.create_editable_copy"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-            },
-            .errors = {-32602, -32000, -32004, -32005, -32007, -32009, -32010},
-            .mcp = mcp(QStringLiteral("vc3d_create_editable_segment_copy"), true),
-        },
-        [this](const QJsonValue& p) {
-            return handleSegmentsCreateEditableCopy(p);
-        });
 
     registerMethod(
         {
@@ -168,7 +120,6 @@ void AgentBridgeServer::registerSessionHandlers()
         {
             .name = QStringLiteral("segments.review"),
             .params = {
-                Params::optionalBoolean(QStringLiteral("onlyLoaded"), false),
                 reviewFilter(),
             },
             .errors = {-32602, -32000},
@@ -234,9 +185,11 @@ void AgentBridgeServer::registerSessionHandlers()
                     QStringLiteral("tags"),
                     AgentBridgeParamType::String),
                 Params::optionalBoolean(QStringLiteral("overwrite"), false),
+                Params::optionalString(QStringLiteral("store")),
+                Params::optionalString(QStringLiteral("newStore")),
             },
             .errors = {-32602, -32007, -32005, -32010},
-            .mcp = mcp(QStringLiteral("vc3d_create_project")),
+            .mcp = mcp(QStringLiteral("vc3d_create_project"), true),
         },
         [this](const QJsonValue& p) { return handleProjectCreate(p); });
 

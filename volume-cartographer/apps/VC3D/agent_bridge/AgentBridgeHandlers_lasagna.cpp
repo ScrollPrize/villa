@@ -1,6 +1,7 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeUi.hpp"
+#include "ProjectWorkspace.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
@@ -41,7 +42,7 @@
 #include "OpenDataLasagna.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -57,7 +58,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -186,10 +186,8 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
         mode = SegmentationLasagnaPanel::ReOptimize;
     else if (modeStr == QLatin1String("new_model"))
         mode = SegmentationLasagnaPanel::NewModel;
-    else if (modeStr == QLatin1String("offset"))
-        mode = SegmentationLasagnaPanel::Offset;
     else
-        mode = SegmentationLasagnaPanel::Atlas;
+        mode = SegmentationLasagnaPanel::Offset;
 
     requireSourceIdle(QStringLiteral("lasagna"));
 
@@ -202,8 +200,6 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
     }
 
     const QString configPath = p.value("configPath").toString();
-    const QString atlasPath = p.value("atlasPath").toString();
-    const QString initShellDir = p.value("initShellDir").toString();
     std::optional<cv::Vec3i> seed;
     if (p.contains("seed")) {
         const cv::Vec3f v = jsonToVec3(p.value("seed"), "seed");
@@ -212,17 +208,13 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
 
     QString errorMessage;
     const bool started = panel->startOptimizationHeadless(
-        state, mode, configPath, seed, atlasPath, initShellDir, &errorMessage);
+        state, mode, configPath, seed, &errorMessage);
     if (!started) {
         QJsonObject data;
         data["detail"] = errorMessage;
         if (errorMessage.contains(QLatin1String("config"), Qt::CaseInsensitive)) {
             data["kind"] = "config";
             throw AgentBridgeError{-32007, "Lasagna config not found", data};
-        }
-        if (errorMessage.contains(QLatin1String("atlas"), Qt::CaseInsensitive)) {
-            data["kind"] = "atlas";
-            throw AgentBridgeError{-32007, "No atlas selected", data};
         }
         throw AgentBridgeError{-32005, "Lasagna optimization failed to start", data};
     }
@@ -321,29 +313,29 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleLasagnaSelectOutputSegment(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    const QString name = p.value("name").toString();
-    if (name.isEmpty()) {
+    const QString segmentId = p.value("segmentId").toString();
+    if (segmentId.isEmpty()) {
         QJsonObject data;
-        data["param"] = "name";
-        throw AgentBridgeError{-32602, "name is required", data};
+        data["param"] = "segmentId";
+        throw AgentBridgeError{-32602, "segmentId is required", data};
     }
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
     SurfacePanelController* panel = _window->_surfacePanel.get();
-    if (!panel || !panel->selectSurfaceById(name.toStdString())) {
+    if (!panel || !panel->selectSurfaceById(segmentId.toStdString())) {
         QJsonObject data;
         data["kind"] = "segment";
-        data["id"] = name;
+        data["id"] = segmentId;
         throw AgentBridgeError{-32007,
-                               QStringLiteral("Unknown or unselectable segment: %1").arg(name),
+                               QStringLiteral("Unknown or unselectable segment: %1").arg(segmentId),
                                data};
     }
 
     QJsonObject result;
     result["selected"] = true;
-    result["name"] = name;
+    result["segmentId"] = segmentId;
     return result;
 }
 
@@ -400,6 +392,16 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
     const QString id = canonicalWorkspaceId(p.value("name").toString());
+
+    // The Project tab also shows that no project is open.
+    if (id == QLatin1String("project")) {
+        const QString previous = currentWorkspaceId();
+        if (_window && _window->_workspaceTabs && _window->_projectWorkspace)
+            _window->_workspaceTabs->setCurrentWidget(_window->_projectWorkspace);
+        return QJsonObject{{"workspace", id},
+                           {"previous", previous.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                                           : QJsonValue(previous)}};
+    }
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())

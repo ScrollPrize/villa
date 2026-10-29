@@ -70,8 +70,7 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
             .name = QStringLiteral("segment.export_obj"),
             .params = {
                 Params::requiredString(QStringLiteral("segmentId")),
-                Params::optionalString(QStringLiteral("outputPath")),
-                Params::optionalBoolean(QStringLiteral("overwrite"), false),
+                Params::optionalString(QStringLiteral("objName")),
                 Params::optionalBoolean(QStringLiteral("normalizeUv"), false),
                 Params::optionalBoolean(QStringLiteral("alignGrid"), false),
                 boundedInteger(QStringLiteral("ompThreads"), 1),
@@ -114,7 +113,7 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
                     QStringLiteral("direction"),
                     {QStringLiteral("out"), QStringLiteral("in")}),
                 Params::optionalString(QStringLiteral("volumeId")),
-                Params::optionalString(QStringLiteral("outputDir")),
+                Params::optionalString(QStringLiteral("outputTag")),
                 boundedInteger(QStringLiteral("neighborMaxDistance"), 1, 500),
                 boundedInteger(QStringLiteral("neighborMinClearance"), 1, 100),
                 Params::optionalBoolean(QStringLiteral("neighborFill")),
@@ -125,8 +124,8 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
                 boundedInteger(QStringLiteral("resumeLocalOptRadius"), 1, 2048),
                 boundedInteger(QStringLiteral("resumeLocalMaxIters"), 1, 10000),
                 Params::optionalBoolean(QStringLiteral("resumeLocalDenseQr")),
-                boundedInteger(QStringLiteral("pass2OmpThreads"), 1, 256),
-                Params::optionalObject(QStringLiteral("pass2ParamOverrides"), {}),
+                boundedInteger(QStringLiteral("refineOmpThreads"), 1, 256),
+                Params::optionalObject(QStringLiteral("refineParamOverrides"), {}),
             },
             .errors = {
                 -32602, -32000, -32004, -32005, -32006, -32007, -32009,
@@ -148,6 +147,7 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
                     QString(),
                     Params::nullable(Params::optionalString(QString())))),
             Params::optionalString(QStringLiteral("refSegmentId")),
+            Params::optionalString(QStringLiteral("outputTag")),
             boundedInteger(QStringLiteral("stripCols"), 0, 1024),
         };
         appendRansacParams(params);
@@ -190,36 +190,4 @@ void AgentBridgeServer::registerSegmentOpsHandlers()
             },
             [this](const QJsonValue& p) { return handleSegmentsPatch(p); });
     }
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segment.restore_backup"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-                [] {
-                    AgentBridgeParam index =
-                        Params::requiredInteger(QStringLiteral("index"));
-                    index.minimum = 0;
-                    index.maximum = 9;
-                    return index;
-                }(),
-                Params::optionalBoolean(QStringLiteral("confirm"), false),
-            },
-            .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_restore_segment_backup")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentRestoreBackup(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("segments.move_to_paths"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-                Params::optionalBoolean(QStringLiteral("replaceExisting"), false),
-                Params::optionalBoolean(QStringLiteral("confirm"), false),
-            },
-            .errors = {-32602, -32000, -32004, -32005, -32007, -32009},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_move_segment_to_paths")),
-        },
-        [this](const QJsonValue& p) { return handleSegmentsMoveToPaths(p); });
 }

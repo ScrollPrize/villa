@@ -21,11 +21,11 @@ namespace vc::object_links {
 
 // Detector identities recorded in edge meta ("detector.name"). A
 // detector may replace only its own still-pending edges on re-runs.
-inline constexpr const char* kPatchOverlapDetector = "patch-overlap";
-inline constexpr const char* kFiberPatchDetector = "fiber-patch";
+inline constexpr const char* kSurfaceOverlapDetector = "surface-overlap";
+inline constexpr const char* kFiberSurfaceDetector = "fiber-surface";
 inline constexpr const char* kTrackTrackDetector = "track-track";
-inline constexpr const char* kTrackPatchDetector = "track-patch";
-inline constexpr const char* kPointCollectionPatchDetector = "point-collection-patch";
+inline constexpr const char* kTrackSurfaceDetector = "track-surface";
+inline constexpr const char* kPointCollectionSurfaceDetector = "point-collection-surface";
 
 // One proposed connection. `kind` is the edge kind metadata to store
 // (detectors default it to "same-surface"); `score` and `meta` are
@@ -89,36 +89,36 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
                                 const objects::util::ProgressCallback& progress = {});
 
 // --- Detectors ---
-struct PointCollectionPatchParams {
-    std::vector<std::string> collectionUuids, patchUuids;
+struct PointCollectionSurfaceParams {
+    std::vector<std::string> collectionUuids, surfaceUuids;
     double tolerance = 2.5;       // working voxels, matching fit_spiral's default
     double pointScale = 1.0;      // source XYZ -> working XYZ
-    double patchScale = 1.0;
+    double surfaceScale = 1.0;
     int windowPoints = 1;         // even values use the next odd centered window
     int windowMinPoints = 1;      // clipped at collection ends
     // Override the ingestion-time role stored in object metadata.
     std::optional<bool> absoluteWinding;
-    std::string edgeKind = "point-patch";
+    std::string edgeKind = "point-surface";
     bool replaceStalePending = true;
     objects::util::ProgressCallback progress;
 };
 
-// Stored point collections -> stored patches. Anchors retain point IDs and
+// Stored point collections -> stored surfaces. Anchors retain point IDs and
 // source XYZ. General collections prefer largest valid-quad area, then distance;
-// between_patches__A__B collections prefer the nearest within that named pair.
-DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
-    const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
+// between_surfaces__A__B collections prefer the nearest within that named pair.
+DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+    const PointCollectionSurfaceParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
-// Patch overlap distances are in working voxels unless noted.
-struct PatchOverlapParams {
-    std::vector<std::string> patchUuids;
+// Surface overlap distances are in working voxels unless noted.
+struct SurfaceOverlapParams {
+    std::vector<std::string> surfaceUuids;
     int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
     // 3D distance within which two surface points are the same sheet.
     // Used for correspondence search and (with uvInlierTolerance) the
     // dense 3D agreement radius.
     double tolerance = 2.0;
-    // Spacing (voxels) between sampled grid points per patch.
+    // Spacing (voxels) between sampled grid points per surface.
     double sampleSpacing = 4.0;
     // One correspondence is kept per seed-UV cell of this size.
     double thinningSpacing = 2.0;
@@ -136,7 +136,7 @@ struct PatchOverlapParams {
     // tolerance + uvInlierTolerance under the fitted pose.
     double minAgreementRatio = 0.6;
     // Minimum of the two one-sided overlap fractions (share of each
-    // patch's samples agreeing with the other). 0 disables.
+    // surface's samples agreeing with the other). 0 disables.
     double minOverlapFraction = 0.0;
     double ransacConfidence = 0.999;
     std::size_t ransacMaxHypotheses = 512;
@@ -144,25 +144,25 @@ struct PatchOverlapParams {
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
-// Stored patches on the same sheet, using 3D correspondences, robust UV fitting
+// Stored surfaces on the same sheet, using 3D correspondences, robust UV fitting
 // and dense overlap agreement. Accepted pairs become pending edges.
-DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
-    const PatchOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
+DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
+    const SurfaceOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
-// Fiber/track-to-patch strips have stripRowsEachSide rows at stripSpacing
+// Fiber/track-to-surface strips have stripRowsEachSide rows at stripSpacing
 // on each side of the centerline. Distances are in working voxels.
-struct LinePatchParams {
-    std::vector<std::string> patchUuids;
+struct LineSurfaceParams {
+    std::vector<std::string> surfaceUuids;
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.
     // All detector distances are working voxels. Working XYZ multiplied by
     // workingToBaseScale / ctToBaseScale addresses selected CT voxels.
     // ctToBaseScale includes the selected level; no extra pyramid scaling.
-    double patchScale = 1.0;
+    double surfaceScale = 1.0;
     double workingToBaseScale = 1.0;
     double ctToBaseScale = 1.0;
     int ctLevel = 0;
-    // Discovery: dense line point -> patch surface distance.
+    // Discovery: dense line point -> surface distance.
     double proximity = 1.5;
     std::size_t minContacts = 2;
     // Normal-field ribbon around the line.
@@ -180,13 +180,13 @@ struct LinePatchParams {
     std::array<double, 4> stripWeights{1.0, 0.7, 0.4, 0.15};  // trust by row from centerline
     double stripGateRatio = 1.5;     // anchor: strip same > ratio * adjacent + margin
     double stripGateMargin = 0.0;
-    double stripMargin = 20.0;       // bbox margin for strip/patch queries
+    double stripMargin = 20.0;       // bbox margin for strip/surface queries
     int maxRounds = 8;
     std::string edgeKind = "same-surface";
     bool replaceStalePending = true;
 };
 // The shared rules apply to both fiber and track centerlines.
-struct FiberPatchParams : LinePatchParams {
+struct FiberSurfaceParams : LineSurfaceParams {
     std::vector<std::string> fiberUuids;
     // Optional disposable strip cache; empty keeps all work in memory.
     std::filesystem::path cacheDirectory;
@@ -198,11 +198,11 @@ struct FiberPatchParams : LinePatchParams {
     bool rebuildStrips = false;
 };
 
-// Stored fibers -> stored patches. CT supplies the normal field.
+// Stored fibers -> stored surfaces. CT supplies the normal field.
 // Only line points between projected endpoint controls participate. Anchors use
 // raw line indices and source XYZ. Failed inputs are excluded from stale removal.
-DetectorReport linkFibersToPatches(objects::ObjectStore& db,
-    const std::filesystem::path& ctVolume, const FiberPatchParams& params = {},
+DetectorReport linkFibersToSurfaces(objects::ObjectStore& db,
+    const std::filesystem::path& ctVolume, const FiberSurfaceParams& params = {},
     const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
@@ -222,14 +222,14 @@ struct TrackTrackParams {
 DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackParams& params = {},
                                   const std::atomic_bool* cancel = nullptr);
 
-struct TrackPatchParams : LinePatchParams {
+struct TrackSurfaceParams : LineSurfaceParams {
     double trackScale = 1.0; // source track XYZ -> working XYZ
     std::vector<std::string> trackUuids; // optional existing graph-object subset
 };
-// Uses the same discovery, CT strip, contact gates and growth as fiber->patch.
-// Reads stored tracks and patches; anchors use raw indices and source XYZ.
-DetectorReport linkTracksToPatches(objects::ObjectStore& db,
-    const std::filesystem::path& ctVolume, const TrackPatchParams& params = {},
+// Uses the same discovery, CT strip, contact gates and growth as fiber->surface.
+// Reads stored tracks and surfaces; anchors use raw indices and source XYZ.
+DetectorReport linkTracksToSurfaces(objects::ObjectStore& db,
+    const std::filesystem::path& ctVolume, const TrackSurfaceParams& params = {},
     const std::atomic_bool* cancel = nullptr);
 
 }  // namespace vc::object_links

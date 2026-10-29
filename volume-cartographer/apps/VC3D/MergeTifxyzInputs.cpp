@@ -5,11 +5,6 @@
 #include <QSet>
 
 #include <algorithm>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <stdexcept>
-#include <string>
 
 namespace vc3d::merge_tifxyz {
 
@@ -17,7 +12,7 @@ namespace {
 
 QString tr(const char* text)
 {
-    return QCoreApplication::translate("MergeTifxyzDialog", text);
+    return QCoreApplication::translate("MergeSurfacesDialog", text);
 }
 
 QStringList flatten(const Grid& rows)
@@ -33,30 +28,14 @@ QStringList flatten(const Grid& rows)
 
 }  // namespace
 
-QString alphaFirst(const QStringList& names)
+QStringList distinctSurfaces(const Grid& rows)
 {
-    QString out;
-    for (const auto& n : names) {
+    QStringList unique;
+    for (const auto& n : flatten(rows)) {
         if (n.isEmpty()) continue;
-        if (out.isEmpty() || n < out) out = n;
+        if (!unique.contains(n)) unique << n;
     }
-    return out;
-}
-
-QString resolveOutputName(const QString& volpkgDir, const QString& base)
-{
-    if (volpkgDir.isEmpty() || base.isEmpty()) return base;
-    namespace fs = std::filesystem;
-    const fs::path paths = fs::path(volpkgDir.toStdString()) / "paths";
-    auto exists = [&](const std::string& name) {
-        return fs::exists(paths / name);
-    };
-    if (!exists(base.toStdString())) return base;
-    for (int v = 2; v < 1000; ++v) {
-        QString candidate = base + QStringLiteral("_v%1").arg(v);
-        if (!exists(candidate.toStdString())) return candidate;
-    }
-    return base + QStringLiteral("_v?");
+    return unique;
 }
 
 QString gridJsonText(const Grid& rows)
@@ -72,9 +51,8 @@ QString gridJsonText(const Grid& rows)
 
     // Whitespace-delimited string rows can't represent interior empty
     // cells -- the parser splits the row on whitespace and looks each
-    // token up as a directory under <paths_dir>, so a literal "" token
-    // would be searched for as the directory `""` and the run would
-    // fail. Switch to JSON array rows (with `null` for empty cells)
+    // token up as a surface, so a literal "" token would be searched for
+    // as the surface `""` and the run would fail. Switch to JSON array rows (with `null` for empty cells)
     // whenever the grid has any blank, which is the form gmResolveGrid
     // already handles. Solid grids keep the more compact string form.
     bool hasEmpty = false;
@@ -136,35 +114,29 @@ QString gridJsonText(const Grid& rows)
 }
 
 QString validate(const Grid& rows,
-                 const QStringList& availableSegments,
-                 const QString& pathsDir,
+                 const QStringList& availableSurfaces,
                  const QString& refSurface,
                  double ransacMinThresh,
                  double ransacMaxThresh)
 {
-    const QStringList names = flatten(rows);
-    QStringList unique;
-    for (const auto& n : names) {
-        if (n.isEmpty()) continue;
-        if (!unique.contains(n)) unique << n;
-    }
+    const QStringList unique = distinctSurfaces(rows);
     if (unique.size() < 2) {
         return tr("Merge requires at least 2 distinct surfaces in the grid; "
                   "currently %1.").arg(unique.size());
     }
-    const QSet<QString> avail(availableSegments.begin(), availableSegments.end());
+    const QSet<QString> avail(availableSurfaces.begin(), availableSurfaces.end());
     QStringList missing;
     for (const auto& n : unique) {
         if (!avail.contains(n)) missing << n;
     }
     if (!missing.isEmpty()) {
-        return tr("These names are not present under %1:\n  %2")
-            .arg(pathsDir, missing.join(QLatin1String(", ")));
+        return tr("These are not surfaces of the current volume:\n  %1")
+            .arg(missing.join(QLatin1String(", ")));
     }
     for (const auto& n : unique) {
         if (n.contains(QRegularExpression("\\s"))) {
-            return tr("Surface name '%1' contains whitespace; the merge.json "
-                      "format does not support that. Rename the surface first.")
+            return tr("Surface '%1' contains whitespace; the merge.json "
+                      "format does not support that.")
                 .arg(n);
         }
     }
@@ -175,32 +147,6 @@ QString validate(const Grid& rows,
         return tr("Reference '%1' is not in the grid.").arg(refSurface);
     }
     return {};
-}
-
-QString writeMergeJson(const QString& volpkgDir, const Grid& rows, QString* error)
-{
-    auto fail = [error](const QString& message) {
-        if (error) *error = message;
-        return QString();
-    };
-    if (volpkgDir.isEmpty()) {
-        return fail(tr("No volpkg directory available; cannot write merge.json."));
-    }
-    namespace fs = std::filesystem;
-    const QString stem = alphaFirst(flatten(rows)) + QStringLiteral("_merged");
-    const QString outName = resolveOutputName(volpkgDir, stem);
-    const fs::path mj = fs::path(volpkgDir.toStdString()) /
-                        (outName.toStdString() + ".merge.json");
-    try {
-        std::ofstream f(mj);
-        if (!f) throw std::runtime_error("ofstream failed to open " + mj.string());
-        const std::string s = gridJsonText(rows).toStdString();
-        f.write(s.data(), static_cast<std::streamsize>(s.size()));
-        if (!f) throw std::runtime_error("ofstream write failed for " + mj.string());
-    } catch (const std::exception& e) {
-        return fail(tr("Failed to write merge.json: %1").arg(QString::fromUtf8(e.what())));
-    }
-    return QString::fromStdString(mj.string());
 }
 
 }  // namespace vc3d::merge_tifxyz
