@@ -24,11 +24,14 @@ class Array;
 namespace vcr::grid {
 
 // rows x cols vertices of three floats (XYZ), row r starting at xyz + r * stride floats.
-// A vertex is missing when a coordinate is NaN or all three are -1.
+// A vertex is missing when a coordinate is NaN or all three are -1. With `normals`
+// (the same layout: a unit normal per vertex, in physical space), normals are those
+// interpolated over each patch instead of the patch's own.
 struct Vertices {
     const float* xyz = nullptr;
     int rows = 0, cols = 0;
     std::size_t stride = 0;
+    const float* normals = nullptr;
 };
 
 // A missing vertex never enters a position: in a cell with missing corners, the
@@ -51,10 +54,12 @@ struct SurfaceOptions {
     std::array<float, 3> spacing{1, 1, 1};
 };
 
-// A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx, row y0 + j * sy.
+// A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,
+// row y0 + i * ky + j * sy (kx, ky shear it; zero for a raster along the grid's axes).
 struct Raster {
     double x0 = 0, y0 = 0, sx = 1, sy = 1;
     int width = 0, height = 0;
+    double kx = 0, ky = 0;
 };
 
 // The vertices of a surface (a view, not a copy: they must outlive the Surface and
@@ -91,11 +96,13 @@ struct Plane {
 
 // One pyramid level of a volume: its array, how its stored elements read, and where
 // its indices sit: index[a] = scale[a] * p[2 - a] + offset[a] for an XYZ point p
-// (indices are ZYX).
+// (indices are ZYX). A level placed by a general affine (e.g. a rotated registration)
+// sets `linear` instead of scale: index[a] = sum_b linear[3a + b] * p[b] + offset[a].
 struct Level {
     Array* array = nullptr;
     ElementType type;
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
+    std::optional<std::array<double, 9>> linear;
 };
 
 struct Request {

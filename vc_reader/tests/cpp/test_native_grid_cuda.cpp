@@ -129,6 +129,27 @@ int main()
                     0.0f, "surface linear mean composite");
         }
 
+        // A sheared raster over the surface with vertex normals, sampled through a
+        // general (rotated) level map.
+        {
+            std::vector<float> normals(grid.size());
+            for (std::size_t k = 0; k < normals.size(); k += 3) {
+                normals[k] = 0.28f;
+                normals[k + 1] = -0.96f;
+                normals[k + 2] = 0.0f;
+            }
+            vcr::grid::Surface surface({grid.data(), rows, cols, std::size_t(cols) * 3, normals.data()});
+            const vcr::grid::Raster raster{2.1, 0.4, 0.11, 0.1, 200, 150, 0.03, -0.02};
+            vcr::grid::Request request;
+            request.levels = {{fine.get(), u8, {}, {3, -2, 1.5}, std::array<double, 9>{0.1, 0.2, 0.9, 0, 0.98, -0.2, 0.95, 0, -0.1}}};
+            request.offsets = {-1.5f, 0.0f, 2.0f};
+            for (const int order : {0, 1}) {
+                request.order = order;
+                compare(vcr::grid::sample(surface, raster, request), vcr::grid::cuda::sample(surface, raster, request, {&fineGpu}),
+                        0.0f, order ? "general map linear" : "general map nearest");
+            }
+        }
+
         // Level fallback: a fresh fine reader has nothing resident, the coarse level does.
         auto fresh = store(path / "fresh", 128, 64);
         vcr::reader_cuda::Reader freshGpu(*fresh, 64 << 20, 0);

@@ -210,55 +210,6 @@ class Geometry:
         self.owner._tiles.put(key, result, xyz.nbytes+valid.nbytes+normals.nbytes)
         return result
 
-    def sample(self, uv, offsets, destination, uv_origin=(0,0,0)):
-        """Interpolate a bounded UV block; outputs are XYZ in destination grid."""
-        import numpy as np
-        from . import _reader
-        coords, base = _transform(np.column_stack((uv, np.zeros(len(uv), np.float32))), self.from_uv, uv_origin)
-        coords[:, :2] += np.asarray(base[:2], np.float32)
-        finite = np.isfinite(coords[:, :2]).all(axis=1)
-        inside = finite & (coords[:, 0]>=0) & (coords[:, 1]>=0) & (coords[:, 0]<=self.shape[1]-1) & (coords[:, 1]<=self.shape[0]-1)
-        output = np.full((len(offsets), len(uv), 3), np.nan, np.float32)
-        output_base = None
-        support = np.zeros((len(offsets), len(uv)), bool)
-        if not inside.any():
-            return output, support, (0, 0, 0)
-        # Group queries by stored coordinate tile; halos supply complete quads.
-        keys = np.floor(coords[inside, :2]/32).astype(np.int64)
-        indices = np.flatnonzero(inside)
-        packed = keys[:, 1]*((self.shape[1]+31)//32)+keys[:, 0]
-        order = np.argsort(packed, kind='stable')
-        groups = np.split(order, np.flatnonzero(np.diff(packed[order]))+1)
-        spacing = self.surface.spacing_um
-        if spacing is None:
-            raise ValueError('surface reads require physical coordinate spacing')
-        for group in groups:
-            at = indices[group]
-            x, y = (int(v)*32 for v in keys[group[0]])
-            x, y = min(x, max(0,self.shape[1]-2)), min(y,max(0,self.shape[0]-2))
-            size = (min(33,self.shape[0]-y),min(33,self.shape[1]-x))
-            xyz, valid, normals = self.tile((y,x),size)
-            if not valid.any():
-                continue
-            anchor = tuple(math.floor(float(v)) for v in xyz[valid][0])
-            physical_origin = tuple(v*s for v,s in zip(anchor,spacing))
-            tile_destination = destination @ _shift(physical_origin)
-            if output_base is None:
-                output_base = tuple(math.floor(v) for v in tile_destination.translation)
-            tile_destination = _shift(tuple(-v for v in output_base)) @ tile_destination
-            xyz = np.ascontiguousarray(xyz-np.asarray(anchor,np.float32))
-            local_queries = np.ascontiguousarray(coords[at,:2]-np.array([x,y],np.float32))
-            for depth, offset in enumerate(offsets):
-                values = np.empty((len(at),3),np.float32); good = np.empty(len(at),bool)
-                if self.owner.backend == 'cuda':
-                    self.owner._surface_metrics['geometry_upload_bytes'] += xyz.nbytes+valid.nbytes+local_queries.nbytes+normals.nbytes
-                    self.owner._surface_metrics['geometry_download_bytes'] += values.nbytes+good.nbytes
-                _reader._grid_points(xyz,valid.view(np.uint8).ravel(),local_queries,normals,values,good.view(np.uint8),
-                                             _matrix(_scale(spacing)),_matrix(tile_destination),self.orientation,offset,
-                                             self.owner.device if self.owner.backend=='cuda' else -1)
-                output[depth,at],support[depth,at] = values,good
-        return output,support,output_base or (0,0,0)
-
 
 def geometry(reader, surface):
     surface = _surface(reader, surface)
@@ -312,6 +263,87 @@ def _check_budget(reader, shape, surface_shape=None):
                           'increase surface_output_bytes or use iter_project_surface')
 
 
+def _patch(geom, start, size):
+    """A UV patch as a raster over the stored grid, with the vertex window it reads.
+
+    Returns (vertices, vertex normals, raster) with missing vertices NaN, or None when
+    the patch misses the grid. A grid position's patch is the cell at its floor, so the
+    window holds every cell the patch can reach and gives the points the whole grid
+    would give."""
+    import numpy as np
+    m = geom.from_uv.matrix
+    u, v = start[1], start[0]
+    sx, kx, ky, sy = m[0][0], m[0][1], m[1][0], m[1][1]
+    x0, y0 = sx*u + kx*v + m[0][3], ky*u + sy*v + m[1][3]
+    corners = [(x0 + i*sx + j*kx, y0 + i*ky + j*sy) for i in (0, size[1]-1) for j in (0, size[0]-1)]
+    rows, cols = geom.shape
+    c0, c1 = max(0, math.floor(min(x for x, _ in corners))), min(cols, math.floor(max(x for x, _ in corners))+2)
+    r0, r1 = max(0, math.floor(min(y for _, y in corners))), min(rows, math.floor(max(y for _, y in corners))+2)
+    if c1-c0 < 2 or r1-r0 < 2:
+        return None
+    xyz, valid, normals = geom.tile((r0, c0), (r1-r0, c1-c0))
+    if not valid.all():
+        xyz = np.where(valid[..., None], xyz, np.float32(np.nan))
+    return xyz, normals, (x0-c0, y0-r0, sx, sy, kx, ky)
+
+
+def _layers(geom, normals, offsets):
+    # A mirrored UV grid flips the patch normals; explicit vertex normals keep their sign.
+    return [float(v)*(geom.orientation if not normals.size else 1) for v in offsets]
+
+
+def _zarr_volume(target):
+    r = target['reader']
+    if not (r._is_zarr and r._raw_axes == ('z', 'y', 'x') and r._lookup is None and target['field'] is None
+            and r.fill_value == r._backend.fill_value):
+        raise ValueError(f"{target['source'].id}: render_surface samples single-channel 3-D Zarr volumes")
+    return r._backend.reader
+
+
+def _cuda_reader(reader, target):
+    from . import _reader
+    if 'cuda' not in target:
+        target['cuda'] = _reader.CudaReader(_zarr_volume(target)._array, reader._tiles.limit, reader.device)
+    return target['cuda']
+
+
+def _render_volume(reader, target, patch, size, layers, to_reference, spacing):
+    """One vcr::grid call: the target's level sampled at every layer of the patch."""
+    import numpy as np
+    from . import _reader
+    array = _zarr_volume(target)
+    dtype = np.dtype(array.dtype)
+    if not target['order'] and dtype.itemsize > 2:
+        raise TypeError(f"{target['source'].id}: render_surface samples labels through float32, "
+                        "exact for integers up to 16 bits")
+    if reader.backend == 'cuda' and dtype != np.uint8:
+        raise TypeError(f"{target['source'].id}: CUDA render_surface samples uint8 volumes")
+    n = math.prod(size)
+    values = np.full((len(layers), n), np.nan, np.float32)
+    level = np.full(n, -2, np.int8)
+    if patch is not None:
+        xyz, normals, raster = patch
+        mapping = (target['mapping'] @ to_reference).matrix
+        args = (xyz, normals, spacing, raster, size[1], size[0], array._array, dtype.kind, dtype.itemsize,
+                not dtype.isnative, tuple(v for a in (2, 1, 0) for v in mapping[a]), target['order'], layers,
+                values.reshape(-1), level.view(np.uint8))
+        if reader.backend == 'cuda':
+            _reader._grid_sample_cuda(*args, _cuda_reader(reader, target))
+        else:
+            _reader._grid_sample(*args)
+    shape = (1, len(layers), *size)
+    valid = np.ascontiguousarray(np.broadcast_to(level >= 0, (len(layers), n))).reshape(shape)
+    data = values.reshape(shape)
+    if not target['order']:
+        out = target['dtype'] if reader.backend == 'cpu' else target['native_endian_dtype']
+        data = np.where(valid, data, np.float32(target['reader'].fill_value)).astype(out)
+    if reader.backend == 'cuda':
+        from .cuda import DeviceArray
+        data = DeviceArray(_reader._cuda_upload(data, reader.device), shape, data.dtype, reader.device)
+        valid = DeviceArray(_reader._cuda_upload(valid, reader.device), shape, np.dtype('bool'), reader.device)
+    return TargetResult(data, valid)
+
+
 def render_surface(reader, surface, start, size, offsets):
     import numpy as np
     start,size = _region(start,size)
@@ -325,52 +357,32 @@ def render_surface(reader, surface, start, size, offsets):
         raise ValueError('surface physical spacing is unknown')
     between = reader._between(next(iter(targets.values()))['source'] if targets else reader.reference,
                               (surface.sample_id,surface.volume_id))
-    destination = reader._reference_map.inverse() @ between @ surface.xyz_to_volume @ _scale(surface.spacing_um).inverse()
+    # Vertex coordinates to reference array coordinates; normals and layer offsets are
+    # taken in the surface's physical space.
+    to_reference = reader._reference_map.inverse() @ between @ surface.xyz_to_volume
     result = SampleResult({}, dict(reader.metadata or {}))
     result.metadata['surface'] = dict(id=surface.id,uv_start=start,uv_size=size,offsets_um=offsets,
         coordinate_frame=(surface.sample_id,surface.volume_id),reference_frame=reader._reference_frame,
         array_to_level0=reader._reference_map.matrix)
-    n = math.prod(size)
-    # Output rows are contiguous UV strips, keeping scratch independent of H/W.
-    for name,target in {**reader._targets,**targets}.items():
-        depth = len(offsets) if name in reader._targets else 1
-        dtype = np.dtype('float32') if target['order'] else target['native_endian_dtype']
-        if reader.backend == 'cpu' and not target['order']:
-            dtype = target['dtype']
-        result.targets[name] = TargetResult(
-            reader._owned_empty((target['channels'],depth*n),dtype),
-            reader._owned_empty((1,depth*n),np.dtype('bool')))
-        result[name].masks = {k:reader._owned_empty((t['channels'],depth*n),np.dtype('float32') if t['order'] else
-                              t['dtype'] if reader.backend == 'cpu' else t['native_endian_dtype'])
-                              for k,t in target['companions'].items()}
-    for first in range(0,n,8192):
-        index=np.arange(first,min(first+8192,n))
-        uv=np.column_stack((index%size[1],index//size[1])).astype(np.float32)
-        uv_origin=(start[1],start[0],0)
-        points,support,point_base=geom.sample(uv,offsets,destination,uv_origin)
-        for name,target in {**reader._targets,**targets}.items():
-            volume=name in reader._targets
-            for d in range(len(offsets) if volume else 1):
-                if volume:
-                    local,base=_transform(points[d],target['mapping'],point_base)
-                    local=np.ascontiguousarray(local[:,::-1]);base=tuple(reversed(base))
-                else:
-                    local,base=_pixel_points(uv,target['mapping'],uv_origin)
-                values,valid=reader._sample_points(target,local,base)
-                reader._copy_columns(values,result[name].data,d*n+first)
-                reader._copy_columns(valid,result[name].valid,d*n+first)
-                for key,child in target['companions'].items():
-                    if volume:
-                        p,b=_transform(points[d],child['mapping'],point_base);p=np.ascontiguousarray(p[:,::-1]);b=tuple(reversed(b))
-                    else:
-                        p,b=_pixel_points(uv,child['mapping'],uv_origin)
-                    values,_=reader._sample_points(child,p,b)
-                    reader._copy_columns(values,result[name].masks[key],d*n+first)
-    for name,target in {**reader._targets,**targets}.items():
-        shape=(len(offsets),*size) if name in reader._targets else size
-        result[name].data=result[name].data.reshape((target['channels'],*shape))
-        result[name].valid=result[name].valid.reshape((1,*shape))
-        result[name].masks={k:v.reshape((target['companions'][k]['channels'],*shape)) for k,v in result[name].masks.items()}
+    patch = _patch(geom,start,size)
+    layers = _layers(geom,patch[1] if patch is not None else np.empty(0),offsets)
+    spacing = tuple(float(v) for v in surface.spacing_um)
+    for name,target in reader._targets.items():
+        result.targets[name] = _render_volume(reader,target,patch,size,layers,to_reference,spacing)
+        result[name].masks = {k:_render_volume(reader,child,patch,size,layers,to_reference,spacing).data
+                              for k,child in target['companions'].items()}
+    # Surface-registered targets are read at the patch's own UV pixels.
+    y,x = np.indices(size,dtype=np.float32)
+    uv = np.column_stack((x.ravel(),y.ravel()))
+    uv_origin = (start[1],start[0],0)
+    for name,target in targets.items():
+        local,base = _pixel_points(uv,target['mapping'],uv_origin)
+        values,valid = reader._sample_points(target,local,base)
+        result.targets[name] = TargetResult(values.reshape((target['channels'],*size)),valid.reshape((1,*size)))
+        for key,child in target['companions'].items():
+            p,b = _pixel_points(uv,child['mapping'],uv_origin)
+            values,_ = reader._sample_points(child,p,b)
+            result[name].masks[key] = values.reshape((child['channels'],*size))
     return result
 
 
@@ -805,15 +817,13 @@ from ._sampling_engine import SamplingEngine
 class SurfaceGeometry(SamplingEngine):
     """Reusable geometry-only UV interpolation, including the benchmark path.
 
-    ``read_points`` returns local XYZ float32 coordinates, validity, and an
-    integer XYZ origin. Coordinates are in the surface coordinate-value frame;
-    offsets are physical micrometers. It does not sample a volume.
+    ``read_points`` returns XYZ float32 points in the surface coordinate-value frame
+    and their validity; offsets are physical micrometers. It does not sample a volume.
     """
-    def __init__(self,surface,*,backend='cpu',device=0,sampling_cache_bytes=64<<20,
-                 sampling_work_bytes=64<<20,**reader_options):
+    def __init__(self,surface,*,sampling_cache_bytes=64<<20,sampling_work_bytes=64<<20,**reader_options):
         limits=(operator.index(sampling_cache_bytes),operator.index(sampling_work_bytes),0)
-        self._configuration=(surface,dict(reader_options),backend,device,limits)
-        self._initialize_runtime(backend,device,limits,reader_options)
+        self._configuration=(surface,dict(reader_options),limits)
+        self._initialize_runtime('cpu',0,limits,reader_options)
         try:
             self.geometry=Geometry(self,surface)
         except BaseException:
@@ -821,6 +831,7 @@ class SurfaceGeometry(SamplingEngine):
 
     def read_points(self,start,size,*,offsets_um=(0,)):
         import numpy as np
+        from . import _reader
         self._ready();start,size=_region(start,size)
         offsets=tuple(float(v) for v in offsets_um)
         if not offsets or any(not math.isfinite(v) for v in offsets):
@@ -830,12 +841,17 @@ class SurfaceGeometry(SamplingEngine):
         if self.geometry.surface.spacing_um is None:
             raise ValueError('surface physical spacing is unknown')
         with self._lock:
-            y,x=np.indices(size,dtype=np.float32)
-            uv=np.column_stack((x.ravel(),y.ravel()))
-            points,valid,base=self.geometry.sample(uv,offsets,_scale(self.geometry.surface.spacing_um).inverse(),(start[1],start[0],0))
-            return points.reshape(len(offsets),*size,3),valid.reshape(len(offsets),*size),base
+            points=np.full((len(offsets),*size,3),np.nan,np.float32)
+            patch=_patch(self.geometry,start,size)
+            if patch is not None:
+                xyz,normals,raster=patch
+                at,step=np.empty((*size,3),np.float32),np.empty((*size,3),np.float32)
+                _reader._grid_resample(xyz,normals,tuple(float(v) for v in self.geometry.surface.spacing_um),raster,
+                                       size[1],size[0],at.reshape(-1),step.reshape(-1))
+                for k,offset in enumerate(_layers(self.geometry,normals,offsets)):
+                    points[k]=at+step*np.float32(offset) if offset else at
+            return points,np.isfinite(points).all(axis=-1)
 
     def _restore(self,state):
-        surface,options,backend,device,limits=state
-        self.__init__(surface,backend=backend,device=device,sampling_cache_bytes=limits[0],
-                      sampling_work_bytes=limits[1],**options)
+        surface,options,limits=state
+        self.__init__(surface,sampling_cache_bytes=limits[0],sampling_work_bytes=limits[1],**options)

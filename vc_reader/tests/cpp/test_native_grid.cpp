@@ -108,6 +108,39 @@ void testResample()
         require(near(n[0], -2 * k) && near(n[1], 0) && near(n[2], 0.5f * k), "anisotropic normal step");
     }
 
+    // A sheared raster: pixel (i, j) at grid column x0 + i sx + j kx, row y0 + i ky + j sy.
+    {
+        vcr::grid::Surface surface(v);
+        const vcr::grid::Raster sheared{1.5, 0.5, 0.75, 0.5, 4, 5, 0.25, 0.125};
+        std::vector<float> q(4 * 5 * 3);
+        surface.resample(sheared, q.data(), nullptr);
+        for (int j = 0; j < 5; ++j)
+            for (int i = 0; i < 4; ++i) {
+                const float* at = &q[std::size_t(j * 4 + i) * 3];
+                const double gx = 1.5 + i * 0.75 + j * 0.25, gy = 0.5 + i * 0.125 + j * 0.5;
+                require(near(at[0], float(2 * gx)) && near(at[1], float(3 * gy)), "sheared raster position");
+            }
+    }
+
+    // Vertex normals replace the patch's, also from padded rows.
+    {
+        const std::size_t stride = std::size_t(cols) * 3 + 3;
+        std::vector<float> padded(std::size_t(rows) * stride), normals(padded.size());
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                std::copy_n(&xyz[(std::size_t(r) * cols + c) * 3], 3, &padded[std::size_t(r) * stride + std::size_t(c) * 3]);
+                float* n = &normals[std::size_t(r) * stride + std::size_t(c) * 3];
+                n[0] = 0.6f;
+                n[1] = 0.0f;
+                n[2] = 0.8f;
+            }
+        vcr::grid::Surface given({padded.data(), rows, cols, stride, normals.data()});
+        float p[3], n[3];
+        given.resample({2.5, 1.5, 1, 1, 1, 1}, p, n);
+        require(near(p[0], 5.0f) && near(p[1], 4.5f) && near(n[0], 0.6f) && near(n[1], 0.0f) && near(n[2], 0.8f),
+                "vertex normals");
+    }
+
     // Two pieces: no point between them, positions inside each from that piece.
     vcr::grid::Surface pieces(v, {vcr::grid::Interpolation::Linear, {{0, 4}, {4, 8}}});
     const vcr::grid::Raster across{2.5, 1.0, 1.0, 1.0, 3, 1};  // grid x 2.5, 3.5 (the seam cell), 4.5
@@ -251,6 +284,24 @@ int main()
                 a0->sample_linear(at, 1, u8, false, &expected);
                 require(near(r.values[std::size_t(j * 6 + i)], expected, 1e-3f), "linear matches Array::sample_linear");
             }
+        // A general level map (as from a rotated registration):
+        // index (z, y, x) = (p.x + 0.25, 0.5 p.y + 0.5 p.z + 1, p.z - 0.5).
+        {
+            vcr::grid::Request general;
+            general.levels = {{a0.get(), u8, {}, {0.25, 1, -0.5}, std::array<double, 9>{1, 0, 0, 0, 0.5, 0.5, 0, 0, 1}}};
+            general.offsets = {0.0f, 1.5f};
+            r = vcr::grid::sample(between, general);
+            for (int k = 0; k < 2; ++k)
+                for (int j = 0; j < 3; ++j)
+                    for (int i = 0; i < 6; ++i) {
+                        const double x = 14.5 + 0.5 * i, y = 3.25 + 0.5 * j, z = 4.5 + 1.5 * k;
+                        const double at[3]{x + 0.25, 0.5 * y + 0.5 * z + 1, z - 0.5};
+                        float expected = 0;
+                        a0->sample_linear(at, 1, u8, false, &expected);
+                        require(near(r.values[std::size_t(k * 18 + j * 6 + i)], expected, 1e-3f),
+                                "a general level map matches Array::sample_linear");
+                    }
+        }
         // A pixel whose layers come from two levels reports the second; a missing layer wins.
         auto partial0 = open(fine, 16), partial1 = open(coarse, 8);
         partial0->chunk({0, 0, 0});  // z 0..7 at level 0 in memory

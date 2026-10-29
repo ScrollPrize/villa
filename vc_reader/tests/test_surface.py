@@ -42,7 +42,7 @@ class SurfaceTests(unittest.TestCase):
         return ('cpu','cuda') if is_available() else ('cpu',)
 
     def test_layers_and_categorical_exactness(self):
-        for backend in self.backends():
+        for backend in ('cpu',):
             with self.subTest(backend=backend),open_sample(self.reference,{'ink':self.label},backend=backend) as reader:
                 result=reader.render_surface(self.surface,(1,2),(3,4),offsets_um=(-1,0,2))
                 expected=np.stack([self.image[z,3:6,5:9] for z in (4,5,7)])[None]
@@ -184,7 +184,7 @@ class SurfaceTests(unittest.TestCase):
         (root/'meta.json').write_text(json.dumps({'scale':[.5,.25]}))
         mask=np.ones((8,9),np.uint8);mask[3,3]=0;tifffile.imwrite(root/'mask.tif',mask)
         surf=replace(self.surface,geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
-        for backend in self.backends():
+        for backend in ('cpu',):
             with open_sample(self.reference,backend=backend) as reader:
                 result=reader.render_surface(surf,(4,2),(1,1),offsets_um=(1,))
                 np.testing.assert_allclose(host(result['image'].data),self.image[None,6:7,3:4,4:5])
@@ -205,8 +205,9 @@ class SurfaceTests(unittest.TestCase):
         label=replace(label,registration=SurfaceRegistration(surf,((1,0,0),(0,1,0))))
         for backend in self.backends():
             with open_sample(self.reference,{'ink':label},backend=backend) as reader:
-                layers=reader.render_surface(surf,(1,1),(1,1),offsets_um=(4,))
-                np.testing.assert_allclose(host(layers['image'].data),self.image[None,6:7,3:4,4:5])
+                if backend=='cpu':
+                    layers=reader.render_surface(surf,(1,1),(1,1),offsets_um=(4,))
+                    np.testing.assert_allclose(layers['image'].data,self.image[None,6:7,3:4,4:5])
                 result=reader.project_surface(surf,(2,2),(2,3),label_target='ink')
                 self.assertTrue(host(result['ink'].valid).any())
                 self.assertFalse(host(result['ink'].masks['supervision']).any())
@@ -278,12 +279,78 @@ class SurfaceTests(unittest.TestCase):
         mask=np.ones((8,9),np.uint8);mask[3,3]=0
         mask=self.source('geometry-mask',mask,('y','x'),role='label',registration=SurfaceRegistration(self.surface,((1,0,0),(0,1,0))))
         surf=replace(self.surface,normals=normal,mask=mask)
-        for backend in self.backends():
+        for backend in ('cpu',):
             with open_sample(self.reference,backend=backend) as reader:
                 result=reader.render_surface(surf,(1,1),(1,1),offsets_um=(1,))
                 np.testing.assert_allclose(host(result['image'].data),self.image[None,4:5,3:4,4:5])
                 result=reader.render_surface(surf,(3,3),(1,1))
                 self.assertFalse(host(result['image'].valid).any())
+
+    def test_render_sheared_uv_and_rotated_volume_frame(self):
+        # Patch pixel (j, i) is UV (2 + i, 1 + j), the grid's column 1 + j and row 2 + i;
+        # the mirrored UV grid flips the sheet normal.
+        transposed=replace(self.surface,pixel_to_uv=((0,1,0),(1,0,0)))
+        # Vertex (x, y, z) sits at volume (z, y, x): the sheet normal +z moves along volume x.
+        swapped=replace(self.surface,xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))))
+        with open_sample(self.reference) as reader:
+            result=reader.render_surface(transposed,(1,2),(3,4),offsets_um=(0,1))
+            for k,z in enumerate((5,4)):
+                np.testing.assert_allclose(result['image'].data[0,k],self.image[z,4:8,4:7].T)
+            result=reader.render_surface(swapped,(1,2),(3,4),offsets_um=(0,1.5))
+            np.testing.assert_allclose(result['image'].data[0,0],self.image[5:9,3:6,5].T)
+            np.testing.assert_allclose(result['image'].data[0,1],self.image[5:9,3:6,5].T+1.5)
+            self.assertTrue(result['image'].valid.all())
+
+    def test_geometry_points_without_a_volume(self):
+        from vc_reader.surface import SurfaceGeometry
+        with SurfaceGeometry(self.surface) as geometry:
+            points,valid=geometry.read_points((1,2),(3,4),offsets_um=(0,2))
+            y,x=np.indices((3,4),dtype=np.float32)
+            np.testing.assert_allclose(points[0],np.stack((x+5,y+3,np.full_like(x,5)),-1))
+            np.testing.assert_allclose(points[1][...,2],7)
+            self.assertTrue(valid.all())
+            # The 8 x 9 grid ends at row 7 and column 8.
+            points,valid=geometry.read_points((6,7),(3,3))
+            np.testing.assert_array_equal(valid[0],[[1,1,0],[1,1,0],[0,0,0]])
+            self.assertTrue(np.isnan(points[0][~valid[0]]).all())
+
+    def test_render_volume_target_limits(self):
+        wide=self.source('wide-seg',np.zeros(self.image.shape,np.uint32),('z','y','x'),role='label',
+                         registration=self.reference.registration)
+        with open_sample(self.reference,{'seg':wide}) as reader:
+            with self.assertRaisesRegex(TypeError,'16 bits'):
+                reader.render_surface(self.surface,(1,1),(1,1))
+        if is_available():
+            with open_sample(self.reference,backend='cuda') as reader:
+                with self.assertRaisesRegex(TypeError,'uint8'):
+                    reader.render_surface(self.surface,(1,1),(1,1))
+
+    def test_render_cuda_matches_cpu_on_uint8_volumes(self):
+        if not is_available():
+            self.skipTest('CUDA unavailable')
+        import json,tifffile
+        z,y,x=np.indices(self.image.shape)
+        image=((z*37+y*11+x*5)%251).astype(np.uint8)
+        reference=self.source('image8',image,('z','y','x'),role='image',registration=self.reference.registration)
+        seg=self.source('seg8',image%7,('z','y','x'),role='label',registration=self.reference.registration)
+        root=self.root/'surface8';root.mkdir()
+        for axis,values in zip('xyz',self.xyz):tifffile.imwrite(root/(axis+'.tif'),values)
+        (root/'meta.json').write_text(json.dumps({'scale':[.5,.25]}))
+        tifxyz=replace(self.surface,geometry=Storage(str(root),'tifxyz'),axes=('y','x'),pixel_to_uv=None)
+        swapped=replace(self.surface,xyz_to_volume=Affine.from_rows(((0,0,1,0),(0,1,0,0),(1,0,0,0))),spacing_um=(1,2,1))
+        cases=((self.surface,{'seg':seg,'ink':self.label},(1,2),(3,4),(-1,0,2)),
+               (tifxyz,{'seg':seg},(3,1),(20,30),(0,1.5)),(swapped,{'seg':seg},(1,2),(5,6),(0,.75)))
+        for surface,targets,start,size,offsets in cases:
+            outputs=[]
+            for backend in ('cpu','cuda'):
+                with self.subTest(surface=surface.id,backend=backend),open_sample(reference,targets,backend=backend) as reader:
+                    result=reader.render_surface(surface,start,size,offsets_um=offsets)
+                    outputs.append({(name,key):host(getattr(result[name],key)) for name in targets.keys()|{'image'}
+                                    for key in ('data','valid')})
+            self.assertTrue(outputs[0][('image','valid')].any())
+            self.assertEqual(outputs[1][('seg','data')].dtype,np.uint8)
+            for key,expected in outputs[0].items():
+                np.testing.assert_array_equal(outputs[1][key],expected,err_msg=str((surface.id,key)))
 
     def test_face_contact_and_physical_band_metric(self):
         xyz=self.xyz.copy();xyz[2]+=.5
@@ -333,8 +400,9 @@ class SurfaceTests(unittest.TestCase):
         outputs=[]
         for backend in self.backends():
             with open_sample(self.reference,{'ink':encoded},backend=backend) as reader:
-                layers=reader.render_surface(self.surface,(2,2),(2,3))
-                np.testing.assert_array_equal(host(layers['ink'].data),data[:,2:4,2:5])
+                if backend=='cpu':
+                    layers=reader.render_surface(self.surface,(2,2),(2,3))
+                    np.testing.assert_array_equal(layers['ink'].data,data[:,2:4,2:5])
                 result=reader.project_surface(self.surface,(2,2),(2,3),label_target='ink')
                 if backend=='cpu':self.assertEqual(result['ink'].data.dtype,data.dtype)
                 outputs.append(host(result['ink'].data))
@@ -350,10 +418,11 @@ class SurfaceTests(unittest.TestCase):
         label=replace(self.label,registration=SurfaceRegistration(surf,uv))
         for backend in self.backends():
             with open_sample(reference,{'ink':label},backend=backend) as reader:
-                layers=reader.render_surface(surf,(huge+2,huge+2),(2,3))
-                expected=self.image[5,4:6,5:8]+np.float32(27.75)
-                np.testing.assert_allclose(host(layers['image'].data)[0,0],expected,atol=1e-4)
-                np.testing.assert_array_equal(host(layers['ink'].data),self.labels[None,2:4,2:5])
+                if backend=='cpu':
+                    layers=reader.render_surface(surf,(huge+2,huge+2),(2,3))
+                    expected=self.image[5,4:6,5:8]+np.float32(27.75)
+                    np.testing.assert_allclose(layers['image'].data[0,0],expected,atol=1e-4)
+                    np.testing.assert_array_equal(layers['ink'].data,self.labels[None,2:4,2:5])
                 projected=reader.project_surface(surf,(2,2),(2,3),label_target='ink')
                 self.assertEqual(projected.metadata['projection']['origin_zyx'],(5,4,5))
                 self.assertTrue(host(projected['ink'].valid).any())

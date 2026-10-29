@@ -40,9 +40,10 @@ struct Surface::Impl {
     std::vector<std::uint8_t> present;  // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
     std::vector<float> du, dv, duv;     // per vertex, smooth mode
-    std::vector<float> packed;          // the vertices without row padding, when stride != cols * 3
+    std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
 
     const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
+    const float* normals() const { return packedNormals.empty() ? v.normals : packedNormals.data(); }
     std::size_t index(int r, int c) const { return std::size_t(r) * std::size_t(v.cols) + std::size_t(c); }
     geometry::V at(int r, int c) const { return geometry::vector(xyz() + 3 * index(r, c)); }
 
@@ -52,6 +53,7 @@ struct Surface::Impl {
         g.xyz = xyz();
         g.present = reinterpret_cast<const bool*>(present.data());
         g.piece = piece.empty() ? nullptr : piece.data();
+        g.normals = normals();
         if (options.interpolation == Interpolation::Smooth) {
             g.du = du.data();
             g.dv = dv.data();
@@ -144,18 +146,28 @@ struct Surface::Impl {
     }
 
     // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into
-    // w x h outputs. Pixel (i, j) sits at grid position (x0 + i sx, y0 + j sy), computed
-    // in double as the CUDA sampler does.
+    // w x h outputs. Pixel (i, j) sits at grid position (x0 + i sx + j kx, y0 + i ky + j sy),
+    // computed in double as the CUDA sampler does.
     void resampleRect(const Raster& raster, int i0, int j0, int w, int h, float* xyz, float* nrm) const
+    {
+        if (raster.ky != 0)
+            resampleRows<true>(raster, i0, j0, w, h, xyz, nrm);
+        else  // the rows of an unsheared raster each lie on one grid row
+            resampleRows<false>(raster, i0, j0, w, h, xyz, nrm);
+    }
+    template <bool Sheared>
+    void resampleRows(const Raster& raster, int i0, int j0, int w, int h, float* xyz, float* nrm) const
     {
         const PointMap g = map();
         const GridView grid = view();
         for (int j = 0; j < h; ++j) {
-            const float y = float(raster.y0 + double(j0 + j) * raster.sy);
+            const double x = raster.x0 + double(j0 + j) * raster.kx, y = raster.y0 + double(j0 + j) * raster.sy;
+            const float row = float(y);
             for (int i = 0; i < w; ++i) {
                 const std::size_t o = (std::size_t(j) * std::size_t(w) + std::size_t(i)) * 3;
                 float step[3];
-                if (!point(g, grid, float(raster.x0 + double(i0 + i) * raster.sx), y, xyz + o, nullptr, step)) {
+                if (!point(g, grid, float(x + double(i0 + i) * raster.sx), Sheared ? float(y + double(i0 + i) * raster.ky) : row,
+                           xyz + o, nullptr, step)) {
                     xyz[o] = xyz[o + 1] = xyz[o + 2] = kNaN;
                     step[0] = step[1] = step[2] = kNaN;
                 }
@@ -184,6 +196,11 @@ Surface::Surface(Vertices vertices, SurfaceOptions options) : impl_(std::make_un
         s.packed.resize(rows * cols * 3);
         for (std::size_t r = 0; r < rows; ++r)
             std::copy_n(vertices.xyz + r * vertices.stride, cols * 3, s.packed.data() + r * cols * 3);
+        if (vertices.normals) {
+            s.packedNormals.resize(rows * cols * 3);
+            for (std::size_t r = 0; r < rows; ++r)
+                std::copy_n(vertices.normals + r * vertices.stride, cols * 3, s.packedNormals.data() + r * cols * 3);
+        }
     }
     // A vertex is missing when a coordinate is NaN or all three are -1.
     s.present.resize(rows * cols);
@@ -311,8 +328,9 @@ constexpr int kTile = 64;
 
 // Samples a raster tile by tile, each tile on one thread of the first level's pool:
 // the tile's points, then per pixel its layers, each from the first level holding
-// it, reduced and written once. Level indices are taken about `centre`.
-template <class Load>
+// it, reduced and written once. Level indices are taken about `centre`; General: some
+// level has a general (non-axis-aligned) map.
+template <bool General, class Load>
 Result sampleTiles(int width, int height, const Request& request, const TilePoints& points, const float* centre, Load load)
 {
     const std::size_t pixels = std::size_t(width) * std::size_t(height);
@@ -320,7 +338,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
     const bool needNormals = std::any_of(request.offsets.begin(), request.offsets.end(), [](float w) { return w != 0; });
     std::vector<LevelMap> maps;
     for (const auto& L : request.levels)
-        maps.push_back(levelMap(L.scale, L.offset, centre));
+        maps.push_back(levelMap(L.scale, L.offset, L.linear ? &*L.linear : nullptr, centre));
     Result result;
     result.width = width;
     result.height = height;
@@ -367,7 +385,7 @@ Result sampleTiles(int width, int height, const Request& request, const TilePoin
                     std::size_t li = 0;
                     for (; li < lookups.size(); ++li) {
                         float c[3];
-                        levelIndex(maps[li], at[0], at[1], at[2], c);
+                        levelIndex<General>(maps[li], at[0], at[1], at[2], c);
                         if (sampling::point(lookups[li], maps[li].base, c, request.order, value))
                             break;
                     }
@@ -417,8 +435,10 @@ Result sampleRaster(int width, int height, const Request& request, const TilePoi
 {
     checkRequest(request, width, height);
     Result result;
+    const bool general = std::any_of(request.levels.begin(), request.levels.end(), [](const Level& L) { return L.linear.has_value(); });
     request.levels.front().type.visit_load([&](auto load) {
-        result = sampleTiles(width, height, request, points, centre, load);
+        result = general ? sampleTiles<true>(width, height, request, points, centre, load)
+                         : sampleTiles<false>(width, height, request, points, centre, load);
     });
     return result;
 }
@@ -533,7 +553,8 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
     const auto levels = device::allocate(pixels, deviceId);
     std::vector<cuda_detail::DeviceLevel> host(readers.size());
     for (std::size_t li = 0; li < readers.size(); ++li)
-        host[li].map = levelMap(request.levels[li].scale, request.levels[li].offset, centre);
+        host[li].map = levelMap(request.levels[li].scale, request.levels[li].offset,
+                                request.levels[li].linear ? &*request.levels[li].linear : nullptr, centre);
     // Blocking requests note the first level's lacking bricks, one bit each.
     std::size_t words = 0;
     device::Storage lacking;
@@ -607,6 +628,7 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     const auto xyz = upload(host.xyz, vertices * 12, id);
     const auto present = upload(host.present, vertices, id);
     const auto piece = upload(host.piece, host.piece ? std::size_t(impl.v.cols) * sizeof(int) : 0, id);
+    const auto normals = upload(host.normals, host.normals ? vertices * 12 : 0, id);
     const bool smooth = host.du != nullptr;
     const auto du = upload(host.du, smooth ? vertices * 12 : 0, id), dv = upload(host.dv, smooth ? vertices * 12 : 0, id),
                duv = upload(host.duv, smooth ? vertices * 12 : 0, id);
@@ -615,10 +637,13 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
     base.y0 = raster.y0;
     base.sx = raster.sx;
     base.sy = raster.sy;
+    base.kx = raster.kx;
+    base.ky = raster.ky;
     base.map = impl.map();
     base.grid.xyz = static_cast<const float*>(xyz->ptr);
     base.grid.present = static_cast<const bool*>(present->ptr);
     base.grid.piece = host.piece ? static_cast<const int*>(piece->ptr) : nullptr;
+    base.grid.normals = host.normals ? static_cast<const float*>(normals->ptr) : nullptr;
     if (smooth) {
         base.grid.du = static_cast<const float*>(du->ptr);
         base.grid.dv = static_cast<const float*>(dv->ptr);

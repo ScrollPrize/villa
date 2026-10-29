@@ -282,7 +282,7 @@ def surface_workload(args, volume_shape):
         candidates = np.unique(np.rint(np.linspace(0, extent[1]-size[1], max(64,args.crops*8))).astype(int))
         tiles = []
         for col in candidates:
-            _, valid, _ = geometry.read_points((row,int(col)),tuple(size))
+            _, valid = geometry.read_points((row,int(col)),tuple(size))
             if valid.all():
                 tiles.append(int(col))
         if len(tiles) < args.crops:
@@ -291,10 +291,10 @@ def surface_workload(args, volume_shape):
         requests, descriptions = [], []
         for index in selected:
             col = tiles[index]
-            points, _, xyz_base = geometry.read_points((row,col),tuple(size))
+            points, _ = geometry.read_points((row,col),tuple(size))
             # Keep coordinates local before applying a requested volume-level scale.
             from vc_reader.surface import _transform
-            local, base = _transform(points[0], Affine.scale(args.surface_coordinate_scale), xyz_base)
+            local, base = _transform(points[0], Affine.scale(args.surface_coordinate_scale))
             local = np.ascontiguousarray(local[...,::-1]); base = tuple(reversed(base))
             shape = tuple(int(n) for n in size)
             lower = local.reshape(-1,3).min(axis=0)

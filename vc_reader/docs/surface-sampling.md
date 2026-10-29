@@ -113,18 +113,30 @@ with open_sample(reference, {"ink": ink}, backend="cuda") as reader:
 
 Here `start` and `size` are YX in **full-resolution surface UV pixels**, rather than the
 label grid. Volume outputs are `(C, D, H, W)` in the supplied offset order;
-labels and masks remain `(C, H, W)`. Coordinate grids are bilinearly sampled
-with valid quad support and interpolation halos. There is no extrapolation
-across holes or beyond the final stored row/column. Normals follow
-`dP/du cross dP/dv`, with increasing columns defining u. Degenerate normals are
-invalid. Offsets are applied in the surface's physical frame before mapping to
-each volume. Geometric target components retain their declared reference-volume
-basis, with value-frame metadata in the result.
+labels and masks remain `(C, H, W)`. Each volume target is one native
+`vcr::grid` call (the sampler of VC3D's viewer): the patch becomes a raster
+over the stored coordinate grid, the window of vertices it reaches is read once,
+and every layer is sampled from the target's array in tiles. Coordinate grids
+are bilinear on complete quads; there is no point across holes or beyond the
+final stored row/column. Normals follow `dP/du cross dP/dv` (taken in physical
+space), with increasing columns defining u, or are the interpolated explicit
+normals. Degenerate normals give no point. Offsets are applied in the surface's
+physical frame; any affine from coordinate values to the volume's array
+(registrations included) is applied by the sampler. A volume sample is valid
+where the surface has a point; points outside the volume read its fill value,
+as in every point sample of an array.
 
-`vc_reader.surface.SurfaceGeometry` exposes the same bounded UV interpolation
-without reading a volume. Its `read_points(...)` returns local XYZ float32
-coordinates, geometry validity, and an integer XYZ origin in the stored
-coordinate-value frame. The benchmark uses this helper too.
+Volume targets of `render_surface` are single-channel 3-D Zarr arrays without a
+value encoding. Images are sampled linearly into float32; labels are sampled
+nearest and returned in their dtype, which must be at most 16 bits wide (the
+sampler carries values as float32). With `backend="cuda"` volume targets must be
+uint8 and outputs are device arrays. Surface-registered targets (UV labels)
+keep the aligned sampler and its CPU/CUDA support for every dtype.
+
+`vc_reader.surface.SurfaceGeometry` exposes the same surface points without
+reading a volume. Its `read_points(...)` returns `(points, valid)`: XYZ float32
+points `(D, H, W, 3)` in the stored coordinate-value frame, NaN where invalid.
+The benchmark uses this helper too.
 
 ## Projection geometry and determinism
 

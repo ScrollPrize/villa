@@ -66,7 +66,7 @@ class SamplingEngine:
         self._tiles, self._plans = _Bounded(limits[0]), _Bounded(limits[2])
         self._work_bytes = limits[1]
         self._uploads = self._tile_reads = self._peak_work = 0
-        self._surface_metrics = dict(geometry_read_bytes=0, geometry_upload_bytes=0, geometry_download_bytes=0,
+        self._surface_metrics = dict(geometry_read_bytes=0,
                                      candidate_upload_bytes=0, preparation_seconds=0., candidate_index_seconds=0.,
                                      raster_call_seconds=0., output_allocation_seconds=0.)
         options = dict(reader_options)
@@ -415,6 +415,11 @@ class SamplingEngine:
         with self._lock:
             if self._closed:
                 return
+            # Device readers of render_surface hold their arrays: drop them first.
+            for target in self._targets.values():
+                for t in (target, *target.get('companions', {}).values()):
+                    if 'cuda' in t:
+                        t.pop('cuda').clear()
             for reader in self._opened:
                 reader.close()
             self._opened.clear()

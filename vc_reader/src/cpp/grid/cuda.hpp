@@ -23,7 +23,7 @@ struct Params {
     // Points: a plane, or a raster over a surface's grid (grid::point on the device).
     bool plane = false;
     float origin[3]{}, dx[3]{}, dy[3]{}, normal[3]{};
-    double x0 = 0, y0 = 0, sx = 1, sy = 1;
+    double x0 = 0, y0 = 0, sx = 1, sy = 1, kx = 0, ky = 0;
     PointMap map{};
     GridView grid{};
     int order = 1;
@@ -40,10 +40,5 @@ struct Params {
 
 // Samples every pixel on the current stream; returns when the launch is enqueued.
 void launch(const Params& params);
-
-// grid::point for n queries (x, y pairs) of one host grid, on a device: points
-// (3 floats each, NaN where none) and validity into host outputs.
-void points(const PointMap& g, const float* xyz, const bool* present, const float* normals, const float* queries,
-            float* out, bool* valid, std::size_t n, int device);
 
 }  // namespace vcr::grid::cuda_detail

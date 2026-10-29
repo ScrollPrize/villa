@@ -73,7 +73,8 @@ __global__ void samplePixels(Params P)
             p[a] = P.origin[a] + P.dy[a] * float(j) + P.dx[a] * float(i);
             n[a] = P.normal[a];
         }
-    } else if (!point(P.map, P.grid, float(P.x0 + double(i) * P.sx), float(P.y0 + double(j) * P.sy), p, nullptr, n)) {
+    } else if (!point(P.map, P.grid, float(P.x0 + double(j) * P.kx + double(i) * P.sx),
+                      float(P.y0 + double(j) * P.sy + double(i) * P.ky), p, nullptr, n)) {
         return;  // no surface point here
     }
     composite::detail::Reducer reducer(P.composite);
@@ -109,15 +110,6 @@ __global__ void samplePixels(Params P)
     P.level[q] = missing ? kMissing : level;
 }
 
-__global__ void pointQueries(PointMap g, GridView v, const float* queries, float* out, bool* valid, std::size_t n)
-{
-    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(blockDim.x) * gridDim.x) {
-        valid[i] = point(g, v, queries[2 * i], queries[2 * i + 1], out + 3 * i, nullptr);
-        if (!valid[i])
-            out[3 * i] = out[3 * i + 1] = out[3 * i + 2] = nanf("");
-    }
-}
-
 }  // namespace
 
 void launch(const Params& params)
@@ -127,34 +119,6 @@ void launch(const Params& params)
         return;
     samplePixels<<<unsigned((pixels + 255) / 256), 256, 0, vcr::device::stream()>>>(params);
     device::check(cudaGetLastError());
-}
-
-void points(const PointMap& g, const float* xyz, const bool* present, const float* normals, const float* queries,
-            float* out, bool* valid, std::size_t n, int id)
-{
-    if (!n)
-        return;
-    device::Guard guard(id);
-    const std::size_t vertices = std::size_t(g.height) * std::size_t(g.width);
-    const auto upload = [&](const void* data, std::size_t bytes) {
-        auto a = device::allocate(std::max<std::size_t>(bytes, 16), id);
-        if (bytes)
-            device::check(cudaMemcpyAsync(a->ptr, data, bytes, cudaMemcpyHostToDevice, device::stream()));
-        return a;
-    };
-    const auto x = upload(xyz, vertices * 12), m = upload(present, vertices), q = upload(queries, n * 8);
-    const auto nn = upload(normals, normals ? vertices * 12 : 0);
-    const auto o = device::allocate(n * 12, id), v = device::allocate(n, id);
-    GridView view;
-    view.xyz = static_cast<const float*>(x->ptr);
-    view.present = static_cast<const bool*>(m->ptr);
-    view.normals = normals ? static_cast<const float*>(nn->ptr) : nullptr;
-    pointQueries<<<unsigned(std::min<std::size_t>((n + 255) / 256, 65535)), 256, 0, device::stream()>>>(
-        g, view, static_cast<const float*>(q->ptr), static_cast<float*>(o->ptr), static_cast<bool*>(v->ptr), n);
-    device::check(cudaGetLastError());
-    device::check(cudaMemcpyAsync(out, o->ptr, n * 12, cudaMemcpyDeviceToHost, device::stream()));
-    device::check(cudaMemcpyAsync(valid, v->ptr, n, cudaMemcpyDeviceToHost, device::stream()));
-    device::complete();
 }
 
 }  // namespace vcr::grid::cuda_detail
