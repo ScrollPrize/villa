@@ -16,7 +16,6 @@
 
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"

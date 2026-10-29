@@ -13,6 +13,7 @@
 #include <QFutureWatcher>
 #include <QString>
 
+class OpenedVolumes;
 class SegmentationEditManager;
 class SegmentationWidget;
 class CState;
@@ -76,6 +77,7 @@ private:
         int direction,
         const AlphaPushPullConfig& config,
         const std::shared_ptr<Volume>& volume,
+        OpenedVolumes& volumes,
         int datasetIndex,
         float scale,
         bool* outUnavailable,
@@ -86,6 +88,7 @@ private:
         int direction,
         const AlphaPushPullConfig& config,
         const std::shared_ptr<Volume>& volume,
+        OpenedVolumes& volumes,
         int datasetIndex,
         float scale,
         std::uint64_t generation);

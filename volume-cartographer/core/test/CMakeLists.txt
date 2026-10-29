@@ -73,7 +73,6 @@ vc_add_test(NAME test_surface_area_units)
 
 vc_add_test(NAME test_voxel_size_metadata)
 
-vc_add_test(NAME test_read_interpolated_render)
 
 vc_add_test(NAME test_chunked_plane_sampler_fallback)
 
@@ -102,6 +101,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenDataManifest.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
@@ -189,6 +189,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             test_lasagna_service_manager_stub.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
@@ -244,6 +245,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
@@ -743,9 +745,10 @@ vc_add_test(NAME test_volume_local)
 
 vc_add_test(NAME test_chunked_plane_sampler)
 
-vc_add_test(NAME test_slicing)
 
 vc_add_test(NAME test_volume_pkg)
+vc_add_test(NAME test_opened_volumes
+    SOURCES test_opened_volumes.cpp ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp)
 
 
 vc_add_test(NAME test_vcdataset)
@@ -775,7 +778,6 @@ vc_add_test(NAME test_zarr_chunk_fetcher)
 
 vc_add_test(NAME test_chunked_plane_sampler_more)
 
-vc_add_test(NAME test_slicing_more)
 
 vc_add_test(NAME test_vcdataset_more)
 

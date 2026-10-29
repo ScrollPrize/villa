@@ -25,7 +25,6 @@ add_library(vc_core
         src/UnixSocket.cpp
         src/VoxelSizeMetadata.cpp
         src/SparseChunkSpool.cpp
-        src/Slicing.cpp
         src/Compositing.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp

@@ -108,6 +108,7 @@ private:
     void setupUI();
     void setDrawEnabled(bool enabled);
     void computeDistanceTransform();
+    std::vector<float> sampleIntensities(const Volume& volume, const std::vector<cv::Vec3f>& points) const;
     void updateModeUI();
     void analyzePaths();
     void findPeaksAlongPath(const ViewerOverlayControllerBase::PathPrimitive& path);

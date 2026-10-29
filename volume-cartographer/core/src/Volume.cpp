@@ -24,7 +24,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
@@ -1113,55 +1112,6 @@ void Volume::invalidateCache()
             chunkCacheSourceIdentity());
     }
     chunkedCache_.reset();
-}
-
-// ============================================================================
-// Sampling API
-// ============================================================================
-
-// Helper: scale level-0 coords to pyramid level coords.
-static const cv::Mat_<cv::Vec3f>& scaleCoords(const cv::Mat_<cv::Vec3f>& coords, int level)
-{
-    if (level <= 0) return coords;
-    // Thread-local buffer avoids per-tile allocation for the scaled copy
-    thread_local cv::Mat_<cv::Vec3f> scaled;
-    float scale = 1.0f / static_cast<float>(1 << level);
-    if (scaled.rows != coords.rows || scaled.cols != coords.cols) {
-        scaled.create(coords.size());
-    }
-    const int total = coords.rows * coords.cols;
-    const auto* src = coords.ptr<cv::Vec3f>();
-    auto* dst = scaled.ptr<cv::Vec3f>();
-    for (int i = 0; i < total; ++i) {
-        dst[i] = src[i] * scale;
-    }
-    return scaled;
-}
-
-void Volume::sample(cv::Mat_<uint8_t>& out,
-                    const cv::Mat_<cv::Vec3f>& coords,
-                    const vc::SampleParams& params)
-{
-    if (coords.empty()) {
-        out.release();
-        return;
-    }
-    out.create(coords.size());
-    const auto& scaled = scaleCoords(coords, params.level);
-    readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
-}
-
-void Volume::sample(cv::Mat_<uint16_t>& out,
-                    const cv::Mat_<cv::Vec3f>& coords,
-                    const vc::SampleParams& params)
-{
-    if (coords.empty()) {
-        out.release();
-        return;
-    }
-    out.create(coords.size());
-    const auto& scaled = scaleCoords(coords, params.level);
-    readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
 }
 
 template <typename T>

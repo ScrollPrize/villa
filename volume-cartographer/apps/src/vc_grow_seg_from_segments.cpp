@@ -19,7 +19,6 @@
 
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/StoreToolOptions.hpp"
 #include <vc_object_store/Uuid.hpp>

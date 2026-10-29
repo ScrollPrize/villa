@@ -4,6 +4,7 @@
 
 #include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
+#include "OpenedVolumes.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -228,6 +229,14 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
     _objectStoreOwner = objectStoreOwner;
     _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
                                           : std::make_shared<vc::objects::ObjectStoreSession>();
+    if (objectStoreOwner) {
+        _openedVolumes = objectStoreOwner->_openedVolumes;
+    } else {
+        using namespace vc3d::settings;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        _openedVolumes = std::make_shared<OpenedVolumes>(std::size_t(gib) << 30);
+    }
     // Open Data surfaces are fetched from the catalog on the first read reaching them.
     if (!objectStoreOwner)
         _objectStoreSession->setGeometryFetcher(vc::objects::kCatalogMetaKey, vc::objects::fetchCatalogSurface);

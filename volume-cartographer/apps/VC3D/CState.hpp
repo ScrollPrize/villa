@@ -25,6 +25,7 @@ Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 
 class VolumePkg;
 class Volume;
+class OpenedVolumes;
 class QuadSurface;
 class Surface;
 class VCCollection;
@@ -50,6 +51,8 @@ public:
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
+    // The opened volume levels the tools sample, shared with the object-store owner's windows.
+    std::shared_ptr<OpenedVolumes> openedVolumes() const { return _openedVolumes; }
     // Decoded surface geometry kept for every store VC3D opens (all workspaces),
     // up to the surface geometry cache setting; re-read after Settings change.
     static std::shared_ptr<vc::objects::SurfaceTileCache> surfaceGeometryCache();
@@ -183,6 +186,7 @@ private:
     std::optional<vc::objects::AttachmentIdentity> attachedAt(const std::filesystem::path& path) const;
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
+    std::shared_ptr<OpenedVolumes> _openedVolumes;
     std::vector<vc::objects::AttachmentIdentity> _attachedStores;
     std::map<std::string, vc::objects::AttachmentIdentity> _storeReferences;
     QString _objectStoreObservationError;

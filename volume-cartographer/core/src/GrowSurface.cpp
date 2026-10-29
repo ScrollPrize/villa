@@ -5,7 +5,6 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"

@@ -2,7 +2,6 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <cctype>
 

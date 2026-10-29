@@ -1,7 +1,6 @@
 // Extra Volume coverage beyond test_volume_local.cpp:
 // - uint16 dtype reads
 // - process cache configuration
-// - sample (single-slice) on a seeded uint8 volume
 // - MissingScaleLevelPolicy::AllFill behaviour for a level that exists but is empty
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -10,7 +9,6 @@
 #include "vc/core/types/Volume.hpp"
 #include "support/TestZarrVolume.hpp"
 #include "vc/core/types/Array3D.hpp"
-#include "vc/core/types/SampleParams.hpp"
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -87,33 +85,6 @@ TEST_CASE("Volume uint16: writeXYZ/readXYZ overload")
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume::sample writes a Mat at the requested coords")
-{
-    auto d = tmpDir("sample");
-    auto v = vc::test::createZarrVolume(d, optsU8());
-    REQUIRE(v);
-    // Seed the volume with a gradient.
-    Array3D<uint8_t> seed({32, 32, 32}, 0);
-    for (size_t z = 0; z < 32; ++z)
-        for (size_t y = 0; y < 32; ++y)
-            for (size_t x = 0; x < 32; ++x)
-                seed(z, y, x) = static_cast<uint8_t>((z + y + x) & 0xFF);
-    vc::test::writeZYX(*v, seed, {0, 0, 0}, 0);
-
-    cv::Mat_<cv::Vec3f> coords(4, 4);
-    for (int r = 0; r < 4; ++r)
-        for (int c = 0; c < 4; ++c)
-            coords(r, c) = cv::Vec3f(float(c), float(r), 0.f);
-    cv::Mat_<uint8_t> out(4, 4, uint8_t{0});
-    vc::SampleParams sp;
-    sp.level = 0;
-    v->sample(out, coords, sp);
-    // No assertion on exact value — sampling interpolates; just non-crash + size.
-    CHECK(out.rows == 4);
-    CHECK(out.cols == 4);
-    fs::remove_all(d);
-}
-
 TEST_CASE("Volume chunk cache reports cumulative decoder work")
 {
     auto d = tmpDir("decode_stats");
@@ -135,25 +106,6 @@ TEST_CASE("Volume chunk cache reports cumulative decoder work")
     CHECK(after.decodeInputBytes > before.decodeInputBytes);
     CHECK(after.decodedChunkBytes > before.decodedChunkBytes);
     CHECK(after.decodeNanoseconds >= before.decodeNanoseconds);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume::sample uint16 overload")
-{
-    auto d = tmpDir("sample_u16");
-    auto v = vc::test::createZarrVolume(d, optsU16());
-    REQUIRE(v);
-    Array3D<uint16_t> seed({16, 16, 16}, 1000);
-    vc::test::writeZYX(*v, seed, {0, 0, 0}, 0);
-    cv::Mat_<cv::Vec3f> coords(2, 2);
-    for (int r = 0; r < 2; ++r)
-        for (int c = 0; c < 2; ++c)
-            coords(r, c) = cv::Vec3f(float(c), float(r), 0.f);
-    cv::Mat_<uint16_t> out(2, 2, uint16_t{0});
-    vc::SampleParams sp;
-    sp.level = 0;
-    v->sample(out, coords, sp);
-    CHECK(out.rows == 2);
     fs::remove_all(d);
 }
 

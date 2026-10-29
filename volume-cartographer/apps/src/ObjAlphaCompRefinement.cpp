@@ -1,8 +1,7 @@
 #include "utils/Json.hpp"
 
 
-#include "vc/core/types/Volume.hpp"
-#include "vc/core/render/ChunkCache.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -130,12 +129,32 @@ bool istype(const std::string &line, const std::string &type)
 }
 
 
+// The sampled pyramid level of the volume and the placement of its level 0.
 struct DSReader {
-    Volume* volume;
+    vcr::zarr::OpenedArray& level;
+    vcr::zarr::LevelPlacement base;
     float scale;
-    int level;
-    std::mutex read_mutex;
 };
+
+// Trilinear samples at volume XYZ coordinates (mapped through the levels'
+// placements), truncated to 8 bits.
+static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz)
+{
+    const auto& to = reader.level.placement;
+    const std::size_t n = xyz.total();
+    std::vector<double> zyx(3 * n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const cv::Vec3f& p = xyz(int(i));
+        for (int a = 0; a < 3; ++a)
+            zyx[3 * i + std::size_t(2 - a)] = to.fromLevel0(2 - a, reader.base.toLevel0(2 - a, p[a]));
+    }
+    std::vector<float> values(n);
+    reader.level.array->sample_linear(zyx.data(), n, reader.level.meta.type, false, values.data());
+    cv::Mat_<uint8_t> out(xyz.size());
+    for (std::size_t i = 0; i < n; ++i)
+        out(int(i)) = std::isnan(values[i]) ? uint8_t(0) : uint8_t(std::clamp(values[i], 0.0f, 255.0f));
+    return out;
+}
 
 float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r)
 {
@@ -154,14 +173,9 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     float s = copysignf(1.0,step);
 
     for(double off=start;off*s<=stop*s;off+=step) {
-        cv::Mat_<uint8_t> slice;
         cv::Mat_<cv::Vec3f> offmat(size, normal*off);
-        {
-            std::lock_guard<std::mutex> lock(reader.read_mutex);
-            vc::SampleParams sp;
-            sp.level = reader.level;
-            reader.volume->sample(slice, coords+offmat, sp);
-        }
+        const cv::Mat_<cv::Vec3f> offsetCoords = coords + offmat;
+        const cv::Mat_<uint8_t> slice = sample(reader, offsetCoords);
 
         cv::Mat floatslice;
         slice.convertTo(floatslice, CV_32F, 1/255.0);
@@ -257,11 +271,8 @@ int process_obj(const std::string& src,
     cv::Mat_<uint8_t> slice;
     bool vertexcolor = cfg.gen_vertexcolor;
     if (vertexcolor) {
-        std::lock_guard<std::mutex> lock(reader.read_mutex);
         cv::Mat_<cv::Vec3f> vs_mat(static_cast<int>(vs.size()), 1, vs.data());
-        vc::SampleParams sp;
-        sp.level = reader.level;
-        reader.volume->sample(slice, vs_mat, sp);
+        slice = sample(reader, vs_mat);
     }
 
     obj.clear();
@@ -443,30 +454,27 @@ int main(int argc, char *argv[])
     const RefinementConfig cfg = parse_config(params);
 
     const int level = std::stoi(cfg.dataset_group);
-    Volume volume(vol_path);
-    if (!volume.hasScaleLevel(level)) {
-        // Sparse pyramids keep absent levels as {0,0,0} placeholders; reading
-        // through one silently yields fill value instead of failing.
-        std::cerr << "Error: dataset group " << cfg.dataset_group
-                  << " is not present in this volume; present levels:";
-        for (int presentLevel : volume.presentScaleLevels())
-            std::cerr << " " << presentLevel;
-        std::cerr << std::endl;
+    vcr::zarr::OpenOptions options;
+    options.memoryCache = std::make_shared<vcr::MemoryCache>(cfg.cache_bytes);
+    std::optional<vcr::zarr::OpenedArray> opened;
+    vcr::zarr::LevelPlacement base;
+    try {
+        opened = vcr::zarr::openPyramidLevel(vol_path.string(), level, options);
+        base = level == 0 ? opened->placement : vcr::zarr::openPyramidLevel(vol_path.string(), 0, {}).placement;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: dataset group " << cfg.dataset_group << ": " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-    vc::render::processChunkCacheService()->configureDecodedByteCapacity(
-        cfg.cache_bytes);
-    auto* chunk_cache = volume.chunkedCache();
 
-    const auto shape = chunk_cache->shape(level);
-    const auto chunk_shape = chunk_cache->chunkShape(level);
+    const auto& shape = opened->meta.shape;
+    const auto& chunk_shape = opened->meta.chunks;
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group
               << " [" << shape[0] << ", " << shape[1] << ", " << shape[2] << "]" << std::endl;
     std::cout << "chunk shape shape "
               << "[" << chunk_shape[0] << ", " << chunk_shape[1] << ", " << chunk_shape[2] << "]" << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
 
-    DSReader reader = {&volume, cfg.reader_scale, level};
+    DSReader reader{*opened, base, cfg.reader_scale};
 
     MeasureLife timer("processing surface ...\n");
 

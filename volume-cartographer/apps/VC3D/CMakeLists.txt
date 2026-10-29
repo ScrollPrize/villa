@@ -11,6 +11,7 @@ set(srcs
     ${vccollection_moc}
     VCAppMain.cpp
     CState.cpp
+    OpenedVolumes.cpp
     CState.hpp
     Keybinds.cpp
     Keybinds.hpp

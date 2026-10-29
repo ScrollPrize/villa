@@ -14,7 +14,6 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/types/Sampling.hpp"
-#include "vc/core/types/SampleParams.hpp"
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
@@ -126,18 +125,6 @@ public:
 
     // Drop decoded/read cache state. Writes call this automatically.
     void invalidateCache();
-
-    // --- Sampling API ---
-
-    // Single-slice blocking sample (uint8)
-    void sample(cv::Mat_<uint8_t>& out,
-                const cv::Mat_<cv::Vec3f>& coords,
-                const vc::SampleParams& params);
-
-    // Single-slice blocking sample (uint16)
-    void sample(cv::Mat_<uint16_t>& out,
-                const cv::Mat_<cv::Vec3f>& coords,
-                const vc::SampleParams& params);
 
     // Blocking integer reads through the chunked local/remote cache.
     // ZYX order matches zarr storage and numpy-style volume indexing:

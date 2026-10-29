@@ -1,4 +1,5 @@
 #include "SeedingWidget.hpp"
+#include "OpenedVolumes.hpp"
 #include "ToolExecutable.hpp"
 #include "VolumeCommandPath.hpp"
 #include "ObjectStoreRegions.hpp"
@@ -25,7 +26,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 
@@ -346,6 +346,22 @@ void SeedingWidget::setDrawEnabled(bool enabled)
     displayPaths();
 }
 
+// Trilinear values of the current volume's working level at XYZ points, truncated
+// to whole numbers as the 8-bit samples were.
+std::vector<float> SeedingWidget::sampleIntensities(const Volume& volume, const std::vector<cv::Vec3f>& points) const
+{
+    const auto level = _state->openedVolumes()->level(volume, 0);
+    std::vector<double> zyx;
+    zyx.reserve(3 * points.size());
+    for (const auto& p : points)
+        zyx.insert(zyx.end(), {double(p[2]), double(p[1]), double(p[0])});
+    std::vector<float> values(points.size());
+    level.array->array->sample_linear(zyx.data(), points.size(), level.array->meta.type, false, values.data());
+    for (auto& v : values)
+        v = std::floor(std::clamp(v, 0.0f, 255.0f));
+    return values;
+}
+
 void SeedingWidget::computeDistanceTransform()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
@@ -353,22 +369,16 @@ void SeedingWidget::computeDistanceTransform()
         return;
     }
 
-    // Get the current slice data
-    const int width = currentVolume->sliceWidth();
-    const int height = currentVolume->sliceHeight();
-    
-    cv::Mat_<uint8_t> sliceData(height, width);
-    
-    // Extract the slice data from the volume
-    cv::Mat_<cv::Vec3f> coords(height, width);
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            coords(y, x) = cv::Vec3f(x, y, currentZSlice);
-        }
-    }
-    
-    // Read the slice data using the volume's dataset
-    currentVolume->sample(sliceData, coords, vc::SampleParams{});
+    // Read the current slice of the volume's working level
+    const auto level = _state->openedVolumes()->level(*currentVolume, 0);
+    const auto& meta = level.array->meta;
+    const int width = int(meta.shape[2]);
+    const int height = int(meta.shape[1]);
+    cv::Mat_<float> values(height, width);
+    level.array->array->read_many_float({{currentZSlice, 0, 0}}, {{1, height, width}},
+                                        {reinterpret_cast<std::uint8_t*>(values.ptr<float>())}, meta.type, false);
+    cv::Mat_<uint8_t> sliceData;
+    values.convertTo(sliceData, CV_8U);
     
     // Threshold the slice to create a binary image for distance transform
     cv::Mat binaryImage;
@@ -751,18 +761,10 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
             pt[1] >= by0 && pt[1] < by1 &&
             pt[2] >= bz0 && pt[2] < bz1) {
             
-            // Create a single-point coordinate matrix for reading
-            cv::Mat_<cv::Vec3f> coord(1, 1);
-            coord(0, 0) = pt;
-            
-            // Read the intensity value at this 3D point
-            cv::Mat_<uint8_t> intensity(1, 1);
-            currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-            intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
     }
+    intensities = sampleIntensities(*currentVolume, positions);
     
     if (intensities.empty()) {
         return;
@@ -977,14 +979,10 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
         if (pt[0] >= bx0 && pt[0] < bx1 &&
             pt[1] >= by0 && pt[1] < by1 &&
             pt[2] >= bz0 && pt[2] < bz1) {
-            cv::Mat_<cv::Vec3f> coord(1, 1);
-            coord(0, 0) = pt;
-            cv::Mat_<uint8_t> intensity(1, 1);
-            currentVolume->sample(intensity, coord, vc::SampleParams{});
-            intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
     }
+    intensities = sampleIntensities(*currentVolume, positions);
 
     if (intensities.empty()) return;
 

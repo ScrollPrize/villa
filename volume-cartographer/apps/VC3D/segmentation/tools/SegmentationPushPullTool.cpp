@@ -8,7 +8,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "../../OpenedVolumes.hpp"
 
 #include <QCoreApplication>
 #include <QTimer>
@@ -772,7 +772,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     if (!volume && _state) {
         volume = _state->currentVolume();
     }
-    if (!volume) {
+    if (!volume || !_state) {
         failAlphaStart(QStringLiteral("Alpha push/pull aborted: no active volume to sample."));
         return;
     }
@@ -853,7 +853,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     _lastAlphaStartFailure.clear();
 
     auto future = QtConcurrent::run(
-        [volume, datasetIndex, scale, direction, config, generation, perVertex,
+        [volume, volumes = _state->openedVolumes(), datasetIndex, scale, direction, config, generation, perVertex,
          centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
         AlphaResult result;
         result.generation = generation;
@@ -866,6 +866,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
                                                direction,
                                                config,
                                                volume,
+                                               *volumes,
                                                datasetIndex,
                                                scale,
                                                generation);
@@ -906,7 +907,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
             std::string noTargetReason;
             auto target = computeAlphaTargetStatic(
                 centerWorld, centerNormal, direction, config,
-                volume, datasetIndex, scale, &unavailable, &noTargetReason);
+                volume, *volumes, datasetIndex, scale, &unavailable, &noTargetReason);
 
             if (target) {
                 result.singleTarget = *target;
@@ -1059,11 +1060,31 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
+// Trilinear samples of an opened level at volume XYZ coordinates, mapped through the
+// levels' placements and truncated to 8 bits as before.
+static void sampleLevel(const OpenedVolumes::Level& level, const cv::Mat_<cv::Vec3f>& xyz, cv::Mat_<uint8_t>& out)
+{
+    const auto& to = level.array->placement;
+    const std::size_t n = xyz.total();
+    std::vector<double> zyx(3 * n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const cv::Vec3f& p = xyz(int(i));
+        for (int a = 0; a < 3; ++a)
+            zyx[3 * i + std::size_t(2 - a)] = to.fromLevel0(2 - a, level.working.toLevel0(2 - a, p[a]));
+    }
+    std::vector<float> values(n);
+    level.array->array->sample_linear(zyx.data(), n, level.array->meta.type, false, values.data());
+    out.create(xyz.size());
+    for (std::size_t i = 0; i < n; ++i)
+        out(int(i)) = std::isnan(values[i]) ? uint8_t(0) : uint8_t(std::clamp(values[i], 0.0f, 255.0f));
+}
+
 SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTargetsStatic(
     const std::vector<AlphaTargetInput>& inputs,
     int direction,
     const AlphaPushPullConfig& config,
     const std::shared_ptr<Volume>& volume,
+    OpenedVolumes& volumes,
     int datasetIndex,
     float scale,
     std::uint64_t generation)
@@ -1087,6 +1108,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
                                   std::to_string(datasetIndex) + ".";
         return result;
     }
+    const auto level = volumes.level(*volume, datasetIndex);
 
     const int radius = std::max(cfg.blurRadius, 0);
     const int kernel = radius * 2 + 1;
@@ -1150,9 +1172,7 @@ SegmentationPushPullTool::AlphaResult SegmentationPushPullTool::computeAlphaTarg
             }
         }
 
-        vc::SampleParams sp;
-        sp.level = datasetIndex;
-        volume->sample(slice, offsetCoords, sp);
+        sampleLevel(level, offsetCoords, slice);
         if (slice.empty()) {
             if (firstNoTargetReason.empty()) {
                 firstNoTargetReason = "Alpha push/pull sampled an empty volume slice.";
@@ -1233,6 +1253,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     int direction,
     const AlphaPushPullConfig& config,
     const std::shared_ptr<Volume>& volume,
+    OpenedVolumes& volumes,
     int datasetIndex,
     float scale,
     bool* outUnavailable,
@@ -1261,6 +1282,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
         }
         return std::nullopt;
     }
+    const auto level = volumes.level(*volume, datasetIndex);
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
@@ -1297,9 +1319,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
     for (float offset = start; offset <= stop + 1e-4f; offset += step) {
         offsetMat.setTo(orientedNormal * offset);
         cv::add(coords, offsetMat, offsetCoords);
-        vc::SampleParams sp;
-        sp.level = datasetIndex;
-        volume->sample(slice, offsetCoords, sp);
+        sampleLevel(level, offsetCoords, slice);
         if (slice.empty()) {
             setAlphaNoTargetReason(outNoTargetReason, "Alpha push/pull sampled an empty volume slice.");
             continue;
