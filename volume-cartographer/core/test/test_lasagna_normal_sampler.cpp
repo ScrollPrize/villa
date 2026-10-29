@@ -6,7 +6,6 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
-#include "vc/atlas/Atlas.hpp"
 
 #include "utils/zarr.hpp"
 
@@ -201,46 +200,6 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     CHECK(scaledSample.normal[0] == doctest::Approx(sample.normal[0]));
     CHECK(scaledSample.normal[1] == doctest::Approx(sample.normal[1]));
     CHECK(scaledSample.normal[2] == doctest::Approx(sample.normal[2]));
-    REQUIRE(scaledSampler.predDtSpacing() == std::nullopt);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("LasagnaNormalSampler samples pred_dt channel with accepted threshold")
-{
-    const auto dir = tmpDir("pred_dt");
-    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
-    std::vector<uint8_t> nx(2 * 2 * 2, 128);
-    std::vector<uint8_t> ny(2 * 2 * 2, 128);
-    std::vector<uint8_t> predDtValues(2 * 2 * 2, 170);
-    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
-    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
-    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &ny);
-    createU8Zarr(dir / "pred_dt.zarr", {2, 2, 2}, {2, 2, 2}, &predDtValues);
-    const auto manifestPath = dir / "dataset.lasagna.json";
-    writeText(manifestPath, R"({
-        "version": 2,
-        "grad_mag_encode_scale": 255.0,
-        "grad_mag_factor": 1.0,
-        "groups": {
-            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
-            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
-            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]},
-            "pred_dt_group": {"zarr": "pred_dt.zarr", "scaledown": 0, "channels": ["pred_dt"]}
-        }
-    })");
-
-    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    vc::lasagna::LasagnaNormalSampler sampler(dataset);
-
-    REQUIRE(sampler.hasPredDtChannel());
-    REQUIRE(sampler.predDtSpacing().has_value());
-    CHECK(*sampler.predDtSpacing() == doctest::Approx(1.0));
-    const auto predDt = sampler.samplePredDt({1.0, 1.0, 1.0});
-    REQUIRE(predDt.has_value());
-    CHECK(*predDt == doctest::Approx(170.0));
-    CHECK(vc::atlas::atlasPredDtIsInside(*predDt));
-    CHECK(vc::atlas::atlasPredDtIsInside(110.0));
-    CHECK_FALSE(vc::atlas::atlasPredDtIsInside(109.0));
     fs::remove_all(dir);
 }
 

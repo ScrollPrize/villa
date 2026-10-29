@@ -6,8 +6,7 @@
 #define SURFACE_LONG_ID_COLUMN 2
 #define SURFACE_AREA_COLUMN 3
 #define SURFACE_AVG_COST_COLUMN 4
-#define SURFACE_OVERLAPS_COLUMN 5
-#define TIMESTAMP_COLUMN 6
+#define TIMESTAMP_COLUMN 5
 
 class SurfaceTreeWidgetItem : public QTreeWidgetItem
 {
@@ -25,11 +24,11 @@ private:
         if (column == 0) {
             return data(column, Qt::UserRole).toString() < other.data(column, Qt::UserRole).toString();
         }
-        // Column 1 = Surface ID (case-insensitive string comparison)
+        // Column 1 = Name (case-insensitive string comparison)
         else if (column == SURFACE_ID_COLUMN) {
             return text(column).toLower() < other.text(column).toLower();
         }
-        // Column 6 = Timestamp (string comparison works due to YYYYMMDDHHMMSSmmm format)
+        // Timestamp column: ISO 8601 change times compare as strings
         else if (column == TIMESTAMP_COLUMN) {
             // Empty timestamps sort to the bottom
             QString thisTime = text(column);
@@ -43,8 +42,7 @@ private:
         }
         // Metrics columns are numeric.
         else if (column == SURFACE_AREA_COLUMN ||
-                 column == SURFACE_AVG_COST_COLUMN ||
-                 column == SURFACE_OVERLAPS_COLUMN) {
+                 column == SURFACE_AVG_COST_COLUMN) {
             return text(column).toDouble() < other.text(column).toDouble();
         }
         // Remaining text columns use case-insensitive string comparison.
@@ -63,5 +61,4 @@ public:
         setContextMenuPolicy(Qt::CustomContextMenu);
     }
     
-    SurfaceTreeWidgetItem* findItemForSurface(std::string id);
 };

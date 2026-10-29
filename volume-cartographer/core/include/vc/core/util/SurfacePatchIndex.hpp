@@ -87,17 +87,11 @@ public:
     SurfacePatchIndex(const SurfacePatchIndex&) = delete;
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
+    // useMappedSurfaces: read surfaces loaded from a tifxyz directory by
+    // memory-mapping its x/y/z TIFFs (the standalone tifxyz tools).
     void rebuild(const std::vector<SurfacePtr>& surfaces,
                  float bboxPadding = 0.0f,
-                 bool useMappedSurfaces = true);
-    static std::string cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
-                                           int samplingStride,
-                                           float bboxPadding);
-    bool loadCache(const std::filesystem::path& cachePath,
-                   const std::vector<SurfacePtr>& surfaces,
-                   const std::string& expectedKey);
-    bool saveCache(const std::filesystem::path& cachePath,
-                   const std::string& cacheKey) const;
+                 bool useMappedSurfaces = false);
     void clear();
     bool empty() const;
     size_t patchCount() const;

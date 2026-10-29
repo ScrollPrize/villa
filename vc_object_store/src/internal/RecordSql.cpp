@@ -23,7 +23,7 @@ std::string projectedObjectColumns(const ObjectFields& fields)
         {"approved_host", "NULL"}, {"approved_generation", "NULL"}, {"format_version", "0"},
         {"storage_kind", "''"}, {"storage_ref", "''"}, {"data_generation", "0"},
         {"data_checksum", "NULL"}, {"meta", "'{}'"}};
-    std::set<std::string> valid{"tags", "fiber", "patch", "track", "retired", "lifecycle_epoch"};
+    std::set<std::string> valid{"tags", "fiber", "surface", "track", "retired", "lifecycle_epoch"};
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
         valid.insert(name);
@@ -118,9 +118,9 @@ template<class Visit> void detailTables(Visit visit)
     visit("fiber", "fibers", "family,manual_family,control_point_count,line_point_count,length,width,"
         "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::fiber, readDetail<FiberDetail>, 14);
-    visit("patch", "patches", "grid_width,grid_height,scale,scale_y,"
+    visit("surface", "surfaces", "grid_width,grid_height,scale,scale_y,area,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
-        &ObjectRecord::patch, readDetail<PatchDetail>, 10);
+        &ObjectRecord::surface, readDetail<SurfaceDetail>, 11);
     visit("track", "tracks", "dataset_ref,external_key,family,point_count,length,"
         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
         &ObjectRecord::track, readDetail<TrackDetail>, 11);
@@ -157,7 +157,7 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields)
 {
-    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "patch") || wants(fields, "track");
+    const bool hydrate = wants(fields, "tags") || wants(fields, "fiber") || wants(fields, "surface") || wants(fields, "track");
     std::vector<ObjectRecord> result;
     nlohmann::json ids = nlohmann::json::array();
     std::unordered_map<int64_t, size_t> positions;
@@ -205,7 +205,15 @@ void validateObjectDetail(const ObjectRecord& rec)
 
 void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
 {
-    for (const char* table : {"fibers", "patches", "tracks"}) {
+    // A surface's area is the store's (refreshSurfaceArea), kept across record
+    // writes, as is its detail row when a record carries none.
+    std::optional<double> storedArea;
+    {
+        Statement area(db, "SELECT area FROM surfaces WHERE object_id=?", id);
+        if (area.row()) storedArea = area.f64(0);
+    }
+    for (const char* table : {"fibers", "surfaces", "tracks"}) {
+        if (storedArea && rec.kind == "surface" && !rec.surface && std::string(table) == "surfaces") continue;
         execute(db, std::string("DELETE FROM ") + table + " WHERE object_id=?", id);
     }
     bool written = false;
@@ -232,6 +240,7 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         row.stepDone();
         written = true;
     });
+    if (storedArea && rec.surface) execute(db, "UPDATE surfaces SET area=? WHERE object_id=?", *storedArea, id);
 }
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags)
@@ -267,10 +276,10 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     Savepoint savepoint(db);
     if (input.kind.empty())
         throw std::runtime_error("object store: object kind must be non-empty");
-    if (input.patch)
-        for (double axis : input.patch->scale)
+    if (input.surface)
+        for (double axis : input.surface->scale)
             if (!std::isfinite(axis) || axis < 0)
-                throw std::runtime_error("object store: patch scale must be finite and nonnegative");
+                throw std::runtime_error("object store: surface scale must be finite and nonnegative");
     ObjectRecord rec = input;
     if (rec.uuid.empty())
         rec.uuid = util::newUuid();

@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "vc/core/util/MemMap.hpp"
+#include <vc_object_store/MemMap.hpp>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -154,15 +154,6 @@ inline bool isFinitePoint(const cv::Vec3f& p) noexcept
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
-inline bool isValidSurfacePoint(const cv::Vec3f& p) noexcept
-{
-    return p[0] != -1.0f && isFinitePoint(p);
-}
-
-inline bool isValidMappedSurfacePoint(const cv::Vec3f& p) noexcept
-{
-    return p[2] > 0.0f && isFinitePoint(p);
-}
 
 inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
 {
@@ -486,7 +477,7 @@ public:
     }
 
 private:
-    vc::memmap::MappedFileRO map_;
+    vc::objects::memmap::MappedFileRO map_;
 };
 
 class MappedTifBand {
@@ -630,81 +621,6 @@ struct SurfaceForIndex {
     int cols = 0;
 };
 
-std::vector<LoadedSurface> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
-{
-    constexpr size_t kBatchSize = 5000;
-    constexpr size_t kMaxWorkers = 8;
-
-    std::vector<LoadedSurface> loaded;
-    loaded.reserve(surfaces.size());
-
-    for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
-        const size_t batchEnd = std::min(batchStart + kBatchSize, surfaces.size());
-        const size_t batchSize = batchEnd - batchStart;
-        const auto batchTimeStart = std::chrono::steady_clock::now();
-        std::cout << "[SurfacePatchIndex] loading surfaces "
-                  << batchStart << "-" << (batchEnd == 0 ? 0 : batchEnd - 1)
-                  << " / " << surfaces.size() << std::endl;
-        std::vector<LoadedSurface> batchLoaded(batchSize);
-
-        const unsigned hw = std::thread::hardware_concurrency();
-        const size_t workerCount = std::max<size_t>(
-            1, std::min<size_t>({batchSize, kMaxWorkers, hw == 0 ? 4 : hw}));
-        std::atomic_size_t next{0};
-        std::vector<std::future<void>> workers;
-        workers.reserve(workerCount);
-
-        for (size_t worker = 0; worker < workerCount; ++worker) {
-            workers.emplace_back(std::async(std::launch::async, [&]() {
-                while (true) {
-                    const size_t localIndex = next.fetch_add(1, std::memory_order_relaxed);
-                    if (localIndex >= batchSize) {
-                        break;
-                    }
-
-                    const auto& s = surfaces[batchStart + localIndex];
-                    if (!s) {
-                        continue;
-                    }
-                    const bool wasLoaded = s->isLoaded();
-                    if (!wasLoaded) {
-                        if (DebugLoggingEnabled()) {
-                            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
-                        }
-                        s->rawPointsPtr();  // triggers ensureLoaded()
-                    }
-                    if (s->isLoaded()) {
-                        batchLoaded[localIndex] = LoadedSurface{s, wasLoaded, !wasLoaded};
-                        if (DebugLoggingEnabled()) {
-                            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
-                        }
-                    } else if (DebugLoggingEnabled()) {
-                        std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
-                    }
-                }
-            }));
-        }
-
-        for (auto& worker : workers) {
-            worker.get();
-        }
-
-        for (auto& item : batchLoaded) {
-            if (item.surface) {
-                loaded.push_back(std::move(item));
-            }
-        }
-        const double seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - batchTimeStart).count();
-        std::cout << "[SurfacePatchIndex] loaded batch "
-                  << batchEnd << "/" << surfaces.size()
-                  << " cumulative_loaded=" << loaded.size()
-                  << " seconds=" << seconds << std::endl;
-    }
-
-    return loaded;
-}
-
 TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
                                    const cv::Vec3f& a,
                                    const cv::Vec3f& b,
@@ -816,11 +732,6 @@ struct CellKey {
         return static_cast<int>(packed & 0xffffffffULL);
     }
 
-    std::uint64_t packedIndex() const noexcept
-    {
-        return packed;
-    }
-
     bool operator==(const CellKey& other) const noexcept
     {
         return surface.get() == other.surface.get() && packed == other.packed;
@@ -867,24 +778,29 @@ struct SurfacePatchIndex::Impl {
         uint16_t hi[3];
     };
 
-    static uint16_t qEnc(float v) noexcept {
+    // Boxes are snapped outward (lower corners down, upper corners up), so a
+    // snapped box contains its geometry. The 0.01-step margin absorbs the
+    // float rounding of a snapped coordinate, so snapping a snapped box again
+    // returns it unchanged (removal matches boxes exactly).
+    static uint16_t qEnc(float v, bool upper) noexcept {
         if (!std::isfinite(v)) return 0;
-        float t = (v - kQLow) * (65535.0f / kQRange);
-        if (t < 0.0f) return 0;
-        if (t > 65535.0f) return 65535;
-        return static_cast<uint16_t>(t + 0.5f);
+        double t = (double(v) - kQLow) * (65535.0 / kQRange);
+        t = upper ? std::ceil(t - 0.01) : std::floor(t + 0.01);
+        if (t < 0.0) return 0;
+        if (t > 65535.0) return 65535;
+        return static_cast<uint16_t>(t);
     }
     static float qDec(uint16_t c) noexcept {
         return kQLow + float(c) * (kQRange / 65535.0f);
     }
     static QBox boxQuantize(const Box3& b) noexcept {
         QBox q;
-        q.lo[0] = qEnc(b.min_corner().get<0>());
-        q.lo[1] = qEnc(b.min_corner().get<1>());
-        q.lo[2] = qEnc(b.min_corner().get<2>());
-        q.hi[0] = qEnc(b.max_corner().get<0>());
-        q.hi[1] = qEnc(b.max_corner().get<1>());
-        q.hi[2] = qEnc(b.max_corner().get<2>());
+        q.lo[0] = qEnc(b.min_corner().get<0>(), false);
+        q.lo[1] = qEnc(b.min_corner().get<1>(), false);
+        q.lo[2] = qEnc(b.min_corner().get<2>(), false);
+        q.hi[0] = qEnc(b.max_corner().get<0>(), true);
+        q.hi[1] = qEnc(b.max_corner().get<1>(), true);
+        q.hi[2] = qEnc(b.max_corner().get<2>(), true);
         return q;
     }
     static Box3 boxDequantize(const QBox& q) noexcept {
@@ -1383,330 +1299,6 @@ SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&& other) noexc
     return *this;
 }
 
-std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
-                                                   int samplingStride,
-                                                   float bboxPadding)
-{
-    struct SurfaceIdentity {
-        std::string path;
-        std::string id;
-    };
-
-    std::vector<SurfaceIdentity> identities;
-    identities.reserve(surfaces.size());
-    for (const auto& surface : surfaces) {
-        if (!surface) {
-            continue;
-        }
-        identities.push_back({normalized_surface_path(surface.get()), surface->id});
-    }
-    std::sort(identities.begin(), identities.end(),
-              [](const SurfaceIdentity& a, const SurfaceIdentity& b) {
-                  if (a.path != b.path) {
-                      return a.path < b.path;
-                  }
-                  return a.id < b.id;
-              });
-
-    std::uint64_t h = 1469598103934665603ULL;
-    h = fnv1a_update(h, kCacheMagic, sizeof(kCacheMagic));
-    h = fnv1a_update(h, &kCacheVersion, sizeof(kCacheVersion));
-    samplingStride = std::max(1, samplingStride);
-    h = fnv1a_update(h, &samplingStride, sizeof(samplingStride));
-    h = fnv1a_update(h, &bboxPadding, sizeof(bboxPadding));
-    const std::uint64_t surfaceCount = identities.size();
-    h = fnv1a_update(h, &surfaceCount, sizeof(surfaceCount));
-
-    for (const auto& identity : identities) {
-        h = fnv1a_update_string(h, identity.id);
-        h = fnv1a_update_string(h, identity.path);
-        if (!identity.path.empty()) {
-            const std::filesystem::path base(identity.path);
-            hash_path_identity(h, base / "meta.json");
-            hash_path_identity(h, base / "x.tif");
-            hash_path_identity(h, base / "y.tif");
-            hash_path_identity(h, base / "z.tif");
-        }
-    }
-
-    std::ostringstream os;
-    os << std::hex << std::setfill('0') << std::setw(16) << h;
-    return os.str();
-}
-
-bool SurfacePatchIndex::saveCache(const std::filesystem::path& cachePath,
-                                  const std::string& cacheKey) const
-{
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_) {
-        return false;
-    }
-
-    std::error_code ec;
-    std::filesystem::create_directories(cachePath.parent_path(), ec);
-    if (ec) {
-        std::cerr << "[SurfacePatchIndex] cache save: failed to create "
-                  << cachePath.parent_path() << ": " << ec.message() << std::endl;
-        return false;
-    }
-
-    const std::filesystem::path tmpPath = cachePath.string() + ".tmp";
-    std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        std::cerr << "[SurfacePatchIndex] cache save: failed to open " << tmpPath << std::endl;
-        return false;
-    }
-
-    std::vector<QuadSurface*> surfaces;
-    surfaces.reserve(impl_->surfaceRecords.size());
-    for (const auto& it : impl_->surfaceRecords) {
-        if (it.first) {
-            surfaces.push_back(it.first);
-        }
-    }
-    std::sort(surfaces.begin(), surfaces.end(), [](QuadSurface* a, QuadSurface* b) {
-        const std::string ap = normalized_surface_path(a);
-        const std::string bp = normalized_surface_path(b);
-        if (ap != bp) {
-            return ap < bp;
-        }
-        return a->id < b->id;
-    });
-
-    std::unordered_map<QuadSurface*, std::uint32_t> surfaceIndex;
-    surfaceIndex.reserve(surfaces.size());
-    for (std::uint32_t i = 0; i < surfaces.size(); ++i) {
-        surfaceIndex[surfaces[i]] = i;
-    }
-
-    std::vector<Impl::Entry> entries;
-    if (impl_->tree) {
-        entries.reserve(impl_->patchCount);
-        for (const auto& entry : *impl_->tree) {
-            if (surfaceIndex.find(entry.second.surface) != surfaceIndex.end()) {
-                entries.push_back(entry);
-            }
-        }
-    }
-
-    out.write(kCacheMagic, sizeof(kCacheMagic));
-    if (!write_pod(out, kCacheVersion) ||
-        !write_string(out, cacheKey) ||
-        !write_pod(out, impl_->samplingStride) ||
-        !write_pod(out, impl_->bboxPadding)) {
-        return false;
-    }
-
-    const std::uint64_t surfaceCount = surfaces.size();
-    if (!write_pod(out, surfaceCount)) {
-        return false;
-    }
-    for (QuadSurface* surface : surfaces) {
-        const auto recIt = impl_->surfaceRecords.find(surface);
-        if (recIt == impl_->surfaceRecords.end()) {
-            return false;
-        }
-        const Impl::SurfaceCellMask& mask = recIt->second.mask;
-        const std::int32_t rows = mask.rows;
-        const std::int32_t cols = mask.cols;
-        if (!write_string(out, surface->id) ||
-            !write_string(out, normalized_surface_path(surface)) ||
-            !write_pod(out, rows) ||
-            !write_pod(out, cols)) {
-            return false;
-        }
-    }
-
-    const std::uint64_t entryCount = entries.size();
-    if (!write_pod(out, entryCount)) {
-        return false;
-    }
-    for (const auto& entry : entries) {
-        const auto idxIt = surfaceIndex.find(entry.second.surface);
-        if (idxIt == surfaceIndex.end()) {
-            return false;
-        }
-        const std::uint32_t idx = idxIt->second;
-        const std::int32_t i = entry.second.i;
-        const std::int32_t j = entry.second.j;
-        const Impl::QBox qbox = Impl::boxQuantize(entry.first);
-        if (!write_pod(out, idx) ||
-            !write_pod(out, i) ||
-            !write_pod(out, j) ||
-            !write_pod(out, qbox)) {
-            return false;
-        }
-    }
-
-    out.close();
-    if (!out) {
-        return false;
-    }
-    std::filesystem::remove(cachePath, ec);
-    ec.clear();
-    std::filesystem::rename(tmpPath, cachePath, ec);
-    if (ec) {
-        std::cerr << "[SurfacePatchIndex] cache save: failed to publish "
-                  << cachePath << ": " << ec.message() << std::endl;
-        return false;
-    }
-    return true;
-}
-
-bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
-                                  const std::vector<SurfacePtr>& surfaces,
-                                  const std::string& expectedKey)
-{
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    std::ifstream in(cachePath, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-
-    char magic[sizeof(kCacheMagic)]{};
-    in.read(magic, sizeof(magic));
-    if (!in || std::memcmp(magic, kCacheMagic, sizeof(kCacheMagic)) != 0) {
-        return false;
-    }
-
-    std::uint32_t version = 0;
-    std::string storedKey;
-    int storedStride = 1;
-    float storedPadding = 0.0f;
-    if (!read_pod(in, version) ||
-        version != kCacheVersion ||
-        !read_string(in, storedKey) ||
-        storedKey != expectedKey ||
-        !read_pod(in, storedStride) ||
-        !read_pod(in, storedPadding)) {
-        return false;
-    }
-
-    std::unordered_map<std::string, SurfacePtr> byPath;
-    std::unordered_map<std::string, SurfacePtr> byId;
-    byPath.reserve(surfaces.size());
-    byId.reserve(surfaces.size());
-    for (const auto& surface : surfaces) {
-        if (!surface) {
-            continue;
-        }
-        const std::string path = normalized_surface_path(surface.get());
-        if (!path.empty()) {
-            byPath.emplace(path, surface);
-        }
-        byId.emplace(surface->id, surface);
-    }
-
-    std::uint64_t surfaceCount64 = 0;
-    if (!read_pod(in, surfaceCount64) ||
-        surfaceCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
-        return false;
-    }
-
-    struct CachedSurface {
-        SurfacePtr surface;
-        std::int32_t rows = 0;
-        std::int32_t cols = 0;
-    };
-    std::vector<CachedSurface> cachedSurfaces;
-    cachedSurfaces.reserve(static_cast<std::size_t>(surfaceCount64));
-
-    for (std::uint64_t idx = 0; idx < surfaceCount64; ++idx) {
-        std::string id;
-        std::string path;
-        std::int32_t rows = 0;
-        std::int32_t cols = 0;
-        if (!read_string(in, id) ||
-            !read_string(in, path) ||
-            !read_pod(in, rows) ||
-            !read_pod(in, cols) ||
-            rows < 0 ||
-            cols < 0) {
-            return false;
-        }
-
-        SurfacePtr surface;
-        auto pathIt = byPath.find(path);
-        if (pathIt != byPath.end()) {
-            surface = pathIt->second;
-        } else {
-            auto idIt = byId.find(id);
-            if (idIt != byId.end()) {
-                surface = idIt->second;
-            }
-        }
-        if (!surface) {
-            return false;
-        }
-        cachedSurfaces.push_back({surface, rows, cols});
-    }
-
-    std::uint64_t entryCount64 = 0;
-    if (!read_pod(in, entryCount64) ||
-        entryCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        return false;
-    }
-
-    auto newImpl = std::make_unique<Impl>();
-    newImpl->bboxPadding = storedPadding;
-    newImpl->samplingStride = std::max(1, storedStride);
-    newImpl->tileStride = Impl::computeTileStride(newImpl->samplingStride);
-    newImpl->readOnly = impl_ ? impl_->readOnly : false;
-
-    for (const auto& cached : cachedSurfaces) {
-        Impl::SurfaceRecord rec;
-        rec.surface = cached.surface;
-        rec.mask.ensureSize(cached.rows, cached.cols, newImpl->tileStride);
-        newImpl->surfaceRecords[cached.surface.get()] = std::move(rec);
-    }
-
-    std::vector<Impl::Entry> entries;
-    entries.reserve(static_cast<std::size_t>(entryCount64));
-    for (std::uint64_t entryIdx = 0; entryIdx < entryCount64; ++entryIdx) {
-        std::uint32_t surfaceIdx = 0;
-        std::int32_t i = 0;
-        std::int32_t j = 0;
-        Impl::QBox qbox{};
-        if (!read_pod(in, surfaceIdx) ||
-            !read_pod(in, i) ||
-            !read_pod(in, j) ||
-            !read_pod(in, qbox) ||
-            surfaceIdx >= cachedSurfaces.size()) {
-            return false;
-        }
-
-        const SurfacePtr& surface = cachedSurfaces[surfaceIdx].surface;
-        auto recIt = newImpl->surfaceRecords.find(surface.get());
-        if (recIt == newImpl->surfaceRecords.end() ||
-            !recIt->second.mask.validIndex(j, i)) {
-            return false;
-        }
-
-        Impl::PatchRecord rec;
-        rec.surface = surface.get();
-        rec.mapped = recIt->second.mapped.get();
-        rec.i = i;
-        rec.j = j;
-        entries.emplace_back(Impl::boxDequantize(qbox), rec);
-
-        Impl::SurfaceCellMask& mask = recIt->second.mask;
-        mask.setActive(j, i, true);
-        if (auto tileIdx = mask.tileIndex(j, i)) {
-            mask.cachedBoxes[*tileIdx] = qbox;
-        } else {
-            return false;
-        }
-    }
-
-    newImpl->patchCount = entries.size();
-    if (!entries.empty()) {
-        newImpl->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
-    }
-    impl_ = std::move(newImpl);
-    globalGeneration_.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
 SurfacePatchIndex::Impl::SurfaceRecord* SurfacePatchIndex::Impl::getRecord(QuadSurface* raw)
 {
     auto it = surfaceRecords.find(raw);
@@ -1845,7 +1437,7 @@ bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
-        if (!isValidMappedSurfacePoint(p)) return;
+        if (!vc::geometry::validSurfacePoint(p)) return;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
@@ -3139,8 +2731,8 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
         p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
     }
 
-    const auto valid = rec.mapped ? isValidMappedSurfacePoint : isValidSurfacePoint;
-    if (!valid(p00) || !valid(p10) || !valid(p01) || !valid(p11)) {
+    if (!vc::geometry::validSurfacePoint(p00) || !vc::geometry::validSurfacePoint(p10) ||
+        !vc::geometry::validSurfacePoint(p01) || !vc::geometry::validSurfacePoint(p11)) {
         return false;
     }
 
@@ -3191,7 +2783,7 @@ bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
                    std::numeric_limits<float>::lowest()};
     bool hasValidPoint = false;
     auto extend = [&](const cv::Vec3f& p) {
-        if (!isValidSurfacePoint(p)) return;
+        if (!vc::geometry::validSurfacePoint(p)) return;
         hasValidPoint = true;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);

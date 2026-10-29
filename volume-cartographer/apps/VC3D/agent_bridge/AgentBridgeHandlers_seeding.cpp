@@ -37,7 +37,7 @@
 #include "MenuActionController.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "OpenDataSegmentCache.hpp"
+#include "OpenDataManifest.hpp"
 #include "SeedingWidget.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfacePanelController.hpp"
@@ -53,7 +53,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -83,11 +82,6 @@ QJsonObject pushPullConfigToJson(const AlphaPushPullConfig& c)
 
 QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
@@ -98,40 +92,16 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
     const QString tagStr = p.value("tag").toString();
     const bool enabled = p.value("enabled").toBool();
 
-    // Keep this mapping aligned with SurfacePanelController::Tag.
-    SurfacePanelController::Tag tag;
-    if (tagStr == QLatin1String("approved"))
-        tag = SurfacePanelController::Tag::Approved;
-    else if (tagStr == QLatin1String("defective"))
-        tag = SurfacePanelController::Tag::Defective;
-    else if (tagStr == QLatin1String("reviewed"))
-        tag = SurfacePanelController::Tag::Reviewed;
-    else if (tagStr == QLatin1String("inspect"))
-        tag = SurfacePanelController::Tag::Inspect;
-    else
-        tag = SurfacePanelController::Tag::Inspect;
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
+    // Review tags are record tags of the surface in its store.
+    const auto& row = writableCatalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    const std::vector<std::string> tag{tagStr.toStdString()};
+    try {
+        _window->_surfaceCatalog->session()->tagObjects(*_window->_surfaceCatalog->attachment(), {row.record.uuid},
+                                                         enabled ? tag : std::vector<std::string>{},
+                                                         enabled ? std::vector<std::string>{} : tag);
+    } catch (const std::exception& error) {
         QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Select first, leaving segmentId active so the tag checkboxes are enabled,
-    // then set the tag. selectSurfaceById returns false for an unknown or
-    // unloaded id.
-    const std::string segmentId = segmentIdQ.toStdString();
-    if (!panel->selectSurfaceById(segmentId)) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
-    if (!panel->setTagChecked(tag, enabled)) {
-        // Selection succeeded but the tag checkbox is unavailable/disabled.
-        QJsonObject data;
-        data["detail"] = "tag checkbox is not available for this segment";
+        data["detail"] = QString::fromUtf8(error.what());
         throw AgentBridgeError{-32010, "Tag could not be set", data};
     }
 
@@ -160,56 +130,6 @@ QJsonObject AgentBridgeServer::handleSeedingSetWindingAnnotationMode(const QJson
     widget->setRelWindingAnnotationMode(active);
     QJsonObject result;
     result["active"] = active;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleSeedingPreviewRays(const QJsonValue&)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
-    if (!widget) {
-        QJsonObject data;
-        data["detail"] = "seeding widget is not available";
-        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
-    }
-    QString errorMessage;
-    if (!widget->previewRaysHeadless(&errorMessage)) {
-        QJsonObject data;
-        data["detail"] = errorMessage;
-        throw AgentBridgeError{-32007, "Cannot preview rays", data};
-    }
-    QJsonObject result;
-    result["requested"] = true;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleSeedingCastRays(const QJsonValue&)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->hasVpkg())
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-    if (!state->currentVolume())
-        throw AgentBridgeError{-32001, "No volume loaded", {}};
-    SeedingWidget* widget = _window ? _window->_seedingWidget : nullptr;
-    if (!widget) {
-        QJsonObject data;
-        data["detail"] = "seeding widget is not available";
-        throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
-    }
-    QString errorMessage;
-    if (!widget->castRaysHeadless(&errorMessage)) {
-        QJsonObject data;
-        data["detail"] = errorMessage;
-        throw AgentBridgeError{-32007, "Cannot cast rays", data};
-    }
-    QJsonObject result;
-    result["requested"] = true;
     return result;
 }
 
@@ -262,11 +182,10 @@ QJsonObject AgentBridgeServer::launchSeedingBatch(
         // vc_grow_seg_from_seed missing -> -32006.
         if (err.contains(QLatin1String("executable not found"), Qt::CaseInsensitive))
             throw AgentBridgeError{-32006, "vc_grow_seg_from_seed not found", data};
-        // Missing config/paths inputs -> -32007 kind:"file" (mirrors
+        // Missing config inputs -> -32007 kind:"file" (mirrors
         // tracer.run_trace's treatment of a missing trace_params.json).
         if (err.contains(QLatin1String("seed.json"), Qt::CaseInsensitive) ||
-            err.contains(QLatin1String("expand.json"), Qt::CaseInsensitive) ||
-            err.contains(QLatin1String("paths directory"), Qt::CaseInsensitive)) {
+            err.contains(QLatin1String("expand.json"), Qt::CaseInsensitive)) {
             data["kind"] = "file";
             throw AgentBridgeError{-32007, err, data};
         }
@@ -352,7 +271,7 @@ QJsonObject AgentBridgeServer::handleSeedingAnalyzePaths(const QJsonValue&)
     }
     // Synchronous, in-process compute (no QProcess, no nested event loop): runs
     // to completion before returning, so this is a plain synchronous RPC rather
-    // than a job. Requires paths drawn in the widget's Draw mode.
+    // than a job. Requires paths drawn in the widget.
     QString err;
     int pathsAnalyzed = 0;
     int peaksFound = 0;
@@ -506,7 +425,8 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
         rt.paramOverrides = overrides.toObject();
     if (p.contains("ompThreads"))
         rt.ompThreads = p.value("ompThreads").toInt();
-    rt.tgtDir = p.value("outputDir").toString();
+    rt.sourceTag = p.value("sourceTag").toString(rt.sourceTag);
+    rt.outputTag = p.value("outputTag").toString(rt.outputTag);
 
     const QString jobId = beginJob(QStringLiteral("tool"),
                                    QStringLiteral("tracer.run_trace"),
@@ -514,24 +434,20 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
                                    /*broadcastStart=*/false);
 
     CommandLaunchError error;
-    QString outputDir;
-    if (!handler->startRunTrace(
-            segmentIdQ.toStdString(), rt, &error, &outputDir)) {
+    if (!handler->startRunTrace(segmentIdQ.toStdString(), rt, &error)) {
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start Run Trace",
                                 segmentIdQ, "tool");
     }
 
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The traced surfaces' UUIDs arrive with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = "tracer.run_trace";
     result["source"] = "tool";
-    result["outputDir"] = outputDir;
     return result;
 }
 
@@ -558,8 +474,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     SegmentationCommandHandler::RenderSegmentParams rp;
 
-    // outputFormat: required; the headline new capability over the GUI (which is
-    // hardcoded to a per-slice TIFF stack).
+    // outputFormat: "zarr", otherwise a per-slice TIFF stack.
     const QString outputFormat = p.value("outputFormat").toString();
     if (outputFormat == QLatin1String("zarr")) {
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::Zarr;
@@ -567,7 +482,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::TifStack;
 
     // volumeId: optional; validated here so a bad id is a clean -32007 before the
-    // job is registered (mirrors segmentation.grow_patch_from_seed).
+    // job is registered (mirrors segmentation.grow_surface_from_seed).
     rp.volumeId = p.value("volumeId").toString();
     if (!rp.volumeId.isEmpty()) {
         const auto ids = state->vpkg()->volumeIDs();

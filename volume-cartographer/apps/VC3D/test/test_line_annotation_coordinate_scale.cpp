@@ -6,36 +6,11 @@ class TestLineAnnotationCoordinateScale : public QObject {
     Q_OBJECT
 
 private slots:
-    void stampsExactViewerGrid();
     void acceptsSameLevelOffByOneDomains();
     void acceptsDyadicNormalAndFiberDomains();
-    void mapsFiberBaseCoordinatesIntoDownsampledVolume();
     void preservesLegacyUnspecifiedDomains();
     void rejectsIncompatibleDomains();
 };
-
-void TestLineAnnotationCoordinateScale::stampsExactViewerGrid()
-{
-    using vc3d::line_annotation::fiberCoordinateShapeFromVolume;
-    const std::array<std::size_t, 3> expected{18946, 8174, 8174};
-    QVERIFY(fiberCoordinateShapeFromVolume({18946, 8174, 8174}) == expected);
-    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({0, 8174, 8174}),
-                             std::runtime_error);
-    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({18946, -1, 8174}),
-                             std::runtime_error);
-}
-
-void TestLineAnnotationCoordinateScale::mapsFiberBaseCoordinatesIntoDownsampledVolume()
-{
-    const std::optional<std::array<std::size_t, 3>> fiberShape{
-        std::array<std::size_t, 3>{75784, 32694, 32694}};
-
-    const double scale =
-        vc3d::line_annotation::resolveFiberBaseToVolumeScale(
-            fiberShape, {18946, 8174, 8174});
-
-    QCOMPARE(scale, 0.25);
-}
 
 void TestLineAnnotationCoordinateScale::acceptsSameLevelOffByOneDomains()
 {

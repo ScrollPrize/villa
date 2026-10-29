@@ -1,4 +1,6 @@
 #pragma once
+#include "vc_object_store/objects/SurfaceTileCache.hpp"
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 
 // SQLite object database with immutable geometry and relationship metadata.
 
@@ -9,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <map>
 #include <optional>
@@ -31,10 +34,14 @@ struct FiberDetail {
     std::optional<std::array<double, 6>> bbox;  // minx,miny,minz,maxx,maxy,maxz
 };
 
-struct PatchDetail {
+struct SurfaceDetail {
     int64_t gridWidth = 0;
     int64_t gridHeight = 0;
     std::array<double, 2> scale{0.0, 0.0};  // column and row scale, as in tifxyz meta.json
+    // The grid's area in stored units squared (geometry::surfaceGridArea over
+    // its valid vertices). The store keeps it with the geometry head; a record
+    // write keeps the stored value.
+    double area = 0.0;
     std::optional<std::array<double, 6>> bbox;
 };
 
@@ -72,13 +79,17 @@ struct ObjectRecord : RecordCommon {
     int64_t dataGeneration = 0;
     std::optional<std::string> dataChecksum;
     std::optional<FiberDetail> fiber;
-    std::optional<PatchDetail> patch;
+    std::optional<SurfaceDetail> surface;
     std::optional<TrackDetail> track;
+    // Set by volume selections ordered by length on objects bound to the
+    // volume: the target-voxel length they were ordered by, which is the
+    // afterLength cursor for the next page.
+    std::optional<double> volumeLength;
 };
 
 struct PointReference {
     // Geometry array and point coordinates, excluding the final XYZ axis:
-    // control_points:[5], line_points:[12], points:[20,145] (patch row,col).
+    // control_points:[5], line_points:[12], points:[20,145] (surface row,col).
     // point_ids:[42] addresses stable point ID 42 in a point_collection.
     std::string array;
     std::vector<int64_t> index;
@@ -111,14 +122,22 @@ struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
-    // False for sync baselines whose original metadata history was not copied.
+    // False for baselines a hub pull installed without their original metadata history.
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
-    // increasing within this store. Missing only for untimed sync baselines.
+    // increasing within this store. Missing only for those untimed baselines.
     std::optional<int64_t> publishedAtUs;
     bool deleted = false;
     ObjectRecord record;
 };
+
+// Edge kind tying a data object to the object it describes (e.g. fit results
+// attached to a surface). Attachments are not graph links: traversal
+// (componentOf, reachableWithin, connectedTo), neighbours() and graph read views
+// skip them unless the attachment kind is requested explicitly. Edge listings
+// and exports include them. Point collections attached this way carry a record
+// meta "role" and are never linked to surfaces by the point-collection linker.
+inline constexpr const char* kAttachmentEdgeKind = "attachment";
 
 // Edge changes revise both endpoints atomically; unchanged membership is inherited.
 // Pins are immutable objectRevision() UUIDs, never moving heads.
@@ -147,6 +166,7 @@ struct JournalEntry {
 };
 
 struct OpenOptions {
+    std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransforms;
     bool readOnly = false;
     int readerPoolSize = 4;
     int busyTimeoutMs = 5000;
@@ -158,11 +178,22 @@ struct OpenOptions {
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
+    // Decoded surface tiles shared by all connections (and by other stores
+    // given the same cache); none: every read decodes its tiles.
+    std::shared_ptr<SurfaceTileCache> surfaceTiles;
+    // An edit whose sparse delta would exceed this many raw bytes is published
+    // as a full revision instead (unchanged chunks are shared by hash). Capped
+    // at 256 MiB, the largest delta read back.
+    std::size_t maxGeometryDeltaBytes = 256 * 1024 * 1024;
     // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
     // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
     // Only the hub functions in objects/Hub.hpp open stores this way; ordinary
     // opens of a hub are rejected so they cannot switch it back to WAL.
     bool sharedFile = false;
+    // Called (on the reading thread, inside the read) with the surfaces a
+    // geometryRegion or nearestSurfaces query reached whose geometry is not
+    // local yet. Must only queue work; ObjectStoreSession sets it on writable attachments.
+    std::function<void(const std::vector<std::string>&)> remoteGeometryReached;
 };
 
 struct ObjectSelection {
@@ -185,17 +216,22 @@ struct ObjectSelection {
     // Exact declared coordinate system (JSON volume_uuid/scale_factor).
     // Missing declarations compare as null; absent filter matches all frames.
     std::optional<std::string> coordinates;
-    // Volume target, exclusive with coordinates: matches objects declared in
-    // this volume ID with a scale factor, across every such frame. bbox,
-    // minLength, afterLength and length_desc then use that volume's voxels,
-    // where volume length = stored length * (1 / scale_factor), the factor of
-    // geometryScaleToVolume(). length_desc ties order by stored length, then
-    // UUID. Returned records and region bounds keep their stored coordinates.
+    // Explicit target volume, exclusive with coordinates. Includes compatible
+    // registered frames. Bounds and length filters use target voxels; affine
+    // lengths are measured from the transformed polyline. Returned object
+    // records retain their canonical metadata. Spatial regions use target bounds.
     std::optional<std::string> volume;
+    // With volume: target voxels at this scale of the volume's (as in RegionOptions).
+    double targetScale = 1;
     // With volume: also list objects not bound to it, after the bound ones in
     // UUID order (a cursor into them has afterUuid without afterLength).
     // Excluded when minLength is positive. Not valid for spatialRegions.
     bool includeUnbound = false;
+    std::shared_ptr<const VolumeTransforms> transforms;
+    // Objects with at least one tag of every group (`tag` is a group of one)
+    // and none of `withoutTags`.
+    std::vector<std::vector<std::string>> tagGroups;
+    std::vector<std::string> withoutTags;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -211,6 +247,8 @@ struct EdgeSelection {
     std::optional<bool> adjacent;
     // Shared membership/dependencies against latest heads. Requires a ReadTxn.
     bool applicableOnly = false;
+    // false skips attachment edges (graph read views do unless kind asks for them).
+    bool attachments = true;
 };
 
 // Snapshot topology in selection order. Every edge, including self/parallel edges,
@@ -252,22 +290,6 @@ struct SpatialRegion {
 struct JsonExportOptions {
     ObjectSelection selection;
     std::vector<std::string> fields; // top-level record fields; UUIDs/endpoints always retained
-};
-
-struct SyncOptions {
-    bool dryRun = false;
-    std::map<std::string, std::string> resolutions; // record UUID -> "local" or "remote"
-    std::optional<std::string> expectedPlan; // preview token; required with resolutions
-};
-struct SyncConflict {
-    std::string uuid, reason;
-    std::string base, local, remote; // canonical record JSON, or "null" for absence/deletion
-};
-struct SyncReport {
-    bool applied = false;
-    std::string localReplica, remoteReplica, planToken;
-    int64_t localChanges = 0, remoteChanges = 0;
-    std::vector<SyncConflict> conflicts;
 };
 
 class ObjectStore;
@@ -350,8 +372,17 @@ public:
     ObjectStore& operator=(const ObjectStore&) = delete;
     ~ObjectStore();
     ReadTxn read();
-    // Typed, bounded geometry reads. Include store/GeometryViews.hpp to use.
-    GeometrySnapshot geometrySnapshot();
+    VolumeTransforms volumeTransforms(const Txn&) const;
+    std::vector<vcr::catalog::TransformResolution> availableTransforms(const Txn&, const std::string& objectUuid) const;
+    // Exact polyline length after mapping to target voxels; reads bounded chunks.
+    double geometryLengthInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1) const;
+    std::string registerVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
+        const VolumeAffine&, const std::string& name, const std::optional<std::string>& uuid = std::nullopt);
+    // The route from `source` to `target` (registration keys as a resolution's
+    // candidate path). Updates the pair's existing choice, else creates one
+    // (as `uuid` when given).
+    std::string chooseVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
+        const std::vector<std::string>& path, const std::optional<std::string>& uuid = std::nullopt);
     WriteTxn write();
     // Check supplied heads before editing; require every changed object/endpoint.
     // Commit publishes one revision per changed object. Missing expectations or
@@ -363,6 +394,9 @@ public:
     // Latest live revisions at/before this time; actions are indivisible.
     // Empty before the first publication; excludes deletions.
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
+    // The current revisions of the selected objects (a pin for each), without a
+    // query per object.
+    RevisionSelection currentRevisions(const Txn&, const ObjectSelection&) const;
     std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
@@ -373,6 +407,9 @@ public:
     // Keep historical pins after an endpoint edit without asserting that the
     // relationship applies to the edited endpoint. Current queries may be stale.
     void keepRecordedRelationship(WriteTxn&, const std::string& edgeUuid);
+    // keepRecordedRelationship for every relationship of the object, retired
+    // ones included (e.g. after a record-only edit of it).
+    void keepRecordedRelationshipsOf(WriteTxn&, const std::string& objectUuid);
     const std::filesystem::path& path() const;
     std::string hostname() const;
     std::string author() const;
@@ -380,13 +417,8 @@ public:
     // Stable store identity, independent of its filesystem location.
     std::string uuid(const Txn&) const;
 
-    // Two-store three-way merge. Conflicts/dry runs leave both stores untouched.
-    // Both stores must be writable, with no active caller write transactions.
-    // Commits are sequential; retained common baselines make interrupted sync retryable.
-    SyncReport synchronize(ObjectStore& peer, const SyncOptions& options = {});
     std::string replicaUuid(const Txn&) const;
-    // Assign a copied database its own replica identity before editing/synchronizing it.
-    // Clears sync history; synchronize with the original before editing either copy.
+    // Assign a copied database its own replica identity.
     std::string forkReplica();
 
     // Create/update by UUID (mint one if empty). Updates bump generation, stamp
@@ -412,7 +444,7 @@ public:
                        const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
-    // Create geometry, or replace a patch; sequences use structural/sparse edits.
+    // Create geometry, or replace a surface; sequences use structural/sparse edits.
     // Creation consumes source point annotations into the immutable revision.
     // Null expectedRevision expects no geometry; stale writers fail. Every
     // affected edge requires an explicit retain/update/remove decision.
@@ -432,6 +464,11 @@ public:
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision,
                              const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    // As above, choosing the decisions for the relationships the edit affects
+    // from the same plan (affectedGeometryEditEdges + editGeometry plans twice).
+    using EdgeDecider = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
+    std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision, const EdgeDecider& decide);
     std::vector<EdgeRecord> affectedGeometryEditEdges(const Txn&, const std::string& objectUuid,
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision) const;
@@ -483,7 +520,7 @@ public:
     std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
 
-    // Dense row-major rectangle from any aligned patch array. Exact
+    // Dense row-major rectangle from any aligned surface array. Exact
     // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.
     // Rectangle/range reads may reuse verified bytes on a pooled reader until
     // its next snapshot observes a commit. Writes always use fresh readers.
@@ -506,6 +543,11 @@ public:
     // Both bump generation and reset approval, like any content change.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
+    // Declare an object's coordinate frame: stored at `storedUnitsPerVoxel`
+    // units per voxel of `volume`, merged into its meta.coordinates, refusing a
+    // conflict with what it already declares.
+    void bindGeometryCoordinates(WriteTxn&, const std::string& objectUuid, const std::string& volume,
+                                 double storedUnitsPerVoxel);
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
     int64_t journalPosition(const Txn& txn) const;
@@ -529,6 +571,13 @@ public:
     // Projection always includes uuid/kind/a/b; empty fields means identities.
     std::vector<EdgeRecord> selectEdges(const Txn&, const EdgeSelection& = {},
         const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
+    // Attach object `data` to `owner` in `role` (kAttachmentEdgeKind, whole
+    // geometry at both ends, the role in the edge meta). Returns the edge UUID.
+    std::string attach(WriteTxn&, const std::string& dataUuid, const std::string& ownerUuid, const std::string& role);
+    // The attachment relationships of `owner`, in `role` when given, in UUID
+    // order; the attached object is the endpoint other than `owner`.
+    std::vector<EdgeRecord> attachments(const Txn&, const std::string& ownerUuid,
+                                        const std::optional<std::string>& role = std::nullopt) const;
     // Both endpoints must belong to the selected objects. Reads topology,
     // generations and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
@@ -566,6 +615,8 @@ public:
     // owned partial runs, no continuation or coverage cache.
     RegionResult geometryRegion(const ReadTxn&, const RegionSlice&,
         const RegionOptions& = {}, const RegionCancel& cancel = {}) const;
+    // Nearest point of each surface near a point, from the persisted tile index.
+    std::vector<SurfaceProximityHit> nearestSurfaces(const ReadTxn&, const SurfaceProximityQuery&) const;
 
     // Requires selection.bbox. Same filters as selectObjects, but pagination
     // counts regions, ordered by object UUID, array name and start indices.
@@ -575,7 +626,7 @@ public:
     std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
     void importJson(WriteTxn&, const std::string&);
 
-    // Resolve patch/fiber/point_collection source UUIDs: verify storageRef, then
+    // Resolve surface/fiber/point_collection source UUIDs: verify storageRef, then
     // search datasetRoot (default: DB directory; also rebases relative hints).
     // Read JSON only; skip hidden/Zarr directories and directory symlinks. No cache
     // or writes. Return an absolute path or nullopt; ambiguity/traversal errors throw.
@@ -592,6 +643,9 @@ private:
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create);
     explicit ObjectStore(std::unique_ptr<Impl>);
     void* connection(const Txn&) const;
+    std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits,
+                             const EdgeDecider* decide);
     std::unique_ptr<Impl> impl_;
     friend class Txn;
 };

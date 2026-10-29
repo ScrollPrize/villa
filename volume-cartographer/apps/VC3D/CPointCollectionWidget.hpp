@@ -2,6 +2,7 @@
 
 #include <QDockWidget>
 #include "vc/ui/VCCollection.hpp"
+#include "utils/Json.hpp"
 #include <QTreeView>
 #include <QStandardItemModel>
 #include <QPushButton>
@@ -37,7 +38,8 @@ public:
     explicit CPointCollectionWidget(VCCollection *collection, QWidget *parent = nullptr);
     ~CPointCollectionWidget();
 
-    void loadCorrPointsResults(const std::filesystem::path& jsonPath);
+    // Lasagna's results for the surface's correction points (points_list).
+    void loadCorrPointsResults(const utils::Json& results);
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);
@@ -82,8 +84,6 @@ private slots:
     void onFillWindingPlusClicked();
     void onFillWindingMinusClicked();
     void onFillWindingEqualsClicked();
-    void onSaveClicked();
-    void onLoadClicked();
     void onConvertToAnchorClicked();
     void onClearAnchorClicked();
     void showContextMenu(const QPoint& pos);
@@ -105,8 +105,6 @@ private slots:
     QTreeView *_tree_view;
     QStandardItemModel *_model;
  
-    QPushButton *_load_button;
-    QPushButton *_save_button;
     QPushButton *_reset_button;
     QPushButton *_reset_winding_button;
 

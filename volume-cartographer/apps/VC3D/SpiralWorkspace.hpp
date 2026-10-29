@@ -13,6 +13,7 @@
 #include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <vc_reader/affine.hpp>
 #include <atomic>
 #include <array>
 #include <cstddef>
@@ -38,6 +39,7 @@ class ViewerSplitGrid;
 class VolumePkg;
 class Volume;
 class SpiralOverlayController;
+class StoreSurfaceOverlayController;
 class SpiralMinimap;
 class SpiralBrushController;
 class SpiralLineDraftOverlay;
@@ -57,19 +59,16 @@ public:
     ViewerSplitGrid* viewerGrid() const { return _grid; }
     QComboBox* volumeSelectionControl() const;
     void synchronizeVolume(const std::shared_ptr<Volume>& volume,
-                           const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+                           const std::optional<vcr::catalog::Affine>& navigationTransform = std::nullopt);
 
     // Cross-panel entry points for "Add to current spiral fit".
-    bool hasActiveSpiralSession() const;
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
     bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
     void refreshTrackedFibers();
     void noteFiberRetired(const QString& objectUuid);
-    bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);
     bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
-    void noteManagedPatchSaved(const QString& path);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);
@@ -109,7 +108,6 @@ private:
             double p50 = 0.0;
             double p95 = 0.0;
             double maximum = 0.0;
-            double displayMaximum = 0.0;
             qint64 sampleCount = 0;
             qint64 eligibleSampleCount = 0;
             qint64 projectedSampleCount = 0;
@@ -163,10 +161,10 @@ private:
     void updateMinimapViewIndicator();
     void panFlattenedViewerToColumn(float column);
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
-    void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
-                                        const QString& registrationId,
-                                        qint64 generation, quint64 revision,
-                                        bool preserveFocus, int attempt);
+    void syncSurfaceDrafts(const std::shared_ptr<QuadSurface>& edited = nullptr);
+    void clearSurfaceDrafts();
+    void installPreviewAlias(const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
+                             qint64 generation, quint64 revision, bool preserveFocus);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void registerPendingPatchSurface(const QString& inputId,
@@ -203,6 +201,11 @@ private:
     std::unique_ptr<ViewerManager> _viewerManager;
     std::unique_ptr<AxisAlignedSliceController> _slices;
     std::unique_ptr<SpiralOverlayController> _overlay;
+    std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
+    // Spiral's surfaces are files, not stored objects: each shown one is a
+    // draft of the store session under its (UUID) id, so store queries
+    // (intersections, lookups, overlaps) see it.
+    std::map<std::string, std::weak_ptr<QuadSurface>> _surfaceDrafts;
     std::unique_ptr<SpiralBrushController> _brush;
     std::unique_ptr<SpiralLineDraftOverlay> _lineDraftOverlay;
     // The display-only overlay of one editable PCL role (same-winding or
