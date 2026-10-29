@@ -343,6 +343,12 @@ vc_add_test(NAME test_surface_meshing)
 # configurations that build the apps -- the test shards configure with
 # VC_BUILD_APPS=OFF and apps/ returns before the tool targets are created.
 if(VC_BUILD_APPS)
+    vc_add_test(NAME test_sparse_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
+    add_dependencies(test_sparse_zarr_output vc_tifxyz2zarr_sparse)
+    set_tests_properties(test_sparse_zarr_output PROPERTIES
+        ENVIRONMENT "VC_TIFXYZ2ZARR_SPARSE_BIN=$<TARGET_FILE:vc_tifxyz2zarr_sparse>"
+        TIMEOUT 180)
+
     # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
     vc_add_test(NAME test_grow_seg_store_mode)
     add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)

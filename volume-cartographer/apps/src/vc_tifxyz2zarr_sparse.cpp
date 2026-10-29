@@ -4,8 +4,7 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/TriangleVoxelRaster.hpp"
-#include "vc/core/util/Zarr.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 
 #include <boost/program_options.hpp>
 
@@ -529,10 +528,6 @@ private:
                        ChunkIndexHash> m_buffers;
 };
 
-static std::vector<size_t> toVector(const Shape3& s) {
-    return {s[0], s[1], s[2]};
-}
-
 static bool hasTifxyzInDir(const fs::path& path) {
     return fs::is_directory(path)
         && fs::is_regular_file(path / "x.tif")
@@ -601,20 +596,20 @@ static std::vector<fs::path> discoverTifxyzMeshes(const fs::path& inputRoot) {
 static Shape3 parseShapeFromReference(const fs::path& ref) {
     fs::path ds = ref;
     if (fs::exists(ref / "0") && fs::is_directory(ref / "0") &&
-        fs::exists(ref / "0" / ".zarray")) {
+        (fs::exists(ref / "0" / ".zarray") || fs::exists(ref / "0" / "zarr.json"))) {
         ds = ref / "0";
-    } else if (fs::exists(ref / ".zarray")) {
+    } else if (fs::exists(ref / ".zarray") || fs::exists(ref / "zarr.json")) {
         ds = ref;
     } else {
         throw std::runtime_error("reference path is not a zarr array or level-0 array: " + ref.string());
     }
 
-    vc::VcDataset dset(ds);
-    const auto& s = dset.shape();
-    if (s.size() < 3) {
+    auto dset = vcr::zarr::openArray(ds.string(), {});
+    const auto& s = dset.meta.shape;
+    if (s.size() != 3) {
         throw std::runtime_error("reference zarr must have 3 dimensions (Z,Y,X)");
     }
-    return {s[0], s[1], s[2]};
+    return {size_t(s[0]), size_t(s[1]), size_t(s[2])};
 }
 
 static std::pair<std::size_t, std::size_t> normalizeZRange(long long requestedMin,
@@ -1048,7 +1043,7 @@ static void rasterizePhase(const std::vector<fs::path>& meshes,
 static void materializeChunk(const ChunkIndex& chunk,
                             const Shape3& shape,
                             const Shape3& chunkShape,
-                            const fs::path& level0Dir,
+                            vcr::zarr::Writer& output,
                             SpoolManager& spool,
                             std::atomic<uint64_t>* uniqueLevel0Voxels) {
     const std::vector<size_t> chunkShapeVec = {chunkShape[0], chunkShape[1], chunkShape[2]};
@@ -1101,9 +1096,8 @@ static void materializeChunk(const ChunkIndex& chunk,
 
     if (!chunkHasAnyNonZero(chunkBuf)) return;
 
-    vc::VcDataset ds(level0Dir);
-    ds.writeChunk(chunk.z, chunk.y, chunk.x,
-                 chunkBuf.data(), chunkBuf.size() * sizeof(uint8_t));
+    output.writeChunk({chunk.z, chunk.y, chunk.x},
+                      chunkBuf.data(), chunkBuf.size());
 }
 
 static void materializePhase(const std::vector<ChunkIndex>& touched,
@@ -1116,6 +1110,7 @@ static void materializePhase(const std::vector<ChunkIndex>& touched,
                             std::atomic<uint64_t>* uniqueLevel0Voxels) {
     if (touched.empty()) return;
 
+    auto output = vcr::zarr::Writer::open(level0Dir);
     std::atomic<size_t> nextIndex{0};
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
@@ -1128,7 +1123,7 @@ static void materializePhase(const std::vector<ChunkIndex>& touched,
                 if (idx >= touched.size()) break;
 
                 try {
-                    materializeChunk(touched[idx], shape, chunkShape, level0Dir, spool, uniqueLevel0Voxels);
+                    materializeChunk(touched[idx], shape, chunkShape, output, spool, uniqueLevel0Voxels);
                 } catch (const std::exception& e) {
                     std::cerr << "materialization failed for chunk ["
                               << touched[idx].z << ", "
@@ -1150,17 +1145,19 @@ static std::vector<ChunkIndex> buildIsotropicPyramidLevel(const fs::path& outDir
     const fs::path srcPath = outDir / std::to_string(level - 1);
     const fs::path dstPath = outDir / std::to_string(level);
 
-    vc::VcDataset src(srcPath);
-    vc::VcDataset dst(dstPath);
+    vcr::zarr::OpenOptions options;
+    options.threads = 1;  // The outer workers already parallelize chunk reads.
+    auto src = vcr::zarr::openArray(srcPath.string(), options);
+    auto dst = vcr::zarr::Writer::open(dstPath);
 
-    const auto& srcShape = src.shape();
-    const auto& srcChunk = src.defaultChunkShape();
-    const auto& dstShape = dst.shape();
-    const auto& dstChunk = dst.defaultChunkShape();
-    const Shape3 srcShape3 = {srcShape[0], srcShape[1], srcShape[2]};
-    const Shape3 srcChunk3 = {srcChunk[0], srcChunk[1], srcChunk[2]};
-    const Shape3 dstShape3 = {dstShape[0], dstShape[1], dstShape[2]};
-    const Shape3 dstChunk3 = {dstChunk[0], dstChunk[1], dstChunk[2]};
+    const auto& srcShape = src.meta.shape;
+    const auto& srcChunk = src.meta.chunks;
+    const auto& dstShape = dst.meta().shape;
+    const auto& dstChunk = dst.meta().chunks;
+    const Shape3 srcShape3 = {size_t(srcShape[0]), size_t(srcShape[1]), size_t(srcShape[2])};
+    const Shape3 srcChunk3 = {size_t(srcChunk[0]), size_t(srcChunk[1]), size_t(srcChunk[2])};
+    const Shape3 dstShape3 = {size_t(dstShape[0]), size_t(dstShape[1]), size_t(dstShape[2])};
+    const Shape3 dstChunk3 = {size_t(dstChunk[0]), size_t(dstChunk[1]), size_t(dstChunk[2])};
 
     const auto touchedChunks = buildTouchedParents(sourceTouched, srcShape3, srcChunk3,
                                                   dstShape3, dstChunk3);
@@ -1185,64 +1182,59 @@ static std::vector<ChunkIndex> buildIsotropicPyramidLevel(const fs::path& outDir
     for (size_t tid = 0; tid < numThreads; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
-            vc::VcDataset srcLocal(srcPath);
-            vc::VcDataset dstLocal(dstPath);
-            std::vector<uint8_t> dstBuf(dstChunkElements, 0);
+            try {
+                std::vector<uint8_t> dstBuf(dstChunkElements, 0);
 
-            while (!hadError.load()) {
-                const size_t idx = nextChunk.fetch_add(1);
-                if (idx >= totalChunks) break;
+                while (!hadError.load()) {
+                    const size_t idx = nextChunk.fetch_add(1);
+                    if (idx >= totalChunks) break;
 
-                const auto chunk = touchedChunks[idx];
-                const size_t cz = chunk.z;
-                const size_t cy = chunk.y;
-                const size_t cx = chunk.x;
+                    const auto chunk = touchedChunks[idx];
+                    const size_t cz = chunk.z;
+                    const size_t cy = chunk.y;
+                    const size_t cx = chunk.x;
 
-                const size_t srcZ0 = cz * dstChunkZ * 2;
-                const size_t srcY0 = cy * dstChunkY * 2;
-                const size_t srcX0 = cx * dstChunkX * 2;
+                    const size_t srcZ0 = cz * dstChunkZ * 2;
+                    const size_t srcY0 = cy * dstChunkY * 2;
+                    const size_t srcX0 = cx * dstChunkX * 2;
 
-                const size_t srcActualZ = srcZ0 < srcShape3[0]
-                    ? std::min(srcShape3[0] - srcZ0, dstChunkZ * 2)
-                    : 0;
-                const size_t srcActualY = srcY0 < srcShape3[1]
-                    ? std::min(srcShape3[1] - srcY0, dstChunkY * 2)
-                    : 0;
-                const size_t srcActualX = srcX0 < srcShape3[2]
-                    ? std::min(srcShape3[2] - srcX0, dstChunkX * 2)
-                    : 0;
+                    const size_t srcActualZ = srcZ0 < srcShape3[0]
+                        ? std::min(srcShape3[0] - srcZ0, dstChunkZ * 2)
+                        : 0;
+                    const size_t srcActualY = srcY0 < srcShape3[1]
+                        ? std::min(srcShape3[1] - srcY0, dstChunkY * 2)
+                        : 0;
+                    const size_t srcActualX = srcX0 < srcShape3[2]
+                        ? std::min(srcShape3[2] - srcX0, dstChunkX * 2)
+                        : 0;
 
-                std::vector<uint8_t> srcBuf(srcActualZ * srcActualY * srcActualX, 0);
-                if (!srcBuf.empty() &&
-                    !srcLocal.readRegion({srcZ0, srcY0, srcX0},
-                                         {srcActualZ, srcActualY, srcActualX},
-                                         srcBuf.data())) {
-                    std::cerr << "pyramid read failed for level " << level << " chunk ["
-                              << cz << ", " << cy << ", " << cx << "]: region outside the source level\n";
-                    hadError.store(true);
-                    return;
-                }
-
-                std::fill(dstBuf.begin(), dstBuf.end(), 0);
-                if (!srcBuf.empty()) {
-                    vc::core::util::downsampleBinaryOr(
-                        srcBuf.data(),
-                        vc::core::util::Shape3{srcActualZ, srcActualY, srcActualX},
-                        dstBuf.data(),
-                        vc::core::util::Shape3{dstChunkZ, dstChunkY, dstChunkX});
-                }
-
-                if (chunkHasAnyNonZero(dstBuf)) {
-                    const bool ok = dstLocal.writeChunk(cz, cy, cx,
-                                                       dstBuf.data(),
-                                                       dstBuf.size() * sizeof(uint8_t));
-                    if (!ok) {
-                        hadError.store(true);
-                        return;
+                    std::vector<uint8_t> srcBuf(srcActualZ * srcActualY * srcActualX, 0);
+                    if (!srcBuf.empty()) {
+                        src.array->read_many(
+                            {{int64_t(srcZ0), int64_t(srcY0), int64_t(srcX0)}},
+                            {{int64_t(srcActualZ), int64_t(srcActualY), int64_t(srcActualX)}},
+                            {srcBuf.data()});
                     }
-                    std::lock_guard<std::mutex> lk(outTouchedMutex);
-                    outputTouched.push_back(chunk);
+
+                    std::fill(dstBuf.begin(), dstBuf.end(), 0);
+                    if (!srcBuf.empty()) {
+                        vc::core::util::downsampleBinaryOr(
+                            srcBuf.data(),
+                            vc::core::util::Shape3{srcActualZ, srcActualY, srcActualX},
+                            dstBuf.data(),
+                            vc::core::util::Shape3{dstChunkZ, dstChunkY, dstChunkX});
+                    }
+
+                    if (chunkHasAnyNonZero(dstBuf)) {
+                        dst.writeChunk({int64_t(cz), int64_t(cy), int64_t(cx)},
+                                       dstBuf.data(), dstBuf.size());
+                        std::lock_guard<std::mutex> lk(outTouchedMutex);
+                        outputTouched.push_back(chunk);
+                    }
                 }
+            } catch (const std::exception& e) {
+                std::cerr << "pyramid level " << level << " failed: " << e.what() << "\n";
+                hadError.store(true);
             }
         });
     }
@@ -1311,7 +1303,7 @@ static void writeSparseAttrs(const fs::path& outDir,
     ms_arr.push_back(ms);
     attrs["multiscales"] = ms_arr;
 
-    vc::writeZarrAttributes(outDir, attrs);
+    vcr::zarr::writeAttributes(outDir, vcr::zarr::Json::parse(attrs.dump()));
 }
 
 // The volume's meta.json in `outDir`, named `uuid` (the published directory's name).
@@ -1633,11 +1625,11 @@ int main(int argc, char* argv[])
                               std::min(x, chunkSize)};
         }
 
-        vc::createZarrDataset(writeRoot, "0", toVector(levelShape[0]),
-                              toVector(levelChunks[0]), vc::VcDtype::uint8, "blosc");
-        for (size_t l = 1; l <= kPyramidLevels; ++l) {
-            vc::createZarrDataset(writeRoot, std::to_string(l), toVector(levelShape[l]),
-                                  toVector(levelChunks[l]), vc::VcDtype::uint8, "blosc");
+        for (size_t l = 0; l <= kPyramidLevels; ++l) {
+            vcr::zarr::CreateOptions options;
+            options.shape.assign(levelShape[l].begin(), levelShape[l].end());
+            options.chunks.assign(levelChunks[l].begin(), levelChunks[l].end());
+            vcr::zarr::Writer::create(writeRoot / std::to_string(l), options);
         }
 
         const SpoolCoordType spoolCoordType = chooseSpoolCoordType(shape);
