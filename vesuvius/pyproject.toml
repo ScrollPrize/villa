@@ -134,6 +134,15 @@ blending = [
 
 tests = ["pytest>=8.4.2"]
 
+# TIFXYZ surface read/write (vesuvius.tifxyz) without torch or the C++ build
+tifxyz = [
+    "opencv-python-headless>=4.11.0.86",
+    "tifffile>=2024.8.30",
+    "imagecodecs>=2024.6.1",  # LZW, write_tifxyz's default compression
+    "numba>=0.60.0",
+    "scipy>=1.13.1",
+]
+
 # Geometry-driven TIFXYZ label production (no torch/GUI dependency)
 label-transfer = [
     "scipy>=1.13.1",
