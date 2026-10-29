@@ -1,7 +1,7 @@
 #pragma once
 // Arrays whose chunks are computed on demand from other data, e.g. a distance
 // transform of a thresholded CT volume. A computed array is an ordinary vcr::Array:
-// register it with chunks::Service and sample it with vcr::slice like a stored one.
+// register it with chunks::Service or read and sample it like a stored one.
 // The compute callback reads its inputs through vc_reader (typically
 // chunks::Service::read on the service the computed array is registered with).
 // Computed chunks can persist in a decoded disk cache that later opens reuse.

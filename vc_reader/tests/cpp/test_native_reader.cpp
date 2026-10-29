@@ -3,7 +3,7 @@
 #define slots
 #define signals public
 #include "vc_reader/zarr.hpp"
-#include "vc_reader/slice.hpp"
+#include "vc_reader/composite.hpp"
 #ifndef emit
 #error Reader headers must preserve the caller's Qt macros
 #endif

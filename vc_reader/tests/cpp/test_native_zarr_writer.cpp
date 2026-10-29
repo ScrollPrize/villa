@@ -1,7 +1,6 @@
 // Native Zarr writes: every codec round-trips through the reader, empty chunks are
 // skipped, regions are read-modified-written, and attributes and metadata are kept.
 #include "vc_reader/zarr.hpp"
-#include "vc_reader/slice.hpp"
 
 #include <algorithm>
 #include <barrier>
@@ -79,19 +78,10 @@ void codecs(const fs::path& root, int version, bool sharded = false)
                 std::memcpy(chunk.data() + i, &v, 4);
             }
         writer.writeChunk({0, 0, 0}, chunk.data(), chunk.size());
-        const float xyz[]{0, 0, 0};
-        float cpu;
-        vcr::slice::points(writer.reader(), meta.type, xyz, 1, vcr::slice::Order::Nearest, &cpu);
-        require(cpu == float(meta.type.load(chunk.data())), "CPU samples written array");
-#ifdef VC_READER_CUDA
-        int devices = 0;
-        if (cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0) {
-            const auto device = vcr::slice::cuda::points(writer.reader(), meta.type, xyz, 1, vcr::slice::Order::Nearest);
-            float gpu;
-            vcr::device::check(cudaMemcpy(&gpu, device->ptr, sizeof(float), cudaMemcpyDeviceToHost));
-            require(gpu == cpu, "CUDA samples written array");
-        }
-#endif
+        const double zyx[]{0, 0, 0};
+        std::vector<std::uint8_t> sampled(meta.itemsize());
+        writer.reader().sample_nearest(zyx, 1, sampled.data());
+        require(std::equal(sampled.begin(), sampled.end(), chunk.begin()), "the written array samples its chunk");
         // The second chunk is never written: it reads as fill.
         auto reopened = vcr::zarr::openArray((root / c.compressor).string(), {});
         const auto all = read(*reopened.array, {0, 0, 0}, meta.shape, meta.itemsize());

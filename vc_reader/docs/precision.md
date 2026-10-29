@@ -38,13 +38,11 @@ constant field. That exceptional scan allocates no dense field. Axis means use
 double for accumulation and cancellation; stored coefficients and evaluated
 weights remain float32. LocalContrast also retains double weighted accumulation.
 
-Point, plane, band and composite sampling (`vc_reader/slice.hpp`) reads each tile's
-neighbourhood as one dense float32 block through the array's caches and interpolates
-it with one formula shared by CPU and CUDA (`slice/math.hpp`). Both backends evaluate
-it unfused (`-ffp-contract=off` and `--fmad=false`), so nearest-voxel ties, linear
-and Catmull-Rom cubic values, and composites agree. Coordinates and interpolation are
-float32; integer and float64 sources are converted to float32 when read. Sources
-whose values exceed float32's 24-bit integer range lose low bits.
+Composite reductions (`vc_reader/composite.hpp`) of sampled layer stacks are float32,
+with one reducer shared by CPU and CUDA (`composite/reducer.hpp`), evaluated unfused
+(`-ffp-contract=off` and `--fmad=false`). Mean, max, min, median, minabs and alpha
+agree exactly; Beer-Lambert's `expf` can differ between the host and CUDA in its
+last bits.
 
 ## Tie rules
 
@@ -52,7 +50,7 @@ whose values exceed float32's 24-bit integer range lose low bits.
 `tests/test_rounding_rules.py` rejects other rounding primitives in native sources.
 
 - **Spatial ties** (the voxel nearest a coordinate) round up: `nearest_index` /
-  `nearest_rounds_up`. Every nearest-neighbour path uses it: slices, `Array` and
+  `nearest_rounds_up`. Every nearest-neighbour path uses it: `Array` and
   `ZarrReader.sample` points, the CUDA reader, surface and aligned label sampling and
   spatial transforms. Integer shifts and crop origins then cannot change which voxel
   wins, and zoomed nearest planes give every voxel equal width. This is SciPy's
@@ -173,43 +171,3 @@ Precision tests cover float32/float64 transforms, CPU/CUDA agreement, replay,
 derived fields, resize ties, coordinate cancellation, normalization cancellation, overflow
 fallbacks and integer component indices. Loader tests cover the public batch
 API, stream lifetime, spawned workers, and backward execution.
-
-
-## Resident sampling coverage
-
-`slice::Resident` overloads use the blocking sampler's float32 conversion,
-interpolation and reduction formulas on CPU and CUDA. They probe the chunk
-service without I/O, queueing or LRU promotion. Each wave pins a single snapshot
-of every chunk it touches; later ready callbacks can trigger a fresh render.
-
-Validity is separate from the sampled value: a stored NaN is available, while an
-unavailable, queued or failed chunk invalidates the entire interpolation
-footprint, even at zero-weight neighbours. Out-of-array neighbours and known
-all-fill chunks are available. Incomplete bands expose validity per layer;
-composites require every layer's footprint, including layers beyond alpha early
-termination, so partial data cannot masquerade as a complete composite. Invalid
-outputs are NaN. A viewer uses the byte mask to fill uncovered pixels from its
-next coarser level. CUDA validity buffers reside on the same device as values.
-
-The current CUDA path uploads the resident float32 wave blocks for each request;
-it does not retain a separate device brick cache across renders.
-
-`slice::Cached` uses the same sampling formulas, but fetches
-missing chunks through the shared service with foreground priority, queueing a
-wave's chunks together so they load in parallel. CPU and CUDA
-requests see the same per-wave chunk snapshot, including when the service budget
-is smaller than the working set. Fetch failures throw; absent chunks use the
-array fill value. Registered arrays must not also hold a private memory cache.
-This path shares host decoded chunks with resident viewers; CUDA still uploads
-float32 wave blocks per request.
-
-Small CPU point requests (up to 64 points, e.g. optimizer residuals) copy each
-point's neighbourhood from its service chunks into a local block instead of
-planning waves, then apply the same footprint, rounding and interpolation
-formulas, so their values are bit-identical to planned requests. CUDA computes
-the corresponding request with the sampling kernel. Both paths return NaN for
-non-finite coordinates and the array fill for coordinates outside the array.
-
-`slice::gradient` returns the derivatives of the same float32 interpolants along
-X, Y and Z, from the shared `sampleGradient` formula on CPU and CUDA. Its values
-are exactly those of `slice::points`.

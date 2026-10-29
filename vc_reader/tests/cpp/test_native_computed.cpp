@@ -2,10 +2,9 @@
 // max filter with a border) computed per chunk from a stored array read through the
 // service; one local worker cannot deadlock on nested reads; chunks persist on disk
 // and are reused by a later open of the same identity; mismatched persisted arrays
-// are refused; fill chunks; errors; CPU and CUDA sampling of the computed array.
+// are refused; fill chunks; errors; point sampling of the computed array.
 #include "vc_reader/computed.hpp"
 #include "vc_reader/chunks.hpp"
-#include "vc_reader/slice.hpp"
 #include "vc_reader/zarr.hpp"
 
 #include <atomic>
@@ -16,10 +15,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#ifdef VC_READER_CUDA
-#include <cuda_runtime.h>
-#endif
 
 namespace fs = std::filesystem;
 using namespace vcr;
@@ -169,28 +164,14 @@ void computedArrays(const Fixture& f)
     array->flush();
     require(array->stats().write_errors == 0, "persisted without errors");
 
-    // Sampling the computed array through the service.
-    const float xyz[] = {3.5f, 4.25f, 5.0f, 10, 10, 10, 21.5f, 25.5f, 29.5f};
-    const ElementType u8{'u', 1, false};
-    slice::Cached cached{*array, service, derived};
-    float values[3], direct3[3];
-    slice::points(cached, u8, xyz, 3, slice::Order::Linear, values);
-    slice::points(*array, u8, xyz, 3, slice::Order::Linear, direct3);
-    require(std::memcmp(values, direct3, sizeof values) == 0, "sampled computed values");
+    // Point sampling of the computed array.
+    const double zyx[] = {5.0, 4.25, 3.5, 10, 10, 10};
+    float values[2];
+    array->sample_linear(zyx, 2, ElementType{'u', 1, false}, false, values);
+    const float y0 = maxFiltered(5, 4, 3) + 0.25f * (maxFiltered(5, 5, 3) - maxFiltered(5, 4, 3));
+    const float y1 = maxFiltered(5, 4, 4) + 0.25f * (maxFiltered(5, 5, 4) - maxFiltered(5, 4, 4));
+    require(std::abs(values[0] - (y0 + 0.5f * (y1 - y0))) < 1e-4f, "a sample interpolates computed voxels");
     require(values[1] == float(maxFiltered(10, 10, 10)), "a voxel sample is the voxel");
-#ifdef VC_READER_CUDA
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) == cudaSuccess && devices > 0) {
-        auto onDevice = slice::cuda::points(cached, u8, xyz, 3, slice::Order::Linear);
-        float back[3];
-        device::check(cudaMemcpy(back, onDevice->ptr, sizeof back, cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 3; ++i)
-            require(std::abs(back[i] - values[i]) <= 1e-4f * (1 + std::abs(values[i])), "CUDA samples computed chunks");
-        std::cout << "CUDA samples computed arrays\n";
-    } else {
-        std::cout << "no CUDA device: CUDA sampling skipped\n";
-    }
-#endif
 
     // A later open of the same identity reads every chunk from disk.
     auto reopened = computed::open(options(cache), [](const Index&, std::uint8_t*) -> bool {
