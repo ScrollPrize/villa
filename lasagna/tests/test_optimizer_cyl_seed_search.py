@@ -18,6 +18,8 @@ if ROOT not in sys.path:
 import fit_data
 import model as fit_model
 import optimizer
+import cyl_sdf_volume
+import opt_loss_cyl
 
 
 def _stage_cfg(stages: list[dict]) -> dict:
@@ -364,7 +366,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		if max_shells is not None:
 			mdl.cyl_shell_search_max_shells = int(max_shells)
 		stdout = io.StringIO()
-		with mock.patch.object(optimizer.opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
+		with mock.patch.object(opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
 			with contextlib.redirect_stdout(stdout):
 				optimizer.optimize(
 					model=mdl,
@@ -384,7 +386,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		]))
 		mdl = _FakeShellModel(["outside"])
 		stdout = io.StringIO()
-		with mock.patch.object(optimizer.opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
+		with mock.patch.object(opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
 			with contextlib.redirect_stdout(stdout):
 				optimizer.optimize(
 					model=mdl,
@@ -457,8 +459,8 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			calls.append(int(getattr(res, "cyl_shell_index", -1)))
 			return _zero_cyl_loss(res=res)
 
-		with mock.patch.object(optimizer.opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
-			with mock.patch.object(optimizer.opt_loss_cyl, "cyl_step_push_loss", _record_step_push):
+		with mock.patch.object(opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
+			with mock.patch.object(opt_loss_cyl, "cyl_step_push_loss", _record_step_push):
 				with contextlib.redirect_stdout(io.StringIO()):
 					optimizer.optimize(
 						model=mdl,
@@ -610,7 +612,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 
 	def test_grow_refine_stops_search_when_ifrac_exceeds_default(self) -> None:
 		with mock.patch.object(
-			optimizer.opt_loss_cyl,
+			opt_loss_cyl,
 			"cyl_shell_width_edge_stats",
 			return_value={"valid_avg_vx": 100.0, "invalid_avg_vx": 100.0, "invalid_frac": 0.75},
 		):
@@ -628,7 +630,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 
 	def test_grow_refine_ifrac_stop_can_be_disabled(self) -> None:
 		with mock.patch.object(
-			optimizer.opt_loss_cyl,
+			opt_loss_cyl,
 			"cyl_shell_width_edge_stats",
 			return_value={"valid_avg_vx": 100.0, "invalid_avg_vx": 100.0, "invalid_frac": 0.75},
 		):
@@ -845,7 +847,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			chunk_sizes.append(int(chunk_size))
 			deep_interp_values.append(float(deep_interp_chunks))
 			deep_blend_values.append(float(deep_blend_chunks))
-			return optimizer.cyl_sdf_volume.CylOutsideVolume(
+			return cyl_sdf_volume.CylOutsideVolume(
 				volume=torch.zeros(1, 1, 1, 1, dtype=torch.uint8, device=device),
 				origin=(0.0, 0.0, 0.0),
 				spacing=(float(grid_step), float(grid_step), float(grid_step)),
@@ -853,9 +855,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 				depth_max=float(len(build_calls)),
 			)
 
-		with mock.patch.object(optimizer.opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
-			with mock.patch.object(optimizer.opt_loss_cyl, "cyl_outside_loss", _zero_cyl_loss):
-				with mock.patch.object(optimizer.cyl_sdf_volume, "build_previous_shell_inside_depth_volume", side_effect=_fake_build):
+		with mock.patch.object(opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
+			with mock.patch.object(opt_loss_cyl, "cyl_outside_loss", _zero_cyl_loss):
+				with mock.patch.object(cyl_sdf_volume, "build_previous_shell_inside_depth_volume", side_effect=_fake_build):
 					with contextlib.redirect_stdout(io.StringIO()):
 						optimizer.optimize(
 							model=mdl,

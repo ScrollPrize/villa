@@ -12,6 +12,7 @@ if ROOT not in sys.path:
 	sys.path.insert(0, ROOT)
 
 import optimizer
+from optimizer.config import _global_map_stage_from_opt_settings
 
 
 class OptimizerStageWeightsTest(unittest.TestCase):
@@ -204,7 +205,7 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 			],
 		})
 
-		stage = optimizer._global_map_stage_from_opt_settings(
+		stage = _global_map_stage_from_opt_settings(
 			name="stage0",
 			opt_cfg=stages[0].global_opt,
 			args={},

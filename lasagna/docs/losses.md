@@ -17,9 +17,9 @@ Conventions:
 
 ## 2) Wire it into optimization
 
-- Add import in [`optimizer.py`](../optimizer.py:1).
-- Add a new key to `lambda_global` in [`optimizer.load_stages()`](../optimizer.py:61).
-- Add the term to the `terms` dict in [`optimizer.optimize()`](../optimizer.py:110), mapping name → loss function.
+- Add an import in [`optimizer/optimizer.py`](../optimizer/optimizer.py).
+- Add a new key to `lambda_global` in [`optimizer/config.py`](../optimizer/config.py).
+- Add the term to the `terms` dict in [`optimizer.optimize()`](../optimizer/optimizer.py), mapping name to loss function.
 
 The term name string must match the stage config key.
 

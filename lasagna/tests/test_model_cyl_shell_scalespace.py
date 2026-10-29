@@ -15,6 +15,7 @@ import fit
 import model as fit_model
 import opt_loss_cyl
 import optimizer
+from optimizer.optimizer import _lr_scalespace
 
 
 class _UmbilicusData:
@@ -79,7 +80,7 @@ class CylinderShellScaleSpaceTest(unittest.TestCase):
 		self.assertEqual(len(params), mdl.cyl_param_scale_count())
 		self.assertIs(params[0], mdl.cyl_shell_delta_ms[0])
 		self.assertEqual(
-			[optimizer._lr_scalespace(lr=[10.0, 1.0, 0.1, 0.01, 0.001], scale_i=i) for i in range(5)],
+			[_lr_scalespace(lr=[10.0, 1.0, 0.1, 0.01, 0.001], scale_i=i) for i in range(5)],
 			[0.001, 0.01, 0.1, 1.0, 10.0],
 		)
 

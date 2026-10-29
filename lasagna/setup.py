@@ -36,7 +36,7 @@ py_modules = sorted(
     if path.name != "setup.py"
 )
 packages = find_packages(
-    include=("lasagna3d", "lasagna3d.*", "snap_surf", "snap_surf.*", "scripts")
+    include=("lasagna3d", "lasagna3d.*", "optimizer", "optimizer.*", "snap_surf", "snap_surf.*", "scripts")
 )
 # Also expose the legacy root modules through their canonical ``lasagna.*``
 # imports.  They remain top-level ``py_modules`` for backwards compatibility.
@@ -45,6 +45,7 @@ packages.append("lasagna")
 # legacy internal imports continue to use the top-level ``scripts`` package.
 packages.append("lasagna.scripts")
 packages.append("lasagna.manager")
+packages.append("lasagna.optimizer")
 
 # Managed Fiber inference is part of the supported Lasagna runtime.  Package
 # the sibling source directly so both editable installs and wheels made from
@@ -121,6 +122,7 @@ setup(
         "lasagna": ".",
         "lasagna.scripts": "scripts",
         "lasagna.manager": "manager",
+        "lasagna.optimizer": "optimizer",
         "vesuvius": "../vesuvius/src/vesuvius",
         "vc3d_fiber_format": "../vesuvius/src/vc3d_fiber_format",
     },
