@@ -1,7 +1,5 @@
 #include "utils/http_fetch.hpp"
 
-#if UTILS_HAS_CURL
-
 #include "utils/Json.hpp"
 
 #include <cstdio>
@@ -187,5 +185,3 @@ AwsAuth AwsAuth::load(const std::string& profile)
 }
 
 } // namespace utils
-
-#endif // UTILS_HAS_CURL

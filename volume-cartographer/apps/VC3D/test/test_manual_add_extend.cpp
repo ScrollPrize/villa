@@ -108,8 +108,8 @@ void TestManualAddExtend::padPointsAddsInvalidBorder()
     const auto padded = ManualAddTool::padPoints(points, padding);
     QCOMPARE(padded.rows, 4);
     QCOMPARE(padded.cols, 6);
-    QVERIFY(ManualAddTool::isInvalidPoint(padded(0, 0)));
-    QVERIFY(ManualAddTool::isInvalidPoint(padded(1, 1)));
+    QVERIFY(!vc::geometry::validSurfacePoint(padded(0, 0)));
+    QVERIFY(!vc::geometry::validSurfacePoint(padded(1, 1)));
     QCOMPARE(padded(1, 2), points(0, 0));
 }
 
@@ -131,7 +131,7 @@ void TestManualAddExtend::extensionContinuesEachLineStraight()
             QVERIFY2(distance(preview(row, col), expected) < 1e-3f,
                      qPrintable(QStringLiteral("row %1 col %2").arg(row).arg(col)));
         }
-        QVERIFY(ManualAddTool::isInvalidPoint(preview(row, 16)));
+        QVERIFY(!vc::geometry::validSurfacePoint(preview(row, 16)));
         QCOMPARE(preview(row, 9), points(row, 9));
     }
 
@@ -141,7 +141,7 @@ void TestManualAddExtend::extensionContinuesEachLineStraight()
     QVERIFY(upTool.begin(lower, splineConfig()));
     QVERIFY(upTool.beginExtension(ManualAddTool::ExtendSide::Up, 3, std::nullopt, &status));
     QVERIFY(distance(upTool.previewPoints()(2, 4), cv::Vec3f(4 * kSpacing, 2 * kSpacing, 100.0f)) < 1e-3f);
-    QVERIFY(ManualAddTool::isInvalidPoint(upTool.previewPoints()(1, 4)));
+    QVERIFY(!vc::geometry::validSurfacePoint(upTool.previewPoints()(1, 4)));
 }
 
 void TestManualAddExtend::extensionFollowsAPlaneClick()
@@ -222,7 +222,7 @@ void TestManualAddExtend::clearPendingDropsTheExtension()
     QVERIFY(tool.clearPending(splineConfig()));
     QVERIFY(!tool.extensionActive());
     QVERIFY(!tool.initialFillCommitted());
-    QVERIFY(ManualAddTool::isInvalidPoint(tool.previewPoints()(0, 9)));
+    QVERIFY(!vc::geometry::validSurfacePoint(tool.previewPoints()(0, 9)));
     QVERIFY(tool.beginExtension(ManualAddTool::ExtendSide::Right, 2, std::nullopt, &status));
 }
 
@@ -243,7 +243,7 @@ void TestManualAddExtend::resizeSurfaceGridKeepsChannelsAligned()
     QCOMPARE(grown->rows, 5);
     QCOMPARE(grown->cols, 10);
     QCOMPARE((*grown)(1, 2), points(0, 0));
-    QVERIFY(ManualAddTool::isInvalidPoint((*grown)(0, 0)));
+    QVERIFY(!vc::geometry::validSurfacePoint((*grown)(0, 0)));
     cv::Mat grownApproval = surface.channel("approval", SURF_CHANNEL_NORESIZE);
     QCOMPARE(grownApproval.size(), cv::Size(10, 5));
     QCOMPARE(grownApproval.at<uint8_t>(1, 2), static_cast<uint8_t>(255));
@@ -305,7 +305,7 @@ void TestManualAddExtend::maskedFillSurvivesReload()
     };
 
     // Without marking the mask, the reload drops the filled vertex.
-    QVERIFY(ManualAddTool::isInvalidPoint(fillAndReload(false)));
+    QVERIFY(!vc::geometry::validSurfacePoint(fillAndReload(false)));
     QVERIFY(distance(fillAndReload(true), filled) < 1e-4f);
 }
 
@@ -383,15 +383,17 @@ void TestManualAddExtend::undoHistoryFollowsGridPadding()
 }
 
 namespace {
-// A sheet curled around the z axis: radius 40 in x and y, flat in z.
+// A sheet curled around the z axis: radius 40 in x and y, flat in z, with row
+// 0 at z = 100 so that rows grown above it keep z > 0 (validSurfacePoint).
 constexpr float kRadius = 40.0f;
+constexpr float kCurvedZ0 = 100.0f;
 cv::Mat_<cv::Vec3f> curvedSheet(int rows, int cols, int validCols)
 {
     cv::Mat_<cv::Vec3f> points(rows, cols, kInvalid);
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < validCols; ++col) {
             const float angle = col * kSpacing / kRadius;
-            points(row, col) = cv::Vec3f(kRadius * std::cos(angle), kRadius * std::sin(angle), row * kSpacing);
+            points(row, col) = cv::Vec3f(kRadius * std::cos(angle), kRadius * std::sin(angle), kCurvedZ0 + row * kSpacing);
         }
     }
     return points;
@@ -437,7 +439,7 @@ void TestManualAddExtend::sheetWalkFollowsACurvedSheet()
         const auto& p = tool.previewPoints()(key.row, key.col);
         QVERIFY2(std::abs(std::hypot(p[0], p[1]) - kRadius) < 1.0f,
                  qPrintable(QString("radius %1").arg(std::hypot(p[0], p[1]))));
-        QVERIFY(std::abs(p[2] - key.row * kSpacing) < 1e-3f);
+        QVERIFY(std::abs(p[2] - (kCurvedZ0 + key.row * kSpacing)) < 1e-3f);
     }
 }
 
@@ -494,7 +496,7 @@ void TestManualAddExtend::autoExtendGrowsAlongTheSheet()
     for (int row = 0; row < points.rows; ++row) {
         for (int col = 0; col < points.cols; ++col) {
             const auto& p = points(row, col);
-            QVERIFY(!ManualAddTool::isInvalidPoint(p));
+            QVERIFY(vc::geometry::validSurfacePoint(p));
             QVERIFY2(std::abs(std::hypot(p[0], p[1]) - kRadius) < 1.0f,
                      qPrintable(QString("(%1, %2) radius %3").arg(row).arg(col).arg(std::hypot(p[0], p[1]))));
         }

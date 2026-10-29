@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 // An in-process JSON-RPC 2.0 server that listens on a QLocalServer socket and
 // lets an out-of-process agent drive and inspect VC3D.
@@ -34,9 +35,7 @@ class CWindow;
 class VolumeViewerBase;
 struct CommandLaunchError;
 
-namespace vc3d::opendata {
-struct OpenDataManifest;
-}
+namespace vcr::catalog { struct OpenDataManifest; }
 
 // Thrown by a handler that has deferred its response: the handler
 // has stashed (socket, id) via beginDeferred() and will write the response
@@ -82,7 +81,6 @@ private:
     void registerWrapHandlers();
     void registerJobHandlers();
     void registerLasagnaHandlers();
-    void registerAtlasHandlers();
     void registerFiberHandlers();
     void registerPointsHandlers();
     void registerSeedingHandlers();
@@ -131,16 +129,13 @@ private:
     QJsonObject handlePing(const QJsonValue& params);
     QJsonObject handleRpcDescribe(const QJsonValue& params);
     QJsonObject handleStateGet(const QJsonValue& params);
-    QJsonObject handleSegmentsAttach(const QJsonValue& params);
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
-    QJsonObject handleSegmentsFetch(const QJsonValue& params);
-    QJsonObject handleSegmentsCreateEditableCopy(const QJsonValue& params);
     // Destructive on-disk operations use the same dialog-free cores as the UI.
     QJsonObject handleSegmentsDelete(const QJsonValue& params);
     QJsonObject handleSegmentsRename(const QJsonValue& params);
     // Review-state-aware segment listing with optional server-side tag filters
-    // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
+    // (AgentBridgeHandlers_review.cpp); reads record tags without forcing a
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
@@ -201,10 +196,6 @@ private:
     QJsonObject handlePointsSetAutoFillMode(const QJsonValue& params);
     QJsonObject handlePointsResetWindings(const QJsonValue& params);
     QJsonObject handlePointsApplyAnchorOffset(const QJsonValue& params);
-    QJsonObject handlePointsSaveJson(const QJsonValue& params);
-    QJsonObject handlePointsLoadJson(const QJsonValue& params);
-    QJsonObject handlePointsSaveSegmentPath(const QJsonValue& params);
-    QJsonObject handlePointsLoadSegmentPath(const QJsonValue& params);
     QJsonObject handleProjectCreate(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeAttach(const QJsonValue& params);
@@ -227,15 +218,6 @@ private:
     QJsonObject handleLasagnaSelectOutputSegment(const QJsonValue& params);
     QJsonObject handleLasagnaRepeatLast(const QJsonValue& params);
     QJsonObject handleWorkspaceSwitch(const QJsonValue& params);
-    // Atlas RPCs.
-    QJsonObject handleAtlasOpen(const QJsonValue& params);
-    QJsonObject handleAtlasStatus(const QJsonValue& params);
-    QJsonObject handleAtlasSearchStart(const QJsonValue& params);
-    QJsonObject handleAtlasSearchCancel(const QJsonValue& params);
-    QJsonObject handleAtlasSearchResults(const QJsonValue& params);
-    QJsonObject handleAtlasOpenResult(const QJsonValue& params);
-    QJsonObject handleAtlasRemap(const QJsonValue& params);
-    QJsonObject handleAtlasOptimizeSnapCandidates(const QJsonValue& params);
     // Line-annotation / fiber RPCs. fiberController() requires an
     // open volume package (-32000) and a live LineAnnotationController
     // (-32010); requireKnownFiber throws -32007 kind:"fiber" for an unknown
@@ -249,14 +231,11 @@ private:
     QJsonObject handleFiberSave(const QJsonValue& params);
     QJsonObject handleFiberDelete(const QJsonValue& params);
     QJsonObject handleFiberSetTag(const QJsonValue& params);
-    QJsonObject handleFiberCreateAtlas(const QJsonValue& params);
     QJsonObject handleFiberExport(const QJsonValue& params);
     QJsonObject handleFiberImport(const QJsonValue& params);
     // Tags, seeding, push/pull, and tracing.
     QJsonObject handleTagsSet(const QJsonValue& params);
     QJsonObject handleSeedingSetWindingAnnotationMode(const QJsonValue& params);
-    QJsonObject handleSeedingPreviewRays(const QJsonValue& params);
-    QJsonObject handleSeedingCastRays(const QJsonValue& params);
     QJsonObject handleSeedingResetPoints(const QJsonValue& params);
     // Batch seeding: run/expand spawn vc_grow_seg_from_seed child processes and
     // resolve through the seedingBatch* signals as source:"seeding" jobs.
@@ -276,29 +255,23 @@ private:
     QJsonObject handlePushPullStop(const QJsonValue& params);
     QJsonObject handleTracerRunTrace(const QJsonValue& params);
     QJsonObject handleRenderTifxyz(const QJsonValue& params);
-    // Flattening RPCs: SLIM/flatboi, ABF++, straighten. Each drives a
+    // Flattening RPCs: SLIM/flatboi, straighten. Each drives a
     // headless SegmentationCommandHandler::start* launcher (dialogs suppressed)
     // and tracks the result as a source:"flatten" job.
     QJsonObject handleFlattenSlim(const QJsonValue& params);
-    QJsonObject handleFlattenAbf(const QJsonValue& params);
     QJsonObject handleFlattenStraighten(const QJsonValue& params);
     // Shared body for the three flatten handlers.
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
         const std::function<bool(CommandLaunchError* error,
-                                 QString* outDir)>& launch);
+                                 QString* outputName)>& launch);
 
     // Per-segment mesh operations live in AgentBridgeHandlers_surfaceops.cpp.
-    // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /
-    // refine_alpha_comp (mirror render.tifxyz). In-process deferred:
-    // generate_mask / append_mask (shared handleSegmentMask helper).
+    // Sync: crop_bounds. Async source:"tool": reoptimize /
+    // refine_alpha_comp (mirror render.tifxyz).
     QJsonObject handleSegmentCropBounds(const QJsonValue& params);
-    QJsonObject handleSegmentRecalcArea(const QJsonValue& params);
     QJsonObject handleSegmentReoptimize(const QJsonValue& params);
     QJsonObject handleSegmentRefineAlphaComp(const QJsonValue& params);
-    QJsonObject handleSegmentGenerateMask(const QJsonValue& params);
-    QJsonObject handleSegmentAppendMask(const QJsonValue& params);
-    QJsonObject handleSegmentMask(const QJsonValue& params, bool append);
 
     // --- Open Data manifest acquisition ---
     // Serves the cached manifest synchronously when available and `refresh` is
@@ -307,10 +280,10 @@ private:
     // `build` may throw AgentBridgeError to surface a -3200x error.
     QJsonObject withOpenDataManifest(
         bool refresh,
-        const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build);
+        const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build);
     void startManifestFetch(
         int token,
-        const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build);
+        const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build);
 
     // Job tracking permits one active job per lifecycle source. Independent
     // sources may run concurrently; job ids share one monotonic counter.
@@ -318,7 +291,7 @@ private:
         QString id;          // "job-<n>"
         int     num = 0;     // monotonic order key (parsed-free "most recent" sort)
         QString source;      // fixed lifecycle source reported over the wire
-        QString kind;        // "segmentation.grow", "segmentation.grow_patch_from_seed", ...
+        QString kind;        // "segmentation.grow", "segmentation.grow_surface_from_seed", ...
         QString label;
         QString state;       // "running" | "succeeded" | "failed"
         QString message;
@@ -377,19 +350,10 @@ private:
                                double loss, double overallProgress);
     void handleLasagnaFinished(bool success, const QString& message,
                                const QString& outputPath);
-    void handleLasagnaResultsPlaced(const QString& outputDir,
-                                    const QStringList& segmentNames);
-    // Atlas fiber-search lifecycle -> source:"atlas" JobRecord.
-    // Only bridge-initiated searches are tracked as jobs: progress for
-    // an untracked (human-initiated) search is deliberately NOT auto-registered,
-    // because FinishResults progress also fires on pure UI re-population (the
-    // group-by-fiber checkbox), which would leak a never-finishing job.
-    void handleAtlasSearchProgress(int phase, double fraction);
-    void handleAtlasSearchFinished(bool success, int resultCount);
     // Batch seeding lifecycle -> source:"seeding" JobRecord. Wired
-    // from SeedingWidget::seedingBatchProgressChanged / seedingBatchFinished. Like
-    // the atlas search, only bridge-initiated batches are tracked (progress/
-    // finished for a human-initiated Run/Expand click are not auto-registered).
+    // from SeedingWidget::seedingBatchProgressChanged / seedingBatchFinished. Only
+    // bridge-initiated batches are tracked (progress/finished for a
+    // human-initiated Run/Expand click are not auto-registered).
     void handleSeedingBatchProgress(const QString& kind, int completed, int total);
     void handleSeedingBatchFinished(const QString& kind, bool success, bool canceled,
                                     int completed, int total, const QString& message);

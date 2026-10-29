@@ -6,7 +6,7 @@ std::vector<uint8_t> readSharedPayload(sqlite3* db, const std::string& name, con
     if (readRequest) {
         Statement size(db, "SELECT length(data) FROM geometry_chunks WHERE hash=?", hash);
         if (!size.row()) throw std::runtime_error("geometry: missing shared payload");
-        requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+        requestBytes(size.i64(0), &RegionStats::payloadBytes);
     }
     Statement row(db, "SELECT data FROM geometry_chunks WHERE hash=?", hash);
     if (!row.row()) throw std::runtime_error("geometry: missing shared payload");
@@ -15,10 +15,6 @@ std::vector<uint8_t> readSharedPayload(sqlite3* db, const std::string& name, con
     if (geometryWork) geometryWork->readBytes[name] += bytes.size();
     if (geometryPayloadHash(name, bytes) != hash) throw std::runtime_error("geometry: corrupt shared payload");
     return bytes;
-}
-bool identityManaged(sqlite3* db,const std::string& object) {
-    Statement latest(db,"SELECT json_type(manifest,'$.sequences') FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
-        parseUuid(object)); return latest.row() && !latest.isNull(0);
 }
 std::string storeSharedPayload(sqlite3* db, const std::string& name, std::span<const uint8_t> bytes) {
     GeometryPhase phase("storeSharedPayload");

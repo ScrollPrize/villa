@@ -1,5 +1,7 @@
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -28,8 +30,9 @@ public:
     void retain(const std::string& revision, std::shared_ptr<GeometryReader> reader) {
         const auto charge = reader->retainedCharge();
         if (charge > budget_) return;
-        // Also bound revision/node overhead, including empty geometries.
-        while (charge_ > budget_ - charge || readers_.size() >= 64) {
+        // Also bound revision/node overhead, including empty geometries: one
+        // reader per MiB of budget, at least 64.
+        while (charge_ > budget_ - charge || readers_.size() >= std::max<size_t>(64, budget_ >> 20)) {
             const auto old = readers_.find(recency_.front());
             charge_ -= old->second.charge;
             readers_.erase(old); recency_.pop_front();
@@ -63,19 +66,34 @@ void beginReadCaches(sqlite3* db, StatementPool& pool, size_t geometryBudget, si
     beginSpatialRead(pool, spatialBudget, version);
 }
 
+namespace {
+std::shared_ptr<GeometryReadCache> connectionGeometryCache(sqlite3* db)
+{
+    const auto lease = activeStatementPools.find(db);
+    return lease == activeStatementPools.end() ? nullptr : lease->second->geometryCache;
+}
+}
+
+RetainedGeometryReader::RetainedGeometryReader(sqlite3* db, std::string revision)
+    : db_(db), revision_(std::move(revision)), exceptions_(std::uncaught_exceptions())
+{
+    const auto cache = connectionGeometryCache(db_);
+    reader_ = cache ? cache->take(revision_) : nullptr;
+    if (!reader_) reader_ = std::make_shared<GeometryReader>(db_, revision_);
+}
+
+RetainedGeometryReader::~RetainedGeometryReader()
+{
+    if (std::uncaught_exceptions() != exceptions_) return;
+    try {
+        if (const auto cache = connectionGeometryCache(db_)) cache->retain(revision_, std::move(reader_));
+    } catch (...) {} // retention is an optimization
+}
+
 template<class F> auto withGeometryReader(const Txn& txn, const std::string& revision, F&& read)
 {
-    auto* db = ObjectStoreImplAccess::conn(txn);
-    std::shared_ptr<GeometryReadCache> cache;
-    if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
-        cache = lease->second->geometryCache;
-    auto reader = cache ? cache->take(revision) : nullptr;
-    if (!reader) reader = std::make_shared<GeometryReader>(db, revision);
-    // A failed read discards its reader; partially verified data never poisons
-    // a future attempt. Successful readers remain connection/snapshot scoped.
-    auto result = read(*reader);
-    if (cache) cache->retain(revision, std::move(reader));
-    return result;
+    RetainedGeometryReader reader(ObjectStoreImplAccess::conn(txn), revision);
+    return read(*reader);
 }
 
 GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
@@ -185,7 +203,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     const ChunkKey key{name, index};
     auto found = chunks_.find(key);
     if (found != chunks_.end()) {
-        requestBytes(found->second.bytes.size(), &FiberRegionStats::cacheBytes);
+        requestServed(found->second.bytes.size(), &RegionStats::cacheBytes);
         recency_.splice(recency_.end(), recency_, found->second.recency);
         visit(found->second.bytes);
         return;
@@ -198,7 +216,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
         if (readRequest) {
             Statement size(db_, "SELECT length(data) FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?",
                 parseUuid(materializedObject_), name, index);
-            if (size.row()) requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+            if (size.row()) requestBytes(size.i64(0), &RegionStats::payloadBytes);
         }
         Statement current(db_, "SELECT data,hash FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?",
             parseUuid(materializedObject_), name, index);
@@ -235,7 +253,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
                     "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
                     baseRevision_.empty() ? revision_ : parseUuid(baseRevision_), name, index);
                 if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
-                requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+                requestBytes(size.i64(0), &RegionStats::payloadBytes);
             }
             Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
                                  "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?",
@@ -282,7 +300,7 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
     if (offset < 0 || offset > length) throw std::out_of_range("geometry: invalid byte offset");
     const int64_t size = count.value_or(length - offset);
     if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
-    requestBytes(size, &FiberRegionStats::reconstructedBytes);
+    requestBytes(size, &RegionStats::reconstructedBytes);
     std::vector<uint8_t> result(size);
     if (!size) return result;
     if (offset == 0 && size == length) {
@@ -391,12 +409,13 @@ std::vector<uint8_t> GeometryReader::rectangle(const std::string& name, int64_t 
     if (found == layouts_.end()) throw std::invalid_argument("geometry: array not found: " + name);
     const auto& array = manifest_.at("arrays").at(name);
     const auto shape = array.at("shape").get<std::vector<int64_t>>();
-    if (manifest_.at("kind") != "patch" || (shape.size() != 2 && shape.size() != 3))
-        throw std::invalid_argument("geometry: rectangle requires an aligned patch array");
+    if (manifest_.at("kind") != "surface" || (shape.size() != 2 && shape.size() != 3))
+        throw std::invalid_argument("geometry: rectangle requires an aligned surface array");
     if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > shape[0] || column > shape[1] ||
         rows > shape[0] - row || columns > shape[1] - column)
         throw std::out_of_range("geometry: invalid rectangle");
     const auto pixelBytes = surfacePixelBytes(array.at("dtype"), shape);
+    requestBytes(rows * columns * pixelBytes, &RegionStats::reconstructedBytes);
     std::vector<uint8_t> result(static_cast<size_t>(rows * columns * pixelBytes));
     if (!rows || !columns) return result;
     const auto& layout = found->second;
@@ -563,6 +582,52 @@ std::vector<uint8_t> ObjectStore::readGeometryRectangle(const Txn& txn, const st
     return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
         return reader.rectangle(arrayName, row, column, rows, columns);
     });
+}
+
+detail::SurfaceTile detail::surfaceTile(GeometryReader& reader, int64_t row, int64_t column, int64_t rows, int64_t columns)
+{
+    SurfaceTile tile;
+    tile.points = xyzValues<float>(reader.rectangle("points", row, column, rows, columns));
+    tile.valid.resize(tile.points.size());
+    const auto channel = reader.manifest().at("arrays").contains(surfaceValidChannel)
+        ? reader.rectangle(surfaceValidChannel, row, column, rows, columns) : std::vector<uint8_t>{};
+    for (size_t i = 0; i < tile.points.size(); ++i)
+        tile.valid[i] = vc::geometry::validSurfacePoint(tile.points[i]) && (channel.empty() || channel[i]);
+    boundSurfaceTileBands(tile, columns);
+    return tile;
+}
+
+void detail::boundSurfaceTileBands(SurfaceTile& tile, int64_t columns)
+{
+    tile.bands.clear();
+    const int64_t rows = columns ? int64_t(tile.points.size()) / columns : 0;
+    for (int64_t first = 0; first + 1 < rows; first += SurfaceTile::bandCells) {
+        const int64_t last = std::min(first + SurfaceTile::bandCells, rows - 1);
+        std::optional<std::array<double, 6>> box;
+        for (int64_t r = first; r <= last; ++r)
+            for (int64_t c = 0; c < columns; ++c) {
+                const auto i = size_t(r * columns + c);
+                if (!tile.valid[i]) continue;
+                const auto& p = tile.points[i];
+                if (!box) box = std::array<double, 6>{p[0], p[1], p[2], p[0], p[1], p[2]};
+                else for (int k = 0; k < 3; ++k) {
+                    (*box)[k] = std::min((*box)[k], double(p[k]));
+                    (*box)[k + 3] = std::max((*box)[k + 3], double(p[k]));
+                }
+            }
+        tile.bands.push_back(box);
+    }
+}
+
+std::shared_ptr<const detail::SurfaceTile> detail::surfaceTile(SurfaceTileCache* cache, const std::string& revision,
+                                                               GeometryReader& reader, int64_t row, int64_t column,
+                                                               int64_t rows, int64_t columns)
+{
+    if (cache)
+        if (auto tile = cache->find(revision, row, column, rows, columns)) return tile;
+    auto tile = std::make_shared<const SurfaceTile>(surfaceTile(reader, row, column, rows, columns));
+    if (cache) cache->insert(revision, row, column, rows, columns, tile);
+    return tile;
 }
 
 std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRectangles(const Txn& txn, const std::string& revisionUuid,

@@ -5,8 +5,9 @@
 
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/ZarrDownloadBenchmark.hpp"
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "support/TestZarrVolume.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 #include <utils/zarr.hpp>
@@ -47,14 +48,12 @@ fs::path tmpDir(const std::string& tag)
 fs::path makeLocalVolume(const fs::path& dir, size_t numLevels = 2,
                         vc::render::ChunkDtype dtype = vc::render::ChunkDtype::UInt8)
 {
-    Volume::ZarrCreateOptions opts;
+    vc::test::ZarrVolumeSpec opts;
     opts.shapeZYX = {64, 64, 64};
     opts.chunkShapeZYX = {32, 32, 32};
     opts.numLevels = numLevels;
-    opts.compressor = "none";
-    opts.overwriteExisting = true;
     opts.dtype = dtype;
-    auto v = Volume::New(dir, opts);
+    auto v = vc::test::createZarrVolume(dir, opts);
     REQUIRE(v);
     return dir;
 }
@@ -202,6 +201,30 @@ TEST_CASE("openLocalZarrPyramid: opens a multi-level local zarr")
     CHECK_FALSE(opened.fetchers[0]->measuresRemoteTransfer());
     CHECK_FALSE(opened.shapes.empty());
     CHECK(opened.shapes[0][0] == 64);
+    fs::remove_all(d);
+}
+
+TEST_CASE("local pyramid source selection skips unfetched scale levels")
+{
+    auto d = tmpDir("sparse_lod");
+    makeLocalVolume(d, 6);
+    // A partial local download may contain only numeric array directories.
+    fs::remove(d / ".zattrs");
+    for (int level : {0, 1, 4})
+        fs::remove_all(d / std::to_string(level));
+
+    auto array = createChunkCache(openLocalZarrPyramid(d), 1024 * 1024, 1);
+    REQUIRE(array->numLevels() == 6);
+    using vc::render::ChunkedPlaneSampler;
+    for (const auto& [zoom, expected] :
+         std::vector<std::pair<float, int>>{{0.03125f, 5}, {0.0625f, 5},
+                                           {0.125f, 3}, {0.25f, 3},
+                                           {0.5f, 2}, {1.0f, 2}, {4.0f, 2}}) {
+        CAPTURE(zoom);
+        CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, zoom) == expected);
+    }
+    // The quality bias still controls the transition between present levels.
+    CHECK(ChunkedPlaneSampler::sourceLevelForView(*array, 0.25f, 1.0f) == 2);
     fs::remove_all(d);
 }
 
@@ -388,18 +411,16 @@ TEST_CASE("validateAndRebaseVcPyramid rejects gaps and invalid retained fill val
 TEST_CASE("ZarrChunkFetcher fetches a present chunk from local")
 {
     auto d = tmpDir("fetch_present");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);
     Array3D<uint8_t> in({32, 32, 32}, /*fill=*/200);
-    v->writeZYX(in, {0, 0, 0}, 0);
+    vc::test::writeZYX(*v, in, {0, 0, 0}, 0);
 
     auto opened = openLocalZarrPyramid(d);
     REQUIRE_FALSE(opened.fetchers.empty());
@@ -523,18 +544,16 @@ TEST_CASE("Delta3D cache is a regular unsharded Zarr with the source layout")
 {
     auto source = tmpDir("delta3d_zarr_source");
     auto cacheDir = tmpDir("delta3d_zarr_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -826,18 +845,16 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 {
     auto source = tmpDir("mirror_unsharded_source");
     auto mirror = tmpDir("mirror_unsharded_cache");
-    auto volume = Volume::New(source, [] {
-        Volume::ZarrCreateOptions options;
+    auto volume = vc::test::createZarrVolume(source, [] {
+        vc::test::ZarrVolumeSpec options;
         options.shapeZYX = {32, 32, 32};
         options.chunkShapeZYX = {32, 32, 32};
         options.numLevels = 1;
-        options.compressor = "none";
-        options.overwriteExisting = true;
         return options;
     }());
     REQUIRE(volume);
     Array3D<std::uint8_t> values({32, 32, 32}, 173);
-    volume->writeZYX(values, {0, 0, 0}, 0);
+    vc::test::writeZYX(*volume, values, {0, 0, 0}, 0);
     volume.reset();
 
     auto store = std::make_shared<utils::FileSystemStore>(source);
@@ -883,13 +900,11 @@ TEST_CASE("native mirror stores exact unsharded bytes and reopens without source
 TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
 {
     auto d = tmpDir("fetch_missing");
-    auto v = Volume::New(d, []() {
-        Volume::ZarrCreateOptions o;
+    auto v = vc::test::createZarrVolume(d, []() {
+        vc::test::ZarrVolumeSpec o;
         o.shapeZYX = {32, 32, 32};
         o.chunkShapeZYX = {32, 32, 32};
         o.numLevels = 1;
-        o.compressor = "none";
-        o.overwriteExisting = true;
         return o;
     }());
     REQUIRE(v);
@@ -900,199 +915,4 @@ TEST_CASE("ZarrChunkFetcher fetches a Missing chunk")
     auto r = opened.fetchers[0]->fetch({0, 0, 0, 0});
     CHECK(r.status == vc::render::ChunkFetchStatus::Missing);
     fs::remove_all(d);
-}
-
-TEST_CASE("Zarr download benchmark selects unique distributed logical chunks")
-{
-    const auto first = vc::render::selectZarrDownloadBenchmarkChunks(
-        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
-    const auto second = vc::render::selectZarrDownloadBenchmarkChunks(
-        {17, 9, 5}, {4, 4, 4}, 2, 100, 41);
-    REQUIRE(first.size() == 30);
-    CHECK(first == second);
-
-    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> unique;
-    for (const auto& key : first) {
-        CHECK(key.level == 2);
-        CHECK(key.iz >= 0);
-        CHECK(key.iz < 5);
-        CHECK(key.iy >= 0);
-        CHECK(key.iy < 3);
-        CHECK(key.ix >= 0);
-        CHECK(key.ix < 2);
-        unique.insert(key);
-    }
-    CHECK(unique.size() == first.size());
-}
-
-TEST_CASE("Zarr download benchmark uses encoded fetches and fixed admission")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            ++decodedCalls;
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            ++calls;
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(1024);
-            return result;
-        }
-
-        std::atomic_size_t calls{0};
-        std::atomic_size_t decodedCalls{0};
-    };
-
-    auto fetcher = std::make_shared<EncodedFetcher>();
-    OpenedChunkedZarr opened;
-    opened.shapes = {{64, 64, 64}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {fetcher};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 12;
-    options.workers = 1;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    std::vector<vc::render::ZarrDownloadProgress> progress;
-    options.progressInterval = std::chrono::hours(1);
-    options.progressCallback = [&](const auto& update) {
-        progress.push_back(update);
-    };
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(fetcher->calls.load() == 12);
-    CHECK(fetcher->decodedCalls.load() == 0);
-    CHECK(result.requestedChunks == 12);
-    CHECK(result.foundChunks == 12);
-    CHECK(result.encodedBytes == 12 * 1024);
-    CHECK(result.httpErrors == 0);
-    CHECK(result.ioErrors == 0);
-    CHECK(result.decodeErrors == 0);
-    CHECK(result.sinkErrors == 0);
-    CHECK(result.peakActive == 1);
-    CHECK(result.finalTransferStats.admissionLimit == 1);
-    CHECK_FALSE(result.finalTransferStats.adaptive);
-    CHECK(result.finalTransferStats.bytesPerSecond == 0.0);
-    REQUIRE(progress.size() == 1);
-    CHECK(progress[0].queuedChunks == 0);
-    CHECK(progress[0].downloadingChunks == 0);
-    CHECK(progress[0].completedChunks == 12);
-    CHECK(progress[0].encodedBytes == 12 * 1024);
-}
-
-TEST_CASE("Zarr download benchmark replenishes work until its duration")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            ++calls;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(1024);
-            return result;
-        }
-
-        std::atomic_size_t calls{0};
-    };
-
-    auto fetcher = std::make_shared<EncodedFetcher>();
-    OpenedChunkedZarr opened;
-    opened.shapes = {{64, 64, 64}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {fetcher};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 2;
-    options.runDuration = std::chrono::milliseconds(15);
-    options.workers = 2;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(result.requestedChunks == fetcher->calls.load());
-    CHECK(result.requestedChunks > options.chunkCount);
-    CHECK(result.foundChunks == result.requestedChunks);
-    CHECK(result.wallSeconds >= 0.015);
-}
-
-TEST_CASE("Zarr download benchmark rejects adaptive mode without remote measurement")
-{
-    class LocalFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-    };
-
-    OpenedChunkedZarr opened;
-    opened.shapes = {{32, 32, 32}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {std::make_shared<LocalFetcher>()};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 1;
-    options.workers = 2;
-    options.schedule = vc::render::ZarrDownloadSchedule::Adaptive;
-    CHECK_THROWS_AS(
-        vc::render::runZarrDownloadBenchmark(opened, options),
-        std::invalid_argument);
-}
-
-TEST_CASE("Zarr download benchmark can write encoded payloads to a temporary sink")
-{
-    class EncodedFetcher final : public vc::render::IChunkFetcher {
-    public:
-        vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey&) override
-        {
-            return {};
-        }
-
-        vc::render::ChunkFetchResult fetchEncoded(
-            const vc::render::ChunkKey&) override
-        {
-            vc::render::ChunkFetchResult result;
-            result.status = vc::render::ChunkFetchStatus::Found;
-            result.bytes.resize(17, std::byte{0x2a});
-            return result;
-        }
-    };
-
-    const auto output = tmpDir("download_benchmark_sink");
-    OpenedChunkedZarr opened;
-    opened.shapes = {{32, 32, 32}};
-    opened.chunkShapes = {{16, 16, 16}};
-    opened.fetchers = {std::make_shared<EncodedFetcher>()};
-
-    vc::render::ZarrDownloadBenchmarkOptions options;
-    options.chunkCount = 3;
-    options.workers = 1;
-    options.schedule = vc::render::ZarrDownloadSchedule::Fixed;
-    options.outputDirectory = output;
-    const auto result = vc::render::runZarrDownloadBenchmark(opened, options);
-
-    CHECK(result.foundChunks == 3);
-    CHECK(result.encodedBytes == 51);
-    CHECK(result.sinkErrors == 0);
-    std::size_t files = 0;
-    for (const auto& entry : fs::directory_iterator(output)) {
-        CHECK(entry.is_regular_file());
-        CHECK(entry.file_size() == 17);
-        ++files;
-    }
-    CHECK(files == 3);
-    fs::remove_all(output);
 }

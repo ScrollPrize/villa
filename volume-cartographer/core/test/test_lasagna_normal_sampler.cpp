@@ -6,7 +6,6 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
-#include "vc/atlas/Atlas.hpp"
 
 #include "utils/zarr.hpp"
 
@@ -23,6 +22,43 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+
+TEST_CASE("packed CZYX channels share decoded payloads and sample their own planes")
+{
+    const auto root = fs::temp_directory_path() / ("packed_lasagna_" + std::to_string(std::random_device{}()));
+    fs::create_directories(root / "sd0");
+    utils::ZarrMetadata meta;
+    meta.version = utils::ZarrVersion::v2;
+    meta.shape = {3,4,4,4};
+    meta.chunks = {3,4,4,4};
+    meta.dtype = utils::ZarrDtype::uint8;
+    meta.compressor_id.clear();
+    meta.fill_value = 0.;
+    auto array = utils::ZarrArray::create(root / "sd0/0", meta);
+    std::vector<std::byte> bytes(3*64);
+    std::fill(bytes.begin(), bytes.begin()+64, std::byte{255});
+    std::fill(bytes.begin()+64, bytes.begin()+128, std::byte{128});
+    std::fill(bytes.begin()+128, bytes.end(), std::byte{200});
+    array.write_chunk(std::vector<size_t>{0,0,0,0}, bytes);
+    { std::ofstream out(root / ".zattrs"); out << R"({"lasagna":{"version":3,"source_to_base":1,"base_shape_zyx":[4,4,4],"validity_channel":"presence","groups":{"sd0":{"zarr":"sd0/0","scaledown":0,"channels":["presence","nx","ny"]}}}})"; }
+    auto dataset = vc::lasagna::LasagnaDataset::open(root);
+    auto presence = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "presence");
+    auto nx = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "nx");
+    auto ny = vc::lasagna::bindLasagnaChannel(dataset.manifest(), "ny");
+    auto first = presence.chunkSource->getChunkBlocking(0,0,0,0);
+    auto second = nx.chunkSource->getChunkBlocking(0,0,0,0);
+    CHECK(first.bytes.get() == second.bytes.get());
+    CHECK(second.byteOffset == 64);
+    CHECK(*vc::lasagna::sampleLasagnaChannel(ny, cv::Vec3d{1.5,1.5,1.5}) == doctest::Approx(200));
+    vc::lasagna::LasagnaChannelCornerSampler a(presence), b(nx), c(ny);
+    vc::lasagna::LasagnaCornerBatch batch;
+    (void)vc::lasagna::sampleLasagnaChannelCornerBatch({&a,&b,&c}, {cv::Vec3f{1.5f,1.5f,1.5f}}, batch, 1);
+    REQUIRE(batch.valid[0]);
+    CHECK(batch.values[0][0][0] == 255);
+    CHECK(batch.values[1][0][0] == 128);
+    CHECK(batch.values[2][0][0] == 200);
+    fs::remove_all(root);
+}
 
 namespace {
 
@@ -164,46 +200,6 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     CHECK(scaledSample.normal[0] == doctest::Approx(sample.normal[0]));
     CHECK(scaledSample.normal[1] == doctest::Approx(sample.normal[1]));
     CHECK(scaledSample.normal[2] == doctest::Approx(sample.normal[2]));
-    REQUIRE(scaledSampler.predDtSpacing() == std::nullopt);
-    fs::remove_all(dir);
-}
-
-TEST_CASE("LasagnaNormalSampler samples pred_dt channel with accepted threshold")
-{
-    const auto dir = tmpDir("pred_dt");
-    std::vector<uint8_t> gradMag(2 * 2 * 2, 255);
-    std::vector<uint8_t> nx(2 * 2 * 2, 128);
-    std::vector<uint8_t> ny(2 * 2 * 2, 128);
-    std::vector<uint8_t> predDtValues(2 * 2 * 2, 170);
-    createU8Zarr(dir / "grad_mag.zarr", {2, 2, 2}, {2, 2, 2}, &gradMag);
-    createU8Zarr(dir / "nx.zarr", {2, 2, 2}, {2, 2, 2}, &nx);
-    createU8Zarr(dir / "ny.zarr", {2, 2, 2}, {2, 2, 2}, &ny);
-    createU8Zarr(dir / "pred_dt.zarr", {2, 2, 2}, {2, 2, 2}, &predDtValues);
-    const auto manifestPath = dir / "dataset.lasagna.json";
-    writeText(manifestPath, R"({
-        "version": 2,
-        "grad_mag_encode_scale": 255.0,
-        "grad_mag_factor": 1.0,
-        "groups": {
-            "grad_mag_group": {"zarr": "grad_mag.zarr", "scaledown": 0, "channels": ["grad_mag"]},
-            "nx_group": {"zarr": "nx.zarr", "scaledown": 0, "channels": ["nx"]},
-            "ny_group": {"zarr": "ny.zarr", "scaledown": 0, "channels": ["ny"]},
-            "pred_dt_group": {"zarr": "pred_dt.zarr", "scaledown": 0, "channels": ["pred_dt"]}
-        }
-    })");
-
-    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
-    vc::lasagna::LasagnaNormalSampler sampler(dataset);
-
-    REQUIRE(sampler.hasPredDtChannel());
-    REQUIRE(sampler.predDtSpacing().has_value());
-    CHECK(*sampler.predDtSpacing() == doctest::Approx(1.0));
-    const auto predDt = sampler.samplePredDt({1.0, 1.0, 1.0});
-    REQUIRE(predDt.has_value());
-    CHECK(*predDt == doctest::Approx(170.0));
-    CHECK(vc::atlas::atlasPredDtIsInside(*predDt));
-    CHECK(vc::atlas::atlasPredDtIsInside(110.0));
-    CHECK_FALSE(vc::atlas::atlasPredDtIsInside(109.0));
     fs::remove_all(dir);
 }
 
@@ -648,7 +644,11 @@ TEST_CASE("Lasagna scalar and corner paths share regular decoded chunks in both 
     const auto dataset = LasagnaDataset::open(manifest);
     const auto a = bindLasagnaChannel(dataset.manifest(), "nx");
     const auto b = bindLasagnaChannel(dataset.manifest(), "nx");
-    CHECK(a.chunkSource->sourceId() == b.chunkSource->sourceId());
+    auto aCache = std::dynamic_pointer_cast<vc::render::ChunkCache>(a.chunkSource);
+    auto bCache = std::dynamic_pointer_cast<vc::render::ChunkCache>(b.chunkSource);
+    REQUIRE(aCache);
+    REQUIRE(bCache);
+    CHECK(aCache->sourceId() == bCache->sourceId());
     LasagnaChannelCornerSampler corners(b);
     auto request = prepareLasagnaCubeRequest(a, cv::Vec3d{1,1,1});
     LasagnaLocalChunkResolver resolver(a);
@@ -656,24 +656,24 @@ TEST_CASE("Lasagna scalar and corner paths share regular decoded chunks in both 
     const auto pin = request.chunks[0].bytes;
     REQUIRE(pin);
     CHECK(pin == b.chunkSource->getChunkIfCached(0,0,0,0).bytes);
-    const auto scalarFirstStats = a.chunkSource->stats();
+    const auto scalarFirstStats = aCache->stats();
     std::vector<LasagnaCornerSample> samples;
     (void)corners.sampleBatch({{1,1,1}}, samples);
     REQUIRE(samples.size() == 1);
     CHECK(samples[0].valid);
     CHECK(samples[0].values[0] == 42);
     CHECK(b.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin);
-    CHECK(a.chunkSource->stats().decodeAttempts == scalarFirstStats.decodeAttempts);
+    CHECK(aCache->stats().decodeAttempts == scalarFirstStats.decodeAttempts);
 
     (void)corners.sampleBatch({{4,4,4}}, samples);
     const auto cornerPin = b.chunkSource->getChunkIfCached(0,1,1,1).bytes;
     REQUIRE(cornerPin);
-    const auto cornerFirstStats = b.chunkSource->stats();
+    const auto cornerFirstStats = bCache->stats();
     const auto value = sampleLasagnaChannel(a, cv::Vec3d{4,4,4});
     REQUIRE(value);
     CHECK(*value == 42);
     CHECK(a.chunkSource->getChunkIfCached(0,1,1,1).bytes == cornerPin);
-    CHECK(a.chunkSource->stats().decodeAttempts == cornerFirstStats.decodeAttempts);
+    CHECK(aCache->stats().decodeAttempts == cornerFirstStats.decodeAttempts);
     fs::remove_all(dir);
 }
 

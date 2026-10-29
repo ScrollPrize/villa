@@ -11,18 +11,16 @@ def split_graph(d, config, protected_sources=()):
     if len(d['links']):raise ValueError('Split input must be whole fibers, not already split')
     centers,widths=uv.radial_initial_geometry(d,config)
     d=dict(d,radial_initial_centers=centers,radial_initial_widths=widths)
-    from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
-    import json
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines
     from .fiber_normal_sign_visualization import load_umbilicus_frame
-    with uv._ro(config['afv']) as db:
-        meta={k:json.loads(v) for k,v in db.execute('SELECT key,value FROM metadata')}
-    axis=load_umbilicus_frame(config['umbilicus'],meta['root'])
-    curves={r['id']:xyz for r,xyz in read_afv_polylines(config['afv'],np.unique(d['source_id']))}
+    volume=fiber_volume(config['fibers'])
+    axis=load_umbilicus_frame(config['umbilicus'],volume)
+    curves={r['id']:xyz for r,xyz in read_polylines(config['fibers'],np.unique(d['source_id']),volume=volume)}
     return split_graph_geometry(d,target,minimum,curves,axis,config.get('h_convention','ccw'),protected_sources)
 
 
 def split_graph_geometry(d,target,minimum,curves,axis,convention='ccw',protected_sources=()):
-    protected=set(map(int,protected_sources));parents=[];starts=[];ends=[];nodes=[];phases=[];zs=[];radii=[];links=[]
+    protected=set(map(str,protected_sources));parents=[];starts=[];ends=[];nodes=[];phases=[];zs=[];radii=[];links=[]
     mapped=[np.empty(len(d['i']),np.int64),np.empty(len(d['j']),np.int64)]
     offsets=[np.empty(len(d['i'])),np.empty(len(d['j']))]
     for f,source in enumerate(d['source_id']):
@@ -32,9 +30,9 @@ def split_graph_geometry(d,target,minimum,curves,axis,convention='ccw',protected
         sides=[np.flatnonzero(d[k]==f) for k in ('i','j')]
         arcs=[a+direction*d[k][rows] for k,rows in zip(('ds_a','ds_b'),sides)]
         perp=np.concatenate([x[~d['parallel'][rows]] for x,rows in zip(arcs,sides)])
-        bounds=(np.array([a,b]) if int(source) in protected else
+        bounds=(np.array([a,b]) if str(source) in protected else
                 a+uv.split_bounds(b-a,perp-a,target,minimum))
-        xyz=curves[int(source)];arc,_,angle,radius=uv.fiber_geometry(xyz,int(d['family'][f]),axis)
+        xyz=curves[str(source)];arc,_,angle,radius=uv.fiber_geometry(xyz,int(d['family'][f]),axis)
         angle*=1 if convention=='ccw' else -1
         first=len(parents)
         for lo,hi in zip(bounds[:-1],bounds[1:]):

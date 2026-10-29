@@ -36,6 +36,8 @@ struct ChunkResult {
     std::shared_ptr<const std::vector<std::byte>> bytes;
     std::string error;
     std::shared_ptr<const DecodedChunkPayload> payload;
+    // Zero-copy scalar view into a shared packed-channel decoded payload.
+    std::size_t byteOffset = 0;
 };
 
 struct ChunkRequestContext {

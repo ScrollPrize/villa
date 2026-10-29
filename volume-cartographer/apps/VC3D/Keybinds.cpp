@@ -12,7 +12,6 @@ constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionSegments = "Segments";
 constexpr const char* kSectionSurfaceTags = "Surface Tags";
 constexpr const char* kSectionSegEditing = "Segmentation Editing";
-constexpr const char* kSectionApprovalMask = "Approval Mask";
 constexpr const char* kSectionSegGrowth = "Segmentation Growth";
 constexpr const char* kSectionPushPull = "Push/Pull";
 constexpr const char* kSectionPointCollection = "Point Collection";
@@ -69,14 +68,6 @@ const ShortcutDef SurfaceNormals{
     "Toggle surface normals visualization",
     ShortcutKind::Text,
     "Ctrl+N",
-    QKeySequence::Open
-};
-const ShortcutDef DirectionHints{
-    "direction_hints",
-    kSectionViewMenu,
-    "Toggle direction hints (flip_x arrows)",
-    ShortcutKind::Text,
-    "Ctrl+T",
     QKeySequence::Open
 };
 const ShortcutDef CompositeView{
@@ -235,34 +226,10 @@ const KeyPressDef SliceStepIncrease{
     false
 };
 
-const KeyPressDef ApprovalPaintToggle{
-    "approval_paint_toggle",
-    kSectionApprovalMask,
-    "Toggle approval painting (when mask is shown)",
-    Qt::Key_B,
-    Qt::NoModifier,
-    true
-};
-const KeyPressDef UnapprovalPaintToggle{
-    "unapproval_paint_toggle",
-    kSectionApprovalMask,
-    "Toggle unapproval painting (when mask is shown)",
-    Qt::Key_N,
-    Qt::NoModifier,
-    true
-};
-const KeyPressDef ApprovalUndo{
-    "approval_undo",
-    kSectionApprovalMask,
-    "Undo last approval mask stroke",
-    Qt::Key_B,
-    Qt::ControlModifier,
-    true
-};
 const KeyPressDef SegmentationUndo{
     "segmentation_undo",
     kSectionSegEditing,
-    "Undo last change (segmentation or approval mask)",
+    "Undo last segmentation change",
     Qt::Key_Z,
     Qt::ControlModifier,
     true
@@ -273,14 +240,6 @@ const KeyPressDef ManualAddToggle{
     "Toggle Manual Add mode",
     Qt::Key_E,
     Qt::ShiftModifier,
-    true
-};
-const KeyPressDef LineDrawHold{
-    "line_draw_hold",
-    kSectionSegEditing,
-    "Line draw mode (hold)",
-    Qt::Key_S,
-    Qt::NoModifier,
     true
 };
 const KeyPressDef GrowSegmentation{
@@ -500,7 +459,6 @@ QString buildKeybindsHelpText()
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
-        { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::CompositeView.description, HelpKeyType::Shortcut, &shortcuts::CompositeView, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::RawPointsOverlay.description, HelpKeyType::Shortcut, &shortcuts::RawPointsOverlay, nullptr, nullptr },
         { kSectionViewMenu, keypress::ToggleVolumeOverlay.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleVolumeOverlay, nullptr },
@@ -528,7 +486,6 @@ QString buildKeybindsHelpText()
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
         { kSectionSegEditing, "Manual Add: extend left / up / down / right (again: apply and continue)", HelpKeyType::Literal, nullptr, nullptr, "  1 / 2 / 3 / 4" },
         { kSectionSegEditing, "Manual Add: extend only part of an edge", HelpKeyType::Literal, nullptr, nullptr, "  Shift+Drag along it" },
-        { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Anchor correction drag", HelpKeyType::Literal, nullptr, nullptr, "Hold G + Drag" },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },
@@ -537,9 +494,6 @@ QString buildKeybindsHelpText()
         { kSectionSegEditing, keypress::EnableEditing.description, HelpKeyType::KeyPress, nullptr, &keypress::EnableEditing, nullptr },
         { kSectionSegEditing, keypress::CancelOperation.description, HelpKeyType::KeyPress, nullptr, &keypress::CancelOperation, nullptr },
 
-        { kSectionApprovalMask, keypress::ApprovalPaintToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ApprovalPaintToggle, nullptr },
-        { kSectionApprovalMask, keypress::UnapprovalPaintToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::UnapprovalPaintToggle, nullptr },
-        { kSectionApprovalMask, keypress::ApprovalUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::ApprovalUndo, nullptr },
 
         { kSectionSegGrowth, keypress::GrowSegmentation.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowSegmentation, nullptr },
         { kSectionSegGrowth, keypress::GrowthLeft.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthLeft, nullptr },

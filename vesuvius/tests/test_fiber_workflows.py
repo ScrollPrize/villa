@@ -62,7 +62,7 @@ def test_native_exporter_uses_standalone_command(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_native_workflow import resolve_command
     monkeypatch.setattr(native.shutil,'which',lambda name:'/bin/exporter' if name=='custom-exporter' else None)
-    assert resolve_command({'binary':'vc_fiber_trace_chunk','args':['afv-constraints','input.json']},
+    assert resolve_command({'binary':'vc_fiber_constraints','args':['input.json']},
         {'native_binary':'custom-exporter'})==['/bin/exporter','input.json']
 
 
@@ -98,4 +98,4 @@ def test_shared_workflows_and_docs_have_no_embedded_run_identity():
 def test_reviewed_json_requires_explicit_scan_identity(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import convert
     with pytest.raises(TypeError,match='expected_manifest_tokens'):
-        convert(tmp_path,tmp_path/'source.afv',tmp_path/'out.afv')
+        convert(tmp_path,tmp_path/'out.vcobj',volume='123',shape_zyx=[10,10,10])

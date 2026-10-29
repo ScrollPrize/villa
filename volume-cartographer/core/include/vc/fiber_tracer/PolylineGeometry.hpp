@@ -46,11 +46,6 @@ struct ForwardPolylineMatch {
     PolylineArcProjection projection;
 };
 
-struct ForwardPolylineArcInterval {
-    double beginArc = 0.0;
-    double endArc = 0.0;
-};
-
 struct BoxClippedLineSegment {
     cv::Vec3d start{0.0, 0.0, 0.0};
     cv::Vec3d finish{0.0, 0.0, 0.0};
@@ -86,11 +81,6 @@ clipPolylineToHalfOpenBox(
 [[nodiscard]] PolylineArcGeometry makePolylineArcGeometry(
     const std::vector<cv::Vec3d>& points);
 
-[[nodiscard]] ForwardPolylineArcInterval selectForwardPolylineArcInterval(
-    const PolylineArcGeometry& geometry,
-    size_t beginVertexIndex,
-    std::optional<double> maximumLength = std::nullopt);
-
 [[nodiscard]] PolylineArcSample samplePolylineArc(
     const PolylineArcGeometry& geometry,
     double arc);
@@ -100,10 +90,6 @@ clipPolylineToHalfOpenBox(
     double beginArc,
     double endArc);
 
-[[nodiscard]] std::vector<PolylineArcSegment> clippedPolylineArcSegments(
-    const PolylineArcGeometry& geometry,
-    double beginArc,
-    double endArc);
 
 [[nodiscard]] PolylineArcProjection projectPointToPolylineArc(
     const PolylineArcGeometry& geometry,

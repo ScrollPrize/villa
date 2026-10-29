@@ -1,5 +1,5 @@
 #pragma once
-#include "geometry/ArrayBytes.hpp"
+#include "vc_object_store/geometry/ArrayBytes.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>

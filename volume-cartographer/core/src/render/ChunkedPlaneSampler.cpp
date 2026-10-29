@@ -1,6 +1,5 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/render/LocalChunkCache.hpp"
-#include "SamplingWaitProfile.hpp"
 #include "vc/core/render/PinnedChunkRegion.hpp"
 
 #include <utils/thread_pool.hpp>
@@ -388,10 +387,10 @@ bool readVoxel(IChunkedArray& array,
     const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
                               + std::size_t(ly)) * std::size_t(chunkShape[2])
                               + std::size_t(lx);
-    if (offset >= result.bytes->size())
+    if (result.byteOffset + offset >= result.bytes->size())
         return false;
 
-    out = std::to_integer<uint8_t>((*result.bytes)[offset]);
+    out = std::to_integer<uint8_t>((*result.bytes)[result.byteOffset + offset]);
     return true;
 }
 
@@ -463,12 +462,12 @@ StrictSampleStatus readPinnedVoxel(const PinnedChunkCache& cache,
     const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
                               + std::size_t(ly)) * std::size_t(chunkShape[2])
                               + std::size_t(lx);
-    if (offset >= result->bytes->size()) {
+    if (result->byteOffset + offset >= result->bytes->size()) {
         error = "chunk payload is smaller than expected";
         return StrictSampleStatus::Error;
     }
 
-    out = std::to_integer<uint8_t>((*result->bytes)[offset]);
+    out = std::to_integer<uint8_t>((*result->bytes)[result->byteOffset + offset]);
     return StrictSampleStatus::Ready;
 }
 
@@ -728,14 +727,6 @@ bool collectLevelPointDependencies(IChunkedArray& array,
     return ok;
 }
 
-void requestDependencies(LocalChunkCache& cache,
-                         const std::unordered_set<ChunkKey, ChunkKeyHash>& keys,
-                         ChunkedPlaneSampler::Stats& stats)
-{
-    for (const ChunkKey& key : keys)
-        (void)cache.get(key, stats.requestedChunks, stats.errorChunks);
-}
-
 bool sampleNearest(IChunkedArray& array,
                    LocalChunkCache& cache,
                    const LevelAccess& access,
@@ -844,8 +835,8 @@ bool sampleTrilinear(IChunkedArray& array,
                                             + std::size_t(ly) * strideY
                                             + std::size_t(lx);
                 const std::size_t offset111 = offset000 + strideZ + strideY + strideX;
-                if (offset111 < result.bytes->size()) {
-                    const auto* bytes = result.bytes->data();
+                if (result.byteOffset + offset111 < result.bytes->size()) {
+                    const auto* bytes = result.bytes->data() + result.byteOffset;
                     const uint8_t v000 = std::to_integer<uint8_t>(bytes[offset000]);
                     const uint8_t v001 = std::to_integer<uint8_t>(bytes[offset000 + strideX]);
                     const uint8_t v010 = std::to_integer<uint8_t>(bytes[offset000 + strideY]);
@@ -982,11 +973,11 @@ StrictSampleStatus samplePinnedTrilinear(const PinnedChunkCache& cache,
                 std::size_t(iy - run->begin[1]) * strideY +
                 std::size_t(ix - run->begin[2]);
             const std::size_t offset111 = offset000 + strideZ + strideY + strideX;
-            if (offset111 >= result->bytes->size()) {
+            if (result->byteOffset + offset111 >= result->bytes->size()) {
                 error = "chunk payload is smaller than expected";
                 return StrictSampleStatus::Error;
             }
-            const auto* bytes = result->bytes->data();
+            const auto* bytes = result->bytes->data() + result->byteOffset;
             out = interpolateTrilinearU8(
                 fx, fy, fz,
                 std::to_integer<uint8_t>(bytes[offset000]),
@@ -1721,97 +1712,22 @@ int ChunkedPlaneSampler::sourceLevelForView(IChunkedArray& array,
     }
     const double maximumExtent =
         1.0 / (static_cast<double>(pixelsPerBaseVoxel) * qualityBias);
-    int selected = 0;
+    int selected = -1;
     for (int level = 0; level < array.numLevels(); ++level) {
+        // Partial local pyramids retain empty slots for absent physical levels.
+        // Their default transforms do not describe sampleable source voxels.
+        const auto shape = array.shape(level);
+        if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)
+            continue;
         const double extent = maximumBaseVoxelExtent(array, level);
-        if (std::isfinite(extent) && extent <= maximumExtent)
+        if (!std::isfinite(extent))
+            continue;
+        // At high zoom, keep the finest available level even if no level meets
+        // the quality threshold.
+        if (selected < 0 || extent <= maximumExtent)
             selected = level;
     }
-    return selected;
-}
-
-ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
-    IChunkedArray& array,
-    int level,
-    const cv::Vec3f& origin,
-    const cv::Vec3f& vxStep,
-    const cv::Vec3f& vyStep,
-    const cv::Mat_<uint8_t>& coverage,
-    const Options& options)
-{
-    Stats stats;
-    if (level < 0 || level >= array.numLevels() || coverage.empty())
-        return stats;
-
-    const LevelAccess access = makeLevelAccess(array, level);
-    if (!hasSampleableLevel(access))
-        return stats;
-    const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
-    LocalChunkCache chunkCache(array, 64, options.queueMisses, options.request);
-    const int tile = std::max(1, options.tileSize);
-    std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-    tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
-    for (int ty = 0; ty < coverage.rows; ty += tile) {
-        const int yEnd = std::min(ty + tile, coverage.rows);
-        for (int tx = 0; tx < coverage.cols; tx += tile) {
-            const int xEnd = std::min(tx + tile, coverage.cols);
-            tileKeys.clear();
-            for (int y = ty; y < yEnd; ++y) {
-                const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                const cv::Vec3f rowBase = levelPlane.origin + levelPlane.vyStep * float(y);
-                for (int x = tx; x < xEnd; ++x) {
-                    if (coverageRow[x])
-                        continue;
-                    (void)collectLevelPointDependencies(
-                        array, access, level, rowBase + levelPlane.vxStep * float(x),
-                        options.sampling, tileKeys);
-                }
-            }
-            requestDependencies(chunkCache, tileKeys, stats);
-        }
-    }
-    return stats;
-}
-
-ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestCoordsDependencies(
-    IChunkedArray& array,
-    int level,
-    const cv::Mat_<cv::Vec3f>& coords,
-    const cv::Mat_<uint8_t>& coverage,
-    const Options& options)
-{
-    Stats stats;
-    if (level < 0 || level >= array.numLevels() || coords.empty() || coverage.empty())
-        return stats;
-
-    const LevelAccess access = makeLevelAccess(array, level);
-    if (!hasSampleableLevel(access))
-        return stats;
-    LocalChunkCache chunkCache(array, 64, options.queueMisses, options.request);
-    const int tile = std::max(1, options.tileSize);
-    const int h = std::min(coords.rows, coverage.rows);
-    const int w = std::min(coords.cols, coverage.cols);
-    std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-    tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
-    for (int ty = 0; ty < h; ty += tile) {
-        const int yEnd = std::min(ty + tile, h);
-        for (int tx = 0; tx < w; tx += tile) {
-            const int xEnd = std::min(tx + tile, w);
-            tileKeys.clear();
-            for (int y = ty; y < yEnd; ++y) {
-                const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
-                const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                for (int x = tx; x < xEnd; ++x) {
-                    if (coverageRow[x])
-                        continue;
-                    (void)collectPointDependencies(array, access, level, coordRow[x],
-                                                   options.sampling, true, tileKeys);
-                }
-            }
-            requestDependencies(chunkCache, tileKeys, stats);
-        }
-    }
-    return stats;
+    return std::max(selected, 0);
 }
 
 ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
@@ -1822,8 +1738,7 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
     const cv::Vec3f& vyStep,
     cv::Mat_<uint8_t>& out,
     cv::Mat_<uint8_t>& coverage,
-    const ChunkedPlaneSampler::Options& options,
-    bool overwriteCovered)
+    const ChunkedPlaneSampler::Options& options)
 {
     ChunkedPlaneSampler::Stats stats;
     if (level < 0 || level >= array.numLevels() || out.empty() || coverage.empty())
@@ -1857,7 +1772,7 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
                 uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
                 const cv::Vec3f rowBase = levelPlane.origin + levelPlane.vyStep * float(y);
                 for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
-                    if (!overwriteCovered && coverageRow[x])
+                    if (coverageRow[x])
                         continue;
 
                     uint8_t value = 0;
@@ -1910,8 +1825,7 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
     const cv::Mat_<cv::Vec3f>& coords,
     cv::Mat_<uint8_t>& out,
     cv::Mat_<uint8_t>& coverage,
-    const ChunkedPlaneSampler::Options& options,
-    bool overwriteCovered)
+    const ChunkedPlaneSampler::Options& options)
 {
     ChunkedPlaneSampler::Stats stats;
     if (level < 0 || level >= array.numLevels() || coords.empty() || out.empty() || coverage.empty())
@@ -1946,7 +1860,7 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
                 uint8_t* outRow = out.ptr<uint8_t>(y);
                 uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
                 for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
-                    if (!overwriteCovered && coverageRow[x])
+                    if (coverageRow[x])
                         continue;
 
                     uint8_t value = 0;
@@ -2140,7 +2054,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneLevel(
     const Options& options)
 {
     return samplePlaneLevelImpl(array, level, origin, vxStep, vyStep, out, coverage,
-                                options, false);
+                                options);
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevel(
@@ -2151,7 +2065,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevel(
     cv::Mat_<uint8_t>& coverage,
     const Options& options)
 {
-    return sampleCoordsLevelImpl(array, level, coords, out, coverage, options, false);
+    return sampleCoordsLevelImpl(array, level, coords, out, coverage, options);
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
@@ -2537,8 +2451,10 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
                 ++stats.missingChunks;
             const auto& stored = result;
             if (stored.status == ChunkStatus::Data && stored.bytes) {
-                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data();
-                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size();
+                if (stored.byteOffset > stored.bytes->size())
+                    throw std::runtime_error("packed channel offset exceeds chunk payload");
+                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data() + stored.byteOffset;
+                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size() - stored.byteOffset;
             }
         }
         ++volumeIndex;
@@ -2666,10 +2582,6 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     const auto gatherEnd = Clock::now();
     stats.cornerGatherSeconds =
         std::chrono::duration<double>(gatherEnd - pinEnd).count();
-    detail::recordSamplingWait(6,stats.cornerPrepareSeconds+stats.cornerLayoutSeconds);
-    detail::recordSamplingWait(7,stats.cornerPinSeconds);
-    detail::recordSamplingWait(8,stats.cornerGatherSeconds);
-    detail::flushSamplingWaits();
     const size_t validPoints = static_cast<size_t>(
         std::count(valid.begin(), valid.end(), uint8_t{1}));
     const size_t covered = validPoints * arrays.size() * 8;
@@ -2783,50 +2695,6 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsFineToCoarse(
     if (remaining > 0) {
         Stats stats = markKnownMissingCoordsPixels(
             array, startLevel, coords, out, coverage, options);
-        addStats(total, stats);
-    }
-    return total;
-}
-
-ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneCoarseToFine(
-    IChunkedArray& array,
-    int finestLevel,
-    const cv::Vec3f& origin,
-    const cv::Vec3f& vxStep,
-    const cv::Vec3f& vyStep,
-    cv::Mat_<uint8_t>& out,
-    cv::Mat_<uint8_t>& coverage,
-    const Options& options)
-{
-    Stats total;
-    if (array.numLevels() <= 0)
-        return total;
-
-    const int firstLevel = std::clamp(finestLevel, 0, array.numLevels() - 1);
-    for (int level = array.numLevels() - 1; level >= firstLevel; --level) {
-        Stats stats = samplePlaneLevelImpl(array, level, origin, vxStep, vyStep,
-                                           out, coverage, options, true);
-        addStats(total, stats);
-    }
-    return total;
-}
-
-ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsCoarseToFine(
-    IChunkedArray& array,
-    int finestLevel,
-    const cv::Mat_<cv::Vec3f>& coords,
-    cv::Mat_<uint8_t>& out,
-    cv::Mat_<uint8_t>& coverage,
-    const Options& options)
-{
-    Stats total;
-    if (array.numLevels() <= 0)
-        return total;
-
-    const int firstLevel = std::clamp(finestLevel, 0, array.numLevels() - 1);
-    for (int level = array.numLevels() - 1; level >= firstLevel; --level) {
-        Stats stats = sampleCoordsLevelImpl(array, level, coords, out, coverage,
-                                            options, true);
         addStats(total, stats);
     }
     return total;

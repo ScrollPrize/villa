@@ -6,8 +6,12 @@ from vesuvius.neural_tracing.fiber_trace_3d import fiber_soft_winding as soft
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_implicit_winding as imp
 
 
+def fid(k):
+    return f'00000000-0000-4000-8000-{k:012d}'
+
+
 def fixture():
-    d=dict(source_id=np.array([7,7,8]),start=np.array([0.,100.,0.]),end=np.array([100.,200.,200.]),
+    d=dict(source_id=np.array([fid(7),fid(7),fid(8)]),start=np.array([0.,100.,0.]),end=np.array([100.,200.,200.]),
         family=np.array([0,0,1]),node_ds=np.array([[0,50,100],[0,50,100],[0,-100,-200.]]),
         i=np.array([0,1,1]),j=np.array([2,2,2]),ds_a=np.array([99.,1.,60.]),ds_b=np.array([-10.,-30.,-70.]),
         parallel=np.zeros(3,dtype=bool),sign=np.ones(3),distance=np.ones(3)*.5,links=np.array([[0,1,100,0]]))
@@ -150,7 +154,7 @@ def test_whole_fiber_topology_and_direction():
     assert t['v_offset_a'][0]==t['v_offset_a'][1] # across split boundary
     np.testing.assert_allclose(t['v_offset_arc'],[100,160,10,30,70])
     np.testing.assert_array_equal(t['v_offset_left'],[0,2,3])
-    d['source_id'][1]=9
+    d['source_id'][1]=fid(9)
     t=off.topology(d)
     assert t['v_offset_a'][0]!=t['v_offset_a'][1]
 

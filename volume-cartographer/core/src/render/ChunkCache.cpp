@@ -1,5 +1,4 @@
-#include "ChunkCache.hpp"
-#include "SamplingWaitProfile.hpp"
+#include "vc/core/render/ChunkCache.hpp"
 
 #include <utils/thread_pool.hpp>
 #include <utils/Json.hpp>
@@ -1397,32 +1396,8 @@ void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
 }
 
 namespace {
-std::atomic_bool g_persistentCompressionDefault{false};
-std::atomic_int g_persistentQuantizationDefault{1};
 std::mutex g_decodedBudgetDefaultMutex;
 std::weak_ptr<DecodedChunkCacheBudget> g_decodedBudgetDefault;
-}
-
-void ChunkCache::setPersistentCompressionDefault(bool enabled)
-{
-    (void)enabled;
-    g_persistentCompressionDefault.store(false, std::memory_order_relaxed);
-}
-
-bool ChunkCache::persistentCompressionDefault()
-{
-    return g_persistentCompressionDefault.load(std::memory_order_relaxed);
-}
-
-void ChunkCache::setPersistentQuantizationDefault(int binWidth)
-{
-    (void)binWidth;
-    g_persistentQuantizationDefault.store(1, std::memory_order_relaxed);
-}
-
-int ChunkCache::persistentQuantizationDefault()
-{
-    return g_persistentQuantizationDefault.load(std::memory_order_relaxed);
 }
 
 void ChunkCache::setDecodedByteBudgetDefault(
@@ -1715,11 +1690,9 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
 
 ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
 {
-    detail::SamplingWaitTimer operationTimer(4);
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix, state->sourceId_};
-    std::unique_lock lock(state->mutex_,std::defer_lock);
-    { detail::SamplingWaitTimer lockTimer(5); lock.lock(); }
+    std::unique_lock lock(state->mutex_);
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
@@ -1752,11 +1725,9 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
                                         const ChunkRequestContext& request)
 {
-    detail::SamplingWaitTimer operationTimer(0);
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix, state->sourceId_};
-    std::unique_lock lock(state->mutex_,std::defer_lock);
-    { detail::SamplingWaitTimer lockTimer(1); lock.lock(); }
+    std::unique_lock lock(state->mutex_);
     if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
         !state->fetchers_[static_cast<std::size_t>(level)]) {
         return ChunkResult{
@@ -1808,9 +1779,9 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
     // takes the lock).
     auto finishLocked = [&](ChunkResult result) {
         releaseReaderLocked();
-        { detail::SamplingWaitTimer timer(10); enforceCapacityLocked(state); }
+        enforceCapacityLocked(state);
         lock.unlock();
-        { detail::SamplingWaitTimer timer(11); enforceSharedBudget(state); }
+        enforceSharedBudget(state);
         return result;
     };
     try {
@@ -1851,7 +1822,6 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
             // observed; one it never observed can only vanish while the
             // reader's own wake is still pending, which lands in the retry
             // below.
-            { detail::SamplingWaitTimer timer(9);
             state->cv_.wait(lock, [&] {
                 auto entry = state->entries_.find(key);
                 if (entry == state->entries_.end())
@@ -1860,7 +1830,6 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
                 entry->second.backgroundDemand |= !request.foreground;
                 return entry->second.status != EntryStatus::InFlight;
             });
-            }
             it = state->entries_.find(key);
             if (it != state->entries_.end())
                 return finishLocked(
@@ -1902,10 +1871,8 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
                                 int priorityOffset,
                                 const ChunkRequestContext& request)
 {
-    detail::SamplingWaitTimer operationTimer(2);
     auto state = state_;
-    std::unique_lock lock(state->mutex_,std::defer_lock);
-    { detail::SamplingWaitTimer lockTimer(3); lock.lock(); }
+    std::unique_lock lock(state->mutex_);
     std::vector<ChunkKey> remoteStarts;
     for (auto key : keys) {
         key = sourceKey(*state, key);
@@ -2058,59 +2025,6 @@ ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
 PersistentCacheLayout ChunkCache::persistentCacheLayout() const noexcept
 {
     return state_->persistentLayout_;
-}
-
-std::vector<ChunkKey> ChunkCache::persistedStorageObjectRepresentatives() const
-{
-    auto state = state_;
-    std::vector<ChunkKey> result;
-    if (!state->options_.persistentCachePath ||
-        (state->persistentLayout_ != PersistentCacheLayout::ZarrMirror &&
-         state->persistentLayout_ != PersistentCacheLayout::Delta3d)) {
-        return result;
-    }
-
-    std::unordered_set<ChunkKey, ChunkKeyHash> seen;
-    std::error_code ec;
-    const auto& root = *state->options_.persistentCachePath;
-    for (std::filesystem::recursive_directory_iterator it(
-             root, std::filesystem::directory_options::skip_permission_denied,
-             ec), end;
-         !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) {
-            ec.clear();
-            continue;
-        }
-        auto relative = std::filesystem::relative(it->path(), root, ec);
-        if (ec) {
-            ec.clear();
-            continue;
-        }
-        std::string key = relative.generic_string();
-        constexpr std::string_view emptyPrefix = ".vc_cache_empty/";
-        if (key.starts_with(emptyPrefix))
-            key.erase(0, emptyPrefix.size());
-        if (key.size() > 6 && key.ends_with(".empty"))
-            key.resize(key.size() - 6);
-        for (std::size_t level = 0; level < state->fetchers_.size(); ++level) {
-            const auto& fetcher = state->fetchers_[level];
-            if (!fetcher)
-                continue;
-            auto logical = fetcher->logicalRepresentativeForStorageKey(
-                static_cast<int>(level), key);
-            if (!logical)
-                continue;
-            *logical = sourceKey(*state, *logical);
-            if (isValidKey(*state, *logical) && seen.insert(*logical).second)
-                result.push_back(*logical);
-            break;
-        }
-    }
-    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
-        return std::tie(lhs.level, lhs.iz, lhs.iy, lhs.ix) <
-               std::tie(rhs.level, rhs.iz, rhs.iy, rhs.ix);
-    });
-    return result;
 }
 
 std::vector<ChunkKey> ChunkCache::storageObjectRepresentatives(int level) const

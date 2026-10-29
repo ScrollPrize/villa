@@ -20,7 +20,7 @@ struct VertexDelta
 class UndoHistory
 {
 public:
-    // Capture full surface state (legacy method - memory intensive)
+    // Capture full surface state (memory intensive)
     bool capture(const cv::Mat_<cv::Vec3f>& points)
     {
         if (points.empty()) {
@@ -68,7 +68,7 @@ public:
         Entry entry = std::move(_states.back());
         _states.pop_back();
 
-        // Return full points if available (legacy)
+        // Return full points if this was a snapshot entry
         if (!entry.points.empty()) {
             return entry.points;
         }
@@ -150,7 +150,7 @@ public:
 private:
     struct Entry
     {
-        cv::Mat_<cv::Vec3f> points;        // Full snapshot (legacy, memory intensive)
+        cv::Mat_<cv::Vec3f> points;        // Full snapshot (memory intensive)
         std::vector<VertexDelta> deltas;   // Delta-based (memory efficient)
     };
 

@@ -42,8 +42,9 @@ def run(settings):
     gcfg=json.loads((gtroot/'uv_whole/config.json').read_text())
     paths=[Path(settings['base_config']),baseline/'tensors.npz',baseline/'init/solution.npz',
            baseline/'init/samples.npz',baseline/'gt_events.json',baseline/'solve/solution.npz',
-           gtroot/'uv_whole/config.json',gtroot/'uv_whole/solution.npz',Path(gcfg['tensor_cache']),Path(gcfg['afv'])]
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+           gtroot/'uv_whole/config.json',gtroot/'uv_whole/solution.npz',Path(gcfg['tensor_cache'])]
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},gt_fibers=fibers_digest(gcfg['fibers']))
     if (root/'inputs.json').exists() and json.loads((root/'inputs.json').read_text())!=signature:
         raise ValueError('Inpainting input changed')
     atomic_write(root/'inputs.json',signature,durable=False)
@@ -71,10 +72,10 @@ def run(settings):
         devices=settings.get('devices',cfg.get('devices','0')))
     cfg['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False,label='fixed-GT-fiber-inpainting')
     atomic_write(root/'solve_config.json',{'fiber_implicit_winding':cfg},durable=False)
-    atomic_write(root/'surface_inputs.json',dict(predicted_curves=str(Path(settings['dataset'])/'selected.afv'),
+    atomic_write(root/'surface_inputs.json',dict(predicted_curves=str(Path(settings['dataset'])/'selected.vcobj'),
         tensors=cfg['tensor_cache'],solution=str(root/'solve/solution.npz'),
         deformed_solution=str(root/'deformed/solution.npz') if 'deformation_parameters' in settings else None,
-        fixed_reference_curves=gcfg['afv'],fixed_reference_solution=str(gtroot/'uv_whole/solution.npz'),
+        fixed_reference_curves=gcfg['fibers'],fixed_reference_solution=str(gtroot/'uv_whole/solution.npz'),
         fixed_reference_config=str(gtroot/'uv_whole/config.json'),reference_endpoints=str(refpath),
         reference_fibers=len(gd['family']),reference_policy='whole curves, exact native GT layout, always active; never optimized or deformed'),durable=False)
     if not (root/'solve/summary.json').exists():dispatch({'fiber_implicit_winding':cfg})
@@ -97,7 +98,8 @@ def run(settings):
         deform=deformation_config(json.loads((root/'solve/config.json').read_text()),settings,root)
         atomic_write(root/'deform_config.json',{'fiber_exact_deformation':deform},durable=False)
         deformation=(json.loads((root/'deformed/summary.json').read_text()) if (root/'deformed/summary.json').exists() else run_exact(deform))
-    if any(sha256_file(p)!=signature['inputs'][str(p)] for p in paths):raise ValueError('Fixed input changed')
+    if (any(sha256_file(p)!=signature['inputs'][str(p)] for p in paths)
+            or fibers_digest(gcfg['fibers'])!=signature['gt_fibers']):raise ValueError('Fixed input changed')
     result=dict(score=score,matches=matches,deformation=deformation,internal_signs=internal,
         final=json.loads((root/'solve/summary.json').read_text())['final'],
         fibers=len(st),enabled=int((st[:,3]>=0).sum()),fixed_references=len(gd['family']),reference_events=len(owner),

@@ -194,7 +194,6 @@ public:
     void setConfig(Config config);
     [[nodiscard]] Config config() const { return _config; }
 
-    static bool isInvalidPoint(const cv::Vec3f& value);
 
 private:
     using GridKey = SegmentationEditManager::GridKey;
