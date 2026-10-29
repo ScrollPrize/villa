@@ -452,7 +452,7 @@ std::optional<Json> cachedSourceZarray(const std::vector<std::string>& cacheDirs
         if (attrs && attrs->contains("vc_reader")) {
             const auto source = attrs->at("vc_reader").value("source_zarray", Json());
             if (!source.is_null() && !source.empty())
-                return source;
+                return std::optional<Json>{source};
         }
         if (auto stored = readJson(droot / ".zarray"); stored && !fallback)
             fallback = stored;
