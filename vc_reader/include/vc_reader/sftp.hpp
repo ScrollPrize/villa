@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-namespace vc::sftp {
+namespace vcr::sftp {
 
 // sftp://[user@]host[:port]/absolute/path; ssh:// is accepted as an alias.
 // Passwords, queries and fragments are rejected; the path is percent-decoded.
@@ -135,4 +135,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace vc::sftp
+}  // namespace vcr::sftp

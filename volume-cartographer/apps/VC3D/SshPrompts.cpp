@@ -1,6 +1,6 @@
 #include "SshPrompts.hpp"
 
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 
 #include <QApplication>
 #include <QInputDialog>
@@ -15,7 +15,7 @@
 
 namespace vc3d {
 namespace {
-std::optional<std::string> ask(const vc::sftp::Prompt& prompt)
+std::optional<std::string> ask(const vcr::sftp::Prompt& prompt)
 {
     auto* parent = QApplication::activeWindow();
     const auto title = QObject::tr("SSH login: %1").arg(QString::fromStdString(prompt.destination));
@@ -33,7 +33,7 @@ std::optional<std::string> ask(const vc::sftp::Prompt& prompt)
 
 void installSshPrompts()
 {
-    vc::sftp::setAuthenticator([](const vc::sftp::Prompt& prompt) -> std::optional<std::string> {
+    vcr::sftp::setAuthenticator([](const vcr::sftp::Prompt& prompt) -> std::optional<std::string> {
         auto* app = QCoreApplication::instance();
         if (!app) return std::nullopt;
         if (QThread::currentThread() == app->thread()) return ask(prompt);

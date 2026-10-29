@@ -1,4 +1,4 @@
-#include "sftp/SshProcess.hpp"
+#include "ssh_process.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -26,7 +26,7 @@
 extern char** environ;
 #endif
 
-namespace vc::sftp {
+namespace vcr::sftp {
 namespace detail {
 namespace {
 constexpr size_t kDiagnosticBytes = 8192;
@@ -483,4 +483,4 @@ Authenticator terminalAuthenticator()
 #endif
 }
 
-}  // namespace vc::sftp
+}  // namespace vcr::sftp

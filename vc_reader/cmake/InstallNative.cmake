@@ -1,5 +1,5 @@
 include(CMakePackageConfigHelpers)
-set(_vc_native_targets vc_reader_headers vc_reader_transforms vc_reader_catalog)
+set(_vc_native_targets vc_reader_headers vc_reader_transforms vc_reader_catalog vc_reader_sftp)
 if(VC_READER_ENABLE_CUDA)
     list(APPEND _vc_native_targets vc_reader_transform_cuda)
 endif()

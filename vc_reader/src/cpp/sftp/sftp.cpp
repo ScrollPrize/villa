@@ -1,5 +1,5 @@
-#include "vc_object_store/sftp/Sftp.hpp"
-#include "sftp/SshProcess.hpp"
+#include "vc_reader/sftp.hpp"
+#include "ssh_process.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -7,7 +7,7 @@
 #include <map>
 #include <mutex>
 
-namespace vc::sftp {
+namespace vcr::sftp {
 namespace {
 constexpr uint32_t kMaxPacket = 16 * 1024 * 1024;
 constexpr uint32_t kChunk = 32768;          // per READ/WRITE request; every server accepts it
@@ -534,4 +534,4 @@ void Session::write(const Handle& handle, uint64_t offset, std::span<const std::
 void Session::flush() { impl_->flush(); }
 bool Session::writesPending() const { return !impl_->writes.empty(); }
 
-}  // namespace vc::sftp
+}  // namespace vcr::sftp

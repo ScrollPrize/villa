@@ -1,7 +1,7 @@
 #pragma once
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 
-namespace vc::sftp::detail {
+namespace vcr::sftp::detail {
 
 // The `ssh -s HOST sftp` child process and its byte stream. With an
 // authenticator (Linux/macOS), ssh's prompts arrive through SSH_ASKPASS and are
@@ -27,4 +27,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace vc::sftp::detail
+}  // namespace vcr::sftp::detail

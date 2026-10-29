@@ -1,6 +1,6 @@
 add_library(utils src/zarr.cpp src/Json.cpp src/aws_auth.cpp src/http_fetch.cpp src/sftp_fetch.cpp)
 # SFTP protocol client shared with the object store's hosted hubs.
-target_link_libraries(utils PRIVATE vc_object_store::vc_sftp)
+target_link_libraries(utils PRIVATE vc_reader::sftp)
 target_include_directories(utils PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )

@@ -25,15 +25,6 @@ target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT
 target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
-# SFTP v3 client over the system OpenSSH program; no SQLite or application types.
-add_library(vc_sftp ${_vc_store_library_type} sftp/Sftp.cpp sftp/SshProcess.cpp)
-target_include_directories(vc_sftp PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-find_package(Threads REQUIRED)
-target_link_libraries(vc_sftp PRIVATE Threads::Threads)
-target_compile_features(vc_sftp PUBLIC cxx_std_20)
-add_library(vc_object_store::vc_sftp ALIAS vc_sftp)
-
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects ${_vc_store_library_type}
     sftp/SftpVfs.cpp
@@ -99,7 +90,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_reader::sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)

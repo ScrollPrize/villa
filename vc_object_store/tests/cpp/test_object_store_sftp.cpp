@@ -6,7 +6,7 @@
 #include "HubTestSupport.hpp"
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 #include <sys/stat.h>
@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 using namespace vc::objects;
-namespace sftp = vc::sftp;
+namespace sftp = vcr::sftp;
 
 namespace {
 std::string shellQuote(const std::string& text)

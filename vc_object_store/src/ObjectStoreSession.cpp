@@ -4,7 +4,7 @@
 #include "hub/HubWorker.hpp"
 #include "internal/SurfaceDrafts.hpp"
 #include "vc_object_store/objects/ObjectCopy.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
@@ -670,7 +670,7 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
         else base = attachment->store.path();
     } catch (...) { release(*attachment, false); throw; }
     release(*attachment, false);
-    if (sftp::isSftpUrl(base.string()))
+    if (vcr::sftp::isSftpUrl(base.string()))
         throw std::runtime_error("an sftp:// hub has no shared artifact directory; mount the share instead");
     auto directory = std::filesystem::path(base.string() + ".artifacts") / object;
     if (create) std::filesystem::create_directories(directory);

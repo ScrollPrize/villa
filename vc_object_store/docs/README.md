@@ -268,8 +268,8 @@ vc_object_hub clone sftp://alice@data.example.org/share/hub.vcobj ~/objects-repl
 the store's own SQLite VFS, which speaks SFTP v3 to the system OpenSSH `ssh`
 program (`ssh -s host sftp`), so `~/.ssh/config`, keys, the agent, ProxyJump and
 `known_hosts` apply as usual and nothing needs mounting. The protocol client is
-the `vc_object_store::vc_sftp` library (`include/vc_object_store/sftp/Sftp.hpp`),
-which VC3D also uses for remote volumes. It locks with the same `<hub>.lock`
+vc_reader's `vc_reader::sftp` library (`vc_reader/sftp.hpp`), which also serves
+remote volumes. It locks with the same `<hub>.lock`
 directory as the `unix-dotfile` VFS, so clients on a mount and clients using an
 address can share one hub. The server must offer OpenSSH's `fsync@openssh.com`
 extension (stock OpenSSH does), or writes could not be made durable; the VFS

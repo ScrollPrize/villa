@@ -1,6 +1,6 @@
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -45,7 +45,7 @@ void print(const std::vector<HubLease>& leases)
 
 int main(int argc, char** argv)
 try {
-    vc::sftp::setAuthenticator(vc::sftp::terminalAuthenticator());
+    vcr::sftp::setAuthenticator(vcr::sftp::terminalAuthenticator());
     std::vector<std::string> positional;
     std::string author;
     int64_t seconds = kDefaultLeaseSeconds;

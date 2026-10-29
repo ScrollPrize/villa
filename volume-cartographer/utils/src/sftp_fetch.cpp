@@ -1,6 +1,6 @@
 #include "utils/sftp_fetch.hpp"
 
-#include "vc_object_store/sftp/Sftp.hpp"
+#include "vc_reader/sftp.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -13,13 +13,13 @@ namespace utils
 {
 namespace
 {
-using vc::sftp::Session;
-using vc::sftp::StatusError;
-using vc::sftp::Url;
+using vcr::sftp::Session;
+using vcr::sftp::StatusError;
+using vcr::sftp::Url;
 
-vc::sftp::Options options(const HttpClient::Config& config)
+vcr::sftp::Options options(const HttpClient::Config& config)
 {
-    vc::sftp::Options out;
+    vcr::sftp::Options out;
     out.connectTimeout = std::chrono::seconds(config.connect_timeout.count());
     const int64_t seconds = config.low_speed_time.count() > 0 ? config.low_speed_time.count()
                             : config.transfer_timeout.count() > 0 ? config.transfer_timeout.count()
@@ -32,16 +32,16 @@ vc::sftp::Options options(const HttpClient::Config& config)
 HttpResponse fetch(Session& session, const Url& url, bool head, std::optional<std::pair<std::size_t, std::size_t>> range,
                    const HttpClient::DownloadObserver& observer)
 {
-    vc::sftp::Attributes attributes;
+    vcr::sftp::Attributes attributes;
     try {
         attributes = session.stat(url.path);
     } catch (const StatusError& e) {
         // A missing sparse chunk is a normal response, not a broken
         // connection. Keep the session for subsequent chunk requests.
-        if (e.status != vc::sftp::NoSuchFile && e.status != vc::sftp::PermissionDenied)
+        if (e.status != vcr::sftp::NoSuchFile && e.status != vcr::sftp::PermissionDenied)
             throw;
         HttpResponse out;
-        out.status_code = e.status == vc::sftp::NoSuchFile ? 404 : 403;
+        out.status_code = e.status == vcr::sftp::NoSuchFile ? 404 : 403;
         out.error_message = e.what();
         return out;
     }
@@ -65,7 +65,7 @@ HttpResponse fetch(Session& session, const Url& url, bool head, std::optional<st
     const uint64_t size = range ? std::min<uint64_t>(range->second, fileSize - start) : fileSize;
     out.content_length = size;
     out.body.reserve(size);
-    const auto handle = session.open(url.path, vc::sftp::Read);
+    const auto handle = session.open(url.path, vcr::sftp::Read);
     session.read(handle, start, size, [&](std::span<const std::byte> data) {
         out.body.insert(out.body.end(), data.begin(), data.end());
         if (observer)
@@ -88,7 +88,7 @@ std::vector<SftpDirectoryEntry> list(Session& session, const Url& url)
             try {
                 a = session.stat(child.path);
             } catch (const StatusError& e) {
-                if (unknownType || (e.status != vc::sftp::NoSuchFile && e.status != vc::sftp::PermissionDenied))
+                if (unknownType || (e.status != vcr::sftp::NoSuchFile && e.status != vcr::sftp::PermissionDenied))
                     throw;
             }
         }
@@ -130,13 +130,13 @@ void discard(const Url& url)
 }
 }  // namespace
 
-bool is_sftp_url(std::string_view url) noexcept { return vc::sftp::isSftpUrl(url); }
-std::string canonical_sftp_url(std::string_view url) { return vc::sftp::parseUrl(url).str(); }
+bool is_sftp_url(std::string_view url) noexcept { return vcr::sftp::isSftpUrl(url); }
+std::string canonical_sftp_url(std::string_view url) { return vcr::sftp::parseUrl(url).str(); }
 std::string sftp_cache_authority(std::string_view url)
 {
     static constexpr char digits[] = "0123456789ABCDEF";
     std::string out;
-    for (const char c : vc::sftp::parseUrl(url).authority()) {
+    for (const char c : vcr::sftp::parseUrl(url).authority()) {
         const auto u = static_cast<unsigned char>(c);
         if (std::isalnum(u) || std::string_view("@.-_~").find(c) != std::string_view::npos)
             out += c;
@@ -151,7 +151,7 @@ std::string sftp_cache_authority(std::string_view url)
 HttpResponse fetch_sftp(
     const HttpClient::Config& config, std::string_view input, bool head, std::optional<std::pair<std::size_t, std::size_t>> range, const HttpClient::DownloadObserver& observer)
 {
-    const auto url = vc::sftp::parseUrl(input);
+    const auto url = vcr::sftp::parseUrl(input);
     for (size_t attempt = 0;; ++attempt) {
         try {
             if (HttpClient::isAborted())
@@ -160,7 +160,7 @@ HttpResponse fetch_sftp(
         } catch (const StatusError& e) {
             discard(url);
             HttpResponse out;
-            out.status_code = e.status == vc::sftp::NoSuchFile ? 404 : e.status == vc::sftp::PermissionDenied ? 403 : 500;
+            out.status_code = e.status == vcr::sftp::NoSuchFile ? 404 : e.status == vcr::sftp::PermissionDenied ? 403 : 500;
             out.error_message = e.what();
             return out;
         } catch (const std::exception& e) {
@@ -175,7 +175,7 @@ HttpResponse fetch_sftp(
 }
 std::vector<SftpDirectoryEntry> list_sftp_directory(std::string_view input)
 {
-    const auto url = vc::sftp::parseUrl(input);
+    const auto url = vcr::sftp::parseUrl(input);
     try {
         return list(session(url, {}), url);
     } catch (...) {
