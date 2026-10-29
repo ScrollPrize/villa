@@ -64,6 +64,10 @@ def verify_release_origin(release, channel, source_sha):
     without its release being updated (or a malformed release may be present).
     This contract matches the current two upstream VC3D publishing workflows.
     """
+    # A GitHub CLI upload can complete six assets yet fail before publishing.
+    # Such a draft is not downloadable by ordinary release consumers.
+    if release.get("draft") is True:
+        raise ArchiveError("release is still a draft; maintainer recovery required")
     expected_title = "VC3D Latest" if channel == "latest" else "VC3D Stable"
     if release.get("name") != expected_title:
         raise ArchiveError("historical release has unexpected title")
@@ -194,6 +198,25 @@ def verify_retained_history(repo, channel, rolling_oid, rolling_sha):
         oid, sha = old_oid, old_sha
 
 
+def require_no_hidden_release(repo, channel):
+    """A 404 by tag means 'not published', not necessarily 'not created'.
+
+    gh release create drafts first, then uploads, then publishes. List all
+    releases, including drafts visible to the publishing token, before a retry.
+    A listing error must fail closed rather than authorize duplicate creation.
+    """
+    pages = gh(repo, "releases?per_page=100", "--paginate", "--slurp")
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise ArchiveError("release listing has unexpected format; cannot authorize retry")
+    for page in pages:
+        for item in page:
+            if not isinstance(item, dict):
+                raise ArchiveError("release listing has invalid entry; cannot authorize retry")
+            if item.get("tag_name") == channel:
+                raise ArchiveError("release exists but is not readable as published by tag "
+                                   "(possibly an interrupted draft); maintainer recovery required")
+
+
 def same_commit_replay(repo, channel, expected_sha, rolling_oid):
     """Read-only replay of a previously archived rolling release.
 
@@ -297,6 +320,9 @@ def same_commit_replay(repo, channel, expected_sha, rolling_oid):
              archived_asset_ids=sorted(six))
         return
 
+    # GET releases/tags/{channel} returns only PUBLISHED releases. A draft
+    # with six uploaded assets may still exist after an interrupted gh create.
+    require_no_hidden_release(repo, channel)
     emit("REPAIR_RELEASE_ONLY", archive=archive, archived_release_id=int(rid_text),
          archived_asset_ids=sorted(six))
 

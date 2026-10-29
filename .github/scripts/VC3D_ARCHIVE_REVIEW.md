@@ -21,11 +21,11 @@ Run all public tests from the repository root with Python 3.9+, Git and Bash on 
     python3 -m unittest discover -s .github/scripts/tests -p 'test_vc3d_archive*.py' -v
 
 - `test_vc3d_archive_contract.py`: eight synthetic metadata tests for expected asset identities, duplicates, mismatched source SHA, missing digests/files and release metadata.
-- `test_vc3d_archive_local_git.py`: nine integration test methods, each exercising both `latest` and `stable`. The **actual Python and Bash helpers** run as subprocesses against disposable local Git repositories and a strict fake `gh` API. Git is restricted to the `file` protocol; no real GitHub client is called. New release creation is a fixture operation, **not** execution of the complete publication YAML or real uploads.
+- `test_vc3d_archive_local_git.py`: eleven integration test methods, each exercising both `latest` and `stable`. The **actual Python and Bash helpers** run as subprocesses against disposable local Git repositories and a strict fake `gh` API. Git is restricted to the `file` protocol; no real GitHub client is called. New release creation is a fixture operation, **not** execution of the complete publication YAML or real uploads.
 
 The local-Git suite checks two successive promotions, exact historical tag objects and original IDs, rejection of a changed historical asset/tag, atomic rejection of a two-ref push, a simulated denied PATCH, missing bootstrap, incomplete uploads, and the distinct interruption cases below.
 
-On 29 October 2026, the corrected candidate passed all **17 distinct public test methods**, with no skips, run in batches because of the execution environment's per-call time limit. Channel subtests are not counted as extra methods. The targeted replacement-ID regression failed on the original published helper (`a6aba4c2e2b4c30b42f804b4a01b1b9ef2b24f36`) for both channels and passed after the correction.
+On 29 October 2026, the P140 candidate passed all **19 distinct public test methods** in one uninterrupted local invocation without skips: eight metadata methods and eleven local-Git methods, each with both channels where relevant. Channel subtests are not counted as extra methods. The replacement-ID regression failed on the original helper (`a6aba4c2e2b4c30b42f804b4a01b1b9ef2b24f36`) and the interrupted-draft regression failed on P139 (`bef8c97d`), both for latest and stable, then passed on their corrected versions.
 
 The separate P135 harness remains historical evidence: 24 distinct local methods passed on the earlier candidate in its originating environment, using actual workflow Bash blocks, local Git and a simulated API. It has **not** been rerun on this correction and is not included in this PR. Its old/new comparison lost twelve prior IDs in the deletion-based baseline and retained twelve plus twelve new IDs in the candidate model. Do not add that historical count to the current 17 tests. An earlier private V5 test used a temporary PAT; neither it nor these local tests establishes native token behavior.
 
@@ -68,3 +68,27 @@ An intact release with a missing alias now fails closed even on a no-op or
 release-only repair; maintainers must investigate and restore the exact-object
 alias before proceeding. This does not fix external races or verify native
 GitHub permissions, and does not prove the byte content of any assets.
+
+## Interrupted draft upload before publication (P140)
+
+`gh release create TAG files...` creates a **draft**, uploads its assets, and
+only then publishes it (three non-atomic phases). An interruption after all six
+uploads can therefore leave a complete-looking **draft** that is not publicly
+fetchable. GitHub's `GET /releases/tags/TAG` reads *published* releases only:
+its 404 cannot prove the release is absent. Without this check the replay
+incorrectly returned `REPAIR_RELEASE_ONLY` and could attempt a duplicate create.
+
+Before a release-only retry, the helper now lists all releases **read-only**,
+including drafts visible to the writer token, via `gh api --paginate --slurp`.
+If the channel tag exists in that listing, or the listing is unavailable or
+malformed, replay stops for maintainer recovery; it does not delete a draft or
+reupload assets. The same helper rejects a draft if returned directly. An
+isolated fake-API regression reproduces the old misclassification for both
+channels; the fix protects the original six archived asset IDs and leaves
+normal release-only recovery when no draft is present.
+
+This is a local simulated GitHub API proof, not validation of real API or
+native `GITHUB_TOKEN` permissions. The documented authoring and REST semantics
+are: https://cli.github.com/manual/gh_release_create ,
+https://cli.github.com/manual/gh_api ,
+https://docs.github.com/en/rest/releases/releases .

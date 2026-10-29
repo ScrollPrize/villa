@@ -31,9 +31,23 @@ def fake_gh(args):
     state_path = Path(os.environ["VC3D_TEST_STATE"])
     state = json.loads(state_path.read_text())
     prefix = "repos/offline/fixture/releases/"
-    if len(args) < 2 or args[0] != "api" or not args[1].startswith(prefix):
+    if len(args) < 2 or args[0] != "api" or not args[1].startswith(prefix[:-1]):
         raise SystemExit("unsupported fake gh command")
-    endpoint, options = args[1][len(prefix):], args[2:]
+    endpoint, options = args[1][len(prefix) - 1:], args[2:]
+    if endpoint == "?per_page=100" and options == ["--paginate", "--slurp"]:
+        state["calls"].append(["GET", "releases?per_page=100"])
+        if state.get("deny_listing"):
+            state_path.write_text(json.dumps(state, sort_keys=True))
+            print("gh: Forbidden (HTTP 403)", file=sys.stderr)
+            raise SystemExit(1)
+        # Two slurped pages deliberately exercise the real CLI result shape.
+        pages = [[], list(state["releases"].values())]
+        state_path.write_text(json.dumps(state, sort_keys=True))
+        print(json.dumps(pages))
+        raise SystemExit(0)
+    if not endpoint.startswith("/"):
+        raise SystemExit("unsupported fake gh endpoint")
+    endpoint = endpoint[1:]
     method = "PATCH" if options[:2] == ["-X", "PATCH"] else "GET"
     state["calls"].append([method, endpoint])
 
@@ -47,8 +61,9 @@ def fake_gh(args):
 
     releases = state["releases"]
     if endpoint.startswith("tags/"):
+        # The real REST endpoint returns published releases by tag only.
         obj = next((r for r in releases.values()
-                    if r["tag_name"] == endpoint[5:]), None)
+                    if r["tag_name"] == endpoint[5:] and not r.get("draft", False)), None)
     else:
         obj = releases.get(endpoint)
     if obj is None:
@@ -251,6 +266,31 @@ class ArchiveLocalGit(unittest.TestCase):
                 self.assertEqual(f.refs(), refs)
                 self.assertEqual(f.load()["releases"], before)
                 self.assertEqual(len(f.patch_calls()), writes)
+
+    def test_draft_after_six_uploads_does_not_authorize_duplicate_release(self):
+        # gh release create drafts, uploads, THEN publishes (not atomically).
+        # Previously the 404 by tag was misdiagnosed as a missing release.
+        for channel in CHANNELS:
+            with self.subTest(channel=channel):
+                f = self.fixture(channel)
+                f.complete()
+                state = f.load()
+                state["releases"]["42"]["draft"] = True
+                f.save(state)
+                before, refs, writes = f.load()["releases"], f.refs(), len(f.patch_calls())
+                result = f.helper(f.new, check=False)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("interrupted draft", result.stderr)
+                self.assertEqual(f.load()["releases"], before)
+                self.assertEqual(f.refs(), refs)
+                self.assertEqual(len(f.patch_calls()), writes)
+                # An inability to read the list also must fail closed.
+                state = f.load()
+                state["deny_listing"] = True
+                f.save(state)
+                result = f.helper(f.new, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("HTTP 403", result.stderr)
 
     def test_crash_after_tag_push_allows_release_only_repair(self):
         for channel in CHANNELS:
