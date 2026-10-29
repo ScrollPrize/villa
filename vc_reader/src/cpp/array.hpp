@@ -192,7 +192,8 @@ struct ArraySpec {
 
 struct Stats {
     std::atomic<std::uint64_t> memory_hits{0}, pending_hits{0}, disk_hits{0}, remote_fetches{0},
-        remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0};
+        remote_missing{0}, remote_bytes{0}, write_errors{0}, computed{0},
+        corrupt{0};  // chunks that did not decode (skipped; see Array::last_corrupt_chunk)
 };
 
 class Array {
@@ -604,6 +605,14 @@ public:
     {
         std::lock_guard lock(error_mutex_);
         return last_write_error_;
+    }
+    // A corrupt chunk (wrong size, undecodable) is skipped: a disk cache's copy is
+    // ignored and the next layer or the source is read; the source's own reads as not
+    // stored (fill). Each is counted in Stats::corrupt; this is the latest one's error.
+    std::string last_corrupt_chunk()
+    {
+        std::lock_guard lock(error_mutex_);
+        return last_corrupt_;
     }
 
 private:
@@ -1453,15 +1462,33 @@ private:
             return std::nullopt;
         }
         auto data = read_whole(f.fd(), l.root + "/" + k);
-        if (codecs_[li] == Codec::Delta3d && !l.allow_lossy && !delta3d_lossless(data.data(), data.size()))
-            return std::nullopt;  // quantized: not the source's values
-        if (codecs_[li] == Codec::Raw) {
-            check_raw_size(data.size(), chunk_bytes_);
-            return std::make_shared<const Chunk>(std::move(data));
+        try {
+            if (codecs_[li] == Codec::Delta3d && !l.allow_lossy && !delta3d_lossless(data.data(), data.size()))
+                return std::nullopt;  // quantized: not the source's values
+            if (codecs_[li] == Codec::Raw) {
+                check_raw_size(data.size(), chunk_bytes_);
+                return std::make_shared<const Chunk>(std::move(data));
+            }
+            auto chunk = std::make_shared<Chunk>(chunk_bytes_);
+            decode(codecs_[li], data.data(), data.size(), chunk->data(), chunk_bytes_);
+            return ChunkPtr(std::move(chunk));
+        } catch (const std::exception& error) {
+            corrupt(l.root + "/" + k, error);
+            return skip_corrupt(l);
         }
-        auto chunk = std::make_shared<Chunk>(chunk_bytes_);
-        decode(codecs_[li], data.data(), data.size(), chunk->data(), chunk_bytes_);
-        return ChunkPtr(std::move(chunk));
+    }
+
+    // A corrupt chunk of a layer: the store's own reads as not stored; a cache's is ignored.
+    static std::optional<ChunkPtr> skip_corrupt(const LayerSpec& l)
+    {
+        return l.kind == "array" ? std::optional<ChunkPtr>(ChunkPtr{}) : std::nullopt;
+    }
+
+    void corrupt(const std::string& where, const std::exception& error)
+    {
+        ++stats_.corrupt;
+        std::lock_guard lock(error_mutex_);
+        last_corrupt_ = where + ": " + error.what();
     }
 
     void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output,
@@ -1494,7 +1521,18 @@ private:
                 continue;
             }
             if ((!cache_ || stream) && codecs_[li] == Codec::Raw) {
-                if (read_raw_pieces(l.root + "/" + k, w, out_strides, op, output) == Found::Copied) {
+                Found found;
+                try {
+                    found = read_raw_pieces(l.root + "/" + k, w, out_strides, op, output);
+                } catch (const std::runtime_error& error) {  // the wrong size: corrupt
+                    corrupt(l.root + "/" + k, error);
+                    if (l.kind == "array") {
+                        fill_pieces(w, out_strides, op, output);
+                        return;
+                    }
+                    continue;
+                }
+                if (found == Found::Copied) {
                     ++stats_.disk_hits;
                     return;
                 }
@@ -1581,16 +1619,21 @@ private:
         }
         ChunkPtr chunk;
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
-        if (remote_codec_ == Codec::Raw) {
-            if (body.size() != chunk_bytes_)
-                throw std::runtime_error(spec_.remote_url + "/" + k + ": body is not one chunk");
-            chunk = std::make_shared<const Chunk>(std::move(body));
-            payload = chunk;  // the stored bytes are the decoded chunk
-        } else {
-            auto decoded = std::make_shared<Chunk>(chunk_bytes_);
-            decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
-            chunk = std::move(decoded);
-            payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+        try {
+            if (remote_codec_ == Codec::Raw) {
+                if (body.size() != chunk_bytes_)
+                    throw std::runtime_error("body is not one chunk");
+                chunk = std::make_shared<const Chunk>(std::move(body));
+                payload = chunk;  // the stored bytes are the decoded chunk
+            } else {
+                auto decoded = std::make_shared<Chunk>(chunk_bytes_);
+                decode(remote_codec_, body.data(), body.size(), decoded->data(), chunk_bytes_);
+                chunk = std::move(decoded);
+                payload = std::make_shared<const std::vector<std::uint8_t>>(std::move(body));
+            }
+        } catch (const std::exception& error) {  // reads as not stored; nothing is cached on disk
+            corrupt((source_ ? spec_.source_root : spec_.remote_url) + "/" + k, error);
+            return nullptr;
         }
         // The read returns now; the cache file is written (and encoded) in the background.
         if (writes_ && !write_disabled_.load()) {
@@ -1684,7 +1727,7 @@ private:
     std::unordered_map<std::string, std::shared_future<ChunkPtr>> inflight_;
     std::atomic<bool> write_disabled_{false};
     std::mutex error_mutex_;
-    std::string last_write_error_;
+    std::string last_write_error_, last_corrupt_;
     // Last member: destroyed first, so queued writes finish while everything they use still exists.
     std::unique_ptr<WriteBehind> writes_;
 };

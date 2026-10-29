@@ -155,6 +155,28 @@ int main()
         std::uint8_t nan_missing = 1;
         array.sample_linear_cached(nan_point, 1, u8, false, &nan_value, &nan_missing);
         require(std::isnan(nan_value) && !nan_missing, "non-finite point");
+        // A corrupt chunk (here a truncated raw file) is noted and skipped: it reads as
+        // not stored, through the memory-cached path and both streaming read modes.
+        {
+            const auto broken = path / "broken";
+            fs::create_directories(broken);
+            write_chunk(broken, 0);
+            std::ofstream(broken / "0.0.1", std::ios::binary).write("short", 5);
+            vcr::ArraySpec b = spec;
+            b.identity = broken.string();
+            b.layers = {{"array", broken.string(), "", "", false}};
+            for (const char* mode : {"cache", "mmap", "slab"}) {
+                b.read_mode = std::string(mode) == "slab" ? "slab" : "mmap";
+                vcr::Array a(b, std::string(mode) == "cache" ? std::make_shared<vcr::MemoryCache>(1 << 20) : nullptr);
+                const double inChunk1[3]{1.0, 1.0, 5.0}, inChunk0[3]{1.0, 1.0, 1.0};
+                std::uint8_t v1 = 99, v0 = 99;
+                a.sample_nearest(inChunk1, 1, &v1);
+                a.sample_nearest(inChunk0, 1, &v0);
+                require(v1 == 7 && v0 == value_at(1, 1, 1), std::string(mode) + ": corrupt chunk reads as fill");
+                require(a.stats().corrupt >= 1 && a.last_corrupt_chunk().find("0.0.1") != std::string::npos,
+                        std::string(mode) + ": corrupt chunk is noted");
+            }
+        }
         std::cout << "Native cache-only sampling passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
