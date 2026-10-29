@@ -67,6 +67,9 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
     // that spans less than half a turn leaves some normal directions empty, and its T is long
     // even when its windings are round, so the step is skipped, and the estimate is the one with
     // uncrush = 0, when the emptiest of 12 direction bins holds under 1 % of an even share.
+    // The step is also skipped when T is nearly round (l1 / l2 under 1.1): the stretch would be
+    // a few per cent, but the new search frame alone (recentred, rotated, new bounds) gives
+    // RANSAC other candidates and can move the estimate to a neighbouring maximum.
     double w00 = 1.0, w01 = 0.0, w10 = 0.0, w11 = 1.0;   // W, row major
     double mu_x = 0.0, mu_y = 0.0;
     bool whiten = false;
@@ -115,7 +118,8 @@ cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store, std::optional
         const double half_trace = 0.5 * (txx + tyy);
         const double r = std::hypot(0.5 * (txx - tyy), txy);
         const double l1 = half_trace + r, l2 = half_trace - r;
-        if (spans_half_turn && l2 > 0.0) {
+        constexpr double kRound = 1.1;
+        if (spans_half_turn && l2 > 0.0 && l1 >= kRound * l2) {
             const double t = 0.5 * std::atan2(2.0 * txy, txx - tyy);   // where the normals crowd
             const double f1 = std::pow(l1 / half_trace, 0.5 * uncrush);
             const double f2 = std::pow(l2 / half_trace, 0.5 * uncrush);
