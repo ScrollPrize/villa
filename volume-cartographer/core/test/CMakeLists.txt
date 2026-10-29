@@ -343,6 +343,12 @@ vc_add_test(NAME test_surface_meshing)
 # configurations that build the apps -- the test shards configure with
 # VC_BUILD_APPS=OFF and apps/ returns before the tool targets are created.
 if(VC_BUILD_APPS)
+    vc_add_test(NAME test_ignore_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
+    add_dependencies(test_ignore_zarr_output vc_add_ignore_label)
+    set_tests_properties(test_ignore_zarr_output PROPERTIES
+        ENVIRONMENT "VC_ADD_IGNORE_LABEL_BIN=$<TARGET_FILE:vc_add_ignore_label>"
+        TIMEOUT 180)
+
     vc_add_test(NAME test_ngrids_zarr_output LIBS doctest::doctest vc_core Qt6::Core)
     add_dependencies(test_ngrids_zarr_output vc_ngrids)
     set_tests_properties(test_ngrids_zarr_output PROPERTIES

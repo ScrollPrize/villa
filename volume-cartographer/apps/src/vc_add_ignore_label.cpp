@@ -1,10 +1,8 @@
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/core/util/Time.hpp"
-#include "vc/core/types/VcDataset.hpp"
+#include <vc_reader/zarr.hpp>
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
-#include "vc/core/util/Zarr.hpp"
-#include <utils/zarr.hpp>
 
 #include <boost/program_options.hpp>
 
@@ -615,36 +613,12 @@ static void writeJsonFile(const fs::path& path, const utils::Json& j)
     }
 }
 
-static Shape3 toShape3(const std::vector<std::size_t>& shape)
+static Shape3 toShape3(const vcr::Index& shape)
 {
     if (shape.size() != 3) {
         throw std::runtime_error("expected 3D dataset");
     }
-    return {shape[0], shape[1], shape[2]};
-}
-
-// VcDataset::readRegion refuses a region that does not fit inside the dataset and leaves the
-// buffer as it was (the bounds contract in VcDataset.hpp). Every read in this tool goes through
-// here, so a refusal stops the run instead of passing on a buffer that was never filled. In the
-// worker threads the exception lands in their existing firstError handling and is reported
-// after the join.
-static void readRegionOrThrow(const vc::VcDataset& ds,
-                              const Shape3& origin,
-                              const Shape3& shape,
-                              void* output)
-{
-    if (ds.readRegion({origin[0], origin[1], origin[2]}, {shape[0], shape[1], shape[2]}, output)) {
-        return;
-    }
-    std::ostringstream msg;
-    msg << "read refused: origin (" << origin[0] << ", " << origin[1] << ", " << origin[2]
-        << ") size (" << shape[0] << ", " << shape[1] << ", " << shape[2]
-        << ") does not fit inside " << ds.path().string() << ", shape (";
-    for (std::size_t d = 0; d < ds.shape().size(); ++d) {
-        msg << (d ? ", " : "") << ds.shape()[d];
-    }
-    msg << ')';
-    throw std::runtime_error(msg.str());
+    return {static_cast<std::size_t>(shape[0]), static_cast<std::size_t>(shape[1]), static_cast<std::size_t>(shape[2])};
 }
 
 static bool hasAnyNonZero(const std::vector<uint8_t>& data)
@@ -734,25 +708,23 @@ static bool shouldDropIgnoreSparseChunk(const Shape3& datasetShape,
     return isUniformValid(uint8_t(0)) || isUniformValid(ignoreValue);
 }
 
-static bool persistIgnoreSparseChunk(vc::VcDataset& dataset,
+static bool persistIgnoreSparseChunk(vcr::zarr::Writer& dataset,
                                      const ChunkIndex& chunk,
                                      const std::vector<uint8_t>& chunkBuf,
                                      uint8_t ignoreValue,
                                      ProfileStats* profile = nullptr,
                                      bool pyramidWrite = false)
 {
-    const Shape3 datasetShape = toShape3(dataset.shape());
-    const Shape3 chunkShape = toShape3(dataset.defaultChunkShape());
+    const Shape3 datasetShape = toShape3(dataset.meta().shape);
+    const Shape3 chunkShape = toShape3(dataset.meta().chunks);
     auto writeStart = std::chrono::steady_clock::now();
     const bool dropChunk =
         shouldDropIgnoreSparseChunk(datasetShape, chunkShape, chunk, chunkBuf, ignoreValue);
     bool changed = false;
     if (dropChunk) {
-        changed = dataset.removeChunk(chunk.z, chunk.y, chunk.x);
+        changed = dataset.removeChunk({static_cast<int64_t>(chunk.z), static_cast<int64_t>(chunk.y), static_cast<int64_t>(chunk.x)});
     } else {
-        dataset.writeChunk(chunk.z,
-                           chunk.y,
-                           chunk.x,
+        dataset.writeChunk({static_cast<int64_t>(chunk.z), static_cast<int64_t>(chunk.y), static_cast<int64_t>(chunk.x)},
                            chunkBuf.data(),
                            chunkBuf.size() * sizeof(uint8_t));
         changed = true;
@@ -1355,7 +1327,7 @@ private:
 };
 
 static void applyMaskToOutputZRangeLegacy(
-    vc::VcDataset& output,
+    vcr::zarr::Writer& output,
     const Shape3& outShape,
     const Shape3& outChunk,
     std::size_t outZ0,
@@ -1412,7 +1384,10 @@ static void applyMaskToOutputZRangeLegacy(
                 std::lock_guard<std::mutex> guard(lockPool.lockFor(cz, cy, cx));
                 auto ioStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
+                output.reader().read_chunk(
+                    {static_cast<int64_t>(cz), static_cast<int64_t>(cy), static_cast<int64_t>(cx)},
+                    chunkBuf.data(),
+                    chunkBuf.size());
                 if (profile) {
                     auto ioEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(
@@ -1455,7 +1430,7 @@ static void applyMaskToOutputZRangeLegacy(
 }
 
 static void applyMaskToOutputZRangeMapped(
-    vc::VcDataset& output,
+    vcr::zarr::Writer& output,
     const Shape3& outShape,
     const Shape3& outChunk,
     const NearestNeighborMap& nn,
@@ -1523,7 +1498,10 @@ static void applyMaskToOutputZRangeMapped(
                 std::lock_guard<std::mutex> guard(lockPool.lockFor(cz, cy, cx));
                 auto ioStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
+                output.reader().read_chunk(
+                    {static_cast<int64_t>(cz), static_cast<int64_t>(cy), static_cast<int64_t>(cx)},
+                    chunkBuf.data(),
+                    chunkBuf.size());
                 if (profile) {
                     auto ioEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(std::chrono::duration<double>(ioEnd - ioStart).count());
@@ -1884,11 +1862,8 @@ static void rewriteOutputFillValue(const fs::path& outputRoot,
 {
     for (int level : levels) {
         const fs::path levelPath = outputRoot / std::to_string(level);
-        auto meta = utils::ZarrArray::open(levelPath).metadata();
-        meta.fill_value = static_cast<double>(fillValue);
-        auto zarray = utils::detail::serialize_zarray(meta);
-        std::ofstream out(levelPath / ".zarray", std::ios::binary | std::ios::trunc);
-        out << zarray;
+        auto writer = vcr::zarr::Writer::open(levelPath);
+        writer.setFillValue(fillValue);
     }
 }
 
@@ -2031,94 +2006,26 @@ static void validateReusableOutputTree(const fs::path& inputRoot,
             throw std::runtime_error("output level is missing .zarray: " + outputLevel.string());
         }
 
-        vc::VcDataset inLevel(inputLevel);
-        vc::VcDataset outLevel(outputLevel);
-        if (inLevel.getDtype() != outLevel.getDtype()) {
+        auto inLevel = vcr::zarr::openArray(inputLevel.string(), {.threads = 1, .readMode = "slab"});
+        auto outLevel = vcr::zarr::Writer::open(outputLevel);
+        if (inLevel.meta.type.kind != outLevel.meta().type.kind ||
+            inLevel.meta.itemsize() != outLevel.meta().itemsize()) {
             throw std::runtime_error("dtype mismatch for reused output level " +
                                      std::to_string(level));
         }
-        if (toShape3(inLevel.shape()) != toShape3(outLevel.shape())) {
+        if (toShape3(inLevel.meta.shape) != toShape3(outLevel.meta().shape)) {
             throw std::runtime_error("shape mismatch for reused output level " +
                                      std::to_string(level));
         }
-        if (toShape3(inLevel.defaultChunkShape()) != toShape3(outLevel.defaultChunkShape())) {
+        if (toShape3(inLevel.meta.chunks) != toShape3(outLevel.meta().chunks)) {
             throw std::runtime_error("chunk-shape mismatch for reused output level " +
                                      std::to_string(level));
         }
     }
 }
 
-static bool readAlignedSourceRegionByChunk(vc::VcDataset& src,
-                                          const Shape3& srcShape,
-                                          const Shape3& srcChunk,
-                                          std::size_t srcZ0,
-                                          std::size_t srcY0,
-                                          std::size_t srcX0,
-                                          std::size_t srcActualZ,
-                                          std::size_t srcActualY,
-                                          std::size_t srcActualX,
-                                          std::vector<uint8_t>& dstBuf)
-{
-    if (srcActualZ == 0 || srcActualY == 0 || srcActualX == 0 || srcShape[0] == 0 ||
-        srcShape[1] == 0 || srcShape[2] == 0 || srcChunk[0] == 0 || srcChunk[1] == 0 || srcChunk[2] == 0) {
-        return false;
-    }
-
-    if (srcZ0 + srcActualZ > srcShape[0] || srcY0 + srcActualY > srcShape[1] ||
-        srcX0 + srcActualX > srcShape[2]) {
-        return false;
-    }
-
-    if ((srcZ0 % srcChunk[0] != 0) || (srcY0 % srcChunk[1] != 0) ||
-        (srcX0 % srcChunk[2] != 0) || (srcActualZ % srcChunk[0] != 0) ||
-        (srcActualY % srcChunk[1] != 0) || (srcActualX % srcChunk[2] != 0)) {
-        return false;
-    }
-
-    const std::size_t zChunks = srcActualZ / srcChunk[0];
-    const std::size_t yChunks = srcActualY / srcChunk[1];
-    const std::size_t xChunks = srcActualX / srcChunk[2];
-    if (zChunks == 0 || yChunks == 0 || xChunks == 0) {
-        return false;
-    }
-
-    const std::size_t dstElems = srcActualZ * srcActualY * srcActualX;
-    dstBuf.assign(dstElems, 0);
-
-    std::vector<uint8_t> chunkBuf(srcChunk[0] * srcChunk[1] * srcChunk[2], 0);
-    const std::size_t zChunkStart = srcZ0 / srcChunk[0];
-    const std::size_t yChunkStart = srcY0 / srcChunk[1];
-    const std::size_t xChunkStart = srcX0 / srcChunk[2];
-
-    for (std::size_t zc = zChunkStart; zc < zChunkStart + zChunks; ++zc) {
-                const std::size_t dstZ = (zc - zChunkStart) * srcChunk[0];
-                for (std::size_t yc = yChunkStart; yc < yChunkStart + yChunks; ++yc) {
-                    const std::size_t dstY = (yc - yChunkStart) * srcChunk[1];
-                    for (std::size_t xc = xChunkStart; xc < xChunkStart + xChunks; ++xc) {
-                        const std::size_t dstX = (xc - xChunkStart) * srcChunk[2];
-                        try {
-                            src.readChunkOrFill(zc, yc, xc, chunkBuf.data());
-                        } catch (...) {
-                            return false;
-                        }
-                        for (std::size_t z = 0; z < srcChunk[0]; ++z) {
-                    const std::size_t dstRowBase = (dstZ + z) * srcActualY * srcActualX + dstY * srcActualX + dstX;
-                    const std::size_t chunkRowBase = z * srcChunk[1] * srcChunk[2];
-                    for (std::size_t y = 0; y < srcChunk[1]; ++y) {
-                        const std::size_t dstBase = dstRowBase + y * srcActualX;
-                        const std::size_t chunkBase = chunkRowBase + y * srcChunk[2];
-                        std::copy_n(chunkBuf.data() + chunkBase, srcChunk[2], dstBuf.data() + dstBase);
-                    }
-                }
-            }
-        }
-    }
-
-    return true;
-}
-
 static std::vector<ChunkIndex> clearLevel0OutsideZRange(
-    vc::VcDataset& output,
+    vcr::zarr::Writer& output,
     const Shape3& outShape,
     const Shape3& outChunk,
     const std::unordered_set<ChunkIndex, ChunkIndexHash>& existingOutputChunks,
@@ -2168,7 +2075,7 @@ static std::vector<ChunkIndex> clearLevel0OutsideZRange(
     for (std::size_t tid = 0; tid < workers; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
-            vc::VcDataset outputLocal(output.path());
+            auto& outputLocal = output;
             std::vector<uint8_t> chunkBuf(chunkElems, 0);
             ProfileStats localProfile;
             std::vector<ChunkIndex> localTouched;
@@ -2191,7 +2098,10 @@ static std::vector<ChunkIndex> clearLevel0OutsideZRange(
                     }
 
                     auto readStart = std::chrono::steady_clock::now();
-                    outputLocal.readChunkOrFill(chunk.z, chunk.y, chunk.x, chunkBuf.data());
+                    outputLocal.reader().read_chunk(
+                        {static_cast<int64_t>(chunk.z), static_cast<int64_t>(chunk.y), static_cast<int64_t>(chunk.x)},
+                        chunkBuf.data(),
+                        chunkBuf.size());
                     auto readEnd = std::chrono::steady_clock::now();
                     localProfile.tChunkReadIo.add(std::chrono::duration<double>(readEnd - readStart).count());
                     ++localProfile.chunkIoReads;
@@ -2327,13 +2237,13 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
     const fs::path srcPath = outputRoot / std::to_string(level - 1);
     const fs::path dstPath = outputRoot / std::to_string(level);
 
-    vc::VcDataset src(srcPath);
-    vc::VcDataset dst(dstPath);
+    auto src = vcr::zarr::openArray(srcPath.string(), {.threads = 1, .readMode = "slab"});
+    auto dst = vcr::zarr::Writer::open(dstPath);
 
-    const Shape3 srcShape = toShape3(src.shape());
-    const Shape3 srcChunk = toShape3(src.defaultChunkShape());
-    const Shape3 dstShape = toShape3(dst.shape());
-    const Shape3 dstChunk = toShape3(dst.defaultChunkShape());
+    const Shape3 srcShape = toShape3(src.meta.shape);
+    const Shape3 srcChunk = toShape3(src.meta.chunks);
+    const Shape3 dstShape = toShape3(dst.meta().shape);
+    const Shape3 dstChunk = toShape3(dst.meta().chunks);
     const std::size_t dstChunkElems = dstChunk[0] * dstChunk[1] * dstChunk[2];
 
     std::vector<ChunkIndex> touchedChunks = buildTouchedParents(sourceTouched,
@@ -2385,8 +2295,8 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
     for (std::size_t tid = 0; tid < workers; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
-            vc::VcDataset srcLocal(srcPath);
-            vc::VcDataset dstLocal(dstPath);
+            auto& srcLocal = src;
+            auto& dstLocal = dst;
             std::vector<uint8_t> dstBuf(dstChunkElems, 0);
             std::vector<uint8_t> srcBuf;
             ProfileStats localProfile;
@@ -2424,22 +2334,11 @@ static std::vector<ChunkIndex> buildLabelPriorityPyramidLevelTouched(
 
                     const std::size_t srcElems = srcActualZ * srcActualY * srcActualX;
                     auto tReadStart = std::chrono::steady_clock::now();
-                    if (!readAlignedSourceRegionByChunk(srcLocal,
-                                                       srcShape,
-                                                       srcChunk,
-                                                       srcZ0,
-                                                       srcY0,
-                                                       srcX0,
-                                                       srcActualZ,
-                                                       srcActualY,
-                                                       srcActualX,
-                                                       srcBuf)) {
-                        srcBuf.assign(srcElems, ignoreValue);
-                        readRegionOrThrow(srcLocal,
-                                          {srcZ0, srcY0, srcX0},
-                                          {srcActualZ, srcActualY, srcActualX},
-                                          srcBuf.data());
-                    }
+                    srcBuf.resize(srcElems);
+                    srcLocal.array->read_many(
+                        {{static_cast<int64_t>(srcZ0), static_cast<int64_t>(srcY0), static_cast<int64_t>(srcX0)}},
+                        {{static_cast<int64_t>(srcActualZ), static_cast<int64_t>(srcActualY), static_cast<int64_t>(srcActualX)}},
+                        {srcBuf.data()}, vcr::Array::Bounds::Strict);
                     auto tReadEnd = std::chrono::steady_clock::now();
                     localProfile.tPyramidRead.add(std::chrono::duration<double>(tReadEnd - tReadStart).count());
                     ++localProfile.pyramidReadCalls;
@@ -2546,7 +2445,7 @@ static std::size_t countNonZeroInRelativeBox(const std::vector<uint8_t>& volume,
 }
 
 static void writeReplicatedCoreMaskToLevel0(
-    vc::VcDataset& output,
+    vcr::zarr::Writer& output,
     const Shape3& outShape,
     const Shape3& outChunk,
     const Box3& coreBox,
@@ -2625,7 +2524,10 @@ static void writeReplicatedCoreMaskToLevel0(
 
                 auto readStart = std::chrono::steady_clock::now();
                 chunkBuf.assign(chunkElems, 0);
-                output.readChunkOrFill(cz, cy, cx, chunkBuf.data());
+                output.reader().read_chunk(
+                    {static_cast<int64_t>(cz), static_cast<int64_t>(cy), static_cast<int64_t>(cx)},
+                    chunkBuf.data(),
+                    chunkBuf.size());
                 if (profile) {
                     auto readEnd = std::chrono::steady_clock::now();
                     profile->tChunkReadIo.add(std::chrono::duration<double>(readEnd - readStart).count());
@@ -2875,9 +2777,10 @@ static int processChunkAlphaWrap(
     int zStart,
     int zStop)
 {
-    vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
-    vc::VcDataset out0(cfg.outputRoot / "0");
-    const Shape3 computeChunk = toShape3(computeDs.defaultChunkShape());
+    auto computeDs = vcr::zarr::openArray(
+        (cfg.inputRoot / std::to_string(cfg.computeLevel)).string(), {.threads = 1, .readMode = "slab"});
+    auto out0 = vcr::zarr::Writer::open(cfg.outputRoot / "0");
+    const Shape3 computeChunk = toShape3(computeDs.meta.chunks);
     if (computeChunk != outChunk) {
         throw std::runtime_error("chunk-alpha-wrap currently requires matching compute/output chunk shapes");
     }
@@ -2973,8 +2876,8 @@ static int processChunkAlphaWrap(
     for (std::size_t tid = 0; tid < workers; ++tid) {
         threads.emplace_back([&, tid]() {
             (void)tid;
-            vc::VcDataset localCompute(cfg.inputRoot / std::to_string(cfg.computeLevel));
-            vc::VcDataset localOut0(cfg.outputRoot / "0");
+            auto& localCompute = computeDs;
+            auto& localOut0 = out0;
             std::vector<uint8_t> haloBuf;
             std::unordered_set<ChunkIndex, ChunkIndexHash> localTouchedLevel0;
             localTouchedLevel0.reserve(128);
@@ -3018,7 +2921,11 @@ static int processChunkAlphaWrap(
                     haloBuf.assign(volumeElements(haloBox.shape), 0);
                     {
                         ScopedTimer readTimer(localProfile.tSliceLoad);
-                        readRegionOrThrow(localCompute, haloBox.origin, haloBox.shape, haloBuf.data());
+                        localCompute.array->read_many(
+                            {vcr::Index(haloBox.origin.begin(), haloBox.origin.end())},
+                            {vcr::Index(haloBox.shape.begin(), haloBox.shape.end())},
+                            {haloBuf.data()},
+                            vcr::Array::Bounds::Strict);
                     }
                     localProfile.bytesRead += haloBuf.size() * sizeof(uint8_t);
 
@@ -3205,8 +3112,9 @@ static void visualizeSlice(const Config& cfg)
         return;
     }
 
-    vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
-    const Shape3 computeShape = toShape3(computeDs.shape());
+    auto computeDs = vcr::zarr::openArray(
+        (cfg.inputRoot / std::to_string(cfg.computeLevel)).string(), {.threads = 1, .readMode = "slab"});
+    const Shape3 computeShape = toShape3(computeDs.meta.shape);
 
     const int z = *cfg.visualizeSlice;
     if (z < 0 || z >= static_cast<int>(computeShape[0])) {
@@ -3214,10 +3122,11 @@ static void visualizeSlice(const Config& cfg)
     }
 
     std::vector<uint8_t> slice(computeShape[1] * computeShape[2], 0);
-    readRegionOrThrow(computeDs,
-                      {static_cast<std::size_t>(z), 0, 0},
-                      {1, computeShape[1], computeShape[2]},
-                      slice.data());
+    computeDs.array->read_many(
+        {{static_cast<int64_t>(z), 0, 0}},
+        {{1, static_cast<int64_t>(computeShape[1]), static_cast<int64_t>(computeShape[2])}},
+        {slice.data()},
+        vcr::Array::Bounds::Strict);
     cv::Mat1b label(static_cast<int>(computeShape[1]),
                     static_cast<int>(computeShape[2]),
                     slice.data());
@@ -3227,16 +3136,17 @@ static void visualizeSlice(const Config& cfg)
     const fs::path outputLevel = cfg.outputRoot / std::to_string(cfg.computeLevel);
     const bool hasOutputLevel = !cfg.outputRoot.empty() && fs::exists(outputLevel / ".zarray");
     if (hasOutputLevel) {
-        vc::VcDataset outputDs(outputLevel);
-        if (toShape3(outputDs.shape()) != computeShape) {
+        auto outputDs = vcr::zarr::openArray(outputLevel.string(), {.threads = 1, .readMode = "slab"});
+        if (toShape3(outputDs.meta.shape) != computeShape) {
             throw std::runtime_error("visualize output level shape mismatch");
         }
 
         std::vector<uint8_t> outSlice(computeShape[1] * computeShape[2], 0);
-        readRegionOrThrow(outputDs,
-                          {static_cast<std::size_t>(z), 0, 0},
-                          {1, computeShape[1], computeShape[2]},
-                          outSlice.data());
+        outputDs.array->read_many(
+            {{static_cast<int64_t>(z), 0, 0}},
+            {{1, static_cast<int64_t>(computeShape[1]), static_cast<int64_t>(computeShape[2])}},
+            {outSlice.data()},
+            vcr::Array::Bounds::Strict);
         cv::Mat1b outputIgnore(static_cast<int>(computeShape[1]),
                                static_cast<int>(computeShape[2]),
                                outSlice.data());
@@ -3608,31 +3518,18 @@ static bool runSelfTest()
         }
 
         try {
-            auto ds = vc::createZarrDataset(tmpRoot,
-                                            "0",
-                                            {128, 128, 256},
-                                            {128, 128, 128},
-                                            vc::VcDtype::uint8,
-                                            "none");
+            vcr::zarr::CreateOptions options;
+            options.shape = {128, 128, 256};
+            options.chunks = {128, 128, 128};
+            options.compressor = "none";
+            options.fillValue = 0;
+            auto ds = vcr::zarr::Writer::create(tmpRoot / "0", options);
             std::vector<uint8_t> chunk(128 * 128 * 128, 11);
-            ds->writeChunk(0, 0, 0, chunk.data(), chunk.size() * sizeof(uint8_t));
+            ds.writeChunk({0, 0, 0}, chunk.data(), chunk.size() * sizeof(uint8_t));
 
             std::vector<uint8_t> region;
-            const bool ok = readAlignedSourceRegionByChunk(*ds,
-                                                           {128, 128, 256},
-                                                           {128, 128, 128},
-                                                           0,
-                                                           0,
-                                                           0,
-                                                           128,
-                                                           128,
-                                                           256,
-                                                           region);
-            if (!ok) {
-                std::cerr << "self-test failed: aligned missing-chunk read returned false\n";
-                fs::remove_all(tmpRoot, ec);
-                return false;
-            }
+            region.resize(128 * 128 * 256);
+            ds.reader().read_many({{0, 0, 0}}, {{128, 128, 256}}, {region.data()}, vcr::Array::Bounds::Strict);
 
             for (std::size_t z = 0; z < 128; ++z) {
                 for (std::size_t y = 0; y < 128; ++y) {
@@ -3655,31 +3552,16 @@ static bool runSelfTest()
                 }
             }
 
-            auto dsIgnore = vc::createZarrDataset(tmpRoot,
-                                                  "1",
-                                                  {128, 128, 256},
-                                                  {128, 128, 128},
-                                                  vc::VcDtype::uint8,
-                                                  "none",
-                                                  ".",
-                                                  2);
-            dsIgnore->writeChunk(0, 0, 0, chunk.data(), chunk.size() * sizeof(uint8_t));
+            vcr::zarr::CreateOptions ignoreOptions;
+            ignoreOptions.shape = {128, 128, 256};
+            ignoreOptions.chunks = {128, 128, 128};
+            ignoreOptions.compressor = "none";
+            ignoreOptions.fillValue = 2;
+            auto dsIgnore = vcr::zarr::Writer::create(tmpRoot / "1", ignoreOptions);
+            dsIgnore.writeChunk({0, 0, 0}, chunk.data(), chunk.size() * sizeof(uint8_t));
             region.clear();
-            const bool ignoreOk = readAlignedSourceRegionByChunk(*dsIgnore,
-                                                                 {128, 128, 256},
-                                                                 {128, 128, 128},
-                                                                 0,
-                                                                 0,
-                                                                 0,
-                                                                 128,
-                                                                 128,
-                                                                 256,
-                                                                 region);
-            if (!ignoreOk) {
-                std::cerr << "self-test failed: aligned ignore-fill read returned false\n";
-                fs::remove_all(tmpRoot, ec);
-                return false;
-            }
+            region.resize(128 * 128 * 256);
+            dsIgnore.reader().read_many({{0, 0, 0}}, {{128, 128, 256}}, {region.data()}, vcr::Array::Bounds::Strict);
             for (std::size_t z = 0; z < 128; ++z) {
                 for (std::size_t y = 0; y < 128; ++y) {
                     const std::size_t right = linearIndex({128, 128, 256}, z, y, 128);
@@ -3716,21 +3598,19 @@ static bool runSelfTest()
             constexpr uint8_t ignoreValue = 2;
             const Shape3 shape = {8, 2, 2};
             const Shape3 chunk = {2, 2, 2};
-            auto ds = vc::createZarrDataset(tmpRoot,
-                                            "0",
-                                            {shape[0], shape[1], shape[2]},
-                                            {chunk[0], chunk[1], chunk[2]},
-                                            vc::VcDtype::uint8,
-                                            "none",
-                                            ".",
-                                            ignoreValue);
+            vcr::zarr::CreateOptions options;
+            options.shape.assign(shape.begin(), shape.end());
+            options.chunks.assign(chunk.begin(), chunk.end());
+            options.compressor = "none";
+            options.fillValue = ignoreValue;
+            auto ds = vcr::zarr::Writer::create(tmpRoot / "0", options);
             std::vector<uint8_t> fullChunk(volumeElements(chunk), 1);
             for (std::size_t cz = 0; cz < 4; ++cz) {
-                ds->writeChunk(cz, 0, 0, fullChunk.data(), fullChunk.size() * sizeof(uint8_t));
+                ds.writeChunk({static_cast<int64_t>(cz), 0, 0}, fullChunk.data(), fullChunk.size() * sizeof(uint8_t));
             }
 
             ProfileStats profile;
-            const auto touched = clearLevel0OutsideZRange(*ds,
+            const auto touched = clearLevel0OutsideZRange(ds,
                                                           shape,
                                                           chunk,
                                                           scanLevelExistingChunks(tmpRoot / "0"),
@@ -3744,14 +3624,18 @@ static bool runSelfTest()
                 fs::remove_all(tmpRoot, ec);
                 return false;
             }
-            if (ds->chunkExists(3, 0, 0)) {
+            if (ds.chunkExists({3, 0, 0})) {
                 std::cerr << "self-test failed: fully outside chunk was not removed\n";
                 fs::remove_all(tmpRoot, ec);
                 return false;
             }
 
             std::vector<uint8_t> volume(volumeElements(shape), 0);
-            readRegionOrThrow(*ds, {0, 0, 0}, shape, volume.data());
+            ds.reader().read_many(
+                {{0, 0, 0}},
+                {vcr::Index(shape.begin(), shape.end())},
+                {volume.data()},
+                vcr::Array::Bounds::Strict);
             for (std::size_t y = 0; y < shape[1]; ++y) {
                 for (std::size_t x = 0; x < shape[2]; ++x) {
                     if (volume[linearIndex(shape, 0, y, x)] != 0 ||
@@ -3856,8 +3740,9 @@ static int process(Config cfg)
 
     const utils::Json inputMeta = readJsonFile(cfg.inputRoot / "meta.json");
     for (int level : levels) {
-        vc::VcDataset inLevel(cfg.inputRoot / std::to_string(level));
-        if (inLevel.getDtype() != vc::VcDtype::uint8) {
+        auto inLevel = vcr::zarr::openArray(
+            (cfg.inputRoot / std::to_string(level)).string(), {.threads = 1, .readMode = "slab"});
+        if (inLevel.meta.type.kind != 'u' || inLevel.meta.itemsize() != 1) {
             throw std::runtime_error("only uint8 zarr inputs are supported");
         }
     }
@@ -3897,11 +3782,12 @@ static int process(Config cfg)
 
     rewriteOutputFillValue(cfg.outputRoot, levels, static_cast<uint8_t>(cfg.ignoreValue));
 
-    vc::VcDataset computeDs(cfg.inputRoot / std::to_string(cfg.computeLevel));
-    vc::VcDataset out0(cfg.outputRoot / "0");
-    const Shape3 computeShape = toShape3(computeDs.shape());
-    const Shape3 outShape = toShape3(out0.shape());
-    const Shape3 outChunk = toShape3(out0.defaultChunkShape());
+    auto computeDs = vcr::zarr::openArray(
+        (cfg.inputRoot / std::to_string(cfg.computeLevel)).string(), {.threads = 1, .readMode = "slab"});
+    auto out0 = vcr::zarr::Writer::open(cfg.outputRoot / "0");
+    const Shape3 computeShape = toShape3(computeDs.meta.shape);
+    const Shape3 outShape = toShape3(out0.meta().shape);
+    const Shape3 outChunk = toShape3(out0.meta().chunks);
 
     int zStart = std::max(0, cfg.zMin);
     int zStop = cfg.zMax >= 0 ? std::min(cfg.zMax, static_cast<int>(computeShape[0]))
@@ -3951,10 +3837,11 @@ static int process(Config cfg)
     if (cachePlan.mode == ComputeCacheMode::preload) {
         auto ioStart = std::chrono::steady_clock::now();
         preloadedCompute.resize(cachePlan.requiredBytes);
-        readRegionOrThrow(computeDs,
-                          {static_cast<std::size_t>(zStart), 0, 0},
-                          {zCount, computeShape[1], computeShape[2]},
-                          preloadedCompute.data());
+        computeDs.array->read_many(
+            {{static_cast<int64_t>(zStart), 0, 0}},
+            {{static_cast<int64_t>(zCount), static_cast<int64_t>(computeShape[1]), static_cast<int64_t>(computeShape[2])}},
+            {preloadedCompute.data()},
+            vcr::Array::Bounds::Strict);
         auto ioEnd = std::chrono::steady_clock::now();
         profile.tSliceLoad.add(std::chrono::duration<double>(ioEnd - ioStart).count());
         profile.bytesRead += cachePlan.requiredBytes;
@@ -4007,8 +3894,8 @@ static int process(Config cfg)
     threads.reserve(workers);
 
     const auto processSlice = [&](int z,
-                                 vc::VcDataset& localCompute,
-                                 vc::VcDataset& localOut0,
+                                 vcr::zarr::OpenedArray& localCompute,
+                                 vcr::zarr::Writer& localOut0,
                                  std::vector<uint8_t>& sliceData,
                                  ProfileStats& localProfile,
                                  std::unordered_set<ChunkIndex, ChunkIndexHash>& localTouchedLevel0,
@@ -4024,10 +3911,11 @@ static int process(Config cfg)
         } else {
             {
                 ScopedTimer readTimer(localProfile.tSliceLoad);
-                readRegionOrThrow(localCompute,
-                                  {static_cast<std::size_t>(z), 0, 0},
-                                  {1, computeShape[1], computeShape[2]},
-                                  sliceData.data());
+                localCompute.array->read_many(
+                    {{static_cast<int64_t>(z), 0, 0}},
+                    {{1, static_cast<int64_t>(computeShape[1]), static_cast<int64_t>(computeShape[2])}},
+                    {sliceData.data()},
+                    vcr::Array::Bounds::Strict);
             }
             localProfile.bytesRead += sliceElems * sizeof(uint8_t);
             hasForeground = hasAnyNonZero(sliceData);
@@ -4171,8 +4059,8 @@ static int process(Config cfg)
         for (std::size_t tid = 0; tid < workers; ++tid) {
             threads.emplace_back([&, tid]() {
                 (void)tid;
-                vc::VcDataset localCompute(cfg.inputRoot / std::to_string(cfg.computeLevel));
-                vc::VcDataset localOut0(cfg.outputRoot / "0");
+                auto& localCompute = computeDs;
+                auto& localOut0 = out0;
                 std::vector<uint8_t> sliceData(computeShape[1] * computeShape[2], 0);
                 std::unordered_set<ChunkIndex, ChunkIndexHash> localTouchedLevel0;
                 localTouchedLevel0.reserve(512);
@@ -4219,10 +4107,11 @@ static int process(Config cfg)
                             } else {
                                 {
                                     ScopedTimer readTimer(localProfile.tSliceLoad);
-                                    readRegionOrThrow(localCompute,
-                                                      {z, 0, 0},
-                                                      {1, computeShape[1], computeShape[2]},
-                                                      sliceData.data());
+                                    localCompute.array->read_many(
+                                        {{static_cast<int64_t>(z), 0, 0}},
+                                        {{1, static_cast<int64_t>(computeShape[1]), static_cast<int64_t>(computeShape[2])}},
+                                        {sliceData.data()},
+                                        vcr::Array::Bounds::Strict);
                                 }
                                 localProfile.bytesRead += sliceElems * sizeof(uint8_t);
                                 hasForeground = hasAnyNonZero(sliceData);
@@ -4320,7 +4209,10 @@ static int process(Config cfg)
                                     }
 
                                     auto readTimer = std::chrono::steady_clock::now();
-                                    localOut0.readChunkOrFill(slab, cy, cx, state.buf.data());
+                                    localOut0.reader().read_chunk(
+                                        {static_cast<int64_t>(slab), static_cast<int64_t>(cy), static_cast<int64_t>(cx)},
+                                        state.buf.data(),
+                                        state.buf.size());
                                     auto readEnd = std::chrono::steady_clock::now();
                                     localProfile.tChunkReadIo.add(std::chrono::duration<double>(readEnd - readTimer).count());
                                     ++localProfile.chunkIoReads;
@@ -4407,8 +4299,8 @@ static int process(Config cfg)
         for (std::size_t tid = 0; tid < workers; ++tid) {
             threads.emplace_back([&, tid]() {
                 (void)tid;
-                vc::VcDataset localCompute(cfg.inputRoot / std::to_string(cfg.computeLevel));
-                vc::VcDataset localOut0(cfg.outputRoot / "0");
+                auto& localCompute = computeDs;
+                auto& localOut0 = out0;
                 std::vector<uint8_t> sliceData(computeShape[1] * computeShape[2], 0);
                 std::unordered_set<ChunkIndex, ChunkIndexHash> localTouchedLevel0;
                 localTouchedLevel0.reserve(512);
@@ -4516,7 +4408,7 @@ static int process(Config cfg)
         std::cerr << "[pyramid] skipped (no-rebuild-pyramid)" << '\n';
     }
 
-    const Shape3 shape0 = toShape3(out0.shape());
+    const Shape3 shape0 = toShape3(out0.meta().shape);
     ProcessingStats stats;
     stats.skippedMissingLevel0 = skippedMissingLevel0.load();
     stats.skippedMissingPyramid = skippedMissingPyramid.load();
