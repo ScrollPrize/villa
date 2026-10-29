@@ -192,6 +192,8 @@ little-endian bytes with optional CRC32C and either index location, following th
 
 Only the index and requested compressed inner chunks are fetched. HTTP ranges
 are validated; ignored ranges are rejected before accepting a whole-shard body.
+Over `sftp://` the same byte ranges are read from the file; its modification
+time and size stand in for the ETag.
 A strong ETag binds payload ranges to the index version. Missing inner chunks
 retain the normal fill/cache behavior. Decoded inner chunks use the existing
 v2 disk-cache representation, including offline reads and shared budgets.

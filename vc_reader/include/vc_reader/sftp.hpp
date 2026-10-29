@@ -8,10 +8,13 @@
 // the application through SSH_ASKPASS (Linux and macOS).
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -134,5 +137,59 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Object reads for remote arrays: a bounded pool of sessions per destination,
+// shared by concurrent readers. Thread-safe.
+struct FetchOptions {
+    Options session;
+    std::size_t sessionsPerHost = 4;
+    int retries = 3;  // transport failures; a server status is never retried
+};
+
+// [offset, offset + length), to the end without a length; suffix: the last `length` bytes.
+struct ByteRange {
+    uint64_t offset = 0;
+    std::optional<uint64_t> length;
+    bool suffix = false;
+};
+
+struct ListedEntry {
+    std::string name;
+    std::string url;  // canonical sftp:// URL; directories end with '/'
+    bool directory = false;
+};
+
+class Fetcher {
+public:
+    explicit Fetcher(FetchOptions options = {});
+    ~Fetcher();
+    Fetcher(const Fetcher&) = delete;
+    Fetcher& operator=(const Fetcher&) = delete;
+
+    // Streams the range of the file to sink. nullopt when the file does not
+    // exist; PermissionDenied and other server answers throw StatusError.
+    // reset() runs before each attempt, so sink sees one attempt's bytes;
+    // begin(attributes, first, count) runs once the range is resolved.
+    std::optional<Attributes> read(std::string_view url, const ByteRange& range,
+                                   const std::function<void()>& reset,
+                                   const std::function<void(const Attributes&, uint64_t, uint64_t)>& begin,
+                                   const std::function<void(std::span<const std::byte>)>& sink);
+    // Directory children, directories first, then by name. Symlinks are resolved.
+    std::vector<ListedEntry> list(std::string_view url);
+
+private:
+    struct Pool;
+    class Lease;
+    Pool& pool(const Url& url);
+    template <class Work>
+    auto withSession(const Url& url, Work&& work);
+
+    FetchOptions options_;
+    std::mutex mutex_;
+    std::map<std::string, std::unique_ptr<Pool>> pools_;
+};
+
+// Filesystem-safe form of the URL's [user@]host[:port] (percent-encoded), for cache paths.
+std::string cacheAuthority(std::string_view url);
 
 }  // namespace vcr::sftp

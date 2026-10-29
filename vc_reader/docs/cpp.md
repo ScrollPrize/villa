@@ -72,8 +72,16 @@ The general array API accepts an `ArraySpec`. This exposes the existing cache,
 authentication, storage-layer and sampling controls directly. Catalog lookup,
 Python DLPack wrappers and Python object orchestration are not C++ types.
 `CtReader` is a convenient opener for three-dimensional uint8 local/anonymous
-HTTP/S3 arrays; other dtypes and authenticated sources use `ArraySpec`.
-The set of supported codecs is unchanged.
+HTTP/S3 and `sftp://` arrays; other dtypes and authenticated sources use `ArraySpec`.
+
+`sftp://[user@]host[:port]/path` (and the `ssh://` alias) work wherever an
+HTTP URL does, including `ArraySpec::remote_url` and `source_root`. Requests
+go through the system OpenSSH `ssh` program (`ssh -s host sftp`), so
+`~/.ssh/config`, keys, the agent, ProxyJump and `known_hosts` apply; nothing is
+mounted. `vc_reader/sftp.hpp` exposes the session, the pooled `Fetcher` the
+reader uses (at most 8 sessions per host, transport failures retried, a missing
+file reads as not stored) and directory listing. Without an
+`sftp::setAuthenticator` callback, ssh runs in batch mode and never prompts.
 
 ## Transform pipelines and replay
 

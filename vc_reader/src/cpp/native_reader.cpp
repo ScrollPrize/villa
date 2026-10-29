@@ -1,5 +1,6 @@
 #include "vc_reader/reader.hpp"
 #include "vc_reader/catalog.hpp"
+#include "vc_reader/sftp.hpp"
 #include "array.hpp"
 #include "sheet_normal/normal.hpp"
 
@@ -108,7 +109,7 @@ std::string normalizeZarrMetadata(const std::string& text)
 namespace {
 bool remote(const std::string& location)
 {
-    return location.starts_with("http://") || location.starts_with("https://");
+    return location.starts_with("http://") || location.starts_with("https://") || sftp::isSftpUrl(location);
 }
 
 std::optional<Json> metadata(const std::string& location, const std::string& name)

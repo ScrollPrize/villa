@@ -1,11 +1,14 @@
 // HTTP(S) GETs over a bounded pool of libcurl handles: anonymous, HTTP basic
-// auth, or signed for S3 (AWS Signature Version 4).
+// auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh:// URLs are
+// read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
 
 #include "sigv4.hpp"
+#include "vc_reader/sftp.hpp"
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -128,6 +131,8 @@ public:
                             const std::vector<std::pair<std::string, std::string>>& extra = {}, long body_status = 200,
                             std::function<void(const HttpResponse&)> begin_body = {})
     {
+        if (sftp::isSftpUrl(url))
+            return get_sftp(url, reset, write, extra, body_status, begin_body);
         Lease lease(*this);
         CURL* h = lease.handle;
         std::shared_ptr<const Auth> auth;
@@ -191,6 +196,87 @@ public:
     }
 
 private:
+    // sftp:// and ssh:// objects through pooled OpenSSH sessions, answered like HTTP:
+    // 200/206 with the body, 404 when absent, HttpDenied when not permitted. Range
+    // and If-Match headers are honoured; the etag is the file's mtime and size.
+    HttpResponse get_sftp(const std::string& url, const std::function<void()>& reset,
+                          const std::function<void(const char*, std::size_t)>& write,
+                          const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
+                          const std::function<void(const HttpResponse&)>& begin_body)
+    {
+        sftp::ByteRange range;
+        bool ranged = false;
+        std::string if_match;
+        for (const auto& [name, value] : extra) {
+            std::string lower = name;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower == "range") {
+                ranged = true;
+                range = parse_byte_range(value);
+            } else if (lower == "if-match") {
+                if_match = value;
+            }
+        }
+        sftp::Fetcher* fetcher;
+        {
+            std::lock_guard lock(mutex_);
+            if (!sftp_) {
+                sftp::FetchOptions options;
+                options.session.connectTimeout =
+                    std::chrono::seconds(std::max<long>(1, (options_.connect_timeout_ms + 999) / 1000));
+                options.session.idleTimeout = std::chrono::milliseconds(std::max<long>(100, options_.stall_timeout_s * 1000));
+                options.sessionsPerHost = static_cast<std::size_t>(std::clamp(options_.connections, 1, 8));
+                options.retries = options_.retries;
+                sftp_ = std::make_unique<sftp::Fetcher>(std::move(options));
+            }
+            fetcher = sftp_.get();
+        }
+        HttpResponse response;
+        std::optional<sftp::Attributes> found;
+        try {
+            found = fetcher->read(url, range, [&] { reset(); response = {}; }, [&](const sftp::Attributes& a, uint64_t first, uint64_t count) {
+                response.status = ranged ? 206 : 200;
+                response.etag = "\"" + std::to_string(a.modified.value_or(0)) + "-" + std::to_string(*a.size) + "\"";
+                if (!if_match.empty() && if_match != response.etag)
+                    throw std::runtime_error("sftp object changed between reads: " + url);
+                if (ranged)
+                    response.content_range = "bytes " + std::to_string(first) + "-" +
+                                             std::to_string(first + count - 1) + "/" + std::to_string(*a.size);
+                response.content_length = count;
+                if (response.status != body_status)
+                    throw std::runtime_error("unexpected sftp response for " + url);
+                if (begin_body) begin_body(response);
+            }, [&](std::span<const std::byte> data) {
+                write(reinterpret_cast<const char*>(data.data()), data.size());
+                response.bytes += data.size();
+            });
+        } catch (const sftp::StatusError& e) {
+            if (e.status == sftp::PermissionDenied) throw HttpDenied("GET " + url + ": " + e.what());
+            throw std::runtime_error("GET " + url + ": " + e.what());
+        }
+        if (!found) {
+            response = {};
+            response.status = 404;
+        }
+        return response;
+    }
+
+    static sftp::ByteRange parse_byte_range(const std::string& value)
+    {
+        unsigned long long first = 0, last = 0;
+        sftp::ByteRange range;
+        if (std::sscanf(value.c_str(), "bytes=-%llu", &last) == 1) {
+            range.suffix = true;
+            range.length = last;
+        } else if (std::sscanf(value.c_str(), "bytes=%llu-%llu", &first, &last) == 2 && last >= first) {
+            range.offset = first;
+            range.length = last - first + 1;
+        } else {
+            throw std::invalid_argument("unsupported byte range for sftp: " + value);
+        }
+        return range;
+    }
+
     struct HeaderList {
         curl_slist* list = nullptr;
         void append(const std::string& line)
@@ -277,6 +363,7 @@ private:
     std::vector<CURL*> handles_;
     std::vector<CURL*> free_;
     std::shared_ptr<const Auth> auth_;  // guarded by mutex_
+    std::unique_ptr<sftp::Fetcher> sftp_;  // created on the first sftp:// request; guarded by mutex_
     std::mutex mutex_;
     std::condition_variable cv_;
 };
