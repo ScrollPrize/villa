@@ -88,3 +88,8 @@ dinovol/cufile.log
 /vc_object_store/build-core
 /vc_object_store/docs/benchmarks
 /volume-cartographer/planning
+/dinovol/dinovol_2/perf
+/dinovol/evals/kaggle_surfaces/data
+/dinovol/evals/kaggle_surfaces/runs
+/dinovol/outputs
+/dinovol/perf_results
