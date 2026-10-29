@@ -735,7 +735,11 @@ class Volume:
             
             if self.verbose:
                 print(f"Successfully opened zarr store: {data}")
-                print(f"Shape: {data.shape}, Dtype: {data.dtype}")
+                # A multiscale OME-Zarr opens as a group, which has no shape or
+                # dtype of its own; report them for a single array only.
+                # meta() lists every level once __init__ finishes.
+                if isinstance(data, zarr.Array):
+                    print(f"Shape: {data.shape}, Dtype: {data.dtype}")
                 
             return data
         except Exception as e:
