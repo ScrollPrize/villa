@@ -2,14 +2,18 @@
 #include "vc_reader/grid.hpp"
 
 #include "../array.hpp"
+#include "../rounding.hpp"
 #include "../composite/reducer.hpp"
 #include "../thread_pool.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <functional>
+#include <optional>
 #include <thread>
 
 namespace vcr::grid {
@@ -398,88 +402,229 @@ void Surface::resample(const Raster& raster, float* xyz, float* normals) const
 
 namespace {
 
-// Where each pixel's point of one layer comes from: a plane (computed from the
-// pixel), or resampled surface positions and normals.
-struct Source {
-    const Plane* plane = nullptr;
-    const float* xyz = nullptr;
-    const float* nrm = nullptr;
-    int width = 0;
-
-    // The point of pixel q at offset w along the normal (non-finite: no point).
-    void point(std::size_t q, float w, float* p) const
-    {
-        if (plane) {
-            const float i = float(q % std::size_t(width)), j = float(q / std::size_t(width));
-            for (int a = 0; a < 3; ++a)
-                p[a] = plane->origin[a] + plane->dy[a] * j + plane->dx[a] * i + plane->normal[a] * w;
-            return;
-        }
-        for (int a = 0; a < 3; ++a)
-            p[a] = w != 0 ? xyz[q * 3 + a] + nrm[q * 3 + a] * w : xyz[q * 3 + a];
-    }
-};
-
-// The points of the pixels `which` lists (all pixels when null) of one layer, as
-// a level's ZYX indices: index[a] = scale[a] * p[2 - a] + offset[a]. Computed as
-// the sampler asks: no point or index buffer.
-struct LayerPoints {
-    using value_type = double;
-    const Source* source;
-    float w;
-    const std::uint32_t* which;
+// One level as the tile loop reads it: its array, its chunk grid, and a few
+// recently used chunks (a pixel's samples and its neighbours' mostly share one).
+template <class Load>
+struct LevelReader {
+    Array* array;
+    Load load;
+    float fill;
     std::array<double, 3> scale, offset;
+    std::array<std::int64_t, 3> shape, chunks, grid, stride;  // stride: bytes per step in a chunk
+    std::array<int, 3> shift;  // log2 of a power-of-two chunk edge, or -1
+    bool cachedOnly;
 
-    std::int64_t base(std::size_t) const { return 0; }
-    std::size_t pixel(std::size_t p) const { return which ? which[p] : p; }
-    const double* operator()(std::size_t p, double* c) const
+    struct Slot {
+        std::array<std::int64_t, 3> index{-1, -1, -1};
+        bool available = false;
+        ChunkPtr chunk;  // null: not stored (reads as fill)
+    };
+    std::array<Slot, 8> slots{};
+    std::size_t last = 0, next = 0;
+
+    LevelReader(const Level& L, Load l, bool cached) : array(L.array), load(l), scale(L.scale), offset(L.offset), cachedOnly(cached)
     {
-        float q[3];
-        source->point(pixel(p), w, q);
-        c[0] = scale[0] * q[2] + offset[0];
-        c[1] = scale[1] * q[1] + offset[1];
-        c[2] = scale[2] * q[0] + offset[2];
-        return c;
+        const auto& spec = array->spec();
+        fill = float(L.type.load(spec.fill.data()));
+        for (std::size_t a = 0; a < 3; ++a) {
+            shape[a] = spec.shape[a];
+            chunks[a] = spec.chunks[a];
+            grid[a] = (shape[a] + chunks[a] - 1) / chunks[a];
+            shift[a] = std::has_single_bit(std::uint64_t(chunks[a])) ? std::countr_zero(std::uint64_t(chunks[a])) : -1;
+        }
+        stride = {chunks[1] * chunks[2] * std::int64_t(spec.itemsize), chunks[2] * std::int64_t(spec.itemsize),
+                  std::int64_t(spec.itemsize)};
     }
-    void prefetch(std::size_t) const {}
+
+    std::int64_t chunkIndex(std::int64_t v, std::size_t a) const { return shift[a] >= 0 ? v >> shift[a] : v / chunks[a]; }
+
+    // The chunk with chunk-grid index c, or null when it is not available (cache-only
+    // reads of a chunk only the source has).
+    const Slot* chunk(const std::array<std::int64_t, 3>& c)
+    {
+        if (slots[last].index == c)
+            return slots[last].available ? &slots[last] : nullptr;
+        for (std::size_t k = 0; k < slots.size(); ++k)
+            if (slots[k].index == c) {
+                last = k;
+                return slots[k].available ? &slots[k] : nullptr;
+            }
+        Slot& slot = slots[next];
+        last = next;
+        next = (next + 1) % slots.size();
+        slot.index = c;
+        const Index idx{c[0], c[1], c[2]};
+        if (cachedOnly) {
+            auto [found, data] = array->cached_chunk(idx);
+            slot.available = found;
+            slot.chunk = std::move(data);
+        } else {
+            slot.available = true;
+            slot.chunk = array->chunk(idx);
+        }
+        return slot.available ? &slot : nullptr;
+    }
+
+    // Byte offset of voxel v in its chunk, whose first voxel is `base`.
+    std::int64_t at(const std::int64_t* v, const std::array<std::int64_t, 3>& base) const
+    {
+        return (v[0] - base[0]) * stride[0] + (v[1] - base[1]) * stride[1] + (v[2] - base[2]) * stride[2];
+    }
+    float voxel(const Slot& slot, std::int64_t byte) const
+    {
+        return slot.chunk ? float(load(slot.chunk->data() + byte)) : fill;
+    }
+    bool inside(const std::int64_t* v) const
+    {
+        return v[0] >= 0 && v[1] >= 0 && v[2] >= 0 && v[0] < shape[0] && v[1] < shape[1] && v[2] < shape[2];
+    }
+    // The value of voxel v (inside the array) through the chunk memo; false when unavailable.
+    bool read(const std::int64_t* v, float& value)
+    {
+        const std::array<std::int64_t, 3> c{chunkIndex(v[0], 0), chunkIndex(v[1], 1), chunkIndex(v[2], 2)};
+        const Slot* slot = chunk(c);
+        if (!slot)
+            return false;
+        value = voxel(*slot, at(v, {c[0] * chunks[0], c[1] * chunks[1], c[2] * chunks[2]}));
+        return true;
+    }
+
+    // The value at the XYZ point p: nearest (order 0) or trilinear; voxels outside the
+    // array read as fill. False when a chunk it needs is not available.
+    bool sample(const float* p, int order, float& value)
+    {
+        double c[3];
+        for (std::size_t a = 0; a < 3; ++a)
+            c[a] = scale[a] * double(p[2 - a]) + offset[a];
+        if (order == 0) {
+            std::int64_t v[3];
+            for (std::size_t a = 0; a < 3; ++a)
+                v[a] = nearest_index(c[a]);
+            if (!inside(v)) {
+                value = fill;
+                return true;
+            }
+            return read(v, value);
+        }
+        std::int64_t lo[3];
+        float f[3];
+        for (std::size_t a = 0; a < 3; ++a) {
+            const double low = std::floor(c[a]);
+            lo[a] = std::int64_t(low);
+            f[a] = float(c[a] - low);
+        }
+        float corner[8];
+        // Usually the whole cell lies in one chunk inside the array: one lookup, strides.
+        const std::array<std::int64_t, 3> c0{chunkIndex(lo[0], 0), chunkIndex(lo[1], 1), chunkIndex(lo[2], 2)};
+        const std::int64_t hi[3]{lo[0] + 1, lo[1] + 1, lo[2] + 1};
+        if (inside(lo) && inside(hi) && chunkIndex(hi[0], 0) == c0[0] && chunkIndex(hi[1], 1) == c0[1] &&
+            chunkIndex(hi[2], 2) == c0[2]) {
+            const Slot* slot = chunk(c0);
+            if (!slot)
+                return false;
+            if (!slot->chunk) {
+                value = fill;
+                return true;
+            }
+            const std::uint8_t* d = slot->chunk->data() + at(lo, {c0[0] * chunks[0], c0[1] * chunks[1], c0[2] * chunks[2]});
+            for (int k = 0; k < 8; ++k)
+                corner[k] = float(load(d + (k >> 2 & 1) * stride[0] + (k >> 1 & 1) * stride[1] + (k & 1) * stride[2]));
+        } else {
+            for (int k = 0; k < 8; ++k) {
+                const std::int64_t v[3]{lo[0] + (k >> 2 & 1), lo[1] + (k >> 1 & 1), lo[2] + (k & 1)};
+                if (!inside(v))
+                    corner[k] = fill;
+                else if (!read(v, corner[k]))
+                    return false;
+            }
+        }
+        const float x00 = corner[0] + f[2] * (corner[1] - corner[0]), x01 = corner[2] + f[2] * (corner[3] - corner[2]);
+        const float x10 = corner[4] + f[2] * (corner[5] - corner[4]), x11 = corner[6] + f[2] * (corner[7] - corner[6]);
+        const float y0 = x00 + f[1] * (x01 - x00), y1 = x10 + f[1] * (x11 - x10);
+        value = y0 + f[0] * (y1 - y0);
+        return true;
+    }
 };
 
-// Runs fn(part, begin, end) over [0, n) in even parts on the pool (plain work division).
-template <class Fn>
-std::size_t forParts(Array& pool, std::size_t n, Fn&& fn)
-{
-    const std::size_t parts = std::clamp<std::size_t>(n / 32768, 1, 64);
-    pool.parallel_for(parts, [&](std::size_t k) { fn(k, n * k / parts, n * (k + 1) / parts); });
-    return parts;
-}
+// The points (and normals) of a tile's pixels: rows [j0, j0 + h), columns [i0, i0 + w).
+using TilePoints = std::function<void(int i0, int j0, int w, int h, float* xyz, float* nrm)>;
 
-// The entries i < n with keep(i), in order.
-template <class Keep>
-std::vector<std::uint32_t> select(Array& pool, std::size_t n, Keep&& keep)
+constexpr int kTile = 64;
+
+// Samples a raster tile by tile, each tile on one thread of the first level's pool:
+// the tile's points, then per pixel its layers, each from the first level holding
+// it, reduced and written once.
+template <class Load>
+Result sampleTiles(int width, int height, const Request& request, const TilePoints& points, Load load)
 {
-    std::vector<std::vector<std::uint32_t>> kept(std::clamp<std::size_t>(n / 32768, 1, 64));
-    forParts(pool, n, [&](std::size_t k, std::size_t a, std::size_t b) {
-        for (std::size_t i = a; i < b; ++i)
-            if (keep(i))
-                kept[k].push_back(std::uint32_t(i));
+    const std::size_t pixels = std::size_t(width) * std::size_t(height);
+    const std::size_t layers = request.offsets.size();
+    const bool needNormals = std::any_of(request.offsets.begin(), request.offsets.end(), [](float w) { return w != 0; });
+    Result result;
+    result.width = width;
+    result.height = height;
+    result.layers = int(layers);
+    result.values.assign(request.composite ? pixels : pixels * layers, kNaN);
+    result.level.assign(pixels, Result::kNone);
+    const int tilesX = (width + kTile - 1) / kTile, tilesY = (height + kTile - 1) / kTile;
+    request.levels.front().array->parallel_for(std::size_t(tilesX) * std::size_t(tilesY), [&](std::size_t t) {
+        const int i0 = int(t % std::size_t(tilesX)) * kTile, j0 = int(t / std::size_t(tilesX)) * kTile;
+        const int w = std::min(kTile, width - i0), h = std::min(kTile, height - j0);
+        if (request.pixels) {  // skip tiles without a requested pixel
+            bool any = false;
+            for (int j = j0; j < j0 + h && !any; ++j)
+                any = std::any_of(request.pixels + std::size_t(j) * width + i0, request.pixels + std::size_t(j) * width + i0 + w,
+                                  [](std::uint8_t m) { return m != 0; });
+            if (!any)
+                return;
+        }
+        std::vector<LevelReader<Load>> readers;
+        readers.reserve(request.levels.size());
+        for (const auto& L : request.levels)
+            readers.emplace_back(L, load, request.cachedOnly);
+        std::vector<float> xyz(std::size_t(w) * h * 3), nrm(needNormals ? xyz.size() : 0);
+        points(i0, j0, w, h, xyz.data(), needNormals ? nrm.data() : nullptr);
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < w; ++i) {
+                const std::size_t q = std::size_t(j0 + j) * std::size_t(width) + std::size_t(i0 + i);
+                if (request.pixels && !request.pixels[q])
+                    continue;
+                const float* p = &xyz[(std::size_t(j) * w + i) * 3];
+                const float* n = needNormals ? &nrm[(std::size_t(j) * w + i) * 3] : nullptr;
+                std::optional<composite::detail::Reducer> reduce;
+                if (request.composite)
+                    reduce.emplace(*request.composite);
+                std::int8_t level = Result::kNone;
+                bool missing = false;
+                for (std::size_t k = 0; k < layers && !(reduce && reduce->done); ++k) {
+                    const float off = request.offsets[k];
+                    const float at[3]{p[0] + (off != 0 ? n[0] * off : 0.0f), p[1] + (off != 0 ? n[1] * off : 0.0f),
+                                      p[2] + (off != 0 ? n[2] * off : 0.0f)};
+                    if (!(std::isfinite(at[0]) && std::isfinite(at[1]) && std::isfinite(at[2])))
+                        continue;  // no point in this layer
+                    float value = kNaN;
+                    std::size_t li = 0;
+                    while (li < readers.size() && !readers[li].sample(at, request.order, value))
+                        ++li;
+                    if (li == readers.size()) {
+                        missing = true;
+                        continue;
+                    }
+                    level = std::max(level, std::int8_t(li));
+                    if (reduce)
+                        reduce->add(value);
+                    else
+                        result.values[k * pixels + q] = value;
+                }
+                if (reduce)
+                    result.values[q] = reduce->result();
+                result.level[q] = missing ? Result::kMissing : level;
+            }
     });
-    std::vector<std::uint32_t> all;
-    for (auto& part : kept)
-        all.insert(all.end(), part.begin(), part.end());
-    return all;
+    return result;
 }
 
-// Per-thread scratch reused across calls (no page faults on every frame).
-std::vector<float>& scratch(int which)
-{
-    thread_local std::vector<float> buffers[3];
-    return buffers[which];
-}
-
-// Samples every layer of a raster whose points `source` gives: per layer, one
-// Array call for all of its pixels at the first level, then calls at the next
-// levels for the pixels still unresolved.
-Result sampleRaster(int width, int height, const Request& request, const Source& source)
+void checkRequest(const Request& request, int width, int height)
 {
     if (request.levels.empty())
         throw std::invalid_argument("a sample request needs at least one level");
@@ -494,113 +639,22 @@ Result sampleRaster(int width, int height, const Request& request, const Source&
         throw std::invalid_argument("order must be 0 or 1");
     if (width < 0 || height < 0)
         throw std::invalid_argument("invalid raster");
-    if (std::size_t(width) * std::size_t(height) > std::numeric_limits<std::uint32_t>::max())
-        throw std::invalid_argument("raster too large");
+    for (const auto& L : request.levels)
+        if (L.type.kind != request.levels.front().type.kind || L.type.itemsize != request.levels.front().type.itemsize ||
+            L.type.swap != request.levels.front().type.swap)
+            throw std::invalid_argument("sample levels must share one element type");
     if (request.composite)
         composite::detail::checkLayers(request.offsets.size(), *request.composite);
-    Array& pool = *request.levels.front().array;
-    const std::size_t pixels = std::size_t(width) * std::size_t(height);
-    const std::size_t layers = request.offsets.size();
-    Result result;
-    result.width = width;
-    result.height = height;
-    result.layers = int(layers);
-    result.level.resize(pixels * layers);
-    result.values.resize(request.composite ? pixels : pixels * layers);
-    auto& stack = scratch(2);  // the layers of a composite
-    if (request.composite)
-        stack.resize(pixels * layers);
+}
 
-    std::vector<float> linear;
-    std::vector<std::uint8_t> raw, missing;
-    for (std::size_t k = 0; k < layers; ++k) {
-        const float w = request.offsets[k];
-        float* values = request.composite ? stack.data() + k * pixels : result.values.data() + k * pixels;
-        std::int8_t* level = result.level.data() + k * pixels;
-        // Masked reads sample only their pixels; frames sample every pixel.
-        std::vector<std::uint32_t> pending;
-        if (request.pixels)
-            pending = select(pool, pixels, [&](std::size_t q) { return request.pixels[q] != 0; });
-        const std::uint32_t* which = request.pixels ? pending.data() : nullptr;
-        std::size_t n = request.pixels ? pending.size() : pixels;
-        if (request.pixels) {
-            std::fill_n(values, pixels, kNaN);
-            std::fill_n(level, pixels, Result::kNone);
-        }
-        for (std::size_t li = 0; li < request.levels.size() && n; ++li) {
-            const Level& L = request.levels[li];
-            const auto& shape = L.array->spec().shape;
-            const LayerPoints points{&source, w, which, L.scale, L.offset};
-            std::uint8_t* miss = nullptr;
-            if (request.cachedOnly) {
-                missing.resize(n);
-                miss = missing.data();
-            }
-            const std::size_t isz = L.array->itemsize();
-            if (request.order == 0) {
-                raw.resize(n * isz);
-                L.array->sample_nearest_coordinates(points, n, raw.data(), miss);
-            } else {
-                linear.resize(n);
-                L.array->sample_linear_coordinates(points, n, L.type, false, linear.data(), miss);
-            }
-            // Write back what this level supplied; count what it did not.
-            std::vector<std::size_t> unresolved(64, 0);
-            forParts(pool, n, [&](std::size_t part, std::size_t a, std::size_t b) {
-                for (std::size_t p = a; p < b; ++p) {
-                    const std::size_t q = points.pixel(p);
-                    double c[3];
-                    points(p, c);
-                    const bool point = std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
-                    bool inside = point;
-                    for (int axis = 0; axis < 3 && inside; ++axis)
-                        inside = c[axis] >= -0.5 && c[axis] <= double(shape[std::size_t(axis)]) - 0.5;
-                    if (li == 0) {
-                        values[q] = kNaN;
-                        level[q] = Result::kNone;
-                    }
-                    if (!inside || (miss && miss[p])) {
-                        if (point) {
-                            ++unresolved[part];
-                            if (inside)
-                                level[q] = Result::kMissing;
-                        }
-                        continue;
-                    }
-                    values[q] = request.order == 0 ? float(L.type.load(raw.data() + p * isz)) : linear[p];
-                    level[q] = std::int8_t(li);
-                }
-            });
-            std::size_t left = 0;
-            for (auto u : unresolved)
-                left += u;
-            if (!left || li + 1 == request.levels.size())
-                break;
-            // The next level samples only the pixels with a point and no value yet.
-            auto next = select(pool, n, [&](std::size_t p) {
-                if (level[points.pixel(p)] >= 0)
-                    return false;
-                double c[3];
-                points(p, c);
-                return std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
-            });
-            for (auto& p : next)  // `points` reads `pending`: remap before replacing it
-                p = std::uint32_t(points.pixel(p));
-            pending = std::move(next);
-            which = pending.data();
-            n = pending.size();
-        }
-    }
-    if (request.composite) {
-        forParts(pool, pixels, [&](std::size_t, std::size_t a, std::size_t b) {
-            for (std::size_t q = a; q < b; ++q) {
-                composite::detail::Reducer r(*request.composite);
-                for (std::size_t k = 0; k < layers && !r.done; ++k)
-                    r.add(stack[k * pixels + q]);
-                result.values[q] = r.result();
-            }
-        });
-    }
+// The tile loop with the levels' element load chosen once.
+Result sampleRaster(int width, int height, const Request& request, const TilePoints& points)
+{
+    checkRequest(request, width, height);
+    Result result;
+    request.levels.front().type.visit_load([&](auto load) {
+        result = sampleTiles(width, height, request, points, load);
+    });
     return result;
 }
 
@@ -608,35 +662,36 @@ Result sampleRaster(int width, int height, const Request& request, const Source&
 
 Result sample(const Surface& surface, const Raster& raster, const Request& request)
 {
-    if (request.levels.empty())
-        throw std::invalid_argument("a sample request needs at least one level");
+    checkRequest(request, raster.width, raster.height);
     const bool needNormals = std::any_of(request.offsets.begin(), request.offsets.end(), [](float w) { return w != 0; });
     auto& impl = *surface.impl_;
     impl.prepare(needNormals);
-    const std::size_t pixels = std::size_t(std::max(raster.width, 0)) * std::size_t(std::max(raster.height, 0));
-    auto& xyz = scratch(0);
-    auto& nrm = scratch(1);
-    xyz.resize(pixels * 3);
-    nrm.resize(needNormals ? pixels * 3 : 0);
-    if (impl.v.rows == 0 || impl.v.cols == 0 || impl.pieces.empty()) {
-        std::fill(xyz.begin(), xyz.end(), kNaN);
-        std::fill(nrm.begin(), nrm.end(), kNaN);
-    } else {
-        const std::size_t rows = std::size_t(std::max(raster.height, 0));
-        const std::size_t parts = std::clamp<std::size_t>(pixels / 32768, 1, 64);
-        request.levels.front().array->parallel_for(parts, [&](std::size_t k) {
-            const std::size_t r0 = rows * k / parts, r1 = rows * (k + 1) / parts;
-            const std::size_t o = r0 * std::size_t(raster.width) * 3;
-            impl.resampleRows(raster, int(r0), int(r1), xyz.data() + o, needNormals ? nrm.data() + o : nullptr);
-        });
-    }
-    return sampleRaster(raster.width, raster.height, request,
-                        Source{nullptr, xyz.data(), needNormals ? nrm.data() : nullptr, raster.width});
+    const bool empty = impl.v.rows == 0 || impl.v.cols == 0 || impl.pieces.empty();
+    return sampleRaster(raster.width, raster.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
+        if (empty) {
+            std::fill_n(xyz, std::size_t(w) * h * 3, kNaN);
+            if (nrm)
+                std::fill_n(nrm, std::size_t(w) * h * 3, kNaN);
+            return;
+        }
+        const Raster tile{raster.x0 + double(i0) * raster.sx, raster.y0 + double(j0) * raster.sy, raster.sx, raster.sy, w, h};
+        impl.resampleRows(tile, 0, h, xyz, nrm);
+    });
 }
 
 Result sample(const Plane& plane, const Request& request)
 {
-    return sampleRaster(plane.width, plane.height, request, Source{&plane, nullptr, nullptr, plane.width});
+    return sampleRaster(plane.width, plane.height, request, [&](int i0, int j0, int w, int h, float* xyz, float* nrm) {
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < w; ++i) {
+                float* p = xyz + (std::size_t(j) * w + i) * 3;
+                for (std::size_t a = 0; a < 3; ++a) {
+                    p[a] = plane.origin[a] + plane.dy[a] * float(j0 + j) + plane.dx[a] * float(i0 + i);
+                    if (nrm)
+                        nrm[(std::size_t(j) * w + i) * 3 + a] = plane.normal[a];
+                }
+            }
+    });
 }
 
 }  // namespace vcr::grid

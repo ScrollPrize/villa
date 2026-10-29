@@ -551,19 +551,46 @@ public:
         return bool(data);
     }
 
-    // Whether the chunk's decoded bytes are already in memory (the memory cache or a
-    // queued cache write), without any I/O: (true, chunk or nullptr) when they are.
+    // The chunk at a chunk-grid index from the caches alone: the memory cache, queued
+    // cache writes and the disk caches, never the array's source (its remote, its own
+    // local store, a computation), so it never waits on the network or the store's
+    // filesystem. (true, chunk or nullptr when it is not stored) when a cache holds it,
+    // (false, nullptr) when only the source can supply it. A chunk read from a disk
+    // cache enters the memory cache.
     std::pair<bool, ChunkPtr> cached_chunk(const Index& idx)
     {
         check_chunk_index(idx);
         const std::string k = key(idx);
+        const std::string ck = spec_.identity + "|" + k;
         if (cache_) {
-            auto found = cache_->get(spec_.identity + "|" + k);
-            if (found.first)
+            auto found = cache_->get(ck);
+            if (found.first) {
+                ++stats_.memory_hits;
                 return found;
+            }
         }
-        if (writes_)
-            return writes_->pending(k);
+        if (writes_) {
+            auto found = writes_->pending(k);
+            if (found.first) {
+                ++stats_.pending_hits;
+                return found;
+            }
+        }
+        bool store = false;  // the array's own store, its source
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (spec_.layers[li].kind == "array") {
+                store = true;
+                continue;
+            }
+            if (auto chunk = read_layer_chunk(li, k)) {
+                ++stats_.disk_hits;
+                if (cache_)
+                    cache_->put(ck, *chunk);
+                return {true, *chunk};
+            }
+        }
+        if (!store && !http_ && !source_ && !spec_.compute && !spec_.offline)
+            return {true, nullptr};  // no source: nothing is stored
         return {false, nullptr};
     }
 

@@ -2,8 +2,9 @@
 // Surfaces stored as grids of vertices (VC's tifxyz), and sampling volumes along
 // them and along planes: positions and normals interpolated from the vertices at
 // every pixel of a raster, offset along the normal into layers, sampled from a
-// pyramid with fine-to-coarse fallback, optionally from the caches alone, and
-// optionally reduced to one value per pixel.
+// pyramid with fallback between levels, optionally from the caches alone, and
+// optionally reduced to one value per pixel. Rasters are sampled in tiles, each on
+// one thread, which reads the chunks its samples need and writes final pixels.
 
 #include "vc_reader/composite.hpp"
 #include "vc_reader/native/element_type.hpp"
@@ -94,14 +95,16 @@ struct Level {
 };
 
 struct Request {
-    // Finest first: each sample comes from the first level that holds it.
+    // In order of preference (e.g. the view's level, finer ones, then coarser): each
+    // sample comes from the first level that holds it.
     std::vector<Level> levels;
     int order = 1;  // 0 nearest, 1 linear
     // One layer per offset along the unit normal. A nonzero offset needs a normal:
     // points without one have no sample in that layer.
     std::vector<float> offsets{0.0f};
-    // Read the caches alone (Array::sample_*_cached): a sample whose chunks only the
+    // Read the caches alone (Array::cached_chunk): a sample whose chunks only the
     // source can supply is missing at that level, and the next level is tried.
+    // Otherwise chunks are read blocking (Array::chunk), fetched as needed.
     bool cachedOnly = false;
     // When set, only pixels p with pixels[p] != 0 are sampled.
     const std::uint8_t* pixels = nullptr;
@@ -110,15 +113,16 @@ struct Request {
 };
 
 struct Result {
-    static constexpr std::int8_t kNone = -2;     // no point here, or outside every level
-    static constexpr std::int8_t kMissing = -1;  // no level held it (cached-only reads)
+    static constexpr std::int8_t kNone = -2;     // no layer of the pixel had a point
+    static constexpr std::int8_t kMissing = -1;  // a layer's chunks were in no level's caches (cached-only reads)
 
     int width = 0, height = 0, layers = 0;
-    // One value per pixel and layer (layer-major: layer * width * height + pixel), or
+    // One value per pixel and layer, layer-major (layer * width * height + pixel), or
     // one per pixel with a composite; NaN where there is no value.
     std::vector<float> values;
-    // Per pixel and layer, always layer-major: the index into Request::levels that
-    // supplied the sample, kMissing or kNone.
+    // Per pixel: the highest index into Request::levels that supplied one of its
+    // layers; kMissing when a layer with a point was in no level (whatever the others
+    // got); kNone when no layer had a point.
     std::vector<std::int8_t> level;
 };
 

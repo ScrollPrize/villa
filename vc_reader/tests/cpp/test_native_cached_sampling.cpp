@@ -104,6 +104,18 @@ int main()
         for (std::size_t p = singles; p < n; ++p)
             require(missing[p] && cachedNearest[p] == 200, "nearest run in a remote-only chunk");
 
+        // cached_chunk: the disk cache holds chunk 0, only the remote has chunk 1; a local
+        // store's chunks are its source.
+        require(array.cached_chunk({0, 0, 0}).first && array.cached_chunk({0, 0, 0}).second, "disk-cached chunk");
+        require(!array.cached_chunk({0, 0, 1}).first, "remote-only chunk is not cached");
+        {
+            vcr::Array store(spec, std::make_shared<vcr::MemoryCache>(1 << 20));
+            require(!store.cached_chunk({0, 0, 0}).first, "a local store's chunk is its source");
+            store.chunk({0, 0, 0});
+            require(store.cached_chunk({0, 0, 0}).first, "after a read it is in memory");
+        }
+        no_fetch();
+
         // The other chunks arrive in the disk cache (chunk 2 as known-missing): every point
         // equals the blocking reference and nothing is fetched.
         write_chunk(cache, 1);

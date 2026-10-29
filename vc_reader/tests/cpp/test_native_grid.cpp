@@ -153,12 +153,14 @@ int main()
         request.levels = {L0};
         request.offsets = {0.0f, 1.0f};
         auto r = vcr::grid::sample(plane, request);
-        require(r.width == 8 && r.height == 4 && r.layers == 2 && r.values.size() == 64, "plane result shape");
-        for (int k = 0; k < 2; ++k)
+        require(r.width == 8 && r.height == 4 && r.layers == 2 && r.values.size() == 64 && r.level.size() == 32,
+                "plane result shape");
+        for (int k = 0; k < 2; ++k)  // values layer-major, levels per pixel
             for (int j = 0; j < 4; ++j)
                 for (int i = 0; i < 8; ++i) {
-                    const std::size_t q = std::size_t(k * 32 + j * 8 + i);
-                    require(r.level[q] == 0 && near(r.values[q], value(2.0f + i, 3.0f + j, 4.0f + k)), "plane layer value");
+                    const std::size_t q = std::size_t(j * 8 + i);
+                    require(r.level[q] == 0 && near(r.values[std::size_t(k) * 32 + q], value(2.0f + i, 3.0f + j, 4.0f + k)),
+                            "plane layer value");
                 }
 
         // Composite: max over the two layers is the upper one.
@@ -214,11 +216,37 @@ int main()
         r = vcr::grid::sample(plane, masked);
         require(r.level[5] == 0 && r.level[4] == vcr::grid::Result::kNone, "pixel mask");
 
-        // A plane leaving the volume: no point outside.
+        // A plane leaving the volume: points outside read as fill, as everywhere.
         vcr::grid::Plane edge{{14, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 4, 1};
         request.offsets = {0.0f};
         r = vcr::grid::sample(edge, request);
-        require(r.level[0] == 0 && r.level[1] == 0 && r.level[2] == vcr::grid::Result::kNone, "outside the volume");
+        require(r.level[1] == 0 && near(r.values[1], value(15, 0, 0)) && r.level[3] == 0 && r.values[3] == 0.0f,
+                "outside the volume reads as fill");
+        // Linear sampling there matches Array::sample_linear, fill neighbours included.
+        request.order = 1;
+        vcr::grid::Plane between{{14.5f, 3.25f, 4.5f}, {0.5f, 0, 0}, {0, 0.5f, 0}, {0, 0, 1}, 6, 3};
+        r = vcr::grid::sample(between, request);
+        for (int j = 0; j < 3; ++j)
+            for (int i = 0; i < 6; ++i) {
+                const double at[3]{4.5, 3.25 + 0.5 * j, 14.5 + 0.5 * i};
+                float expected = 0;
+                a0->sample_linear(at, 1, u8, false, &expected);
+                require(near(r.values[std::size_t(j * 6 + i)], expected, 1e-3f), "linear matches Array::sample_linear");
+            }
+        // A pixel whose layers come from two levels reports the second; a missing layer wins.
+        auto partial0 = open(fine, 16), partial1 = open(coarse, 8);
+        partial0->chunk({0, 0, 0});  // z 0..7 at level 0 in memory
+        partial1->chunk({0, 0, 0});
+        vcr::grid::Request mixed;
+        mixed.levels = {{partial0.get(), u8, L0.scale, L0.offset}, {partial1.get(), u8, L1.scale, L1.offset}};
+        mixed.cachedOnly = true;
+        mixed.offsets = {0.0f, 6.0f};  // z 2 and z 8: level 0, then only level 1 holds it
+        vcr::grid::Plane corner{{1, 1, 2}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, 2, 1};
+        r = vcr::grid::sample(corner, mixed);
+        require(r.level[0] == 1 && near(r.values[0], value(1, 1, 2)) && near(r.values[2], 200.0f), "levels mix per layer");
+        mixed.levels.pop_back();
+        r = vcr::grid::sample(corner, mixed);
+        require(r.level[0] == vcr::grid::Result::kMissing && near(r.values[0], value(1, 1, 2)), "a missing layer wins");
 
         // Along a surface: the flat grid lies at z = 10 with x = 2c, y = 3r; sampled
         // linearly between voxels, and one layer down the normal.
