@@ -1,7 +1,9 @@
 // Point, plane, band and composite sampling: tiled block reads agree with a direct
 // evaluation over the whole array, interpolation reproduces linear fields, edges
 // read the fill value, nearest half ties round up, and composites reduce as
-// documented. With CUDA, the device backend matches the CPU.
+// documented. Gradients match the interpolants' derivatives, and service-backed
+// requests (small direct ones and planned ones) match array reads. With CUDA, the
+// device backend matches the CPU.
 #include "vc_reader/slice.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/slice/math.hpp"
@@ -9,6 +11,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -71,6 +74,7 @@ void check_close(const std::vector<float>& got, const std::vector<float>& want, 
 struct Case {
     vcr::Array* array;
     vcr::ElementType type;
+    vcr::Array* uncached = nullptr;  // the same array without a memory cache, for the chunk service
 };
 
 void points(Case c, const Reference& ref)
@@ -254,6 +258,106 @@ void composite(Case c)
     require(std::isnan(reduce(Mean)), "no surviving layer is NaN");
 }
 
+std::vector<float> gradient_points(std::uint32_t seed, int n)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> d(-3.0f, 48.0f);
+    std::vector<float> xyz;
+    for (int i = 0; i < n; ++i)
+        for (int a = 0; a < 3; ++a)
+            xyz.push_back(d(rng));
+    xyz.insert(xyz.end(), {NAN, 1, 1, 200, 3, 3, 10, 10, 10});  // non-finite, outside, on a voxel
+    return xyz;
+}
+
+// Values equal points(); gradients equal the reference cell's derivatives and, away
+// from cell faces, central differences of the sampled values.
+void gradients(Case c, const Reference& ref)
+{
+    const auto xyz = gradient_points(5, 3000);
+    const std::size_t n = xyz.size() / 3;
+    for (const auto order : {slice::Order::Nearest, slice::Order::Linear, slice::Order::Cubic}) {
+        const int o = int(order);
+        std::vector<float> values(n), g(3 * n), plain(n);
+        slice::gradient(*c.array, c.type, xyz.data(), n, order, values.data(), g.data());
+        slice::points(*c.array, c.type, xyz.data(), n, order, plain.data());
+        check_close(values, plain, "gradient values equal points, order " + std::to_string(o));
+        std::vector<float> want(3 * n);
+        for (std::size_t p = 0; p < n; ++p) {
+            const float x = xyz[3 * p], y = xyz[3 * p + 1], z = xyz[3 * p + 2];
+            float* w = &want[3 * p];
+            w[0] = w[1] = w[2] = 0.0f;
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+                w[0] = w[1] = w[2] = NAN;
+            else if (!vcr::slice::detail::outside(x, y, z, Z, Y, X, o))
+                vcr::slice::detail::sampleGradient(ref.data.data(), ref.block, x, y, z, o, w);
+        }
+        check_close(g, want, "gradient, order " + std::to_string(o));
+        if (order == slice::Order::Nearest)
+            continue;
+        const float h = 1.0f / 64;
+        for (std::size_t p = 0; p < n; ++p) {
+            float q[3] = {xyz[3 * p], xyz[3 * p + 1], xyz[3 * p + 2]};
+            bool interior = true;
+            for (const float v : q)
+                interior = interior && std::isfinite(v) && v > 1 && v < 36 && v - std::floor(v) > 0.1f &&
+                           v - std::floor(v) < 0.9f;
+            if (!interior)
+                continue;
+            for (int a = 0; a < 3; ++a) {
+                float lo[3] = {q[0], q[1], q[2]}, hi[3] = {q[0], q[1], q[2]};
+                lo[a] -= h;
+                hi[a] += h;
+                const float slope = (ref(hi[0], hi[1], hi[2], o) - ref(lo[0], lo[1], lo[2], o)) / (2 * h);
+                require(std::abs(slope - g[3 * p + a]) <= 0.05f * (1 + std::abs(slope)),
+                        "gradient matches central differences, order " + std::to_string(o) + " axis " +
+                            std::to_string(a) + ": " + std::to_string(g[3 * p + a]) + " vs " + std::to_string(slope));
+            }
+        }
+    }
+    // Linear fields have their constant slope everywhere inside.
+    const vcr::slice::detail::Block b{0, 0, 0, 0, 4, 4, 4};
+    std::vector<float> ramp(64);
+    for (int z = 0; z < 4; ++z)
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x)
+                ramp[(z * 4 + y) * 4 + x] = 2.0f * x - 3.0f * y + 0.5f * z;
+    for (const int o : {1, 3}) {
+        float g[3];
+        vcr::slice::detail::sampleGradient(ramp.data(), b, 1.3f, 1.7f, 1.25f, o, g);
+        require(std::abs(g[0] - 2) < 1e-4f && std::abs(g[1] + 3) < 1e-4f && std::abs(g[2] - 0.5f) < 1e-4f,
+                "slope of a linear field, order " + std::to_string(o));
+    }
+}
+
+// Requests through the shared service, both small direct ones and planned ones,
+// give exactly the array's values and gradients.
+void service_matches(vcr::Array& stored, const vcr::Array& uncached, const vcr::ElementType& type)
+{
+    vcr::chunks::Service service({.decodedBytes = 1 << 20, .remoteWorkers = 1, .localWorkers = 2});
+    auto shared = std::shared_ptr<vcr::Array>(const_cast<vcr::Array*>(&uncached), [](vcr::Array*) {});
+    const auto source = service.addSource({shared});
+    slice::Cached cached{*shared, service, source};
+    for (const int n : {1, 17, 3000}) {
+        const auto xyz = gradient_points(9 + n, n);
+        const std::size_t count = xyz.size() / 3;
+        for (const auto order : {slice::Order::Nearest, slice::Order::Linear, slice::Order::Cubic}) {
+            std::vector<float> want(count), got(count), wantG(3 * count), gotG(3 * count);
+            slice::points(stored, type, xyz.data(), count, order, want.data());
+            slice::points(cached, type, xyz.data(), count, order, got.data());
+            const std::string what = std::to_string(count) + " cached points, order " + std::to_string(int(order));
+            for (std::size_t i = 0; i < count; ++i)
+                require(std::memcmp(&want[i], &got[i], sizeof(float)) == 0 || (std::isnan(want[i]) && std::isnan(got[i])),
+                        what);
+            slice::gradient(stored, type, xyz.data(), count, order, want.data(), wantG.data());
+            slice::gradient(cached, type, xyz.data(), count, order, got.data(), gotG.data());
+            for (std::size_t i = 0; i < 3 * count; ++i)
+                require(std::memcmp(&wantG[i], &gotG[i], sizeof(float)) == 0 || (std::isnan(wantG[i]) && std::isnan(gotG[i])),
+                        "gradients of " + what);
+        }
+    }
+}
+
 #ifdef VC_READER_CUDA
 std::vector<float> download(const vcr::device::Storage& s)
 {
@@ -309,6 +413,22 @@ void cuda_matches(Case c)
                                                     b.offsets, slice::Order::Cubic, cfg)),
                     cpu, "CUDA composite " + std::to_string(int(method)));
     }
+    const auto g = gradient_points(13, 4000);
+    vcr::chunks::Service service({.decodedBytes = 1 << 20, .remoteWorkers = 1, .localWorkers = 2});
+    auto shared = std::shared_ptr<vcr::Array>(c.uncached, [](vcr::Array*) {});
+    slice::Cached cached{*shared, service, service.addSource({shared})};
+    for (const auto order : {slice::Order::Nearest, slice::Order::Linear, slice::Order::Cubic}) {
+        const std::size_t n = g.size() / 3;
+        std::vector<float> values(n), slopes(3 * n);
+        slice::gradient(*c.array, c.type, g.data(), n, order, values.data(), slopes.data());
+        vcr::device::Storage deviceSlopes, cachedSlopes;
+        check_close(download(slice::cuda::gradient(*c.array, c.type, g.data(), n, order, &deviceSlopes)), values,
+                    "CUDA gradient values, order " + std::to_string(int(order)));
+        check_close(download(deviceSlopes), slopes, "CUDA gradients, order " + std::to_string(int(order)));
+        check_close(download(slice::cuda::gradient(cached, c.type, g.data(), n, order, &cachedSlopes)), values,
+                    "CUDA cached gradient values");
+        check_close(download(cachedSlopes), slopes, "CUDA cached gradients");
+    }
     std::cout << "CUDA matches CPU\n";
 }
 #endif
@@ -344,13 +464,16 @@ int main()
         vcr::zarr::OpenOptions options;
         options.memoryCache = std::make_shared<vcr::MemoryCache>(64 << 20);
         auto opened = vcr::zarr::openArray((root / "v.zarr" / "0").string(), options);
+        auto uncached = vcr::zarr::openArray((root / "v.zarr" / "0").string(), {});
         const Reference ref;
-        const Case c{opened.array.get(), opened.meta.type};
+        const Case c{opened.array.get(), opened.meta.type, uncached.array.get()};
         points(c, ref);
         plane(c, ref);
         nearest_ties(c);
         band(c, ref);
         composite(c);
+        gradients(c, ref);
+        service_matches(*c.array, *c.uncached, c.type);
 #ifdef VC_READER_CUDA
         cuda_matches(c);
 #endif

@@ -83,6 +83,16 @@ void band(Cached& cached, const ElementType& type, const float* base, const floa
 void composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                std::size_t width, std::span<const float> offsets, Order order, const Composite& method, float* out);
 
+// Values with their derivatives: out[p] as points() samples it, and gradient[3p + a]
+// its derivative along X, Y, Z (a = 0, 1, 2) for autodiff and optimizers. Linear and
+// cubic differentiate the interpolant of the cell holding the point (the cell from
+// floor(c), so on a voxel plane the cell above); nearest and fill points are flat;
+// non-finite points give NaN.
+void gradient(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+              float* gradient);
+void gradient(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+              float* gradient);
+
 // Resident overloads return one validity byte per output (1 = all required
 // chunks available). Invalid outputs are NaN, including incomplete composites.
 // `type` says how the array's elements read as numbers.
@@ -120,6 +130,11 @@ device::Storage band(Cached& cached, const ElementType& type, const float* base,
                      std::size_t width, std::span<const float> offsets, Order order);
 device::Storage composite(Cached& cached, const ElementType& type, const float* base, const float* dirs, std::size_t n,
                           std::size_t width, std::span<const float> offsets, Order order, const Composite& method);
+// Values; *gradient receives the 3n derivatives (XYZ per point).
+device::Storage gradient(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order,
+                         device::Storage* gradient);
+device::Storage gradient(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order,
+                         device::Storage* gradient);
 device::Storage points(Resident& resident, const ElementType& type, const float* xyz, std::size_t n, Order order,
            device::Storage* valid = nullptr);
 device::Storage plane(Resident& resident, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,

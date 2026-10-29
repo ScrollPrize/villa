@@ -52,6 +52,17 @@ VCR_SLICE_HD float cubicWeight(float t)
     return 0.0f;
 }
 
+// d/dt of cubicWeight.
+VCR_SLICE_HD float cubicSlope(float t)
+{
+    const float at = fabsf(t), sign = t < 0.0f ? -1.0f : 1.0f;
+    if (at < 1.0f)
+        return sign * (4.5f * at - 5.0f) * at;
+    if (at < 2.0f)
+        return sign * ((-1.5f * at + 5.0f) * at - 4.0f);
+    return 0.0f;
+}
+
 // Neighbourhood of a point for an interpolation order, as [first, last] voxel indices.
 VCR_SLICE_HD void footprint(float c, int order, std::int64_t& first, std::int64_t& last)
 {
@@ -137,6 +148,62 @@ VCR_SLICE_HD float sample(const float* data, const Block& b, float x, float y, f
         result += wz[dz] * plane;
     }
     return result;
+}
+
+// sample() and its derivatives along X, Y and Z in g. Linear and cubic differentiate
+// the interpolant of the cell holding the point (the cell starting at floor(c), so a
+// point on a voxel plane gets the derivative of the cell above it); nearest is flat.
+VCR_SLICE_HD float sampleGradient(const float* data, const Block& b, float x, float y, float z, int order, float g[3])
+{
+    const float value = sample(data, b, x, y, z, order);
+    g[0] = g[1] = g[2] = 0.0f;
+    if (order == 0)
+        return value;
+    const float fz = floorf(z), fy = floorf(y), fx = floorf(x);
+    const std::int64_t iz = std::int64_t(fz), iy = std::int64_t(fy), ix = std::int64_t(fx);
+    const float tz = z - fz, ty = y - fy, tx = x - fx;
+    if (order == 1) {
+        float c[2][2], d[2][2];  // rows interpolated along x, and their x differences
+        for (int dz = 0; dz < 2; ++dz)
+            for (int dy = 0; dy < 2; ++dy) {
+                const float v0 = at(data, b, iz + dz, iy + dy, ix), v1 = at(data, b, iz + dz, iy + dy, ix + 1);
+                c[dz][dy] = v0 + tx * (v1 - v0);
+                d[dz][dy] = v1 - v0;
+            }
+        const float d0 = d[0][0] + ty * (d[0][1] - d[0][0]), d1 = d[1][0] + ty * (d[1][1] - d[1][0]);
+        const float c0 = c[0][0] + ty * (c[0][1] - c[0][0]), c1 = c[1][0] + ty * (c[1][1] - c[1][0]);
+        g[0] = d0 + tz * (d1 - d0);
+        g[1] = (c[0][1] - c[0][0]) + tz * ((c[1][1] - c[1][0]) - (c[0][1] - c[0][0]));
+        g[2] = c1 - c0;
+        return value;
+    }
+    float wz[4], wy[4], wx[4], sz[4], sy[4], sx[4];
+    for (int k = 0; k < 4; ++k) {
+        wz[k] = cubicWeight(tz - float(k - 1));
+        wy[k] = cubicWeight(ty - float(k - 1));
+        wx[k] = cubicWeight(tx - float(k - 1));
+        sz[k] = cubicSlope(tz - float(k - 1));
+        sy[k] = cubicSlope(ty - float(k - 1));
+        sx[k] = cubicSlope(tx - float(k - 1));
+    }
+    for (int dz = 0; dz < 4; ++dz) {
+        float plane = 0.0f, planeX = 0.0f, planeY = 0.0f;
+        for (int dy = 0; dy < 4; ++dy) {
+            float row = 0.0f, rowX = 0.0f;
+            for (int dx = 0; dx < 4; ++dx) {
+                const float v = at(data, b, iz + dz - 1, iy + dy - 1, ix + dx - 1);
+                row += wx[dx] * v;
+                rowX += sx[dx] * v;
+            }
+            plane += wy[dy] * row;
+            planeX += wy[dy] * rowX;
+            planeY += sy[dy] * row;
+        }
+        g[0] += wz[dz] * planeX;
+        g[1] += wz[dz] * planeY;
+        g[2] += sz[dz] * plane;
+    }
+    return value;
 }
 
 // Where the samples of a request lie. Unit p (an output pixel, or a point) has K
@@ -266,7 +333,8 @@ struct Reducer {
 // (composite false) or reduces them (composite true). Pointers are device memory.
 void launch(const Source& source, const Tile* tiles, std::size_t count, const float* blocks, std::int64_t width,
             const std::int64_t shape[3], int order, float fill, bool composite, const CompositeConfig& config, float* out,
-            cudaStream_t stream, const std::uint8_t* coverage = nullptr, std::uint8_t* valid = nullptr);
+            cudaStream_t stream, const std::uint8_t* coverage = nullptr, std::uint8_t* valid = nullptr,
+            float* gradient = nullptr);
 #endif
 
 }  // namespace vcr::slice::detail

@@ -202,8 +202,13 @@ array fill value. Registered arrays must not also hold a private memory cache.
 This path shares host decoded chunks with resident viewers; CUDA still uploads
 float32 wave blocks per request.
 
-A scalar nearest CPU request loads its single element directly from the service
-chunk without allocating a dense wave. It uses the shared footprint/rounding
-formula and fetch-error handling; CUDA computes the corresponding request with
-the sampling kernel. Both paths return NaN for non-finite coordinates and the
-array fill for coordinates outside the array.
+Small CPU point requests (up to 64 points, e.g. optimizer residuals) copy each
+point's neighbourhood from its service chunks into a local block instead of
+planning waves, then apply the same footprint, rounding and interpolation
+formulas, so their values are bit-identical to planned requests. CUDA computes
+the corresponding request with the sampling kernel. Both paths return NaN for
+non-finite coordinates and the array fill for coordinates outside the array.
+
+`slice::gradient` returns the derivatives of the same float32 interpolants along
+X, Y and Z, from the shared `sampleGradient` formula on CPU and CUDA. Its values
+are exactly those of `slice::points`.

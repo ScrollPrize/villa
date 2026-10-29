@@ -148,28 +148,70 @@ inline chunks::Chunk fetchChunk(Cached& input, const chunks::Key& key)
     return chunk;
 }
 
-// Scalar nearest requests (e.g. optimizer residuals) need one element of one
-// service chunk. Avoid allocating a dense wave and its snapshot map for them.
-inline float nearestPoint(Cached& input, const ElementType& type, const float* xyz)
+// Small point requests (e.g. optimizer residuals) skip wave planning: each point's
+// neighbourhood is copied from its service chunks into a local block, then sampled
+// with the same formulas as a planned request.
+inline constexpr std::size_t kDirectPoints = 64;
+
+inline void directPoints(Cached& input, const ElementType& type, const float* xyz, std::size_t n, int order,
+                         float* out, float* gradient)
 {
     const auto& spec = input.array.spec();
     if (spec.shape.size() != 3)
         throw std::invalid_argument("sampling requires a 3-D array");
     if (type.itemsize != spec.itemsize)
         throw std::invalid_argument("service sampling element size differs from the array");
-    if (!finite(xyz[0]) || !finite(xyz[1]) || !finite(xyz[2]))
-        return std::numeric_limits<float>::quiet_NaN();
-    const float fill = float(type.load(spec.fill.data()));
-    if (outside(xyz[0], xyz[1], xyz[2], spec.shape[0], spec.shape[1], spec.shape[2], 0))
-        return fill;
-    std::int64_t index[3], last;
-    for (int a = 0; a < 3; ++a) footprint(xyz[2-a], 0, index[a], last);
+    const auto& shape = spec.shape;
     const auto& c = spec.chunks;
-    const chunks::Key key{input.source, input.level, index[0]/c[0], index[1]/c[1], index[2]/c[2]};
-    const auto chunk = fetchChunk(input, key);
-    if (chunk.status == chunks::Status::Fill) return fill;
-    const auto offset = ((index[0]%c[0])*c[1] + index[1]%c[1])*c[2] + index[2]%c[2];
-    return float(type.load(chunk.bytes->data() + offset*type.itemsize));
+    const float fill = float(type.load(spec.fill.data()));
+    constexpr int kHeld = 8;  // a cubic neighbourhood touches at most eight chunks
+    std::pair<chunks::Key, chunks::Chunk> held[kHeld];
+    int heldCount = 0, replace = 0;
+    auto chunkAt = [&](const chunks::Key& key) -> const chunks::Chunk& {
+        for (int i = 0; i < heldCount; ++i)
+            if (held[i].first == key)
+                return held[i].second;
+        const int slot = heldCount < kHeld ? heldCount++ : replace++ % kHeld;
+        held[slot] = {key, fetchChunk(input, key)};
+        return held[slot].second;
+    };
+    float buffer[64];
+    for (std::size_t p = 0; p < n; ++p) {
+        const float x = xyz[3 * p], y = xyz[3 * p + 1], z = xyz[3 * p + 2];
+        float* g = gradient ? gradient + 3 * p : nullptr;
+        if (!finite(x) || !finite(y) || !finite(z)) {
+            out[p] = std::numeric_limits<float>::quiet_NaN();
+            if (g)
+                g[0] = g[1] = g[2] = std::numeric_limits<float>::quiet_NaN();
+            continue;
+        }
+        if (outside(x, y, z, shape[0], shape[1], shape[2], order)) {
+            out[p] = fill;
+            if (g)
+                g[0] = g[1] = g[2] = 0.0f;
+            continue;
+        }
+        const float coordinate[3] = {z, y, x};
+        std::int64_t first[3], last[3];
+        for (int a = 0; a < 3; ++a)
+            footprint(coordinate[a], order, first[a], last[a]);
+        const Block b{0, first[0], first[1], first[2], std::int32_t(last[0] - first[0] + 1),
+                      std::int32_t(last[1] - first[1] + 1), std::int32_t(last[2] - first[2] + 1)};
+        float* v = buffer;
+        for (auto iz = first[0]; iz <= last[0]; ++iz)
+            for (auto iy = first[1]; iy <= last[1]; ++iy)
+                for (auto ix = first[2]; ix <= last[2]; ++ix, ++v) {
+                    *v = fill;
+                    if (iz < 0 || iy < 0 || ix < 0 || iz >= shape[0] || iy >= shape[1] || ix >= shape[2])
+                        continue;
+                    const auto& chunk = chunkAt({input.source, input.level, iz / c[0], iy / c[1], ix / c[2]});
+                    if (chunk.status != chunks::Status::Data)
+                        continue;
+                    const auto offset = ((iz % c[0]) * c[1] + iy % c[1]) * c[2] + ix % c[2];
+                    *v = float(type.load(chunk.bytes->data() + offset * type.itemsize));
+                }
+        out[p] = g ? sampleGradient(buffer, b, x, y, z, order, g) : sample(buffer, b, x, y, z, order);
+    }
 }
 
 // Assemble service-backed blocks once for both sampling backends. Pin each

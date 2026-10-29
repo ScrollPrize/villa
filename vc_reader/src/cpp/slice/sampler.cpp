@@ -24,8 +24,9 @@ CompositeConfig config(const Composite& c)
     return out;
 }
 
-// Runs every wave of the request; unit(tile, data, p, sample) handles pixel p, where
-// sample(k) is the value of its k-th sample.
+// Runs every wave of the request; unit(p, sample, covered, gradient) handles pixel p,
+// where sample(k) is the value of its k-th sample, covered(k) whether its chunks were
+// available and gradient(k, g) its value with the derivatives along XYZ stored in g.
 template <class Input, class Unit>
 void run(Input& input, const ElementType& type, const Source& src, Order order, Unit&& unit)
 {
@@ -57,6 +58,16 @@ void run(Input& input, const ElementType& type, const Source& src, Order order, 
                         if (!src.point(p,k,x,y,z)) return false;
                         return !t.hasBlock || outside(x,y,z,shape[0],shape[1],shape[2],o) ||
                             covered(coverage.empty() ? nullptr : coverage.data(),t.block,x,y,z,o);
+                    }, [&](int k, float* g) {
+                        float x, y, z;
+                        g[0] = g[1] = g[2] = 0.0f;
+                        if (!src.point(p, k, x, y, z)) {
+                            g[0] = g[1] = g[2] = std::numeric_limits<float>::quiet_NaN();
+                            return std::numeric_limits<float>::quiet_NaN();
+                        }
+                        if (!t.hasBlock || outside(x, y, z, shape[0], shape[1], shape[2], o))
+                            return fill;
+                        return sampleGradient(buffer.data(), t.block, x, y, z, o, g);
                     });
                 }
         });
@@ -73,7 +84,7 @@ template <class Input>
 void store(Input& input, const ElementType& type, const Source& src, Order order, float* out, std::uint8_t* valid)
 {
     check(order);
-    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered) {
+    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered, auto&&) {
         for (int k = 0; k < src.K; ++k) {
             const auto i=std::size_t(k)*std::size_t(src.n)+std::size_t(p);
             const bool available=covered(k);
@@ -93,6 +104,26 @@ void pointsImpl(Input& input, const ElementType& type, const float* xyz, std::si
     s.xyz = xyz;
     s.n = std::int64_t(n);
     store(input, type, s, order, out, valid);
+}
+
+template <class Input>
+void gradientImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+                  float* gradient)
+{
+    check(order);
+    if constexpr (std::is_same_v<Input, Cached>) {
+        if (n <= kDirectPoints) {
+            directPoints(input, type, xyz, n, int(order), out, gradient);
+            return;
+        }
+    }
+    Source s;
+    s.kind = Source::Points;
+    s.xyz = xyz;
+    s.n = std::int64_t(n);
+    run(input, type, s, order, [&](std::int64_t p, auto&&, auto&&, auto&& sampleGradient) {
+        out[p] = sampleGradient(0, gradient + 3 * p);
+    });
 }
 
 template <class Input>
@@ -130,7 +161,7 @@ void compositeImpl(Input& input, const ElementType& type, const float* base, con
     if (method.method == Composite::Method::Median && offsets.size() > slice::kMaxMedianLayers)
         throw std::invalid_argument("median composites take at most 256 layers");
     const auto c = config(method);
-    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered) {
+    run(input, type, src, order, [&](std::int64_t p, auto&& sample, auto&& covered, auto&&) {
         Reducer r(c);
         float x, y, z;
         if (!src.point(p, 0, x, y, z)) {  // no surface at this pixel
@@ -167,12 +198,21 @@ void composite(Array& array, const ElementType& type, const float* base, const f
 
 void points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out)
 {
-    if (n == 1 && order == Order::Nearest) {
-        *out = detail::nearestPoint(cached, type, xyz);
+    check(order);
+    if (n <= kDirectPoints) {
+        directPoints(cached, type, xyz, n, int(order), out, nullptr);
         return;
     }
     pointsImpl(cached, type, xyz, n, order, out, nullptr);
 }
+
+void gradient(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+              float* gradient)
+{ gradientImpl(array, type, xyz, n, order, out, gradient); }
+
+void gradient(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order, float* out,
+              float* gradient)
+{ gradientImpl(cached, type, xyz, n, order, out, gradient); }
 
 void plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
            std::array<float, 3> v, std::size_t width, std::size_t height, Order order, float* out)
@@ -221,7 +261,7 @@ device::Storage upload(const void* data, std::size_t bytes, int dev)
 template <class Input>
 device::Storage run(Input& input, const ElementType& type, const Source& hostSource, const Source& deviceSource,
                     Order order, bool composite, const CompositeConfig& config, std::size_t outputs,
-           device::Storage* valid)
+           device::Storage* valid, device::Storage* gradient = nullptr)
 {
     check(order);
     int dev = 0;
@@ -230,6 +270,7 @@ device::Storage run(Input& input, const ElementType& type, const Source& hostSou
     auto out = device::allocate(outputs * sizeof(float), dev);
     device::Storage validity;
     if (valid) { validity=device::allocate(outputs,dev); *valid=validity; }
+    if (gradient) *gradient = device::allocate(outputs * 3 * sizeof(float), dev);
     const auto& shape = array.spec().shape;
     const std::int64_t extent[3] = {shape.size() > 0 ? shape[0] : 0, shape.size() > 1 ? shape[1] : 0,
                                     shape.size() > 2 ? shape[2] : 0};
@@ -256,7 +297,8 @@ device::Storage run(Input& input, const ElementType& type, const Source& hostSou
                static_cast<const float*>(blocks ? blocks->ptr : nullptr), W, extent, int(order), fill, composite, config,
                static_cast<float*>(out->ptr), device::stream(),
                coverage.empty() ? nullptr : static_cast<const std::uint8_t*>(coverageDevice->ptr),
-               validity ? static_cast<std::uint8_t*>(validity->ptr) : nullptr);
+               validity ? static_cast<std::uint8_t*>(validity->ptr) : nullptr,
+               gradient ? static_cast<float*>((*gradient)->ptr) : nullptr);
     });
     device::complete();
     return out;
@@ -293,6 +335,24 @@ device::Storage pointsImpl(Input& input, const ElementType& type, const float* x
     Source deviceSource = host;
     deviceSource.xyz = static_cast<const float*>(coordinates->ptr);
     return run(input, type, host, deviceSource, order, false, {}, n, valid);
+}
+
+template <class Input>
+device::Storage gradientImpl(Input& input, const ElementType& type, const float* xyz, std::size_t n, Order order,
+                             device::Storage* gradient)
+{
+    if (!gradient)
+        throw std::invalid_argument("gradient sampling needs a gradient output");
+    Source host;
+    host.kind = Source::Points;
+    host.xyz = xyz;
+    host.n = std::int64_t(n);
+    int dev = 0;
+    device::check(cudaGetDevice(&dev));
+    const auto coordinates = upload(xyz, n * 3 * sizeof(float), dev);
+    Source deviceSource = host;
+    deviceSource.xyz = static_cast<const float*>(coordinates->ptr);
+    return run(input, type, host, deviceSource, order, false, {}, n, nullptr, gradient);
 }
 
 template <class Input>
@@ -357,6 +417,14 @@ device::Storage composite(Array& array, const ElementType& type, const float* ba
 
 device::Storage points(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order)
 { return pointsImpl(cached, type, xyz, n, order, nullptr); }
+
+device::Storage gradient(Array& array, const ElementType& type, const float* xyz, std::size_t n, Order order,
+                         device::Storage* gradient)
+{ return gradientImpl(array, type, xyz, n, order, gradient); }
+
+device::Storage gradient(Cached& cached, const ElementType& type, const float* xyz, std::size_t n, Order order,
+                         device::Storage* gradient)
+{ return gradientImpl(cached, type, xyz, n, order, gradient); }
 
 device::Storage plane(Cached& cached, const ElementType& type, std::array<float, 3> origin, std::array<float, 3> u,
                       std::array<float, 3> v, std::size_t width, std::size_t height, Order order)
