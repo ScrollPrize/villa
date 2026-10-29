@@ -520,8 +520,10 @@ def logits_to_probabilities(
     if logits.ndim != 5:
         raise ValueError(f"Expected logits [B,C,Z,Y,X], got {tuple(logits.shape)}")
     if tuple(logits.shape[-3:]) != patch_size_zyx:
+        # Same resize as native training (train.prepare_loss_inputs), e.g. for
+        # the output of a model_config.input_pad_depth_to padded input.
         logits = F.interpolate(
-            logits.float(), size=patch_size_zyx, mode="trilinear", align_corners=False
+            logits.float(), size=patch_size_zyx, mode="trilinear", align_corners=True
         )
     return logits.float().sigmoid()
 
@@ -992,7 +994,10 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     )
     base_model = make_model(config)
     load_model_state(base_model, state)
-    model = TargetModel(base_model.eval()).eval()
+    model = TargetModel(
+        base_model.eval(),
+        input_pad_depth_to=config.model.input_pad_depth_to,
+    ).eval()
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
