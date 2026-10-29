@@ -15,7 +15,7 @@ the volume and decides, per request, whether to answer. Six cases:
                          run against a server that never fails
   a failure partway      one chunk column is served and the next refused, so the failure lands inside
                          the sampling loop, which is the situation #1809 describes
-  the error message      one line naming the chunk and the HTTP status, exit code 1, and no sign of
+  the error message      one line naming the chunk and the transport error, exit code 1, and no sign of
                          the abort path, for both zarr chunk-key styles
   a working render       a guard: a run against a server that answers everything must come back with
                          real voxels in it, or every case above would pass without rendering anything
@@ -307,8 +307,8 @@ class FetchFailureTests(unittest.TestCase):
                 url = self.serving(0, separator=sep)
                 r = self.render(url, "--tif-output", self.root / ("named%s" % (sep == "/")))
                 both = r.stdout + r.stderr
-                self.assertRegex(both, r"Error: HTTP \d+ fetching [\d]+[/.][\d./]+",
-                                 "the error should name the chunk and the HTTP status")
+                self.assertRegex(both, r"Error: GET http://\S+/0/\d+[/.]\d+[/.]\d+ failed after \d+ attempts: \S",
+                                 "the error should name the chunk and the transport error")
                 self.assertNotIn("terminating due to", both, "that is the abort path this PR removes")
                 self.assertEqual(r.returncode, 1,
                                  "the PR documents exit code 1; another non-zero code is still a change")

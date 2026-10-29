@@ -1,18 +1,16 @@
-"""CLI regression: a TIFF render must only fetch the chunks its samples read, not their bounding box.
+"""CLI regression: a render must only fetch the chunks its samples read, not their bounding box.
 
-Run with: python test_render_band_prefetch.py /path/to/vc_render_tifxyz
+Run with: python test_render_sampled_chunks.py /path/to/vc_render_tifxyz
 
-The TIFF path renders a segment in bands of rows that each run the full width of the segment. The
-band readers prefetch a bounding box around the band (readMultiSlice: all its samples;
-readCompositeFast: its surface points). On a winding that box covers the area inside the winding
-while the samples touch a thin ring of it: on a band crop of the published PHercParis4 mesh
-20260701183128-w053-058, each full band queued 2,772-3,087 chunks where its samples read 369-397.
-The renderer now queues exactly the chunks each band samples.
+A segment's output rows run its full width, so on a winding the bounding box of a row's samples
+covers the area inside the winding while the samples touch a thin ring of it: on a crop of the
+published PHercParis4 mesh 20260701183128-w053-058, a full-width row's box held 2,772-3,087 chunks
+where its samples read 369-397. The renderer samples points, so it fetches only what they read.
 
 The volume is synthetic and served over HTTP by this script, which records every chunk requested.
-The surface is a diagonal wall, x = y, so one band's bounding box covers every chunk column of the
-volume while its samples stay within one chunk of the diagonal. A request for a chunk far from the
-diagonal can only come from a bounding-box prefetch.
+The surface is a diagonal wall, x = y, so the bounding box of a row of output covers every chunk
+column of the volume while its samples stay within one chunk of the diagonal. A request for a chunk
+far from the diagonal can only come from reading a bounding box.
 
 Standard library only, like test_render_fetch_failure.py. A few seconds.
 """
@@ -31,7 +29,7 @@ import unittest
 from render_test_tiff import write_float_tiff
 
 if len(sys.argv) < 2:
-    raise SystemExit("usage: test_render_band_prefetch.py /path/to/vc_render_tifxyz")
+    raise SystemExit("usage: test_render_sampled_chunks.py /path/to/vc_render_tifxyz")
 RENDERER = str(Path(sys.argv.pop(1)).resolve())
 
 # Volume shape and chunk size, in voxels: 8 x 8 chunk columns. The wall runs x = y = 0..255 at
@@ -143,9 +141,9 @@ def write_wall(root):
     return d
 
 
-class BandPrefetchTests(unittest.TestCase):
+class SampledChunkTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="vc render band prefetch ")
+        self.temp = tempfile.TemporaryDirectory(prefix="vc render sampled chunks ")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.wall = write_wall(self.root)
@@ -180,20 +178,16 @@ class BandPrefetchTests(unittest.TestCase):
             far,
             [],
             "%d of %d requested chunks are away from the wall, e.g. %s: the "
-            "band prefetched its bounding box" % (len(far), len(requested), far[:4]),
+            "the render read a bounding box" % (len(far), len(requested), far[:4]),
         )
 
-    def test_band_fetches_only_the_chunks_it_samples(self):
+    def test_render_fetches_only_the_chunks_it_samples(self):
         self.check_only_near_the_wall(self.render())
 
-    def test_composite_band_fetches_only_the_chunks_it_samples(self):
-        # --composite-collapse reads through readCompositeFast, the other band reader.
+    def test_composite_fetches_only_the_chunks_it_samples(self):
+        # --composite-collapse samples nearest voxels and reduces them.
         extra = ["--composite-collapse", "--composite-start", "-1", "--composite-end", "1"]
         self.check_only_near_the_wall(self.render(extra, tifs=1))
-
-    def test_prefetch_remote_fetches_only_the_chunks_it_samples(self):
-        # --prefetch-remote plans the whole render exactly up front (#1657); keep it that way.
-        self.check_only_near_the_wall(self.render(["--prefetch-remote"]))
 
 
 if __name__ == "__main__":

@@ -349,19 +349,13 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
         }
 
-        // The tracer reads the working level through vc_reader's shared chunk service.
-        const auto service = vcr::chunks::processService();
-        auto level = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
-            context.volume->sourceLocation(), context.level + context.volume->baseScaleLevel(),
-            context.volume->sourceOpenOptions()));
-        const auto source = service->addSource({std::shared_ptr<vcr::Array>(level, level->array.get())});
-        struct RemoveSource {
-            vcr::chunks::Service& service;
-            vcr::chunks::SourceId source;
-            ~RemoveSource() { service.removeSource(source); }
-        } removeSource{*service, source};
-        vcr::slice::Cached tracingVolume{*level->array, *service, source};
-        QuadSurface* surface = tracer(tracingVolume,
+        // The tracer samples the working level point by point from its memory cache
+        // (the tracer's cache_size parameter, as for vc_grow_seg_from_seed).
+        auto options = context.volume->sourceOpenOptions();
+        options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
+        auto level = vcr::zarr::openPyramidLevel(
+            context.volume->sourceLocation(), context.level + context.volume->baseScaleLevel(), options);
+        QuadSurface* surface = tracer(*level.array,
                                       1.0f,
                                       origin,
                                       params,

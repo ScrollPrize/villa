@@ -296,8 +296,9 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   error. Since #1657 the renderer opens the remote volume the same way the
   tracer does, so the chunks it fetches persist in the shared remote cache
   (`~/.VC3D/remote_cache/<volume>-<id>/`, or `remote_cache_dir` under
-  `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the process-wide
-  decoded-chunk cache and `--prefetch-remote` warms it before rendering starts.
+  `[viewer]` in `VC3D.ini`); `--cache-gb` (default 16) sizes the volume's
+  decoded-chunk memory cache. The renderer fetches only the chunks its samples
+  read, in parallel.
 - The renderer reads the voxel size from the remote volume's metadata, as the
   tracer does: without `--voxel-size` the log says
   `Voxel size (from volume metadata): 45.532` and the TIFF carries the

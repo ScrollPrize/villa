@@ -10,8 +10,6 @@
 #include <opencv2/imgproc.hpp>
 #include "utils/Json.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc_reader/chunks.hpp"
-#include "vc_reader/slice.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -78,20 +76,20 @@ static bool is_remote_volume_path(const std::string& path)
            path.rfind("s3://", 0) == 0;
 }
 
-static bool chunk_has_source_data(vcr::slice::Cached& volume, std::int64_t iz, std::int64_t iy, std::int64_t ix)
+// Whether a uint8 chunk is stored and holds anything but the fill value.
+static bool chunk_has_source_data(vcr::Array& volume, std::int64_t iz, std::int64_t iy, std::int64_t ix)
 {
-    const auto result = volume.service.get({volume.source, volume.level, iz, iy, ix});
-    if (result.status == vcr::chunks::Status::Error)
-        throw std::runtime_error("Failed to read zarr chunk: " + result.error);
-    return result.status == vcr::chunks::Status::Data;
+    const auto chunk = volume.chunk({iz, iy, ix});
+    const std::uint8_t fill = volume.spec().fill[0];
+    return chunk && std::any_of(chunk->begin(), chunk->end(), [fill](std::uint8_t v) { return v != fill; });
 }
 
 // Trilinear volume value at an XYZ location.
-static double volume_value(vcr::slice::Cached& volume, const cv::Vec3d& xyz)
+static double volume_value(vcr::Array& volume, const cv::Vec3d& xyz)
 {
-    const float point[3] = {float(xyz[0]), float(xyz[1]), float(xyz[2])};
+    const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
     float value = 0.0f;
-    vcr::slice::points(volume, vcr::ElementType{'u', 1, false}, point, 1, vcr::slice::Order::Linear, &value);
+    volume.sample_linear(zyx, 1, vcr::ElementType{'u', 1, false}, false, &value);
     return value;
 }
 
@@ -348,17 +346,15 @@ static int run_main(int argc, char *argv[])
         std::cerr << std::endl;
         return EXIT_FAILURE;
     }
-    vcr::chunks::Service::Options service_options;
-    service_options.decodedBytes = size_t(params.value("cache_size", 1e9));
-    auto service = vcr::chunks::configureProcessService(service_options);
+    auto level0_options = volume->sourceOpenOptions();
+    level0_options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
     auto level0 = std::make_shared<vcr::zarr::OpenedArray>(vcr::zarr::openPyramidLevel(
-        volume->sourceLocation(), volume->baseScaleLevel(), volume->sourceOpenOptions()));
+        volume->sourceLocation(), volume->baseScaleLevel(), level0_options));
     if (level0->meta.type.kind != 'u' || level0->meta.itemsize() != 1) {
         std::cerr << "ERROR: the tracer reads uint8 volumes, not " << level0->meta.dtype << std::endl;
         return EXIT_FAILURE;
     }
-    const auto volume_source = service->addSource({std::shared_ptr<vcr::Array>(level0, level0->array.get())});
-    vcr::slice::Cached tracing_volume{*level0->array, *service, volume_source};
+    vcr::Array& tracing_volume = *level0->array;
     const std::array<int, 3> volume_shape_zyx{
         int(level0->meta.shape[0]), int(level0->meta.shape[1]), int(level0->meta.shape[2])};
     const std::array<int, 3> chunk_shape_zyx{

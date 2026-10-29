@@ -673,12 +673,12 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_fetch_failure PROPERTIES TIMEOUT 300)
     vc_register_ctest(test_render_fetch_failure vc_render_tifxyz)
-    add_test(NAME test_render_band_prefetch
+    add_test(NAME test_render_sampled_chunks
         COMMAND ${Python3_EXECUTABLE}
-            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_band_prefetch.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_sampled_chunks.py"
             $<TARGET_FILE:vc_render_tifxyz>)
-    set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
-    vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
+    set_tests_properties(test_render_sampled_chunks PROPERTIES TIMEOUT 120)
+    vc_register_ctest(test_render_sampled_chunks vc_render_tifxyz)
     add_test(NAME test_render_zarr_output
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_render_zarr_output.py"
@@ -745,10 +745,6 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_slicing)
-# The vc_render_tifxyz prefetch planner and PrefetchedArrayView (header-only
-# under apps/src, shared with the command-line tool so the tested code is the
-# shipped code).
-vc_add_test(NAME test_render_prefetch)
 
 vc_add_test(NAME test_volume_pkg)
 

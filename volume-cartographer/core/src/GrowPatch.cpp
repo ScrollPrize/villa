@@ -452,7 +452,7 @@ struct TraceData {
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     cv::Mat_<uchar> allowed_growth_mask;
 
-    vcr::slice::Cached* raw_volume = nullptr;
+    vcr::Array* raw_volume = nullptr;
 };
 
 class ReferenceClearanceCost {
@@ -490,7 +490,7 @@ private:
 
 class ReferenceRayOcclusionCost {
 public:
-    ReferenceRayOcclusionCost(vcr::slice::Cached* volume,
+    ReferenceRayOcclusionCost(vcr::Array* volume,
                               const cv::Vec3d& target,
                               double threshold,
                               double weight,
@@ -583,13 +583,13 @@ public:
 
 private:
     double sample(const cv::Vec3d& xyz) const {
-        const float point[3] = {float(xyz[0]), float(xyz[1]), float(xyz[2])};
+        const double zyx[3] = {xyz[2], xyz[1], xyz[0]};
         float value = 0.0f;
-        vcr::slice::points(*volume_, kVolumeType, point, 1, vcr::slice::Order::Linear, &value);
+        volume_->sample_linear(zyx, 1, kVolumeType, false, &value);
         return value;
     }
 
-    vcr::slice::Cached* volume_;
+    vcr::Array* volume_;
     cv::Vec3d target_;
     double threshold_;
     double weight_;
@@ -1874,9 +1874,9 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
-    if (volume.array.itemsize() != 1)
+    if (volume.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
 
     const int growth_scale_level = std::clamp(params.value("growth_scale", 0), 0, 5);
@@ -2125,8 +2125,8 @@ QuadSurface *tracer(vcr::slice::Cached& volume, float scale, cv::Vec3f origin, c
     trace_data.raw_volume = &volume;
     {
         std::uint8_t seed_value = 0;
-        volume.service.read(volume.source, volume.level, {int(origin[2]), int(origin[1]), int(origin[0])}, {1, 1, 1},
-                            &seed_value);
+        const std::int64_t seed_zyx[3] = {std::int64_t(origin[2]), std::int64_t(origin[1]), std::int64_t(origin[0])};
+        volume.read_points(seed_zyx, 1, &seed_value);
         std::cout << "seed val " << origin << " " << int(seed_value) << std::endl;
     }
 
