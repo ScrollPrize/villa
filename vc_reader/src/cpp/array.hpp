@@ -619,11 +619,11 @@ private:
     }
 
     // Groups point reads by chunk. The n points are split into plan_segments(n) contiguous
-    // ranges, each planned in order on one thread: locate(segment, p, scratch, emit) reports
+    // ranges, each planned in order on one thread: locate(segment, p, scratch, emitter) reports
     // what point p reads (scratch: room for nd indices; index: nd indices inside the array):
-    //  - emit.point(index, tag): the point is answered from the chunk holding `index` alone,
+    //  - emitter.point(index, tag): the point is answered from the chunk holding `index` alone,
     //    and the PointOp can recompute everything it needs from the point's number, `tag`;
-    //  - emit(index, tag): one element the point needs.
+    //  - emitter(index, tag): one element the point needs.
     // Consecutive points answered from one chunk become a Run, which stores no per-point data;
     // the other elements become Points (byte offset and tag). Returns one Work per chunk, in
     // chunk order, whose points and runs (in emission order) are stored in `points` and `runs`.
@@ -739,11 +739,11 @@ private:
             const std::size_t p0 = n * s / segs, p1 = n * (s + 1) / segs;
             g.entries.reserve(p1 - p0);
             Index scratch(nd);
-            Emit emit{*this, g};
-            emit.run_base.resize(nd);
+            Emit emitter{*this, g};
+            emitter.run_base.resize(nd);
             for (std::size_t p = p0; p < p1; ++p)
-                locate(s, p, scratch.data(), emit);
-            emit.close();
+                locate(s, p, scratch.data(), emitter);
+            emitter.close();
         });
         // Chunks in order; within a chunk, each segment's elements after the earlier segments'.
         // Every segment's chunks get a dense id (in order of appearance), then their rank.
@@ -926,7 +926,7 @@ private:
         const std::size_t nd = N ? N : ndim();
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
-            gather_points<N>(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emit) {
+            gather_points<N>(m, out, [&](std::size_t, std::size_t p, std::int64_t* idx, auto& emitter) {
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 const std::int64_t* at;
@@ -949,7 +949,7 @@ private:
                 for (std::size_t i = 0; i < nd; ++i)
                     inside &= at[i] >= 0 && at[i] < spec_.shape[i];
                 if (inside)
-                    emit(at, b0 + p);
+                    emitter(at, b0 + p);
                 else
                     std::memcpy(out + (b0 + p) * spec_.itemsize, spec_.fill.data(), spec_.itemsize);
             });
@@ -1005,7 +1005,7 @@ private:
         };
         struct Splits {
             std::vector<Split> points;
-            std::uint64_t slots = 0;
+            std::uint64_t slotCount = 0;
         };
         std::int64_t reach = static_cast<std::int64_t>(isz);  // the far corner of a cell, from its near one
         for (std::size_t i = 0; i < nd; ++i)
@@ -1030,7 +1030,7 @@ private:
         for (std::size_t b0 = 0; b0 < n; b0 += kPointBatch) {
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
-            auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
+            auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emitter) {
                 Coord scratch[N ? N : kMaxSampleDims];
                 const Coord* c = coords(b0 + p, scratch);
                 bool finite = true, outside = false;
@@ -1055,14 +1055,14 @@ private:
                     whole &= cell.lo[i] + 1 < spec_.shape[i] && rem + 1 < spec_.chunks[i];
                 }
                 if (whole) {
-                    emit.point(cell.lo, b0 + p);
+                    emitter.point(cell.lo, b0 + p);
                     return;
                 }
                 Splits& sp = split[s];
-                const std::uint64_t first = sp.slots;
+                const std::uint64_t first = sp.slotCount;
                 const std::size_t count = std::size_t{1} << cell.k;
                 sp.points.push_back(Split{b0 + p, first});
-                sp.slots += count;
+                sp.slotCount += count;
                 for (std::size_t corner = 0; corner < count; ++corner) {
                     bool inside = true;
                     for (std::size_t i = 0; i < nd; ++i)
@@ -1072,17 +1072,17 @@ private:
                     for (std::size_t i = 0; i < nd; ++i)
                         inside &= idx[i] >= 0 && idx[i] < spec_.shape[i];
                     if (inside)  // outside neighbours keep raw's fill
-                        emit(idx, kSplit | std::uint64_t{s} << kSegmentShift | (first + corner));
+                        emitter(idx, kSplit | std::uint64_t{s} << kSegmentShift | (first + corner));
                 }
             });
             base.assign(split.size(), 0);
-            std::uint64_t slots = 0;
+            std::uint64_t slotCount = 0;
             for (std::size_t s = 0; s < split.size(); ++s) {
-                base[s] = slots;
-                slots += split[s].slots;
+                base[s] = slotCount;
+                slotCount += split[s].slotCount;
             }
-            raw.resize(slots * isz);
-            fill_elements(raw.data(), slots, spec_.fill);
+            raw.resize(slotCount * isz);
+            fill_elements(raw.data(), slotCount, spec_.fill);
             PointOp op;
             op.reach = reach;
             op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {

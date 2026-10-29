@@ -1,3 +1,15 @@
+// Public reader headers must also compile after Qt's keyword macros.
+#define emit
+#define slots
+#define signals public
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/slice.hpp"
+#ifndef emit
+#error Reader headers must preserve the caller's Qt macros
+#endif
+#undef emit
+#undef slots
+#undef signals
 #include "vc_reader/reader.hpp"
 #include <filesystem>
 #include <fstream>
