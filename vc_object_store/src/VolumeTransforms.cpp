@@ -36,7 +36,15 @@ std::vector<VolumeTransforms::Related> VolumeTransforms::related(const std::stri
         entry.volume=routes.source;
         entry.status=resolve(routes.source,target).status;
         entry.routes=std::move(routes.candidates);
-        entry.chosen=chosen(entry.volume,target);
+        if(auto choice=chosen(entry.volume,target)) {
+            // Report the listed route with the choice's mapping: an implied
+            // reverse choice may name a route the listing folded into another.
+            const auto resolution=graph.resolve(entry.volume,target,choice);
+            if(resolution.status==vcr::catalog::TransformStatus::Resolved)
+                for(const auto& route:entry.routes)
+                    if(route.forward.equivalent(resolution.resolved().forward)){choice=route.path;break;}
+            entry.chosen=std::move(choice);
+        }
         result.push_back(std::move(entry));
     }
     return result;

@@ -182,6 +182,17 @@ int main() try {
         require(choice.has_value(),"the explicit reverse choice is stored");
         {auto txn=db.write({{choice->uuid,db.currentObjectRevision(read,choice->uuid)->uuid}});db.retireObject(txn,choice->uuid);txn.commit();}
         {auto after=db.read();require(db.volumeTransforms(after).resolve("b","a").resolved().path==implied,"retiring it restores the implied choice");}
+        // A b -> a registration equal to the chosen route's inverse folds the
+        // implied route into it; the related listing names the listed route.
+        {auto txn=db.write();db.registerVolumeTransform(txn,"b","a",context.resolve("a","b").resolved().inverse,"reverse scan");txn.commit();}
+        auto after=db.read();const auto folded=db.volumeTransforms(after);
+        require(folded.resolve("b","a").resolved().path==implied,"the implied route still resolves");
+        bool listed=false;
+        for(const auto& related:folded.related("a"))if(related.volume=="b") {
+            require(related.chosen.has_value()&&*related.chosen!=implied,"the implied route is reported as the listed route");
+            for(const auto& route:related.routes)if(route.path==*related.chosen)listed=route.forward.equivalent(folded.resolve("b","a").resolved().forward);
+        }
+        require(listed,"the reported route is a listed route with the choice's mapping");
     }
     {
         // A volume's one umbilicus, read in its voxels; importing another replaces it.
