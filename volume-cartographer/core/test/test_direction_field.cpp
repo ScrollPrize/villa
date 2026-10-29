@@ -59,9 +59,9 @@ TEST_CASE("growth directions use native sources, scale, XYZ channels and sparse 
             checkVector(fill.directionZYX, {0,0,0});
             CHECK(fill.confidence == 0);
         }
-        // The native nearest sampler rounds half ties to even.
+        // The native nearest sampler rounds half ties up.
         checkVector(sampleDirectionConstraint(field,{5,4,2}).directionZYX,
-                    sampleDirectionConstraint(field,{4,4,2}).directionZYX);
+                    sampleDirectionConstraint(field,{6,4,2}).directionZYX);
         DirectionField unweighted("normal", fixture.root, 1);
         CHECK(sampleDirectionConstraint(unweighted,{12,4,2}).confidence == 1);
 
