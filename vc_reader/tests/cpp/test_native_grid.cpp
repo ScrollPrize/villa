@@ -70,9 +70,19 @@ void testResample()
     vcr::grid::Surface nearest(hv);
     nearest.resample(probe, out, nullptr);
     require(std::isnan(out[0]) && std::isnan(out[3]), "pixels nearest the missing vertex have no point");
-    // (Linear positions blend the missing vertex's sentinel, as QuadSurface::gen did; at
-    // a present vertex itself the position is exact.)
-    require(near(out[12], 8.0f), "a pixel on a present vertex keeps it");
+    // A missing vertex never enters a position: at grid x 3.5 and 3.75 on row 2 only
+    // vertex (2, 4) of the cell is present and has weight, so the position is its own.
+    require(near(out[6], 8.0f) && near(out[7], 6.0f) && near(out[9], 8.0f) && near(out[12], 8.0f),
+            "positions next to a missing vertex blend only present vertices");
+    for (const auto mode : {vcr::grid::Interpolation::Linear, vcr::grid::Interpolation::Smooth}) {
+        vcr::grid::Surface s(hv, {mode});
+        const vcr::grid::Raster cell{2.0, 1.0, 0.1, 0.1, 21, 21};  // the four cells around the hole
+        std::vector<float> q(21 * 21 * 3);
+        s.resample(cell, q.data(), nullptr);
+        for (std::size_t i = 0; i < q.size(); i += 3)
+            require(std::isnan(q[i]) || (q[i] >= 3.999f && q[i] <= 8.001f && q[i + 1] >= 2.999f && near(q[i + 2], 10.0f)),
+                    "no position is pulled toward the missing vertex's sentinel");
+    }
     vcr::grid::Surface strict(hv, {vcr::grid::Interpolation::Linear, true});
     strict.resample(probe, out, nullptr);
     require(std::isnan(out[6]) && near(out[12], 8.0f), "strict: only cells with a missing vertex have no point");

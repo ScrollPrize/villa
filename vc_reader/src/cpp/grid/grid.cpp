@@ -255,7 +255,7 @@ struct Surface::Impl {
             const bool complete = sc >= 2 && sr >= 2 && valid[index(y0, a0)] && valid[index(y0, a1)] &&
                                   valid[index(y1, a0)] && valid[index(y1, a1)];
             if (!complete) {
-                p = bilerp(at(y0, a0), at(y0, a1), at(y1, a0), at(y1, a1), wx, wy);
+                p = blendPresent(y0, a0, y1, a1, wx, wy);
                 return;
             }
             const Hermite bx = hermite(wx), by = hermite(wy);
@@ -281,8 +281,29 @@ struct Surface::Impl {
         }
         const int x0 = int(fx), y0 = int(fy);
         const int x1 = std::min(x0 + 1, sc - 1), y1 = std::min(y0 + 1, sr - 1);
-        p = bilerp(at(y0, x0 + c0), at(y0, x1 + c0), at(y1, x0 + c0), at(y1, x1 + c0), float(fx - x0),
-                   float(fy - y0));
+        p = blendPresent(y0, x0 + c0, y1, x1 + c0, float(fx - x0), float(fy - y0));
+    }
+
+    // The bilinear blend of a cell's corners; with a missing corner, of the present
+    // ones only, their weights renormalised (a missing vertex's coordinates never
+    // enter a position). NaN when no present corner has weight.
+    Vec blendPresent(int y0, int x0, int y1, int x1, float wx, float wy) const
+    {
+        const bool v00 = valid[index(y0, x0)], v01 = valid[index(y0, x1)];
+        const bool v10 = valid[index(y1, x0)], v11 = valid[index(y1, x1)];
+        if (v00 && v01 && v10 && v11)
+            return bilerp(at(y0, x0), at(y0, x1), at(y1, x0), at(y1, x1), wx, wy);
+        const float w[4]{(1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy};
+        const bool ok[4]{v00, v01, v10, v11};
+        const Vec c[4]{at(y0, x0), at(y0, x1), at(y1, x0), at(y1, x1)};
+        Vec sum{};
+        float total = 0;
+        for (int k = 0; k < 4; ++k)
+            if (ok[k] && w[k] > 0) {
+                sum = sum + c[k] * w[k];
+                total += w[k];
+            }
+        return total > 0 ? sum * (1.0f / total) : nanVec();
     }
 
     // Positions and normals of the raster rows [j0, j1), into out rows starting at j0.

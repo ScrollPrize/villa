@@ -30,9 +30,11 @@ struct Vertices {
     std::size_t stride = 0;
 };
 
+// A missing vertex never enters a position: in a cell with missing corners, the
+// present corners are blended with renormalised bilinear weights.
 enum class Interpolation {
     Linear,  // bilinear positions; each pixel takes its nearest vertex's normal
-    Smooth,  // bicubic Hermite patches over complete cells, normals from the same patch
+    Smooth,  // bicubic Hermite patches over complete cells (others: the blend above, no normal)
 };
 
 struct SurfaceOptions {
