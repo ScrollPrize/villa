@@ -68,6 +68,7 @@ int runObjectStoreControllerTests()
                 "hub status preserves fiber generation and warm snapshots");
     };
     try {
+#include "LineAnnotationFiberCacheTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
             Controller controller(&state,nullptr,nullptr,nullptr);

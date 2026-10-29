@@ -100,7 +100,9 @@ that object's lease (`vc_object_hub lease acquire REPLICA UUID`):
 
 ```sh
 vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj
-vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj   # no mount needed
+# SSH access: stop all clients for the one-time conversion (Linux server).
+vc_object_hub enable-ssh-locking sftp://user@host/path/hub.vcobj
+vc_object_hub clone sftp://user@host/path/hub.vcobj ~/replica.vcobj
 vc_object_hub sync ~/replica.vcobj
 ```
 
@@ -124,7 +126,30 @@ split as surface regions); relationship discovery shares the triangle routine.
 Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
-its fixture data.
+its fixture data. A standalone build and regression run (using installed dependencies):
+
+```sh
+AGENTS_AGENT_MODE=1 cmake -S vc_object_store -B /tmp/vc-hub-lock-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVC_OBJECT_STORE_BUILD_ADAPTERS=ON \
+  -DVC_OBJECT_STORE_BUILD_LINKING=OFF -DVC_OBJECT_STORE_BUILD_TESTS=ON
+cmake --build /tmp/vc-hub-lock-build -j 4
+ctest --test-dir /tmp/vc-hub-lock-build --output-on-failure
+```
+
+`object_store_sftp` uses a local SSH fixture executing the production remote
+command with real OpenSSH `sftp-server`, `flock` and `timeout`; it needs no sshd
+or credentials. It covers concurrent sessions, legacy-client exclusion,
+client death during a spilled write, lost replies without reconnect, server
+deadlines, journal recovery, cache reuse across operations, cache invalidation
+after another writer, and sync/push/pull with 250 ms reply delays. The process-lock fixture
+requires Linux; client portability does not depend on those utilities locally.
+To repeat the recovery and two-replica sync checks on real fiber data, supply
+an ordinary store in the current schema. The fixture snapshots it without
+changing the input:
+
+```sh
+/tmp/vc-hub-lock-build/bin/test_object_store_sftp --real-store /path/to/fibers.vcobj
+```
 
 ## Transformed geometry views
 

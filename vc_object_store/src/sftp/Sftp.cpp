@@ -16,7 +16,7 @@ constexpr size_t kWritesInFlight = 64;
 
 enum Type : uint8_t {
     Init = 1, Version = 2, Open = 3, Close = 4, ReadRequest = 5, WriteRequest = 6, Lstat = 7, Fstat = 8,
-    Fsetstat = 10, Opendir = 11, Readdir = 12, Remove = 13, Mkdir = 14, Rmdir = 15, Realpath = 16, Stat = 17,
+    Setstat = 9, Fsetstat = 10, Opendir = 11, Readdir = 12, Remove = 13, Mkdir = 14, Rmdir = 15, Realpath = 16, Stat = 17,
     Rename = 18, StatusReply = 101, HandleReply = 102, DataReply = 103, NameReply = 104, AttrsReply = 105,
     Extended = 200,
 };
@@ -356,6 +356,7 @@ void Session::setOptions(Options options)
 }
 const Url& Session::destination() const { return impl_->url; }
 bool Session::supports(std::string_view extension) const { return impl_->extensions.find(extension) != impl_->extensions.end(); }
+bool Session::transportClosed() const { return impl_->process->closed(); }
 
 Attributes Session::stat(const std::string& path)
 {
@@ -449,6 +450,13 @@ void Session::setPermissions(const Handle& handle, uint32_t mode)
     u32(b, PermissionsFlag);
     u32(b, mode);
     impl_->call(Fsetstat, b, StatusReply);
+}
+void Session::setPathPermissions(const std::string& path, uint32_t mode)
+{
+    auto b = impl_->pathPayload(path);
+    u32(b, PermissionsFlag);
+    u32(b, mode);
+    impl_->call(Setstat, b, StatusReply);
 }
 void Session::fsync(const Handle& handle)
 {
