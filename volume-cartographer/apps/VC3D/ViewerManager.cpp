@@ -175,10 +175,6 @@ ViewerManager::ViewerManager(CState* state,
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
 
-    // Derived surface tiles are workspace-local, while their decoded volume
-    // chunks come from the application-wide cache service.
-    applyViewerCacheSettings();
-
     if (_state) {
         connect(_state,
                 &CState::volumeChanged,
@@ -207,48 +203,6 @@ ViewerManager::~ViewerManager()
 const std::vector<ViewerManager*>& ViewerManager::allManagers()
 {
     return managerRegistry();
-}
-
-void ViewerManager::applyViewerCacheSettings()
-{
-    using namespace vc3d::settings;
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    constexpr std::size_t mib = 1024ULL * 1024ULL;
-    constexpr std::size_t gib = 1024ULL * mib;
-    const auto surfaceGb = std::max<qlonglong>(
-        0, settings.value(viewer_cache::SURFACE_CACHE_GB,
-                          viewer_cache::SURFACE_CACHE_GB_DEFAULT).toLongLong());
-    const auto overlayGb = std::max<qlonglong>(
-        0, settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                          viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
-
-    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
-}
-
-void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
-{
-    if (_surfaceCacheBudgetBytes == baseBytes &&
-        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
-        return;
-    }
-    _surfaceCacheBudgetBytes = baseBytes;
-    _overlaySurfaceCacheBudgetBytes = overlayBytes;
-    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
-        if (viewer)
-            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
-    });
-}
-
-void ViewerManager::setPreferSurfaceTileFills(bool enabled)
-{
-    if (_preferSurfaceTileFills == enabled) {
-        return;
-    }
-    _preferSurfaceTileFills = enabled;
-    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
-        if (viewer)
-            viewer->setPreferSurfaceTileFills(enabled);
-    });
 }
 
 void ViewerManager::onGlobalTick()
@@ -384,9 +338,6 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayIntensityAsAlpha(_overlayIntensityAsAlpha);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
-    baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
-                                       _overlaySurfaceCacheBudgetBytes);
-    baseViewer->setPreferSurfaceTileFills(_preferSurfaceTileFills);
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);

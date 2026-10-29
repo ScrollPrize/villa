@@ -233,21 +233,9 @@ namespace perf {
 // -----------------------------------------------------------------------------
 // Viewer Cache Settings
 //
-// Each ViewerManager owns independent derived surface-tile caches. Raw decoded
-// volume chunks use the application-wide cache. These settings apply without a
-// restart.
+// These settings apply without a restart.
 // -----------------------------------------------------------------------------
 namespace viewer_cache {
-    // Per-workspace budget for the flattened segmentation view's cache of
-    // resampled surface space. 0 selects the legacy direct-sampling path.
-    constexpr auto SURFACE_CACHE_GB = "viewer_cache/surface_cache_gb";
-    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
-
-    // Per-workspace budget for the overlay volume's surface-space cache. 0
-    // leaves the overlay channel on its legacy resident-only sampling path.
-    constexpr auto OVERLAY_SURFACE_CACHE_GB = "viewer_cache/overlay_surface_cache_gb";
-    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 2;
-
     // App-wide budget for decoded object-store surface geometry (every
     // surface's tiles read for intersections and lookups), shared by all
     // workspaces and stores.

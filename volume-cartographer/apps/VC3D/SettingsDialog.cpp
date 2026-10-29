@@ -64,12 +64,6 @@ SettingsDialog::SettingsDialog(QWidget *parent)
 
     // Cache settings
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
-    spinViewerSurfaceCacheGB->setValue(
-        settings.value(viewer_cache::SURFACE_CACHE_GB,
-                       viewer_cache::SURFACE_CACHE_GB_DEFAULT).toInt());
-    spinViewerOverlaySurfaceCacheGB->setValue(
-        settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                       viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
     spinSurfaceGeometryCacheGB->setValue(
         settings.value(viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
                        viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toInt());
@@ -175,9 +169,6 @@ void SettingsDialog::accept()
 
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
-    settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
-    settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                      spinViewerOverlaySurfaceCacheGB->value());
     settings.setValue(viewer_cache::SURFACE_GEOMETRY_CACHE_GB, spinSurfaceGeometryCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text().trimmed());
     settings.setValue(

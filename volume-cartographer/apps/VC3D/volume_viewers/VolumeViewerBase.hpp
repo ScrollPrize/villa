@@ -138,18 +138,6 @@ public:
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
-    // SurfaceCache budgets for the flattened segmentation view (base, overlay).
-    // Zero disables that channel; viewers that are not a flattened
-    // QuadSurface view ignore both.
-    virtual void setSurfaceCacheBudgets(std::size_t, std::size_t) {}
-
-    // When the SurfaceCache band covers a frame, stop publishing that frame's
-    // raw-path viewport chunk demand so the (background-priority) tile fills
-    // are not starved by interactive fetches for a sampling path the frame
-    // never executes. Off by default; enabled by the main and Spiral
-    // workspaces.
-    virtual void setPreferSurfaceTileFills(bool) {}
-
     // --- Interaction state ---
     virtual std::optional<vc::PointRef> highlightedPoint() const = 0;
     virtual std::optional<vc::PointRef> selectedPoint() const = 0;

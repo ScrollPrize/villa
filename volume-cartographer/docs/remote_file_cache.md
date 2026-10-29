@@ -206,8 +206,7 @@ Core owns one process-lifetime `vc::render::ChunkCacheService`, returned by
 `processChunkCacheService()`. Every normal `Volume` discovers that service
 internally; applications and workspaces neither attach nor replace services.
 A `ChunkCache` is a source-bound `IChunkedArray` handle over service-retained
-source state. VC3D Main views, Spiral views, overlays, and `SurfaceCache`
-fillers therefore reuse the same decoded source chunks and in-flight requests.
+source state. VC3D Main views, Spiral views and overlays therefore reuse the same decoded source chunks and in-flight requests.
 
 Shared sources are acquired only through `ChunkCacheService::acquireSource()`.
 Standalone `ChunkCache` construction remains a convenience for tests and batch
@@ -411,23 +410,6 @@ them, and each handoff recomputes current view-relative priority. View-demand
 publication updates all three queues atomically. Running work is allowed to
 finish, and this separation does not yet enforce a pyramid-level barrier across
 different stages.
-
-The viewport probe reuses the render's geometry path. Direct surface rendering
-generates the full coordinate/normal matrices once and uses them for both the
-probe and pixel sampling. Fully SurfaceCache-backed rendering probes the shared
-`SurfaceGeometryTileCache`; the following tile fills consume the same geometry
-tiles. This keeps the probe from introducing a competing surface-coordinate
-cache.
-
-Exact chunk dependencies for a derived SurfaceCache image tile, including its
-normal band, are background-owned by the fill rather than by the viewer frame
-that admitted it. Replacing sparse per-view demand therefore cannot cancel a
-blocking tile fill. A view change may make the completed tile stale, but the
-SurfaceCache epoch and visible-tile checks prevent stale publication.
-
-`SurfaceCache` level keys name the selected source Zarr level. Its surface-grid
-sampling stride is derived cache detail, not an independently selected surface
-LOD.
 
 Persistent Zarr cache directory selection and file naming are unchanged and
 remain separate from in-memory source identity. Surface image and geometry

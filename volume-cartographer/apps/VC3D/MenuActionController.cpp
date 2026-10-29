@@ -1319,12 +1319,6 @@ void MenuActionController::showSettingsDialog()
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
 
-    // Cache budgets are independent per workspace. Re-read them for every live
-    // manager so changes take effect without reopening either workspace.
-    for (auto* manager : ViewerManager::allManagers()) {
-        if (manager)
-            manager->applyViewerCacheSettings();
-    }
     CState::applySurfaceGeometryCacheSettings();
 
     dialog->deleteLater();

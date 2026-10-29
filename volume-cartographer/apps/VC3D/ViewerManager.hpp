@@ -86,21 +86,6 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
-    // Re-read the derived surface-cache settings. Called during manager
-    // construction and whenever the settings dialog applies.
-    void applyViewerCacheSettings();
-
-    // --- SurfaceCache budgets (flattened segmentation view) ---
-    //
-    // Zero disables a channel and leaves it on the legacy render path.
-    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
-
-    // Withhold raw-path viewport chunk demand from frames the SurfaceCache
-    // fully serves, so tile fills are not starved behind interactive fetches
-    // (see VolumeViewerBase::setPreferSurfaceTileFills). Applied to every
-    // viewer this manager owns; enabled by the main and Spiral workspaces.
-    void setPreferSurfaceTileFills(bool enabled);
-
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
@@ -294,9 +279,6 @@ private:
     bool _showCoordinateFrames{true};
     double _zScrollSensitivity{1.0};
 
-    std::size_t _surfaceCacheBudgetBytes{0};
-    std::size_t _overlaySurfaceCacheBudgetBytes{0};
-    bool _preferSurfaceTileFills{false};
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};

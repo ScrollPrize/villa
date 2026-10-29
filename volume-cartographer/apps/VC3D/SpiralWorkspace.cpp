@@ -301,11 +301,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         syncSurfaceDrafts();
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
-    // The flattened preview is this workspace's primary pane: stop publishing
-    // raw-path chunk demand for frames the SurfaceCache fully serves, so its
-    // tile fills are not starved behind interactive fetches the frame never
-    // reads.
-    _viewerManager->setPreferSurfaceTileFills(true);
     _slices = std::make_unique<AxisAlignedSliceController>(_state, this);
     _slices->setViewerManager(_viewerManager.get());
     // Spiral always uses axis-aligned slices; don't write the user's global
