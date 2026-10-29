@@ -509,6 +509,78 @@ def fit_affine_transform_from_points(fixed_points, moving_points):
     return transform_4x4
 
 
+# Flag a saved matrix that misses its own landmarks by this much more (RMS, fixed-volume
+# voxels) than a least-squares affine fit to the same landmarks does.
+LANDMARK_MISMATCH_TOLERANCE = 5.0
+
+
+def landmark_residuals(matrix, fixed_points, moving_points) -> np.ndarray:
+    """Per-landmark distance |matrix @ moving - fixed| in fixed-volume voxels (3x4 or 4x4 matrix)."""
+    m = np.asarray(matrix, dtype=float)[:3]
+    fixed = np.asarray(fixed_points, dtype=float).reshape(-1, 3)
+    moving = np.asarray(moving_points, dtype=float).reshape(-1, 3)
+    if len(fixed) != len(moving):
+        raise ValueError(f"{len(fixed)} fixed vs {len(moving)} moving landmarks")
+    return np.linalg.norm(moving @ m[:, :3].T + m[:, 3] - fixed, axis=1)
+
+
+def landmark_report(
+    matrix, fixed_points, moving_points, tolerance: float = LANDMARK_MISMATCH_TOLERANCE
+) -> dict:
+    """How well a saved matrix agrees with its own landmarks, next to what the landmarks support.
+
+    matrix_rms / matrix_max: residuals of the saved matrix.
+    lsq_rms: residual of a least-squares affine fit to the same landmarks (>= 4 pairs).
+    lsq_loo_rms: leave-one-out error of that fit (>= 5 pairs); large values mean the
+        landmarks barely constrain the transform.
+    flagged: matrix_rms exceeds lsq_rms by more than `tolerance`, i.e. the matrix no longer
+        matches its landmarks (for example the view was moved after the last fit).
+    """
+    res = landmark_residuals(matrix, fixed_points, moving_points)
+    n = len(res)
+    rep = {
+        "n_landmarks": n,
+        "matrix_rms": float(np.sqrt(np.mean(res**2))) if n else None,
+        "matrix_max": float(res.max()) if n else None,
+        "lsq_rms": None,
+        "lsq_loo_rms": None,
+        "flagged": False,
+    }
+    if n >= 4:
+        lsq = fit_affine_transform_from_points(fixed_points, moving_points)
+        rep["lsq_rms"] = float(
+            np.sqrt(np.mean(landmark_residuals(lsq, fixed_points, moving_points) ** 2))
+        )
+        rep["flagged"] = rep["matrix_rms"] - rep["lsq_rms"] > tolerance
+    if n >= 5:
+        fixed = np.asarray(fixed_points, dtype=float).reshape(-1, 3)
+        moving = np.asarray(moving_points, dtype=float).reshape(-1, 3)
+        loo = []
+        for i in range(n):
+            keep = np.arange(n) != i
+            m_i = fit_affine_transform_from_points(fixed[keep], moving[keep])
+            loo.append(landmark_residuals(m_i, fixed[i : i + 1], moving[i : i + 1])[0])
+        rep["lsq_loo_rms"] = float(np.sqrt(np.mean(np.square(loo))))
+    return rep
+
+
+def format_landmark_report(rep: dict) -> str:
+    def f(v):
+        return "n/a" if v is None else f"{v:.2f}"
+
+    text = (
+        f"{rep['n_landmarks']} landmarks: matrix RMS {f(rep['matrix_rms'])} "
+        f"(max {f(rep['matrix_max'])}), least-squares RMS {f(rep['lsq_rms'])}, "
+        f"leave-one-out RMS {f(rep['lsq_loo_rms'])} (fixed-volume voxels)"
+    )
+    if rep["flagged"]:
+        text += (
+            "\nWARNING: the transformation matrix does not match its own landmarks; "
+            "a least-squares fit to the same landmarks is much closer."
+        )
+    return text
+
+
 def fit_constrained_transform_from_points(fixed_points, moving_points):
     """Fit a constrained affine transform from corresponding point pairs.
 
@@ -689,3 +761,6 @@ def write_transform_json(
 
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)
+
+    if len(fixed_landmarks_list) and len(fixed_landmarks_list) == len(moving_landmarks_list):
+        print(format_landmark_report(landmark_report(matrix, fixed_landmarks_list, moving_landmarks_list)))
