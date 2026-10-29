@@ -278,12 +278,12 @@ def test_a_checkpoint_resumes_at_its_recorded_position(state, hub, tmp_path,
     assert state.status()['input_position']['source'] == 'checkpoint'
 
 
-def test_positions_need_a_hub_replica(store_path, tmp_path):
+def test_a_shared_store_has_positions_of_its_own(store_path, tmp_path):
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
-        assert state.dataset()['capabilities']['input_positions'] is False
-        with pytest.raises(spiral_service.ApiError, match='not a hub replica'):
-            state.initialize({**REQUEST, 'inputs_position': 3})
+        assert state.dataset()['capabilities']['input_positions'] is True
+        with ObjectStore.open(store_path, read_only=True) as db:
+            assert state.object_store.positions == db.store_positions()['store']
         with pytest.raises(spiral_service.ApiError, match='non-negative integer'):
             state._inputs_position(-1)
         # A client cannot pin a position through the configuration.

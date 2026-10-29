@@ -547,7 +547,7 @@ cache, `$XDG_CACHE_HOME/vc3d/spiral` (`~/.cache/vc3d/spiral`). Clients change
 run parameters but cannot repoint the session at other host paths or another
 object store.
 
-### Object store, hub positions and input updates
+### Object store, positions and input updates
 
 `--object-store STORE.vcobj` binds the service to one store for its lifetime;
 `--object-store-author NAME` names the author of the links it writes (default
@@ -556,6 +556,19 @@ object store.
 lists them under `service_owned`, a request that leaves them out or repeats
 the bound values is accepted, and a request naming another value is refused.
 VC3D removes them from saved profiles before sending a request.
+
+**A service on a plain store** (no `--object-store-hub`) shares the file in
+place with the clients on its machine (VC3D's project store): binding it
+makes the store record positions of its own (its journal head after each
+write, by any connection; the store's schema version becomes 18, so binaries
+from before the index refuse it). There is no hub, no replica and no sync:
+VC3D's saves are in the file the service reads. The service links over the
+selection and pins the new head when every write since the head it linked
+at is its own; another writer in between (a save, an approval) makes it
+relink at the new head, up to the same bound. Links it wrote for a head it
+then abandons stay as pending detector output, which the next refresh
+replaces. Keep the store on a local disk (SQLite's WAL does not work over
+network filesystems); a service on another machine needs a hub.
 
 **A hub-bound service** (`--object-store-hub HUB`, a path or an
 `sftp://[user@]host/path` address) works on its own replica of that hub:
@@ -575,9 +588,10 @@ python spiral_service.py --dataset DATA --output OUT --object-store ~/spiral/rep
     --object-store-hub sftp://data-host/share/scroll.hub.vcobj
 ```
 
-Each build (Initialize Fit, a full Rebuild Fit) links and pins a hub position,
-including at least the request's `inputs_position` (the position a client's
-pushed edits reached), before tearing anything down: a failure there leaves
+Each build (Initialize Fit, a full Rebuild Fit) links and pins a position (the
+hub's, or the shared store's own), including at least the request's
+`inputs_position` (the position a client's saved, or pushed, edits reached),
+before tearing anything down: a failure there leaves
 the resident fit untouched and is reported in `input_preparation_error`. A
 checkpoint resumes at the position it recorded. A model-only rebuild keeps the
 position. `POST /session/update-inputs {"inputs_position", "expected_input_generation"}`
@@ -591,8 +605,8 @@ as it was; a failure after the release fails the session
 (`input_preparation_error.recovery_required`): rebuild it or load a
 checkpoint.
 
-**A service without a hub** freezes its inputs: runs, pauses, checkpoint loads
-and model-only rebuilds keep them, and `POST /session/rebuild {"inputs":
+Between builds and updates the inputs are frozen: runs, pauses, checkpoint
+loads and model-only rebuilds keep them, and `POST /session/rebuild {"inputs":
 "reload"}` (VC3D: *Rebuild Fit* → *Rebuild with Current Inputs*) rereads the
 store. Without `"inputs"` a rebuild that changes only model configuration
 keeps the inputs and one that changes anything else rereads them; the
@@ -852,28 +866,31 @@ changes a rebuild's selection may include; *Rebuild Fit* reads them.
 *Show fitted fibers* in Display draws the fit's fibers on the plane views,
 within the point view tolerance of the slice.
 
-With a hub-bound service the profile works through a replica of the
-service's hub: a local profile whose store is a replica launches its
-service with its own replica of the same hub (under the output root), and
-*File > Stores > Host Store Locally* turns an ordinary attached store into a
-local hub with its path as the replica, keeping its place in the project.
-For a remote profile, attach a replica of the service's hub; *Clone the
+A local profile on a plain store launches its service on that same file:
+saved edits are already where the service reads them, and *Update Fit
+Inputs* names the store's head. A direct profile to a loopback address is
+treated the same way when the service advertises the store's path; any other
+profile cannot name positions of a plain store it does not share, so its
+updates need a hub. With a hub-bound service the profile works through a
+replica of the service's hub: a local profile whose store is a replica
+launches its service with its own replica of the same hub (under the output
+root). For a remote profile, attach a replica of the service's hub; *Clone the
 Service's Hub* (shown when Spiral's store is not one) prefills the hub
 address, through the SSH destination for an SSH profile, or the profile's
 saved hub address, and routes the three kinds to the replica. The
 *Object store* row then compares hub identities and positions as well as
 store UUIDs.
 
-Edits are saved into the replica, not into the fit. *Save Drafts to Store*
-(Shift+E) writes the ready brush patches (new surfaces tagged `spiral-brush`,
-in the preview's frame of the fit volume, or new revisions of ones saved
-earlier) and point-collection edits (fitted collections keep their objects
-and point ids) as checked revisions; the replica's background sync pushes
-them. *Update Fit Inputs* holds the replica's pushes, pushes everything saved
-and waits (hub conflicts stop it and are named), then updates an idle fit in
-place at a position including those edits (initializing one when there is
-none, rebuilding a failed one), and pulls to the position the service
-fitted. It reports the hub commits that position includes beyond the
+Edits are saved into the store (or replica), not into the fit. *Save Drafts
+to Store* (Shift+E) writes the ready brush patches (new surfaces tagged
+`spiral-brush`, in the preview's frame of the fit volume, or new revisions of
+ones saved earlier) and point-collection edits (fitted collections keep their
+objects and point ids) as checked revisions; a replica's background sync
+pushes them. *Update Fit Inputs* updates an idle fit in place at a position
+including those edits (initializing one when there is none, rebuilding a
+failed one). With a hub it first holds the replica's pushes, pushes
+everything saved and waits (hub conflicts stop it and are named), and
+afterwards pulls to the position the service fitted. It reports the hub commits that position includes beyond the
 request and those after it, which show as stale. *Save and Update Fit
 Inputs* does both. The run panel's position summary shows the four states:
 unsaved drawings, saved edits not yet pushed (or in conflict), a position

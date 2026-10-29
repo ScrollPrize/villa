@@ -20,6 +20,7 @@ from config import Config  # noqa: E402
 from fit_session import (SessionState, SpiralInputPaths,  # noqa: E402
                          SpiralRunConfig, resolve_dataset_root)
 from service_http import ApiError  # noqa: E402
+from test_object_store_startup import store_path  # noqa: E402,F401
 
 # The dataset has no Lasagna stores or shell, so runs turn off the losses
 # that would need them.
@@ -28,11 +29,9 @@ NO_DENSE = {'dense_spacing_mode': 'grad_mag', 'loss_weight_dense_spacing': 0,
 
 
 @pytest.fixture()
-def store(tmp_path):
-    path = tmp_path / 'inputs.vcobj'
-    with ObjectStore.create(str(path), author='ingest', hostname='host'):
-        pass
-    return str(path)
+def store(store_path):
+    # Populated: a service links and pins a position of it before a build.
+    return store_path
 
 
 @pytest.fixture()
@@ -64,8 +63,8 @@ def service(dataset, store, **kwargs):
 
 def test_binding_resolves_the_store_once_and_records_its_uuid(store, tmp_path,
                                                               monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    binding = spiral_service.bind_object_store('inputs.vcobj', 'svc')
+    monkeypatch.chdir(Path(store).parent)
+    binding = spiral_service.bind_object_store(Path(store).name, 'svc')
     with ObjectStore.open(store, read_only=True) as db:
         assert binding.uuid == db.uuid
     assert binding.path == str(Path(store).resolve())
@@ -73,6 +72,9 @@ def test_binding_resolves_the_store_once_and_records_its_uuid(store, tmp_path,
                                 'object_store_author': 'svc',
                                 'object_store_input_position': None}
     assert not binding.hosted
+    # Shared in place: the store records positions of its own from now on.
+    with ObjectStore.open(store, read_only=True) as db:
+        assert binding.positions == db.store_positions()['store']
     assert spiral_service.bind_object_store(store).author.startswith(
         'spiral-service@')
 
@@ -431,12 +433,16 @@ def filled_store(tmp_path):
 def test_dataset_advertises_the_binding_and_its_selection(dataset, filled_store):
     state = service(dataset, filled_store)
     advertised = state.dataset()
+    with ObjectStore.open(filled_store, read_only=True) as db:
+        positions = db.store_positions()
     assert advertised['object_store'] == {
         'uuid': state.object_store.uuid, 'path': state.object_store.path,
-        'author': 'spiral-test', 'hub': None}
+        'author': 'spiral-test', 'hub': None,
+        'positions': {'identity': positions['store'], 'position': positions['position'],
+                      'position_error': None}}
     assert advertised['capabilities'] == {
-        'input_source': 'object_store', 'inputs_frozen': True,
-        'input_reload_rebuild': True, 'input_positions': False, 'input_updates': False}
+        'input_source': 'object_store', 'inputs_frozen': False,
+        'input_reload_rebuild': True, 'input_positions': True, 'input_updates': True}
     # The dataset no longer resolves or advertises patch, fiber or PCL files.
     assert 'pcl_inputs' not in advertised
     assert not {'verified_patches', 'fibers'} & set(advertised['resolved'])

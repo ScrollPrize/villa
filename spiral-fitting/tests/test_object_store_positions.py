@@ -303,7 +303,7 @@ def test_a_position_of_another_hub_is_refused(hub, tmp_path):
     request = dataclasses.replace(osi.request_from_config(fit_config(hub['service'])),
                                   position=other)
     with ObjectStore.open(hub['service'], read_only=True) as db:
-        with pytest.raises(osi.ObjectStoreInputError, match='belongs to hub another-hub'):
+        with pytest.raises(osi.ObjectStoreInputError, match='belongs to another-hub'):
             osi.read_snapshot(db, request)
 
 
@@ -343,7 +343,7 @@ def test_load_fit_inputs_on_a_replica_matches_the_plain_store(hub, tmp_path):
                                log=lambda line: None)
     assert copy.manifest['position'] is None
     assert copy.digest == inputs.digest
-    with pytest.raises(osi.ObjectStoreInputError, match='not a hosted replica'):
+    with pytest.raises(osi.ObjectStoreInputError, match='records no positions'):
         osi.load_fit_inputs(fit_config(plain), log=lambda line: None, minimum_position=1)
 
 
@@ -359,3 +359,102 @@ def test_changed_link_parameters_or_normals_mark_links_stale(hub):
     lasagna = {'normal_x': '/x', 'normal_y': '/y', 'group': '4', 'scale': 4}
     assert osi.stale_link_reasons(inputs.manifest, config, osi.fiber_normal_source(
         config, lasagna)) == ['the fiber-patch normal source changed']
+
+
+# ---------------------------------------------------------------------------
+# A plain store shared in place (no hub): VC3D and the service write one file
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def shared(tmp_path):
+    """The hub fixture's objects in one plain store that records positions."""
+    path = str(tmp_path / 'shared.vcobj')
+    with ObjectStore.create(path, author='ingest', hostname='host') as db:
+        put_patch(db, _grid(), (0.25, 0.25), name='near')
+        put_patch(db, _grid(140.0), (0.25, 0.25), name='far')
+        put_pcl(db, {**_on(100.0, (12.0, 48.0), (16.0, 52.0)),
+                     2: ([20.0, 140.0, 56.0], None)}, name='walk')
+        db.enable_store_positions()
+    return path
+
+
+def _shared_edit(path, change):
+    with ObjectStore.open(path, author='editor') as db:
+        change(db)
+        return db.store_positions()['position']
+
+
+def test_a_shared_store_links_and_pins_positions_of_its_own(shared):
+    walk = _names(shared)['walk']
+    edited = _shared_edit(shared, lambda db: db.set_meta(walk, 'sampling_group', 'reviewed'))
+    prepared = prepare(shared, minimum=edited)
+    with ObjectStore.open(shared, read_only=True) as db:
+        owner = db.store_positions()['store']
+    assert prepared.attempts == 1 and prepared.head == edited
+    assert prepared.position == osi.InputPosition(owner, prepared.position.sequence)
+    assert prepared.position.sequence > edited
+    assert any('links written at position' in line for line in prepared.lines)
+    request = dataclasses.replace(osi.request_from_config(fit_config(shared)),
+                                  position=prepared.position)
+    with ObjectStore.open(shared, read_only=True) as db:
+        before = osi.read_snapshot(db, request)
+    assert len(before.relationships) == 3
+    # Later edits leave the position as it was.
+    _shared_edit(shared, lambda db: db.set_meta(walk, 'sampling_group', 'later'))
+    with ObjectStore.open(shared, read_only=True) as db:
+        after = osi.read_snapshot(db, request)
+    assert after.digest() == before.digest()
+    [entry] = [e for e in after.manifest()['objects'] if e['uuid'] == walk]
+    assert entry['metadata']['sampling_group'] == 'reviewed'
+    # Nothing new to link: the head is the position.
+    again = prepare(shared)
+    assert again.position.sequence == again.head
+
+
+def test_an_edit_while_linking_a_shared_store_relinks(shared, monkeypatch):
+    walk = _names(shared)['walk']
+    original = osi.refresh_links
+    calls = []
+
+    def racing(store, snapshot, *args, **kwargs):
+        outcomes = original(store, snapshot, *args, **kwargs)
+        if not calls:  # VC3D saves while the detectors run
+            calls.append(_shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', 'saved')))
+        return outcomes
+
+    monkeypatch.setattr(osi, 'refresh_links', racing)
+    prepared = prepare(shared)
+    assert prepared.attempts == 2 and prepared.head >= calls[0]
+    assert any('editor wrote while linking' in line for line in prepared.lines)
+    with ObjectStore.open(shared, read_only=True) as db:
+        view = db.hub_read_view_at(prepared.position.sequence)
+        entries = db.journal_since(prepared.head)
+    [walk_record] = [r['record'] for r in view['objects'] if r['object_uuid'] == walk]
+    assert walk_record['meta']['review_note'] == 'saved'
+    assert {entry['author'] for entry in entries if entry['seq'] <= prepared.position.sequence} <= {'service'}
+
+
+def test_continuous_edits_of_a_shared_store_fail_cleanly(shared, monkeypatch):
+    walk = _names(shared)['walk']
+    original = osi.refresh_links
+    count = []
+
+    def busy(store, snapshot, *args, **kwargs):
+        outcomes = original(store, snapshot, *args, **kwargs)
+        count.append(1)
+        _shared_edit(shared, lambda db: db.set_meta(walk, 'review_note', str(len(count))))
+        return outcomes
+
+    monkeypatch.setattr(osi, 'refresh_links', busy)
+    with pytest.raises(osi.PositionError, match='inputs kept changing'):
+        prepare(shared, attempts=2)
+
+
+def test_a_plain_store_without_positions_has_none(tmp_path):
+    path = str(tmp_path / 'plain.vcobj')
+    with ObjectStore.create(path, author='ingest', hostname='host') as db:
+        put_patch(db, _grid(), (0.25, 0.25), name='near')
+    with ObjectStore.open(path, author='service') as store:
+        assert osi.position_owner(store) is None
+        with pytest.raises(osi.ObjectStoreInputError, match='records no positions'):
+            osi.prepare_position(store, fit_config(path), osi.request_from_config(fit_config(path)))

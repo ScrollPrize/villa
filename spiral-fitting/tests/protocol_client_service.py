@@ -5,7 +5,8 @@ an object store, with the resident runtime faked.
     python protocol_client_service.py --store STORE.vcobj [--hub HUB] --root DIR --port-file FILE
 
 With --hub the store is the service's replica of that hub (cloned when
-absent), and builds link and pin hub positions as a real service's do.
+absent); without, the store is shared in place. Builds link and pin
+positions (the hub's, or the store's own) as a real service's do.
 The faked session freezes inputs the way a real one does: it reads the
 store's default selection (at the pinned position) read-only, writes the run directory's
 object_store_inputs.json and reports its digest, summary and manifest path,
@@ -47,7 +48,7 @@ class FrozenInputsRuntime(FakeRuntime):
             request = osi.request_from_config(config)
             if position is not None:
                 request = dataclasses.replace(request, position=osi.InputPosition(
-                    store.hub_status()['hub_replica'], position))
+                    osi.position_owner(store), position))
             snapshot = osi.read_snapshot(store, request)
         manifest = snapshot.manifest()
         manifest['link_refresh'] = {'enabled': False}

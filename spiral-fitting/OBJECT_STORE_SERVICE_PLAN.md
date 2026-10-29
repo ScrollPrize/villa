@@ -1250,6 +1250,44 @@ hub transaction; a hub on a different host from the service; interactive VC3D
 GUI inspection (the VC3D client code ran in the protocol tests, against the
 fixture service).
 
+### Positions without a hub (2026-10-29)
+
+Revision of 2.1 for local profiles. A local service and VC3D on one machine
+need no hub: the stage 2a step 10 provisioning (Host Object Store Locally:
+the store becomes a hub, VC3D's path a replica, plus the service's own
+replica under its output root) kept three copies of the store in sync for
+two processes that can share one SQLite file. A service bound to a plain
+store (no `--object-store-hub`) now shares it in place:
+
+- Store: a plain store can keep the hub's publication index
+  (`enableStorePositions`; every write then records its position, checked
+  per write so a connection opened before the index records too; schema
+  version 18). `readHubPosition` and `hubJournal` read a plain store's own
+  history; `storePositions` gives its identity and head. `detachHub` drops a
+  replica's index (it held the hub's positions) and `initHub` keeps a plain
+  store's, which also fixes the review finding that a detached replica of an
+  indexed hub could not be hosted again.
+- Adapter: `position_owner` (a hub's identity, or the store's own);
+  `prepare_position` on a shared store reads the head H, links in place and
+  pins the new head N when every journal entry in (H, N] is the service's,
+  else relinks at the new head (same bound). Deviation from 2.3: there is no
+  atomic conditional publication, so links written for an abandoned head are
+  visible as pending detector output until the next refresh replaces them,
+  and a refresh failure leaves the detectors' committed links in place.
+- Service (API 39): every binding has positions; a plain one advertises
+  `object_store.positions` (identity, position) and updates in place. The
+  stage 1 "frozen without a hub" mode remains only for the CLI on a store no
+  service indexed.
+- VC3D (kApiVersion 39): `StoreBinding::shared()` when the service is on
+  this machine (a launched profile, or a direct loopback one) and opened the
+  same file; Update Fit Inputs then sends the store's head as M with no
+  push, hold or pull, and lists the journal entries around the fitted
+  position from the store itself. Host Store Locally (and `CState::closeStore`)
+  is removed; remote services still use hubs (Clone the Service's Hub).
+
+Limits: the store must be on a local disk (WAL); detector transactions and
+VC3D saves serialize on SQLite's writer lock (5 s busy timeout).
+
 ## Implementation and validation workflow
 
 Keep service and VC3D changes in reviewable patches, with their protocol changes

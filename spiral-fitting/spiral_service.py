@@ -17,11 +17,14 @@ creates the first resident session, and ``POST /session/rebuild`` replaces an
 existing one.
 
 Patch, PCL and fiber inputs come from the object store bound at launch
-(``--object-store``), never from an upload. With ``--object-store-hub`` that
-store is the service's replica of a hub: a fit reads the inputs of a linked,
-pinned hub position, and ``POST /session/update-inputs`` replaces a resident
-fit's inputs with a newer position's in place, keeping its model and
-optimiser. Without a hub the inputs are frozen for a resident session, and
+(``--object-store``), never from an upload. A fit reads the inputs of a
+linked, pinned position of it, and ``POST /session/update-inputs`` replaces
+a resident fit's inputs with a newer position's in place, keeping its model
+and optimiser. With ``--object-store-hub`` the store is the service's
+replica of a hub and positions are the hub's; otherwise the store is shared
+with the client's processes on this machine and records positions of its
+own. Without a position (a rebuild of an old checkpoint's inputs) the
+inputs are frozen for a resident session, and
 changing them is an edit in the store followed by a full-input rebuild. One
 client owns the mutation surface through the session lease
 (``POST /session/lease/claim``).
@@ -213,7 +216,10 @@ class ObjectStoreBinding:
     A hosted binding (``hub`` set) is the service's own replica of a hub:
     it writes only detector links, pushes them only with a conditional
     push, and fits hub positions (object_store_inputs.prepare_position).
-    ``hub_identity`` names the hub positions belong to.
+    ``hub_identity`` names the hub positions belong to. Otherwise the store
+    is shared in place (VC3D on this machine edits the same file) and
+    records positions of its own, linked in place. ``positions`` names
+    whose positions the service fits: the hub's, or the store's own.
     """
 
     path: str
@@ -221,10 +227,15 @@ class ObjectStoreBinding:
     author: str
     hub: str = None
     hub_identity: str = None
+    positions: str = None
 
     @property
     def hosted(self):
         return self.hub is not None
+
+    @property
+    def positioned(self):
+        return self.positions is not None
 
     def config(self):
         """The service-owned configuration a session request receives."""
@@ -243,20 +254,33 @@ class ObjectStoreBinding:
         except Exception as exc:  # noqa: BLE001 - reported, not fatal
             return None, f"{type(exc).__name__}: {exc}"
 
+    def store_position(self):
+        """``(position, error)``: the head of a shared store, read now."""
+        from vc_object_store import ObjectStore
+        try:
+            with ObjectStore.open(self.path, read_only=True) as store:
+                return (store.store_positions() or {}).get("position"), None
+        except Exception as exc:  # noqa: BLE001 - reported, not fatal
+            return None, f"{type(exc).__name__}: {exc}"
+
     def advertisement(self):
         result = {"uuid": self.uuid, "path": self.path, "author": self.author,
-                  "hub": None}
+                  "hub": None, "positions": None}
         if self.hosted:
             position, error = self.hub_position()
             result["hub"] = {"address": self.hub, "identity": self.hub_identity,
                              "position": position, "position_error": error}
+        elif self.positioned:
+            position, error = self.store_position()
+            result["positions"] = {"identity": self.positions, "position": position,
+                                   "position_error": error}
         return result
 
 
 # Configuration keys the launch binding owns. A session request or --config
 # naming one is refused, as the scroll-specification keys are, rather than
 # quietly overruled: a client cannot repoint the inputs a service reads, or
-# choose the hub position a build pins (it asks with ``inputs_position``).
+# choose the position a build pins (it asks with ``inputs_position``).
 SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
                              "object_store_input_position")
 
@@ -266,16 +290,16 @@ SERVICE_OWNED_CONFIG_KEYS = ("object_store_path", "object_store_author",
 SERVICE_CAPABILITIES = {
     # Patches, PCLs and fibers are read from the bound object store.
     "input_source": "object_store",
-    # A resident session's inputs never change (a service without a hub);
-    # a hub-bound service updates them in place instead.
+    # A resident session's inputs never change (a service without
+    # positions); one with positions updates them in place instead.
     "inputs_frozen": True,
     # POST /session/rebuild {"inputs": "reload"} rereads the store.
     "input_reload_rebuild": True,
-    # Initialize and full-input rebuilds link and pin a hub position,
-    # including at least the request's ``inputs_position`` (hosted bindings).
+    # Initialize and full-input rebuilds link and pin a position, including
+    # at least the request's ``inputs_position`` (bindings with positions).
     "input_positions": False,
     # POST /session/update-inputs replaces a resident fit's inputs with a
-    # hub position's, keeping its model and optimiser (hosted bindings).
+    # position's, keeping its model and optimiser (bindings with positions).
     "input_updates": False,
 }
 
@@ -351,7 +375,17 @@ def bind_object_store(path, author=None, hub=None):
             raise ObjectStoreBindingError(
                 f"{resolved} exists and is not a replica of the hub {hub}; "
                 "name a new replica path, or omit --object-store-hub")
-        return ObjectStoreBinding(str(resolved), str(uuid), author)
+        # Shared in place: every write, VC3D's included, records a position
+        # from now on, so the service links and pins positions of the store
+        # itself (no hub, no replicas).
+        try:
+            with ObjectStore.open(str(resolved), author=author) as store:
+                store.enable_store_positions()
+                positions = store.store_positions()["store"]
+        except Exception as exc:
+            raise ObjectStoreBindingError(
+                f"cannot record positions of the object store {resolved}: {exc}") from exc
+        return ObjectStoreBinding(str(resolved), str(uuid), author, positions=positions)
     if hub is not None and _canonical_hub(vos, hub) != status["hub"]:
         raise ObjectStoreBindingError(
             f"{resolved} replicates the hub {status['hub']}, not {hub}")
@@ -387,7 +421,7 @@ def bind_object_store(path, author=None, hub=None):
             f"({len(pending)} pending, {len(conflicts)} in conflict with the hub); "
             "a service replica must hold none: resolve them, or name a new replica path")
     return ObjectStoreBinding(str(resolved), str(uuid), author,
-                              status["hub"], status["hub_replica"])
+                              status["hub"], status["hub_replica"], status["hub_replica"])
 
 
 def bind_service_paths(resolution, output_directory, cache_directory):
@@ -1010,11 +1044,11 @@ class ServiceState:
 
     def dataset(self):
         capabilities = dict(SERVICE_CAPABILITIES)
-        hosted = bool(self.object_store is not None and self.object_store.hosted)
-        capabilities["input_positions"] = hosted
-        # A hub-bound service updates a resident fit's inputs in place.
-        capabilities["inputs_frozen"] = not hosted
-        capabilities["input_updates"] = hosted
+        positioned = self._positioned()
+        capabilities["input_positions"] = positioned
+        # A service with positions updates a resident fit's inputs in place.
+        capabilities["inputs_frozen"] = not positioned
+        capabilities["input_updates"] = positioned
         response = {**self._base(), **self.dataset_resolution.to_dict(),
                     "session_checkpoints": self.session_checkpoints(),
                     "capabilities": capabilities}
@@ -1033,7 +1067,9 @@ class ServiceState:
         result is reused until the store's files change.
         """
         path = Path(self.object_store.path)
-        key = tuple((info.st_size, info.st_mtime_ns) if info else None
+        # An empty WAL (a read-only open after the last writer closed
+        # creates one) holds no writes: it keys as an absent one.
+        key = tuple((info.st_size, info.st_mtime_ns) if info and info.st_size else None
                     for info in (_stat_or_none(path),
                                  _stat_or_none(Path(f"{path}-wal"))))
         with self._startup_inputs_lock:
@@ -1295,21 +1331,21 @@ class ServiceState:
                                f"{verb} waits for the input update in progress",
                                payload={"code": INPUT_UPDATE_IN_PROGRESS})
 
-    def _hosted(self):
-        return self.object_store is not None and self.object_store.hosted
+    def _positioned(self):
+        return self.object_store is not None and self.object_store.positioned
 
     def _inputs_position(self, value):
-        """A request's ``inputs_position``: the hub position (M) the build's
-        inputs must include, e.g. where a client's pushed edits reached."""
+        """A request's ``inputs_position``: the position (M) the build's
+        inputs must include, e.g. where a client's saved (and, with a hub,
+        pushed) edits reached."""
         if value is None:
             return None
         if type(value) is not int or value < 0:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "inputs_position must be a non-negative integer")
-        if not self._hosted():
+        if not self._positioned():
             raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "This service's object store is not a hub replica; "
-                           "it has no input positions")
+                           "This service's object store records no positions")
         return value
 
     def rebuild(self, request):
@@ -1399,7 +1435,7 @@ class ServiceState:
                 "build_id": build_id}
 
     def update_inputs(self, request):
-        """Update the resident fit's inputs to a hub position, keeping its
+        """Update the resident fit's inputs to a position, keeping its
         model and optimiser state (stage 2b).
 
         ``inputs_position`` (M) is the position the inputs must include,
@@ -1420,9 +1456,9 @@ class ServiceState:
         if request:
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            f"Unknown input update fields: {', '.join(sorted(request))}")
-        if not self._hosted():
+        if not self._positioned():
             raise ApiError(HTTPStatus.CONFLICT,
-                           "This service's object store is not a hub replica; rebuild "
+                           "This service's object store records no positions; rebuild "
                            "the fit with current inputs instead",
                            payload={"code": INPUT_UPDATE_UNAVAILABLE})
         with self.lock:
@@ -1541,7 +1577,7 @@ class ServiceState:
             self._input_update = None
             self.status_generation += 1
         self.events.append(
-            "log", f"Inputs updated to hub position {prepared.position.sequence} "
+            "log", f"Inputs updated to position {prepared.position.sequence} "
             f"(input generation {result.get('input_generation')})",
             source="service", operation="updating_inputs")
 
@@ -1638,15 +1674,15 @@ class ServiceState:
                      reload_inputs=False):
         """Publish ``Loading`` and construct the runtime off the HTTP thread.
 
-        On a hosted binding the build reads a hub position. A checkpoint
-        resume reads the position the checkpoint recorded on this hub,
+        On a binding with positions the build reads a position. A checkpoint
+        resume reads the position the checkpoint recorded of this store (or hub),
         unless the request reloads the inputs or names a position to
         include; otherwise the inputs are linked and pinned first
         (``_prepare_then_build``), while the resident session, if any, is
         left alone. Returns the build's ID.
         """
         record = None
-        if self._hosted():
+        if self._positioned():
             position = None
             if paths.checkpoint and minimum is None and not reload_inputs:
                 position = self._checkpoint_position(paths.checkpoint)
@@ -1654,7 +1690,7 @@ class ServiceState:
                 return self._begin_prepared_build(paths, run, preview, scroll,
                                                   minimum)
             run = self._pin_run(run, position)
-            record = {"hub": self.object_store.hub_identity,
+            record = {"hub": self.object_store.positions,
                       "sequence": position, "requested": None, "head": None,
                       "attempts": 0, "source": "checkpoint"}
         with self.lock:
@@ -1680,12 +1716,12 @@ class ServiceState:
         read at, or None."""
         *_, manifest = self._checkpoint_durable_cfg(path)
         position = ((manifest or {}).get("object_store") or {}).get("position")
-        if not position or position.get("hub") != self.object_store.hub_identity:
+        if not position or position.get("hub") != self.object_store.positions:
             return None
         return int(position["sequence"])
 
     def _begin_prepared_build(self, paths, run, preview, scroll, minimum):
-        """Link and pin a hub position off the HTTP thread, then build at it."""
+        """Link and pin a position off the HTTP thread, then build at it."""
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
@@ -1719,7 +1755,7 @@ class ServiceState:
         return self._prepare_position(config, paths, scroll, minimum)
 
     def _prepare_position(self, config, paths, scroll, minimum):
-        """Link and pin a hub position for ``config`` on the bound replica."""
+        """Link and pin a position for ``config`` on the bound store."""
         from vc_object_store import ObjectStore
         from fit_session import lasagna_normal_inputs
         from object_store_inputs import prepare_position, request_from_config
@@ -3804,6 +3840,9 @@ def main(argv=None):
     if object_store.hosted:
         print(f"Spiral object-store hub: {object_store.hub} "
               f"({object_store.hub_identity})", flush=True)
+    elif object_store.positioned:
+        print(f"Spiral object store shared in place; positions of "
+              f"{object_store.positions}", flush=True)
     print(f"Spiral output root: {output_root}", flush=True)
     print(f"Spiral cache root: {cache_root}", flush=True)
     if args.session_name:

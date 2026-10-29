@@ -446,14 +446,28 @@ def test_verbs_that_change_the_fit_wait_for_an_input_update(state, hub, device_s
     assert status['input_generation'] == 1
 
 
-def test_a_plain_store_has_no_input_updates(store_path, tmp_path):
+def test_a_shared_plain_store_updates_in_place(store_path, tmp_path, device_stubs,
+                                               no_theta_topology):
+    # No hub: the service shares the store file with an editor on this
+    # machine, and fits positions of the store itself.
     import spiral_service
     from test_service_hub_positions import _service_state
     state = _service_state(spiral_service.bind_object_store(store_path, 'svc'), tmp_path)
     try:
-        assert state.dataset()['capabilities']['input_updates'] is False
-        with pytest.raises(spiral_service.ApiError, match='not a hub replica') as refused:
-            state.update_inputs({})
-        assert refused.value.payload['code'] == spiral_service.INPUT_UPDATE_UNAVAILABLE
+        assert state.dataset()['capabilities']['input_updates'] is True
+        state.initialize(REQUEST)
+        before = settle(state)
+        identity = state.object_store.positions
+        assert before['input_position']['hub'] == identity
+        with ObjectStore.open(store_path, author='editor') as db:
+            rows, cols = np.mgrid[:8, :8]
+            put_patch(db, np.stack([4.0 + rows * 4, np.full(rows.shape, 120.0), 40.0 + cols * 4],
+                                   axis=-1), (0.25, 0.25), name='added')
+            reached = db.store_positions()['position']
+        state.update_inputs({'inputs_position': reached, 'expected_input_generation': 0})
+        status = _settled_update(state)
+        assert status['state'] == 'Idle' and status['input_generation'] == 1
+        assert status['input_position']['sequence'] >= reached
+        assert status['input_digest'] != before['input_digest']
     finally:
         state.close()

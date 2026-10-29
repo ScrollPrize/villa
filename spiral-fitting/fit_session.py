@@ -150,7 +150,14 @@ from surface_orientation import spiral_outward_sense_for
 # "input_update" while one runs and "input_generation"; a failed update's
 # "input_preparation_error" says its "phase" and whether the fit needs
 # recovery ("recovery_required").
-API_VERSION = 38
+# 39: positions without a hub. A service bound to a plain store (no
+# --object-store-hub) records positions of the store itself, shared in place
+# with the client's processes on its machine: /dataset's object_store carries
+# "positions" (identity, position, position_error), the capabilities report
+# input_positions and input_updates, and initialize, full-input rebuilds and
+# update-inputs link and pin positions of the store as for a hub. Positions'
+# "hub" names their owner (a hub, or the store).
+API_VERSION = 39
 
 
 class SessionState(str, Enum):

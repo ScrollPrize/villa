@@ -105,9 +105,15 @@ def test_the_runtime_reads_the_bound_store_and_reports_it(state, store_path,
     assert device_stubs == [True]
     assert len(_edges(store_path)) == 3
     inputs = context.object_store_inputs
+    # The service linked and pinned a position of the shared store first
+    # (its lines are preparation events); the runtime read that position.
+    preparing = [event['text'] for event in state.events.read_after(0)['events']
+                 if event.get('operation') == 'preparing_inputs']
+    assert any(line.startswith('link refresh pcl_patch: 3 created') for line in preparing)
+    assert status['input_position']['source'] == 'prepared'
     # The adapter's report is in the status and in the event stream.
     report = status['input_report']
-    assert any(line.startswith('link refresh pcl_patch: 3 created') for line in report)
+    assert any(line.startswith('reading pinned position') for line in report)
     assert f'object-store inputs frozen: digest {inputs.digest[:16]}' in report
     assert any(line.startswith('constraints:') for line in report)
     events = [event for event in state.events.read_after(0)['events']
@@ -179,24 +185,21 @@ def test_a_model_rebuild_keeps_the_frozen_inputs(state, store_path, device_stubs
 
 
 def test_input_refusals_reach_status_and_events(state, store_path, device_stubs):
+    # Linking a position fails before any build: nothing is torn down.
     state.initialize({'run': {'z_begin': 0, 'z_end': 64, 'config': {
         **RUN, 'pcl_link_window_min_points': 5}}})
-    status = settle(state)
-    assert status['state'] == 'Error'
-    problems = status['input_problems']
-    assert any('pcl_patch: FAILED' in line for line in problems)
-    assert any('the fit will not train' in line for line in problems)
-    assert 'LinkRefreshError' in status['error']
-    # The state is readable before the fitter thread publishes it as events.
-    deadline = time.monotonic() + 10
-    while True:
-        errors = [event for event in state.events.read_after(0)['events']
-                  if event['kind'] == 'error']
-        if errors or time.monotonic() > deadline:
-            break
+    deadline = time.monotonic() + 60
+    while state._building:
+        assert time.monotonic() < deadline
         time.sleep(0.02)
-    [error] = errors
-    assert error['payload'] == {'input_problems': problems}
+    status = state.status()
+    assert status['state'] == 'Uninitialized' and device_stubs == []
+    failure = status['input_preparation_error']
+    assert any('pcl_patch: FAILED' in line for line in failure['problems'])
+    assert 'LinkRefreshError' in failure['message']
+    [error] = [event for event in state.events.read_after(0)['events']
+               if event['kind'] == 'error']
+    assert error['text'].startswith('The inputs could not be prepared')
 
 
 # ---------------------------------------------------------------------------

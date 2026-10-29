@@ -99,9 +99,12 @@ class Selector:
 
 @dataclasses.dataclass(frozen=True)
 class InputPosition:
-    """An immutable store state: a hosted store's hub (its identity, the
-    ``hub_replica`` of every replica's hub_status) and a journal sequence on
-    it. Every replica reads the same inputs at one position."""
+    """An immutable store state: the identity positions belong to and a
+    journal sequence of it. For a hosted store that is its hub (the
+    ``hub_replica`` of every replica's hub_status): every replica reads the
+    same inputs at one position. A plain store that records positions
+    (store_positions(), shared by the processes of one machine) owns its
+    own."""
     hub: str
     sequence: int
 
@@ -455,18 +458,29 @@ def filter_relationships(view_relationships, objects, approved_links_only):
     return consumed, exclusions
 
 
+def position_owner(store):
+    """The identity this store's positions belong to: its hub's for a
+    hosted replica, its own for a plain store that records positions, else
+    None."""
+    status = store.hub_status()
+    if status is not None:
+        return status['hub_replica']
+    positions = store.store_positions()
+    return None if positions is None else positions['store']
+
+
 def check_position(store, position):
     """Refuse a position this store cannot read: it must be a replica of the
-    position's hub."""
-    status = store.hub_status()
-    if status is None:
+    position's hub, or the plain store the position is of."""
+    owner = position_owner(store)
+    if owner is None:
         raise ObjectStoreInputError([
-            f'object store {store.path} is not a hosted replica; input positions '
-            'name hub states'])
-    if status['hub_replica'] != position.hub:
+            f'object store {store.path} records no positions (neither a hosted '
+            'replica nor a store a service shares)'])
+    if owner != position.hub:
         raise ObjectStoreInputError([
-            f'input position {position.sequence} belongs to hub {position.hub}; '
-            f'{store.path} replicates hub {status["hub_replica"]}'])
+            f'input position {position.sequence} belongs to {position.hub}; '
+            f'{store.path} reads the positions of {owner}'])
 
 
 def _position_records(store, position):
@@ -1581,17 +1595,18 @@ def _refresh(store, snapshot, config, lasagna, cache_directory, log):
     return refresh_report(refresh_links(store, snapshot, config, normal, cache_directory))
 
 
-def _hosted(path):
-    """hub_status of the store at ``path`` (None for an ordinary store)."""
+def _position_owner(path):
+    """position_owner of the store at ``path``."""
     from vc_object_store import ObjectStore
     with ObjectStore.open(path, read_only=True) as store:
-        return store.hub_status()
+        return position_owner(store)
 
 
 def _startup_phase(config, request, lasagna, cache_directory, log, minimum_position=None):
     """Rank zero's startup: resolve the selection once, validate it and its
     frames, then (unless refresh is off) run the detectors as
-    object_store_author. A hosted replica links and pins a hub position
+    object_store_author. A store with positions (a hosted replica, or a
+    plain store a service shares) links and pins a position
     (prepare_position) instead. Returns ``(selected UUIDs by kind, report
     lines, InputPosition or None)``; raises ObjectStoreInputError on any
     failure."""
@@ -1603,19 +1618,18 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
     pinned = config['object_store_input_position']
     if pinned is not None:
         # Prepared already (the service linked and pinned it): read it exactly.
-        status = _hosted(path)
-        if status is None:
+        owner = _position_owner(path)
+        if owner is None:
             raise ObjectStoreInputError([
-                f'object store {path} is not a hosted replica; it has no position {pinned}'])
-        position = InputPosition(status['hub_replica'], int(pinned))
+                f'object store {path} records no positions; it has no position {pinned}'])
+        position = InputPosition(owner, int(pinned))
         with ObjectStore.open(path, read_only=True) as store:
             uuids = resolve_selection(store, dataclasses.replace(request, position=position))
-        return uuids, [f'reading pinned hub position {pinned}'], position
-    if _hosted(path) is not None:
+        return uuids, [f'reading pinned position {pinned}'], position
+    if _position_owner(path) is not None:
         if not author:
             raise ObjectStoreInputError([
-                f'object_store_author is required to pull and link a position of the '
-                f'hosted store {path}'])
+                f'object_store_author is required to link a position of the store {path}'])
         with ObjectStore.open(path, author=author) as store:
             prepared = prepare_position(store, config, request, lasagna=lasagna,
                                         minimum=minimum_position,
@@ -1623,7 +1637,7 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
         return prepared.uuids, prepared.lines, prepared.position
     if minimum_position is not None:
         raise ObjectStoreInputError([
-            f'object store {path} is not a hosted replica; it has no position '
+            f'object store {path} records no positions; it has no position '
             f'{minimum_position}'])
     if refresh and not author:
         raise ObjectStoreInputError([
@@ -1642,7 +1656,7 @@ def _startup_phase(config, request, lasagna, cache_directory, log, minimum_posit
 
 
 class PositionError(ObjectStoreInputError):
-    """No hub position could be linked and pinned; the active fit is kept."""
+    """No position could be linked and pinned; the active fit is kept."""
 
 
 @dataclasses.dataclass
@@ -1699,12 +1713,19 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     A detector failure or the bound raises, publishing nothing (and
     discarding the links), and leaves the caller's active inputs alone.
     With object_store_refresh_links off, the pulled head is the position.
+
+    A plain store that records positions (shared with the client's
+    processes on one machine) is linked in place instead
+    (_prepare_shared_position).
     """
     status = store.hub_status()
     if status is None:
-        raise ObjectStoreInputError([
-            f'object store {store.path} is not a hosted replica; input positions '
-            'name hub states'])
+        if store.store_positions() is None:
+            raise ObjectStoreInputError([
+                f'object store {store.path} records no positions (neither a hosted '
+                'replica nor a store a service shares)'])
+        return _prepare_shared_position(store, config, request, lasagna=lasagna, minimum=minimum,
+                                        cache_directory=cache_directory, log=log, attempts=attempts)
     hub = status['hub_replica']
     refresh = bool(config['object_store_refresh_links'])
     current = dataclasses.replace(request, position=None)
@@ -1760,6 +1781,58 @@ def prepare_position(store, config, request, *, lasagna=None, minimum=None,
     pinned = InputPosition(hub, position)
     if minimum is not None and position > minimum:
         lines.append(f'position {position} includes hub commits after the requested {minimum}')
+    return PreparedPosition(
+        position=pinned, head=head, minimum=minimum, attempts=attempt,
+        uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
+        lines=notes + lines)
+
+
+def _prepare_shared_position(store, config, request, *, lasagna, minimum, cache_directory,
+                             log, attempts):
+    """prepare_position on a plain store others write as well (VC3D, on
+    the same machine). Detectors commit straight into the store, so there
+    is no conditional push: read the head H, link over the selection, and
+    pin the new head N only if every write after H is this service's own
+    (N is then H plus its links, as a conditional push would publish).
+    Another writer in between (a save, a deletion, an approval) relinks at
+    the new head; links already written stay as pending detector output,
+    which the next refresh replaces. ``attempts`` bounds the loop."""
+    owner = store.store_positions()['store']
+    author = config['object_store_author']
+    refresh = bool(config['object_store_refresh_links'])
+    current = dataclasses.replace(request, position=None)
+    notes = []
+    for attempt in range(1, attempts + 1):
+        head = store.store_positions()['position']
+        if minimum is not None and head < minimum:
+            raise PositionError([
+                f'store {owner} is at position {head}, before the requested position '
+                f'{minimum}; is this the store the edits were saved to?'])
+        if not refresh:
+            position, lines = head, [f'link refresh: off; pinning position {head}']
+            break
+        snapshot = read_snapshot(store, current)
+        lines, problems = _refresh(store, snapshot, config, lasagna, cache_directory, log)
+        if problems:
+            raise LinkRefreshError(notes + problems + [
+                'links the detectors committed stay as pending output; the next refresh '
+                'replaces them'])
+        after = store.store_positions()['position']
+        others = sorted({entry['author'] for entry in store.journal_since(head)
+                         if entry['seq'] <= after and entry['author'] != author})
+        if others:
+            notes.append(f'attempt {attempt}: {", ".join(others)} wrote while linking at '
+                         f'{head}; relinking')
+            continue
+        position = after
+        lines = lines + [f'links written at position {position} (linked at {head})']
+        break
+    else:
+        raise PositionError(notes + [
+            f'inputs kept changing: no position could be linked in {attempts} attempts; retry'])
+    pinned = InputPosition(owner, position)
+    if minimum is not None and head > minimum:
+        lines.append(f'position {position} includes commits after the requested {minimum}')
     return PreparedPosition(
         position=pinned, head=head, minimum=minimum, attempts=attempt,
         uuids=resolve_selection(store, dataclasses.replace(request, position=pinned)),
